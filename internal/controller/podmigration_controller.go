@@ -476,8 +476,14 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 		}
 	}
 
-	checkpointRef := ""
-	if pm.Status.CheckpointRef != nil {
+	// Derive the canonical checkpoint directory path. The agent wrote images to
+	// /var/lib/podmotion/checkpoints/<migrationName>/final/ on the source node.
+	// For Sprint 4 kind clusters (single-host Docker, shared hostPath), this path
+	// is accessible from both nodes via the Docker bind-mount, so we pass it directly.
+	checkpointDir := fmt.Sprintf("/var/lib/podmotion/checkpoints/%s/final", pm.Name)
+	checkpointRef := checkpointDir // use the full path as the ref so the agent skips the default
+	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != pm.Name {
+		// If a more specific ref was stored (e.g. OCI digest), use that instead.
 		checkpointRef = pm.Status.CheckpointRef.Name
 	}
 
@@ -489,6 +495,37 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 		return ctrl.Result{}, r.Status().Update(ctx, pm)
 	}
 
+	// PrepareDestination: pre-allocate the checkpoint directory and any cgroup/netns
+	// resources on the destination node before invoking CRIU restore.
+	prepDestResp, err := agentClient.PrepareDestination(ctx, &agentpb.PrepareDestinationRequest{
+		MigrationName: pm.Name,
+		SourceNode:    pm.Status.SourceNodeName,
+		PodNamespace:  pm.Spec.PodNamespace,
+	})
+	if err != nil {
+		log.Error(err, "PrepareDestination RPC failed", "node", destNode)
+		setCondition(pm, conditionRestored, metav1.ConditionFalse, "RestoreFailed",
+			fmt.Sprintf("PrepareDestination failed: %v", err))
+		return ctrl.Result{}, r.Status().Update(ctx, pm)
+	}
+	if !prepDestResp.Ready {
+		msg := prepDestResp.BlockingReason
+		if msg == "" {
+			msg = "PrepareDestination: destination node not ready"
+		}
+		log.Info("PrepareDestination not ready, requeuing", "reason", msg)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	log.Info("PrepareDestination OK", "migration", pm.Name, "destNode", destNode,
+		"ipReserved", prepDestResp.IpReserved, "storageReady", prepDestResp.StorageReady)
+
+	// Restore: CRIU restores the process tree from the checkpoint images on the destination
+	// node. checkpoint_ref carries the full images-dir path so the agent uses it directly
+	// rather than falling back to the default path (which would be empty on a fresh node).
+	// DestinationNodeName is already pinned in pm.Status.DestinationNodeName = destNode above;
+	// CRIU recreates the process directly without a scheduler round-trip, so no pod object
+	// with NodeName needs to be created here — the process is pinned by executing the restore
+	// RPC on the target node's agent.
 	restoreResp, err := agentClient.Restore(ctx, &agentpb.RestoreRequest{
 		MigrationName:  pm.Name,
 		CheckpointRef:  checkpointRef,
