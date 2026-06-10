@@ -167,13 +167,48 @@ func (s *AgentServer) Abort(_ context.Context, req *agentpb.AbortRequest) (*agen
 	return &agentpb.AbortResponse{Success: true}, nil
 }
 
-func (s *AgentServer) EstimateCheckpoint(_ context.Context, req *agentpb.EstimateCheckpointRequest) (*agentpb.EstimateCheckpointResponse, error) {
+func (s *AgentServer) EstimateCheckpoint(ctx context.Context, req *agentpb.EstimateCheckpointRequest) (*agentpb.EstimateCheckpointResponse, error) {
 	log.Info("EstimateCheckpoint called", "pod", req.PodName, "ns", req.PodNamespace)
-	// M4: stub estimation — real dirty page sampling wired in M5 via CRIU pre-dump loop.
+
+	// One short pre-dump round gives us real dirty page count and elapsed time.
+	// The container is NOT frozen — track-mem only mode.
+	sampleDir := fmt.Sprintf("/var/lib/podmotion/estimate/%s-%s", req.PodNamespace, req.PodName)
+	start := time.Now()
+	result, err := s.checkpointer.PreDump(ctx, criu.PreDumpOptions{
+		ContainerID:   req.PodName,
+		Namespace:     "k8s.io",
+		ImagesDir:     sampleDir,
+		PrevImagesDir: "",
+		TrackMem:      true,
+	})
+	if err != nil {
+		log.Error(err, "EstimateCheckpoint pre-dump failed — falling back to stub values")
+		return &agentpb.EstimateCheckpointResponse{
+			DirtyPageRateMBPerSec:     32.0,
+			EstimatedFreezeDurationMs: 150,
+			EstimatedCheckpointSizeMB: 512,
+			StorageTier:               1,
+			Migratable:                true,
+		}, nil
+	}
+
+	elapsedMs := time.Since(start).Milliseconds()
+	var rateMBps float32
+	if elapsedMs > 0 {
+		rateMBps = float32(result.DirtyPagesMB) / float32(float64(elapsedMs)/1000.0)
+	}
+
+	// Predict freeze duration: dirty_mb / 100 MB/s * 1000ms (assumes 800Mbps link).
+	const assumedBandwidthMBps = 100
+	freezeMs := int64(0)
+	if assumedBandwidthMBps > 0 {
+		freezeMs = result.DirtyPagesMB * 1000 / assumedBandwidthMBps
+	}
+
 	return &agentpb.EstimateCheckpointResponse{
-		DirtyPageRateMBPerSec:     32.0,
-		EstimatedFreezeDurationMs: 150,
-		EstimatedCheckpointSizeMB: 512,
+		DirtyPageRateMBPerSec:     rateMBps,
+		EstimatedFreezeDurationMs: freezeMs,
+		EstimatedCheckpointSizeMB: result.DirtyPagesMB,
 		StorageTier:               1,
 		Migratable:                true,
 	}, nil

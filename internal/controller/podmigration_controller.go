@@ -24,6 +24,8 @@ import (
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	agentclient "github.com/podmotion-io/podmotion/internal/agent/client"
+	"github.com/podmotion-io/podmotion/internal/agent/criu"
+	"github.com/podmotion-io/podmotion/internal/agent/replication"
 	"github.com/podmotion-io/podmotion/internal/estimation"
 	"github.com/podmotion-io/podmotion/internal/rollback"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
@@ -51,6 +53,12 @@ type PodMigrationReconciler struct {
 	// AgentPool provides per-node gRPC connections to podmotion-agent DaemonSet pods.
 	// Nil in unit tests — phase handlers skip gRPC calls when nil.
 	AgentPool   *agentclient.AgentClientPool
+	// ReplicationMgr drives the pre-copy dirty-page sync loop (Agent 11, M5).
+	// Nil in unit tests — PreMigrating phase skips loop launch when nil.
+	ReplicationMgr *replication.ReplicationManager
+	// Checkpointer is the CRIU checkpointer used by the replication loop.
+	// Defaults to StubCheckpointer when nil.
+	Checkpointer criu.Checkpointer
 }
 
 // +kubebuilder:rbac:groups=migration.podmotion.io,resources=podmigrations,verbs=get;list;watch;create;update;patch;delete
@@ -190,6 +198,8 @@ func (r *PodMigrationReconciler) reconcileValidating(ctx context.Context, pm *pm
 }
 
 func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
 	// Agent 11 (replication) and Agent 3 (storage) drive the pre-migration work asynchronously.
 	// This controller watches for the two keystone conditions to both become True:
 	//   MemorySynced=True   (emitted by Agent 11 replication loop)
@@ -197,14 +207,38 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 	//
 	// When both are True, advance to Checkpointing (the freeze).
 	memorySynced := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionMemorySynced)
+	memoryCond := meta.FindStatusCondition(pm.Status.Conditions, conditionMemorySynced)
 	storageReady := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionStorageReady)
+
+	// ADR-0024: DirtyRateIncreasing abort — pod is never frozen, clean abort without rollback.
+	if memoryCond != nil && memoryCond.Status == "False" && memoryCond.Reason == "DirtyRateIncreasing" {
+		return r.failMigration(ctx, pm, fmt.Sprintf("pre-copy aborted: %s", memoryCond.Message))
+	}
 
 	if memorySynced && storageReady {
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCheckpointing)
 	}
 
+	// Launch the pre-copy loop goroutine if it has not been started yet.
+	// We detect "not yet started" by the absence of the MemorySynced condition.
+	// The goroutine patches MemorySynced=True/False when it finishes; the next
+	// reconcile iteration will pick it up.
+	if memoryCond == nil && r.ReplicationMgr != nil {
+		cp := r.Checkpointer
+		if cp == nil {
+			cp = &criu.StubCheckpointer{}
+		}
+		// Snapshot name/namespace for the goroutine closure — pm may be mutated later.
+		pmCopy := pm.DeepCopy()
+		go func() {
+			if err := r.ReplicationMgr.RunPreCopyLoop(context.Background(), pmCopy, cp); err != nil {
+				log.Error(err, "pre-copy loop failed", "migration", pmCopy.Name)
+			}
+		}()
+		log.Info("launched pre-copy loop goroutine", "migration", pm.Name)
+	}
+
 	// Requeue after a short interval to re-check agent progress.
-	// Agents write directly to pm.status.conditions via their own controller/patch calls.
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
