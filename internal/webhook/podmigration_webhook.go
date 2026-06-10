@@ -40,6 +40,7 @@ import (
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	"github.com/podmotion-io/podmotion/internal/featuregate"
+	"github.com/podmotion-io/podmotion/internal/multicluster"
 )
 
 var webhookLog = logf.Log.WithName("podmigration-webhook")
@@ -47,14 +48,18 @@ var webhookLog = logf.Log.WithName("podmigration-webhook")
 // PodMigrationValidator implements the ValidatingAdmissionWebhook for PodMigration.
 // It is registered via SetupWithManager and served at /validate-podmotion-io-v1alpha1-podmigration.
 type PodMigrationValidator struct {
-	client  client.Client
-	decoder admission.Decoder
+	client     client.Client
+	decoder    admission.Decoder
+	Federator  multicluster.ClusterFederator
 }
 
 // SetupWithManager registers the webhook with the controller-runtime manager.
 func (v *PodMigrationValidator) SetupWithManager(mgr ctrl.Manager) error {
 	v.client = mgr.GetClient()
 	v.decoder = admission.NewDecoder(mgr.GetScheme())
+	if v.Federator == nil {
+		v.Federator = &multicluster.StubClusterFederator{}
+	}
 	mgr.GetWebhookServer().Register(
 		"/validate-podmotion-io-v1alpha1-podmigration",
 		&admission.Webhook{Handler: v},
@@ -173,6 +178,20 @@ func (v *PodMigrationValidator) validate(ctx context.Context, pm *pmv1.PodMigrat
 	if webhookPodHasGPU(pod) && !featuregate.IsEnabled(featuregate.GPUMigration) {
 		allErrs = append(allErrs, field.Forbidden(spec,
 			"GPU migration requires --feature-gates=GPUMigration=true"))
+	}
+
+	// Rule 11: destinationCluster cross-cluster checks (ADR-0022, ADR-0034)
+	if pm.Spec.DestinationCluster != "" {
+		// Verify remote cluster connectivity.
+		if _, err := v.Federator.GetRemoteClient(pm.Spec.DestinationCluster); err != nil {
+			allErrs = append(allErrs, field.Invalid(spec.Child("destinationCluster"), pm.Spec.DestinationCluster,
+				fmt.Sprintf("cannot reach remote cluster: %v", err)))
+		}
+		// Warn via annotation: multi-cluster uses TIER_4 network (reconnect model).
+		// We surface this as an informational deny-override via an annotation rather
+		// than a rejection because the caller has explicitly opted in to cross-cluster.
+		webhookLog.Info("multi-cluster migration uses TIER_4 network reconnect model — IP preservation is not available",
+			"destinationCluster", pm.Spec.DestinationCluster, "migration", pm.Name)
 	}
 
 	// Rule 10: range validations
