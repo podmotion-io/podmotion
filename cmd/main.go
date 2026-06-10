@@ -37,11 +37,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	migrationv1alpha1 "github.com/podmotion-io/podmotion/api/v1alpha1"
-	"github.com/podmotion-io/podmotion/internal/controller"
-	"github.com/podmotion-io/podmotion/internal/controller/spotreclaim"
 	agentclient "github.com/podmotion-io/podmotion/internal/agent/client"
 	agenttls "github.com/podmotion-io/podmotion/internal/agent/tls"
 	"github.com/podmotion-io/podmotion/internal/agent/traffic"
+	"github.com/podmotion-io/podmotion/internal/controller"
+	"github.com/podmotion-io/podmotion/internal/controller/spotreclaim"
 	"github.com/podmotion-io/podmotion/internal/estimation"
 	"github.com/podmotion-io/podmotion/internal/rollback"
 	pmwebhook "github.com/podmotion-io/podmotion/internal/webhook"
@@ -201,7 +201,7 @@ func main() {
 		setupLog.Error(err, "Failed to load agent client TLS config")
 		os.Exit(1)
 	}
-	agentPool := agentclient.NewAgentClientPool("9090", agentTLSCfg)
+	agentPool := agentclient.NewAgentClientPool(mgr.GetClient(), "9090", agentTLSCfg)
 
 	// AWSLBStubVerifier is used until a real AWS cluster is available (M9 live PoC).
 	// Replace with AWSLoadBalancerVerifier + TargetGroupDiscovery when running on AWS.
