@@ -21,7 +21,7 @@ Living catalogue of all planned and implemented features. Updated as features ar
 |---------|-----------|--------|-----|--------------|
 | Cold migration (checkpoint → OCI image → restore) | M3 | 🔲 Planned | — | 0A, 1, 7 |
 | Iterative pre-copy (multi-round dirty page convergence) | M5 | 🔲 Planned | — | 1 |
-| Post-copy / lazy-pages mode | M13 | 🔲 Planned | — | 1 |
+| Post-copy / lazy-pages mode | M13 | 🔨 In Progress | ADR-0031 | 1 |
 | Dry-run estimation (dirty page sampling, no pod impact) | M2 | 🔲 Planned | — | 0A, 1 |
 | Rollback on failure (unfreeze source pod) | M2 | 🔲 Planned | — | 0A, 4 |
 | Migration bandwidth throttling | M4 | 🔲 Planned | — | 7 |

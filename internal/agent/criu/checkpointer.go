@@ -70,6 +70,10 @@ type DumpOptions struct {
 	ImagesDir     string
 	PrevImagesDir string // last pre-dump dir; empty for cold migration
 	LeaveRunning  bool   // keep process running after dump (not valid for final freeze)
+	// LazyPages enables --lazy-pages in the CRIU dump invocation (post-copy mode).
+	// When true, CRIU writes lazy-pages metadata into ImagesDir so the lazy-pages
+	// daemon can serve on-demand page faults from the destination.
+	LazyPages bool
 }
 
 // RestoreOptions configures CRIU restore on the destination node.
@@ -81,6 +85,10 @@ type RestoreOptions struct {
 	BundleDir string
 	// Detached restores the process tree detached from CRIU (normal production mode).
 	Detached bool
+	// LazyPagesServerAddr is the "host:port" of the source lazy-pages daemon.
+	// Non-empty signals CRIU to use --lazy-pages and connect back to the source for
+	// on-demand page faults. Only set in PostCopy mode.
+	LazyPagesServerAddr string
 }
 
 // Checkpointer is the interface Agent 1 exposes to the orchestration layer.

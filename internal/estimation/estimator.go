@@ -97,6 +97,26 @@ func (e *DefaultEstimator) Estimate(
 		return nil, fmt.Errorf("dirty page probe failed: %w", err)
 	}
 
+	// PostCopy: restore starts immediately with a minimal page set; there is no
+	// freeze window for the initial dump (the lazy dump itself is async).
+	// Total migration time is dominated by RSS transfer over the lazy-pages channel.
+	if spec.Mode == pmv1.MigrationModePostCopy {
+		bandwidth := estimateBandwidthMbps(spec, nmc)
+		totalMs := int64(0)
+		if bandwidth > 0 {
+			totalMs = int64((probe.RSSMb / bandwidth) * 1000)
+		}
+		est.EstimatedFreezeDurationMs = 0 // no freeze window in post-copy (ADR-0031)
+		est.DirtyPageRateMBps = strconv.FormatFloat(0, 'f', 2, 64)
+		est.Migratable = true
+		if totalMs > 30000 {
+			est.BlockingReason = fmt.Sprintf(
+				"post-copy estimated transfer time %dms; large RSS may cause prolonged page-fault latency",
+				totalMs)
+		}
+		return est, nil
+	}
+
 	// Compute predicted freeze duration.
 	// Model: freeze_ms ≈ dirty_pages_mb / bandwidth_mbps * 1000
 	// where bandwidth_mbps is capped by spec.BandwidthLimitMbps (0 = estimate from NMC).
