@@ -37,6 +37,8 @@ import (
 
 	migrationv1alpha1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	"github.com/podmotion-io/podmotion/internal/controller"
+	agentclient "github.com/podmotion-io/podmotion/internal/agent/client"
+	agenttls "github.com/podmotion-io/podmotion/internal/agent/tls"
 	"github.com/podmotion-io/podmotion/internal/estimation"
 	"github.com/podmotion-io/podmotion/internal/rollback"
 	pmwebhook "github.com/podmotion-io/podmotion/internal/webhook"
@@ -181,6 +183,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Build mTLS client config for operator→agent calls.
+	// Falls back to insecure when certs are absent (dev/kind environment).
+	agentTLSCfg, err := agenttls.LoadClientConfig(
+		agenttls.DefaultCertFile,
+		agenttls.DefaultKeyFile,
+		agenttls.DefaultCAFile,
+	)
+	if err != nil {
+		setupLog.Error(err, "Failed to load agent client TLS config")
+		os.Exit(1)
+	}
+	agentPool := agentclient.NewAgentClientPool("9090", agentTLSCfg)
+
 	if err := (&controller.PodMigrationReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -188,6 +203,7 @@ func main() {
 			Prober: &estimation.StubProber{},
 		},
 		Rollbacker: rollback.NewStubRollbacker(),
+		AgentPool:  agentPool,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "podmigration")
 		os.Exit(1)

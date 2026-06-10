@@ -23,8 +23,10 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	agentclient "github.com/podmotion-io/podmotion/internal/agent/client"
 	"github.com/podmotion-io/podmotion/internal/estimation"
 	"github.com/podmotion-io/podmotion/internal/rollback"
+	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 )
 
 const (
@@ -43,9 +45,12 @@ const (
 // PodMigrationReconciler reconciles a PodMigration object.
 type PodMigrationReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
-	Estimator  estimation.Estimator
-	Rollbacker rollback.Rollbacker
+	Scheme      *runtime.Scheme
+	Estimator   estimation.Estimator
+	Rollbacker  rollback.Rollbacker
+	// AgentPool provides per-node gRPC connections to podmotion-agent DaemonSet pods.
+	// Nil in unit tests — phase handlers skip gRPC calls when nil.
+	AgentPool   *agentclient.AgentClientPool
 }
 
 // +kubebuilder:rbac:groups=migration.podmotion.io,resources=podmigrations,verbs=get;list;watch;create;update;patch;delete
@@ -204,21 +209,72 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 }
 
 func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
-	// Agent 1 (CRIU) drives the actual checkpoint. This controller watches for the
-	// Checkpointed condition to become True (agent sets it) then advances phase.
-	// If the agent reports failure via condition, we roll back.
-	checkpointed := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionCheckpointed)
-	if checkpointed {
-		setCondition(pm, conditionCheckpointed, metav1.ConditionTrue, "Checkpointed", "Checkpoint captured")
+	log := logf.FromContext(ctx)
+
+	// Fast-path: if the Checkpointed condition was already set True (e.g. agent called back
+	// directly or we are re-entering after a controller restart), advance immediately.
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionCheckpointed) {
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseTransferring)
 	}
 
+	// Check for a prior CheckpointFailed signal before issuing a fresh call.
 	condFailed := meta.FindStatusCondition(pm.Status.Conditions, conditionCheckpointed)
 	if condFailed != nil && condFailed.Status == metav1.ConditionFalse && condFailed.Reason == "CheckpointFailed" {
 		return r.initiateRollback(ctx, pm, condFailed.Message)
 	}
 
-	return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	// Drive the checkpoint via the agent gRPC client if the pool is wired.
+	if r.AgentPool == nil {
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	sourceNode := pm.Status.SourceNodeName
+	if sourceNode == "" {
+		pod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+		if err != nil {
+			return r.failMigration(ctx, pm, fmt.Sprintf("checkpoint: source pod not found: %v", err))
+		}
+		sourceNode = pod.Spec.NodeName
+		pm.Status.SourceNodeName = sourceNode
+	}
+
+	agentClient, err := r.AgentPool.ForNode(ctx, sourceNode)
+	if err != nil {
+		log.Error(err, "Failed to connect to source agent", "node", sourceNode)
+		setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CheckpointFailed",
+			fmt.Sprintf("agent connection failed: %v", err))
+		return ctrl.Result{}, r.Status().Update(ctx, pm)
+	}
+
+	// Step 1: PrepareSource — verify the pod is still migratable.
+	prepResp, err := agentClient.PrepareSource(ctx, &agentpb.PrepareSourceRequest{
+		PodName:       pm.Spec.PodName,
+		PodNamespace:  pm.Spec.PodNamespace,
+		MigrationName: pm.Name,
+	})
+	if err != nil || (prepResp != nil && !prepResp.Compatible) {
+		reason := "agent PrepareSource failed"
+		if prepResp != nil && prepResp.BlockingReason != "" {
+			reason = prepResp.BlockingReason
+		}
+		if err != nil {
+			reason = err.Error()
+		}
+		setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CheckpointFailed", reason)
+		return ctrl.Result{}, r.Status().Update(ctx, pm)
+	}
+
+	// Step 2: Checkpoint — freeze and dump.
+	_, err = agentClient.Checkpoint(ctx, &agentpb.CheckpointRequest{
+		MigrationName: pm.Name,
+	})
+	if err != nil {
+		setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CheckpointFailed", err.Error())
+		return ctrl.Result{}, r.Status().Update(ctx, pm)
+	}
+
+	setCondition(pm, conditionCheckpointed, metav1.ConditionTrue, "Checkpointed", "Checkpoint captured by agent")
+	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseTransferring)
 }
 
 func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
@@ -230,9 +286,9 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 }
 
 func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
-	// Agent 1 drives restore on the destination node. Watches for Restored condition.
-	restored := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionRestored)
-	if restored {
+	log := logf.FromContext(ctx)
+
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionRestored) {
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseVerifying)
 	}
 
@@ -244,7 +300,49 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 		return r.failMigration(ctx, pm, condFailed.Message)
 	}
 
-	return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	if r.AgentPool == nil {
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	destNode := pm.Status.DestinationNodeName
+	if destNode == "" {
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	checkpointRef := ""
+	if pm.Status.CheckpointRef != nil {
+		checkpointRef = pm.Status.CheckpointRef.Name
+	}
+
+	agentClient, err := r.AgentPool.ForNode(ctx, destNode)
+	if err != nil {
+		log.Error(err, "Failed to connect to destination agent", "node", destNode)
+		setCondition(pm, conditionRestored, metav1.ConditionFalse, "RestoreFailed",
+			fmt.Sprintf("agent connection failed: %v", err))
+		return ctrl.Result{}, r.Status().Update(ctx, pm)
+	}
+
+	restoreResp, err := agentClient.Restore(ctx, &agentpb.RestoreRequest{
+		MigrationName: pm.Name,
+		CheckpointRef: checkpointRef,
+		SourceNodeAddr: pm.Status.SourceNodeName,
+	})
+	if err != nil || (restoreResp != nil && !restoreResp.Success) {
+		msg := "restore RPC failed"
+		if err != nil {
+			msg = err.Error()
+		} else if restoreResp != nil {
+			msg = restoreResp.ErrorMessage
+		}
+		setCondition(pm, conditionRestored, metav1.ConditionFalse, "RestoreFailed", msg)
+		if pm.Spec.RollbackOnFailure {
+			return r.initiateRollback(ctx, pm, msg)
+		}
+		return ctrl.Result{}, r.Status().Update(ctx, pm)
+	}
+
+	setCondition(pm, conditionRestored, metav1.ConditionTrue, "Restored", "Container restored by agent")
+	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseVerifying)
 }
 
 func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
