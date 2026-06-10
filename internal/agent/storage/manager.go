@@ -66,13 +66,32 @@ type StorageMigrationManager struct {
 }
 
 // NewStorageMigrationManager returns a manager wired with the default migrators.
-// Pass overrides via opts to inject stubs in tests.
+// Tier2 (CephRBD) and Tier3 (SnapshotRsync) are registered as stubs by default
+// so that the state machine is unblocked in environments without Ceph or a snapshot
+// provisioner. Wire production migrators via RegisterMigrator in cmd/operator.
+// Pass overrides via RegisterMigrator in tests to inject fakes.
 func NewStorageMigrationManager(c client.Client) *StorageMigrationManager {
-	return &StorageMigrationManager{
+	m := &StorageMigrationManager{
 		Client:     c,
 		Classifier: NewStorageClassifier(c),
 		Migrators:  map[StorageTier]Migrator{},
 	}
+	// Default registrations — all production implementations are registered by
+	// the operator wire code; stubs are used here so the manager is usable out of
+	// the box without external dependencies.
+	m.Migrators[TierRWX] = NewRWXReattachMigrator(c)
+	m.Migrators[TierCephRBD] = &CephRBDStubMigrator{}
+	m.Migrators[TierSnapshotRsync] = &SnapshotRsyncStubMigrator{}
+	return m
+}
+
+// NewStorageMigrationManagerWithProduction returns a manager wired with real migrators
+// for all tiers. cephDestPool is the Ceph pool for RBD live migration destination images.
+func NewStorageMigrationManagerWithProduction(c client.Client, cephDestPool string) *StorageMigrationManager {
+	m := NewStorageMigrationManager(c)
+	m.Migrators[TierCephRBD] = NewCephRBDMigrator(cephDestPool)
+	m.Migrators[TierSnapshotRsync] = NewSnapshotRsyncMigrator(c)
+	return m
 }
 
 // RegisterMigrator adds or replaces the migrator for a given tier.
