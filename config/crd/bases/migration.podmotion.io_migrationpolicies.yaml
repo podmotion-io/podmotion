@@ -173,6 +173,16 @@ spec:
                 - podName
                 - podNamespace
                 type: object
+              safeOrdinalParallelism:
+                default: 1
+                description: |-
+                  SafeOrdinalParallelism controls how many StatefulSet ordinals may be migrated
+                  simultaneously. Must be ≥1. Non-adjacent constraint is still enforced regardless
+                  of this value; setting it >1 is only useful for large StatefulSets where
+                  non-adjacent pairs exist.
+                format: int32
+                minimum: 1
+                type: integer
               selector:
                 description: Selector selects pods this policy applies to.
                 properties:
@@ -217,6 +227,24 @@ spec:
                       map is equivalent to an element of matchExpressions, whose key field is "key", the
                       operator is "In", and the values array contains only "value". The requirements are ANDed.
                     type: object
+                type: object
+                x-kubernetes-map-type: atomic
+              statefulSetRef:
+                description: |-
+                  StatefulSetRef, when set, targets all pods in the named StatefulSet for migration.
+                  The StatefulSetMigrationOrchestrator is used instead of single-pod migration,
+                  enforcing ordinal ordering and quorum safety (ADR-0033).
+                  Mutually exclusive with Selector-driven single-pod migration when set.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
                 type: object
                 x-kubernetes-map-type: atomic
               triggers:

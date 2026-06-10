@@ -8,6 +8,7 @@ you may not use this file except in compliance with the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -72,6 +73,22 @@ type MigrationPolicySpec struct {
 	// BlockedNamespaces lists namespaces this policy will never target, regardless of selector.
 	// +optional
 	BlockedNamespaces []string `json:"blockedNamespaces,omitempty"`
+
+	// StatefulSetRef, when set, targets all pods in the named StatefulSet for migration.
+	// The StatefulSetMigrationOrchestrator is used instead of single-pod migration,
+	// enforcing ordinal ordering and quorum safety (ADR-0033).
+	// Mutually exclusive with Selector-driven single-pod migration when set.
+	// +optional
+	StatefulSetRef *corev1.LocalObjectReference `json:"statefulSetRef,omitempty"`
+
+	// SafeOrdinalParallelism controls how many StatefulSet ordinals may be migrated
+	// simultaneously. Must be ≥1. Non-adjacent constraint is still enforced regardless
+	// of this value; setting it >1 is only useful for large StatefulSets where
+	// non-adjacent pairs exist.
+	// +optional
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	SafeOrdinalParallelism int32 `json:"safeOrdinalParallelism,omitempty"`
 }
 
 // MigrationPolicyStatus defines the observed state of MigrationPolicy.

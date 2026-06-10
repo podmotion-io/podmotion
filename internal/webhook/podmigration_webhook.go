@@ -269,7 +269,8 @@ func (d *PodMigrationDefaulter) Handle(ctx context.Context, req admission.Reques
 	)
 }
 
-// applyDefaults sets missing spec fields and handles the networkContinuity downgrade.
+// applyDefaults sets missing spec fields, handles the networkContinuity downgrade,
+// and annotates solo StatefulSet pod migrations that bypass the orchestrator.
 func (d *PodMigrationDefaulter) applyDefaults(ctx context.Context, pm *pmv1.PodMigration) {
 	if pm.Spec.Mode == "" {
 		pm.Spec.Mode = pmv1.MigrationModePreCopy
@@ -285,6 +286,23 @@ func (d *PodMigrationDefaulter) applyDefaults(ctx context.Context, pm *pmv1.PodM
 	}
 	if pm.Spec.StorageStrategy == "" {
 		pm.Spec.StorageStrategy = pmv1.StorageStrategyAuto
+	}
+
+	// StatefulSet ordinal-safety warning: if the pod belongs to a StatefulSet but this
+	// migration was not created by a MigrationPolicy with statefulSetRef (i.e., no
+	// orchestrator is managing it), annotate with a warning. We check for the
+	// migration.podmotion.io/statefulset label which the orchestrator sets.
+	if pod, err := d.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName); err == nil {
+		if ownerRef := statefulSetOwnerRef(pod); ownerRef != "" {
+			if pm.Labels == nil || pm.Labels["migration.podmotion.io/statefulset"] == "" {
+				if pm.Annotations == nil {
+					pm.Annotations = make(map[string]string)
+				}
+				pm.Annotations["podmotion.io/statefulset-ordinal-safety-warning"] = fmt.Sprintf(
+					"pod %q belongs to StatefulSet %q but no StatefulSet orchestrator is managing this migration; ordinal safety is not guaranteed",
+					pm.Spec.PodName, ownerRef)
+			}
+		}
 	}
 
 	// Rule 8: networkContinuity downgrade — if requested but CNI doesn't support IP mobility,
@@ -306,10 +324,26 @@ func (d *PodMigrationDefaulter) applyDefaults(ctx context.Context, pm *pmv1.PodM
 	}
 }
 
+func (d *PodMigrationDefaulter) getPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
+	pod := &corev1.Pod{}
+	err := d.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, pod)
+	return pod, err
+}
+
 func (d *PodMigrationDefaulter) getNMC(ctx context.Context, nodeName string) (*pmv1.NodeMigrationCapacity, error) {
 	nmc := &pmv1.NodeMigrationCapacity{}
 	err := d.client.Get(ctx, client.ObjectKey{Name: nodeName}, nmc)
 	return nmc, err
+}
+
+// statefulSetOwnerRef returns the StatefulSet name if the pod is owned by one, else "".
+func statefulSetOwnerRef(pod *corev1.Pod) string {
+	for _, ref := range pod.OwnerReferences {
+		if ref.Kind == "StatefulSet" {
+			return ref.Name
+		}
+	}
+	return ""
 }
 
 // mustMarshal marshals obj to JSON using the runtime codec; panics on error (should never happen).
