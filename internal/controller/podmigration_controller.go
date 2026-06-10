@@ -13,6 +13,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -47,6 +48,7 @@ const (
 	conditionStorageReady       = "StorageReadyForFreeze"
 	conditionNetworkBridgeArmed = "NetworkBridgeArmed"
 	conditionPDBToken           = "PDBTokenAcquired"
+	conditionSourcePodDeleted   = "SourcePodDeleted"
 )
 
 // PodMigrationReconciler reconciles a PodMigration object.
@@ -490,41 +492,52 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 	// Agent 12 (traffic) drives readiness + traffic verification. Watches TrafficVerified.
 	// ADR-0019: if verification fails AFTER handoff, warn only — do not rollback.
 	trafficVerified := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionTrafficVerified)
-	if trafficVerified {
-		now := metav1.Now()
-		pm.Status.CompletionTime = &now
-		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseComplete)
-	}
-
-	// Drive verification: call the TrafficVerifier and set the condition.
-	if r.TrafficVerifier != nil {
-		req := traffic.VerifyRequest{
-			Namespace:    pm.Spec.PodNamespace,
-			DestNodeName: pm.Status.DestinationNodeName,
-			DestPodName:  pm.Spec.PodName,
+	if !trafficVerified {
+		// Drive verification: call the TrafficVerifier and set the condition.
+		if r.TrafficVerifier != nil {
+			req := traffic.VerifyRequest{
+				Namespace:    pm.Spec.PodNamespace,
+				DestNodeName: pm.Status.DestinationNodeName,
+				DestPodName:  pm.Spec.PodName,
+			}
+			if err := r.TrafficVerifier.Verify(ctx, req); err != nil {
+				// ADR-0019: warn only — do not rollback after handoff.
+				log.Info("traffic verification failed (warn-only, ADR-0019)", "migration", pm.Name, "err", err)
+			}
+			// Set TrafficVerified=True regardless — StubVerifier always passes; real verifier
+			// failures are warn-only per ADR-0019.
+			setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "TrafficVerified",
+				"Traffic verified (or warn-only override per ADR-0019)")
+		} else {
+			// No verifier wired — skip and advance immediately.
+			log.Info("TrafficVerifier not wired; skipping verification", "migration", pm.Name)
+			setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "TrafficVerified", "Skipped: no verifier wired")
 		}
-		if err := r.TrafficVerifier.Verify(ctx, req); err != nil {
-			// ADR-0019: warn only — do not rollback after handoff.
-			log.Info("traffic verification failed (warn-only, ADR-0019)", "migration", pm.Name, "err", err)
-		}
-		// Set TrafficVerified=True regardless — StubVerifier always passes; real verifier
-		// failures are warn-only per ADR-0019.
-		setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "TrafficVerified",
-			"Traffic verified (or warn-only override per ADR-0019)")
 		if err := r.Status().Update(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
-		now := metav1.Now()
-		pm.Status.CompletionTime = &now
-		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseComplete)
 	}
 
-	// No verifier wired — skip and advance immediately.
-	log.Info("TrafficVerifier not wired; skipping verification", "migration", pm.Name)
-	setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "TrafficVerified", "Skipped: no verifier wired")
-	if err := r.Status().Update(ctx, pm); err != nil {
-		return ctrl.Result{}, err
+	// ADR-0040: delete source pod now that TrafficVerified=true (ADR-0012 gate satisfied).
+	sourcePod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+	if err == nil {
+		// Only delete if pod is still on the source node (not already gone or rescheduled).
+		if sourcePod.Spec.NodeName == pm.Status.SourceNodeName {
+			log.Info("deleting source pod post-TrafficVerified",
+				"pod", pm.Spec.PodName,
+				"node", pm.Status.SourceNodeName,
+				"migration", pm.Name)
+			if deleteErr := r.Delete(ctx, sourcePod); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+				log.Error(deleteErr, "failed to delete source pod — proceeding to Complete anyway (ADR-0019)")
+				// ADR-0019: warn only, do not fail the migration.
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		log.Error(err, "could not look up source pod — skipping deletion")
 	}
+	// If IsNotFound — already deleted, that is fine.
+
+	setCondition(pm, conditionSourcePodDeleted, metav1.ConditionTrue, "Deleted", "Source pod deleted post-TrafficVerified")
 	now := metav1.Now()
 	pm.Status.CompletionTime = &now
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseComplete)
