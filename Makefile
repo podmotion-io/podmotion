@@ -43,6 +43,16 @@ help: ## Display this help.
 
 ##@ Development
 
+.PHONY: proto
+proto: ## Generate Go bindings from proto/migration_agent.proto using protoc.
+	PATH=$(PATH):$(GOBIN) protoc \
+		--go_out=proto/gen \
+		--go_opt=paths=source_relative \
+		--go-grpc_out=proto/gen \
+		--go-grpc_opt=paths=source_relative \
+		-I proto \
+		proto/migration_agent.proto
+
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases

@@ -106,7 +106,7 @@ func (s *AgentServer) PreDumpRound(_ context.Context, req *agentpb.PreDumpRoundR
 		return nil, err
 	}
 	return &agentpb.PreDumpRoundResponse{
-		DirtyPagesMB:    result.DirtyPagesMB,
+		DirtyPagesMb:    result.DirtyPagesMB,
 		RoundDurationMs: result.FreezeDurationMs,
 		// Convergence threshold: < 64 MB dirty qualifies as "good enough to freeze" (ADR-0011).
 		ThresholdReached: result.DirtyPagesMB < 64,
@@ -124,7 +124,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 	return &agentpb.CheckpointResponse{
 		FreezeDurationMs: result.FreezeDurationMs,
 		// SHA256 populated by real CRIU checkpointer in M5.
-		CheckpointSHA256: "",
+		CheckpointSha256: "",
 	}, nil
 }
 
@@ -133,7 +133,7 @@ func (s *AgentServer) PrepareDestination(_ context.Context, req *agentpb.Prepare
 	// M4: stub — cgroup/netns setup wired in M5.
 	return &agentpb.PrepareDestinationResponse{
 		Ready:        true,
-		IPReserved:   true,
+		IpReserved:   true,
 		StorageReady: true,
 	}, nil
 }
@@ -184,9 +184,9 @@ func (s *AgentServer) EstimateCheckpoint(ctx context.Context, req *agentpb.Estim
 	if err != nil {
 		log.Error(err, "EstimateCheckpoint pre-dump failed — falling back to stub values")
 		return &agentpb.EstimateCheckpointResponse{
-			DirtyPageRateMBPerSec:     32.0,
+			DirtyPageRateMbPerSec:     32.0,
 			EstimatedFreezeDurationMs: 150,
-			EstimatedCheckpointSizeMB: 512,
+			EstimatedCheckpointSizeMb: 512,
 			StorageTier:               1,
 			Migratable:                true,
 		}, nil
@@ -206,9 +206,9 @@ func (s *AgentServer) EstimateCheckpoint(ctx context.Context, req *agentpb.Estim
 	}
 
 	return &agentpb.EstimateCheckpointResponse{
-		DirtyPageRateMBPerSec:     rateMBps,
+		DirtyPageRateMbPerSec:     rateMBps,
 		EstimatedFreezeDurationMs: freezeMs,
-		EstimatedCheckpointSizeMB: result.DirtyPagesMB,
+		EstimatedCheckpointSizeMb: result.DirtyPagesMB,
 		StorageTier:               1,
 		Migratable:                true,
 	}, nil
