@@ -1,0 +1,208 @@
+// Package orchestration defines the inter-agent interface contracts for PodMotion.
+// All pipelines communicate through this package — domain agents never import each other.
+// See ADR-0008 (orchestration owns interfaces) and ADR-0016 (gate runner order).
+package orchestration
+
+import (
+	"context"
+	"time"
+
+	migrationv1alpha1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
+)
+
+// GateOutcome is the result of a single readiness gate check.
+// +kubebuilder:validation:Enum=Pass;Warn;DegradeMode;Block
+type GateOutcome string
+
+const (
+	GateOutcomePass        GateOutcome = "Pass"
+	GateOutcomeWarn        GateOutcome = "Warn"
+	GateOutcomeDegradeMode GateOutcome = "DegradeMode" // migration proceeds in degraded mode
+	GateOutcomeBlock       GateOutcome = "Block"       // hard stop — migration cannot proceed
+)
+
+// GateCategory groups gates by execution cost (see ADR-0016).
+type GateCategory string
+
+const (
+	GateCategoryNode    GateCategory = "Node"    // microseconds — CR reads
+	GateCategoryCompute GateCategory = "Compute" // 2-10s — CRIU probe + /proc
+	GateCategoryNetwork GateCategory = "Network" // up to 10s — gRPC pings + CNI API
+	GateCategoryStorage GateCategory = "Storage" // up to 30s — Ceph/Longhorn API
+)
+
+// GateResult is the result of evaluating a single gate.
+type GateResult struct {
+	GateID    string
+	Outcome   GateOutcome
+	Message   string
+	Checked   time.Time
+	// Degraded fields are set when Outcome==DegradeMode.
+	DegradedMigrationMode    migrationv1alpha1.MigrationMode
+	DegradedNetworkTier      string
+}
+
+// Gate is the interface every readiness gate must implement.
+// Domain agents register their gates with the GateRunner at startup.
+type Gate interface {
+	// ID returns a stable identifier for this gate (e.g. "CG-01-CRIU-VERSION").
+	ID() string
+	// Category determines execution ordering and cost class.
+	Category() GateCategory
+	// Check evaluates the gate for the given pod, source node, and destination node.
+	// Must be context-aware — respect cancellation.
+	Check(ctx context.Context, pod *corev1.Pod, sourceNode, destNode string) GateResult
+}
+
+// GateSummary is the aggregated result of running all gates.
+type GateSummary struct {
+	Results              []GateResult
+	Blocked              bool
+	BlockingGateID       string
+	BlockingReason       string
+	ResolvedMigrationMode migrationv1alpha1.MigrationMode
+	ResolvedNetworkTier  string // TIER_1_FULL | TIER_2_BRIEF_DISRUPTION | TIER_3_GRACEFUL_DRAIN | TIER_4_COLD_MIGRATION
+	ResolvedStorageTier  int32  // 0-4
+}
+
+// GateRunner executes all registered gates in category order with intra-category parallelism.
+// See ADR-0016 for execution order rationale.
+type GateRunner interface {
+	Register(gates ...Gate)
+	Run(ctx context.Context, pod *corev1.Pod, sourceNode, destNode string) GateSummary
+}
+
+// ─── Pipeline interfaces ─────────────────────────────────────────────────────
+// See ADR-0011 (two-pipeline model) and ADR-0014 (rollback order).
+
+// PipelinePhase is a named phase within a pipeline for crash-safe persistence.
+// See ADR-0018 (phase persistence).
+type PipelinePhase string
+
+// ComputePipeline is implemented by Agent 1 (CRIU primitives) and Agent 11 (replication loop).
+// It owns the memory migration path: iterative pre-copy, freeze, transfer, restore, verify.
+type ComputePipeline interface {
+	// Checkpoint runs iterative pre-copy rounds then performs final freeze + dump.
+	// Writes pipelineConditions: ComputePreCopyComplete, ComputeFrozen.
+	Checkpoint(ctx context.Context, opts CheckpointOptions) (CheckpointResult, error)
+	// Transfer copies the checkpoint artifact to the destination node.
+	// Writes pipelineCondition: CheckpointTransferred.
+	Transfer(ctx context.Context, opts TransferOptions) error
+	// Restore performs CRIU restore on the destination node.
+	// Writes pipelineCondition: ComputeRestored.
+	Restore(ctx context.Context, opts RestoreOptions) error
+	// Verify checks that the restored pod is healthy.
+	// On failure after Handoff: Warn only (ADR-0019).
+	Verify(ctx context.Context, podName, namespace string) error
+	// Rollback unfreezes/restarts the source pod. Idempotent.
+	Rollback(ctx context.Context) error
+}
+
+// StoragePipeline is implemented by Agent 3.
+// It owns the PVC data migration path, independent of compute (ADR-0011).
+type StoragePipeline interface {
+	// PreStage begins the async storage mirror (tier-dependent).
+	// Tier 0: no-op. Tier 1: Longhorn dual-engine. Tier 2: rbd migrate. Tier 3: snapshot+rsync.
+	// Returns immediately; progress reported via SyncStatus channel.
+	PreStage(ctx context.Context) (<-chan SyncStatus, error)
+	// Sync flushes the final dirty delta after compute freeze.
+	Sync(ctx context.Context, targetPercent float64) error
+	// Cutover performs the atomic PV binding flip to the destination.
+	// Writes pipelineCondition: StorageCutoverComplete.
+	Cutover(ctx context.Context) error
+	// Cleanup removes source-side mirror artifacts. Non-fatal if it fails — retried via finalizer.
+	Cleanup(ctx context.Context) error
+	// Rollback abandons the mirror and restores source PV binding. Idempotent.
+	Rollback(ctx context.Context) error
+}
+
+// NetworkPipeline is implemented by Agent 2 (v0.2+; v0.1 is TIER_4 no-op).
+type NetworkPipeline interface {
+	// ArmBridge begins async GENEVE tunnel and IP mobility preparation.
+	// Returns immediately; status reported via BridgeStatus channel.
+	ArmBridge(ctx context.Context) (<-chan BridgeStatus, error)
+	// Handoff updates routing rules (gARP / BGP / CNI API) so traffic reaches destination.
+	// Writes pipelineCondition: NetworkHandoffComplete.
+	Handoff(ctx context.Context) error
+	// Teardown removes source-side bridge entries. Non-fatal — retried via finalizer.
+	Teardown(ctx context.Context) error
+	// Rollback restores source-side routing. Must run BEFORE compute rollback (ADR-0014).
+	Rollback(ctx context.Context) error
+}
+
+// TrafficPipeline is implemented by Agent 12.
+type TrafficPipeline interface {
+	// PrepareEndpoints adds the new pod IP to EndpointSlices before removing the old one.
+	PrepareEndpoints(ctx context.Context) error
+	// Verify waits for traffic to arrive at the new pod (eBPF counter / ALB health / metrics / hook).
+	// Returns when TrafficVerified=true or timeoutSeconds exceeded.
+	Verify(ctx context.Context, timeoutSeconds int32) error
+	// DrainOld stops new connections to the source pod; lets in-flight complete up to drainSeconds.
+	DrainOld(ctx context.Context, drainSeconds int32) error
+	// DeregisterOld removes the old node from external LB target groups (AWS ALB/NLB).
+	DeregisterOld(ctx context.Context) error
+}
+
+// ─── Supporting types ────────────────────────────────────────────────────────
+
+type CheckpointOptions struct {
+	MigrationName        string
+	MaxRounds            int32
+	DirtyThresholdMB     int32
+	BandwidthLimitMbps   int32
+	UseTCPRepair         bool // v0.2+
+}
+
+type CheckpointResult struct {
+	RoundsCompleted  int32
+	FinalDirtyPagesMB int32
+	FreezeDurationMs  int64
+	CheckpointSHA256  string
+	CheckpointSizeBytes int64
+}
+
+type TransferOptions struct {
+	Mode          string // DirectP2P | Registry
+	DestNodeAddr  string
+	RegistryRef   string
+	BandwidthMbps int32
+}
+
+type RestoreOptions struct {
+	CheckpointRef  string
+	DestNodeName   string
+	NetworkTier    string
+}
+
+type SyncStatus struct {
+	Tier             int32
+	Phase            string
+	SyncPercent      float64
+	BytesTotal       int64
+	BytesSynced      int64
+	EstimatedSecsLeft int32
+	Error            error
+}
+
+type BridgeStatus struct {
+	Armed bool
+	Error error
+	Mode  string // GENEVE | BGP | GARP | TIER4_NOOP
+}
+
+// CutoverCoordinator orchestrates the synchronized cutover across all three pipelines.
+// See ADR-0011. Owned by Agent 0A.
+type CutoverCoordinator interface {
+	// Coordinate blocks until all three pipeline gates are ready, then executes the
+	// synchronized freeze → storage cutover → network handoff → restore sequence.
+	Coordinate(ctx context.Context, opts CutoverOptions) error
+}
+
+type CutoverOptions struct {
+	SyncThresholdPercent float64 // default 95.0
+	FreezeTimeoutSeconds int32   // default 30
+	CutoverTimeoutSeconds int32  // default 120
+	StorageTier          int32
+	NetworkTier          string
+}

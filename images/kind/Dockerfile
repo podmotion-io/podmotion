@@ -1,12 +1,12 @@
 # PodMotion kind node image for local E2E testing.
-# Built on top of the upstream kind node image base.
-# Usage: docker build -t podmotion/kind-node:latest images/kind/
-#        kind create cluster --image podmotion/kind-node:latest
+# Built on top of the upstream kind node image.
+# Usage: make kind-node-image
+#        kind create cluster --config images/kind/kind-config.yaml
 
-ARG KIND_BASE=kindest/base:latest
+ARG KIND_BASE=kindest/node:v1.32.0
 FROM ${KIND_BASE}
 
-# Install CRIU and dependencies
+# Install CRIU and supporting tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     criu \
     bpftool \
@@ -16,17 +16,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
   && rm -rf /var/lib/apt/lists/*
 
-# Verify CRIU installed (may warn about missing kernel features inside Docker — expected)
-RUN criu --version
+# Verify CRIU installed (kernel feature warnings inside Docker are expected)
+RUN criu --version || true
 
-# Enable NRI in containerd config (appended; containerd config is finalized at cluster create time)
+# Create required directories
+RUN mkdir -p /etc/containerd/conf.d /usr/local/lib/nri
+
+# Enable NRI in containerd
 COPY nri.toml /etc/containerd/conf.d/nri.toml
 
-# bpffs mount unit
+# bpffs systemd mount unit
 COPY sys-fs-bpf.mount /etc/systemd/system/sys-fs-bpf.mount
 RUN systemctl enable sys-fs-bpf.mount 2>/dev/null || true
 
-# Placeholder agent binaries — replaced by 'make kind-load' during development
-COPY --chown=root:root podmotion-agent-placeholder /usr/local/bin/podmotion-agent
-COPY --chown=root:root podmotion-nri-placeholder /usr/local/lib/nri/podmotion-nri
-RUN chmod +x /usr/local/bin/podmotion-agent /usr/local/lib/nri/podmotion-nri
+# Stub agent binaries — replaced by 'make kind-load' once real binaries are built
+RUN touch /usr/local/bin/podmotion-agent \
+  && touch /usr/local/lib/nri/podmotion-nri \
+  && chmod +x /usr/local/bin/podmotion-agent /usr/local/lib/nri/podmotion-nri

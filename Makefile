@@ -257,3 +257,70 @@ endef
 define gomodver
 $(shell go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' $(1) 2>/dev/null)
 endef
+
+# ── PodMotion custom targets ──────────────────────────────────────────────────
+
+IMG_OPERATOR ?= podmotion/operator:dev
+IMG_AGENT    ?= podmotion/agent:dev
+KIND_NODE_IMG ?= podmotion/kind-node:dev
+KIND_CLUSTER  ?= podmotion-dev
+
+## kind-node-image: Build the custom kind node image with CRIU + NRI
+.PHONY: kind-node-image
+kind-node-image:
+	@echo "Staging node image build context..."
+	mkdir -p /tmp/podmotion-kind-ctx
+	cp images/kind/Dockerfile /tmp/podmotion-kind-ctx/Dockerfile
+	cp images/capi/ansible/roles/podmotion-node/files/nri.toml /tmp/podmotion-kind-ctx/nri.toml
+	cp images/capi/ansible/roles/podmotion-node/files/sys-fs-bpf.mount /tmp/podmotion-kind-ctx/sys-fs-bpf.mount
+	docker build -t $(KIND_NODE_IMG) /tmp/podmotion-kind-ctx
+
+## kind-create: Create the local development kind cluster (idempotent)
+.PHONY: kind-create
+kind-create:
+	kind get clusters | grep -q $(KIND_CLUSTER) || \
+	  kind create cluster --config images/kind/kind-config.yaml
+
+## kind-delete: Tear down the local development kind cluster
+.PHONY: kind-delete
+kind-delete:
+	kind delete cluster --name $(KIND_CLUSTER)
+
+## kind-load: Load operator and agent images into the kind cluster
+.PHONY: kind-load
+kind-load:
+	kind load docker-image $(IMG_OPERATOR) --name $(KIND_CLUSTER)
+	kind load docker-image $(IMG_AGENT) --name $(KIND_CLUSTER)
+
+## deploy: Apply manifests to current kubeconfig cluster
+.PHONY: deploy
+deploy: manifests
+	kubectl apply -k config/default
+
+## deploy-kind: Build images, load into kind, and deploy
+.PHONY: deploy-kind
+deploy-kind: docker-build kind-load deploy
+
+## webhook-certs-dev: Generate self-signed webhook TLS certs for local dev (no cert-manager needed)
+.PHONY: webhook-certs-dev
+webhook-certs-dev:
+	mkdir -p /tmp/podmotion-webhook-certs
+	openssl req -x509 -newkey rsa:4096 -keyout /tmp/podmotion-webhook-certs/tls.key \
+	  -out /tmp/podmotion-webhook-certs/tls.crt -days 365 -nodes \
+	  -subj "/CN=podmotion-webhook-service.podmotion-system.svc"
+	kubectl create secret tls podmotion-webhook-tls \
+	  --cert=/tmp/podmotion-webhook-certs/tls.crt \
+	  --key=/tmp/podmotion-webhook-certs/tls.key \
+	  --namespace=podmotion-system --dry-run=client -o yaml | kubectl apply -f -
+
+## proto-gen: Regenerate Go code from .proto files
+.PHONY: proto-gen
+proto-gen:
+	protoc --go_out=. --go_opt=paths=source_relative \
+	  --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+	  proto/migration_agent.proto
+
+## verify-kernel-config: Verify kernel config on the current node meets PodMotion requirements
+.PHONY: verify-kernel-config
+verify-kernel-config:
+	bash hack/verify-kernel-config.sh
