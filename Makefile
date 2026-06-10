@@ -275,15 +275,14 @@ IMG_AGENT    ?= podmotion/agent:dev
 KIND_NODE_IMG ?= podmotion/kind-node:dev
 KIND_CLUSTER  ?= podmotion-dev
 
-## kind-node-image: Build the custom kind node image with CRIU + NRI
+## kind-image: Build kind node image with CRIU and podmotion-agent
+.PHONY: kind-image
+kind-image:
+	docker build -f images/kind/Dockerfile -t podmotion-node:dev .
+
+## kind-node-image: Build the custom kind node image with CRIU + NRI (alias for kind-image)
 .PHONY: kind-node-image
-kind-node-image:
-	@echo "Staging node image build context..."
-	mkdir -p /tmp/podmotion-kind-ctx
-	cp images/kind/Dockerfile /tmp/podmotion-kind-ctx/Dockerfile
-	cp images/capi/ansible/roles/podmotion-node/files/nri.toml /tmp/podmotion-kind-ctx/nri.toml
-	cp images/capi/ansible/roles/podmotion-node/files/sys-fs-bpf.mount /tmp/podmotion-kind-ctx/sys-fs-bpf.mount
-	docker build -t $(KIND_NODE_IMG) /tmp/podmotion-kind-ctx
+kind-node-image: kind-image
 
 ## kind-create: Create the local development kind cluster (idempotent)
 .PHONY: kind-create
