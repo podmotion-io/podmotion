@@ -6,18 +6,31 @@
 ARG KIND_BASE=kindest/node:v1.32.0
 FROM ${KIND_BASE}
 
-# Install CRIU and supporting tools
+# Add CRIU PPA to get CRIU 4.x.
+# Ubuntu 22.04 universe ships CRIU 3.17 which is incompatible with go-criu v7.2
+# RPC protocol (requires 4.x). kindest/node:v1.32.0 is Ubuntu 22.04-based.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    ca-certificates \
+  && add-apt-repository -y ppa:criu/ppa \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install CRIU 4.x and supporting tools.
+# bpftool is provided via linux-tools-virtual on Ubuntu 22.04 (no standalone package).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     criu \
-    bpftool \
+    linux-tools-common \
+    linux-tools-virtual \
     iproute2 \
     buildah \
     skopeo \
     jq \
   && rm -rf /var/lib/apt/lists/*
 
-# Verify CRIU installed (kernel feature warnings inside Docker are expected)
-RUN criu --version || true
+# Verify CRIU 4.x is installed. Kernel feature warnings inside Docker are expected.
+# A version < 4.0 here means the PPA was not honoured — fail the build explicitly.
+RUN criu --version && criu --version | grep -qE "^Version: [4-9]\." || \
+    { echo "ERROR: CRIU < 4.0 installed. go-criu v7.2 requires CRIU 4.x RPC protocol."; exit 1; }
 
 # Create required directories
 RUN mkdir -p /etc/containerd/conf.d /usr/local/lib/nri
