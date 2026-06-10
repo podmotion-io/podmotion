@@ -1,0 +1,221 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: nodemigrationcapacities.migration.podmotion.io
+spec:
+  group: migration.podmotion.io
+  names:
+    categories:
+    - podmotion
+    kind: NodeMigrationCapacity
+    listKind: NodeMigrationCapacityList
+    plural: nodemigrationcapacities
+    shortNames:
+    - nmc
+    singular: nodemigrationcapacity
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.nodeName
+      name: Node
+      type: string
+    - jsonPath: .spec.criuVersion
+      name: CRIU
+      type: string
+    - jsonPath: .spec.networkCapability.ipMobilitySupported
+      name: IPMobility
+      type: boolean
+    - jsonPath: .status.ready
+      name: Ready
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          NodeMigrationCapacity is a cluster-scoped record advertising a node's migration capabilities.
+          One record per node, named after the node. Created and maintained by the podmotion-agent DaemonSet.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: NodeMigrationCapacitySpec is set by the node agent at startup
+              and updated periodically.
+            properties:
+              criuVersion:
+                description: CRIUVersion is the version of CRIU installed on the node
+                  (e.g. "4.2").
+                type: string
+              gpuDriverVersion:
+                description: GPUDriverVersion is the NVIDIA driver version if GPU
+                  migration is supported.
+                type: string
+              gpuMigrationSupported:
+                description: GPUMigrationSupported indicates NVIDIA cuda-checkpoint
+                  is available.
+                type: boolean
+              kernelFeatures:
+                description: KernelFeatures describes kernel capability flags verified
+                  at agent startup.
+                properties:
+                  bpfEnabled:
+                    description: BPFEnabled indicates CONFIG_BPF_SYSCALL is enabled
+                      (required for eBPF packet bridge).
+                    type: boolean
+                  checkpointRestore:
+                    description: CheckpointRestore indicates CONFIG_CHECKPOINT_RESTORE
+                      is enabled.
+                    type: boolean
+                  kernelVersion:
+                    description: KernelVersion is the full kernel version string reported
+                      by uname -r.
+                    type: string
+                  memSoftDirty:
+                    description: MemSoftDirty indicates CONFIG_MEM_SOFT_DIRTY is enabled
+                      (required for iterative pre-copy).
+                    type: boolean
+                  userfaultfd:
+                    description: Userfaultfd indicates CONFIG_USERFAULTFD is enabled
+                      (required for post-copy lazy pages).
+                    type: boolean
+                  xdpSupported:
+                    description: XDPSupported indicates XDP on veth is supported (kernel
+                      4.19+).
+                    type: boolean
+                required:
+                - bpfEnabled
+                - checkpointRestore
+                - kernelVersion
+                - memSoftDirty
+                - userfaultfd
+                - xdpSupported
+                type: object
+              maxConcurrentMigrationsDestination:
+                default: 2
+                description: MaxConcurrentMigrationsDestination is the maximum simultaneous
+                  migrations this node can receive.
+                format: int32
+                type: integer
+              maxConcurrentMigrationsSource:
+                default: 2
+                description: MaxConcurrentMigrationsSource is the maximum simultaneous
+                  migrations this node can serve as source.
+                format: int32
+                type: integer
+              networkCapability:
+                description: NetworkCapability describes network continuity support.
+                properties:
+                  cniPlugin:
+                    description: CNIPlugin is the detected primary CNI plugin (e.g.
+                      ovn-kubernetes, calico, cilium, flannel).
+                    type: string
+                  ipMobilityMode:
+                    description: IPMobilityMode describes the mechanism (e.g. IPAMClaim,
+                      BGPHostRoute, L2Announce).
+                    type: string
+                  ipMobilitySupported:
+                    description: IPMobilitySupported indicates the CNI can preserve
+                      pod IPs across node moves.
+                    type: boolean
+                  xdpBridgeCapable:
+                    description: XDPBridgeCapable indicates the node can run the XDP
+                      packet bridge program.
+                    type: boolean
+                required:
+                - cniPlugin
+                - ipMobilitySupported
+                - xdpBridgeCapable
+                type: object
+              nodeName:
+                description: NodeName is the Kubernetes node this capacity record
+                  describes.
+                type: string
+              nriEnabled:
+                description: NRIEnabled indicates containerd NRI is enabled on this
+                  node.
+                type: boolean
+              storageCapability:
+                description: StorageCapability describes supported storage migration
+                  tiers.
+                properties:
+                  cephRBDAvailable:
+                    description: CephRBDAvailable indicates the Ceph RBD live migration
+                      API is reachable.
+                    type: boolean
+                  localPVMigratable:
+                    description: LocalPVMigratable indicates pv-migrate rsync is available
+                      for local PV migration.
+                    type: boolean
+                  longhornAvailable:
+                    description: LonghornAvailable indicates Longhorn is deployed
+                      and the node hosts engine replicas.
+                    type: boolean
+                required:
+                - cephRBDAvailable
+                - localPVMigratable
+                - longhornAvailable
+                type: object
+            required:
+            - criuVersion
+            - kernelFeatures
+            - networkCapability
+            - nodeName
+            - nriEnabled
+            - storageCapability
+            type: object
+          status:
+            description: NodeMigrationCapacityStatus reflects real-time node state.
+            properties:
+              activeDestinationMigrations:
+                description: ActiveDestinationMigrations is the number of migrations
+                  currently targeting this node.
+                format: int32
+                type: integer
+              activeSourceMigrations:
+                description: ActiveSourceMigrations is the number of migrations currently
+                  sourced from this node.
+                format: int32
+                type: integer
+              lastHeartbeat:
+                description: LastHeartbeat is when the agent last updated this record.
+                format: date-time
+                type: string
+              ready:
+                description: Ready indicates the agent is running and all required
+                  features are available.
+                type: boolean
+              thermalThrottlePercent:
+                description: ThermalThrottlePercent is the current CPU thermal throttle
+                  percentage (0 = no throttling).
+                format: int32
+                type: integer
+            required:
+            - activeDestinationMigrations
+            - activeSourceMigrations
+            - ready
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

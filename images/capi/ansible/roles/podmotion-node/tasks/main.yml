@@ -1,0 +1,114 @@
+---
+# podmotion-node Ansible role
+# Applied on top of kubernetes-sigs/image-builder CAPI base image.
+# Installs CRIU, pins runc, enables NRI in containerd, configures bpffs, and bakes agent binaries.
+
+- name: Install CRIU and supporting tools
+  apt:
+    name:
+      - criu
+      - bpftool
+      - iproute2
+      - libnetfilter-queue-dev
+      - buildah
+      - skopeo
+      - jq
+    state: present
+    update_cache: true
+
+- name: Verify CRIU is functional
+  command: criu check --extra
+  register: criu_check
+  failed_when: criu_check.rc != 0
+
+- name: Verify kernel config — CHECKPOINT_RESTORE
+  shell: grep -q "CONFIG_CHECKPOINT_RESTORE=y" /boot/config-$(uname -r)
+  failed_when: false
+  register: kconfig_cr
+
+- name: Verify kernel config — MEM_SOFT_DIRTY
+  shell: grep -q "CONFIG_MEM_SOFT_DIRTY=y" /boot/config-$(uname -r)
+  failed_when: false
+  register: kconfig_msd
+
+- name: Verify kernel config — USERFAULTFD
+  shell: grep -q "CONFIG_USERFAULTFD=y" /boot/config-$(uname -r)
+  failed_when: false
+  register: kconfig_ufd
+
+- name: Warn on missing kernel configs
+  debug:
+    msg: "WARNING: kernel config {{ item.name }} is not set — some migration modes will be unavailable"
+  when: item.result.rc != 0
+  loop:
+    - { name: CONFIG_CHECKPOINT_RESTORE, result: "{{ kconfig_cr }}" }
+    - { name: CONFIG_MEM_SOFT_DIRTY,     result: "{{ kconfig_msd }}" }
+    - { name: CONFIG_USERFAULTFD,        result: "{{ kconfig_ufd }}" }
+
+- name: Install containerd NRI config snippet
+  copy:
+    src: nri.toml
+    dest: /etc/containerd/conf.d/nri.toml
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install bpffs systemd mount unit
+  copy:
+    src: sys-fs-bpf.mount
+    dest: /etc/systemd/system/sys-fs-bpf.mount
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable bpffs mount at boot
+  systemd:
+    name: sys-fs-bpf.mount
+    enabled: true
+    daemon_reload: true
+
+- name: Install podmotion-agent binary
+  copy:
+    src: podmotion-agent
+    dest: /usr/local/bin/podmotion-agent
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install podmotion-nri-plugin binary
+  copy:
+    src: podmotion-nri-plugin
+    dest: /usr/local/lib/nri/podmotion-nri
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install podmotion-agent systemd unit
+  copy:
+    content: |
+      [Unit]
+      Description=PodMotion Node Agent
+      After=network.target containerd.service
+      Requires=containerd.service
+
+      [Service]
+      ExecStart=/usr/local/bin/podmotion-agent \
+        --node-name=${NODE_NAME} \
+        --grpc-port=9090 \
+        --metrics-port=9091
+      Restart=always
+      RestartSec=5
+      Environment=NODE_NAME=
+
+      [Install]
+      WantedBy=multi-user.target
+    dest: /etc/systemd/system/podmotion-agent.service
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable podmotion-agent service
+  systemd:
+    name: podmotion-agent
+    enabled: true
+    daemon_reload: true

@@ -1,0 +1,13 @@
+[Unit]
+Description=BPF filesystem mount
+DefaultDependencies=no
+Before=containerd.service
+
+[Mount]
+What=bpffs
+Where=/sys/fs/bpf
+Type=bpf
+Options=mode=700
+
+[Install]
+WantedBy=multi-user.target

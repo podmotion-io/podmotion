@@ -1,0 +1,9 @@
+apiVersion: migration.podmotion.io/v1alpha1
+kind: NodeMigrationCapacity
+metadata:
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/managed-by: kustomize
+  name: nodemigrationcapacity-sample
+spec:
+  # TODO(user): Add fields here

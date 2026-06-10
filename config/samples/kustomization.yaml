@@ -1,0 +1,8 @@
+## Append samples of your project ##
+resources:
+- migration_v1alpha1_podmigration.yaml
+- migration_v1alpha1_migrationpolicy.yaml
+- migration_v1alpha1_nodemigrationcapacity.yaml
+- migration_v1alpha1_migrationcheckpoint.yaml
+- migration_v1alpha1_migrationwebhookconfig.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
