@@ -8,7 +8,15 @@ nodes:
   image: podmotion-node:dev
   labels:
     podmotion.io/migration-capable: "true"
+  extraMounts:
+  - hostPath: /tmp/podmotion-checkpoints
+    containerPath: /var/lib/podmotion/checkpoints
+    readOnly: false
 - role: worker
   image: podmotion-node:dev
   labels:
     podmotion.io/migration-capable: "true"
+  extraMounts:
+  - hostPath: /tmp/podmotion-checkpoints
+    containerPath: /var/lib/podmotion/checkpoints
+    readOnly: false
