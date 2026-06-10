@@ -200,6 +200,171 @@ var _ = Describe("Cold Migration", Ordered, func() {
 		}, SpecTimeout(migrationTimeout+time.Minute))
 	})
 
+	// ── Tier 2: Data-integrity assertions (Sprint 3 Phase 3) ──────────────
+
+	Describe("nginx data integrity after cold migration", Ordered, func() {
+		const workload = "pm-test-nginx"
+
+		BeforeAll(func() {
+			By("deploying nginx fixture for data-integrity test")
+			cmd := exec.Command("kubectl", "apply", "-f", "test/e2e/fixtures/nginx.yaml")
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			waitForPodReady(workload, e2eNamespace, readinessTimeout)
+		})
+
+		AfterAll(func() {
+			cmd := exec.Command("kubectl", "delete", "-f", "test/e2e/fixtures/nginx.yaml", "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+		})
+
+		It("nginx serves HTTP 200 with 'Welcome to nginx' before and after migration", func(ctx SpecContext) {
+			By("confirming nginx serves HTTP 200 before migration")
+			Eventually(func() (string, error) {
+				cmd := exec.Command("kubectl", "exec", "-n", e2eNamespace,
+					"-l", "app="+workload, "--", "wget", "-qO-", "http://localhost")
+				out, err := utils.Run(cmd)
+				return out, err
+			}, 30*time.Second, 3*time.Second).Should(ContainSubstring("Welcome to nginx"),
+				"nginx should return 'Welcome to nginx' before migration")
+
+			sourcePod := getPodByDeployment(ctx, k8sClient, workload, e2eNamespace)
+			sourcePodName := sourcePod.Name
+			targetNode, err := otherWorkerNode(ctx, k8sClient, sourcePod.Spec.NodeName)
+			Expect(err).NotTo(HaveOccurred())
+
+			pm := createColdMigration(ctx, k8sClient, workload, e2eNamespace, targetNode)
+			defer cleanupMigration(ctx, k8sClient, pm)
+
+			By("waiting for migration to complete")
+			Expect(waitForMigrationPhase(ctx, k8sClient, pm.Namespace, pm.Name,
+				string(pmv1.MigrationPhaseComplete), migrationTimeout)).To(Succeed())
+
+			By("confirming source pod is gone within 30s (ADR-0040)")
+			Expect(waitForSourcePodGone(e2eNamespace, sourcePodName, 30*time.Second)).To(Succeed())
+
+			By("confirming nginx serves HTTP 200 with correct body after migration")
+			Eventually(func() (string, error) {
+				cmd := exec.Command("kubectl", "exec", "-n", e2eNamespace,
+					"-l", "app="+workload, "--", "wget", "-qO-", "http://localhost")
+				out, err := utils.Run(cmd)
+				return out, err
+			}, 30*time.Second, 3*time.Second).Should(ContainSubstring("Welcome to nginx"),
+				"nginx should return 'Welcome to nginx' after migration")
+		}, SpecTimeout(migrationTimeout+time.Minute))
+	})
+
+	Describe("Redis key persistence after cold migration", Ordered, func() {
+		const workload = "pm-test-redis"
+
+		BeforeAll(func() {
+			By("deploying redis fixture for key-persistence test")
+			cmd := exec.Command("kubectl", "apply", "-f", "test/e2e/fixtures/redis.yaml")
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			waitForPodReady(workload, e2eNamespace, readinessTimeout)
+		})
+
+		AfterAll(func() {
+			cmd := exec.Command("kubectl", "delete", "-f", "test/e2e/fixtures/redis.yaml", "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+		})
+
+		It("Redis keys survive cold migration and source pod is gone within 30s", func(ctx SpecContext) {
+			By("seeding migration_test_key before migration")
+			Expect(redisSet(e2eNamespace, workload, "migration_test_key", "hello_podmotion")).To(Succeed())
+			By("seeding counter before migration")
+			Expect(redisSet(e2eNamespace, workload, "counter", "42")).To(Succeed())
+
+			sourcePod := getPodByDeployment(ctx, k8sClient, workload, e2eNamespace)
+			sourcePodName := sourcePod.Name
+			targetNode, err := otherWorkerNode(ctx, k8sClient, sourcePod.Spec.NodeName)
+			Expect(err).NotTo(HaveOccurred())
+
+			pm := createColdMigration(ctx, k8sClient, workload, e2eNamespace, targetNode)
+			defer cleanupMigration(ctx, k8sClient, pm)
+
+			By("waiting for migration to complete")
+			Expect(waitForMigrationPhase(ctx, k8sClient, pm.Namespace, pm.Name,
+				string(pmv1.MigrationPhaseComplete), migrationTimeout)).To(Succeed())
+
+			By("verifying migration_test_key value after migration")
+			val, err := redisGet(e2eNamespace, workload, "migration_test_key")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(val).To(Equal("hello_podmotion"), "migration_test_key should survive cold migration")
+
+			By("verifying counter value after migration")
+			counter, err := redisGet(e2eNamespace, workload, "counter")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(counter).To(Equal("42"), "counter should survive cold migration")
+
+			By("confirming source pod is gone within 30s (ADR-0040)")
+			Expect(waitForSourcePodGone(e2eNamespace, sourcePodName, 30*time.Second)).To(Succeed())
+		}, SpecTimeout(migrationTimeout+time.Minute))
+	})
+
+	Describe("Postgres row integrity after cold migration", Ordered, func() {
+		const workload = "pm-test-postgres"
+
+		BeforeAll(func() {
+			By("deploying postgres fixture for row-integrity test")
+			cmd := exec.Command("kubectl", "apply", "-f", "test/e2e/fixtures/postgres.yaml")
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			waitForPodReady(workload, e2eNamespace, readinessTimeout)
+		})
+
+		AfterAll(func() {
+			cmd := exec.Command("kubectl", "delete", "-f", "test/e2e/fixtures/postgres.yaml", "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+		})
+
+		It("Postgres rows survive cold migration and new writes succeed after migration", func(ctx SpecContext) {
+			By("creating migration_test table and inserting pre-migration row")
+			Expect(pgExec(e2eNamespace, workload,
+				"CREATE TABLE IF NOT EXISTS migration_test (id SERIAL PRIMARY KEY, value TEXT);")).To(Succeed())
+			Expect(pgExec(e2eNamespace, workload,
+				"INSERT INTO migration_test (value) VALUES ('sprint3-pre-migration');")).To(Succeed())
+
+			By("recording pre-migration row count")
+			preCount, err := pgQuery(e2eNamespace, workload,
+				"SELECT COUNT(*) FROM migration_test;")
+			Expect(err).NotTo(HaveOccurred())
+
+			sourcePod := getPodByDeployment(ctx, k8sClient, workload, e2eNamespace)
+			sourcePodName := sourcePod.Name
+			targetNode, err := otherWorkerNode(ctx, k8sClient, sourcePod.Spec.NodeName)
+			Expect(err).NotTo(HaveOccurred())
+
+			pm := createColdMigration(ctx, k8sClient, workload, e2eNamespace, targetNode)
+			defer cleanupMigration(ctx, k8sClient, pm)
+
+			By("waiting for migration to complete")
+			Expect(waitForMigrationPhase(ctx, k8sClient, pm.Namespace, pm.Name,
+				string(pmv1.MigrationPhaseComplete), migrationTimeout)).To(Succeed())
+
+			By("verifying row count matches pre-migration count")
+			postCount, err := pgQuery(e2eNamespace, workload,
+				"SELECT COUNT(*) FROM migration_test;")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(postCount).To(Equal(preCount), "row count should match pre-migration count")
+
+			By("verifying sprint3-pre-migration row is present after migration")
+			rowVal, err := pgQuery(e2eNamespace, workload,
+				"SELECT value FROM migration_test WHERE value='sprint3-pre-migration' LIMIT 1;")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(rowVal).To(Equal("sprint3-pre-migration"),
+				"pre-migration row should be present after migration")
+
+			By("verifying new writes succeed after migration")
+			Expect(pgExec(e2eNamespace, workload,
+				"INSERT INTO migration_test (value) VALUES ('sprint3-post-migration');")).To(Succeed())
+
+			By("confirming source pod is gone within 30s (ADR-0040)")
+			Expect(waitForSourcePodGone(e2eNamespace, sourcePodName, 30*time.Second)).To(Succeed())
+		}, SpecTimeout(migrationTimeout+time.Minute))
+	})
+
 	// ── Admission control tests ────────────────────────────────────────────
 
 	Describe("Webhook admission rules", func() {
@@ -340,6 +505,62 @@ func pgQuery(ns, svc, sql string) (string, error) {
 		"psql", "-U", "pmtest", "-d", "pmtest", "-tAc", sql)
 	out, err := utils.Run(cmd)
 	return strings.TrimSpace(string(out)), err
+}
+
+// waitForSourcePodGone polls kubectl until the named pod is NotFound or timeout is exceeded.
+func waitForSourcePodGone(namespace, podName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		cmd := exec.Command("kubectl", "get", "pod", podName, "-n", namespace)
+		out, err := utils.Run(cmd)
+		if err != nil && strings.Contains(out, "NotFound") {
+			return nil
+		}
+		if err != nil && strings.Contains(strings.ToLower(out), "not found") {
+			return nil
+		}
+		time.Sleep(pollInterval)
+	}
+	return fmt.Errorf("pod %s/%s still present after %s", namespace, podName, timeout)
+}
+
+// waitForMigrationPhase polls the PodMigration CR until it reaches the desired phase or timeout.
+func waitForMigrationPhase(ctx context.Context, c client.Client, namespace, migrationName, phase string, timeout time.Duration) error {
+	pm := &pmv1.PodMigration{}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: migrationName}, pm); err != nil {
+			return fmt.Errorf("getting PodMigration %s/%s: %w", namespace, migrationName, err)
+		}
+		if string(pm.Status.Phase) == phase {
+			return nil
+		}
+		if pm.Status.Phase == pmv1.MigrationPhaseFailed {
+			return fmt.Errorf("PodMigration %s/%s reached Failed phase (wanted %s)", namespace, migrationName, phase)
+		}
+		time.Sleep(pollInterval)
+	}
+	return fmt.Errorf("PodMigration %s/%s did not reach phase %s within %s (last: %s)",
+		namespace, migrationName, phase, timeout, pm.Status.Phase)
+}
+
+// otherWorkerNode returns a worker node that is different from the given node.
+// It is used to pin migrations to the opposite worker so source/destination differ.
+func otherWorkerNode(ctx context.Context, c client.Client, currentNode string) (string, error) {
+	nodeList := &corev1.NodeList{}
+	if err := c.List(ctx, nodeList); err != nil {
+		return "", fmt.Errorf("listing nodes: %w", err)
+	}
+	for _, node := range nodeList.Items {
+		// Skip control-plane nodes.
+		if _, isCP := node.Labels["node-role.kubernetes.io/control-plane"]; isCP {
+			continue
+		}
+		if node.Name != currentNode {
+			return node.Name, nil
+		}
+	}
+	return "", fmt.Errorf("no other worker node found (current: %s)", currentNode)
 }
 
 // Ensure wait is referenced.
