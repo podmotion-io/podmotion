@@ -25,10 +25,12 @@ import (
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	agentclient "github.com/podmotion-io/podmotion/internal/agent/client"
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
+	gpuagent "github.com/podmotion-io/podmotion/internal/agent/gpu"
 	"github.com/podmotion-io/podmotion/internal/agent/replication"
 	"github.com/podmotion-io/podmotion/internal/agent/storage"
 	"github.com/podmotion-io/podmotion/internal/agent/traffic"
 	"github.com/podmotion-io/podmotion/internal/estimation"
+	"github.com/podmotion-io/podmotion/internal/featuregate"
 	"github.com/podmotion-io/podmotion/internal/rollback"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 )
@@ -69,6 +71,10 @@ type PodMigrationReconciler struct {
 	// Wired to CompositeVerifier (EndpointSlice + AWSALB) in production.
 	// Nil in unit tests — Verifying phase logs a skip when nil.
 	TrafficVerifier traffic.Verifier
+	// GPUCheckpointer handles NVIDIA CUDA context checkpoint/restore.
+	// Only called when GPUMigration feature gate is enabled and the pod has GPU resources.
+	// Defaults to GPUCheckpointerStub when nil (so GPU-unaware environments are unaffected).
+	GPUCheckpointer gpuagent.GPUCheckpointer
 }
 
 // +kubebuilder:rbac:groups=migration.podmotion.io,resources=podmigrations,verbs=get;list;watch;create;update;patch;delete
@@ -294,6 +300,18 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		return r.initiateRollback(ctx, pm, condFailed.Message)
 	}
 
+	// Defence-in-depth (ADR-0031): the webhook should have blocked PostCopy when
+	// userfaultfd is absent, but guard here as well because the node capability
+	// could change between admission and execution.
+	if pm.Spec.Mode == pmv1.MigrationModePostCopy {
+		nmc, err := r.getNMC(ctx, pm.Status.SourceNodeName)
+		if err == nil && !nmc.Spec.KernelFeatures.Userfaultfd {
+			msg := "PostCopy mode requires CONFIG_USERFAULTFD on source node (kernel feature absent)"
+			setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CheckpointFailed", msg)
+			return ctrl.Result{}, r.Status().Update(ctx, pm)
+		}
+	}
+
 	// Drive the checkpoint via the agent gRPC client if the pool is wired.
 	if r.AgentPool == nil {
 		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
@@ -333,6 +351,27 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		}
 		setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CheckpointFailed", reason)
 		return ctrl.Result{}, r.Status().Update(ctx, pm)
+	}
+
+	// Step 1b: GPU gate check and pre-checkpoint.
+	// Must run before CRIU freeze so GPU context is captured while the container is still live.
+	pod, podErr := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+	if podErr == nil && podHasGPU(pod) {
+		if !featuregate.IsEnabled(featuregate.GPUMigration) {
+			setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "FeatureGateRequired",
+				gpuagent.ErrFeatureGateRequired.Error())
+			return r.failMigration(ctx, pm, gpuagent.ErrFeatureGateRequired.Error())
+		}
+		gpuCP := r.GPUCheckpointer
+		if gpuCP == nil {
+			gpuCP = &gpuagent.GPUCheckpointerStub{}
+		}
+		gpuDir := fmt.Sprintf("/tmp/podmotion/%s/gpu", pm.Name)
+		if _, err := gpuCP.Checkpoint(ctx, pm.Spec.PodName, pm.Spec.PodNamespace, gpuDir); err != nil {
+			setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "GPUCheckpointFailed", err.Error())
+			return ctrl.Result{}, r.Status().Update(ctx, pm)
+		}
+		log.Info("GPU checkpoint captured", "migration", pm.Name, "gpuDir", gpuDir)
 	}
 
 	// Step 2: Checkpoint — freeze and dump.
@@ -410,6 +449,20 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 			return r.initiateRollback(ctx, pm, msg)
 		}
 		return ctrl.Result{}, r.Status().Update(ctx, pm)
+	}
+
+	// GPU restore: reload GPU context after CRIU restore completes, if applicable.
+	// GPU restore must happen after CRIU so the container process tree is alive to receive it.
+	srcPod, podErr := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+	if podErr == nil && podHasGPU(srcPod) && featuregate.IsEnabled(featuregate.GPUMigration) {
+		gpuCP := r.GPUCheckpointer
+		if gpuCP == nil {
+			gpuCP = &gpuagent.GPUCheckpointerStub{}
+		}
+		gpuDir := fmt.Sprintf("/tmp/podmotion/%s/gpu", pm.Name)
+		if gpuErr := gpuCP.Restore(ctx, pm.Spec.PodName, pm.Spec.PodNamespace, gpuDir); gpuErr != nil {
+			log.Error(gpuErr, "GPU restore failed — continuing (non-fatal)", "migration", pm.Name)
+		}
 	}
 
 	setCondition(pm, conditionRestored, metav1.ConditionTrue, "Restored", "Container restored by agent")
@@ -519,6 +572,20 @@ func setCondition(pm *pmv1.PodMigration, condType string, status metav1.Conditio
 }
 
 // SetupWithManager sets up the controller with the Manager.
+// podHasGPU returns true if any container in the pod declares an nvidia.com/gpu resource limit > 0.
+// This drives the GPU checkpoint/restore path when the GPUMigration feature gate is enabled.
+func podHasGPU(pod *corev1.Pod) bool {
+	const gpuResource = "nvidia.com/gpu"
+	for _, c := range pod.Spec.Containers {
+		if q, ok := c.Resources.Limits[corev1.ResourceName(gpuResource)]; ok {
+			if q.Value() > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (r *PodMigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pmv1.PodMigration{}).
