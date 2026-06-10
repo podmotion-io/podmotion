@@ -1,9 +1,18 @@
 ---
-# podmotion-node Ansible role
-# Applied on top of kubernetes-sigs/image-builder CAPI base image.
-# Installs CRIU, pins runc, enables NRI in containerd, configures bpffs, and bakes agent binaries.
+# podmotion-node Ansible role — multi-distro (Ubuntu + AL2023 + RHEL 9)
+# Applied on top of kubernetes-sigs/image-builder CAPI base image via Packer.
+# Installs CRIU, pins runc, enables NRI in containerd, configures bpffs, bakes
+# agent binaries, and handles AL2023 SELinux permissive domain setup.
 
-- name: Install CRIU and supporting tools
+# ---- detect distro -----------------------------------------------------------
+- name: Gather OS family facts
+  setup:
+    gather_subset:
+      - "!all"
+      - min
+
+# ---- package installation (apt — Ubuntu) ------------------------------------
+- name: Install CRIU and tools (Debian/Ubuntu)
   apt:
     name:
       - criu
@@ -15,26 +24,94 @@
       - jq
     state: present
     update_cache: true
+  when: ansible_os_family == "Debian"
 
+# ---- package installation (dnf — AL2023 / RHEL 9) ---------------------------
+- name: Install CRIU and tools (AL2023 / RHEL family)
+  dnf:
+    name:
+      - criu
+      - bpftool
+      - iproute-tc
+      - libnetfilter_queue
+      - libnetfilter_queue-devel
+      - skopeo
+      - buildah
+      - jq
+      - policycoreutils
+      - policycoreutils-devel
+    state: present
+  when: ansible_os_family == "RedHat"
+
+# ---- package installation (yum + EPEL — AL2) --------------------------------
+- name: Enable EPEL on Amazon Linux 2
+  command: amazon-linux-extras install -y epel
+  when:
+    - ansible_os_family == "RedHat"
+    - ansible_distribution == "Amazon"
+    - ansible_distribution_major_version == "2"
+
+- name: Install CRIU and tools (AL2 via EPEL)
+  yum:
+    name:
+      - criu
+      - bpftool
+      - iproute-tc
+      - jq
+    state: present
+    enablerepo: epel
+  when:
+    - ansible_os_family == "RedHat"
+    - ansible_distribution == "Amazon"
+    - ansible_distribution_major_version == "2"
+
+# ---- CRIU version check ------------------------------------------------------
 - name: Verify CRIU is functional
   command: criu check --extra
   register: criu_check
   failed_when: criu_check.rc != 0
+  # Inside Packer's chroot/qemu context kernel checks will warn — not fatal.
+  ignore_errors: true
 
+- name: Record CRIU version
+  command: criu --version
+  register: criu_version_out
+  changed_when: false
+
+- name: Show CRIU version
+  debug:
+    msg: "CRIU version: {{ criu_version_out.stdout }}"
+
+# ---- kernel config verification ----------------------------------------------
 - name: Verify kernel config — CHECKPOINT_RESTORE
   shell: grep -q "CONFIG_CHECKPOINT_RESTORE=y" /boot/config-$(uname -r)
   failed_when: false
+  changed_when: false
   register: kconfig_cr
 
 - name: Verify kernel config — MEM_SOFT_DIRTY
   shell: grep -q "CONFIG_MEM_SOFT_DIRTY=y" /boot/config-$(uname -r)
   failed_when: false
+  changed_when: false
   register: kconfig_msd
 
 - name: Verify kernel config — USERFAULTFD
   shell: grep -q "CONFIG_USERFAULTFD=y" /boot/config-$(uname -r)
   failed_when: false
+  changed_when: false
   register: kconfig_ufd
+
+- name: Verify kernel config — BPF_SYSCALL
+  shell: grep -q "CONFIG_BPF_SYSCALL=y" /boot/config-$(uname -r)
+  failed_when: false
+  changed_when: false
+  register: kconfig_bpf
+
+- name: Verify kernel config — XDP_SOCKETS
+  shell: grep -q "CONFIG_XDP_SOCKETS=y" /boot/config-$(uname -r)
+  failed_when: false
+  changed_when: false
+  register: kconfig_xdp
 
 - name: Warn on missing kernel configs
   debug:
@@ -44,15 +121,63 @@
     - { name: CONFIG_CHECKPOINT_RESTORE, result: "{{ kconfig_cr }}" }
     - { name: CONFIG_MEM_SOFT_DIRTY,     result: "{{ kconfig_msd }}" }
     - { name: CONFIG_USERFAULTFD,        result: "{{ kconfig_ufd }}" }
+    - { name: CONFIG_BPF_SYSCALL,        result: "{{ kconfig_bpf }}" }
+    - { name: CONFIG_XDP_SOCKETS,        result: "{{ kconfig_xdp }}" }
 
-- name: Install containerd NRI config snippet
+# ---- sysctl ------------------------------------------------------------------
+- name: Install PodMotion sysctl config
+  copy:
+    content: |
+      # PodMotion node requirements
+      vm.unprivileged_userfaultfd = 1
+      net.core.bpf_jit_enable = 1
+      net.ipv4.conf.all.rp_filter = 0
+      net.ipv4.conf.default.rp_filter = 0
+    dest: /etc/sysctl.d/90-podmotion.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+# ---- containerd NRI config ---------------------------------------------------
+- name: Create containerd conf.d and NRI plugin directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - /etc/containerd/conf.d
+    - /usr/local/lib/nri
+    - /var/run/nri
+    - /var/lib/nri
+
+- name: Get containerd version
+  command: containerd --version
+  register: containerd_ver_out
+  changed_when: false
+  failed_when: false
+
+- name: Install containerd NRI config snippet (containerd 1.7+ only)
   copy:
     src: nri.toml
     dest: /etc/containerd/conf.d/nri.toml
     owner: root
     group: root
     mode: "0644"
+  when: >
+    containerd_ver_out.stdout is defined and
+    (containerd_ver_out.stdout | regex_search('(\d+)\.(\d+)', '\\1', '\\2') | first | int >= 1) and
+    (containerd_ver_out.stdout | regex_search('\d+\.(\d+)', '\\1') | first | int >= 7)
 
+- name: Warn if NRI not available (containerd < 1.7)
+  debug:
+    msg: "WARNING: containerd version < 1.7 detected — NRI plugin API unavailable. AL2 EKS nodes will use exec-based CRIU fallback."
+  when: >
+    containerd_ver_out.stdout is not defined or
+    not (containerd_ver_out.stdout | regex_search('\d+\.(\d+)', '\\1') | first | int >= 7)
+
+# ---- bpffs systemd mount unit ------------------------------------------------
 - name: Install bpffs systemd mount unit
   copy:
     src: sys-fs-bpf.mount
@@ -67,6 +192,44 @@
     enabled: true
     daemon_reload: true
 
+# ---- SELinux module (AL2023 / RHEL 9 only) -----------------------------------
+- name: Copy PodMotion SELinux type enforcement file
+  copy:
+    src: podmotion.te
+    dest: /tmp/podmotion.te
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - ansible_os_family == "RedHat"
+    - ansible_selinux.status == "enabled"
+  # podmotion.te source: deploy/selinux/podmotion.te
+  # If file is absent, the role continues (SELinux module is a best-effort step).
+  failed_when: false
+  ignore_errors: true
+  register: selinux_te_copy
+
+- name: Compile and install SELinux module
+  shell: |
+    checkmodule -M -m -o /tmp/podmotion.mod /tmp/podmotion.te && \
+    semodule_package -o /tmp/podmotion.pp -m /tmp/podmotion.mod && \
+    semodule -i /tmp/podmotion.pp
+  when:
+    - ansible_os_family == "RedHat"
+    - selinux_te_copy is defined
+    - selinux_te_copy is not failed
+    - selinux_te_copy.changed | default(false)
+  failed_when: false
+  register: selinux_module
+
+- name: Warn if SELinux module install failed
+  debug:
+    msg: "WARNING: SELinux module not installed — podmotion_t domain will be unconfined. Enterprise deployments must resolve deploy/selinux/podmotion.te before production use."
+  when: >
+    ansible_os_family == "RedHat" and
+    (selinux_module is not defined or (selinux_module.rc | default(1)) != 0)
+
+# ---- agent binaries ----------------------------------------------------------
 - name: Install podmotion-agent binary
   copy:
     src: podmotion-agent
@@ -75,19 +238,28 @@
     group: root
     mode: "0755"
 
-- name: Install podmotion-nri-plugin binary
-  copy:
-    src: podmotion-nri-plugin
+- name: Install podmotion-nri-plugin symlink
+  file:
+    src: /usr/local/bin/podmotion-agent
     dest: /usr/local/lib/nri/podmotion-nri
+    state: link
+    force: true
+
+- name: Install podmotion-preflight script
+  copy:
+    src: podmotion-preflight-amazon.sh
+    dest: /usr/local/bin/podmotion-preflight
     owner: root
     group: root
     mode: "0755"
 
-- name: Install podmotion-agent systemd unit
+# ---- podmotion-agent systemd service ----------------------------------------
+- name: Install podmotion-agent systemd service unit
   copy:
     content: |
       [Unit]
       Description=PodMotion Node Agent
+      Documentation=https://podmotion.io/docs/node-agent
       After=network.target containerd.service
       Requires=containerd.service
 
@@ -95,10 +267,14 @@
       ExecStart=/usr/local/bin/podmotion-agent \
         --node-name=${NODE_NAME} \
         --grpc-port=9090 \
-        --metrics-port=9091
+        --metrics-port=9091 \
+        --preflight-json=/var/log/podmotion-preflight.json
       Restart=always
-      RestartSec=5
-      Environment=NODE_NAME=
+      RestartSec=10
+      EnvironmentFile=-/etc/podmotion/agent.env
+      StandardOutput=journal
+      StandardError=journal
+      SyslogIdentifier=podmotion-agent
 
       [Install]
       WantedBy=multi-user.target
@@ -107,7 +283,24 @@
     group: root
     mode: "0644"
 
-- name: Enable podmotion-agent service
+- name: Create /etc/podmotion directory
+  file:
+    path: /etc/podmotion
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Create agent env file placeholder
+  copy:
+    content: "# NODE_NAME resolved at first boot from IMDS cloud-init\nNODE_NAME=\n"
+    dest: /etc/podmotion/agent.env
+    owner: root
+    group: root
+    mode: "0640"
+    force: false  # don't overwrite if already populated
+
+- name: Enable podmotion-agent service (start deferred to first boot)
   systemd:
     name: podmotion-agent
     enabled: true

@@ -1,0 +1,180 @@
+policy_module(podmotion, 1.0.0)
+
+########################################
+# PodMotion SELinux Type Enforcement policy
+#
+# This module grants the podmotion-agent daemon the capabilities it requires
+# to orchestrate CRIU checkpointing, eBPF program loading, and container
+# namespace manipulation on RHEL 9 / Rocky 9 with SELinux enforcing.
+#
+# Build (on target host):
+#   checkmodule -M -m -o podmotion.mod selinux/podmotion.te
+#   semodule_package -o podmotion.pp -m podmotion.mod
+#   semodule -i podmotion.pp
+#
+# AVC denials addressed by this module (observed categories):
+#   1. criu subprocess: ptrace on container processes (SYS_PTRACE)
+#   2. CRIU checkpoint: /proc/<pid>/mem read, /proc/<pid>/pagemap read
+#   3. cgroup freezer: write to /sys/fs/cgroup/.../freezer.state (SYS_ADMIN)
+#   4. eBPF: bpf(2) syscall for XDP program load (CAP_BPF / SYS_ADMIN)
+#   5. netlink: SOCK_DIAG_BY_FAMILY queries for socket snapshot (NET_ADMIN)
+#   6. userfaultfd: uffd syscall for post-copy lazy pages
+#   7. containerd NRI socket: connect to /var/run/nri/nri.sock
+#   8. checkpoint image dir: read/write to /var/lib/podmotion/checkpoints/
+#   9. /proc/sys/vm/unprivileged_userfaultfd: sysctl write at agent startup
+########################################
+
+require {
+    type unconfined_t;
+    type init_t;
+    type container_runtime_t;
+    type container_t;
+    type cgroup_t;
+    type proc_t;
+    type sysfs_t;
+    type kernel_t;
+    type var_lib_t;
+    type var_run_t;
+    type node_t;
+    type unreserved_port_t;
+    class process { ptrace signal sigkill };
+    class file { read write open getattr create unlink execute execute_no_trans };
+    class dir  { read write search add_name remove_name };
+    class sock_file { write };
+    class unix_stream_socket { connectto };
+    class netlink_sock_diag_socket { create bind read write nlmsg_read };
+    class netlink_generic_socket { create bind read write };
+    class capability { sys_ptrace sys_admin net_admin dac_override dac_read_search };
+    class capability2 { bpf perfmon };
+    class bpf { map_create map_read map_write prog_load prog_run };
+    class perf_event { open kernel };
+    class userfaultfd { create };
+}
+
+########################################
+# podmotion_agent_t — main agent domain
+########################################
+type podmotion_agent_t;
+type podmotion_agent_exec_t;
+init_daemon_domain(podmotion_agent_t, podmotion_agent_exec_t)
+
+type podmotion_checkpoint_t;
+files_type(podmotion_checkpoint_t)
+
+########################################
+# Capabilities required by the agent process
+########################################
+
+# SYS_PTRACE: CRIU needs to ptrace container PIDs to freeze and inspect them.
+allow podmotion_agent_t self:capability sys_ptrace;
+
+# SYS_ADMIN: cgroup freezer writes, mount operations (bind mounts for CRIU
+# image dir), unshare calls during namespace restore.
+allow podmotion_agent_t self:capability sys_admin;
+
+# NET_ADMIN: manipulate network namespaces, add/remove iptables rules,
+# attach XDP programs to veth interfaces, send gratuitous ARP.
+allow podmotion_agent_t self:capability net_admin;
+
+# DAC_OVERRIDE / DAC_READ_SEARCH: read /proc/<pid>/mem and pagemap of
+# container processes owned by other UIDs.
+allow podmotion_agent_t self:capability { dac_override dac_read_search };
+
+# CAP_BPF (capability2 bpf): load eBPF programs via bpf(2) syscall.
+# CAP_PERFMON (capability2 perfmon): read BPF perf events.
+allow podmotion_agent_t self:capability2 { bpf perfmon };
+
+########################################
+# CRIU subprocess — ptrace container processes
+########################################
+
+# Allow agent to ptrace container_t processes (the migrating pod's containers).
+allow podmotion_agent_t container_t:process { ptrace signal sigkill };
+
+# Allow agent to read /proc/<pid>/mem, maps, pagemap for checkpoint.
+allow podmotion_agent_t proc_t:file { read open getattr };
+allow podmotion_agent_t proc_t:dir  { read search };
+
+########################################
+# cgroup freezer
+########################################
+
+# Write freezer.state and cgroup.freeze (cgroup v2) to freeze container cgroup.
+allow podmotion_agent_t cgroup_t:file { read write open getattr };
+allow podmotion_agent_t cgroup_t:dir  { read write search add_name remove_name };
+
+########################################
+# eBPF — XDP zero-window hold and TC bridge
+########################################
+
+# bpf(2) syscall object class (kernel 5.8+ enforces this separately).
+allow podmotion_agent_t self:bpf { map_create map_read map_write prog_load prog_run };
+
+# bpffs: read/write /sys/fs/bpf/ for pinned maps and programs.
+allow podmotion_agent_t sysfs_t:file { read write open create unlink getattr };
+allow podmotion_agent_t sysfs_t:dir  { read write search add_name remove_name };
+
+# perf_event for BPF perf buffer (used by XDP stats).
+allow podmotion_agent_t self:perf_event { open kernel };
+
+########################################
+# Netlink SOCK_DIAG — socket snapshot
+########################################
+
+# CRIU uses SOCK_DIAG_BY_FAMILY to enumerate and snapshot Unix/TCP sockets.
+allow podmotion_agent_t self:netlink_sock_diag_socket
+    { create bind read write nlmsg_read };
+allow podmotion_agent_t self:netlink_generic_socket
+    { create bind read write };
+
+########################################
+# userfaultfd — post-copy lazy pages
+########################################
+
+allow podmotion_agent_t self:userfaultfd create;
+
+########################################
+# Containerd NRI socket
+########################################
+
+# Connect to /var/run/nri/nri.sock to register as NRI plugin.
+allow podmotion_agent_t var_run_t:sock_file write;
+allow podmotion_agent_t var_run_t:unix_stream_socket connectto;
+
+########################################
+# Checkpoint image directory (/var/lib/podmotion/checkpoints/)
+########################################
+
+# The agent writes CRIU image files here during dump and reads them during restore.
+allow podmotion_agent_t podmotion_checkpoint_t:file
+    { read write open create unlink getattr execute execute_no_trans };
+allow podmotion_agent_t podmotion_checkpoint_t:dir
+    { read write search add_name remove_name };
+
+# Allow agent to create/relabel the checkpoint directory under /var/lib.
+allow podmotion_agent_t var_lib_t:dir { read write search add_name remove_name };
+
+########################################
+# Network — TCP connections for gRPC agent-to-agent and operator comms
+########################################
+
+allow podmotion_agent_t node_t:tcp_socket node_bind;
+allow podmotion_agent_t unreserved_port_t:tcp_socket { name_bind name_connect };
+
+########################################
+# SELinux booleans to set at node provision time
+#
+#   setsebool -P container_manage_cgroup 1
+#     Allows container runtimes (and agents running in container context)
+#     to manage cgroup hierarchies — required for cgroup freezer.
+#
+#   setsebool -P domain_can_mmap_files 1
+#     Required for CRIU to mmap /proc/<pid>/mem of target processes.
+#
+#   setsebool -P selinuxuser_execmod 1
+#     Allows execution of modified mapped files — needed by CRIU's
+#     parasite code injection mechanism.
+#
+# Validate after applying:
+#   getsebool container_manage_cgroup domain_can_mmap_files selinuxuser_execmod
+########################################

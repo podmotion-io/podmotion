@@ -1,0 +1,162 @@
+# AppArmor profile for podmotion-agent on Ubuntu 22.04 / 24.04.
+#
+# CRIU requires SYS_PTRACE to freeze and inspect target processes,
+# SYS_ADMIN for cgroup and namespace manipulation, and NET_ADMIN
+# for network namespace and iptables state checkpoint/restore.
+#
+# Load with: apparmor_parser -r /etc/apparmor.d/podmotion-agent
+# Verify:    aa-status | grep podmotion
+
+#include <tunables/global>
+
+profile podmotion-agent /usr/local/bin/podmotion-agent flags=(attach_disconnected, mediate_deleted) {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+
+  # Allow the binary itself and the NRI symlink
+  /usr/local/bin/podmotion-agent mr,
+  /usr/local/lib/nri/podmotion-nri mr,
+
+  # CRIU binary invocation (subprocess per ADR-0002)
+  /usr/sbin/criu Cx -> podmotion_criu,
+  /usr/bin/criu  Cx -> podmotion_criu,
+
+  # bpftool for eBPF program management
+  /usr/sbin/bpftool    Cx -> podmotion_bpftool,
+  /usr/lib/linux-tools-*/bpftool Cx -> podmotion_bpftool,
+
+  # Checkpoint image directories
+  /var/lib/podmotion/checkpoints/ rw,
+  /var/lib/podmotion/checkpoints/** rwk,
+
+  # containerd NRI socket
+  /var/run/nri/nri.sock rw,
+  /var/lib/nri/ r,
+  /var/lib/nri/** rw,
+
+  # bpffs — XDP and TC program attachment points
+  /sys/fs/bpf/ rw,
+  /sys/fs/bpf/** rw,
+
+  # cgroup v2 hierarchy — agent reads/writes freezer state
+  /sys/fs/cgroup/ r,
+  /sys/fs/cgroup/** rw,
+
+  # proc — agent reads namespace info, pagemap for pre-copy dirty tracking
+  /proc/ r,
+  /proc/** r,
+  # Write access for agent's own process
+  /proc/@{pid}/fd/ r,
+
+  # Kernel config for preflight checks
+  /boot/config-* r,
+  /proc/config.gz r,
+
+  # sysctl for runtime configuration
+  /proc/sys/vm/unprivileged_userfaultfd r,
+  /proc/sys/net/core/bpf_jit_enable r,
+
+  # Network device management (veth pair creation, XDP attach)
+  network inet  stream,
+  network inet6 stream,
+  network inet  dgram,
+  network inet6 dgram,
+  network netlink raw,
+
+  # Capabilities required for CRIU subprocess orchestration
+  capability sys_ptrace,
+  capability sys_admin,
+  capability net_admin,
+  capability net_raw,
+  capability dac_override,
+  capability dac_read_search,
+  capability setuid,
+  capability setgid,
+  capability sys_resource,
+  capability kill,
+
+  # gRPC server socket
+  /var/run/podmotion-agent.sock rw,
+  /tmp/podmotion-** rw,
+
+  # Logging
+  /var/log/podmotion/ rw,
+  /var/log/podmotion/** rw,
+
+  # buildah / skopeo for OCI checkpoint image push
+  /usr/bin/buildah Cx -> podmotion_buildah,
+  /usr/bin/skopeo  Cx -> podmotion_skopeo,
+
+  # OCI storage
+  /var/lib/containers/ r,
+  /var/lib/containers/** rwk,
+  /etc/containers/ r,
+  /etc/containers/** r,
+
+  # Allow signaling CRIU child process
+  signal (send) set=(int, kill, stop, cont) peer=podmotion_criu,
+
+  # Child profile for CRIU subprocess
+  profile podmotion_criu /usr/sbin/criu {
+    #include <abstractions/base>
+    capability sys_ptrace,
+    capability sys_admin,
+    capability net_admin,
+    capability dac_override,
+    capability dac_read_search,
+    capability setuid,
+    capability setgid,
+    capability sys_resource,
+    capability kill,
+    capability chown,
+    capability fowner,
+
+    /proc/ r,
+    /proc/** rw,
+    /sys/fs/cgroup/ r,
+    /sys/fs/cgroup/** rw,
+    /var/lib/podmotion/checkpoints/ rw,
+    /var/lib/podmotion/checkpoints/** rwk,
+    /tmp/podmotion-** rw,
+
+    network netlink raw,
+    network inet  stream,
+    network inet6 stream,
+
+    # CRIU RPC socket (go-criu communicates over this)
+    /var/run/criu-service.socket rw,
+    /tmp/criu-*.socket rw,
+  }
+
+  # Child profile for bpftool
+  profile podmotion_bpftool /usr/sbin/bpftool {
+    #include <abstractions/base>
+    capability sys_admin,
+    /sys/fs/bpf/ rw,
+    /sys/fs/bpf/** rw,
+    /proc/sys/net/core/bpf_jit_enable r,
+  }
+
+  # Child profile for buildah
+  profile podmotion_buildah /usr/bin/buildah {
+    #include <abstractions/base>
+    capability sys_admin,
+    capability chown,
+    capability fowner,
+    /var/lib/containers/** rwk,
+    /var/lib/podmotion/checkpoints/** r,
+    /etc/containers/** r,
+    /tmp/** rw,
+    network inet stream,
+    network inet6 stream,
+  }
+
+  # Child profile for skopeo
+  profile podmotion_skopeo /usr/bin/skopeo {
+    #include <abstractions/base>
+    /var/lib/containers/** rwk,
+    /etc/containers/** r,
+    network inet  stream,
+    network inet6 stream,
+  }
+}
