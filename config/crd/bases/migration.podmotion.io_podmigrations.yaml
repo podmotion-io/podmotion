@@ -257,6 +257,7 @@ spec:
                   dirtyPageRateMBps:
                     description: DirtyPageRateMBps is the observed dirty page write
                       rate during sampling.
+                    type: string
                   estimatedFreezeDurationMs:
                     description: EstimatedFreezeDurationMs is the predicted freeze
                       duration based on dirty page sampling.

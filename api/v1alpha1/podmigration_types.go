@@ -132,7 +132,7 @@ type DryRunEstimate struct {
 	// EstimatedFreezeDurationMs is the predicted freeze duration based on dirty page sampling.
 	EstimatedFreezeDurationMs int64 `json:"estimatedFreezeDurationMs"`
 	// DirtyPageRateMBps is the observed dirty page write rate during sampling.
-	DirtyPageRateMBps float64 `json:"dirtyPageRateMBps"`
+	DirtyPageRateMBps string `json:"dirtyPageRateMBps"`
 	// StorageTier is the detected storage migration tier (0-4).
 	StorageTier int32 `json:"storageTier"`
 	// Migratable indicates whether the pod is estimated to be migratable within policy constraints.
