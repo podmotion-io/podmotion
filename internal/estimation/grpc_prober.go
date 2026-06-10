@@ -62,11 +62,11 @@ func (g *GRPCProber) Probe(ctx context.Context, pod *corev1.Pod, _ string) (Prob
 
 	// DirtyPageRateMBPerSec * ElapsedMs gives us the dirty MB observed during the sample.
 	elapsedMs := int64(sampleSecs) * 1000
-	dirtyMB := float64(resp.DirtyPageRateMBPerSec) * float64(sampleSecs)
+	dirtyMB := float64(resp.DirtyPageRateMbPerSec) * float64(sampleSecs)
 
 	return Probe{
 		DirtyPagesMB: dirtyMB,
 		ElapsedMs:    elapsedMs,
-		RSSMb:        float64(resp.EstimatedCheckpointSizeMB),
+		RSSMb:        float64(resp.EstimatedCheckpointSizeMb),
 	}, nil
 }
