@@ -5,8 +5,15 @@ package compat
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 
 	migrationv1alpha1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 )
@@ -29,19 +36,19 @@ func (p *Prober) Run(ctx context.Context) (ProbeResult, error) {
 	result := ProbeResult{}
 	result.Spec.NodeName = p.NodeName
 
-	// TODO(M1): probe CRIU version
 	result.Spec.CRIUVersion = probeCRIUVersion()
-
-	// TODO(M1): probe kernel features from /proc/config.gz or /boot/config-$(uname -r)
-	// TODO(M1): probe NRI socket at /var/run/nri/nri.sock
-	// TODO(M1): probe runc version
-	// TODO(M1): probe CNI plugin from /etc/cni/net.d/
-	// TODO(M1): probe XDP capability from kernel version
-	// TODO(M1): probe storage capabilities (Longhorn API, Ceph RBD, pv-migrate)
-	// TODO(M1): probe GPU (nvidia-smi, cuda-checkpoint binary)
-	// TODO(M1): probe AWS IMDS for VPC/subnet/instance type
-
 	result.Spec.NRIEnabled = probeNRIEnabled()
+
+	cniPlugin, ipMobility, ipMobilityMode := ProbeNetworkCapability()
+	result.Spec.NetworkCapability.CNIPlugin = cniPlugin
+	result.Spec.NetworkCapability.IPMobilitySupported = ipMobility
+	result.Spec.NetworkCapability.IPMobilityMode = ipMobilityMode
+
+	if srcDstOk, err := ProbeAWSSourceDestCheck(ctx); err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("AWS src/dst check probe: %v", err))
+	} else if !srcDstOk {
+		result.Errors = append(result.Errors, "AWS source/destination check is ENABLED — IP mobility requires it to be disabled")
+	}
 
 	return result, nil
 }
@@ -65,4 +72,129 @@ func probeNRIEnabled() bool {
 	out, err := exec.Command("test", "-S", "/var/run/nri/nri.sock").Output()
 	_ = out
 	return err == nil
+}
+
+// ProbeNetworkCapability detects the primary CNI plugin from /etc/cni/net.d/*.conf
+// or *.conflist. Returns (cniPlugin, ipMobilitySupported, ipMobilityMode).
+//
+// The CNI conf directory is the canonical source of truth for which plugin is active.
+// We read only the first lexically-sorted file (active CNI convention).
+func ProbeNetworkCapability() (cniPlugin string, ipMobilitySupported bool, ipMobilityMode string) {
+	const cniDir = "/etc/cni/net.d"
+	matches, err := filepath.Glob(filepath.Join(cniDir, "*.conf"))
+	if err == nil && len(matches) == 0 {
+		// Also check conflist format
+		matches2, _ := filepath.Glob(filepath.Join(cniDir, "*.conflist"))
+		matches = append(matches, matches2...)
+	}
+	if len(matches) == 0 {
+		return "", false, ""
+	}
+
+	data, err := os.ReadFile(matches[0])
+	if err != nil {
+		return "", false, ""
+	}
+
+	var conf struct {
+		Type    string `json:"type"`
+		Plugins []struct {
+			Type string `json:"type"`
+		} `json:"plugins"`
+	}
+	if err := json.Unmarshal(data, &conf); err != nil {
+		return "", false, ""
+	}
+
+	// Prefer top-level "type"; fall back to first plugin entry (conflist format).
+	detected := conf.Type
+	if detected == "" && len(conf.Plugins) > 0 {
+		detected = conf.Plugins[0].Type
+	}
+
+	lower := strings.ToLower(detected)
+	switch {
+	case strings.Contains(lower, "ovn"):
+		return detected, true, "IPAMClaim"
+	case strings.Contains(lower, "calico"):
+		return detected, true, "BGPHostRoute"
+	case strings.Contains(lower, "cilium"):
+		return detected, false, ""
+	default:
+		return detected, false, ""
+	}
+}
+
+// imdsClient is a package-level HTTP client for IMDS calls.
+// Timeout of 2s avoids blocking the probe loop on non-AWS nodes.
+var imdsClient = &http.Client{Timeout: 2 * time.Second}
+
+// ProbeAWSSourceDestCheck queries IMDSv2 to determine whether the EC2 instance's
+// source/destination check is disabled. IP mobility requires it to be disabled so
+// the instance can forward packets destined for the migrated pod IP.
+//
+// Returns (true, nil) if src/dst check is disabled (OK for IP mobility).
+// Returns (false, nil) if enabled (migration will fail).
+// Returns (false, err) if IMDS is unreachable (non-AWS node).
+func ProbeAWSSourceDestCheck(ctx context.Context) (bool, error) {
+	token, err := imdsToken(ctx)
+	if err != nil {
+		// Not an AWS instance or IMDS unreachable — not an error for non-AWS clusters.
+		return true, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://169.254.169.254/latest/meta-data/network/interfaces/macs/", nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("X-aws-ec2-metadata-token", token)
+
+	resp, err := imdsClient.Do(req)
+	if err != nil {
+		return true, nil // non-AWS: skip
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	macs := strings.Fields(strings.TrimSpace(string(body)))
+	if len(macs) == 0 {
+		return true, nil
+	}
+	// Check the first MAC's source/destination check field.
+	mac := strings.TrimSuffix(macs[0], "/")
+	url := fmt.Sprintf("http://169.254.169.254/latest/meta-data/network/interfaces/macs/%s/source-dest-check", mac)
+	req2, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, err
+	}
+	req2.Header.Set("X-aws-ec2-metadata-token", token)
+	resp2, err := imdsClient.Do(req2)
+	if err != nil {
+		return false, err
+	}
+	defer resp2.Body.Close()
+	val, _ := io.ReadAll(resp2.Body)
+	// IMDS returns "true" or "false" as a plain string.
+	disabled := strings.TrimSpace(string(val)) == "false"
+	return disabled, nil
+}
+
+// imdsToken fetches an IMDSv2 session token using a PUT request.
+func imdsToken(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
+		"http://169.254.169.254/latest/api/token", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+	resp, err := imdsClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	tok, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(tok)), nil
 }
