@@ -1,7 +1,7 @@
 syntax = "proto3";
 
 package podmotion.agent.v1;
-option go_package = "github.com/podmotion/podmotion/proto/gen;agentpb";
+option go_package = "github.com/podmotion-io/podmotion/proto/gen;agentpb";
 
 // MigrationAgentService is implemented by the podmotion-agent DaemonSet on each node.
 service MigrationAgentService {

@@ -1,4 +1,4 @@
-module github.com/podmotion/podmotion
+module github.com/podmotion-io/podmotion
 
 go 1.25.7
 

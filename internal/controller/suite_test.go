@@ -33,7 +33,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	migrationv1alpha1 "github.com/podmotion/podmotion/api/v1alpha1"
+	migrationv1alpha1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
