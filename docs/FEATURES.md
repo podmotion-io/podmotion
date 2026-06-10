@@ -160,3 +160,20 @@ Living catalogue of all planned and implemented features. Updated as features ar
 | Destination pod pre-activation (warm, not yet live) | M5 | 🔲 Planned | — | 11 |
 | MemorySynced handoff gate signal to CutoverCoordinator | M5 | 🔲 Planned | — | 11, 0A |
 | Force-freeze after max rounds (bounded downtime guarantee) | M5 | 🔲 Planned | — | 11 |
+
+---
+
+## Traffic Drain and Verification (Agent 12)
+
+| Feature | Milestone | Status | ADR | Owning Agent |
+|---------|-----------|--------|-----|--------------|
+| EndpointSlice transition management (add new before removing old) | M3 | 🔲 Planned | ADR-0012 | 12 |
+| TrafficVerified gate (blocks source pod deletion) | M3 | 🔲 Planned | ADR-0012 | 12, 0A |
+| eBPF packet counter on new pod veth (traffic arrival detection) | M5 | 🔲 Planned | ADR-0012 | 12 |
+| AWS ALB target group registration + health check polling | M9 | 🔲 Planned | ADR-0012 | 12 |
+| AWS NLB target group integration | M9 | 🔲 Planned | ADR-0012 | 12 |
+| ALB connection draining before old target deregistration | M9 | 🔲 Planned | ADR-0012 | 12 |
+| Prometheus metrics-based traffic verification (PromQL hook) | M12 | 🔲 Planned | ADR-0012 | 12 |
+| Custom webhook verification hook (escape hatch) | M12 | 🔲 Planned | ADR-0012 | 12 |
+| Rollback-on-no-traffic (timeout → clean rollback, source never deleted) | M3 | 🔲 Planned | ADR-0012 | 12, 0A |
+| Old pod drain (stop new connections, let in-flight complete) | M3 | 🔲 Planned | ADR-0012 | 12 |
