@@ -1,0 +1,23 @@
+---
+# Self-signed Issuer for development. In production, swap to a real CA-backed Issuer.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: podmotion-selfsigned-issuer
+  namespace: podmotion-system
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: podmotion-serving-cert
+  namespace: podmotion-system
+spec:
+  dnsNames:
+    - podmotion-webhook-service.podmotion-system.svc
+    - podmotion-webhook-service.podmotion-system.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: podmotion-selfsigned-issuer
+  secretName: podmotion-webhook-server-cert

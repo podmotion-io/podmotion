@@ -1,0 +1,45 @@
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: podmotion-validating-webhook-configuration
+  annotations:
+    # cert-manager injects the CA bundle into this annotation.
+    cert-manager.io/inject-ca-from: podmotion-system/podmotion-serving-cert
+webhooks:
+  - name: vpodmigration.podmotion.io
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: podmotion-webhook-service
+        namespace: podmotion-system
+        path: /validate-podmotion-io-v1alpha1-podmigration
+    failurePolicy: Fail
+    rules:
+      - apiGroups: ["migration.podmotion.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["podmigrations"]
+    sideEffects: None
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: podmotion-mutating-webhook-configuration
+  annotations:
+    cert-manager.io/inject-ca-from: podmotion-system/podmotion-serving-cert
+webhooks:
+  - name: mpodmigration.podmotion.io
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: podmotion-webhook-service
+        namespace: podmotion-system
+        path: /mutate-podmotion-io-v1alpha1-podmigration
+    failurePolicy: Fail
+    rules:
+      - apiGroups: ["migration.podmotion.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE"]
+        resources: ["podmigrations"]
+    sideEffects: None
