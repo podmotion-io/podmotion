@@ -11,7 +11,10 @@ require (
 	sigs.k8s.io/controller-runtime v0.23.3
 )
 
-require github.com/kylelemons/godebug v1.1.0 // indirect
+require (
+	github.com/checkpoint-restore/go-criu/v7 v7.2.0 // indirect
+	github.com/kylelemons/godebug v1.1.0 // indirect
+)
 
 require (
 	cel.dev/expr v0.24.0 // indirect
