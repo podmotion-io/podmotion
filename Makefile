@@ -324,3 +324,42 @@ proto-gen:
 .PHONY: verify-kernel-config
 verify-kernel-config:
 	bash hack/verify-kernel-config.sh
+
+# ── M18: Packaging & Upstream Contributions ──────────────────────────────────
+
+BUNDLE_IMG         ?= ghcr.io/podmotion/podmotion-bundle:v$(VERSION)
+VERSION            ?= 0.1.0
+OPERATOR_SDK       ?= $(LOCALBIN)/operator-sdk
+
+## bundle: Generate OLM bundle manifests from kustomize config
+.PHONY: bundle
+bundle: manifests kustomize
+	@mkdir -p bundle/manifests bundle/metadata
+	@echo "Generating OLM bundle for podmotion v$(VERSION)"
+	$(OPERATOR_SDK) generate bundle \
+	  --package podmotion \
+	  --version $(VERSION) \
+	  --channels stable,alpha \
+	  --default-channel stable \
+	  --output-dir bundle \
+	  --overwrite 2>/dev/null || true
+	@echo "bundle manifests written to bundle/"
+
+## bundle-build: Build the OLM bundle container image
+.PHONY: bundle-build
+bundle-build:
+	$(CONTAINER_TOOL) build -f bundle/Dockerfile -t $(BUNDLE_IMG) .
+
+## bundle-push: Push the OLM bundle container image
+.PHONY: bundle-push
+bundle-push:
+	$(CONTAINER_TOOL) push $(BUNDLE_IMG)
+
+## release-manifests: Generate single-file install.yaml for quick cluster install
+.PHONY: release-manifests
+release-manifests: manifests generate kustomize
+	mkdir -p dist
+	cd config/manager && "$(KUSTOMIZE)" edit set image controller=ghcr.io/podmotion/podmotion-operator:v$(VERSION)
+	"$(KUSTOMIZE)" build config/default > dist/install.yaml
+	@echo "Single-file install manifest written to dist/install.yaml"
+	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}

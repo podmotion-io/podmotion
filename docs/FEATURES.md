@@ -112,7 +112,7 @@ Living catalogue of all planned and implemented features. Updated as features ar
 | `kubectl podmotion cancel` | M3 | 🔲 Planned | — | 0A |
 | `kubectl podmotion describe` | M3 | 🔲 Planned | — | 0A |
 | `kubectl podmotion estimate` | M2 | 🔲 Planned | — | 0A, 1 |
-| Native `kubectl migrate` (fork, upstream proposal) | M18 | 🔲 Planned | — | 0B |
+| Native `kubectl migrate` (fork, upstream proposal) | M18 | ✅ Done | — | 0B |
 
 ---
 
@@ -143,9 +143,9 @@ Living catalogue of all planned and implemented features. Updated as features ar
 
 | Feature | Milestone | Status | ADR | Owning Agent |
 |---------|-----------|--------|-----|--------------|
-| KEP draft: kubelet Restore API (companion to KEP-2008) | M18 | 🔲 Planned | — | 0B, 10 |
-| Upstream descheduler EvictPlugin PR | M18 | 🔲 Planned | — | 0B, 5 |
-| OperatorHub bundle | M18 | 🔲 Planned | — | 10 |
+| KEP draft: kubelet Restore API (companion to KEP-2008) | M18 | ✅ Done | — | 0B, 10 |
+| Upstream descheduler EvictPlugin PR | M18 | ✅ Done | — | 0B, 5 |
+| OperatorHub bundle | M18 | ✅ Done | — | 10 |
 
 ---
 
