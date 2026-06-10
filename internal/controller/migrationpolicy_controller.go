@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -25,6 +26,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	stsorch "github.com/podmotion-io/podmotion/internal/controller/statefulset"
 )
 
 // MigrationPolicyReconciler reconciles a MigrationPolicy object
@@ -33,6 +35,9 @@ type MigrationPolicyReconciler struct {
 	Scheme *runtime.Scheme
 	// Now is injectable for deterministic unit tests.
 	Now func() time.Time
+	// STSOrchestrator handles StatefulSet-targeted migration plans.
+	// Injected so tests can override; production wire in SetupWithManager.
+	STSOrchestrator *stsorch.StatefulSetMigrationOrchestrator
 }
 
 // +kubebuilder:rbac:groups=migration.podmotion.io,resources=migrationpolicies,verbs=get;list;watch;create;update;patch;delete
@@ -41,6 +46,7 @@ type MigrationPolicyReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=migration.podmotion.io,resources=podmigrations,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch
 
 func (r *MigrationPolicyReconciler) now() time.Time {
 	if r.Now != nil {
@@ -108,6 +114,11 @@ func (r *MigrationPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if active >= policy.Spec.MaxConcurrentMigrations {
 		log.Info("max concurrent migrations reached", "active", active, "max", policy.Spec.MaxConcurrentMigrations)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// --- StatefulSet-targeted migration path ---
+	if policy.Spec.StatefulSetRef != nil {
+		return r.reconcileStatefulSet(ctx, &policy, pmList.Items, active, now)
 	}
 
 	// --- Find candidate pods via selector ---
@@ -222,6 +233,134 @@ func (r *MigrationPolicyReconciler) buildPodMigration(policy *pmv1.MigrationPoli
 			Namespace:    policy.Namespace,
 			Labels: map[string]string{
 				"migration.podmotion.io/policy": policy.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: pmv1.GroupVersion.String(),
+					Kind:       "MigrationPolicy",
+					Name:       policy.Name,
+					UID:        policy.UID,
+				},
+			},
+		},
+		Spec: spec,
+	}
+}
+
+// reconcileStatefulSet handles migration for policies that target a StatefulSet directly.
+// It builds a migration plan via StatefulSetMigrationOrchestrator, then creates PodMigration
+// CRs for ordinals that are safe to migrate given current quorum and parallelism settings.
+func (r *MigrationPolicyReconciler) reconcileStatefulSet(
+	ctx context.Context,
+	policy *pmv1.MigrationPolicy,
+	existingMigrations []pmv1.PodMigration,
+	active int32,
+	now time.Time,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{
+		Namespace: policy.Namespace,
+		Name:      policy.Spec.StatefulSetRef.Name,
+	}, sts); err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("StatefulSet not found, requeueing", "sts", policy.Spec.StatefulSetRef.Name)
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	// Build in-flight ordinal set from existing non-terminal migrations.
+	inFlight := map[int]bool{}
+	for _, pm := range existingMigrations {
+		if pm.Spec.MigrationPolicyRef == nil || pm.Spec.MigrationPolicyRef.Name != policy.Name {
+			continue
+		}
+		if isTerminal(pm.Status.Phase) {
+			continue
+		}
+		// Derive ordinal from pod name suffix (e.g. "myapp-2" → 2).
+		ord, err := stsorch.OrdinalFromPodName(pm.Spec.PodName)
+		if err == nil {
+			inFlight[ord] = true
+		}
+	}
+
+	safeParallelism := int(policy.Spec.SafeOrdinalParallelism)
+	if safeParallelism < 1 {
+		safeParallelism = 1
+	}
+
+	orch := r.STSOrchestrator
+	if orch == nil {
+		orch = &stsorch.StatefulSetMigrationOrchestrator{Client: r.Client}
+	}
+
+	batch, err := orch.NextBatch(ctx, sts, inFlight, safeParallelism)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("statefulset next batch: %w", err)
+	}
+
+	for _, ord := range batch {
+		podName := fmt.Sprintf("%s-%d", sts.Name, ord)
+		if r.alreadyMigrating(existingMigrations, podName, policy.Namespace) {
+			continue
+		}
+		pm := r.buildStatefulSetPodMigration(policy, podName)
+		if err := r.Create(ctx, pm); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				log.Error(err, "failed to create StatefulSet PodMigration", "pod", podName)
+			}
+			continue
+		}
+		log.Info("created StatefulSet PodMigration", "migration", pm.Name, "pod", podName, "ordinal", ord)
+		active++
+		policy.Status.TotalMigrations++
+		t := metav1.NewTime(now)
+		policy.Status.LastTriggerTime = &t
+		if err := r.Status().Update(ctx, policy); err != nil {
+			return ctrl.Result{}, err
+		}
+		if active >= policy.Spec.MaxConcurrentMigrations {
+			break
+		}
+	}
+
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
+func (r *MigrationPolicyReconciler) buildStatefulSetPodMigration(policy *pmv1.MigrationPolicy, podName string) *pmv1.PodMigration {
+	spec := pmv1.PodMigrationSpec{
+		PodName:            podName,
+		PodNamespace:       policy.Namespace,
+		MigrationPolicyRef: &corev1.LocalObjectReference{Name: policy.Name},
+	}
+	if policy.Spec.MigrationDefaults != nil {
+		d := policy.Spec.MigrationDefaults
+		if d.Mode != "" {
+			spec.Mode = d.Mode
+		}
+		if d.PreCopyMaxRounds > 0 {
+			spec.PreCopyMaxRounds = d.PreCopyMaxRounds
+		}
+		if d.BandwidthLimitMbps > 0 {
+			spec.BandwidthLimitMbps = d.BandwidthLimitMbps
+		}
+		if d.CompletionTimeoutSeconds > 0 {
+			spec.CompletionTimeoutSeconds = d.CompletionTimeoutSeconds
+		}
+		spec.StorageStrategy = d.StorageStrategy
+		spec.NetworkContinuity = d.NetworkContinuity
+		spec.RollbackOnFailure = d.RollbackOnFailure
+	}
+	return &pmv1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: policy.Name + "-sts-",
+			Namespace:    policy.Namespace,
+			Labels: map[string]string{
+				"migration.podmotion.io/policy":      policy.Name,
+				"migration.podmotion.io/statefulset": policy.Spec.StatefulSetRef.Name,
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				{
