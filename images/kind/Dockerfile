@@ -23,13 +23,13 @@ RUN criu --version || true
 RUN mkdir -p /etc/containerd/conf.d /usr/local/lib/nri
 
 # Enable NRI in containerd
-COPY nri.toml /etc/containerd/conf.d/nri.toml
+COPY images/capi/ansible/roles/podmotion-node/files/nri.toml /etc/containerd/conf.d/nri.toml
 
 # bpffs systemd mount unit
-COPY sys-fs-bpf.mount /etc/systemd/system/sys-fs-bpf.mount
+COPY images/capi/ansible/roles/podmotion-node/files/sys-fs-bpf.mount /etc/systemd/system/sys-fs-bpf.mount
 RUN systemctl enable sys-fs-bpf.mount 2>/dev/null || true
 
-# Stub agent binaries — replaced by 'make kind-load' once real binaries are built
-RUN touch /usr/local/bin/podmotion-agent \
-  && touch /usr/local/lib/nri/podmotion-nri \
-  && chmod +x /usr/local/bin/podmotion-agent /usr/local/lib/nri/podmotion-nri
+# Install real agent binary (compiled for linux/amd64)
+COPY bin/agent-linux-amd64 /usr/local/bin/podmotion-agent
+RUN chmod +x /usr/local/bin/podmotion-agent \
+  && ln -sf /usr/local/bin/podmotion-agent /usr/local/lib/nri/podmotion-nri
