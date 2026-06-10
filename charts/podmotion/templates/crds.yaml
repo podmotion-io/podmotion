@@ -1,0 +1,11 @@
+{{- if .Values.installCRDs }}
+# CRDs are installed inline when installCRDs=true.
+# For production clusters, prefer managing CRDs separately via:
+#   kubectl apply -k config/crd/bases/
+# to avoid accidental CRD deletion on helm uninstall.
+{{- $files := .Files }}
+{{- range $path, $_ := .Files.Glob "crds/*.yaml" }}
+---
+{{ $files.Get $path }}
+{{- end }}
+{{- end }}
