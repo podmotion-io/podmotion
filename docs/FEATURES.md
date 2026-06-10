@@ -26,7 +26,7 @@ Living catalogue of all planned and implemented features. Updated as features ar
 | Rollback on failure (unfreeze source pod) | M2 | 🔲 Planned | — | 0A, 4 |
 | Migration bandwidth throttling | M4 | 🔲 Planned | — | 7 |
 | Completion timeout with auto-abort | M2 | 🔲 Planned | — | 0A, 4 |
-| GPU workload migration (NVIDIA CUDA) | M15 | 🧪 Experimental | — | 1 |
+| GPU workload migration (NVIDIA CUDA) | M15 | 🧪 Experimental | ADR-0032 | 1 | Requires `--feature-gates=GPUMigration=true`; driver >= 525 |
 
 ---
 

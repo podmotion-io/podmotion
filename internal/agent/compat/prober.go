@@ -18,6 +18,16 @@ import (
 	migrationv1alpha1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 )
 
+// GPUProbeResult holds the result of the GPU capability probe.
+type GPUProbeResult struct {
+	// Available is true when nvidia-smi is on PATH.
+	Available bool
+	// DriverVersion is the NVIDIA driver version string (e.g. "530.30.02").
+	DriverVersion string
+	// SupportedCheckpoint is true when the driver version meets the CUDA checkpoint minimum (525+).
+	SupportedCheckpoint bool
+}
+
 // ProbeResult contains all capability data for a single probe run.
 type ProbeResult struct {
 	Spec   migrationv1alpha1.NodeMigrationCapacitySpec
@@ -44,6 +54,10 @@ func (p *Prober) Run(ctx context.Context) (ProbeResult, error) {
 	result.Spec.NetworkCapability.IPMobilitySupported = ipMobility
 	result.Spec.NetworkCapability.IPMobilityMode = ipMobilityMode
 
+	gpu := ProbeGPU()
+	result.Spec.GPUMigrationSupported = gpu.SupportedCheckpoint
+	result.Spec.GPUDriverVersion = gpu.DriverVersion
+
 	if srcDstOk, err := ProbeAWSSourceDestCheck(ctx); err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("AWS src/dst check probe: %v", err))
 	} else if !srcDstOk {
@@ -65,6 +79,37 @@ func probeCRIUVersion() string {
 		}
 	}
 	return ""
+}
+
+// ProbeGPU detects NVIDIA GPU availability and driver version via nvidia-smi.
+// Returns a zero-value result (Available=false) when no GPU hardware is present —
+// this is not an error, just an absent capability.
+func ProbeGPU() GPUProbeResult {
+	const minMajor = 525
+
+	out, err := exec.Command("nvidia-smi",
+		"--query-gpu=driver_version",
+		"--format=csv,noheader",
+	).Output()
+	if err != nil {
+		return GPUProbeResult{}
+	}
+	dv := strings.TrimSpace(string(out))
+	if dv == "" {
+		return GPUProbeResult{Available: true}
+	}
+
+	parts := strings.SplitN(dv, ".", 2)
+	var major int
+	if _, err := fmt.Sscanf(parts[0], "%d", &major); err != nil {
+		return GPUProbeResult{Available: true, DriverVersion: dv}
+	}
+
+	return GPUProbeResult{
+		Available:           true,
+		DriverVersion:       dv,
+		SupportedCheckpoint: major >= minMajor,
+	}
 }
 
 func probeNRIEnabled() bool {
