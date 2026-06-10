@@ -1,2 +1,7 @@
 resources:
 - manager.yaml
+
+images:
+- name: controller:latest
+  newName: podmotion-operator
+  newTag: dev

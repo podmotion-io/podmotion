@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: podmotion-agent
+  namespace: podmotion-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: podmotion-agent-role
+rules:
+- apiGroups: ["migration.podmotion.io"]
+  resources: ["nodemigrationcapacities"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: podmotion-agent-rolebinding
+subjects:
+- kind: ServiceAccount
+  name: podmotion-agent
+  namespace: podmotion-system
+roleRef:
+  kind: ClusterRole
+  name: podmotion-agent-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: podmotion-agent
+  namespace: podmotion-system
+  labels:
+    app: podmotion-agent
+spec:
+  selector:
+    matchLabels:
+      app: podmotion-agent
+  template:
+    metadata:
+      labels:
+        app: podmotion-agent
+    spec:
+      serviceAccountName: podmotion-agent
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: agent
+        image: podmotion-agent:dev
+        imagePullPolicy: Never
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        ports:
+        - containerPort: 9090
+          name: grpc
+          protocol: TCP
+        securityContext:
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - "ALL"
+        resources:
+          limits:
+            cpu: 200m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 32Mi
