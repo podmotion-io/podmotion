@@ -10,6 +10,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -34,6 +35,8 @@ import (
 	"github.com/podmotion-io/podmotion/internal/featuregate"
 	"github.com/podmotion-io/podmotion/internal/rollback"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -322,6 +325,12 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 
 	// Drive the checkpoint via the agent gRPC client if the pool is wired.
 	if r.AgentPool == nil {
+		log.Error(nil, "AgentPool is nil — cannot issue Checkpoint RPC; requeuing", "migration", pm.Name)
+		setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "AgentPoolUnavailable",
+			"AgentPool not wired; waiting for agent pool to become available")
+		if err := r.Status().Update(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 	}
 
@@ -382,16 +391,47 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		log.Info("GPU checkpoint captured", "migration", pm.Name, "gpuDir", gpuDir)
 	}
 
-	// Step 2: Checkpoint — freeze and dump.
-	_, err = agentClient.Checkpoint(ctx, &agentpb.CheckpointRequest{
-		MigrationName: pm.Name,
+	// Step 2: Checkpoint — freeze and dump via real CRIU gRPC call.
+	checkpointResp, err := agentClient.Checkpoint(ctx, &agentpb.CheckpointRequest{
+		MigrationName:   pm.Name,
+		TcpEstablished:  pm.Spec.NetworkContinuity,
+		ApplyZeroWindow: pm.Spec.NetworkContinuity,
 	})
 	if err != nil {
-		setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CheckpointFailed", err.Error())
+		errStr := err.Error()
+		// Distinguish transient connection errors from hard capability failures.
+		if grpcStatus, ok := status.FromError(err); ok && grpcStatus.Code() == codes.Unavailable {
+			log.Error(err, "Checkpoint RPC unavailable — requeuing", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		if strings.Contains(errStr, "ptrace") || strings.Contains(errStr, "EPERM") ||
+			strings.Contains(errStr, "capability") || strings.Contains(errStr, "permission denied") {
+			log.Error(err, "Checkpoint RPC failed: CRIU capability/ptrace error", "migration", pm.Name)
+			setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CRIUCapabilityError",
+				fmt.Sprintf("CRIU ptrace/capability error: %v", err))
+			return ctrl.Result{}, r.Status().Update(ctx, pm)
+		}
+		log.Error(err, "Checkpoint RPC failed", "migration", pm.Name)
+		setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CheckpointFailed", errStr)
 		return ctrl.Result{}, r.Status().Update(ctx, pm)
 	}
 
-	setCondition(pm, conditionCheckpointed, metav1.ConditionTrue, "Checkpointed", "Checkpoint captured by agent")
+	// Store the checkpoint reference so reconcileTransferring can advance.
+	// The agent writes images to /var/lib/podmotion/checkpoints/<migrationName>/final/;
+	// pm.Name is the canonical reference key used by the transfer and restore agents.
+	pm.Status.CheckpointRef = &corev1.LocalObjectReference{Name: pm.Name}
+
+	checkpointMsg := "Checkpoint captured by agent"
+	if checkpointResp != nil {
+		checkpointMsg = fmt.Sprintf("Checkpoint captured: size=%d bytes sha256=%s freeze=%dms",
+			checkpointResp.CheckpointSizeBytes, checkpointResp.CheckpointSha256, checkpointResp.FreezeDurationMs)
+		log.Info("CRIU checkpoint complete", "migration", pm.Name,
+			"sizeBytes", checkpointResp.CheckpointSizeBytes,
+			"sha256", checkpointResp.CheckpointSha256,
+			"freezeDurationMs", checkpointResp.FreezeDurationMs)
+	}
+
+	setCondition(pm, conditionCheckpointed, metav1.ConditionTrue, "Checkpointed", checkpointMsg)
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseTransferring)
 }
 
