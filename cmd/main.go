@@ -37,6 +37,7 @@ import (
 
 	migrationv1alpha1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	"github.com/podmotion-io/podmotion/internal/controller"
+	pmwebhook "github.com/podmotion-io/podmotion/internal/webhook"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -211,6 +212,14 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "migrationwebhookconfig")
+		os.Exit(1)
+	}
+	if err := (&pmwebhook.PodMigrationValidator{}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to register webhook", "webhook", "PodMigrationValidator")
+		os.Exit(1)
+	}
+	if err := (&pmwebhook.PodMigrationDefaulter{}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to register webhook", "webhook", "PodMigrationDefaulter")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
