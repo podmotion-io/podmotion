@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pm-test-nginx
+  namespace: pm-e2e
+  labels:
+    app: pm-test-nginx
+    podmotion.io/test-workload: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pm-test-nginx
+  template:
+    metadata:
+      labels:
+        app: pm-test-nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pm-test-nginx
+  namespace: pm-e2e
+spec:
+  selector:
+    app: pm-test-nginx
+  ports:
+    - port: 80
+      targetPort: 80

@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pm-test-postgres-data
+  namespace: pm-e2e
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pm-test-postgres
+  namespace: pm-e2e
+  labels:
+    app: pm-test-postgres
+    podmotion.io/test-workload: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pm-test-postgres
+  template:
+    metadata:
+      labels:
+        app: pm-test-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_DB
+              value: pmtest
+            - name: POSTGRES_USER
+              value: pmtest
+            - name: POSTGRES_PASSWORD
+              value: pmtest
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "pmtest", "-d", "pmtest"]
+            initialDelaySeconds: 5
+            periodSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: pm-test-postgres-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pm-test-postgres
+  namespace: pm-e2e
+spec:
+  selector:
+    app: pm-test-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

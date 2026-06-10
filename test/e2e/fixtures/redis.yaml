@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pm-test-redis
+  namespace: pm-e2e
+  labels:
+    app: pm-test-redis
+    podmotion.io/test-workload: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pm-test-redis
+  template:
+    metadata:
+      labels:
+        app: pm-test-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.2-alpine
+          command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+      volumes:
+        - name: redis-data
+          emptyDir: {}   # no PVC in M3 cold migration test; PVC added in M6
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pm-test-redis
+  namespace: pm-e2e
+spec:
+  selector:
+    app: pm-test-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
