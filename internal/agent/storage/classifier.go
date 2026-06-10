@@ -1,0 +1,208 @@
+/*
+Copyright 2026 PodMotion Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+*/
+
+// Package storage implements M6 storage tier classification and migration
+// strategies for PodMotion live pod migration.
+//
+// Tier hierarchy (ADR-0007):
+//
+//	Tier0: ReadWriteMany (NFS, CephFS) — re-attach only, zero data movement
+//	Tier1: Longhorn dual-engine live migration
+//	Tier2: Ceph RBD (rbd.csi.ceph.com) — live migration via CSI
+//	Tier3: RWO generic — snapshot + rsync
+//	Tier4: hostPath / memory emptyDir — blocked by webhook before we get here
+package storage
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// StorageTier identifies which migration strategy to use for a PVC.
+type StorageTier int32
+
+const (
+	// TierRWX is a ReadWriteMany volume — re-attach only, StorageReadyForFreeze is immediate.
+	TierRWX StorageTier = 0
+	// TierLonghorn uses Longhorn dual-engine live migration.
+	TierLonghorn StorageTier = 1
+	// TierCephRBD uses Ceph RBD live migration via CSI.
+	TierCephRBD StorageTier = 2
+	// TierSnapshotRsync snapshots the PVC and rsyncs to destination.
+	TierSnapshotRsync StorageTier = 3
+	// TierBlocked is a volume type (hostPath, memory emptyDir) that cannot be migrated.
+	// The webhook rejects pods with Tier4 volumes before migration begins.
+	TierBlocked StorageTier = 4
+)
+
+// TierClassification holds the result of classifying a single PVC.
+type TierClassification struct {
+	Tier         StorageTier
+	Reason       string
+	PVCName      string
+	StorageClass string
+}
+
+// StorageClassifier inspects a pod's PVCs and determines the appropriate
+// migration tier for each volume.
+type StorageClassifier struct {
+	client client.Client
+}
+
+// NewStorageClassifier returns a classifier backed by the given k8s client.
+func NewStorageClassifier(c client.Client) *StorageClassifier {
+	return &StorageClassifier{client: c}
+}
+
+// ClassifyPod returns a TierClassification for each PVC mounted by the pod.
+// If the pod has no PVCs it returns an empty slice — Tier0 re-attach logic applies.
+// The highest-cost tier across all PVCs determines the overall migration strategy.
+func (sc *StorageClassifier) ClassifyPod(ctx context.Context, pod *corev1.Pod) ([]TierClassification, error) {
+	var results []TierClassification
+
+	for _, vol := range pod.Spec.Volumes {
+		// hostPath and memory emptyDir are caught by the webhook, but guard defensively.
+		if vol.HostPath != nil {
+			results = append(results, TierClassification{
+				Tier:    TierBlocked,
+				Reason:  "hostPath volumes cannot be migrated",
+				PVCName: vol.Name,
+			})
+			continue
+		}
+		if vol.EmptyDir != nil && vol.EmptyDir.Medium == corev1.StorageMediumMemory {
+			results = append(results, TierClassification{
+				Tier:    TierBlocked,
+				Reason:  "memory-backed emptyDir cannot be migrated",
+				PVCName: vol.Name,
+			})
+			continue
+		}
+
+		if vol.PersistentVolumeClaim == nil {
+			// Non-PVC volumes (configMap, secret, emptyDir disk) are transparent — no classification needed.
+			continue
+		}
+
+		clsf, err := sc.classifyPVC(ctx, pod.Namespace, vol.PersistentVolumeClaim.ClaimName)
+		if err != nil {
+			return nil, fmt.Errorf("classify pvc %s: %w", vol.PersistentVolumeClaim.ClaimName, err)
+		}
+		results = append(results, clsf)
+	}
+
+	return results, nil
+}
+
+// HighestTier returns the most expensive tier from a slice of classifications.
+// Tier4 (blocked) always wins; Tier0 only wins if nothing else is present.
+func HighestTier(classifications []TierClassification) TierClassification {
+	if len(classifications) == 0 {
+		return TierClassification{
+			Tier:   TierRWX,
+			Reason: "no PVCs — treat as RWX re-attach",
+		}
+	}
+	highest := classifications[0]
+	for _, c := range classifications[1:] {
+		if c.Tier > highest.Tier {
+			highest = c
+		}
+	}
+	return highest
+}
+
+func (sc *StorageClassifier) classifyPVC(ctx context.Context, namespace, name string) (TierClassification, error) {
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := sc.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, pvc); err != nil {
+		return TierClassification{}, fmt.Errorf("get pvc: %w", err)
+	}
+
+	// ReadWriteMany always maps to Tier0 regardless of storage provider.
+	for _, am := range pvc.Spec.AccessModes {
+		if am == corev1.ReadWriteMany {
+			return TierClassification{
+				Tier:    TierRWX,
+				Reason:  "ReadWriteMany access mode — re-attach only",
+				PVCName: name,
+			}, nil
+		}
+	}
+
+	// Resolve StorageClass to inspect provisioner annotations.
+	scName := ""
+	if pvc.Spec.StorageClassName != nil {
+		scName = *pvc.Spec.StorageClassName
+	}
+
+	if scName != "" {
+		sc2 := &storagev1.StorageClass{}
+		if err := sc.client.Get(ctx, client.ObjectKey{Name: scName}, sc2); err == nil {
+			tier := classifyByStorageClass(sc2)
+			return TierClassification{
+				Tier:         tier,
+				Reason:       reasonForTier(tier, sc2.Provisioner),
+				PVCName:      name,
+				StorageClass: scName,
+			}, nil
+		}
+		// If StorageClass not found, fall through to Tier3 (generic RWO snapshot+rsync).
+	}
+
+	return TierClassification{
+		Tier:         TierSnapshotRsync,
+		Reason:       "no StorageClass resolved — falling back to snapshot+rsync",
+		PVCName:      name,
+		StorageClass: scName,
+	}, nil
+}
+
+// classifyByStorageClass maps a StorageClass provisioner to a StorageTier.
+// Longhorn takes priority over Ceph because Longhorn's dual-engine migration
+// is less disruptive than RBD mirroring for single-replica volumes.
+func classifyByStorageClass(sc *storagev1.StorageClass) StorageTier {
+	p := sc.Provisioner
+
+	// Longhorn: driver.longhorn.io or any longhorn.io/* annotation
+	if strings.Contains(p, "longhorn.io") {
+		return TierLonghorn
+	}
+	for k := range sc.Annotations {
+		if strings.HasPrefix(k, "longhorn.io/") {
+			return TierLonghorn
+		}
+	}
+
+	// Ceph RBD via CSI
+	if strings.Contains(p, "rbd.csi.ceph.com") {
+		return TierCephRBD
+	}
+
+	// CephFS via CSI — still RWX capable but single-access RWO mode treated as Tier3
+	// unless the PVC actually has RWX (handled above).
+	if strings.Contains(p, "cephfs.csi.ceph.com") {
+		return TierSnapshotRsync
+	}
+
+	return TierSnapshotRsync
+}
+
+func reasonForTier(tier StorageTier, provisioner string) string {
+	switch tier {
+	case TierLonghorn:
+		return fmt.Sprintf("Longhorn provisioner (%s) — dual-engine live migration", provisioner)
+	case TierCephRBD:
+		return fmt.Sprintf("Ceph RBD provisioner (%s) — live migration via CSI", provisioner)
+	default:
+		return fmt.Sprintf("provisioner %s — snapshot+rsync fallback", provisioner)
+	}
+}

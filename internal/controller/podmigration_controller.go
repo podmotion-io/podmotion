@@ -26,6 +26,7 @@ import (
 	agentclient "github.com/podmotion-io/podmotion/internal/agent/client"
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
 	"github.com/podmotion-io/podmotion/internal/agent/replication"
+	"github.com/podmotion-io/podmotion/internal/agent/storage"
 	"github.com/podmotion-io/podmotion/internal/estimation"
 	"github.com/podmotion-io/podmotion/internal/rollback"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
@@ -59,6 +60,9 @@ type PodMigrationReconciler struct {
 	// Checkpointer is the CRIU checkpointer used by the replication loop.
 	// Defaults to StubCheckpointer when nil.
 	Checkpointer criu.Checkpointer
+	// StorageMgr drives storage pre-stage concurrently with the pre-copy loop (M6).
+	// Nil in unit tests — PreMigrating phase skips storage goroutine when nil.
+	StorageMgr *storage.StorageMigrationManager
 }
 
 // +kubebuilder:rbac:groups=migration.podmotion.io,resources=podmigrations,verbs=get;list;watch;create;update;patch;delete
@@ -236,6 +240,19 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 			}
 		}()
 		log.Info("launched pre-copy loop goroutine", "migration", pm.Name)
+	}
+
+	// Launch the storage pre-stage goroutine concurrently with the pre-copy loop (ADR-0011).
+	// Detected as "not yet started" by the absence of the StorageReadyForFreeze condition.
+	storageCond := meta.FindStatusCondition(pm.Status.Conditions, conditionStorageReady)
+	if storageCond == nil && r.StorageMgr != nil {
+		pmCopy := pm.DeepCopy()
+		go func() {
+			if err := r.StorageMgr.RunPreStage(context.Background(), pmCopy); err != nil {
+				log.Error(err, "storage pre-stage failed", "migration", pmCopy.Name)
+			}
+		}()
+		log.Info("launched storage pre-stage goroutine", "migration", pm.Name)
 	}
 
 	// Requeue after a short interval to re-check agent progress.
