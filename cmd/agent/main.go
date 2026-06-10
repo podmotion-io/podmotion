@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
+	"github.com/podmotion-io/podmotion/internal/agent/nmcregistrar"
 	"github.com/podmotion-io/podmotion/internal/agent/nri"
 	"github.com/podmotion-io/podmotion/internal/agent/server"
 	agenttls "github.com/podmotion-io/podmotion/internal/agent/tls"
@@ -42,7 +43,12 @@ func main() {
 		log.Error(err, "Failed to build in-cluster kubeconfig")
 		os.Exit(1)
 	}
-	_ = cfg
+
+	registrar, regErr := nmcregistrar.New(cfg, nodeName)
+	if regErr != nil {
+		log.Error(regErr, "Failed to build NMC registrar — NMC registration will be skipped")
+		registrar = nil
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
@@ -94,7 +100,16 @@ func main() {
 		}
 	}()
 
-	// TODO(M1): run compat prober → create/update NodeMigrationCapacity CR
+	// Register NodeMigrationCapacity for this node.
+	// Non-fatal: agent still serves gRPC even if NMC registration fails temporarily.
+	if registrar != nil {
+		if err := registrar.Register(ctx); err != nil {
+			log.Error(err, "NMC registration failed — will retry via heartbeat")
+		} else {
+			log.Info("NodeMigrationCapacity registered", "node", nodeName)
+		}
+	}
+
 	// TODO(M1): start metrics server on :9091
 
 	// Heartbeat loop — updates NMC status.lastHeartbeat every 30s.
@@ -106,10 +121,18 @@ func main() {
 			select {
 			case <-ctx.Done():
 				log.Info("Shutting down — marking node not ready for migration")
-				// TODO(M1): patch NMC status.ready=false
+				if registrar != nil {
+					if err := registrar.Deregister(context.Background()); err != nil {
+						log.Error(err, "Failed to deregister NMC on shutdown")
+					}
+				}
 				return
 			case <-ticker.C:
-				// TODO(M1): patch NMC status.lastHeartbeat = now
+				if registrar != nil {
+					if err := registrar.Heartbeat(ctx); err != nil {
+						log.Error(err, "NMC heartbeat failed")
+					}
+				}
 			}
 		}
 	}()
