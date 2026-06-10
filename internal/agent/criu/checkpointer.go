@@ -14,9 +14,10 @@ you may not use this file except in compliance with the License.
 //     image has CRIU installed and the kind cluster is running
 //
 // CRIU invocation model:
-//   criu dump  --tree <PID> --images-dir <dir> --track-mem  (pre-dump)
-//   criu dump  --tree <PID> --images-dir <dir> --prev-images-dir <prev> (final dump)
-//   criu restore --images-dir <dir> --restore-detached
+//
+//	criu dump  --tree <PID> --images-dir <dir> --track-mem  (pre-dump)
+//	criu dump  --tree <PID> --images-dir <dir> --prev-images-dir <prev> (final dump)
+//	criu restore --images-dir <dir> --restore-detached
 //
 // All invocations go through go-criu RPC (LGPL-2.1, Apache-compatible).
 // PodMotion never statically links CRIU (GPLv2). See ADR-0002.
@@ -124,10 +125,10 @@ type StubCheckpointer struct {
 	SimulatedFreezeDurationMs int64
 
 	// Recorded calls for test assertions.
-	PreDumpCalls  []PreDumpOptions
-	DumpCalls     []DumpOptions
-	RestoreCalls  []RestoreOptions
-	AbortCalls    []string
+	PreDumpCalls []PreDumpOptions
+	DumpCalls    []DumpOptions
+	RestoreCalls []RestoreOptions
+	AbortCalls   []string
 }
 
 func (s *StubCheckpointer) PreDump(_ context.Context, opts PreDumpOptions) (CheckpointResult, error) {

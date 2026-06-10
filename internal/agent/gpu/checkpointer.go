@@ -24,9 +24,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"strconv"
 	"strings"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const minDriverVersion = 525
@@ -255,4 +255,3 @@ func (s *GPUCheckpointerStub) Restore(_ context.Context, containerID, namespace,
 // ErrFeatureGateRequired is returned when a GPU migration is attempted but
 // the GPUMigration feature gate is not enabled. See ADR-0032.
 var ErrFeatureGateRequired = fmt.Errorf("GPU migration requires --feature-gates=GPUMigration=true")
-

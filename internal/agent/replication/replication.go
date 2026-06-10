@@ -67,10 +67,10 @@ func (r *ReplicationManager) RunPreCopyLoop(
 	}
 
 	var (
-		rounds       []RoundStats
-		prevDir      string
-		containerID  = pm.Spec.PodName // placeholder — real impl resolves via CRI
-		namespace    = "k8s.io"
+		rounds      []RoundStats
+		prevDir     string
+		containerID = pm.Spec.PodName // placeholder — real impl resolves via CRI
+		namespace   = "k8s.io"
 	)
 
 	for round := 0; int32(round) < maxRounds; round++ {

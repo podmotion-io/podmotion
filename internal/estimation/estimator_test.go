@@ -25,7 +25,7 @@ func TestConvergencePredict(t *testing.T) {
 		wantBelow float64
 	}{
 		{initial: 512, rounds: 5, threshold: 64, wantBelow: 64},
-		{initial: 32, rounds: 5, threshold: 64, wantBelow: 64},   // already below — returns quickly
+		{initial: 32, rounds: 5, threshold: 64, wantBelow: 64},    // already below — returns quickly
 		{initial: 2048, rounds: 3, threshold: 64, wantBelow: 300}, // not converged in 3 rounds
 	}
 	for _, tc := range tests {
@@ -80,10 +80,10 @@ func TestEstimator_Tier4SkipOverride(t *testing.T) {
 	}
 	nmc := &pmv1.NodeMigrationCapacity{}
 	spec := pmv1.PodMigrationSpec{
-		StorageStrategy:      pmv1.StorageStrategySkip,
-		PreCopyMaxRounds:     5,
+		StorageStrategy:         pmv1.StorageStrategySkip,
+		PreCopyMaxRounds:        5,
 		PreCopyDirtyThresholdMB: 64,
-		BandwidthLimitMbps:   1000,
+		BandwidthLimitMbps:      1000,
 	}
 
 	result, err := est.Estimate(context.Background(), pod, nmc, spec)

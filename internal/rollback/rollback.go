@@ -42,9 +42,9 @@ type Step interface {
 
 // DefaultRollbacker runs the three-step pipeline in fixed order: Network → Compute → Storage.
 type DefaultRollbacker struct {
-	NetworkStep  Step
-	ComputeStep  Step
-	StorageStep  Step
+	NetworkStep Step
+	ComputeStep Step
+	StorageStep Step
 }
 
 // Rollback implements Rollbacker.
@@ -111,8 +111,8 @@ func (s *StubStorageRollback) Execute(ctx context.Context, pm *pmv1.PodMigration
 // Used in cmd/main.go for M2; swap individual steps for real implementations as agents land.
 func NewStubRollbacker() *DefaultRollbacker {
 	return &DefaultRollbacker{
-		NetworkStep:  &StubNetworkRollback{},
-		ComputeStep:  &StubComputeRollback{},
-		StorageStep:  &StubStorageRollback{},
+		NetworkStep: &StubNetworkRollback{},
+		ComputeStep: &StubComputeRollback{},
+		StorageStep: &StubStorageRollback{},
 	}
 }

@@ -21,7 +21,7 @@ you may not use this file except in compliance with the License.
 //  9. Tier 4 storage block — reject if any pod volume matches a Tier-4 unsupported pattern AND
 //     storageStrategy is not explicitly set to Skip (caller's explicit opt-out).
 //  10. Range validations — preCopyMaxRounds [1,20], preCopyDirtyThresholdMB >=1,
-//      completionTimeoutSeconds >=30.
+//     completionTimeoutSeconds >=30.
 package webhook
 
 import (
@@ -48,9 +48,9 @@ var webhookLog = logf.Log.WithName("podmigration-webhook")
 // PodMigrationValidator implements the ValidatingAdmissionWebhook for PodMigration.
 // It is registered via SetupWithManager and served at /validate-podmotion-io-v1alpha1-podmigration.
 type PodMigrationValidator struct {
-	client     client.Client
-	decoder    admission.Decoder
-	Federator  multicluster.ClusterFederator
+	client    client.Client
+	decoder   admission.Decoder
+	Federator multicluster.ClusterFederator
 }
 
 // SetupWithManager registers the webhook with the controller-runtime manager.

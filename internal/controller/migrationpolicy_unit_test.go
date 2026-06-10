@@ -81,11 +81,11 @@ func TestCronMatches(t *testing.T) {
 	}{
 		{"* * * * *", true},
 		{"30 14 * * 2", true},
-		{"0 14 * * 2", false},   // minute 0, not 30
-		{"* 14 * * 1-5", true},  // weekday in range
-		{"* 14 * * 6", false},   // Saturday
-		{"*/15 * * * *", true},  // 30 % 15 == 0
-		{"*/7 * * * *", false},  // 30 % 7 != 0
+		{"0 14 * * 2", false},  // minute 0, not 30
+		{"* 14 * * 1-5", true}, // weekday in range
+		{"* 14 * * 6", false},  // Saturday
+		{"*/15 * * * *", true}, // 30 % 15 == 0
+		{"*/7 * * * *", false}, // 30 % 7 != 0
 		{"30,45 14 * * *", true},
 		{"0,15 14 * * *", false},
 	}

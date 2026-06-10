@@ -105,7 +105,8 @@ type PodMigrationSpec struct {
 
 	// NetworkContinuity enables TCP connection preservation via eBPF bridge and IP handoff.
 	// Requires CNI support — see NodeMigrationCapacity.status.cniIPMobilitySupported.
-	// +kubebuilder:default=true
+	// Defaults to false; eBPF bridge is not yet implemented (use TIER_4 cold migration path).
+	// +kubebuilder:default=false
 	NetworkContinuity bool `json:"networkContinuity,omitempty"`
 
 	// DryRun runs the estimation pipeline only; does not touch the running pod.
