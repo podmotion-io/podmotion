@@ -7,8 +7,8 @@ Licensed under the Apache License, Version 2.0.
 // Runs as a DaemonSet on every node. Responsibilities:
 //   - On startup: run compatibility probe, create/update NodeMigrationCapacity CR
 //   - Periodic heartbeat: update NMC status.lastHeartbeat and status.ready
-//   - gRPC server: MigrationAgentService, TransferService, HealthService
-//   - NRI plugin: hook into containerd Stopping events for pre-dump trigger
+//   - gRPC server: MigrationAgentService on :9090 (mTLS via cert-manager in production)
+//   - NRI plugin: hook into containerd Stopping events for pre-dump trigger (M5)
 package main
 
 import (
@@ -20,6 +20,11 @@ import (
 
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	"github.com/podmotion-io/podmotion/internal/agent/criu"
+	"github.com/podmotion-io/podmotion/internal/agent/nri"
+	"github.com/podmotion-io/podmotion/internal/agent/server"
+	agenttls "github.com/podmotion-io/podmotion/internal/agent/tls"
 )
 
 func main() {
@@ -43,13 +48,48 @@ func main() {
 
 	log.Info("PodMotion agent starting", "node", nodeName)
 
-	// TODO(M1): run compat prober → create/update NodeMigrationCapacity CR
-	// TODO(M1): start gRPC stub server on :9090
-	// TODO(M1): start metrics server on :9091
-	// TODO(M4): start NRI plugin
+	// Load mTLS config from cert-manager-provisioned secret mount.
+	// Falls back to insecure if certs are not present (dev/kind environment).
+	tlsCfg, err := agenttls.LoadServerConfig(
+		agenttls.DefaultCertFile,
+		agenttls.DefaultKeyFile,
+		agenttls.DefaultCAFile,
+	)
+	if err != nil {
+		log.Error(err, "Failed to load TLS config")
+		os.Exit(1)
+	}
 
-	// Heartbeat loop — updates NMC status.lastHeartbeat every 30s
-	// Sets status.ready=false on shutdown so scheduler stops sending migrations here
+	// M4: StubCheckpointer — replaced with CRIUCheckpointer in M5 once the
+	// kind node image ships with CRIU installed and /proc/sys/kernel/perf_event_paranoid
+	// is set appropriately.
+	checkpointer := &criu.StubCheckpointer{
+		SimulatedDirtyMB:         128,
+		SimulatedFreezeDurationMs: 150,
+	}
+
+	agentSrv := server.New(nodeName, checkpointer)
+
+	// Start gRPC server on :9090.
+	go func() {
+		if err := agentSrv.ListenAndServe(ctx, ":9090", tlsCfg); err != nil {
+			log.Error(err, "gRPC server exited with error")
+		}
+	}()
+
+	// Start NRI plugin stub. The real pre-dump trigger lands in M5.
+	nriPlugin := nri.New(nil)
+	go func() {
+		if err := nriPlugin.RunStub(ctx); err != nil {
+			log.Error(err, "NRI plugin exited with error")
+		}
+	}()
+
+	// TODO(M1): run compat prober → create/update NodeMigrationCapacity CR
+	// TODO(M1): start metrics server on :9091
+
+	// Heartbeat loop — updates NMC status.lastHeartbeat every 30s.
+	// Sets status.ready=false on shutdown so the scheduler stops sending migrations here.
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -57,10 +97,10 @@ func main() {
 			select {
 			case <-ctx.Done():
 				log.Info("Shutting down — marking node not ready for migration")
-				// TODO: patch NMC status.ready=false
+				// TODO(M1): patch NMC status.ready=false
 				return
 			case <-ticker.C:
-				// TODO: patch NMC status.lastHeartbeat = now
+				// TODO(M1): patch NMC status.lastHeartbeat = now
 			}
 		}
 	}()
