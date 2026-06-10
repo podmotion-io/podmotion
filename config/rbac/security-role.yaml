@@ -1,0 +1,39 @@
+---
+# Security role: allows the operator to call the TokenRequest API for migration SATs
+# and allows node agents to read cert-manager TLS secrets in podmotion-system.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: podmotion-security-operator
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: operator
+rules:
+  # TokenRequest API — issue node-scoped projected ServiceAccountTokens (M11).
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
+  # Read NodeMigrationCapacity to look up dest node names for audience binding.
+  - apiGroups: ["podmotion.io"]
+    resources: ["nodemigrationcapacities"]
+    verbs: ["get", "list", "watch"]
+---
+# Node-agent role: read TLS secrets in podmotion-system (cert-manager certs).
+# Scoped to podmotion-system namespace only via a RoleBinding (not ClusterRoleBinding).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: podmotion-agent-secret-reader
+  namespace: podmotion-system
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: agent
+rules:
+  # Agents read their own TLS cert/key secret provisioned by cert-manager.
+  # Cannot read secrets in any other namespace (Role, not ClusterRole).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+    resourceNames:
+      - podmotion-agent-tls
+      - podmotion-operator-tls
