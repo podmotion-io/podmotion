@@ -1,0 +1,61 @@
+# PodMotion Helm chart values
+
+operator:
+  image:
+    repository: ghcr.io/podmotion/podmotion-operator
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicas: 3
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+agent:
+  image:
+    repository: ghcr.io/podmotion/podmotion-agent
+    tag: latest
+    pullPolicy: IfNotPresent
+  grpcPort: 9090
+  metricsPort: 9091
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+checkpoint:
+  # registry: use an in-cluster OCI registry for checkpoint staging (cross-AZ / cross-cluster)
+  # p2p: direct node-to-node gRPC streaming (same-DC, RTT < 50ms)
+  transferMode: p2p
+  registry:
+    url: ""
+    secret: ""
+  # Maximum time to retain a checkpoint artifact before GC (seconds)
+  retentionSeconds: 3600
+
+scheduler:
+  enabled: true
+  profileName: podmotion-scheduler
+
+descheduler:
+  enabled: false
+
+webhook:
+  certManager:
+    enabled: true
+
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: false
+
+# AWS-specific: tag node images and enable spot reclaim trigger
+aws:
+  spotReclaimTrigger: false
+  nodeImageFamily: podmotion-node-ubuntu-22.04

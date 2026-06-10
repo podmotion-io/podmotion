@@ -1,0 +1,46 @@
+apiVersion: nfd.k8s-sigs.io/v1alpha1
+kind: NodeFeatureRule
+metadata:
+  name: podmotion-criu-capable
+  namespace: node-feature-discovery
+spec:
+  rules:
+    - name: criu-binary-present
+      labels:
+        podmotion.io/criu-capable: "true"
+      matchFeatures:
+        - feature: binary
+          matchExpressions:
+            criu: { op: Exists }
+
+    - name: kernel-checkpoint-restore
+      labels:
+        podmotion.io/kernel-checkpoint-restore: "true"
+      matchFeatures:
+        - feature: kernel.config
+          matchExpressions:
+            CHECKPOINT_RESTORE: { op: In, value: ["y"] }
+
+    - name: kernel-mem-soft-dirty
+      labels:
+        podmotion.io/kernel-mem-soft-dirty: "true"
+      matchFeatures:
+        - feature: kernel.config
+          matchExpressions:
+            MEM_SOFT_DIRTY: { op: In, value: ["y"] }
+
+    - name: kernel-userfaultfd
+      labels:
+        podmotion.io/kernel-userfaultfd: "true"
+      matchFeatures:
+        - feature: kernel.config
+          matchExpressions:
+            USERFAULTFD: { op: In, value: ["y"] }
+
+    - name: kernel-bpf-syscall
+      labels:
+        podmotion.io/kernel-bpf: "true"
+      matchFeatures:
+        - feature: kernel.config
+          matchExpressions:
+            BPF_SYSCALL: { op: In, value: ["y"] }

@@ -1,0 +1,44 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - migration.podmotion.io
+  resources:
+  - migrationcheckpoints
+  - migrationpolicies
+  - migrationwebhookconfigs
+  - nodemigrationcapacities
+  - podmigrations
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - migration.podmotion.io
+  resources:
+  - migrationcheckpoints/finalizers
+  - migrationpolicies/finalizers
+  - migrationwebhookconfigs/finalizers
+  - nodemigrationcapacities/finalizers
+  - podmigrations/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - migration.podmotion.io
+  resources:
+  - migrationcheckpoints/status
+  - migrationpolicies/status
+  - migrationwebhookconfigs/status
+  - nodemigrationcapacities/status
+  - podmigrations/status
+  verbs:
+  - get
+  - patch
+  - update

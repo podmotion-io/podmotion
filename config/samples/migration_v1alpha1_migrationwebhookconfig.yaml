@@ -1,0 +1,9 @@
+apiVersion: migration.podmotion.io/v1alpha1
+kind: MigrationWebhookConfig
+metadata:
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/managed-by: kustomize
+  name: migrationwebhookconfig-sample
+spec:
+  # TODO(user): Add fields here
