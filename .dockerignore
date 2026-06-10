@@ -10,7 +10,8 @@
 !go.mod
 !go.sum
 
-# Re-include kind node image assets
+# Re-include operator and agent binaries
+!bin/manager-linux-amd64
 !bin/agent-linux-amd64
 !images/capi/ansible/roles/podmotion-node/files/nri.toml
 !images/capi/ansible/roles/podmotion-node/files/sys-fs-bpf.mount
