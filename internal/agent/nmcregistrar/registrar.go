@@ -46,10 +46,19 @@ func New(cfg *rest.Config, nodeName string) (*Registrar, error) {
 	return &Registrar{client: c, nodeName: nodeName}, nil
 }
 
-// detectCRIU runs "criu --version" and returns the version string (e.g. "4.2").
+// criuBinaryPath is the path to the CRIU binary, mounted from the host node via hostPath volume.
+const criuBinaryPath = "/usr/sbin/criu"
+
+// detectCRIU runs "/usr/sbin/criu --version" and returns the version string (e.g. "3.17.1").
+// Falls back to searching PATH if the explicit path is not present.
 // Returns an empty string on any error.
 func detectCRIU() string {
-	out, err := exec.Command("criu", "--version").Output()
+	bin := criuBinaryPath
+	if _, err := os.Stat(bin); err != nil {
+		// Fallback: search PATH (useful in dev/test environments)
+		bin = "criu"
+	}
+	out, err := exec.Command(bin, "--version").Output()
 	if err != nil {
 		return ""
 	}

@@ -49,6 +49,7 @@ spec:
         app: podmotion-agent
     spec:
       serviceAccountName: podmotion-agent
+      hostPID: true
       tolerations:
       - operator: Exists
       containers:
@@ -65,11 +66,14 @@ spec:
           name: grpc
           protocol: TCP
         securityContext:
-          runAsNonRoot: true
           seccompProfile:
             type: RuntimeDefault
-          allowPrivilegeEscalation: false
           capabilities:
+            add:
+            - "SYS_PTRACE"
+            - "SYS_ADMIN"
+            - "NET_ADMIN"
+            - "DAC_OVERRIDE"
             drop:
             - "ALL"
         resources:
@@ -79,3 +83,18 @@ spec:
           requests:
             cpu: 10m
             memory: 32Mi
+        volumeMounts:
+        - name: criu-binary
+          mountPath: /usr/sbin/criu
+          readOnly: true
+        - name: checkpoint-storage
+          mountPath: /var/lib/podmotion/checkpoints
+      volumes:
+      - name: criu-binary
+        hostPath:
+          path: /usr/sbin/criu
+          type: File
+      - name: checkpoint-storage
+        hostPath:
+          path: /var/lib/podmotion/checkpoints
+          type: DirectoryOrCreate
