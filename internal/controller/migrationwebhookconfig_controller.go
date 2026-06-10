@@ -24,7 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	migrationv1alpha1 "github.com/podmotion/podmotion/api/v1alpha1"
+	migrationv1alpha1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 )
 
 // MigrationWebhookConfigReconciler reconciles a MigrationWebhookConfig object

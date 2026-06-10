@@ -12,6 +12,6 @@ keywords:
   - live VM migration
 home: https://podmotion.io
 sources:
-  - https://github.com/podmotion/podmotion
+  - https://github.com/podmotion-io/podmotion
 maintainers:
   - name: PodMotion Authors

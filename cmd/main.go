@@ -35,8 +35,8 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	migrationv1alpha1 "github.com/podmotion/podmotion/api/v1alpha1"
-	"github.com/podmotion/podmotion/internal/controller"
+	migrationv1alpha1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	"github.com/podmotion-io/podmotion/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
 

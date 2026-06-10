@@ -27,7 +27,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	migrationv1alpha1 "github.com/podmotion/podmotion/api/v1alpha1"
+	migrationv1alpha1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 )
 
 var _ = Describe("MigrationPolicy Controller", func() {

@@ -28,7 +28,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/podmotion/podmotion/test/utils"
+	"github.com/podmotion-io/podmotion/test/utils"
 )
 
 var (
