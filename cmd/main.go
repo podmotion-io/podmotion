@@ -39,6 +39,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/controller"
 	agentclient "github.com/podmotion-io/podmotion/internal/agent/client"
 	agenttls "github.com/podmotion-io/podmotion/internal/agent/tls"
+	"github.com/podmotion-io/podmotion/internal/agent/traffic"
 	"github.com/podmotion-io/podmotion/internal/estimation"
 	"github.com/podmotion-io/podmotion/internal/rollback"
 	pmwebhook "github.com/podmotion-io/podmotion/internal/webhook"
@@ -196,14 +197,22 @@ func main() {
 	}
 	agentPool := agentclient.NewAgentClientPool("9090", agentTLSCfg)
 
+	// AWSLBStubVerifier is used until a real AWS cluster is available (M9 live PoC).
+	// Replace with AWSLoadBalancerVerifier + TargetGroupDiscovery when running on AWS.
+	compositeVerifier := &traffic.CompositeVerifier{
+		EndpointSliceVerifier: &traffic.StubVerifier{},
+		AWSALBVerifier:        &traffic.AWSLBStubVerifier{},
+	}
+
 	if err := (&controller.PodMigrationReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 		Estimator: &estimation.DefaultEstimator{
 			Prober: &estimation.StubProber{},
 		},
-		Rollbacker: rollback.NewStubRollbacker(),
-		AgentPool:  agentPool,
+		Rollbacker:      rollback.NewStubRollbacker(),
+		AgentPool:       agentPool,
+		TrafficVerifier: compositeVerifier,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "podmigration")
 		os.Exit(1)

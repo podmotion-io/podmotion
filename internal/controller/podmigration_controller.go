@@ -27,6 +27,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
 	"github.com/podmotion-io/podmotion/internal/agent/replication"
 	"github.com/podmotion-io/podmotion/internal/agent/storage"
+	"github.com/podmotion-io/podmotion/internal/agent/traffic"
 	"github.com/podmotion-io/podmotion/internal/estimation"
 	"github.com/podmotion-io/podmotion/internal/rollback"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
@@ -63,6 +64,10 @@ type PodMigrationReconciler struct {
 	// StorageMgr drives storage pre-stage concurrently with the pre-copy loop (M6).
 	// Nil in unit tests — PreMigrating phase skips storage goroutine when nil.
 	StorageMgr *storage.StorageMigrationManager
+	// TrafficVerifier confirms live traffic is arriving at the destination pod.
+	// Wired to CompositeVerifier (EndpointSlice + AWSALB) in production.
+	// Nil in unit tests — Verifying phase logs a skip when nil.
+	TrafficVerifier traffic.Verifier
 }
 
 // +kubebuilder:rbac:groups=migration.podmotion.io,resources=podmigrations,verbs=get;list;watch;create;update;patch;delete
