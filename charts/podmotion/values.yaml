@@ -50,12 +50,30 @@ webhook:
   certManager:
     enabled: true
 
+networkPolicy:
+  enabled: false
+
+installCRDs: false
+
 metrics:
   enabled: true
   serviceMonitor:
     enabled: false
 
 # AWS-specific: tag node images and enable spot reclaim trigger
+#
+# To enable spot instance reclamation automation:
+#   1. Set aws.spotReclaimTrigger: true  — activates SpotReclaimReconciler in the operator
+#      (passes --enable-spot-reclaim flag to the operator Deployment)
+#   2. Set aws.imdsPollingEnabled: true  — starts the IMDS poller in the node agent DaemonSet
+#   3. Tune aws.spotReclaimTimeoutSeconds if your workloads need a different window.
+#      Must be ≥10 and ≤115 (AWS 2-minute window minus a minimum 5 s buffer).
 aws:
   spotReclaimTrigger: false
   nodeImageFamily: podmotion-node-ubuntu-22.04
+  # imdsPollingEnabled enables the IMDS poller in the node agent.
+  # Only effective on AWS instances; safe to leave true on non-AWS nodes (polls will 404).
+  imdsPollingEnabled: true
+  # spotReclaimTimeoutSeconds is the CompletionTimeoutSeconds set on PodMigration CRs
+  # created by the spot reclaim controller. Should be < 120 (AWS notice window).
+  spotReclaimTimeoutSeconds: 90

@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
@@ -37,12 +38,14 @@ import (
 
 	migrationv1alpha1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	"github.com/podmotion-io/podmotion/internal/controller"
+	"github.com/podmotion-io/podmotion/internal/controller/spotreclaim"
 	agentclient "github.com/podmotion-io/podmotion/internal/agent/client"
 	agenttls "github.com/podmotion-io/podmotion/internal/agent/tls"
 	"github.com/podmotion-io/podmotion/internal/agent/traffic"
 	"github.com/podmotion-io/podmotion/internal/estimation"
 	"github.com/podmotion-io/podmotion/internal/rollback"
 	pmwebhook "github.com/podmotion-io/podmotion/internal/webhook"
+	corev1 "k8s.io/api/core/v1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -67,6 +70,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var enableSpotReclaim bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -85,6 +89,8 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.BoolVar(&enableSpotReclaim, "enable-spot-reclaim", false,
+		"If set, the SpotReclaimReconciler is started. Enable only on AWS clusters with spot instances.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -256,6 +262,27 @@ func main() {
 	if err := (&pmwebhook.PodMigrationDefaulter{}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to register webhook", "webhook", "PodMigrationDefaulter")
 		os.Exit(1)
+	}
+	if enableSpotReclaim {
+		// Register the spec.nodeName field index required by SpotReclaimReconciler for
+		// efficient pod listing by node without a full cache scan.
+		if err := mgr.GetFieldIndexer().IndexField(
+			context.Background(),
+			&corev1.Pod{},
+			spotreclaim.NodeFieldIndexName,
+			spotreclaim.PodNodeNameIndexer,
+		); err != nil {
+			setupLog.Error(err, "Failed to register pod nodeName field index")
+			os.Exit(1)
+		}
+		if err := (&spotreclaim.SpotReclaimReconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "spotreclaim")
+			os.Exit(1)
+		}
+		setupLog.Info("SpotReclaimReconciler enabled")
 	}
 	// +kubebuilder:scaffold:builder
 

@@ -273,6 +273,16 @@ spec:
                     description: SpotReclaim triggers migration when the node receives
                       a spot/preemptible termination notice.
                     type: boolean
+                  spotReclaimTimeoutSeconds:
+                    default: 90
+                    description: |-
+                      SpotReclaimTimeoutSeconds overrides the default CompletionTimeoutSeconds used when
+                      creating PodMigration CRs in response to a spot interruption event.
+                      The AWS notice window is 120 s; default 90 s leaves a 30 s buffer.
+                    format: int32
+                    maximum: 115
+                    minimum: 10
+                    type: integer
                 type: object
               window:
                 description: Window restricts when this policy may create migrations.

@@ -33,6 +33,15 @@ type MigrationTrigger struct {
 	// SpotReclaim triggers migration when the node receives a spot/preemptible termination notice.
 	// +optional
 	SpotReclaim *bool `json:"spotReclaim,omitempty"`
+
+	// SpotReclaimTimeoutSeconds overrides the default CompletionTimeoutSeconds used when
+	// creating PodMigration CRs in response to a spot interruption event.
+	// The AWS notice window is 120 s; default 90 s leaves a 30 s buffer.
+	// +optional
+	// +kubebuilder:default=90
+	// +kubebuilder:validation:Minimum=10
+	// +kubebuilder:validation:Maximum=115
+	SpotReclaimTimeoutSeconds int32 `json:"spotReclaimTimeoutSeconds,omitempty"`
 }
 
 // MigrationWindow restricts when migrations are allowed to run.
