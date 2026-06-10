@@ -146,3 +146,17 @@ Living catalogue of all planned and implemented features. Updated as features ar
 | KEP draft: kubelet Restore API (companion to KEP-2008) | M18 | 🔲 Planned | — | 0B, 10 |
 | Upstream descheduler EvictPlugin PR | M18 | 🔲 Planned | — | 0B, 5 |
 | OperatorHub bundle | M18 | 🔲 Planned | — | 10 |
+
+---
+
+## Live Replication Pipeline (Agent 11)
+
+| Feature | Milestone | Status | ADR | Owning Agent |
+|---------|-----------|--------|-----|--------------|
+| Mirror stage: initial full pre-dump to destination | M5 | 🔲 Planned | — | 11, 1 |
+| Iterative sync: incremental dirty page rounds | M5 | 🔲 Planned | — | 11, 1 |
+| Convergence tracking: dirty page rate per round | M5 | 🔲 Planned | — | 11 |
+| Abort-on-divergence: thrashing workload clean abort | M5 | 🔲 Planned | — | 11 |
+| Destination pod pre-activation (warm, not yet live) | M5 | 🔲 Planned | — | 11 |
+| MemorySynced handoff gate signal to CutoverCoordinator | M5 | 🔲 Planned | — | 11, 0A |
+| Force-freeze after max rounds (bounded downtime guarantee) | M5 | 🔲 Planned | — | 11 |
