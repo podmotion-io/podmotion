@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	"github.com/podmotion-io/podmotion/internal/featuregate"
 )
 
 var webhookLog = logf.Log.WithName("podmigration-webhook")
@@ -166,6 +167,14 @@ func (v *PodMigrationValidator) validate(ctx context.Context, pm *pmv1.PodMigrat
 		}
 	}
 
+	// Rule 10a: GPU migration gate — deny early if pod has GPU resources but gate is off.
+	// This prevents a migration from reaching the Checkpointing phase only to fail there.
+	// See ADR-0032: GPUMigration gate is never enabled by default.
+	if webhookPodHasGPU(pod) && !featuregate.IsEnabled(featuregate.GPUMigration) {
+		allErrs = append(allErrs, field.Forbidden(spec,
+			"GPU migration requires --feature-gates=GPUMigration=true"))
+	}
+
 	// Rule 10: range validations
 	if pm.Spec.PreCopyMaxRounds < 1 || pm.Spec.PreCopyMaxRounds > 20 {
 		allErrs = append(allErrs, field.Invalid(spec.Child("preCopyMaxRounds"), pm.Spec.PreCopyMaxRounds,
@@ -199,6 +208,17 @@ func detectTier4Volume(pod *corev1.Pod) string {
 		}
 	}
 	return ""
+}
+
+// webhookPodHasGPU returns true if any container in the pod requests an nvidia.com/gpu resource.
+func webhookPodHasGPU(pod *corev1.Pod) bool {
+	const gpuResource = corev1.ResourceName("nvidia.com/gpu")
+	for _, c := range pod.Spec.Containers {
+		if q, ok := c.Resources.Limits[gpuResource]; ok && q.Value() > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // getPod fetches the live pod from the API server.
