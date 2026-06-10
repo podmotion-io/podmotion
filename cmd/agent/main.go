@@ -15,6 +15,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -60,12 +61,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	// M4: StubCheckpointer — replaced with CRIUCheckpointer in M5 once the
-	// kind node image ships with CRIU installed and /proc/sys/kernel/perf_event_paranoid
-	// is set appropriately.
-	checkpointer := &criu.StubCheckpointer{
-		SimulatedDirtyMB:         128,
-		SimulatedFreezeDurationMs: 150,
+	// Select the checkpointer based on OS.
+	// On Linux (kind nodes / production), use the real CRIUCheckpointer.
+	// On macOS (developer machines), fall back to StubCheckpointer with a warning.
+	var checkpointer criu.Checkpointer
+	if runtime.GOOS == "linux" {
+		log.Info("Using CRIUCheckpointer (real CRIU subprocess via go-criu/v7)")
+		checkpointer = criu.NewCRIUCheckpointer("")
+	} else {
+		log.Info("CRIU not available on this OS — using StubCheckpointer (dev mode)",
+			"os", runtime.GOOS)
+		checkpointer = &criu.StubCheckpointer{
+			SimulatedDirtyMB:          128,
+			SimulatedFreezeDurationMs: 150,
+		}
 	}
 
 	agentSrv := server.New(nodeName, checkpointer)
