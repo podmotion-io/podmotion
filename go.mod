@@ -4,6 +4,7 @@ go 1.25.7
 
 require (
 	github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2 v1.55.4
+	github.com/checkpoint-restore/go-criu/v7 v7.2.0
 	github.com/onsi/ginkgo/v2 v2.27.2
 	github.com/onsi/gomega v1.38.2
 	k8s.io/apimachinery v0.35.0
@@ -11,10 +12,7 @@ require (
 	sigs.k8s.io/controller-runtime v0.23.3
 )
 
-require (
-	github.com/checkpoint-restore/go-criu/v7 v7.2.0 // indirect
-	github.com/kylelemons/godebug v1.1.0 // indirect
-)
+require github.com/kylelemons/godebug v1.1.0 // indirect
 
 require (
 	cel.dev/expr v0.24.0 // indirect
@@ -91,7 +89,7 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20250303144028-a0af3efb3deb // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250528174236-200df99c418a // indirect
 	google.golang.org/grpc v1.72.2
-	google.golang.org/protobuf v1.36.8 // indirect
+	google.golang.org/protobuf v1.36.8
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
