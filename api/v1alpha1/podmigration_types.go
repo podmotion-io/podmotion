@@ -115,6 +115,11 @@ type PodMigrationSpec struct {
 	// RollbackOnFailure unfreezes and restarts the source pod if migration fails post-checkpoint.
 	// +kubebuilder:default=true
 	RollbackOnFailure bool `json:"rollbackOnFailure,omitempty"`
+
+	// DestinationCluster is reserved for future multi-cluster migration (post-v1.0).
+	// Leave empty for intra-cluster migrations (the only supported mode in v0.x and v1.x).
+	// +optional
+	DestinationCluster string `json:"destinationCluster,omitempty"`
 }
 
 // PreCopyStats records metrics from the iterative pre-copy phase.
