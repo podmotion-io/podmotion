@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: podmotion-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  selector:
+    matchLabels:
+      app: podmotion-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: podmotion-agent
+        app.kubernetes.io/name: podmotion
+        app.kubernetes.io/component: agent
+    spec:
+      serviceAccountName: podmotion-agent
+      hostPID: true
+      hostNetwork: false
+      # Agent needs to be on every worker node that can participate in migrations.
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute
+      containers:
+        - name: agent
+          image: "{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"
+          imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          command: [/agent]
+          args:
+            - --grpc-port={{ .Values.agent.grpcPort }}
+            - --metrics-port={{ .Values.agent.metricsPort }}
+            - --node-name=$(NODE_NAME)
+            {{- if .Values.aws.imdsPollingEnabled }}
+            - --enable-imds-polling
+            - --spot-reclaim-timeout={{ .Values.aws.spotReclaimTimeoutSeconds }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.agent.grpcPort }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.agent.metricsPort }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.agent.resources | nindent 12 }}
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: criu-socket
+              mountPath: /var/run/criu
+            - name: containerd-socket
+              mountPath: /run/containerd/containerd.sock
+            - name: sys
+              mountPath: /sys
+      volumes:
+        - name: criu-socket
+          hostPath:
+            path: /var/run/criu
+            type: DirectoryOrCreate
+        - name: containerd-socket
+          hostPath:
+            path: /run/containerd/containerd.sock
+            type: Socket
+        - name: sys
+          hostPath:
+            path: /sys

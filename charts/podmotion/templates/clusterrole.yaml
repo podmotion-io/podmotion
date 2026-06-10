@@ -1,0 +1,85 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: podmotion-manager-role
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: operator
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+rules:
+  - apiGroups: [""]
+    resources: [nodes, persistentvolumeclaims]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [delete, get, list, watch]
+  - apiGroups: [""]
+    resources: [pods/status]
+    verbs: [get]
+  - apiGroups: [apps]
+    resources: [statefulsets]
+    verbs: [get, list, watch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create, delete, get, list, patch, update, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, patch, update, watch]
+  - apiGroups: [migration.podmotion.io]
+    resources:
+      - migrationcheckpoints
+      - migrationpolicies
+      - migrationwebhookconfigs
+      - nodemigrationcapacities
+      - podmigrations
+    verbs: [create, delete, get, list, patch, update, watch]
+  - apiGroups: [migration.podmotion.io]
+    resources:
+      - migrationcheckpoints/finalizers
+      - migrationpolicies/finalizers
+      - migrationwebhookconfigs/finalizers
+      - nodemigrationcapacities/finalizers
+      - podmigrations/finalizers
+    verbs: [update]
+  - apiGroups: [migration.podmotion.io]
+    resources:
+      - migrationcheckpoints/status
+      - migrationpolicies/status
+      - migrationwebhookconfigs/status
+      - nodemigrationcapacities/status
+      - podmigrations/status
+    verbs: [get, patch, update]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [create, delete, get, list, patch, update, watch]
+  - apiGroups: [admissionregistration.k8s.io]
+    resources: [validatingwebhookconfigurations, mutatingwebhookconfigurations]
+    verbs: [get, list, watch, patch, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: podmotion-agent-role
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [migration.podmotion.io]
+    resources: [nodemigrationcapacities]
+    verbs: [create, get, list, patch, update, watch]
+  - apiGroups: [migration.podmotion.io]
+    resources: [nodemigrationcapacities/status]
+    verbs: [get, patch, update]
+  - apiGroups: [migration.podmotion.io]
+    resources: [migrationcheckpoints]
+    verbs: [get, list, watch, patch, update]
+  - apiGroups: [migration.podmotion.io]
+    resources: [migrationcheckpoints/status]
+    verbs: [get, patch, update]

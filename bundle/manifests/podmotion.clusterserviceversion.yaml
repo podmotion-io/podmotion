@@ -1,0 +1,291 @@
+apiVersion: operators.coreos.com/v1alpha1
+kind: ClusterServiceVersion
+metadata:
+  name: podmotion.v0.1.0
+  namespace: podmotion-system
+  annotations:
+    alm-examples: |-
+      [
+        {
+          "apiVersion": "migration.podmotion.io/v1alpha1",
+          "kind": "PodMigration",
+          "metadata": {
+            "name": "example-migration",
+            "namespace": "default"
+          },
+          "spec": {
+            "sourcePodName": "my-pod",
+            "targetNodeName": "worker-2",
+            "strategy": "live"
+          }
+        },
+        {
+          "apiVersion": "migration.podmotion.io/v1alpha1",
+          "kind": "MigrationPolicy",
+          "metadata": {
+            "name": "default-policy"
+          },
+          "spec": {
+            "selector": {},
+            "tier": "TIER_4",
+            "maxConcurrentMigrations": 2
+          }
+        }
+      ]
+    capabilities: Deep Insights
+    categories: Storage,Networking
+    containerImage: ghcr.io/podmotion/podmotion-operator:v0.1.0
+    createdAt: "2026-06-09T00:00:00Z"
+    description: Live pod migration for Kubernetes — the live VM migration equivalent for containers.
+    repository: https://github.com/podmotion-io/podmotion
+    support: PodMotion Authors
+spec:
+  displayName: PodMotion
+  description: |
+    ## Overview
+
+    PodMotion enables **live pod migration** in Kubernetes clusters — analogous to live VM migration
+    but for containerised workloads.  It orchestrates CRIU-based checkpoint/restore to move a
+    running pod from one node to another with minimal downtime and no application changes.
+
+    ## Features
+
+    - **Live migration** — checkpoint-and-restore with TIER_4 network reconnect (v0.1)
+    - **Dry-run estimation** — predict downtime and storage cost before committing
+    - **Policy-driven** — MigrationPolicy CRD controls which workloads can migrate and how
+    - **PDB-safe** — both pods run simultaneously until traffic is verified (ADR-0015)
+    - **Rollback pipeline** — automatic rollback if any phase fails (ADR-0014)
+    - **Gate ordering** — Node → Compute → Network → Storage cost-ordered execution (ADR-0016)
+    - **Webhook protection** — eviction interceptor prevents unsafe deletions during migration
+
+    ## Architecture
+
+    PodMotion runs as a central operator with per-node agent DaemonSet.  The operator manages
+    five CRDs (`PodMigration`, `MigrationCheckpoint`, `MigrationPolicy`, `NodeMigrationCapacity`,
+    `MigrationWebhookConfig`) and co-ordinates with the agent via gRPC.
+
+    ## Prerequisites
+
+    - Kubernetes 1.27+
+    - CRIU 3.15+ installed on all worker nodes
+    - containerd 1.7+ with NRI support, or CRI-O 1.28+
+    - cert-manager (optional, for webhook TLS automation)
+
+  keywords:
+    - kubernetes
+    - migration
+    - live-migration
+    - criu
+    - live VM migration
+    - checkpoint
+    - restore
+
+  maintainers:
+    - name: PodMotion Authors
+      email: maintainers@podmotion.io
+
+  provider:
+    name: PodMotion
+    url: https://podmotion.io
+
+  links:
+    - name: Documentation
+      url: https://docs.podmotion.io
+    - name: GitHub
+      url: https://github.com/podmotion-io/podmotion
+
+  icon:
+    - base64data: ""
+      mediatype: image/svg+xml
+
+  version: 0.1.0
+  minKubeVersion: 1.27.0
+
+  installModes:
+    - type: OwnNamespace
+      supported: true
+    - type: SingleNamespace
+      supported: true
+    - type: MultiNamespace
+      supported: false
+    - type: AllNamespaces
+      supported: true
+
+  install:
+    strategy: deployment
+    spec:
+      clusterPermissions:
+        - serviceAccountName: podmotion-operator
+          rules:
+            - apiGroups: [""]
+              resources: [nodes, persistentvolumeclaims]
+              verbs: [get, list, watch]
+            - apiGroups: [""]
+              resources: [pods]
+              verbs: [delete, get, list, watch]
+            - apiGroups: [""]
+              resources: [pods/status]
+              verbs: [get]
+            - apiGroups: [apps]
+              resources: [statefulsets]
+              verbs: [get, list, watch]
+            - apiGroups: [coordination.k8s.io]
+              resources: [leases]
+              verbs: [create, delete, get, list, patch, update, watch]
+            - apiGroups: [discovery.k8s.io]
+              resources: [endpointslices]
+              verbs: [get, list, patch, update, watch]
+            - apiGroups: [migration.podmotion.io]
+              resources:
+                - migrationcheckpoints
+                - migrationpolicies
+                - migrationwebhookconfigs
+                - nodemigrationcapacities
+                - podmigrations
+              verbs: [create, delete, get, list, patch, update, watch]
+            - apiGroups: [migration.podmotion.io]
+              resources:
+                - migrationcheckpoints/finalizers
+                - migrationpolicies/finalizers
+                - migrationwebhookconfigs/finalizers
+                - nodemigrationcapacities/finalizers
+                - podmigrations/finalizers
+              verbs: [update]
+            - apiGroups: [migration.podmotion.io]
+              resources:
+                - migrationcheckpoints/status
+                - migrationpolicies/status
+                - migrationwebhookconfigs/status
+                - nodemigrationcapacities/status
+                - podmigrations/status
+              verbs: [get, patch, update]
+            - apiGroups: [policy]
+              resources: [poddisruptionbudgets]
+              verbs: [create, delete, get, list, patch, update, watch]
+            - apiGroups: [admissionregistration.k8s.io]
+              resources: [validatingwebhookconfigurations, mutatingwebhookconfigurations]
+              verbs: [get, list, watch, patch, update]
+
+      deployments:
+        - name: podmotion-operator
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: podmotion-operator
+            template:
+              metadata:
+                labels:
+                  app: podmotion-operator
+              spec:
+                serviceAccountName: podmotion-operator
+                securityContext:
+                  runAsNonRoot: true
+                containers:
+                  - name: manager
+                    image: ghcr.io/podmotion/podmotion-operator:v0.1.0
+                    imagePullPolicy: IfNotPresent
+                    command: [/manager]
+                    args:
+                      - --leader-elect
+                      - --metrics-bind-address=:8080
+                      - --health-probe-bind-address=:8081
+                    ports:
+                      - name: metrics
+                        containerPort: 8080
+                      - name: health
+                        containerPort: 8081
+                      - name: webhook
+                        containerPort: 9443
+                    livenessProbe:
+                      httpGet:
+                        path: /healthz
+                        port: 8081
+                      initialDelaySeconds: 15
+                      periodSeconds: 20
+                    readinessProbe:
+                      httpGet:
+                        path: /readyz
+                        port: 8081
+                      initialDelaySeconds: 5
+                      periodSeconds: 10
+                    resources:
+                      limits:
+                        cpu: 500m
+                        memory: 512Mi
+                      requests:
+                        cpu: 100m
+                        memory: 128Mi
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      capabilities:
+                        drop: [ALL]
+
+  customresourcedefinitions:
+    owned:
+      - name: podmigrations.migration.podmotion.io
+        version: v1alpha1
+        kind: PodMigration
+        displayName: Pod Migration
+        description: >
+          Represents a single live pod migration request. Drives the state machine from
+          Pending through Checkpointing, Restoring, TrafficSwitching to Completed or Failed.
+      - name: migrationcheckpoints.migration.podmotion.io
+        version: v1alpha1
+        kind: MigrationCheckpoint
+        displayName: Migration Checkpoint
+        description: >
+          Tracks the lifecycle of a CRIU checkpoint artifact: creation, OCI push, sync
+          progress, and garbage collection.
+      - name: migrationpolicies.migration.podmotion.io
+        version: v1alpha1
+        kind: MigrationPolicy
+        displayName: Migration Policy
+        description: >
+          Cluster-scoped policy that governs which pods may be migrated, the migration
+          tier, concurrency limits, and acceptable downtime thresholds.
+      - name: nodemigrationcapacities.migration.podmotion.io
+        version: v1alpha1
+        kind: NodeMigrationCapacity
+        displayName: Node Migration Capacity
+        description: >
+          Per-node resource representing the node agent's CRIU capability, kernel
+          version, available memory for in-flight migrations, and current load.
+      - name: migrationwebhookconfigs.migration.podmotion.io
+        version: v1alpha1
+        kind: MigrationWebhookConfig
+        displayName: Migration Webhook Config
+        description: >
+          Controls the eviction interceptor webhook: which namespaces and pod selectors
+          are protected from eviction during active migration windows.
+    required: []
+
+  webhookdefinitions:
+    - type: ValidatingAdmissionWebhook
+      admissionReviewVersions: ["v1"]
+      containerPort: 9443
+      deploymentName: podmotion-operator
+      failurePolicy: Fail
+      generateName: vpodmigration.kb.io
+      rules:
+        - apiGroups: [migration.podmotion.io]
+          apiVersions: [v1alpha1]
+          operations: [CREATE, UPDATE]
+          resources: [podmigrations]
+      sideEffects: None
+      targetPort: 9443
+      webhookPath: /validate-migration-podmotion-io-v1alpha1-podmigration
+    - type: MutatingAdmissionWebhook
+      admissionReviewVersions: ["v1"]
+      containerPort: 9443
+      deploymentName: podmotion-operator
+      failurePolicy: Fail
+      generateName: mpodmigration.kb.io
+      rules:
+        - apiGroups: [migration.podmotion.io]
+          apiVersions: [v1alpha1]
+          operations: [CREATE, UPDATE]
+          resources: [podmigrations]
+      sideEffects: None
+      targetPort: 9443
+      webhookPath: /mutate-migration-podmotion-io-v1alpha1-podmigration

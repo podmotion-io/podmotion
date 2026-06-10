@@ -1,0 +1,100 @@
+{{- if .Values.webhook.certManager.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: podmotion-serving-cert
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  dnsNames:
+    - podmotion-webhook-service.{{ .Release.Namespace }}.svc
+    - podmotion-webhook-service.{{ .Release.Namespace }}.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: podmotion-selfsigned-issuer
+  secretName: podmotion-webhook-tls
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: podmotion-selfsigned-issuer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  selfSigned: {}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: podmotion-webhook-service
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: operator
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  ports:
+    - name: https
+      port: 443
+      targetPort: 9443
+  selector:
+    app: podmotion-operator
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: podmotion-validating-webhook
+  {{- if .Values.webhook.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/podmotion-serving-cert
+  {{- end }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+webhooks:
+  - name: vpodmigration.kb.io
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: podmotion-webhook-service
+        namespace: {{ .Release.Namespace }}
+        path: /validate-migration-podmotion-io-v1alpha1-podmigration
+    failurePolicy: Fail
+    rules:
+      - apiGroups: [migration.podmotion.io]
+        apiVersions: [v1alpha1]
+        operations: [CREATE, UPDATE]
+        resources: [podmigrations]
+    sideEffects: None
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: podmotion-mutating-webhook
+  {{- if .Values.webhook.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/podmotion-serving-cert
+  {{- end }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+webhooks:
+  - name: mpodmigration.kb.io
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: podmotion-webhook-service
+        namespace: {{ .Release.Namespace }}
+        path: /mutate-migration-podmotion-io-v1alpha1-podmigration
+    failurePolicy: Fail
+    rules:
+      - apiGroups: [migration.podmotion.io]
+        apiVersions: [v1alpha1]
+        operations: [CREATE, UPDATE]
+        resources: [podmigrations]
+    sideEffects: None
