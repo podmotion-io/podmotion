@@ -220,7 +220,7 @@ func estimateBandwidthMbps(spec pmv1.PodMigrationSpec, _ *pmv1.NodeMigrationCapa
 // StubProber returns a synthetic probe for testing and M2 wiring.
 // Replace with gRPC prober in M4.
 type StubProber struct {
-	DirtyMB float64
+	DirtyMB  float64
 	ElapseMs int64
 }
 

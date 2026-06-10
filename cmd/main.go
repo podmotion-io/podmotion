@@ -38,6 +38,8 @@ import (
 
 	migrationv1alpha1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	agentclient "github.com/podmotion-io/podmotion/internal/agent/client"
+	"github.com/podmotion-io/podmotion/internal/agent/replication"
+	"github.com/podmotion-io/podmotion/internal/agent/storage"
 	agenttls "github.com/podmotion-io/podmotion/internal/agent/tls"
 	"github.com/podmotion-io/podmotion/internal/agent/traffic"
 	"github.com/podmotion-io/podmotion/internal/controller"
@@ -203,12 +205,30 @@ func main() {
 	}
 	agentPool := agentclient.NewAgentClientPool(mgr.GetClient(), "9090", agentTLSCfg)
 
+	// Register the spec.nodeName field index unconditionally — required by AgentClientPool.ForNode
+	// to efficiently list agent pods on a specific node without a full cache scan.
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&corev1.Pod{},
+		spotreclaim.NodeFieldIndexName,
+		spotreclaim.PodNodeNameIndexer,
+	); err != nil {
+		setupLog.Error(err, "Failed to register pod nodeName field index")
+		os.Exit(1)
+	}
+
 	// AWSLBStubVerifier is used until a real AWS cluster is available (M9 live PoC).
 	// Replace with AWSLoadBalancerVerifier + TargetGroupDiscovery when running on AWS.
 	compositeVerifier := &traffic.CompositeVerifier{
 		EndpointSliceVerifier: &traffic.StubVerifier{},
 		AWSALBVerifier:        &traffic.AWSLBStubVerifier{},
 	}
+
+	// Wire ReplicationMgr and StorageMgr so the PreMigrating state machine can advance.
+	// ReplicationManager drives the pre-copy dirty-page sync loop (sets MemorySynced=True).
+	// StorageMigrationManager drives storage pre-stage (sets StorageReadyForFreeze=True).
+	replicationMgr := &replication.ReplicationManager{Client: mgr.GetClient()}
+	storageMgr := storage.NewStorageMigrationManager(mgr.GetClient())
 
 	if err := (&controller.PodMigrationReconciler{
 		Client: mgr.GetClient(),
@@ -219,6 +239,8 @@ func main() {
 		Rollbacker:      rollback.NewStubRollbacker(),
 		AgentPool:       agentPool,
 		TrafficVerifier: compositeVerifier,
+		ReplicationMgr:  replicationMgr,
+		StorageMgr:      storageMgr,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "podmigration")
 		os.Exit(1)
@@ -264,17 +286,6 @@ func main() {
 		os.Exit(1)
 	}
 	if enableSpotReclaim {
-		// Register the spec.nodeName field index required by SpotReclaimReconciler for
-		// efficient pod listing by node without a full cache scan.
-		if err := mgr.GetFieldIndexer().IndexField(
-			context.Background(),
-			&corev1.Pod{},
-			spotreclaim.NodeFieldIndexName,
-			spotreclaim.PodNodeNameIndexer,
-		); err != nil {
-			setupLog.Error(err, "Failed to register pod nodeName field index")
-			os.Exit(1)
-		}
 		if err := (&spotreclaim.SpotReclaimReconciler{
 			Client: mgr.GetClient(),
 			Scheme: mgr.GetScheme(),

@@ -29,8 +29,8 @@ const defaultCRIUBinaryPath = "/usr/sbin/criu"
 type CRIUCheckpointer struct {
 	criuBinaryPath string
 
-	mu          sync.Mutex
-	activeCriu  *gocriu.Criu // non-nil while a dump/restore is in progress
+	mu         sync.Mutex
+	activeCriu *gocriu.Criu // non-nil while a dump/restore is in progress
 }
 
 // NewCRIUCheckpointer returns a CRIUCheckpointer that invokes the CRIU binary
@@ -148,12 +148,12 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	defer imgDirFd.Close()
 
 	criuOpts := &rpc.CriuOpts{
-		ImagesDirFd:  proto.Int32(int32(imgDirFd.Fd())),
-		LogFile:      proto.String("dump.log"),
-		LogLevel:     proto.Int32(4),
-		LeaveRunning: proto.Bool(opts.LeaveRunning),
+		ImagesDirFd:    proto.Int32(int32(imgDirFd.Fd())),
+		LogFile:        proto.String("dump.log"),
+		LogLevel:       proto.Int32(4),
+		LeaveRunning:   proto.Bool(opts.LeaveRunning),
 		TcpEstablished: proto.Bool(true),
-		ShellJob:     proto.Bool(true),
+		ShellJob:       proto.Bool(true),
 	}
 
 	if opts.PrevImagesDir != "" {
@@ -221,12 +221,12 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 	defer imgDirFd.Close()
 
 	criuOpts := &rpc.CriuOpts{
-		ImagesDirFd:     proto.Int32(int32(imgDirFd.Fd())),
-		LogFile:         proto.String("restore.log"),
-		LogLevel:        proto.Int32(4),
-		TcpEstablished:  proto.Bool(true),
-		ShellJob:        proto.Bool(true),
-		RstSibling:      proto.Bool(opts.Detached),
+		ImagesDirFd:    proto.Int32(int32(imgDirFd.Fd())),
+		LogFile:        proto.String("restore.log"),
+		LogLevel:       proto.Int32(4),
+		TcpEstablished: proto.Bool(true),
+		ShellJob:       proto.Bool(true),
+		RstSibling:     proto.Bool(opts.Detached),
 	}
 
 	c.mu.Lock()

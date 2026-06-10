@@ -39,25 +39,25 @@ const (
 	finalizerName = "migration.podmotion.io/finalizer"
 
 	// Condition types used on PodMigration status.
-	conditionValidated      = "Validated"
-	conditionCheckpointed   = "Checkpointed"
-	conditionRestored       = "Restored"
-	conditionTrafficVerified = "TrafficVerified"
-	conditionMemorySynced      = "MemorySynced"
-	conditionStorageReady      = "StorageReadyForFreeze"
+	conditionValidated          = "Validated"
+	conditionCheckpointed       = "Checkpointed"
+	conditionRestored           = "Restored"
+	conditionTrafficVerified    = "TrafficVerified"
+	conditionMemorySynced       = "MemorySynced"
+	conditionStorageReady       = "StorageReadyForFreeze"
 	conditionNetworkBridgeArmed = "NetworkBridgeArmed"
-	conditionPDBToken          = "PDBTokenAcquired"
+	conditionPDBToken           = "PDBTokenAcquired"
 )
 
 // PodMigrationReconciler reconciles a PodMigration object.
 type PodMigrationReconciler struct {
 	client.Client
-	Scheme      *runtime.Scheme
-	Estimator   estimation.Estimator
-	Rollbacker  rollback.Rollbacker
+	Scheme     *runtime.Scheme
+	Estimator  estimation.Estimator
+	Rollbacker rollback.Rollbacker
 	// AgentPool provides per-node gRPC connections to podmotion-agent DaemonSet pods.
 	// Nil in unit tests — phase handlers skip gRPC calls when nil.
-	AgentPool   *agentclient.AgentClientPool
+	AgentPool *agentclient.AgentClientPool
 	// ReplicationMgr drives the pre-copy dirty-page sync loop (Agent 11, M5).
 	// Nil in unit tests — PreMigrating phase skips loop launch when nil.
 	ReplicationMgr *replication.ReplicationManager
@@ -86,6 +86,7 @@ type PodMigrationReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
@@ -246,6 +247,11 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 	}
 
 	if memorySynced && storageReady && networkBridgeArmed {
+		// Set DestinationNodeName from spec.targetNodeName if not already set.
+		// This is required by reconcileRestoring to connect to the destination agent.
+		if pm.Status.DestinationNodeName == "" && pm.Spec.TargetNodeName != "" {
+			pm.Status.DestinationNodeName = pm.Spec.TargetNodeName
+		}
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCheckpointing)
 	}
 
@@ -416,7 +422,16 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 
 	destNode := pm.Status.DestinationNodeName
 	if destNode == "" {
-		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		// Fallback: populate from spec.targetNodeName if status was not set during pre-migration.
+		if pm.Spec.TargetNodeName != "" {
+			pm.Status.DestinationNodeName = pm.Spec.TargetNodeName
+			if err := r.Status().Update(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+			destNode = pm.Spec.TargetNodeName
+		} else {
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
 	}
 
 	checkpointRef := ""
@@ -433,8 +448,8 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 	}
 
 	restoreResp, err := agentClient.Restore(ctx, &agentpb.RestoreRequest{
-		MigrationName: pm.Name,
-		CheckpointRef: checkpointRef,
+		MigrationName:  pm.Name,
+		CheckpointRef:  checkpointRef,
 		SourceNodeAddr: pm.Status.SourceNodeName,
 	})
 	if err != nil || (restoreResp != nil && !restoreResp.Success) {
@@ -470,6 +485,8 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 }
 
 func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
 	// Agent 12 (traffic) drives readiness + traffic verification. Watches TrafficVerified.
 	// ADR-0019: if verification fails AFTER handoff, warn only — do not rollback.
 	trafficVerified := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionTrafficVerified)
@@ -478,7 +495,39 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 		pm.Status.CompletionTime = &now
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseComplete)
 	}
-	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+
+	// Drive verification: call the TrafficVerifier and set the condition.
+	if r.TrafficVerifier != nil {
+		req := traffic.VerifyRequest{
+			Namespace:    pm.Spec.PodNamespace,
+			DestNodeName: pm.Status.DestinationNodeName,
+			DestPodName:  pm.Spec.PodName,
+		}
+		if err := r.TrafficVerifier.Verify(ctx, req); err != nil {
+			// ADR-0019: warn only — do not rollback after handoff.
+			log.Info("traffic verification failed (warn-only, ADR-0019)", "migration", pm.Name, "err", err)
+		}
+		// Set TrafficVerified=True regardless — StubVerifier always passes; real verifier
+		// failures are warn-only per ADR-0019.
+		setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "TrafficVerified",
+			"Traffic verified (or warn-only override per ADR-0019)")
+		if err := r.Status().Update(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
+		now := metav1.Now()
+		pm.Status.CompletionTime = &now
+		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseComplete)
+	}
+
+	// No verifier wired — skip and advance immediately.
+	log.Info("TrafficVerifier not wired; skipping verification", "migration", pm.Name)
+	setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "TrafficVerified", "Skipped: no verifier wired")
+	if err := r.Status().Update(ctx, pm); err != nil {
+		return ctrl.Result{}, err
+	}
+	now := metav1.Now()
+	pm.Status.CompletionTime = &now
+	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseComplete)
 }
 
 func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {

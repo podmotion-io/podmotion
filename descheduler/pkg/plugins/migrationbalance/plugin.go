@@ -191,11 +191,11 @@ func (b *MigrationBalance) createPodMigration(
 			},
 		},
 		Spec: v1alpha1.PodMigrationSpec{
-			PodName:        pod.Name,
-			PodNamespace:   pod.Namespace,
-			SourcePodUID:   string(pod.UID),
-			TargetNodeName: destNode,
-			Mode:           v1alpha1.MigrationModePreCopy,
+			PodName:           pod.Name,
+			PodNamespace:      pod.Namespace,
+			SourcePodUID:      string(pod.UID),
+			TargetNodeName:    destNode,
+			Mode:              v1alpha1.MigrationModePreCopy,
 			RollbackOnFailure: true,
 		},
 	}

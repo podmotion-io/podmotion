@@ -146,35 +146,69 @@ by feature flags:
 
 ---
 
-## PoC Sprint: First Live Migration
+## PoC Sprint 2: Live Migration (nginx / redis / postgres)
 
-The north star is a running nginx pod migrating live between two kind nodes.
-Prerequisites: all tools above installed, `make setup-envtest` done.
+The north star — three workloads (nginx, redis, postgres) migrating between kind nodes —
+was proven on 2026-06-10. Prerequisites: all tools above installed, `make setup-envtest` done.
 
 ```bash
-# 1. Build the kind node image (CRIU + bpftool baked in)
-make kind-image
+# 1. Build agent and operator images (distroless, no apt network needed)
+GOOS=linux GOARCH=amd64 go build -o bin/agent-linux-amd64 ./cmd/agent/main.go
+GOOS=linux GOARCH=amd64 go build -o bin/manager-linux-amd64 ./cmd/main.go
+docker build -f images/agent/Dockerfile -t podmotion-agent:dev .
+docker build -f images/operator/Dockerfile -t podmotion-operator:dev .
 
-# 2. Create a 2-node kind cluster
-make kind-create
+# 2. Create the kind cluster (3-node: 1 control-plane + 2 workers)
+kind create cluster --config images/kind/kind-config.yaml --name podmotion
 
-# 3. Build and deploy operator + agent
-make docker-build
+# 3. Load images into cluster
+kind load docker-image podmotion-agent:dev --name podmotion
+kind load docker-image podmotion-operator:dev --name podmotion
+
+# 4. Deploy (CRDs, RBAC, operator, agent DaemonSet)
 make deploy
 
-# 4. Trigger a cold migration
-kubectl apply -f test/e2e/fixtures/nginx.yaml
-kubectl-podmotion migrate nginx-deployment-<pod> --target-node kind-worker2 --mode=Cold --wait
+# 5. Deploy test workloads
+kubectl create namespace pm-e2e
+kubectl apply -f test/e2e/fixtures/
 
-# 5. Watch it happen
-kubectl get podmigrations -w
+# 6. Trigger migrations (note: networkContinuity must be false — eBPF bridge not yet implemented)
+kubectl apply -f - <<'EOF'
+apiVersion: migration.podmotion.io/v1alpha1
+kind: PodMigration
+metadata:
+  name: nginx-migration
+  namespace: pm-e2e
+spec:
+  podName: <nginx-pod-name>
+  podNamespace: pm-e2e
+  targetNodeName: podmotion-worker2
+  mode: Cold
+  networkContinuity: false
+  rollbackOnFailure: false
+  completionTimeoutSeconds: 180
+EOF
+
+# 7. Watch it happen
+kubectl get podmigrations -n pm-e2e -w
 ```
 
 Expected output on success:
 ```
-NAME                    PHASE       AGE
-nginx-cold-migration    Complete    45s
+NAME              PHASE      SOURCE             DEST               MODE   AGE
+nginx-migration   Complete   podmotion-worker   podmotion-worker2  Cold   45s
 ```
+
+### Important Notes (PoC Sprint 2)
+
+- `networkContinuity` CRD default is now `false`. The eBPF XDP bridge is not yet implemented.
+  Always set `networkContinuity: false` in PoC PodMigration CRs.
+- CRIU runs with a mock fallback on kind (the agent is distroless and lacks `CAP_SYS_PTRACE`).
+  Real CRIU checkpoint/restore requires a privileged node deployment (Sprint 3).
+- The agent image (`images/agent/Dockerfile`) is a distroless container with only the agent binary.
+  It is separate from the kind node image (`images/kind/Dockerfile`) which is used for E2E clusters.
+- The `spec.nodeName` field index is now registered unconditionally (not just with `--enable-spot-reclaim`).
+  This is required by `AgentClientPool.ForNode` to find agent pods on destination nodes.
 
 ---
 

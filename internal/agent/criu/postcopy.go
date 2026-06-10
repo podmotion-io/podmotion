@@ -41,10 +41,10 @@ const (
 // The daemon listens on LazyPagesDefaultPort and serves page faults from the
 // destination's userfaultfd handler.
 type LazyPagesServer struct {
-	mu         sync.Mutex
-	cmd        *exec.Cmd
-	imagesDir  string
-	active     bool
+	mu        sync.Mutex
+	cmd       *exec.Cmd
+	imagesDir string
+	active    bool
 }
 
 // Start launches `criu lazy-pages --images-dir <imagesDir>` as a subprocess.

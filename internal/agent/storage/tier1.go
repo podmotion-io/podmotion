@@ -145,17 +145,17 @@ func (m *LonghornMigrator) Cutover(ctx context.Context, opts MigrationOptions) e
 
 // longhornVolume is the subset of the Longhorn volume API response we care about.
 type longhornVolume struct {
-	Name    string             `json:"name"`
-	State   string             `json:"state"`
-	Robustness string          `json:"robustness"`
-	Replicas []longhornReplica `json:"replicas"`
+	Name       string            `json:"name"`
+	State      string            `json:"state"`
+	Robustness string            `json:"robustness"`
+	Replicas   []longhornReplica `json:"replicas"`
 }
 
 type longhornReplica struct {
-	Name     string `json:"name"`
-	NodeID   string `json:"nodeID"`
-	Mode     string `json:"mode"` // "RW", "WO", "ERR"
-	Running  bool   `json:"running"`
+	Name    string `json:"name"`
+	NodeID  string `json:"nodeID"`
+	Mode    string `json:"mode"` // "RW", "WO", "ERR"
+	Running bool   `json:"running"`
 	// SnapshotSizeUsage is used to estimate sync progress.
 	// Longhorn does not expose a direct sync% — we approximate from
 	// mode=WO (write-only / syncing) vs mode=RW (fully synced).

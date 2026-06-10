@@ -12,9 +12,9 @@
 // Source pod was never stopped, so rollback is zero-downtime.
 //
 // Verification modes (in priority order for AWS PoC):
-//   1. AWSALB  — target group registration + DescribeTargetHealth polling
-//   2. EndpointSlice — explicit K8s endpoint transition management (always runs)
-//   3. Metrics — configurable PromQL query against pod metrics
-//   4. Hook    — user-provided webhook URL returning 200 OK
-//   5. None    — explicit opt-in skip (operator acknowledges risk)
+//  1. AWSALB  — target group registration + DescribeTargetHealth polling
+//  2. EndpointSlice — explicit K8s endpoint transition management (always runs)
+//  3. Metrics — configurable PromQL query against pod metrics
+//  4. Hook    — user-provided webhook URL returning 200 OK
+//  5. None    — explicit opt-in skip (operator acknowledges risk)
 package traffic

@@ -119,10 +119,11 @@ spec:
                     - Cold
                     type: string
                   networkContinuity:
-                    default: true
+                    default: false
                     description: |-
                       NetworkContinuity enables TCP connection preservation via eBPF bridge and IP handoff.
                       Requires CNI support — see NodeMigrationCapacity.status.cniIPMobilitySupported.
+                      Defaults to false; eBPF bridge is not yet implemented (use TIER_4 cold migration path).
                     type: boolean
                   podName:
                     description: PodName is the name of the source pod to migrate.

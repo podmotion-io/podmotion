@@ -35,10 +35,11 @@ const (
 // MigrationCheckpointReconciler manages MigrationCheckpoint lifecycle and GC.
 //
 // State machine:
-//   Capturing → Available  (CRIU agent transitions once dump is complete)
-//   Available → Consumed   (PodMigration controller after successful restore)
-//   Available → Expired    (this controller when ExpiresAt passes)
-//   Expired/Consumed/Failed → deleted (60s grace period)
+//
+//	Capturing → Available  (CRIU agent transitions once dump is complete)
+//	Available → Consumed   (PodMigration controller after successful restore)
+//	Available → Expired    (this controller when ExpiresAt passes)
+//	Expired/Consumed/Failed → deleted (60s grace period)
 type MigrationCheckpointReconciler struct {
 	client.Client
 	Scheme           *runtime.Scheme

@@ -17,8 +17,8 @@ package replication
 
 // RoundStats captures the outcome of one pre-dump round.
 type RoundStats struct {
-	Round     int
-	DirtyMB   int64
+	Round   int
+	DirtyMB int64
 	// DirtyRateMBps is the dirty page rate for this round; used for logging only.
 	DirtyRateMBps float64
 	ElapsedMs     int64

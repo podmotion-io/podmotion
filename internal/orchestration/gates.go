@@ -34,13 +34,13 @@ const (
 
 // GateResult is the result of evaluating a single gate.
 type GateResult struct {
-	GateID    string
-	Outcome   GateOutcome
-	Message   string
-	Checked   time.Time
+	GateID  string
+	Outcome GateOutcome
+	Message string
+	Checked time.Time
 	// Degraded fields are set when Outcome==DegradeMode.
-	DegradedMigrationMode    migrationv1alpha1.MigrationMode
-	DegradedNetworkTier      string
+	DegradedMigrationMode migrationv1alpha1.MigrationMode
+	DegradedNetworkTier   string
 }
 
 // Gate is the interface every readiness gate must implement.
@@ -57,13 +57,13 @@ type Gate interface {
 
 // GateSummary is the aggregated result of running all gates.
 type GateSummary struct {
-	Results              []GateResult
-	Blocked              bool
-	BlockingGateID       string
-	BlockingReason       string
+	Results               []GateResult
+	Blocked               bool
+	BlockingGateID        string
+	BlockingReason        string
 	ResolvedMigrationMode migrationv1alpha1.MigrationMode
-	ResolvedNetworkTier  string // TIER_1_FULL | TIER_2_BRIEF_DISRUPTION | TIER_3_GRACEFUL_DRAIN | TIER_4_COLD_MIGRATION
-	ResolvedStorageTier  int32  // 0-4
+	ResolvedNetworkTier   string // TIER_1_FULL | TIER_2_BRIEF_DISRUPTION | TIER_3_GRACEFUL_DRAIN | TIER_4_COLD_MIGRATION
+	ResolvedStorageTier   int32  // 0-4
 }
 
 // GateRunner executes all registered gates in category order with intra-category parallelism.
@@ -147,18 +147,18 @@ type TrafficPipeline interface {
 // ─── Supporting types ────────────────────────────────────────────────────────
 
 type CheckpointOptions struct {
-	MigrationName        string
-	MaxRounds            int32
-	DirtyThresholdMB     int32
-	BandwidthLimitMbps   int32
-	UseTCPRepair         bool // v0.2+
+	MigrationName      string
+	MaxRounds          int32
+	DirtyThresholdMB   int32
+	BandwidthLimitMbps int32
+	UseTCPRepair       bool // v0.2+
 }
 
 type CheckpointResult struct {
-	RoundsCompleted  int32
-	FinalDirtyPagesMB int32
-	FreezeDurationMs  int64
-	CheckpointSHA256  string
+	RoundsCompleted     int32
+	FinalDirtyPagesMB   int32
+	FreezeDurationMs    int64
+	CheckpointSHA256    string
 	CheckpointSizeBytes int64
 }
 
@@ -170,19 +170,19 @@ type TransferOptions struct {
 }
 
 type RestoreOptions struct {
-	CheckpointRef  string
-	DestNodeName   string
-	NetworkTier    string
+	CheckpointRef string
+	DestNodeName  string
+	NetworkTier   string
 }
 
 type SyncStatus struct {
-	Tier             int32
-	Phase            string
-	SyncPercent      float64
-	BytesTotal       int64
-	BytesSynced      int64
+	Tier              int32
+	Phase             string
+	SyncPercent       float64
+	BytesTotal        int64
+	BytesSynced       int64
 	EstimatedSecsLeft int32
-	Error            error
+	Error             error
 }
 
 type BridgeStatus struct {
@@ -221,9 +221,9 @@ type CutoverCoordinator interface {
 }
 
 type CutoverOptions struct {
-	SyncThresholdPercent float64 // default 95.0
-	FreezeTimeoutSeconds int32   // default 30
-	CutoverTimeoutSeconds int32  // default 120
-	StorageTier          int32
-	NetworkTier          string
+	SyncThresholdPercent  float64 // default 95.0
+	FreezeTimeoutSeconds  int32   // default 30
+	CutoverTimeoutSeconds int32   // default 120
+	StorageTier           int32
+	NetworkTier           string
 }

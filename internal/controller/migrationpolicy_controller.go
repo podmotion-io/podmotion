@@ -205,8 +205,8 @@ func (r *MigrationPolicyReconciler) triggerFired(policy *pmv1.MigrationPolicy, p
 
 func (r *MigrationPolicyReconciler) buildPodMigration(policy *pmv1.MigrationPolicy, pod *corev1.Pod) *pmv1.PodMigration {
 	spec := pmv1.PodMigrationSpec{
-		PodName:          pod.Name,
-		PodNamespace:     pod.Namespace,
+		PodName:            pod.Name,
+		PodNamespace:       pod.Namespace,
 		MigrationPolicyRef: &corev1.LocalObjectReference{Name: policy.Name},
 	}
 	if policy.Spec.MigrationDefaults != nil {
