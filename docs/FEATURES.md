@@ -72,7 +72,7 @@ Living catalogue of all planned and implemented features. Updated as features ar
 | Leader election (3 replicas, coordination.k8s.io/v1 Lease) | M2 | 🔲 Planned | — | 4 |
 | Migration window (allowedCron / blockedCron) | M12 | 🔲 Planned | — | 4 |
 | Phase gate protocol (inter-agent ready signals via CR status) | M4 | 🔲 Planned | ADR-0008 | 0A |
-| Multi-cluster migration | M14 | 🔲 Planned | — | 0A, 7 |
+| Multi-cluster migration | M14 | 🔨 In Progress | ADR-0022, ADR-0034 | 0A, 7 |
 | Spot instance reclamation automation | M17 | 🔲 Planned | — | 0B, 4 |
 | StatefulSet-aware ordinal migration ordering | M16 | 🔲 Planned | — | 0A, 3 |
 
