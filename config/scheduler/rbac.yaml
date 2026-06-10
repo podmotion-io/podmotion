@@ -1,0 +1,51 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: podmotion-scheduler
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: podmotion-scheduler
+rules:
+  # Standard scheduler RBAC — required to read nodes, pods, and run leader election.
+  - apiGroups: [""]
+    resources: [nodes, pods, replicationcontrollers, services, persistentvolumeclaims, persistentvolumes, namespaces]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch, update]
+  - apiGroups: [""]
+    resources: [pods/status]
+    verbs: [update, patch]
+  - apiGroups: [apps]
+    resources: [statefulsets, replicasets, daemonsets]
+    verbs: [get, list, watch]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, delete]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses, csinodes, csidrivers, csistoragecapacities]
+    verbs: [get, list, watch]
+  # PodMotion extension — read NodeMigrationCapacity to make filter/score decisions.
+  - apiGroups: [migration.podmotion.io]
+    resources: [nodemigrationcapacities]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: podmotion-scheduler
+subjects:
+  - kind: ServiceAccount
+    name: podmotion-scheduler
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: podmotion-scheduler
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,23 @@
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: /etc/kubernetes/scheduler.conf
+profiles:
+  - schedulerName: podmotion-scheduler
+    plugins:
+      filter:
+        enabled:
+          - name: MigrationAware
+      score:
+        enabled:
+          - name: MigrationAware
+            weight: 10
+    pluginConfig:
+      - name: MigrationAware
+        args:
+          # Weights control the relative importance of each scoring dimension.
+          # See scheduler-plugins/pkg/podmigration/score.go ScoreWeights.
+          networkLocalityWeight: 40
+          thermalWeight: 20
+          migrationLoadWeight: 20
+          memoryHeadroomWeight: 20
