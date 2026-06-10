@@ -19,15 +19,25 @@ import (
 	"syscall"
 	"time"
 
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
 	"github.com/podmotion-io/podmotion/internal/agent/nmcregistrar"
 	"github.com/podmotion-io/podmotion/internal/agent/nri"
 	"github.com/podmotion-io/podmotion/internal/agent/server"
 	agenttls "github.com/podmotion-io/podmotion/internal/agent/tls"
 )
+
+var scheme = k8sruntime.NewScheme()
+
+func init() {
+	utilruntime.Must(pmv1.AddToScheme(scheme))
+}
 
 func main() {
 	log := zap.New().WithName("podmotion-agent")
@@ -83,7 +93,15 @@ func main() {
 		}
 	}
 
-	agentSrv := server.New(nodeName, checkpointer)
+	// Build a k8s client so the agent can upsert MigrationCheckpoint CRs.
+	var k8sClient client.Client
+	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		log.Error(err, "Failed to build k8s client — MigrationCheckpoint CR updates will be skipped")
+		k8sClient = nil
+	}
+
+	agentSrv := server.New(nodeName, checkpointer, k8sClient)
 
 	// Start gRPC server on :9090.
 	go func() {
