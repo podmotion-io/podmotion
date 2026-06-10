@@ -37,6 +37,8 @@ import (
 
 	migrationv1alpha1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	"github.com/podmotion-io/podmotion/internal/controller"
+	"github.com/podmotion-io/podmotion/internal/estimation"
+	"github.com/podmotion-io/podmotion/internal/rollback"
 	pmwebhook "github.com/podmotion-io/podmotion/internal/webhook"
 	// +kubebuilder:scaffold:imports
 )
@@ -182,6 +184,10 @@ func main() {
 	if err := (&controller.PodMigrationReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		Estimator: &estimation.DefaultEstimator{
+			Prober: &estimation.StubProber{},
+		},
+		Rollbacker: rollback.NewStubRollbacker(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "podmigration")
 		os.Exit(1)
@@ -212,6 +218,10 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "migrationwebhookconfig")
+		os.Exit(1)
+	}
+	if err := (&pmwebhook.EvictionInterceptor{}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to register webhook", "webhook", "EvictionInterceptor")
 		os.Exit(1)
 	}
 	if err := (&pmwebhook.PodMigrationValidator{}).SetupWithManager(mgr); err != nil {

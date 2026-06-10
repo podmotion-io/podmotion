@@ -1,36 +1,51 @@
 /*
-Copyright 2026.
+Copyright 2026 PodMotion Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
 */
 
 package controller
 
 import (
 	"context"
+	"fmt"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	migrationv1alpha1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	"github.com/podmotion-io/podmotion/internal/estimation"
+	"github.com/podmotion-io/podmotion/internal/rollback"
 )
 
-// PodMigrationReconciler reconciles a PodMigration object
+const (
+	finalizerName = "migration.podmotion.io/finalizer"
+
+	// Condition types used on PodMigration status.
+	conditionValidated      = "Validated"
+	conditionCheckpointed   = "Checkpointed"
+	conditionRestored       = "Restored"
+	conditionTrafficVerified = "TrafficVerified"
+	conditionMemorySynced   = "MemorySynced"
+	conditionStorageReady   = "StorageReadyForFreeze"
+	conditionPDBToken       = "PDBTokenAcquired"
+)
+
+// PodMigrationReconciler reconciles a PodMigration object.
 type PodMigrationReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme     *runtime.Scheme
+	Estimator  estimation.Estimator
+	Rollbacker rollback.Rollbacker
 }
 
 // +kubebuilder:rbac:groups=migration.podmotion.io,resources=podmigrations,verbs=get;list;watch;create;update;patch;delete
@@ -46,27 +61,298 @@ type PodMigrationReconciler struct {
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the PodMigration object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.3/pkg/reconcile
 func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	log := logf.FromContext(ctx)
 
-	// TODO(user): your logic here
+	pm := &pmv1.PodMigration{}
+	if err := r.Get(ctx, req.NamespacedName, pm); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
 
+	// Attach completion timeout to context so all downstream calls are bounded.
+	timeoutSecs := pm.Spec.CompletionTimeoutSeconds
+	if timeoutSecs <= 0 {
+		timeoutSecs = 600
+	}
+	deadline, cancel := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
+	defer cancel()
+
+	// Crash-safety (ADR-0018): if we restarted with the pod already frozen,
+	// issue restore immediately before anything else.
+	if r.isFrozenWithoutRestore(pm) {
+		log.Info("crash-safe restart: pod was frozen but not restored — issuing restore", "migration", req.NamespacedName)
+		return r.transitionTo(deadline, pm, pmv1.MigrationPhaseRestoring)
+	}
+
+	// Finalizer: ensure we always get a chance to clean up (rollback, delete checkpoint).
+	if pm.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(pm, finalizerName) {
+			controllerutil.AddFinalizer(pm, finalizerName)
+			return ctrl.Result{}, r.Update(deadline, pm)
+		}
+	} else {
+		return r.handleDeletion(deadline, pm)
+	}
+
+	switch pm.Status.Phase {
+	case "", pmv1.MigrationPhasePending:
+		return r.reconcilePending(deadline, pm)
+	case pmv1.MigrationPhaseValidating:
+		return r.reconcileValidating(deadline, pm)
+	case pmv1.MigrationPhasePreMigrating:
+		// Pre-migration is agent-driven (dirty page sync loop).
+		// Controller watches for MemorySynced + StorageReadyForFreeze conditions.
+		return r.reconcilePreMigrating(deadline, pm)
+	case pmv1.MigrationPhaseCheckpointing:
+		return r.reconcileCheckpointing(deadline, pm)
+	case pmv1.MigrationPhaseTransferring:
+		return r.reconcileTransferring(deadline, pm)
+	case pmv1.MigrationPhaseRestoring:
+		return r.reconcileRestoring(deadline, pm)
+	case pmv1.MigrationPhaseVerifying:
+		return r.reconcileVerifying(deadline, pm)
+	case pmv1.MigrationPhaseComplete, pmv1.MigrationPhaseDryRunComplete:
+		return ctrl.Result{}, nil
+	case pmv1.MigrationPhaseFailed:
+		return ctrl.Result{}, nil
+	case pmv1.MigrationPhaseRollingBack:
+		return r.reconcileRollingBack(deadline, pm)
+	default:
+		log.Error(fmt.Errorf("unknown phase %q", pm.Status.Phase), "unhandled phase")
+		return ctrl.Result{}, nil
+	}
+}
+
+// ── Phase handlers ─────────────────────────────────────────────────────────
+
+func (r *PodMigrationReconciler) reconcilePending(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	// Dry-run: run the estimation pipeline and surface results without touching the pod.
+	if pm.Spec.DryRun {
+		return r.reconcileDryRun(ctx, pm)
+	}
+	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseValidating)
+}
+
+func (r *PodMigrationReconciler) reconcileDryRun(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	pod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+	if err != nil {
+		return r.failMigration(ctx, pm, fmt.Sprintf("dry-run: pod not found: %v", err))
+	}
+
+	nmc, err := r.getNMC(ctx, pod.Spec.NodeName)
+	if err != nil {
+		return r.failMigration(ctx, pm, fmt.Sprintf("dry-run: NMC not found for source node %q: %v", pod.Spec.NodeName, err))
+	}
+
+	estimate, err := r.Estimator.Estimate(ctx, pod, nmc, pm.Spec)
+	if err != nil {
+		log.Error(err, "dry-run estimation failed")
+		return r.failMigration(ctx, pm, fmt.Sprintf("dry-run estimation error: %v", err))
+	}
+
+	pm.Status.DryRunEstimate = estimate
+	pm.Status.Phase = pmv1.MigrationPhaseDryRunComplete
+	setCondition(pm, conditionValidated, metav1.ConditionTrue, "DryRunComplete", "Estimation succeeded")
+	return ctrl.Result{}, r.Status().Update(ctx, pm)
+}
+
+func (r *PodMigrationReconciler) reconcileValidating(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	// Validation is primarily handled by the ValidatingAdmissionWebhook.
+	// Here we do a lighter runtime re-check: pod still exists, NMC still ready.
+	pod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+	if err != nil {
+		return r.failMigration(ctx, pm, fmt.Sprintf("source pod disappeared: %v", err))
+	}
+
+	// Check UID still matches (pod could have been replaced between webhook and here).
+	if pm.Spec.SourcePodUID != "" && string(pod.UID) != pm.Spec.SourcePodUID {
+		return r.failMigration(ctx, pm, fmt.Sprintf("pod UID changed: expected %s, got %s", pm.Spec.SourcePodUID, pod.UID))
+	}
+
+	// Verify NMC is still ready on source node.
+	if pod.Spec.NodeName != "" {
+		nmc, nmcErr := r.getNMC(ctx, pod.Spec.NodeName)
+		if nmcErr != nil || !nmc.Status.Ready {
+			return r.failMigration(ctx, pm, fmt.Sprintf("source node NMC not ready: %v", nmcErr))
+		}
+		pm.Status.SourceNodeName = pod.Spec.NodeName
+	}
+
+	setCondition(pm, conditionValidated, metav1.ConditionTrue, "Validated", "Pod and node checks passed")
+	return r.transitionTo(ctx, pm, pmv1.MigrationPhasePreMigrating)
+}
+
+func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	// Agent 11 (replication) and Agent 3 (storage) drive the pre-migration work asynchronously.
+	// This controller watches for the two keystone conditions to both become True:
+	//   MemorySynced=True   (emitted by Agent 11 replication loop)
+	//   StorageReadyForFreeze=True  (emitted by Agent 3 storage pre-stage)
+	//
+	// When both are True, advance to Checkpointing (the freeze).
+	memorySynced := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionMemorySynced)
+	storageReady := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionStorageReady)
+
+	if memorySynced && storageReady {
+		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCheckpointing)
+	}
+
+	// Requeue after a short interval to re-check agent progress.
+	// Agents write directly to pm.status.conditions via their own controller/patch calls.
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	// Agent 1 (CRIU) drives the actual checkpoint. This controller watches for the
+	// Checkpointed condition to become True (agent sets it) then advances phase.
+	// If the agent reports failure via condition, we roll back.
+	checkpointed := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionCheckpointed)
+	if checkpointed {
+		setCondition(pm, conditionCheckpointed, metav1.ConditionTrue, "Checkpointed", "Checkpoint captured")
+		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseTransferring)
+	}
+
+	condFailed := meta.FindStatusCondition(pm.Status.Conditions, conditionCheckpointed)
+	if condFailed != nil && condFailed.Status == metav1.ConditionFalse && condFailed.Reason == "CheckpointFailed" {
+		return r.initiateRollback(ctx, pm, condFailed.Message)
+	}
+
+	return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+}
+
+func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	// Agent 7 (gRPC transfer) moves the checkpoint image. Watches for CheckpointRef to be set.
+	if pm.Status.CheckpointRef != nil {
+		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoring)
+	}
+	return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+}
+
+func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	// Agent 1 drives restore on the destination node. Watches for Restored condition.
+	restored := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionRestored)
+	if restored {
+		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseVerifying)
+	}
+
+	condFailed := meta.FindStatusCondition(pm.Status.Conditions, conditionRestored)
+	if condFailed != nil && condFailed.Status == metav1.ConditionFalse && condFailed.Reason == "RestoreFailed" {
+		if pm.Spec.RollbackOnFailure {
+			return r.initiateRollback(ctx, pm, condFailed.Message)
+		}
+		return r.failMigration(ctx, pm, condFailed.Message)
+	}
+
+	return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+}
+
+func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	// Agent 12 (traffic) drives readiness + traffic verification. Watches TrafficVerified.
+	// ADR-0019: if verification fails AFTER handoff, warn only — do not rollback.
+	trafficVerified := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionTrafficVerified)
+	if trafficVerified {
+		now := metav1.Now()
+		pm.Status.CompletionTime = &now
+		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseComplete)
+	}
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	if err := r.Rollbacker.Rollback(ctx, pm); err != nil {
+		log.Error(err, "rollback failed — source pod may require manual intervention")
+		return r.failMigration(ctx, pm, fmt.Sprintf("rollback failed: %v", err))
+	}
+
+	pm.Status.Phase = pmv1.MigrationPhaseFailed
+	setCondition(pm, "RolledBack", metav1.ConditionTrue, "RollbackComplete", "Source pod restored to live state")
+	return ctrl.Result{}, r.Status().Update(ctx, pm)
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+// transitionTo sets pm.Status.Phase and patches status.
+func (r *PodMigrationReconciler) transitionTo(ctx context.Context, pm *pmv1.PodMigration, phase pmv1.MigrationPhase) (ctrl.Result, error) {
+	pm.Status.Phase = phase
+	if err := r.Status().Update(ctx, pm); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Immediately requeue so the new phase handler runs in the same loop iteration.
+	return ctrl.Result{Requeue: true}, nil
+}
+
+func (r *PodMigrationReconciler) failMigration(ctx context.Context, pm *pmv1.PodMigration, reason string) (ctrl.Result, error) {
+	pm.Status.Phase = pmv1.MigrationPhaseFailed
+	now := metav1.Now()
+	pm.Status.CompletionTime = &now
+	setCondition(pm, "Failed", metav1.ConditionTrue, "MigrationFailed", reason)
+	return ctrl.Result{}, r.Status().Update(ctx, pm)
+}
+
+func (r *PodMigrationReconciler) initiateRollback(ctx context.Context, pm *pmv1.PodMigration, reason string) (ctrl.Result, error) {
+	setCondition(pm, "RollbackReason", metav1.ConditionTrue, "Initiating", reason)
+	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRollingBack)
+}
+
+// isFrozenWithoutRestore detects the crash-safety condition from ADR-0018:
+// pod was frozen (Checkpointing phase persisted) but Restored condition is missing.
+func (r *PodMigrationReconciler) isFrozenWithoutRestore(pm *pmv1.PodMigration) bool {
+	if pm.Status.Phase != pmv1.MigrationPhaseCheckpointing &&
+		pm.Status.Phase != pmv1.MigrationPhaseTransferring {
+		return false
+	}
+	return meta.FindStatusCondition(pm.Status.Conditions, conditionRestored) == nil
+}
+
+func (r *PodMigrationReconciler) handleDeletion(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	if controllerutil.ContainsFinalizer(pm, finalizerName) {
+		// Clean up checkpoint artifact if it exists.
+		if pm.Status.CheckpointRef != nil {
+			mcp := &pmv1.MigrationCheckpoint{}
+			err := r.Get(ctx, types.NamespacedName{
+				Namespace: pm.Namespace,
+				Name:      pm.Status.CheckpointRef.Name,
+			}, mcp)
+			if err == nil {
+				_ = r.Delete(ctx, mcp)
+			}
+		}
+		controllerutil.RemoveFinalizer(pm, finalizerName)
+		return ctrl.Result{}, r.Update(ctx, pm)
+	}
 	return ctrl.Result{}, nil
+}
+
+func (r *PodMigrationReconciler) getPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
+	pod := &corev1.Pod{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, pod)
+	return pod, err
+}
+
+func (r *PodMigrationReconciler) getNMC(ctx context.Context, nodeName string) (*pmv1.NodeMigrationCapacity, error) {
+	nmc := &pmv1.NodeMigrationCapacity{}
+	err := r.Get(ctx, client.ObjectKey{Name: nodeName}, nmc)
+	return nmc, err
+}
+
+// setCondition is a convenience wrapper around meta.SetStatusCondition.
+func setCondition(pm *pmv1.PodMigration, condType string, status metav1.ConditionStatus, reason, message string) {
+	meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
+		Type:               condType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: metav1.Now(),
+	})
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *PodMigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&migrationv1alpha1.PodMigration{}).
+		For(&pmv1.PodMigration{}).
 		Named("podmigration").
 		Complete(r)
 }
