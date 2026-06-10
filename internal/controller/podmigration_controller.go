@@ -41,9 +41,10 @@ const (
 	conditionCheckpointed   = "Checkpointed"
 	conditionRestored       = "Restored"
 	conditionTrafficVerified = "TrafficVerified"
-	conditionMemorySynced   = "MemorySynced"
-	conditionStorageReady   = "StorageReadyForFreeze"
-	conditionPDBToken       = "PDBTokenAcquired"
+	conditionMemorySynced      = "MemorySynced"
+	conditionStorageReady      = "StorageReadyForFreeze"
+	conditionNetworkBridgeArmed = "NetworkBridgeArmed"
+	conditionPDBToken          = "PDBTokenAcquired"
 )
 
 // PodMigrationReconciler reconciles a PodMigration object.
@@ -209,22 +210,36 @@ func (r *PodMigrationReconciler) reconcileValidating(ctx context.Context, pm *pm
 func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// Agent 11 (replication) and Agent 3 (storage) drive the pre-migration work asynchronously.
-	// This controller watches for the two keystone conditions to both become True:
-	//   MemorySynced=True   (emitted by Agent 11 replication loop)
-	//   StorageReadyForFreeze=True  (emitted by Agent 3 storage pre-stage)
+	// Agent 11 (replication), Agent 3 (storage), and Agent 2 (network) drive pre-migration
+	// work asynchronously.  All three keystone conditions must be True before advancing:
+	//   MemorySynced=True           (Agent 11 replication loop)
+	//   StorageReadyForFreeze=True  (Agent 3 storage pre-stage, ADR-0011)
+	//   NetworkBridgeArmed=True     (Agent 2 eBPF bridge OR v0.1 fast-path, ADR-0028)
 	//
-	// When both are True, advance to Checkpointing (the freeze).
+	// When all three are True, advance to Checkpointing (the freeze).
 	memorySynced := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionMemorySynced)
 	memoryCond := meta.FindStatusCondition(pm.Status.Conditions, conditionMemorySynced)
 	storageReady := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionStorageReady)
+	networkBridgeArmed := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionNetworkBridgeArmed)
 
 	// ADR-0024: DirtyRateIncreasing abort — pod is never frozen, clean abort without rollback.
 	if memoryCond != nil && memoryCond.Status == "False" && memoryCond.Reason == "DirtyRateIncreasing" {
 		return r.failMigration(ctx, pm, fmt.Sprintf("pre-copy aborted: %s", memoryCond.Message))
 	}
 
-	if memorySynced && storageReady {
+	// ADR-0028: v0.1 fast-path — if NetworkContinuity is false, set NetworkBridgeArmed=True
+	// immediately without waiting for the eBPF agent (TIER_4 cold migration).
+	if !pm.Spec.NetworkContinuity && !networkBridgeArmed {
+		setCondition(pm, conditionNetworkBridgeArmed, metav1.ConditionTrue,
+			"TIER4FastPath", "v0.1 cold migration: no eBPF bridge needed (ADR-0028)")
+		if err := r.Status().Update(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
+		networkBridgeArmed = true
+		log.Info("set NetworkBridgeArmed=True via TIER_4 fast-path", "migration", pm.Name)
+	}
+
+	if memorySynced && storageReady && networkBridgeArmed {
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCheckpointing)
 	}
 

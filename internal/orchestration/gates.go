@@ -191,6 +191,27 @@ type BridgeStatus struct {
 	Mode  string // GENEVE | BGP | GARP | TIER4_NOOP
 }
 
+// ─── Condition names ─────────────────────────────────────────────────────────
+// These are the three keystone conditions that gate the PreMigrating → Checkpointing
+// transition.  They are defined here (orchestration package) so every consumer
+// can import a single canonical source of truth without creating import cycles.
+
+const (
+	// ConditionMemorySynced is set True by Agent 11 (replication) when dirty pages
+	// have converged below the threshold.
+	ConditionMemorySynced = "MemorySynced"
+
+	// ConditionStorageReadyForFreeze is set True by Agent 3 (storage) when the PVC
+	// mirror has reached ≥95% sync (ADR-0011).
+	ConditionStorageReadyForFreeze = "StorageReadyForFreeze"
+
+	// ConditionNetworkBridgeArmed is the third keystone (ADR-0028).
+	// In v0.1 (TIER_4, NetworkContinuity=false) it is set True immediately by the
+	// controller without loading any eBPF programs.
+	// In v0.2+ it is set True by NetworkBridgeAgent after ArmBridge completes.
+	ConditionNetworkBridgeArmed = "NetworkBridgeArmed"
+)
+
 // CutoverCoordinator orchestrates the synchronized cutover across all three pipelines.
 // See ADR-0011. Owned by Agent 0A.
 type CutoverCoordinator interface {
