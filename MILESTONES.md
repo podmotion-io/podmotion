@@ -150,6 +150,43 @@ migration path. Specifically:
 
 ---
 
+## PoC Sprint 4 (2026-06-10) — Progress
+
+### What Was Proven
+
+| Area | Result |
+|------|--------|
+| Checkpoint gRPC wired | reconcileCheckpointing now calls AgentPool.ForNode, PrepareSource + Checkpoint RPCs, sets pm.Status.CheckpointRef, and transitions to Transferring |
+| Restore gRPC wired | reconcileRestoring now calls PrepareDestination before Restore; passes CheckpointRef name to agent |
+| Destination node pinning | Destination pod pinned via spec.nodeName (targetNodeName) in operator |
+| Build | go build ./... passes cleanly; CRIU 3.17.1 confirmed in podmotion-node:dev image |
+| All 3 workloads Complete | nginx, Redis, Postgres all reached phase=Complete with source pod deleted |
+| Postgres data intact | 5 rows survived (PVC-backed) |
+| CRIUCheckpointer initialized | Agent startup log confirms "Using CRIUCheckpointer (real CRIU subprocess via go-criu/v7)" |
+
+### What Was NOT Yet Proven (Real CRIU Gap)
+
+Real CRIU checkpoint/restore did NOT execute. The operator still takes the crash-safe restart path
+("pod was frozen but not restored — issuing restore") for all 3 migrations. No CRIU dump paths,
+no ptrace lines, no /proc/<pid> freeze events appeared in agent logs. Redis in-memory data was
+lost post-migration (empty keys), confirming pods were freshly restarted — not restored from a
+CRIU image.
+
+Root cause: the agent server's Checkpoint handler calls `s.checkpointer.Checkpoint(ctx, req)` which
+invokes `criu.Dump()` on the container PID. On kind nodes, even with CAP_SYS_PTRACE + CAP_SYS_ADMIN
++ hostPID:true, the CRIU dump is failing silently (likely EPERM or missing /proc/<containerPid>
+access from the agent's PID namespace) and falling through to the crash-safe path.
+
+### Sprint 5 Target
+
+Prove real CRIU dump on source node (log: "criu dump completed, checkpoint dir: ...") and real
+CRIU restore on destination (log: "criu restore completed, pid: ..."), with Redis sprint4_key
+surviving migration end-to-end. This requires diagnosing why criu.Dump() silently fails on kind
+and either fixing the PID namespace resolution (agent must see the container PID from the host PID
+namespace) or running an aws/bare-metal E2E.
+
+---
+
 ## M1 — Operator Scaffold ✅
 
 CRD types, controller stubs, webhook skeleton, Helm chart, Makefile targets.
