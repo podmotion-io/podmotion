@@ -171,11 +171,17 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		LeaveRunning:   proto.Bool(opts.LeaveRunning),
 		TcpEstablished: proto.Bool(false),
 		TcpClose:       proto.Bool(true),
-		ShellJob:       proto.Bool(false),
-		TrackMem:       proto.Bool(true),
-		AutoDedup:      proto.Bool(true),
-		ExtSharing:     proto.Bool(true),
-		ExtMasters:     proto.Bool(true),
+		// TcpSkipInFlight skips TCP sockets with in-flight data — avoids iptables
+		// network-lock scripts (iptables-restore) that are absent in kind agent images.
+		TcpSkipInFlight: proto.Bool(true),
+		// NetworkLock=SKIP bypasses iptables-based network namespace locking entirely.
+		// Safe for kind where network isolation is Docker-managed, not iptables per-ns.
+		NetworkLock: rpc.CriuNetworkLockMethod_SKIP.Enum(),
+		ShellJob:    proto.Bool(false),
+		TrackMem:    proto.Bool(true),
+		AutoDedup:   proto.Bool(true),
+		ExtSharing:  proto.Bool(true),
+		ExtMasters:  proto.Bool(true),
 		// Root tells CRIU where the container's rootfs is visible from the
 		// host mount namespace.  /proc/<pid>/root always works regardless of
 		// how the container runtime mounted it.
@@ -232,6 +238,13 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		return CheckpointResult{}, fmt.Errorf("criu dump (pid=%d): %w", opts.Pid, dumpErr)
 	}
 
+	// Verify that CRIU wrote inventory.img — its absence means the dump silently
+	// failed (e.g. network-lock or ptrace error) even though go-criu returned nil.
+	if _, statErr := os.Stat(filepath.Join(opts.ImagesDir, "inventory.img")); statErr != nil {
+		dumpLog, _ := os.ReadFile(filepath.Join(opts.ImagesDir, "dump.log"))
+		return CheckpointResult{}, fmt.Errorf("criu dump (pid=%d): inventory.img not written — dump may have failed silently\ndump.log:\n%s", opts.Pid, string(dumpLog))
+	}
+
 	return CheckpointResult{
 		ImagesDir:        opts.ImagesDir,
 		DirtyPagesMB:     0,
@@ -251,6 +264,13 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 		return RestoreResult{}, fmt.Errorf("context cancelled before Restore: %w", err)
 	}
 
+	// Ensure the images dir exists on the destination before opening it.
+	// In kind, both worker nodes mount the same hostPath so the dir should
+	// already exist after Dump writes it; MkdirAll is a safe no-op if present.
+	if err := os.MkdirAll(opts.ImagesDir, 0o700); err != nil {
+		return RestoreResult{}, fmt.Errorf("creating restore images dir %s: %w", opts.ImagesDir, err)
+	}
+
 	imgDirFd, err := openDirFd(opts.ImagesDir)
 	if err != nil {
 		return RestoreResult{}, err
@@ -262,15 +282,19 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 	// Restore opts mirror the Dump opts: same TCP/shell settings, detached mode
 	// so the restored process tree is reparented to init rather than CRIU.
 	criuOpts := &rpc.CriuOpts{
-		ImagesDirFd:    proto.Int32(int32(imgDirFd.Fd())),
-		LogFile:        proto.String("restore.log"),
-		LogLevel:       proto.Int32(4),
+		ImagesDirFd: proto.Int32(int32(imgDirFd.Fd())),
+		LogFile:     proto.String("restore.log"),
+		LogLevel:    proto.Int32(4),
 		TcpEstablished: proto.Bool(false),
-		TcpClose:       proto.Bool(true),
-		ShellJob:       proto.Bool(false),
-		ExtSharing:     proto.Bool(true),
-		ExtMasters:     proto.Bool(true),
-		RstSibling:     proto.Bool(opts.Detached),
+		TcpClose:        proto.Bool(true),
+		TcpSkipInFlight: proto.Bool(true),
+		// NetworkLock=SKIP: no iptables-restore needed on destination either.
+		NetworkLock: rpc.CriuNetworkLockMethod_SKIP.Enum(),
+		ShellJob:    proto.Bool(false),
+		ExtSharing:  proto.Bool(true),
+		ExtMasters:  proto.Bool(true),
+		// RstSibling restores in detached mode (process reparented to init, not CRIU).
+		RstSibling: proto.Bool(opts.Detached),
 	}
 
 	if opts.BundleDir != "" {
