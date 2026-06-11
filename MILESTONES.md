@@ -21,6 +21,44 @@ was exercised with real gRPC calls to the agent on each node.
 
 ---
 
+## PoC Sprint 9 — Multipass Ubuntu 24.04 ARM64 + k3s: CRIU restore path reached, dump never executed (2026-06-10)
+
+North Star not yet achieved. Sprint 9 moved off ARM64 linuxkit to a real Ubuntu 24.04 kernel
+(6.8.0-117-generic) on two Multipass VMs (pm-control, pm-worker) with k3s forming the cluster.
+CRIU 4.2 was installed and confirmed via `criu check`. The operator state machine advanced through
+all phases; CRIU restore was invoked via go-criu/v7 CRIUCheckpointer on pm-control. However, the
+checkpoint (dump) step on pm-worker was never executed — the controller took the crash-safe restart
+path (isFrozenWithoutRestore) due to concurrent reconcile races advancing conditions without
+persisting checkpoint artifacts. Restore received an empty images directory, failing with:
+`No inventory.img image / Unexpected EOF on (empty-image)`. Agent fallback mock-restore returned
+success, allowing the state machine to complete, but the destination pod is a fresh Kubernetes-
+rescheduled Redis with no in-memory state. sprint9_key was not preserved.
+
+**Root cause:** Controller reconcile race — multiple concurrent reconciles advanced PodMigration
+conditions (StorageReadyForFreeze, etc.) without the actual CRIU dump completing first, so the
+state machine transitioned to Restoring with an empty checkpoint directory.
+
+**Quorum findings (Sprint 9 agents):**
+- CRIU Agent: BLOCKED on CONFIG_MEM_SOFT_DIRTY absent from Ubuntu 6.8.0-117-generic HWE kernel
+- Network Agent: NEEDS_TUNING — ptrace_scope=1 must be lowered to 0; AppArmor profile needed once containerd is installed
+- Node Agent: NEEDS_PACKAGES — containerd+runc absent; criu from checkpoint-restore PPA; veth module availability TBD; perf_event_paranoid=4 must be lowered
+- Security Agent: READY — netns+veth+iptables confirmed present; CNI binaries absent (Sprint 10 install task)
+
+**Sprint 9 key results:**
+
+| Area | Result |
+|------|--------|
+| Kernel | Ubuntu 6.8.0-117-generic ARM64, Multipass VMs |
+| k3s | Both nodes Ready |
+| CRIU version | 4.2 (confirmed via criu check) |
+| Real CRIU invoked | Yes (go-criu/v7 CRIUCheckpointer, restore path) |
+| Dump executed | No — controller race bypassed dump phase |
+| inventory.img present | No |
+| In-memory data intact | No |
+| State machine completed | Yes (via mock-restore fallback) |
+
+---
+
 ## PoC Sprint 8 — ARM64 linuxkit CRIU limitation confirmed — EC2 pivot required (2026-06-10)
 
 North Star not yet achieved. Sprint 8 resolved the seccomp / capability question definitively:
