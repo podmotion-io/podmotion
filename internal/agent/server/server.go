@@ -296,7 +296,8 @@ func FindContainerTaskID(podUID string) (string, error) {
 // writing CRIU images to imagesDir. Also copies config.json from the containerd
 // bundle directory into imagesDir so the destination can set up an OCI bundle for restore.
 func ctrCheckpoint(taskID, imagesDir string) (int64, error) {
-	if err := os.MkdirAll(imagesDir, 0o755); err != nil {
+	// 0700: checkpoint images contain verbatim process memory and must be root-only.
+	if err := os.MkdirAll(imagesDir, 0o700); err != nil {
 		return 0, fmt.Errorf("mkdir %s: %w", imagesDir, err)
 	}
 	cmd := exec.Command("ctr", "--namespace", "k8s.io", "tasks", "checkpoint",
@@ -379,9 +380,21 @@ func joinNsRestore(migrationName, checkpointDir string) (int, error) {
 	// Step 2: Mount overlayfs rootfs from containerd snapshot layers.
 	bundleDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/bundle", migrationName)
 	rootfsDir := filepath.Join(bundleDir, "rootfs")
+	placeholderID := "pm-placeholder-" + migrationName
 	if err := setupRestoreOverlayfs(migrationName, checkpointDir, imageName, rootfsDir); err != nil {
 		return 0, fmt.Errorf("setup rootfs overlayfs: %w", err)
 	}
+	// On any error after this point: unmount overlay, remove upper/work dirs, kill placeholder.
+	success := false
+	defer func() {
+		if success {
+			return
+		}
+		_ = exec.Command("umount", rootfsDir).Run()
+		_ = os.RemoveAll(bundleDir)
+		_ = exec.Command("ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
+		_ = exec.Command("ctr", "--namespace", "k8s.io", "container", "rm", placeholderID).Run()
+	}()
 
 	// Step 3: Create ext-mount-map target paths on the host.
 	dataDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/data", migrationName)
@@ -424,14 +437,22 @@ func joinNsRestore(migrationName, checkpointDir string) (int, error) {
 		"--ext-mount-map", "/etc/hosts:/etc/hosts",
 		// Create a fresh network namespace; the veth peer doesn't exist cross-node.
 		"--empty-ns", "net",
-		"--restore-detached",
+		// No --restore-detached: CRIU runs foreground as the restored process's init/parent.
+		// --restore-detached would cause CRIU to exit-0 and orphan the process (ghost
+		// container — PID visible in /proc but not tracked by any supervisor).
 		"-v4",
 		"-o", restoreLogPath,
 	}
 	criuCmd := exec.Command("/usr/local/sbin/criu", criuArgs...)
-	if out, err := criuCmd.CombinedOutput(); err != nil {
+	if err := criuCmd.Start(); err != nil {
+		return 0, fmt.Errorf("criu restore start: %w", err)
+	}
+	// Give CRIU time to fork and restore the process tree before we scan /proc.
+	time.Sleep(500 * time.Millisecond)
+	// Check for early exit — if CRIU failed it will have exited already.
+	if criuCmd.ProcessState != nil && criuCmd.ProcessState.Exited() {
 		logContent, _ := os.ReadFile(restoreLogPath)
-		return 0, fmt.Errorf("criu restore: %w\n%s\nlog:\n%s", err, out, logContent)
+		return 0, fmt.Errorf("criu restore exited prematurely\nlog:\n%s", logContent)
 	}
 
 	// Step 5: Find the restored process by scanning /proc for the process name.
@@ -451,6 +472,7 @@ func joinNsRestore(migrationName, checkpointDir string) (int, error) {
 		log.Info("joinNsRestore: warning — failed to bring up loopback", "err", err, "output", string(out))
 	}
 
+	success = true
 	return pid, nil
 }
 
@@ -526,10 +548,13 @@ if os.path.exists(netdev_path):
         pycriu.images.dump(img, f)
     print('netdev: kept', len(kept), 'entries (loopback only)')
 `
-	scriptPath := "/tmp/pm-patch-ckpt.py"
-	if err := os.WriteFile(scriptPath, []byte(patchScript), 0o644); err != nil {
+	// /dev/shm is an in-memory filesystem (tmpfs) — avoids writing the script to disk.
+	// 0600 so only root can read the path; removed immediately after exec.
+	scriptPath := "/dev/shm/pm-patch-ckpt.py"
+	if err := os.WriteFile(scriptPath, []byte(patchScript), 0o600); err != nil {
 		return fmt.Errorf("write patch script: %w", err)
 	}
+	defer os.Remove(scriptPath)
 	out, err := exec.Command("python3", scriptPath, checkpointDir).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("patch script failed: %w\n%s", err, out)
@@ -689,7 +714,9 @@ func (s *AgentServer) PreDumpRound(_ context.Context, req *agentpb.PreDumpRoundR
 func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointRequest) (*agentpb.CheckpointResponse, error) {
 	log.Info("Checkpoint called", "migration", req.MigrationName)
 
-	imagesDir := fmt.Sprintf("/var/lib/podmotion/checkpoints/%s/final", req.MigrationName)
+	// Stage on tmpfs (/run is a tmpfs mount on Linux) so checkpoint images containing
+	// process memory and secrets are never written to persistent disk (ADR-0046).
+	imagesDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", req.MigrationName)
 
 	// Resolve the container root PID from the pod UID stored during PrepareSource.
 	s.migrationPodUIDMu.RLock()
@@ -737,7 +764,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 
 	// Ensure the images directory exists before invoking CRIU — on a freshly provisioned VM
 	// the directory will not exist and criu.Dump() will fail with "opening images dir".
-	if mkErr := os.MkdirAll(imagesDir, 0o755); mkErr != nil {
+	if mkErr := os.MkdirAll(imagesDir, 0o700); mkErr != nil {
 		return nil, fmt.Errorf("checkpoint: cannot create images dir %s: %w", imagesDir, mkErr)
 	}
 
@@ -768,7 +795,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		// can complete its state machine transitions in kind/dev environments.
 		log.Info("Checkpoint: PODMOTION_MOCK_CRIU=true, writing mock checkpoint (kind/dev fallback)", "err", err)
 
-		if mkErr := os.MkdirAll(imagesDir, 0o755); mkErr != nil {
+		if mkErr := os.MkdirAll(imagesDir, 0o700); mkErr != nil {
 			return nil, fmt.Errorf("checkpoint fallback: cannot create images dir: %w", mkErr)
 		}
 
@@ -1045,10 +1072,13 @@ func (s *AgentServer) PutCheckpointTar(_ context.Context, req *agentpb.PutCheckp
 		return &agentpb.PutCheckpointTarResponse{Success: false, Error: "tar_data is empty"}, nil
 	}
 
-	destDir := fmt.Sprintf("/var/lib/podmotion/checkpoints/%s/final", req.MigrationName)
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
+	// Stage on tmpfs, root-only permissions. Defer zeroize so checkpoint images
+	// (containing process memory and secrets) are scrubbed on all return paths.
+	destDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", req.MigrationName)
+	if err := os.MkdirAll(destDir, 0o700); err != nil {
 		return &agentpb.PutCheckpointTarResponse{Success: false, Error: fmt.Sprintf("mkdir %s: %v", destDir, err)}, nil
 	}
+	defer func() { _ = zeroizeDir(destDir) }()
 
 	// Decompress and extract tar.
 	gzr, err := gzip.NewReader(bytes.NewReader(req.TarData))
@@ -1138,4 +1168,23 @@ func checksumDir(dir string) (string, int64) {
 		return nil
 	})
 	return hex.EncodeToString(h.Sum(nil)), totalBytes
+}
+
+// zeroizeDir overwrites all regular files in dir with zeros then removes the directory.
+// Called to scrub checkpoint images (verbatim process memory) from tmpfs on all exit paths.
+func zeroizeDir(dir string) error {
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			return nil
+		}
+		zeros := make([]byte, info.Size())
+		_, _ = f.WriteAt(zeros, 0)
+		f.Close()
+		return nil
+	})
+	return os.RemoveAll(dir)
 }

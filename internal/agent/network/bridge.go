@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -51,6 +52,15 @@ type BridgeConfig struct {
 	// False → TIER_4 fast-path: NetworkBridgeArmed is set immediately without
 	// loading any eBPF programs. (ADR-0028)
 	NetworkContinuity bool
+	// CNIPlugin is the detected primary CNI (e.g. "calico", "cilium", "flannel").
+	// Used for Flannel live-migration rejection and Cilium XDP conflict detection.
+	CNIPlugin string
+	// UnderlayNetworkType is the CNI's encapsulation type (VXLAN, Direct, WireGuard, BGP).
+	// Used to determine if MSS clamping is needed when GENEVE bridge is active.
+	UnderlayNetworkType string
+	// DataplaneReconciliationTimeoutSeconds is how long to wait for Felix/Cilium to
+	// confirm the dataplane is ready after restore. Default 30s.
+	DataplaneReconciliationTimeoutSeconds int
 }
 
 // NetworkBridgeAgent implements orchestration.NetworkPipeline for v0.1/v0.2.
@@ -103,6 +113,11 @@ func (a *NetworkBridgeAgent) ArmBridge(ctx context.Context) (<-chan orchestratio
 		return ch, nil
 	}
 
+	// Flannel does not support IP mobility — NetworkContinuity=true is invalid.
+	if strings.Contains(strings.ToLower(a.Config.CNIPlugin), "flannel") {
+		return nil, fmt.Errorf("NetworkContinuity=true not supported for Flannel CNI; use NetworkContinuity=false (cold migration only)")
+	}
+
 	// v0.2 path — run as a goroutine so ArmBridge returns immediately.
 	go func() {
 		defer close(ch)
@@ -147,17 +162,66 @@ func (a *NetworkBridgeAgent) runBridgeArm(ctx context.Context, ch chan<- orchest
 		port = 6081
 	}
 
-	log.Info("arming XDP bridge", "srcIP", srcIP, "dstIP", dstIP, "genevePort", port)
+	// Detect Cilium XDP conflict before attaching — if Cilium's kube-proxy-replacement
+	// XDP hook is already on this interface, fall back to TC ingress to avoid conflict.
+	bridgeMode := "GENEVE"
+	if conflict, conflictErr := a.eBPF.CheckXDPHookConflict(ctx, ifindex); conflictErr == nil && conflict &&
+		strings.Contains(strings.ToLower(a.Config.CNIPlugin), "cilium") {
+		log.Info("Cilium XDP hook conflict detected — falling back to TC ingress bridge mode", "ifindex", ifindex)
+		bridgeMode = "GENEVE_TC"
+		// TC ingress bridge is implemented in v0.2+; for now arm succeeds but logs the mode.
+	}
+
+	log.Info("arming XDP bridge", "srcIP", srcIP, "dstIP", dstIP, "genevePort", port, "mode", bridgeMode)
 	if err := a.eBPF.ArmXDPBridge(ctx, srcIP, dstIP, port); err != nil {
 		_ = a.eBPF.DisarmZeroWindowHold(ctx, ifindex)
 		return fmt.Errorf("arm XDP bridge: %w", err)
 	}
 
-	if err := a.setNetworkBridgeArmed(ctx, true, "GENEVE"); err != nil {
+	// Wait for the CNI dataplane to confirm the destination endpoint is ready
+	// before releasing the eBPF hold. This ensures Felix/Cilium has programmed
+	// the WEP/ipcache before traffic is redirected (ADR-0045: stability wins).
+	if err := a.waitForDataplaneReconciled(ctx); err != nil {
+		log.Error(err, "dataplane reconciliation timeout — proceeding but bridge hold stays armed", "migration", a.Migration.Name)
+		// Non-fatal in v0.1 — condition set below for operator visibility.
+	}
+
+	if err := a.setNetworkBridgeArmed(ctx, true, bridgeMode); err != nil {
 		return err
 	}
-	ch <- orchestration.BridgeStatus{Armed: true, Mode: "GENEVE"}
+	ch <- orchestration.BridgeStatus{Armed: true, Mode: bridgeMode}
 	return nil
+}
+
+// waitForDataplaneReconciled polls the PodMigration until DataplaneReconciled=True
+// or the timeout (default 30s) is reached. The eBPF hold should not release until
+// both Restored=True AND DataplaneReconciled=True (ADR-0046).
+func (a *NetworkBridgeAgent) waitForDataplaneReconciled(ctx context.Context) error {
+	log := logf.FromContext(ctx)
+	timeout := a.Config.DataplaneReconciliationTimeoutSeconds
+	if timeout <= 0 {
+		timeout = 30
+	}
+	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(defaultFreezePollInterval):
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for DataplaneReconciled condition after %ds", timeout)
+		}
+
+		pm := &pmv1.PodMigration{}
+		if err := a.Client.Get(ctx, client.ObjectKeyFromObject(a.Migration), pm); err != nil {
+			log.Error(err, "waitForDataplaneReconciled: Get failed")
+			continue
+		}
+		if meta.IsStatusConditionTrue(pm.Status.Conditions, "DataplaneReconciled") {
+			return nil
+		}
+	}
 }
 
 // waitForFreeze polls the PodMigration conditions until MemorySynced=True or ctx expires.

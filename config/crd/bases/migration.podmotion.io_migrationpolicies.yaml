@@ -60,6 +60,36 @@ spec:
                 items:
                   type: string
                 type: array
+              gitOpsAwareness:
+                description: |-
+                  GitOpsAwareness configures how PodMotion interacts with GitOps controllers
+                  (ArgoCD, Flux) that manage the migrated workload. When enabled, PodMotion
+                  briefly suspends GitOps reconciliation for the narrow cases where the
+                  sub-controller migration approach is insufficient (see ADR-0046).
+                  Auto-detected when ArgoCD or Flux CRDs are present on the cluster.
+                properties:
+                  enabled:
+                    description: |-
+                      Enabled toggles GitOps suspension. Defaults to true when ArgoCD or Flux
+                      CRDs are detected via the discovery API.
+                    type: boolean
+                  resumeTimeoutSeconds:
+                    default: 60
+                    description: |-
+                      ResumeTimeoutSeconds is the maximum time to wait for GitOps controllers to
+                      acknowledge resume before failing the cleanup step. Default 60s.
+                    format: int32
+                    minimum: 10
+                    type: integer
+                  suspendDurationSeconds:
+                    default: 120
+                    description: |-
+                      SuspendDurationSeconds is how long to suspend GitOps controllers during the
+                      migration window. Must be longer than the expected freeze + restore time.
+                    format: int32
+                    minimum: 10
+                    type: integer
+                type: object
               maxConcurrentMigrations:
                 default: 1
                 description: MaxConcurrentMigrations is the maximum number of simultaneous
@@ -89,6 +119,12 @@ spec:
                     description: |-
                       DestinationCluster is reserved for future multi-cluster migration (post-v1.0).
                       Leave empty for intra-cluster migrations (the only supported mode in v0.x and v1.x).
+                    type: string
+                  destinationNode:
+                    description: |-
+                      DestinationNode is the pre-selected destination node for the replacement pod.
+                      Set by the controller after capacity reservation; read by the scheduler plugin
+                      and MutatingAdmissionWebhook to enforce exclusive node placement.
                     type: string
                   dryRun:
                     default: false
@@ -146,11 +182,22 @@ spec:
                     maximum: 20
                     minimum: 1
                     type: integer
+                  replacementPodName:
+                    description: |-
+                      ReplacementPodName is the name of the replacement pod created by the workload
+                      controller after source pod deletion. Tracked by the PodMotion controller.
+                    type: string
                   rollbackOnFailure:
                     default: true
                     description: RollbackOnFailure unfreezes and restarts the source
                       pod if migration fails post-checkpoint.
                     type: boolean
+                  sourcePodIP:
+                    description: |-
+                      SourcePodIP is the original IP of the source pod. Injected as a CNI IPAM
+                      annotation on the replacement pod at admission so the original IP is pinned
+                      at CNI ADD time (Calico / Cilium only; Flannel does not support IP mobility).
+                    type: string
                   sourcePodUID:
                     description: SourcePodUID pins the migration to a specific pod
                       UID to prevent races.

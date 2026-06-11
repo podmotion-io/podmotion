@@ -23,7 +23,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-const defaultCRIUBinaryPath = "/usr/sbin/criu"
+const defaultCRIUBinaryPath = "/usr/local/sbin/criu"
 
 // CRIUCheckpointer implements Checkpointer using go-criu/v7 RPC to invoke
 // CRIU as a subprocess (ADR-0002 — never statically link GPLv2 code).
@@ -335,6 +335,27 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 		ExtMasters:  proto.Bool(true),
 		// RstSibling restores in detached mode (process reparented to init, not CRIU).
 		RstSibling: proto.Bool(opts.Detached),
+		// AutoExtMnt handles k8s bind-mounts (/etc/resolv.conf, etc.) — mirrors dump option.
+		AutoExtMnt: proto.Bool(true),
+		// MntnsCompatMode relaxes mount namespace restore strictness for containerised processes.
+		MntnsCompatMode: proto.Bool(true),
+		// SkipMnt: skip restoring Kubernetes masked-path mounts (tmpfs bind-mounts of /dev/null)
+		// and the service-account tmpfs that references source-node-specific device IDs.
+		// These mounts have null-resolvable sources on the destination and cause "No mapping"
+		// errors. Skipping them is safe: Redis does not use any of these paths.
+		SkipMnt: []string{
+			"/proc/interrupts",
+			"/proc/kcore",
+			"/proc/keys",
+			"/proc/latency_stats",
+			"/proc/timer_list",
+			"/proc/timer_stats",
+			"/proc/sched_debug",
+			"/proc/scsi",
+			"/sys/firmware",
+			"/sys/fs/pstore",
+			"/run/secrets/kubernetes.io/serviceaccount",
+		},
 	}
 
 	if opts.BundleDir != "" {
@@ -344,6 +365,15 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 
 	if opts.LazyPagesServerAddr != "" {
 		criuOpts.LazyPages = proto.Bool(true)
+	}
+
+	// VethPair: tell CRIU which host-side veth name to use for the container's eth0.
+	// Without this, CRIU fails with "Unknown peer net namespace" when the source veth
+	// peer no longer exists on the destination node (cold migration cross-node case).
+	if opts.HostVethName != "" {
+		criuOpts.Veths = []*rpc.CriuVethPair{
+			{IfIn: proto.String("eth0"), IfOut: proto.String(opts.HostVethName)},
+		}
 	}
 
 	c.mu.Lock()

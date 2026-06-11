@@ -44,6 +44,12 @@ type eBPFManager interface {
 	// DisarmXDPBridge deletes the srcIP entry from PM_BRIDGE_MAP.
 	// If the map is empty afterwards the XDP program is detached.
 	DisarmXDPBridge(ctx context.Context, srcIP net.IP) error
+
+	// CheckXDPHookConflict returns true when another XDP program (e.g. Cilium's
+	// kube-proxy-replacement XDP hook) is already attached to the interface
+	// identified by ifindex. Used by NetworkBridgeAgent to detect Cilium XDP
+	// conflicts and fall back to TC ingress mode.
+	CheckXDPHookConflict(ctx context.Context, ifindex uint32) (bool, error)
 }
 
 // eBPFManagerStub satisfies eBPFManager by logging intended operations only.
@@ -70,6 +76,11 @@ func (s *eBPFManagerStub) ArmXDPBridge(ctx context.Context, srcIP, dstIP net.IP,
 func (s *eBPFManagerStub) DisarmXDPBridge(ctx context.Context, srcIP net.IP) error {
 	logf.FromContext(ctx).Info("ebpf stub: DisarmXDPBridge", "srcIP", srcIP)
 	return nil
+}
+
+func (s *eBPFManagerStub) CheckXDPHookConflict(ctx context.Context, ifindex uint32) (bool, error) {
+	logf.FromContext(ctx).Info("ebpf stub: CheckXDPHookConflict", "ifindex", ifindex)
+	return false, nil
 }
 
 // resolveIfindex converts an interface name (e.g. "veth1a2b3c") to its kernel ifindex.

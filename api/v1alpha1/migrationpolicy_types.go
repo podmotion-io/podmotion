@@ -98,6 +98,36 @@ type MigrationPolicySpec struct {
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
 	SafeOrdinalParallelism int32 `json:"safeOrdinalParallelism,omitempty"`
+
+	// GitOpsAwareness configures how PodMotion interacts with GitOps controllers
+	// (ArgoCD, Flux) that manage the migrated workload. When enabled, PodMotion
+	// briefly suspends GitOps reconciliation for the narrow cases where the
+	// sub-controller migration approach is insufficient (see ADR-0046).
+	// Auto-detected when ArgoCD or Flux CRDs are present on the cluster.
+	// +optional
+	GitOpsAwareness *GitOpsAwarenessConfig `json:"gitOpsAwareness,omitempty"`
+}
+
+// GitOpsAwarenessConfig controls PodMotion's GitOps suspension behaviour.
+type GitOpsAwarenessConfig struct {
+	// Enabled toggles GitOps suspension. Defaults to true when ArgoCD or Flux
+	// CRDs are detected via the discovery API.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// SuspendDurationSeconds is how long to suspend GitOps controllers during the
+	// migration window. Must be longer than the expected freeze + restore time.
+	// +kubebuilder:default=120
+	// +kubebuilder:validation:Minimum=10
+	// +optional
+	SuspendDurationSeconds int32 `json:"suspendDurationSeconds,omitempty"`
+
+	// ResumeTimeoutSeconds is the maximum time to wait for GitOps controllers to
+	// acknowledge resume before failing the cleanup step. Default 60s.
+	// +kubebuilder:default=60
+	// +kubebuilder:validation:Minimum=10
+	// +optional
+	ResumeTimeoutSeconds int32 `json:"resumeTimeoutSeconds,omitempty"`
 }
 
 // MigrationPolicyStatus defines the observed state of MigrationPolicy.

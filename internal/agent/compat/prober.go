@@ -113,10 +113,64 @@ func ProbeGPU() GPUProbeResult {
 }
 
 func probeNRIEnabled() bool {
-	// NRI socket presence indicates containerd has NRI enabled
-	out, err := exec.Command("test", "-S", "/var/run/nri/nri.sock").Output()
-	_ = out
-	return err == nil
+	info, err := os.Stat("/var/run/nri/nri.sock")
+	return err == nil && (info.Mode()&os.ModeSocket != 0)
+}
+
+// NRIPreflightResult holds the outcome of the NRI readiness check.
+type NRIPreflightResult struct {
+	// SocketPresent is true when /var/run/nri/nri.sock exists and is a socket.
+	SocketPresent bool
+	// ContainerdVersion is the detected containerd version string (e.g. "2.0.1").
+	ContainerdVersion string
+	// ContainerdMeetsMinimum is true when containerd >= 2.0 (NRI plugin API stable).
+	ContainerdMeetsMinimum bool
+	// Ready is true when both SocketPresent and ContainerdMeetsMinimum are true.
+	Ready bool
+	// Reason is populated when Ready=false.
+	Reason string
+}
+
+// ProbeNRIPreflight checks whether the NRI plugin API is available and usable.
+// The NRI StartContainer hook (which CRIU restore uses) requires containerd >= 2.0.
+// Nodes running older containerd cannot use NRI-based restore; they must use the
+// legacy joinNsRestore path.
+func ProbeNRIPreflight() NRIPreflightResult {
+	result := NRIPreflightResult{}
+
+	result.SocketPresent = probeNRIEnabled()
+	if !result.SocketPresent {
+		result.Reason = "NRI socket /var/run/nri/nri.sock not found — containerd NRI not enabled"
+		return result
+	}
+
+	// Probe containerd version via `containerd --version`.
+	out, err := exec.Command("containerd", "--version").Output()
+	if err != nil {
+		result.Reason = fmt.Sprintf("containerd --version failed: %v", err)
+		return result
+	}
+	// Output: "containerd containerd.io 2.0.1 ..."
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	if len(fields) >= 3 {
+		result.ContainerdVersion = fields[2]
+	} else if len(fields) >= 2 {
+		result.ContainerdVersion = fields[1]
+	}
+
+	// Check major version >= 2.
+	major := 0
+	if result.ContainerdVersion != "" {
+		fmt.Sscanf(strings.SplitN(result.ContainerdVersion, ".", 2)[0], "%d", &major)
+	}
+	result.ContainerdMeetsMinimum = major >= 2
+	if !result.ContainerdMeetsMinimum {
+		result.Reason = fmt.Sprintf("containerd %s < 2.0 — NRI plugin API requires containerd >= 2.0 (StartContainer hook unavailable)", result.ContainerdVersion)
+		return result
+	}
+
+	result.Ready = true
+	return result
 }
 
 // ProbeNetworkCapability detects the primary CNI plugin from /etc/cni/net.d/*.conf
@@ -162,9 +216,12 @@ func ProbeNetworkCapability() (cniPlugin string, ipMobilitySupported bool, ipMob
 	case strings.Contains(lower, "ovn"):
 		return detected, true, "IPAMClaim"
 	case strings.Contains(lower, "calico"):
-		return detected, true, "BGPHostRoute"
+		return detected, true, "IPAMAnnotation"
 	case strings.Contains(lower, "cilium"):
-		return detected, false, ""
+		return detected, true, "IPAMAnnotation"
+	case strings.Contains(lower, "flannel"):
+		// Flannel has no IP mobility support — cold migration (NetworkContinuity=false) only.
+		return detected, false, "ColdOnly"
 	default:
 		return detected, false, ""
 	}
