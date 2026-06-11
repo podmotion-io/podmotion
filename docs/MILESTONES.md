@@ -130,6 +130,28 @@ Current version: **v0.1.0-alpha**
 - AWS NLB target group integration
 - ALB connection draining before old target deregistration
 
+**CNI compatibility target matrix (live migration):**
+
+| CNI | IP Handoff Mechanism | Notes |
+|-----|---------------------|-------|
+| Flannel (VXLAN/host-gw) | Gratuitous ARP + Flannel VTEP route refresh | Current dev CNI; baseline |
+| Calico (BGP mode) | BGP /32 host route withdrawal + re-advertisement via `calicoctl node status`; workloadendpoint update | Calico node re-learns pod MAC via gratuitous ARP; no IP address migration needed if IP pool spans nodes |
+| Calico (VXLAN mode) | VTEP MAC update + gratuitous ARP; IPAM release on source, annotate on destination | Similar to Flannel VXLAN path |
+| Cilium (eBPF native) | `cilium endpoint migrate` (if available) or Cilium IPAM release+re-acquire + XDP BPF map update; identity-based policy via SecurityIdentity re-sync | Cilium's eBPF data plane bypasses iptables; PodMotion eBPF bridge must coordinate with Cilium's BPF programs to avoid double-processing |
+
+**Calico-specific work items:**
+- Detect Calico via `NetworkPlugin=calico` annotation on node or presence of `crd.projectcalico.org` API group
+- On source: call `calicoctl delete workloadendpoint` after `TrafficVerified=true`
+- On destination: create new `WorkloadEndpoint` before loopback bring-up; Calico programs iptables/eBPF rules before traffic is accepted
+- Test matrix: BGP peered (bird), VXLAN encap, WireGuard encryption overlay
+
+**Cilium-specific work items:**
+- Detect Cilium via `cilium.io/` node annotations or `cilium` DaemonSet presence
+- Cilium assigns `CiliumEndpoint` CRs; PodMotion must create the CE on destination before restore completes
+- Cilium's `kube-proxy-replacement=strict` mode means no iptables fallback — eBPF map consistency is mandatory
+- XDP bridge (M10) must avoid conflicting with Cilium's XDP hook on the same interface; use TC ingress hook as fallback when Cilium XDP is active (detect via `bpftool net show`)
+- Test matrix: kube-proxy-replacement=strict, Hubble enabled, WireGuard transparent encryption
+
 **Dependencies:** M5, M6.
 
 ---
@@ -251,6 +273,85 @@ Current version: **v0.1.0-alpha**
 
 ---
 
+## M19 — GitOps-Aware Migration (ADR-0046)
+
+**Problem statement:** GitOps tools (ArgoCD, Flux CD) continuously reconcile workload
+controller objects (Deployments, StatefulSets, ReplicaSets) toward Git-declared state. Any
+PodMotion mutation of these objects triggers reconciliation and reversion. Additionally,
+PodMotion's own transient CRs in workload namespaces are at risk from prune operations.
+
+**Core architectural rule (ADR-0046):** PodMotion MUST NOT mutate workload controller
+objects. Never patch `Deployment.spec`, `StatefulSet.spec`, `ReplicaSet.spec`, or
+equivalent higher-level resource specs during any migration phase.
+
+**Primary strategy — sub-controller migration (scheduler plugin + NRI hook):**
+
+Instead of directing migration by patching workload controllers, PodMotion works entirely
+below the controller layer:
+
+1. Source pod is deleted (the only K8s write — a pod-level operation, not a controller
+   mutation). The owning ReplicaSet/StatefulSet immediately creates a replacement pod.
+2. PodMotion's MutatingAdmissionWebhook injects `podmotion.io/migration-name` and
+   `podmotion.io/restore-from-checkpoint` labels on the replacement pod at creation time.
+3. The `MigrationAwareScore` scheduler plugin routes the replacement pod to the destination
+   node by scoring it MAX and all others zero — no Deployment mutation required.
+4. PodMotion's NRI `CreateContainer` hook on the destination node intercepts the container
+   startup and invokes CRIU restore from the checkpoint images instead of running the
+   original entrypoint.
+5. From GitOps perspective: the workload controller spec is unchanged, replica count is
+   satisfied, pod is Running on destination. No drift is detected.
+
+**Deliverables:**
+
+- `internal/gitops/` package:
+  - `detector.go` — walk ownerRefs to find GitOps-managed controllers; read ArgoCD and
+    Flux labels; store result as annotations on PodMigration CR during `Validating` phase
+  - `argocd_client.go` — toggle `Application.spec.syncPolicy.automated.selfHeal` for the
+    narrow edge cases that still need suppression (standalone pods, Argo Rollouts)
+  - `flux_client.go` — toggle `Kustomization.spec.suspend` / `HelmRelease.spec.suspend`;
+    trigger immediate re-reconcile via `reconcile.fluxcd.io/requestedAt` annotation on resume
+  - `suspender.go` — `GitOpsSuspender` interface dispatching to argocd/flux clients;
+    auto-detect GitOps tool presence via discovery API; no-op when neither is present
+- MutatingAdmissionWebhook: inject migration labels on replacement pods (the labels that
+  guide the scheduler plugin and NRI hook)
+- Scheduler plugin: extend `MigrationAwareScore` to score destination node MAX for
+  replacement pods carrying `podmotion.io/migration-name` label
+- NRI plugin: implement `CreateContainer` hook; ship `criu-nri-restore` binary in node
+  image; invoke CRIU restore using containerd's already-configured container namespaces
+  (eliminates the overlayfs + placeholder + `--empty-ns net` workarounds from cold-migration PoC)
+- PodMigration CR self-protection:
+  - Inject `argocd.argoproj.io/sync-options: Prune=false` on all PodMigration CRs at
+    creation (blocks ArgoCD prune; zero user config)
+  - Add `podmotion.io/migration-in-progress` finalizer to all active PodMigration CRs
+    (defers deletion; triggers emergency rollback if deleted while in Checkpointing phase)
+- `GitOpsAwareness` field on `MigrationPolicy` CRD
+- Argo Rollouts: pause via `spec.paused: true` during migration window (this is the one
+  controller-level write still permitted — Rollout pause is an explicit runtime flag, not
+  a spec drift)
+- RBAC: new ClusterRole entries for ArgoCD Application and Flux Kustomization/HelmRelease
+  patch; gated behind `--enable-gitops-integration` (auto-detect by CRD presence)
+- E2E tests: ArgoCD selfHeal=true + prune=true fires during Checkpointing; Flux healthChecks
+  fail during freeze; Argo Rollouts pause/resume; emergency rollback on DeletionTimestamp
+  set mid-migration
+- CNI compatibility: the scheduler + NRI approach is CNI-agnostic. Calico and Cilium
+  endpoint lifecycle (WorkloadEndpoint, CiliumEndpoint) is handled post-restore by the
+  existing network agent, not the migration routing mechanism.
+
+**Dependencies:** M1 (webhook), M4 (NRI stub + agent), M8 (scheduler plugin), M10 (eBPF hold).
+
+**User friction inventory:**
+
+| Item | Required | Friction |
+|---|---|---|
+| ClusterRole addition for ArgoCD Application/Rollout patch | Conditional (auto-skipped if ArgoCD absent) | Low — included in Helm chart |
+| ClusterRole addition for Flux Kustomization/HelmRelease patch | Conditional (auto-skipped if Flux absent) | Low — included in Helm chart |
+| NRI plugin installed on all nodes | YES | None — DaemonSet in node image |
+| Do NOT place PodMigration CRs in Git-managed directories | YES | Documentation only |
+| `argocd-cm` resource.exclusions for podmotion.io group | Recommended | Low — one-time admin |
+| `ignoreDifferences` for webhook-injected pod labels | If ArgoCD with pod-level sync | Low — copy-paste from docs |
+
+---
+
 ## Dependency Graph (summary)
 
 ```
@@ -262,6 +363,7 @@ M1 ──► M2 ──► M3 ──► M4 ──► M5 ──► M6 ──► M7
                                                          M17 (M8+M12)
                                                          M15 (M5+M11)
                                                          M18 (all)
+                                                         M19 (M1+M4+M8+M10)
 ```
 
 ---
@@ -273,7 +375,7 @@ M1 ──► M2 ──► M3 ──► M4 ──► M5 ──► M6 ──► M7
 | v0.1.0-alpha | M1–M5, M8, M11 | Cold + iterative pre-copy; TIER_4 network (reconnect); no TCP preservation |
 | v0.1.0 | M1–M12 | Full intra-cluster migration; eBPF network bridge; all storage tiers |
 | v0.2.0 | M13, M15, M16, M17 | Post-copy, GPU, StatefulSet, spot automation; TCP_REPAIR preservation |
-| v1.0.0 | M1–M18 | Production-ready; OperatorHub; upstream KEPs submitted |
+| v1.0.0 | M1–M18, M19 | Production-ready; GitOps-aware; OperatorHub; upstream KEPs submitted |
 | v1.x+ | Multi-cluster GA | M14 graduated from experimental |
 
 ---
