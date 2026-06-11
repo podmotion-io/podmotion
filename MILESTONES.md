@@ -21,6 +21,54 @@ was exercised with real gRPC calls to the agent on each node.
 
 ---
 
+## PoC Sprint 8 — ARM64 linuxkit CRIU limitation confirmed — EC2 pivot required (2026-06-10)
+
+North Star not yet achieved. Sprint 8 resolved the seccomp / capability question definitively:
+`CAP_SYS_PTRACE` (bit 19) is present in CapEff/CapPrm, and seccomp profile was set to unconfined
+(`securityContext.seccompProfile.type: Unconfined`). With those fixes, CRIU `Dump()` succeeded
+(dump log showed "Dumping finished successfully") and `ptrace(PTRACE_SEIZE)` no longer generated
+errors. However, CRIU restore still fails due to hard kernel-level limitations of the
+Linux 6.12.76-linuxkit aarch64 kernel running inside Apple Silicon Docker Desktop:
+
+| Error | Root Cause |
+|-------|------------|
+| `tun: Unable to create tun: No such file or directory` | TUN device not available in linuxkit |
+| `Unable to create a veth pair: -95 (EOPNOTSUPP)` | veth pair creation unsupported in linuxkit netns |
+| `ns_last_pid sysctl read-only` | PID namespace sysctls locked in linuxkit |
+| Dirty page tracking OFF | `CONFIG_MEM_SOFT_DIRTY` not enabled in linuxkit kernel |
+
+These are not seccomp or capability issues — they are hard kernel/infrastructure walls of the
+linuxkit environment. CRIU on ARM64 linuxkit (Docker Desktop kind) is unsupported upstream.
+This is expected behavior and is NOT a PodMotion bug.
+
+### What Was Proven in Sprint 8
+
+| Result | Detail |
+|--------|--------|
+| `CAP_SYS_PTRACE` confirmed present | CapEff `0000000000281002` — bit 19 set |
+| Seccomp was the ptrace blocker (fixed) | Default RuntimeDefault profile blocked `ptrace(PTRACE_SEIZE)` despite capability; `Unconfined` fixed it |
+| CRIU dump succeeds end-to-end | "Dumping finished successfully" in dump log; pre-existing infra errors only |
+| ARM64 linuxkit = hard wall | tun/veth/ns_last_pid/dirty-tracking all blocked at kernel level; no workaround |
+| Mock fallback correctly gated | Agent falls back to mock-restore only when real CRIU restore fails; no silent failures |
+| ADR-0043 written | Deployment/RS/StatefulSet workload-aware migration design locked |
+| ADR-0044 written | Cold migration with full storage for beta; live VM migration v1.2 storage scope locked |
+
+### Sprint 9 Target — EC2 Pivot
+
+Provision `t3.medium` EC2 instance (Ubuntu 24.04, kernel 6.8) and wire it as a two-node kind
+cluster (or self-managed k3s) accessible via SSH/kubectl. Re-run the full cold migration pipeline
+on real x86_64 Linux where CRIU tun/veth/dirty-tracking/ns_last_pid are fully supported.
+A successful CRIU dump + restore on EC2 will achieve the North Star.
+
+Steps:
+1. Provision `t3.medium` Ubuntu 24.04 EC2 (or equivalent bare-metal Linux VM)
+2. Install kind + kubectl + Docker; build podmotion node image
+3. `make kind-create` on EC2; deploy operator + agent DaemonSet
+4. Run nginx cold migration end-to-end; confirm `inventory.img` present + data intact
+5. If successful → North Star achieved; document in MILESTONES.md
+
+---
+
 ## PoC Sprint 7 — Progress: dump path fixed, transfer wired, CRIU restore attempted but dump still empty (2026-06-10)
 
 North Star not yet achieved. The checkpoint directory path handoff and shared-storage transfer were
