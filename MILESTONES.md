@@ -21,6 +21,49 @@ was exercised with real gRPC calls to the agent on each node.
 
 ---
 
+## PoC Sprint 6 — Progress: conflict fixed, CRIU invoked, checkpoint images empty (2026-06-10)
+
+North Star not yet achieved. Real CRIU binary was invoked (3.17.1 confirmed), but restore failed
+because no checkpoint images were written to the source node — dump.log was absent and restore.log
+showed CRIU reading empty/missing images (`No inventory.img image`).
+
+### What Was Fixed
+
+| Fix | Detail |
+|-----|--------|
+| Optimistic-lock conflict loop | All six `patchStorageReady`, `patchStorageTier`, `patchMemorySynced`, `updatePreCopyStats`, `transitionTo`, `failMigration` call sites re-fetch latest ResourceVersion before patching |
+| State machine now advances past `PreMigrating` | `StorageConflict` loop broken; operator reached `Checkpointing` for the first time |
+| Real CRIU checkpoint path exercised | All three agents logged `Using CRIUCheckpointer (real CRIU subprocess via go-criu/v7)` at startup |
+| Crash-safe restart logic fires | Operator logged `crash-safe restart: pod was frozen but not restored — issuing restore`; `Restored=True` condition set |
+
+### Why North Star Still Not Achieved
+
+CRIU restore ran against empty/missing checkpoint images. The dump phase either did not write images
+to disk or wrote them to a path the restore phase could not find. Specific errors from restore.log:
+
+- `tun: Unable to create tun: No such file or directory`
+- `Unable to create a veth pair: Operation not supported (-95)`
+- `uffd: Lazy pages are not available: Operation not permitted`
+- `No inventory.img image / Unexpected EOF on (empty-image)`
+
+The network namespace errors (`tun`, `veth`) indicate CRIU attempted to restore network interfaces
+inside the container but lacked host privileges. The `uffd` error means userfaultfd lazy pages are
+blocked in the kind kernel config. The missing `inventory.img` is the critical failure: the dump
+either crashed silently before writing any images, or the checkpoint directory path used during dump
+differs from the path used during restore.
+
+### Sprint 7 Target
+
+Fix the checkpoint image path handoff: ensure the `Dump()` call writes images to a directory that
+is (a) on shared or transferred storage accessible to the destination node, and (b) uses the exact
+same absolute path passed to `Restore()`. Add post-dump validation: after `go-criu Dump()` returns,
+stat `<checkpoint_dir>/inventory.img` and fail fast with an explicit error if it is absent, rather
+than letting the restore phase discover empty images silently. Also add `--no-restore-net` CRIU
+restore option to skip network namespace recreation inside kind (where `tun`/`veth` operations are
+unsupported), relying on the eBPF bridge for network handoff instead.
+
+---
+
 ## PoC Sprint 5 — Progress (2026-06-10)
 
 North Star not yet achieved. Real CRIU checkpoint/restore still did not execute.
