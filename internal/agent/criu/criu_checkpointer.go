@@ -154,6 +154,18 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 
 	logger := logf.FromContext(ctx)
 
+	// Ptrace preflight: attempt PTRACE_SEIZE before starting CRIU RPC so we get
+	// the exact errno on capability/seccomp failures rather than a silent dump with
+	// zero files written.
+	if err := ptracePreflight(opts.Pid); err != nil {
+		logger.Error(err, "CRIU ptrace preflight failed — CAP_SYS_PTRACE or seccomp may be blocking",
+			"pid", opts.Pid,
+			"imagesDir", opts.ImagesDir,
+		)
+		return CheckpointResult{}, fmt.Errorf("CRIU preflight failed: %w", err)
+	}
+	logger.Info("CRIU ptrace preflight passed", "pid", opts.Pid)
+
 	// Build CRIU opts tuned for a containerised process on a kind (Docker-based)
 	// node.  Key choices:
 	//   - TcpEstablished=false  — cold migration; TCP connections break at cutover
@@ -212,6 +224,14 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		c.mu.Unlock()
 	}()
 
+	logger.Info("CRIU Dump starting",
+		"pid", opts.Pid,
+		"imagesDir", opts.ImagesDir,
+		"criuBinary", c.criuBinaryPath,
+		"opts", fmt.Sprintf("LeaveRunning=%v TcpClose=%v TrackMem=%v ExtSharing=%v ExtMasters=%v NetworkLock=SKIP",
+			opts.LeaveRunning, true, true, true, true),
+	)
+
 	freezeStart := time.Now()
 
 	type result struct{ err error }
@@ -230,13 +250,26 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	}
 
 	// Always surface the CRIU dump log — invaluable for diagnosing failures on kind.
-	if dumpLogBytes, readErr := os.ReadFile(filepath.Join(opts.ImagesDir, "dump.log")); readErr == nil {
+	dumpLogBytes, _ := os.ReadFile(filepath.Join(opts.ImagesDir, "dump.log"))
+	if len(dumpLogBytes) > 0 {
 		logger.Info("CRIU dump log", "pid", opts.Pid, "imagesDir", opts.ImagesDir, "content", string(dumpLogBytes))
 	}
 
 	if dumpErr != nil {
-		return CheckpointResult{}, fmt.Errorf("criu dump (pid=%d): %w", opts.Pid, dumpErr)
+		logger.Error(dumpErr, "CRIU Dump failed",
+			"pid", opts.Pid,
+			"imagesDir", opts.ImagesDir,
+			"criuError", dumpErr.Error(),
+			"dumpLog", string(dumpLogBytes),
+		)
+		return CheckpointResult{}, fmt.Errorf("criu.Dump(pid=%d): %w\ndump.log: %s", opts.Pid, dumpErr, string(dumpLogBytes))
 	}
+
+	logger.Info("CRIU Dump succeeded",
+		"pid", opts.Pid,
+		"imagesDir", opts.ImagesDir,
+		"freezeDurationMs", time.Since(freezeStart).Milliseconds(),
+	)
 
 	// Verify that CRIU wrote inventory.img — its absence means the dump silently
 	// failed (e.g. network-lock or ptrace error) even though go-criu returned nil.
@@ -282,10 +315,10 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 	// Restore opts mirror the Dump opts: same TCP/shell settings, detached mode
 	// so the restored process tree is reparented to init rather than CRIU.
 	criuOpts := &rpc.CriuOpts{
-		ImagesDirFd: proto.Int32(int32(imgDirFd.Fd())),
-		LogFile:     proto.String("restore.log"),
-		LogLevel:    proto.Int32(4),
-		TcpEstablished: proto.Bool(false),
+		ImagesDirFd:     proto.Int32(int32(imgDirFd.Fd())),
+		LogFile:         proto.String("restore.log"),
+		LogLevel:        proto.Int32(4),
+		TcpEstablished:  proto.Bool(false),
 		TcpClose:        proto.Bool(true),
 		TcpSkipInFlight: proto.Bool(true),
 		// NetworkLock=SKIP: no iptables-restore needed on destination either.
