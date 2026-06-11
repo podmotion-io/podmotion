@@ -173,7 +173,9 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	//   - ExtSharing=true       — overlay rootfs shares mount subtrees externally
 	//   - ExtMasters=true       — overlay upper/work dirs are external mount masters
 	//   - Root                  — container rootfs visible from the host via /proc/<pid>/root
-	//   - TrackMem=true         — enable soft-dirty tracking (pre-copy convergence)
+	//   - TrackMem=false        — soft-dirty tracking requires CONFIG_MEM_SOFT_DIRTY
+	//                            (x86-only; not available on ARM64 / Ubuntu 24.04 aarch64)
+	//                            Safe to omit for cold migration — no pre-copy rounds needed
 	//   - TcpClose=true         — close TCP sockets instead of erroring on multi-thread tasks
 	criuOpts := &rpc.CriuOpts{
 		ImagesDirFd:    proto.Int32(int32(imgDirFd.Fd())),
@@ -190,7 +192,7 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		// Safe for kind where network isolation is Docker-managed, not iptables per-ns.
 		NetworkLock: rpc.CriuNetworkLockMethod_SKIP.Enum(),
 		ShellJob:    proto.Bool(false),
-		TrackMem:    proto.Bool(true),
+		TrackMem:    proto.Bool(false), // ARM64 lacks CONFIG_MEM_SOFT_DIRTY; not needed for cold migration
 		AutoDedup:   proto.Bool(true),
 		ExtSharing:  proto.Bool(true),
 		ExtMasters:  proto.Bool(true),
