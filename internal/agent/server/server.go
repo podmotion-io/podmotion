@@ -196,8 +196,23 @@ func scanProcForPodUID(podUID string) bool {
 	return false
 }
 
+// isPauseContainer returns true if the given PID is a pause/infra container.
+// The pause container is the sandbox init process that holds the pod's namespaces
+// but contains no real workload. CRIU must not be directed at it — we want the
+// application container's root PID instead.
+func isPauseContainer(pid int) bool {
+	commData, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		return false
+	}
+	comm := strings.TrimSpace(string(commData))
+	// containerd-shim creates a "pause" process as the pod sandbox.
+	// Some runtimes also name it "pause\x00" or similar — strip non-printable chars.
+	return comm == "pause" || strings.HasPrefix(comm, "pause")
+}
+
 // FindContainerPID scans /proc/*/cgroup for a line containing podUID and returns
-// the lowest-numbered matching host PID (the container's root process).
+// the lowest-numbered matching host PID that is NOT the pause/infra container.
 // The agent must have hostPID:true so all host PIDs are visible under /proc.
 // Handles both hyphenated UIDs and the underscore-encoded form used by cgroup v2
 // systemd slices (Ubuntu 22.04+, k3s).
@@ -219,14 +234,20 @@ func FindContainerPID(podUID string) (int32, error) {
 		if err != nil {
 			continue
 		}
-		if cgroupContainsPodUID(string(cgroupData), podUID) {
-			if lowest == 0 || int32(pid) < lowest {
-				lowest = int32(pid)
-			}
+		if !cgroupContainsPodUID(string(cgroupData), podUID) {
+			continue
+		}
+		// Skip the pause/infra container — CRIU must dump the application container.
+		if isPauseContainer(pid) {
+			log.Info("FindContainerPID: skipping pause container", "pid", pid)
+			continue
+		}
+		if lowest == 0 || int32(pid) < lowest {
+			lowest = int32(pid)
 		}
 	}
 	if lowest == 0 {
-		return 0, fmt.Errorf("container PID not found for pod UID %s (tried hyphenated and underscore forms)", podUID)
+		return 0, fmt.Errorf("container PID not found for pod UID %s (tried hyphenated and underscore forms; pause containers skipped)", podUID)
 	}
 	return lowest, nil
 }
