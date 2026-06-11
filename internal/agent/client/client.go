@@ -13,6 +13,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -170,8 +171,12 @@ func (p *AgentClientPool) Close() {
 func (p *AgentClientPool) dial(ctx context.Context, addr string) (*grpc.ClientConn, error) {
 	opts := []grpc.DialOption{
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                30,
-			Timeout:             10,
+			// Time: how often to send keepalive pings when no activity.
+			// CRIU dump can take 60-120s; set well above that so the ping
+			// doesn't fire while the Checkpoint RPC is still in-flight.
+			Time: 5 * time.Minute,
+			// Timeout: how long to wait for a ping ACK before declaring dead.
+			Timeout:             30 * time.Second,
 			PermitWithoutStream: true,
 		}),
 	}
