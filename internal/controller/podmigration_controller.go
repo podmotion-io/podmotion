@@ -335,13 +335,14 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 	}
 
+	// Always fetch the source pod so we have its UID for PrepareSource.
+	sourcePod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+	if err != nil {
+		return r.failMigration(ctx, pm, fmt.Sprintf("checkpoint: source pod not found: %v", err))
+	}
 	sourceNode := pm.Status.SourceNodeName
 	if sourceNode == "" {
-		pod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
-		if err != nil {
-			return r.failMigration(ctx, pm, fmt.Sprintf("checkpoint: source pod not found: %v", err))
-		}
-		sourceNode = pod.Spec.NodeName
+		sourceNode = sourcePod.Spec.NodeName
 		pm.Status.SourceNodeName = sourceNode
 	}
 
@@ -354,9 +355,12 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 	}
 
 	// Step 1: PrepareSource — verify the pod is still migratable.
+	// Include PodUid so the agent can populate its migrationPodUID map, which
+	// FindContainerPID uses to resolve the container root PID for CRIU.
 	prepResp, err := agentClient.PrepareSource(ctx, &agentpb.PrepareSourceRequest{
 		PodName:       pm.Spec.PodName,
 		PodNamespace:  pm.Spec.PodNamespace,
+		PodUid:        string(sourcePod.UID),
 		MigrationName: pm.Name,
 	})
 	if err != nil || (prepResp != nil && !prepResp.Compatible) {

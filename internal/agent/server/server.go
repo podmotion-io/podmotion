@@ -148,6 +148,31 @@ func (s *AgentServer) PrepareSource(_ context.Context, req *agentpb.PrepareSourc
 	}, nil
 }
 
+// cgroupUIDVariants returns both the hyphen and underscore forms of a pod UID.
+// cgroup v2 on systemd (Ubuntu 22.04+, k3s) encodes pod UIDs with underscores:
+//
+//	kubepods-besteffort-pod34b0b99f_b322_4cd8_b4e2_6b3003963468.slice
+//
+// so we must match either form.
+func cgroupUIDVariants(podUID string) []string {
+	underscored := strings.ReplaceAll(podUID, "-", "_")
+	if underscored == podUID {
+		return []string{podUID}
+	}
+	return []string{podUID, underscored}
+}
+
+// cgroupContainsPodUID returns true if the cgroup data contains the pod UID in
+// either its hyphenated or underscore-encoded form.
+func cgroupContainsPodUID(data, podUID string) bool {
+	for _, v := range cgroupUIDVariants(podUID) {
+		if strings.Contains(data, v) {
+			return true
+		}
+	}
+	return false
+}
+
 // scanProcForPodUID looks through /proc/*/cgroup for any entry containing podUID.
 // Returns true if found. Ignores errors (best-effort).
 func scanProcForPodUID(podUID string) bool {
@@ -164,7 +189,7 @@ func scanProcForPodUID(podUID string) bool {
 		if err != nil {
 			continue
 		}
-		if strings.Contains(string(data), podUID) {
+		if cgroupContainsPodUID(string(data), podUID) {
 			return true
 		}
 	}
@@ -174,6 +199,8 @@ func scanProcForPodUID(podUID string) bool {
 // FindContainerPID scans /proc/*/cgroup for a line containing podUID and returns
 // the lowest-numbered matching host PID (the container's root process).
 // The agent must have hostPID:true so all host PIDs are visible under /proc.
+// Handles both hyphenated UIDs and the underscore-encoded form used by cgroup v2
+// systemd slices (Ubuntu 22.04+, k3s).
 func FindContainerPID(podUID string) (int32, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -192,14 +219,14 @@ func FindContainerPID(podUID string) (int32, error) {
 		if err != nil {
 			continue
 		}
-		if strings.Contains(string(cgroupData), podUID) {
+		if cgroupContainsPodUID(string(cgroupData), podUID) {
 			if lowest == 0 || int32(pid) < lowest {
 				lowest = int32(pid)
 			}
 		}
 	}
 	if lowest == 0 {
-		return 0, fmt.Errorf("container PID not found for pod UID %s", podUID)
+		return 0, fmt.Errorf("container PID not found for pod UID %s (tried hyphenated and underscore forms)", podUID)
 	}
 	return lowest, nil
 }
