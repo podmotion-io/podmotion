@@ -62,7 +62,17 @@ type FilterResult struct {
 
 // Filter evaluates whether nodeName is an acceptable migration destination.
 // Called by the custom scheduler for every node in the candidate set.
-func (f *MigrationAwareFilter) Filter(ctx context.Context, node *corev1.Node) FilterResult {
+//
+// Migration-labeled replacement pods (carrying podmotion.io/migration-name) bypass
+// all standard scoring and are exclusively routed to the pre-designated destination
+// node stored in the PodMigration CR spec.destinationNode.
+func (f *MigrationAwareFilter) Filter(ctx context.Context, pod *corev1.Pod, node *corev1.Node) FilterResult {
+	// Migration-label fast path: if this pod is a PodMotion replacement, only allow
+	// the pre-designated destination node. Filter out all others immediately.
+	if pmName := pod.Labels["podmotion.io/migration-name"]; pmName != "" {
+		return f.filterForMigrationLabel(ctx, pod.Namespace, pmName, node.Name)
+	}
+
 	// Drain label check happens before NMC lookup — avoids a cache round-trip for
 	// nodes that are mid-drain and should never receive traffic.
 	if node.Labels[LabelDraining] == "true" {
@@ -89,5 +99,24 @@ func (f *MigrationAwareFilter) Filter(ctx context.Context, node *corev1.Node) Fi
 		return FilterResult{false, fmt.Sprintf("destination capacity full (%d/%d)", active, limit)}
 	}
 
+	return FilterResult{Allowed: true}
+}
+
+// filterForMigrationLabel enforces exclusive routing for replacement pods.
+// Only the pre-designated destination node (from PodMigration spec.destinationNode)
+// is allowed; all other nodes are filtered out.
+func (f *MigrationAwareFilter) filterForMigrationLabel(ctx context.Context, namespace, pmName, nodeName string) FilterResult {
+	pm := &v1alpha1.PodMigration{}
+	if err := f.reader.Get(ctx, types.NamespacedName{Name: pmName, Namespace: namespace}, pm); err != nil {
+		return FilterResult{false, fmt.Sprintf("PodMigration %s/%s not found: %v", namespace, pmName, err)}
+	}
+	destNode := pm.Spec.DestinationNode
+	if destNode == "" {
+		// DestinationNode not yet set — capacity reservation still in progress; reject all nodes.
+		return FilterResult{false, "PodMigration.spec.destinationNode not yet assigned — awaiting capacity reservation"}
+	}
+	if nodeName != destNode {
+		return FilterResult{false, fmt.Sprintf("not the pre-designated migration destination (want %s)", destNode)}
+	}
 	return FilterResult{Allowed: true}
 }

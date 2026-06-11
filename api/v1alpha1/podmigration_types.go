@@ -121,6 +121,23 @@ type PodMigrationSpec struct {
 	// Leave empty for intra-cluster migrations (the only supported mode in v0.x and v1.x).
 	// +optional
 	DestinationCluster string `json:"destinationCluster,omitempty"`
+
+	// DestinationNode is the pre-selected destination node for the replacement pod.
+	// Set by the controller after capacity reservation; read by the scheduler plugin
+	// and MutatingAdmissionWebhook to enforce exclusive node placement.
+	// +optional
+	DestinationNode string `json:"destinationNode,omitempty"`
+
+	// ReplacementPodName is the name of the replacement pod created by the workload
+	// controller after source pod deletion. Tracked by the PodMotion controller.
+	// +optional
+	ReplacementPodName string `json:"replacementPodName,omitempty"`
+
+	// SourcePodIP is the original IP of the source pod. Injected as a CNI IPAM
+	// annotation on the replacement pod at admission so the original IP is pinned
+	// at CNI ADD time (Calico / Cilium only; Flannel does not support IP mobility).
+	// +optional
+	SourcePodIP string `json:"sourcePodIP,omitempty"`
 }
 
 // PreCopyStats records metrics from the iterative pre-copy phase.
@@ -195,6 +212,11 @@ type PodMigrationStatus struct {
 	// TCPConnectionsPreserved is the number of TCP connections successfully migrated.
 	// +optional
 	TCPConnectionsPreserved *int32 `json:"tcpConnectionsPreserved,omitempty"`
+
+	// CNIProvider is the detected CNI plugin on the source node (e.g. "calico", "cilium",
+	// "flannel"). Set during Validating phase and read by the webhook's IPAM annotation logic.
+	// +optional
+	CNIProvider string `json:"cniProvider,omitempty"`
 }
 
 // +kubebuilder:object:root=true

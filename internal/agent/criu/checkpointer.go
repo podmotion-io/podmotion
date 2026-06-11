@@ -94,6 +94,11 @@ type RestoreOptions struct {
 	// Non-empty signals CRIU to use --lazy-pages and connect back to the source for
 	// on-demand page faults. Only set in PostCopy mode.
 	LazyPagesServerAddr string
+	// HostVethName is the name CRIU should give to the host-side end of the veth pair
+	// when recreating the container's eth0 during restore. If empty, no VethPair hint
+	// is passed and CRIU attempts to reconstruct the veth from checkpoint metadata (which
+	// fails when the peer netns is absent on the destination node).
+	HostVethName string
 }
 
 // Checkpointer is the interface Agent 1 exposes to the orchestration layer.

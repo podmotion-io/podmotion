@@ -135,6 +135,11 @@ spec:
                     description: CNIPlugin is the detected primary CNI plugin (e.g.
                       ovn-kubernetes, calico, cilium, flannel).
                     type: string
+                  cniUnderlayType:
+                    description: |-
+                      CNIUnderlayType captures the dataplane encapsulation type (e.g. VXLAN, Direct,
+                      WireGuard, BGP). Used for MSS clamping calculations when GENEVE bridge is active.
+                    type: string
                   ipMobilityMode:
                     description: IPMobilityMode describes the mechanism (e.g. IPAMClaim,
                       BGPHostRoute, L2Announce).
@@ -143,6 +148,13 @@ spec:
                     description: IPMobilitySupported indicates the CNI can preserve
                       pod IPs across node moves.
                     type: boolean
+                  liveMigrationEligible:
+                    default: true
+                    description: |-
+                      LiveMigrationEligible is false when the CNI does not support IP mobility
+                      (e.g. Flannel). Pods on nodes where this is false can only use cold migration
+                      (NetworkContinuity=false). Defaults to true for CNIs that support IPAM pinning.
+                    type: boolean
                   xdpBridgeCapable:
                     description: XDPBridgeCapable indicates the node can run the XDP
                       packet bridge program.
@@ -150,6 +162,7 @@ spec:
                 required:
                 - cniPlugin
                 - ipMobilitySupported
+                - liveMigrationEligible
                 - xdpBridgeCapable
                 type: object
               nodeName:

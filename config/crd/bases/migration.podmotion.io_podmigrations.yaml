@@ -83,6 +83,12 @@ spec:
                   DestinationCluster is reserved for future multi-cluster migration (post-v1.0).
                   Leave empty for intra-cluster migrations (the only supported mode in v0.x and v1.x).
                 type: string
+              destinationNode:
+                description: |-
+                  DestinationNode is the pre-selected destination node for the replacement pod.
+                  Set by the controller after capacity reservation; read by the scheduler plugin
+                  and MutatingAdmissionWebhook to enforce exclusive node placement.
+                type: string
               dryRun:
                 default: false
                 description: DryRun runs the estimation pipeline only; does not touch
@@ -139,11 +145,22 @@ spec:
                 maximum: 20
                 minimum: 1
                 type: integer
+              replacementPodName:
+                description: |-
+                  ReplacementPodName is the name of the replacement pod created by the workload
+                  controller after source pod deletion. Tracked by the PodMotion controller.
+                type: string
               rollbackOnFailure:
                 default: true
                 description: RollbackOnFailure unfreezes and restarts the source pod
                   if migration fails post-checkpoint.
                 type: boolean
+              sourcePodIP:
+                description: |-
+                  SourcePodIP is the original IP of the source pod. Injected as a CNI IPAM
+                  annotation on the replacement pod at admission so the original IP is pinned
+                  at CNI ADD time (Calico / Cilium only; Flannel does not support IP mobility).
+                type: string
               sourcePodUID:
                 description: SourcePodUID pins the migration to a specific pod UID
                   to prevent races.
@@ -184,6 +201,11 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              cniProvider:
+                description: |-
+                  CNIProvider is the detected CNI plugin on the source node (e.g. "calico", "cilium",
+                  "flannel"). Set during Validating phase and read by the webhook's IPAM annotation logic.
+                type: string
               completionTime:
                 description: CompletionTime is when the migration reached Complete,
                   Failed, or DryRunComplete.

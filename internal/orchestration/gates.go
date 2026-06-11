@@ -210,6 +210,36 @@ const (
 	// controller without loading any eBPF programs.
 	// In v0.2+ it is set True by NetworkBridgeAgent after ArmBridge completes.
 	ConditionNetworkBridgeArmed = "NetworkBridgeArmed"
+
+	// ── Reserve-before-delete gates (ADR-0046 rev) ─────────────────────────────
+
+	// ConditionCapacityReserved is set True when the destination node has confirmed
+	// it can accept the replacement pod (NodeMigrationCapacity slot pre-reserved).
+	// Must be True before the source pod is deleted.
+	ConditionCapacityReserved = "CapacityReserved"
+
+	// ConditionDestinationVolumeReady is set True when VolumeAttachment.Status.Attached
+	// is confirmed for all RWO PVCs on the destination node. For RWX/emptyDir-free pods
+	// this is set True immediately. Source pod must not be finally removed until this
+	// and TrafficVerified are both True.
+	ConditionDestinationVolumeReady = "DestinationVolumeReady"
+
+	// ConditionSchedulingGateRemoved is set True when the controller has removed the
+	// "podmotion.io/awaiting-checkpoint" PodSchedulingGate from the replacement pod,
+	// unblocking the scheduler to place the pod on the destination node.
+	// Only removed after images are staged AND CapacityReserved is True.
+	ConditionSchedulingGateRemoved = "SchedulingGateRemoved"
+
+	// ConditionSecurityContextVerified is set True after restore when the restored
+	// process's capability sets, seccomp mode, and AppArmor label match the source
+	// pod's security context manifest captured at checkpoint time.
+	ConditionSecurityContextVerified = "SecurityContextVerified"
+
+	// ConditionDataplaneReconciled is set True when the CNI's data-plane has confirmed
+	// the destination pod's endpoint is ready: Calico Felix WEP ActivelyUsed, or
+	// CiliumEndpoint.Status.State=="ready". For non-IP-mobility CNIs set immediately.
+	// The eBPF hold must not be released until both this and TrafficVerified are True.
+	ConditionDataplaneReconciled = "DataplaneReconciled"
 )
 
 // CutoverCoordinator orchestrates the synchronized cutover across all three pipelines.

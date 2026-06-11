@@ -94,7 +94,7 @@ func main() {
 	var checkpointer criu.Checkpointer
 	if runtime.GOOS == "linux" {
 		log.Info("Using CRIUCheckpointer (real CRIU subprocess via go-criu/v7)")
-		checkpointer = criu.NewCRIUCheckpointer("/usr/sbin/criu")
+		checkpointer = criu.NewCRIUCheckpointer("/usr/local/sbin/criu")
 	} else {
 		log.Info("CRIU not available on this OS — using StubCheckpointer (dev mode)",
 			"os", runtime.GOOS)

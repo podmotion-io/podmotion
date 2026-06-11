@@ -48,6 +48,15 @@ type NetworkCapability struct {
 	IPMobilityMode string `json:"ipMobilityMode,omitempty"`
 	// XDPBridgeCapable indicates the node can run the XDP packet bridge program.
 	XDPBridgeCapable bool `json:"xdpBridgeCapable"`
+	// LiveMigrationEligible is false when the CNI does not support IP mobility
+	// (e.g. Flannel). Pods on nodes where this is false can only use cold migration
+	// (NetworkContinuity=false). Defaults to true for CNIs that support IPAM pinning.
+	// +kubebuilder:default=true
+	LiveMigrationEligible bool `json:"liveMigrationEligible"`
+	// CNIUnderlayType captures the dataplane encapsulation type (e.g. VXLAN, Direct,
+	// WireGuard, BGP). Used for MSS clamping calculations when GENEVE bridge is active.
+	// +optional
+	CNIUnderlayType string `json:"cniUnderlayType,omitempty"`
 }
 
 // NodeMigrationCapacitySpec is set by the node agent at startup and updated periodically.

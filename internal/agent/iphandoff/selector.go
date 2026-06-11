@@ -40,10 +40,18 @@ func (s *CNIMobilitySelector) Select(ctx context.Context, cniPlugin string) IPHa
 		return &OVNKHandoff{DynamicClient: s.DynamicClient}
 	case strings.Contains(lower, "calico"):
 		return &CalicoHandoff{KubeClient: s.KubeClient}
+	case strings.Contains(lower, "cilium"):
+		// Cilium IPAM-pin approach: annotate destination pod with ipam.cilium.io/ip.
+		// Requires multi-pool or CRD IPAM mode. Live migration only.
+		return &CiliumHandoff{KubeClient: s.KubeClient}
+	case strings.Contains(lower, "flannel"):
+		// Flannel does not support IP mobility — cold migration only.
+		// NetworkContinuity=true requests are rejected at admission and at runtime.
+		return &FlannelHandoff{}
 	default:
-		// Gratuitous ARP is the universal fallback but it is a stub in v0.1.
-		// CNIs that do not have a dedicated handoff path (Cilium, Flannel, Weave)
-		// rely on GARP + reconnect semantics per ADR-0017 (TIER_4 network).
+		// Gratuitous ARP is the universal fallback for unknown CNIs (v0.1 stub).
+		// CNIs without a dedicated handoff path fall back to GARP + reconnect
+		// semantics per ADR-0017 (TIER_4 network).
 		return &ARPHandoff{}
 	}
 }

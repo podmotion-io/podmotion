@@ -71,7 +71,16 @@ func (s *MigrationAwareScore) SetSourceContext(sourceNodeLabels map[string]strin
 
 // Score returns a 0-100 score for the candidate destination node.
 // Higher is better. Returns an error only when the NMC cannot be read.
-func (s *MigrationAwareScore) Score(ctx context.Context, node *corev1.Node) (int64, error) {
+//
+// Migration-labeled replacement pods (carrying podmotion.io/migration-name) bypass
+// all multi-factor scoring and return MaxNodeScore only for the pre-designated
+// destination node, 0 for all others.
+func (s *MigrationAwareScore) Score(ctx context.Context, pod *corev1.Pod, node *corev1.Node) (int64, error) {
+	// Migration-label fast path: exclusively score the pre-designated destination.
+	if pmName := pod.Labels["podmotion.io/migration-name"]; pmName != "" {
+		return s.scoreForMigrationLabel(ctx, pod.Namespace, pmName, node.Name)
+	}
+
 	nmc := &v1alpha1.NodeMigrationCapacity{}
 	if err := s.reader.Get(ctx, types.NamespacedName{Name: node.Name}, nmc); err != nil {
 		return 0, fmt.Errorf("reading NMC for node %s: %w", node.Name, err)
@@ -97,6 +106,19 @@ func (s *MigrationAwareScore) Score(ctx context.Context, node *corev1.Node) (int
 		return maxScore, nil
 	}
 	return weighted, nil
+}
+
+// scoreForMigrationLabel returns maxScore for the pre-designated destination node
+// and 0 for all other nodes. Reads PodMigration.spec.destinationNode.
+func (s *MigrationAwareScore) scoreForMigrationLabel(ctx context.Context, namespace, pmName, nodeName string) (int64, error) {
+	pm := &v1alpha1.PodMigration{}
+	if err := s.reader.Get(ctx, types.NamespacedName{Name: pmName, Namespace: namespace}, pm); err != nil {
+		return 0, fmt.Errorf("scoreForMigrationLabel: PodMigration %s/%s not found: %w", namespace, pmName, err)
+	}
+	if pm.Spec.DestinationNode == nodeName {
+		return maxScore, nil
+	}
+	return 0, nil
 }
 
 // scoreLocality gives full marks for same-zone, half for same-region, zero for cross-region.
