@@ -21,6 +21,48 @@ was exercised with real gRPC calls to the agent on each node.
 
 ---
 
+## PoC Sprint 7 — Progress: dump path fixed, transfer wired, CRIU restore attempted but dump still empty (2026-06-10)
+
+North Star not yet achieved. The checkpoint directory path handoff and shared-storage transfer were
+fixed (extra-mounts added, `TcpSkipInFlight=true`, `NetworkLock=SKIP`). CRIU restore was invoked on
+the destination node with CRIU 3.17.1 (real subprocess, no mock). However, no dump images were
+written on the source node — no `dump.log`, no `inventory.img`, no memory images in the checkpoint
+directory — so restore read empty images and failed.
+
+### What Was Fixed
+
+| Fix | Detail |
+|-----|--------|
+| Network-lock stage — `iptables-restore` missing | Root cause identified: `iptables-restore` / `ip6tables-restore` absent from agent container image; CRIU requires these to lock the network namespace during dump |
+| CRIU flags | `TcpSkipInFlight=true` and `NetworkLock=CriuNetworkLockMethod_SKIP` set to bypass iptables dependency |
+| Checkpoint directory created | `mkdir` of checkpoint path confirmed before dump |
+| Inventory check wired | Post-dump `inventory.img` stat check added; fast-fails with explicit error if absent |
+| Shared transfer mount | Extra-mounts added so checkpoint dir is accessible on destination node |
+
+### Why North Star Still Not Achieved
+
+Despite the `NetworkLock=SKIP` flag, CRIU dump still wrote zero image files. The restore.log on the
+destination confirmed the source checkpoint directory arrived empty:
+
+- `No inventory.img image / Unexpected EOF on (empty-image)`
+- `tun: Unable to create tun: No such file or directory`
+- `Unable to create a veth pair: Operation not supported (-95)`
+
+The Checkpoint gRPC call was never observed in agent logs during the migration window — only startup
+and `PrepareDestination` stack traces appeared, suggesting the operator's Checkpoint RPC call path
+did not reach the CRIU `Dump()` call, or `Dump()` returned immediately without writing anything
+(likely a silent EPERM from the kind kernel's PID namespace or seccomp profile).
+
+### Sprint 8 Target
+
+Instrument the `CRIUCheckpointer.Checkpoint()` call to log the exact `criu.Dump()` return code and
+`errno` before any fallback fires, add `ptrace(PTRACE_SEIZE, containerPid)` preflight to confirm
+the agent process can attach to the container PID from the host PID namespace in kind, and if
+`PTRACE_SEIZE` fails, surface the specific capability or seccomp rule blocking it so it can be
+patched into the agent DaemonSet before the next sprint.
+
+---
+
 ## PoC Sprint 6 — Progress: conflict fixed, CRIU invoked, checkpoint images empty (2026-06-10)
 
 North Star not yet achieved. Real CRIU binary was invoked (3.17.1 confirmed), but restore failed
