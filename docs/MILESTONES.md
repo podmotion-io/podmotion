@@ -341,6 +341,7 @@ below the controller layer:
 
 **User friction inventory:**
 
+
 | Item | Required | Friction |
 |---|---|---|
 | ClusterRole addition for ArgoCD Application/Rollout patch | Conditional (auto-skipped if ArgoCD absent) | Low — included in Helm chart |
@@ -349,6 +350,95 @@ below the controller layer:
 | Do NOT place PodMigration CRs in Git-managed directories | YES | Documentation only |
 | `argocd-cm` resource.exclusions for podmotion.io group | Recommended | Low — one-time admin |
 | `ignoreDifferences` for webhook-injected pod labels | If ArgoCD with pod-level sync | Low — copy-paste from docs |
+
+---
+
+## M20 — Istio Service Mesh Certification 🔲 Planned
+
+Certify PodMotion for pods running inside an Istio service mesh (both sidecar and ambient
+modes). This milestone covers detection, multi-process checkpoint/restore, certificate
+continuity, xDS reconnect gating, and ztunnel coordination.
+
+**Deliverables:**
+
+- **Istio detection at admission**: ValidatingWebhook inspects pod annotations/namespace
+  labels (`istio-injection=enabled`, `sidecar.istio.io/inject`) and sets an
+  `IstioAnnotated` flag on the `PodMigration` CR; triggers Istio-specific migration path
+- **Sidecar-mode multi-process checkpoint** (sidecar injection path):
+  - CRIU must checkpoint the entire pod PID namespace — `istio-proxy` (Envoy) +
+    `pilot-agent` + the application process — in a single dump tree rooted at the init
+    process; single-container checkpoint misses `istio-proxy` PIDs entirely
+  - Compat prober: verify Envoy process is in a WAIT-xDS-ready state before freeze
+    (Envoy mid-config-push is unsafe to freeze; emit `EvoyConfigPushInProgress` gate)
+  - pilot-agent holds a UDS connection to `/var/run/secrets/istio/` SPIFFE Workload API
+    socket; this FD survives CRIU restore as a pending FD — the socket will reconnect
+    post-restore; no special handling required for the FD itself, but the certificate it
+    references is time-limited (see SVID window below)
+- **iptables redirect rules preservation**: Istio's `istio-init` init container writes
+  iptables redirect rules (REDIRECT 15001 inbound, REDIRECT 15001 outbound) into the
+  pod's net namespace; these rules are in the CRIU netns/iptables state and survive
+  CRIU restore automatically — no extra step needed; verify in E2E that rules are intact
+  post-restore via `nsenter --net -- iptables -t nat -L`
+- **SVID certificate continuity**:
+  - SPIFFE SVIDs issued by istiod have short TTLs (default 24h, can be as low as 1h)
+  - pilot-agent auto-rotates; post-restore it will reconnect to istiod and get a fresh
+    SVID within seconds; mTLS enforcement during this brief window is the risk
+  - Mitigation: hold eBPF traffic (extend the zero-window gate, ADR-0045) until pilot-agent
+    reports SVID acquisition; detect via health probe on `15020/healthz/ready` (returns
+    200 only when Envoy xDS sync + SVID are valid)
+  - Surface `SvidRenewWindowTooShort` preflight error if remaining SVID TTL < restore
+    estimated duration + 30s safety margin
+- **Envoy xDS reconnect gate**: post-restore, `pilot-agent` reconnects to istiod via xDS;
+  Envoy `CONFIG_DUMP` status (`15000/config_dump`) goes from `STALE` → `SYNCED`; add
+  gate `EnvoyXdsSynced=true` to the Verifying phase; do NOT release eBPF hold until both
+  `TrafficVerified=true` AND `EnvoyXdsSynced=true`; poll `15020/healthz/ready` with 2s
+  interval; timeout after 60s → rollback
+- **Ambient mode** (ztunnel path, Istio ≥ 1.21):
+  - No sidecar in the pod; L4/L7 handled by per-node ztunnel DaemonSet
+  - Migration model: standard pod migration; ztunnel on destination node automatically
+    enrolls the restored pod via Kubernetes API watches (pod label `istio.io/dataplane-mode=ambient`)
+  - Source-node ztunnel cleans up its enrollment when source pod is deleted
+  - Verify: after restore, ztunnel enrollment on destination appears in `ztunnel` proxy
+    config dump; add E2E check
+  - Risk: ztunnel is tied to node IP for L4 redirects; during the migration freeze window
+    there is a brief period where neither node's ztunnel has a valid enrollment; the eBPF
+    zero-window hold covers this window
+- **PeerAuthentication STRICT mode gate**: if the pod's namespace enforces
+  `PeerAuthentication.mtls.mode=STRICT`, any request arriving before Envoy has a valid
+  SVID will be rejected with `RBAC: access denied`; the SVID gate above prevents this;
+  detect STRICT mode at preflight and require SVID gate
+- **VirtualService / DestinationRule continuity**: these resources are cluster-scoped and
+  not tied to the pod's node; no migration action required; traffic policy is seamlessly
+  applied by the destination Envoy once xDS syncs
+- **Argo Rollouts + Istio traffic shifting**: if a canary Rollout controls VirtualService
+  traffic weights, migration must not disrupt the weight — the pause approach from M19
+  covers this; document the interaction
+- **Compat prober extension**: add `IstioCertifiable` check —
+  SVID TTL > threshold, Envoy not in CONFIG_PUSH, ambient vs sidecar mode detected
+- **E2E certification matrix**:
+  - Sidecar mode + PeerAuthentication STRICT: mTLS continuity across migration
+  - Sidecar mode + `istio-proxy` resource limits (CPU/memory cgroup constraints honored)
+  - Ambient mode + ztunnel enrollment round-trip
+  - Failed restore rollback: source SVID still valid, traffic re-routes without gap
+  - Canary Rollout paused during migration, resumed after
+- **Documentation**: Istio compatibility guide in Docusaurus; add
+  `migration.podmotion.io/istio-mode: sidecar|ambient` annotation to PodMigration spec;
+  add Istio to compatibility matrix table in docs/compatibility.md
+
+**Key constraints:**
+- NRI + seccomp: Istio sidecar adds a seccomp profile on `istio-proxy` container;
+  the CRIU/seccomp preflight (M20 must run after ADR-0046's security context harness is
+  built) must include `istio-proxy`'s profile, not just the app container's
+- CRIU tree rooting: the pod's init process (PID 1 in the container, typically
+  `/sbin/docker-init` or `pause`) is the root; `istio-proxy` and `pilot-agent` are
+  children; CRIU dump of PID 1 captures all; verify with `pstree` in the frozen state
+- NRI `--join-ns` timing: same constraint as M19/ADR-0046 — restore must target the
+  runc-built namespace, not attempt to pre-join at CreateContainer time
+- containerd ≥ 2.0 required for NRI (same as M19)
+
+**Dependencies:** M9 (CNI compatibility — Calico/Cilium endpoints), M10 (eBPF zero-window
+hold — extended for SVID gate), M19 (GitOps-aware migration — NRI hook, sub-controller
+approach, security context harness).
 
 ---
 
@@ -364,6 +454,7 @@ M1 ──► M2 ──► M3 ──► M4 ──► M5 ──► M6 ──► M7
                                                          M15 (M5+M11)
                                                          M18 (all)
                                                          M19 (M1+M4+M8+M10)
+                                                         M20 (M9+M10+M19)
 ```
 
 ---
@@ -375,7 +466,8 @@ M1 ──► M2 ──► M3 ──► M4 ──► M5 ──► M6 ──► M7
 | v0.1.0-alpha | M1–M5, M8, M11 | Cold + iterative pre-copy; TIER_4 network (reconnect); no TCP preservation |
 | v0.1.0 | M1–M12 | Full intra-cluster migration; eBPF network bridge; all storage tiers |
 | v0.2.0 | M13, M15, M16, M17 | Post-copy, GPU, StatefulSet, spot automation; TCP_REPAIR preservation |
-| v1.0.0 | M1–M18, M19 | Production-ready; GitOps-aware; OperatorHub; upstream KEPs submitted |
+| v1.0.0 | M1–M19 | Production-ready; GitOps-aware; OperatorHub; upstream KEPs submitted |
+| v1.1.0 | +M20 | Istio service mesh certification |
 | v1.x+ | Multi-cluster GA | M14 graduated from experimental |
 
 ---
