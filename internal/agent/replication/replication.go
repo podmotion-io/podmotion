@@ -14,6 +14,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -143,47 +144,53 @@ func (r *ReplicationManager) RunPreCopyLoop(
 		fmt.Sprintf("max rounds exhausted: %dMB remaining", conv.FinalDirtyMB))
 }
 
-// patchMemorySynced writes the MemorySynced condition to the PodMigration status via SSA patch.
+// patchMemorySynced writes the MemorySynced condition to the PodMigration status.
+// Retries on optimistic-lock conflict (resource version mismatch) using retry.RetryOnConflict.
 func (r *ReplicationManager) patchMemorySynced(
 	ctx context.Context,
 	pm *pmv1.PodMigration,
 	status metav1.ConditionStatus,
 	reason, message string,
 ) error {
-	// Fetch fresh copy to avoid conflict on stale resource version.
-	fresh := &pmv1.PodMigration{}
-	if err := r.Client.Get(ctx, client.ObjectKeyFromObject(pm), fresh); err != nil {
-		return fmt.Errorf("get PodMigration for patch: %w", err)
-	}
-	meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
-		Type:               conditionMemorySynced,
-		Status:             status,
-		Reason:             reason,
-		Message:            message,
-		LastTransitionTime: metav1.Now(),
+	key := client.ObjectKeyFromObject(pm)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &pmv1.PodMigration{}
+		if err := r.Client.Get(ctx, key, fresh); err != nil {
+			return fmt.Errorf("get PodMigration for patch: %w", err)
+		}
+		meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:               conditionMemorySynced,
+			Status:             status,
+			Reason:             reason,
+			Message:            message,
+			LastTransitionTime: metav1.Now(),
+		})
+		return r.Client.Status().Update(ctx, fresh)
 	})
-	return r.Client.Status().Update(ctx, fresh)
 }
 
 // updatePreCopyStats persists pre-copy metrics to pm.Status.PreCopyStats.
 // Called before patchMemorySynced so stats are visible alongside the condition.
+// Retries on optimistic-lock conflict.
 func (r *ReplicationManager) updatePreCopyStats(
 	ctx context.Context,
 	pm *pmv1.PodMigration,
 	conv ConvergenceResult,
 	rounds []RoundStats,
 ) error {
-	fresh := &pmv1.PodMigration{}
-	if err := r.Client.Get(ctx, client.ObjectKeyFromObject(pm), fresh); err != nil {
-		return err
-	}
-
-	// FreezeDurationMs is not known here (that is the final CRIU Dump timing).
-	// Recorded as 0 now; the Checkpointing phase updates it after the real dump.
-	fresh.Status.PreCopyStats = &pmv1.PreCopyStats{
-		RoundsCompleted:   int32(conv.Rounds),
-		FinalDirtyPagesMB: int32(conv.FinalDirtyMB),
-		FreezeDurationMs:  0,
-	}
-	return r.Client.Status().Update(ctx, fresh)
+	key := client.ObjectKeyFromObject(pm)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &pmv1.PodMigration{}
+		if err := r.Client.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		// FreezeDurationMs is not known here (that is the final CRIU Dump timing).
+		// Recorded as 0 now; the Checkpointing phase updates it after the real dump.
+		fresh.Status.PreCopyStats = &pmv1.PreCopyStats{
+			RoundsCompleted:   int32(conv.Rounds),
+			FinalDirtyPagesMB: int32(conv.FinalDirtyMB),
+			FreezeDurationMs:  0,
+		}
+		return r.Client.Status().Update(ctx, fresh)
+	})
 }

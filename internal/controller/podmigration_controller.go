@@ -19,6 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -635,10 +636,20 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-// transitionTo sets pm.Status.Phase and patches status.
+// transitionTo sets pm.Status.Phase and patches status with retry on conflict.
 func (r *PodMigrationReconciler) transitionTo(ctx context.Context, pm *pmv1.PodMigration, phase pmv1.MigrationPhase) (ctrl.Result, error) {
-	pm.Status.Phase = phase
-	if err := r.Status().Update(ctx, pm); err != nil {
+	key := client.ObjectKeyFromObject(pm)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &pmv1.PodMigration{}
+		if fetchErr := r.Get(ctx, key, fresh); fetchErr != nil {
+			return fetchErr
+		}
+		// Carry forward any mutations made by the caller (conditions, CheckpointRef, etc.)
+		fresh.Status = pm.Status
+		fresh.Status.Phase = phase
+		return r.Status().Update(ctx, fresh)
+	})
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 	// Immediately requeue so the new phase handler runs in the same loop iteration.
@@ -646,11 +657,20 @@ func (r *PodMigrationReconciler) transitionTo(ctx context.Context, pm *pmv1.PodM
 }
 
 func (r *PodMigrationReconciler) failMigration(ctx context.Context, pm *pmv1.PodMigration, reason string) (ctrl.Result, error) {
-	pm.Status.Phase = pmv1.MigrationPhaseFailed
-	now := metav1.Now()
-	pm.Status.CompletionTime = &now
-	setCondition(pm, "Failed", metav1.ConditionTrue, "MigrationFailed", reason)
-	return ctrl.Result{}, r.Status().Update(ctx, pm)
+	key := client.ObjectKeyFromObject(pm)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &pmv1.PodMigration{}
+		if fetchErr := r.Get(ctx, key, fresh); fetchErr != nil {
+			return fetchErr
+		}
+		fresh.Status = pm.Status
+		fresh.Status.Phase = pmv1.MigrationPhaseFailed
+		now := metav1.Now()
+		fresh.Status.CompletionTime = &now
+		setCondition(fresh, "Failed", metav1.ConditionTrue, "MigrationFailed", reason)
+		return r.Status().Update(ctx, fresh)
+	})
+	return ctrl.Result{}, err
 }
 
 func (r *PodMigrationReconciler) initiateRollback(ctx context.Context, pm *pmv1.PodMigration, reason string) (ctrl.Result, error) {
