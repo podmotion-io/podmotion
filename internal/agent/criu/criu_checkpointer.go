@@ -147,6 +147,10 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	}
 	defer imgDirFd.Close()
 
+	if opts.Pid == 0 {
+		return CheckpointResult{}, fmt.Errorf("criu dump: Pid is 0 — caller must resolve the container root PID before calling Dump")
+	}
+
 	criuOpts := &rpc.CriuOpts{
 		ImagesDirFd:    proto.Int32(int32(imgDirFd.Fd())),
 		LogFile:        proto.String("dump.log"),
@@ -154,6 +158,7 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		LeaveRunning:   proto.Bool(opts.LeaveRunning),
 		TcpEstablished: proto.Bool(true),
 		ShellJob:       proto.Bool(true),
+		Pid:            proto.Int32(opts.Pid),
 	}
 
 	if opts.PrevImagesDir != "" {

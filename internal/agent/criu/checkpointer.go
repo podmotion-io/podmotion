@@ -75,6 +75,10 @@ type DumpOptions struct {
 	// When true, CRIU writes lazy-pages metadata into ImagesDir so the lazy-pages
 	// daemon can serve on-demand page faults from the destination.
 	LazyPages bool
+	// Pid is the host PID of the container's root process. CRIU requires a non-zero
+	// Pid to identify which process tree to dump. Callers must resolve this via
+	// FindContainerPID before calling Dump. A zero value causes Dump to fail fast.
+	Pid int32
 }
 
 // RestoreOptions configures CRIU restore on the destination node.
