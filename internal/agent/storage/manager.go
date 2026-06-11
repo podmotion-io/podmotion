@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -164,35 +165,42 @@ func (m *StorageMigrationManager) RunPreStage(ctx context.Context, pm *pmv1.PodM
 }
 
 // patchStorageReady updates the StorageReadyForFreeze condition on the PodMigration CR.
-// Fetches a fresh copy to avoid conflict on stale resource version.
+// Retries on optimistic-lock conflict (resource version mismatch) using retry.RetryOnConflict.
 func (m *StorageMigrationManager) patchStorageReady(
 	ctx context.Context,
 	pm *pmv1.PodMigration,
 	status metav1.ConditionStatus,
 	reason, message string,
 ) error {
-	fresh := &pmv1.PodMigration{}
-	if err := m.Client.Get(ctx, client.ObjectKeyFromObject(pm), fresh); err != nil {
-		return fmt.Errorf("get PodMigration for storage patch: %w", err)
-	}
-	meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
-		Type:               conditionStorageReadyForFreeze,
-		Status:             status,
-		Reason:             reason,
-		Message:            message,
-		LastTransitionTime: metav1.Now(),
+	key := client.ObjectKeyFromObject(pm)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &pmv1.PodMigration{}
+		if err := m.Client.Get(ctx, key, fresh); err != nil {
+			return fmt.Errorf("get PodMigration for storage patch: %w", err)
+		}
+		meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:               conditionStorageReadyForFreeze,
+			Status:             status,
+			Reason:             reason,
+			Message:            message,
+			LastTransitionTime: metav1.Now(),
+		})
+		return m.Client.Status().Update(ctx, fresh)
 	})
-	return m.Client.Status().Update(ctx, fresh)
 }
 
 // patchStorageTier writes pm.Status.StorageTier via a fresh fetch.
+// Retries on optimistic-lock conflict (resource version mismatch).
 func (m *StorageMigrationManager) patchStorageTier(ctx context.Context, pm *pmv1.PodMigration, tier int32) error {
-	fresh := &pmv1.PodMigration{}
-	if err := m.Client.Get(ctx, client.ObjectKeyFromObject(pm), fresh); err != nil {
-		return err
-	}
-	fresh.Status.StorageTier = &tier
-	return m.Client.Status().Update(ctx, fresh)
+	key := client.ObjectKeyFromObject(pm)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &pmv1.PodMigration{}
+		if err := m.Client.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		fresh.Status.StorageTier = &tier
+		return m.Client.Status().Update(ctx, fresh)
+	})
 }
 
 func (m *StorageMigrationManager) getSourcePod(ctx context.Context, pm *pmv1.PodMigration) (*corev1.Pod, error) {
