@@ -21,6 +21,26 @@ was exercised with real gRPC calls to the agent on each node.
 
 ---
 
+## PoC Sprint 11 — Path mismatch fixed; checkpoint call never reached pm-worker in this run (2026-06-10)
+
+North Star not yet achieved. Sprint 11 fixed the CheckpointRef path divergence identified in Sprint 10: `pm.Status.CheckpointRef.Name` is now set to the full filesystem path `/var/lib/podmotion/checkpoints/{pm.Name}/final` so that `reconcileRestoring` reads the same directory that `reconcileCheckpointing` wrote. Build passes cleanly (operator + agent). However, during the Sprint 11 validation run the operator entered the crash-safe restart path ("pod was frozen but not restored — issuing restore") before the gRPC Checkpoint call to pm-worker was ever made — leaving `/var/lib/podmotion/checkpoints/sprint11-redis/final/` empty on pm-worker. CRIU restore on pm-control then failed with "No inventory.img image (Unexpected EOF on empty-image)".
+
+**Sprint 11 quorum findings:**
+- CRIU Agent: dumpPath="/var/lib/podmotion/checkpoints/sprint11-redis/final" — path fix confirmed.
+- Controller Agent: divergence confirmed and fixed — CheckpointRef now carries full filesystem path. The crash-safe restart path fires before Checkpoint RPC executes, skipping the dump entirely.
+- gRPC Agent: pathMismatch confirmed resolved; checkpoint gRPC call to pm-worker did not execute in this run.
+
+**Sprint 11 key results:**
+- buildOk=true
+- realCRIU=true (go-criu/v7 CRIUCheckpointer active)
+- inventoryImgPresent=false (checkpoint dir on pm-worker was empty — gRPC call never made)
+- dataIntact=false (CRIU restore failed: no dump images)
+- northStar=false
+
+**Sprint 12 precise fix:** The crash-safe restart path in `reconcileRestoring` fires when the pod annotation `podmotion.io/frozen=true` is set but `pm.Status.Phase != Restoring`. This causes restore to run before Checkpoint RPC is dispatched. Fix: add a guard so the crash-safe path only fires when `pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != ""` (i.e., a successful checkpoint was recorded). Without this guard the operator skips the dump and attempts restore against an empty directory on every controller restart. The exact location is `reconcileRestoring` in `internal/controller/podmigration_controller.go` — find the block that checks `podFrozen && phase != Restoring` and add the CheckpointRef nil-guard before issuing the restore.
+
+---
+
 ## PoC Sprint 10 — CRIU dump artifacts confirmed on pm-worker; restore pointed at wrong directory (2026-06-10)
 
 North Star not yet achieved. Sprint 10 fixed the controller reconcile race (line 435-436 in podmigration_controller.go), installed containerd+runc, lowered ptrace_scope/perf_event_paranoid, and installed CNI binaries. Real CRIU (go-criu/v7 CRIUCheckpointer) executed a full dump on pm-worker: 13 artifacts confirmed including inventory.img in /tmp/criu-sprint10/. The gRPC Checkpoint call succeeded. However, restore failed with "No inventory.img image" because CRIU restore was invoked against a different, empty directory — the checkpoint directory path was not correctly handed off from dump to restore.
