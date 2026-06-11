@@ -20,6 +20,7 @@ import (
 	gocriu "github.com/checkpoint-restore/go-criu/v7"
 	"github.com/checkpoint-restore/go-criu/v7/rpc"
 	"google.golang.org/protobuf/proto"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const defaultCRIUBinaryPath = "/usr/sbin/criu"
@@ -151,14 +152,34 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		return CheckpointResult{}, fmt.Errorf("criu dump: Pid is 0 — caller must resolve the container root PID before calling Dump")
 	}
 
+	logger := logf.FromContext(ctx)
+
+	// Build CRIU opts tuned for a containerised process on a kind (Docker-based)
+	// node.  Key choices:
+	//   - TcpEstablished=false  — cold migration; TCP connections break at cutover
+	//   - ShellJob=false        — container init is not a shell job
+	//   - ExtSharing=true       — overlay rootfs shares mount subtrees externally
+	//   - ExtMasters=true       — overlay upper/work dirs are external mount masters
+	//   - Root                  — container rootfs visible from the host via /proc/<pid>/root
+	//   - TrackMem=true         — enable soft-dirty tracking (pre-copy convergence)
+	//   - TcpClose=true         — close TCP sockets instead of erroring on multi-thread tasks
 	criuOpts := &rpc.CriuOpts{
 		ImagesDirFd:    proto.Int32(int32(imgDirFd.Fd())),
 		LogFile:        proto.String("dump.log"),
 		LogLevel:       proto.Int32(4),
-		LeaveRunning:   proto.Bool(opts.LeaveRunning),
-		TcpEstablished: proto.Bool(true),
-		ShellJob:       proto.Bool(true),
 		Pid:            proto.Int32(opts.Pid),
+		LeaveRunning:   proto.Bool(opts.LeaveRunning),
+		TcpEstablished: proto.Bool(false),
+		TcpClose:       proto.Bool(true),
+		ShellJob:       proto.Bool(false),
+		TrackMem:       proto.Bool(true),
+		AutoDedup:      proto.Bool(true),
+		ExtSharing:     proto.Bool(true),
+		ExtMasters:     proto.Bool(true),
+		// Root tells CRIU where the container's rootfs is visible from the
+		// host mount namespace.  /proc/<pid>/root always works regardless of
+		// how the container runtime mounted it.
+		Root: proto.String(fmt.Sprintf("/proc/%d/root", opts.Pid)),
 	}
 
 	if opts.PrevImagesDir != "" {
@@ -167,7 +188,10 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 			rel = opts.PrevImagesDir
 		}
 		criuOpts.ParentImg = proto.String(rel)
-		criuOpts.TrackMem = proto.Bool(true)
+	}
+
+	if opts.LazyPages {
+		criuOpts.LazyPages = proto.Bool(true)
 	}
 
 	c.mu.Lock()
@@ -190,14 +214,22 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		done <- result{err: cr.Dump(criuOpts, nil)}
 	}()
 
+	var dumpErr error
 	select {
 	case <-ctx.Done():
 		c.Abort(context.Background(), opts.ContainerID, opts.Namespace) //nolint:errcheck
 		return CheckpointResult{}, fmt.Errorf("Dump aborted: %w", ctx.Err())
 	case res := <-done:
-		if res.err != nil {
-			return CheckpointResult{}, fmt.Errorf("criu dump: %w", res.err)
-		}
+		dumpErr = res.err
+	}
+
+	// Always surface the CRIU dump log — invaluable for diagnosing failures on kind.
+	if dumpLogBytes, readErr := os.ReadFile(filepath.Join(opts.ImagesDir, "dump.log")); readErr == nil {
+		logger.Info("CRIU dump log", "pid", opts.Pid, "imagesDir", opts.ImagesDir, "content", string(dumpLogBytes))
+	}
+
+	if dumpErr != nil {
+		return CheckpointResult{}, fmt.Errorf("criu dump (pid=%d): %w", opts.Pid, dumpErr)
 	}
 
 	return CheckpointResult{
@@ -225,13 +257,29 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 	}
 	defer imgDirFd.Close()
 
+	logger := logf.FromContext(ctx)
+
+	// Restore opts mirror the Dump opts: same TCP/shell settings, detached mode
+	// so the restored process tree is reparented to init rather than CRIU.
 	criuOpts := &rpc.CriuOpts{
 		ImagesDirFd:    proto.Int32(int32(imgDirFd.Fd())),
 		LogFile:        proto.String("restore.log"),
 		LogLevel:       proto.Int32(4),
-		TcpEstablished: proto.Bool(true),
-		ShellJob:       proto.Bool(true),
+		TcpEstablished: proto.Bool(false),
+		TcpClose:       proto.Bool(true),
+		ShellJob:       proto.Bool(false),
+		ExtSharing:     proto.Bool(true),
+		ExtMasters:     proto.Bool(true),
 		RstSibling:     proto.Bool(opts.Detached),
+	}
+
+	if opts.BundleDir != "" {
+		// BundleDir is the OCI bundle; its rootfs subdirectory is the container rootfs.
+		criuOpts.Root = proto.String(filepath.Join(opts.BundleDir, "rootfs"))
+	}
+
+	if opts.LazyPagesServerAddr != "" {
+		criuOpts.LazyPages = proto.Bool(true)
 	}
 
 	c.mu.Lock()
@@ -254,14 +302,22 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 		done <- result{err: cr.Restore(criuOpts, nil)}
 	}()
 
+	var restoreErr error
 	select {
 	case <-ctx.Done():
 		c.Abort(context.Background(), opts.ContainerID, opts.Namespace) //nolint:errcheck
 		return RestoreResult{}, fmt.Errorf("Restore aborted: %w", ctx.Err())
 	case res := <-done:
-		if res.err != nil {
-			return RestoreResult{}, fmt.Errorf("criu restore: %w", res.err)
-		}
+		restoreErr = res.err
+	}
+
+	// Surface the CRIU restore log regardless of success/failure.
+	if restoreLogBytes, readErr := os.ReadFile(filepath.Join(opts.ImagesDir, "restore.log")); readErr == nil {
+		logger.Info("CRIU restore log", "imagesDir", opts.ImagesDir, "content", string(restoreLogBytes))
+	}
+
+	if restoreErr != nil {
+		return RestoreResult{}, fmt.Errorf("criu restore: %w", restoreErr)
 	}
 
 	return RestoreResult{
