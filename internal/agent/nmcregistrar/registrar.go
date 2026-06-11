@@ -24,13 +24,19 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	corev1 "k8s.io/api/core/v1"
+
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 )
 
+// defaultAgentPort is the port the agent gRPC server listens on.
+const defaultAgentPort = "9090"
+
 // Registrar creates and updates the NodeMigrationCapacity CR for the local node.
 type Registrar struct {
-	client   client.Client
-	nodeName string
+	client    client.Client
+	nodeName  string
+	agentPort string // gRPC listen port; defaults to defaultAgentPort
 }
 
 // New builds a controller-runtime client with the pmv1 scheme registered.
@@ -43,7 +49,21 @@ func New(cfg *rest.Config, nodeName string) (*Registrar, error) {
 	if err != nil {
 		return nil, fmt.Errorf("building controller-runtime client: %w", err)
 	}
-	return &Registrar{client: c, nodeName: nodeName}, nil
+	return &Registrar{client: c, nodeName: nodeName, agentPort: defaultAgentPort}, nil
+}
+
+// resolveNodeInternalIP looks up the Node object and returns its first InternalIP address.
+func (r *Registrar) resolveNodeInternalIP(ctx context.Context) (string, error) {
+	node := &corev1.Node{}
+	if err := r.client.Get(ctx, types.NamespacedName{Name: r.nodeName}, node); err != nil {
+		return "", fmt.Errorf("getting Node %q to resolve InternalIP: %w", r.nodeName, err)
+	}
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
+			return addr.Address, nil
+		}
+	}
+	return "", fmt.Errorf("no InternalIP found for node %q", r.nodeName)
 }
 
 // criuBinaryPath is the path to the CRIU binary, mounted from the host node via hostPath volume.
@@ -175,6 +195,17 @@ func (r *Registrar) Register(ctx context.Context) error {
 	kernelFeatures := detectKernelFeatures()
 	longhornAvailable := detectLonghorn(ctx, r.client)
 
+	// Resolve the node's InternalIP so the operator can reach this agent even when
+	// it runs as a systemd service (no pod IP discoverable via label selector).
+	agentEndpoint := ""
+	if nodeIP, err := r.resolveNodeInternalIP(ctx); err == nil {
+		port := r.agentPort
+		if port == "" {
+			port = defaultAgentPort
+		}
+		agentEndpoint = fmt.Sprintf("%s:%s", nodeIP, port)
+	}
+
 	nmc := &pmv1.NodeMigrationCapacity{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "migration.podmotion.io/v1alpha1",
@@ -184,9 +215,10 @@ func (r *Registrar) Register(ctx context.Context) error {
 			Name: r.nodeName,
 		},
 		Spec: pmv1.NodeMigrationCapacitySpec{
-			NodeName:       r.nodeName,
-			CRIUVersion:    criuVersion,
-			NRIEnabled:     false, // set by NRI probe in M5
+			NodeName:      r.nodeName,
+			CRIUVersion:   criuVersion,
+			NRIEnabled:    false, // set by NRI probe in M5
+			AgentEndpoint: agentEndpoint,
 			KernelFeatures: kernelFeatures,
 			StorageCapability: pmv1.StorageCapability{
 				LonghornAvailable: longhornAvailable,

@@ -417,20 +417,27 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		return ctrl.Result{}, r.Status().Update(ctx, pm)
 	}
 
+	// Gate: treat a zero-byte checkpoint as an incomplete dump and requeue.
+	// The agent sets CheckpointSizeBytes only after checksumDir() runs over the completed
+	// dump directory (including inventory.img). A zero value means the dump is still in
+	// progress or failed silently; we must not advance to Transferring in that case.
+	if checkpointResp == nil || checkpointResp.CheckpointSizeBytes == 0 {
+		log.Info("Checkpoint RPC returned but CheckpointSizeBytes==0 — dump not yet flushed; requeuing",
+			"migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
 	// Store the checkpoint reference so reconcileTransferring can advance.
 	// The agent writes images to /var/lib/podmotion/checkpoints/<migrationName>/final/;
 	// pm.Name is the canonical reference key used by the transfer and restore agents.
 	pm.Status.CheckpointRef = &corev1.LocalObjectReference{Name: pm.Name}
 
-	checkpointMsg := "Checkpoint captured by agent"
-	if checkpointResp != nil {
-		checkpointMsg = fmt.Sprintf("Checkpoint captured: size=%d bytes sha256=%s freeze=%dms",
-			checkpointResp.CheckpointSizeBytes, checkpointResp.CheckpointSha256, checkpointResp.FreezeDurationMs)
-		log.Info("CRIU checkpoint complete", "migration", pm.Name,
-			"sizeBytes", checkpointResp.CheckpointSizeBytes,
-			"sha256", checkpointResp.CheckpointSha256,
-			"freezeDurationMs", checkpointResp.FreezeDurationMs)
-	}
+	checkpointMsg := fmt.Sprintf("Checkpoint captured: size=%d bytes sha256=%s freeze=%dms",
+		checkpointResp.CheckpointSizeBytes, checkpointResp.CheckpointSha256, checkpointResp.FreezeDurationMs)
+	log.Info("CRIU checkpoint complete", "migration", pm.Name,
+		"sizeBytes", checkpointResp.CheckpointSizeBytes,
+		"sha256", checkpointResp.CheckpointSha256,
+		"freezeDurationMs", checkpointResp.FreezeDurationMs)
 
 	setCondition(pm, conditionCheckpointed, metav1.ConditionTrue, "Checkpointed", checkpointMsg)
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseTransferring)
