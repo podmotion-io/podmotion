@@ -67,13 +67,17 @@ spec:
           protocol: TCP
         securityContext:
           seccompProfile:
-            type: RuntimeDefault
+            type: Unconfined
           capabilities:
             add:
             - "SYS_PTRACE"
             - "SYS_ADMIN"
             - "NET_ADMIN"
             - "DAC_OVERRIDE"
+            - "CHOWN"
+            - "SETUID"
+            - "SETGID"
+            - "CHECKPOINT_RESTORE"
             drop:
             - "ALL"
         resources:
