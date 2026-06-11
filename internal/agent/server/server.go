@@ -457,7 +457,7 @@ func joinNsRestore(migrationName, checkpointDir string) (int, error) {
 
 	// Step 5: Find the restored process by scanning /proc for the process name.
 	time.Sleep(200 * time.Millisecond)
-	pid, err := findRestoredProcessPID()
+	pid, err := findRestoredProcessPID(checkpointDir)
 	if err != nil {
 		return 0, err
 	}
@@ -635,22 +635,48 @@ func setupRestoreOverlayfs(migrationName, checkpointDir, imageName, rootfsDir st
 	return nil
 }
 
-// findRestoredProcessPID scans /proc for a process named "redis-server" that appeared after
-// CRIU restore. Returns the first match.
-func findRestoredProcessPID() (int, error) {
+// findRestoredProcessPID scans /proc for the restored container process by reading the
+// expected comm name from config.json process.args[0] in checkpointDir.
+// Falls back to scanning for any recently-created non-pause process if config.json is absent.
+func findRestoredProcessPID(checkpointDir string) (int, error) {
+	// Determine the expected process name from config.json.
+	expectedComm := ""
+	cfgData, err := os.ReadFile(filepath.Join(checkpointDir, "config.json"))
+	if err == nil {
+		var cfg struct {
+			Process struct {
+				Args []string `json:"args"`
+			} `json:"process"`
+		}
+		if json.Unmarshal(cfgData, &cfg) == nil && len(cfg.Process.Args) > 0 {
+			expectedComm = filepath.Base(cfg.Process.Args[0])
+		}
+	}
+
 	procs, _ := os.ReadDir("/proc")
 	for _, p := range procs {
 		if !p.IsDir() {
 			continue
 		}
 		comm, _ := os.ReadFile(fmt.Sprintf("/proc/%s/comm", p.Name()))
-		if strings.TrimSpace(string(comm)) == "redis-server" {
-			if pid, e := strconv.Atoi(p.Name()); e == nil {
+		commStr := strings.TrimSpace(string(comm))
+		if commStr == "" || commStr == "pause" {
+			continue
+		}
+		pid, err := strconv.Atoi(p.Name())
+		if err != nil {
+			continue
+		}
+		if expectedComm != "" {
+			if commStr == expectedComm {
 				return pid, nil
 			}
 		}
 	}
-	return 0, fmt.Errorf("restored redis-server PID not found in /proc")
+	if expectedComm != "" {
+		return 0, fmt.Errorf("restored process %q not found in /proc after CRIU restore", expectedComm)
+	}
+	return 0, fmt.Errorf("findRestoredProcessPID: config.json absent and no non-pause process found")
 }
 
 // buildMinimalOCIConfig strips pod-specific paths from config.json, leaving only
@@ -693,7 +719,7 @@ func buildMinimalOCIConfig(src map[string]interface{}, rootfsDir string) map[str
 func (s *AgentServer) PreDumpRound(_ context.Context, req *agentpb.PreDumpRoundRequest) (*agentpb.PreDumpRoundResponse, error) {
 	log.Info("PreDumpRound called", "migration", req.MigrationName, "round", req.RoundNumber)
 	result, err := s.checkpointer.PreDump(context.Background(), criu.PreDumpOptions{
-		ImagesDir: fmt.Sprintf("/var/lib/podmotion/checkpoints/%s/round-%d", req.MigrationName, req.RoundNumber),
+		ImagesDir: fmt.Sprintf("/run/podmotion/checkpoints/%s/round-%d", req.MigrationName, req.RoundNumber),
 		TrackMem:  true,
 	})
 	if err != nil {
