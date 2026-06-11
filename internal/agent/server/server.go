@@ -248,6 +248,12 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		log.Info("Checkpoint: no pod UID recorded for migration — PID will be 0 (PrepareSource may not have been called)", "migration", req.MigrationName)
 	}
 
+	// Ensure the images directory exists before invoking CRIU — on a freshly provisioned VM
+	// the directory will not exist and criu.Dump() will fail with "opening images dir".
+	if mkErr := os.MkdirAll(imagesDir, 0o755); mkErr != nil {
+		return nil, fmt.Errorf("checkpoint: cannot create images dir %s: %w", imagesDir, mkErr)
+	}
+
 	freezeStart := time.Now()
 	result, err := s.checkpointer.Dump(context.Background(), criu.DumpOptions{
 		ImagesDir: imagesDir,
