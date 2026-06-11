@@ -427,10 +427,17 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
-	// Store the checkpoint reference so reconcileTransferring can advance.
-	// The agent writes images to /var/lib/podmotion/checkpoints/<migrationName>/final/;
-	// pm.Name is the canonical reference key used by the transfer and restore agents.
-	pm.Status.CheckpointRef = &corev1.LocalObjectReference{Name: pm.Name}
+	// Gate: treat a missing SHA256 as an incomplete dump and requeue.
+	if checkpointResp.CheckpointSha256 == "" {
+		log.Info("Checkpoint RPC returned but CheckpointSha256==\"\" — dump not yet flushed; requeuing",
+			"migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	// Store the full filesystem dump path in CheckpointRef so reconcileRestoring can read it
+	// directly without reconstructing it. Both sides must use the identical path.
+	checkpointDir := fmt.Sprintf("/var/lib/podmotion/checkpoints/%s/final", pm.Name)
+	pm.Status.CheckpointRef = &corev1.LocalObjectReference{Name: checkpointDir}
 
 	checkpointMsg := fmt.Sprintf("Checkpoint captured: size=%d bytes sha256=%s freeze=%dms",
 		checkpointResp.CheckpointSizeBytes, checkpointResp.CheckpointSha256, checkpointResp.FreezeDurationMs)
@@ -484,14 +491,12 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 		}
 	}
 
-	// Derive the canonical checkpoint directory path. The agent wrote images to
-	// /var/lib/podmotion/checkpoints/<migrationName>/final/ on the source node.
-	// For Sprint 4 kind clusters (single-host Docker, shared hostPath), this path
-	// is accessible from both nodes via the Docker bind-mount, so we pass it directly.
-	checkpointDir := fmt.Sprintf("/var/lib/podmotion/checkpoints/%s/final", pm.Name)
-	checkpointRef := checkpointDir // use the full path as the ref so the agent skips the default
-	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != pm.Name {
-		// If a more specific ref was stored (e.g. OCI digest), use that instead.
+	// Read the checkpoint directory path stored during reconcileCheckpointing.
+	// The path is the full filesystem path set in CheckpointRef.Name; fall back
+	// to the canonical pattern only if the ref was not set (e.g. controller restart
+	// before the fix was deployed).
+	checkpointRef := fmt.Sprintf("/var/lib/podmotion/checkpoints/%s/final", pm.Name)
+	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
 		checkpointRef = pm.Status.CheckpointRef.Name
 	}
 
@@ -551,6 +556,17 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 			return r.initiateRollback(ctx, pm, msg)
 		}
 		return ctrl.Result{}, r.Status().Update(ctx, pm)
+	}
+
+	// Warn if the pod appears to have started fresh rather than from a CRIU checkpoint.
+	// A CRIU-restored pod will typically have a non-zero RestoreDurationMs; a zero value
+	// combined with a mock error message indicates the pod started fresh.
+	if restoreResp != nil && restoreResp.ErrorMessage != "" &&
+		(strings.Contains(restoreResp.ErrorMessage, "mock-restore") ||
+			strings.Contains(restoreResp.ErrorMessage, "fallback")) {
+		log.Info("WARN: pod started fresh, not from checkpoint",
+			"migration", pm.Name,
+			"note", restoreResp.ErrorMessage)
 	}
 
 	// GPU restore: reload GPU context after CRIU restore completes, if applicable.
