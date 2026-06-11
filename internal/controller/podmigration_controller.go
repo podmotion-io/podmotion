@@ -703,12 +703,26 @@ func (r *PodMigrationReconciler) initiateRollback(ctx context.Context, pm *pmv1.
 
 // isFrozenWithoutRestore detects the crash-safety condition from ADR-0018:
 // pod was frozen (Checkpointing phase persisted) but Restored condition is missing.
+//
+// Sprint 12 nil-guard: only trigger the crash-safe restart if CheckpointRef is NOT
+// yet written. If CheckpointRef is already set it means the Checkpoint gRPC completed
+// successfully and the normal Restoring path must run against that checkpoint — firing
+// the crash-safe path at that point would skip the real restore from a valid checkpoint.
 func (r *PodMigrationReconciler) isFrozenWithoutRestore(pm *pmv1.PodMigration) bool {
 	if pm.Status.Phase != pmv1.MigrationPhaseCheckpointing &&
 		pm.Status.Phase != pmv1.MigrationPhaseTransferring {
 		return false
 	}
-	return meta.FindStatusCondition(pm.Status.Conditions, conditionRestored) == nil
+	if meta.FindStatusCondition(pm.Status.Conditions, conditionRestored) != nil {
+		return false
+	}
+	// Only activate crash-safe path when no checkpoint has been written yet.
+	// If CheckpointRef is already populated the Checkpoint gRPC completed and the
+	// normal state-machine path (Transferring → Restoring) must proceed instead.
+	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
+		return false
+	}
+	return true
 }
 
 func (r *PodMigrationReconciler) handleDeletion(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
