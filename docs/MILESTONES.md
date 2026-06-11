@@ -275,3 +275,31 @@ M1 ──► M2 ──► M3 ──► M4 ──► M5 ──► M6 ──► M7
 | v0.2.0 | M13, M15, M16, M17 | Post-copy, GPU, StatefulSet, spot automation; TCP_REPAIR preservation |
 | v1.0.0 | M1–M18 | Production-ready; OperatorHub; upstream KEPs submitted |
 | v1.x+ | Multi-cluster GA | M14 graduated from experimental |
+
+---
+
+## PoC Sprint Log
+
+| Sprint | Status | Key Achievement |
+|--------|--------|-----------------|
+| Sprint 1 | Complete | First nginx migration end-to-end (state machine wired, gRPC skeleton) |
+| Sprint 2 | Complete | AgentPool wired, all 3 workloads (nginx/redis/postgres) reach Complete |
+| Sprint 3 | Complete | Privileged DaemonSet, source pod deletion, Postgres data integrity via PVC |
+| Sprint 4 | Complete | Checkpoint + Restore gRPC fully wired; CheckpointRef set; PrepareDestination called; destination node pinning enforced |
+| Sprint 5 | Complete | CRIU opts corrected for containers; PID resolution via /proc cgroup scan; mock fallback gated on env var; CRIU errors surfaced at ERROR level; ADR-0042 written |
+| Sprint 6 | Complete | Optimistic-lock conflict fixed (6 call sites); state machine reaches Checkpointing; CRIU 3.17.1 confirmed invoked; restore failed — checkpoint images missing/empty |
+| Sprint 7 | Complete | Dump path fixed; transfer wired; NetworkLock=SKIP; TcpSkipInFlight=true; CRIU restore invoked but dump still empty |
+| Sprint 8 | Complete | Seccomp unconfined + CAP_SYS_PTRACE confirmed; CRIU dump succeeds; restore blocked by ARM64 linuxkit hard wall; Multipass pivot |
+| Sprint 9 | Complete | Multipass Ubuntu 24.04 ARM64 + k3s; CRIU 4.2 installed; real CRIU restore invoked; dump never executed (controller reconcile race) |
+| Sprint 10 | Complete | Reconcile race fixed; CRIU dump succeeded; inventory.img confirmed (13 artifacts); restore failed — wrong directory path; dataIntact=false |
+| Sprint 11 | Complete | CheckpointRef path fixed (full filesystem path stored); crash-safe restart path fired before Checkpoint gRPC — dump never made; dataIntact=false |
+| Sprint 12 | Failed | Crash-safe restart nil-guard added (CheckpointRef check); blocker: crash-safe restart path fired on brand-new migration — Checkpointing phase skipped entirely, no gRPC CheckpointPod call made, no CRIU dump written |
+| Sprint 13 | Failed | data transfer wired; blocker: CRIU not reached — container root PID resolved as 0; agent in-memory migrationPodUID map empty at Checkpoint time (agent restarted between PrepareSource and Checkpoint calls) |
+
+## Sprint 14 Target
+
+**Blocker:** `migrationPodUID` map in `internal/agent/server/server.go` is in-memory only. When the agent DaemonSet pod restarts between the `PrepareSource` and `Checkpoint` RPC calls, the stored pod UID is lost and `FindContainerPID` receives an empty string, returning PID 0. CRIU `Dump()` fast-fails on PID 0.
+
+**Fix:** In `AgentServer.Checkpoint()` (`internal/agent/server/server.go`), when `podUID == ""` (map miss due to restart), fall back to resolving the pod UID directly from the Kubernetes API using the migration name and namespace passed in the `CheckpointRequest`. The `AgentServer` already holds a `k8sClient`; use it to `Get` the `PodMigration` CR and extract `spec.podName` + `spec.namespace`, then `Get` the Pod and use `pod.UID`. Store the resolved UID back in the map so subsequent calls are fast. This eliminates the in-memory-only gap without requiring persistent storage.
+
+**Acceptance criteria:** CRIU dump writes `inventory.img`; `sprint14_key=hello_podmotion` survives migration; `dataIntact=true`, `realCRIU=true`, `inventory.img` present.
