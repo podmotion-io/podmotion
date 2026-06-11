@@ -21,6 +21,11 @@ service MigrationAgentService {
   rpc Abort(AbortRequest) returns (AbortResponse);
   // EstimateCheckpoint performs a 10-second dirty page sampling without checkpointing.
   rpc EstimateCheckpoint(EstimateCheckpointRequest) returns (EstimateCheckpointResponse);
+  // PutCheckpointTar receives a tar archive of checkpoint image files from the operator
+  // and extracts them into the migration checkpoint directory on the destination node.
+  // Used for same-cluster (LAN) cold migration where the operator can read source
+  // checkpoint files directly and push them to the destination agent.
+  rpc PutCheckpointTar(PutCheckpointTarRequest) returns (PutCheckpointTarResponse);
 }
 
 message PrepareSourceRequest {
@@ -116,6 +121,16 @@ message EstimateCheckpointResponse {
   int32  storage_tier                  = 4;
   bool   migratable                    = 5;
   string blocking_reason               = 6;
+}
+
+message PutCheckpointTarRequest {
+  string migration_name = 1; // used to determine destination directory
+  bytes  tar_data       = 2; // gzip-compressed tar of the checkpoint final/ directory
+}
+message PutCheckpointTarResponse {
+  bool   success      = 1;
+  string error        = 2;
+  int64  bytes_written = 3;
 }
 
 enum MigrationMode {

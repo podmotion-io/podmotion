@@ -8,8 +8,14 @@ you may not use this file except in compliance with the License.
 package controller
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -461,11 +467,110 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 }
 
 func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
-	// Agent 7 (gRPC transfer) moves the checkpoint image. Watches for CheckpointRef to be set.
-	if pm.Status.CheckpointRef != nil {
-		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoring)
+	log := logf.FromContext(ctx)
+
+	// Determine the local checkpoint directory (operator runs on pm-control, same host as source agent).
+	checkpointDir := fmt.Sprintf("/var/lib/podmotion/checkpoints/%s/final", pm.Name)
+	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
+		checkpointDir = pm.Status.CheckpointRef.Name
 	}
-	return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+
+	// Determine the destination node.
+	destNode := pm.Status.DestinationNodeName
+	if destNode == "" && pm.Spec.TargetNodeName != "" {
+		destNode = pm.Spec.TargetNodeName
+	}
+	if destNode == "" {
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	// Verify the checkpoint directory has files before attempting transfer.
+	entries, err := os.ReadDir(checkpointDir)
+	if err != nil || len(entries) == 0 {
+		log.Info("reconcileTransferring: checkpoint dir not ready, requeuing",
+			"dir", checkpointDir, "err", err)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	// Create a gzip-compressed tar of all checkpoint image files.
+	log.Info("reconcileTransferring: creating checkpoint tar", "dir", checkpointDir, "destNode", destNode)
+	tarData, err := tarGzDir(checkpointDir)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("tar checkpoint dir %s: %w", checkpointDir, err)
+	}
+	log.Info("reconcileTransferring: checkpoint tar created",
+		"migration", pm.Name, "tarSizeBytes", len(tarData))
+
+	// Connect to the destination agent and push the tar.
+	if r.AgentPool == nil {
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+	agentClient, err := r.AgentPool.ForNode(ctx, destNode)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("connect to dest agent %s: %w", destNode, err)
+	}
+
+	putResp, err := agentClient.PutCheckpointTar(ctx, &agentpb.PutCheckpointTarRequest{
+		MigrationName: pm.Name,
+		TarData:       tarData,
+	})
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("PutCheckpointTar to %s: %w", destNode, err)
+	}
+	if !putResp.Success {
+		return ctrl.Result{}, fmt.Errorf("PutCheckpointTar failed: %s", putResp.Error)
+	}
+	log.Info("reconcileTransferring: checkpoint transferred successfully",
+		"migration", pm.Name, "destNode", destNode, "bytesWritten", putResp.BytesWritten)
+
+	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoring)
+}
+
+// tarGzDir creates a gzip-compressed tar archive of all regular files in dir
+// (flat, no subdirectory recursion needed — CRIU writes images directly into final/).
+func tarGzDir(dir string) ([]byte, error) {
+	var buf bytes.Buffer
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		hdr := &tar.Header{
+			Name:    rel,
+			Size:    info.Size(),
+			Mode:    int64(info.Mode()),
+			ModTime: info.ModTime(),
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(tw, f)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+	if err := gzw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
