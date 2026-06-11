@@ -21,6 +21,38 @@ was exercised with real gRPC calls to the agent on each node.
 
 ---
 
+## PoC Sprint 5 — Progress (2026-06-10)
+
+North Star not yet achieved. Real CRIU checkpoint/restore still did not execute.
+
+### What Was Fixed
+
+| Fix | Commits |
+|-----|---------|
+| `DumpOptions.Pid` field added; `Dump()` fast-fails if `Pid == 0` | 08c5dba |
+| `server.go` `FindContainerPID()` — scans `/proc/*/cgroup` by pod UID | 08c5dba |
+| Mock fallback now only fires when `PODMOTION_MOCK_CRIU=true` | 08c5dba |
+| CRIU dump failures logged at `log.Error` (was `log.Info`) | 08c5dba |
+| `go-criu` opts corrected for containers: `TcpClose`, no `ShellJob`, `TrackMem`, `AutoDedup`, `ExtSharing`, `ExtMasters`, `Root=/proc/<pid>/root` | 8bea7d0 |
+| `dump.log` / `restore.log` tailed and emitted at Info after every CRIU call | 8bea7d0 |
+
+### Why CRIU Still Did Not Fire
+
+The `sprint5-redis` PodMigration never reached `Checkpointing`. A persistent optimistic-lock
+conflict (`StorageConflict`) in the pre-copy reconciler loop (`manager.go:128`) kept the operator
+retrying the storage pre-stage without advancing the state machine. The `Checkpoint` gRPC was
+never called, so PID resolution and the new CRIU opts were never exercised.
+
+### Sprint 6 Target
+
+Fix the optimistic-lock conflict in the pre-copy storage manager (`internal/agent/storage/manager.go`
+and the operator's pre-copy reconciler): re-fetch the latest PodMigration CR resource version
+before patching `storageTier`, and use `Patch` with optimistic concurrency rather than a blind
+`Update`. Once the state machine advances to `Checkpointing`, the corrected CRIU opts and PID
+resolution from Sprint 5 will fire for the first time.
+
+---
+
 ## ✅ FIRST LIVE MIGRATION PROVEN
 
 On 2026-06-10, the PodMotion PoC Sprint completed a full end-to-end pod migration:
