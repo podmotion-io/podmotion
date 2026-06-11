@@ -21,6 +21,26 @@ was exercised with real gRPC calls to the agent on each node.
 
 ---
 
+## PoC Sprint 10 — CRIU dump artifacts confirmed on pm-worker; restore pointed at wrong directory (2026-06-10)
+
+North Star not yet achieved. Sprint 10 fixed the controller reconcile race (line 435-436 in podmigration_controller.go), installed containerd+runc, lowered ptrace_scope/perf_event_paranoid, and installed CNI binaries. Real CRIU (go-criu/v7 CRIUCheckpointer) executed a full dump on pm-worker: 13 artifacts confirmed including inventory.img in /tmp/criu-sprint10/. The gRPC Checkpoint call succeeded. However, restore failed with "No inventory.img image" because CRIU restore was invoked against a different, empty directory — the checkpoint directory path was not correctly handed off from dump to restore.
+
+**Sprint 10 quorum findings:**
+- CRIU Agent: CheckpointResponse fields are freeze_duration_ms, checkpoint_sha256, checkpoint_size_bytes only. Operator must gate on resp.CheckpointSizeBytes > 0 AND resp.CheckpointSha256 != "" before advancing to Transferring.
+- Controller Agent: race confirmed at podmigration_controller.go:435-436 (fixed this sprint).
+- gRPC Agent: DaemonSet running; agent resolves; PrepareSource prepResp.Compatible=false or BlockingReason may short-circuit before Checkpoint RPC fires.
+- Security Agent: NEEDS_TUNING — manualDump=false.
+
+**Sprint 10 key results:**
+- realCRIU=true (CRIUCheckpointer confirmed in startup log)
+- inventory.img present in /tmp/criu-sprint10/ (13 dump artifacts)
+- dataIntact=false (restore failed — wrong directory)
+- northStar=false
+
+**Sprint 11 precise fix:** In `internal/controller/podmigration_controller.go` function `reconcileCheckpointing`, after the Checkpoint gRPC call returns nil error, add an explicit gate: `if resp.CheckpointSizeBytes == 0 || resp.CheckpointSha256 == "" { return ctrl.Result{}, fmt.Errorf("checkpoint response missing size/sha256 — dump incomplete") }`. Then verify the CheckpointRef path stored on pm.Status matches the directory the restore agent reads in `reconcileRestoring`. The restore log shows CRIU was invoked against /var/lib/podmotion/checkpoints/sprint10-redis/final/ while dump artifacts live in /tmp/criu-sprint10/ — the path handoff is broken.
+
+---
+
 ## PoC Sprint 9 — Multipass Ubuntu 24.04 ARM64 + k3s: CRIU restore path reached, dump never executed (2026-06-10)
 
 North Star not yet achieved. Sprint 9 moved off ARM64 linuxkit to a real Ubuntu 24.04 kernel
