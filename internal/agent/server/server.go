@@ -17,7 +17,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -42,15 +44,21 @@ type AgentServer struct {
 	checkpointer criu.Checkpointer
 	nodeName     string
 	k8sClient    client.Client // may be nil in pure-stub mode
+
+	// migrationPodUID stores pod UID keyed by migration name, populated by PrepareSource.
+	// Used by Checkpoint to resolve the container root PID via /proc cgroup scan.
+	migrationPodUIDMu sync.RWMutex
+	migrationPodUID   map[string]string
 }
 
 // New constructs an AgentServer with the given Checkpointer implementation.
 // k8sClient may be nil; when set the Checkpoint handler will update MigrationCheckpoint CRs.
 func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentServer {
 	return &AgentServer{
-		checkpointer: cp,
-		nodeName:     nodeName,
-		k8sClient:    k8sClient,
+		checkpointer:    cp,
+		nodeName:        nodeName,
+		k8sClient:       k8sClient,
+		migrationPodUID: make(map[string]string),
 	}
 }
 
@@ -113,6 +121,11 @@ func (s *AgentServer) PrepareSource(_ context.Context, req *agentpb.PrepareSourc
 	// Best-effort: scan /proc for a process whose cgroup path contains the pod UID.
 	// This works on Linux nodes where cgroups are visible; on kind it usually works too.
 	if req.PodUid != "" {
+		// Store pod UID so Checkpoint can resolve the container root PID later.
+		s.migrationPodUIDMu.Lock()
+		s.migrationPodUID[req.MigrationName] = req.PodUid
+		s.migrationPodUIDMu.Unlock()
+
 		found := scanProcForPodUID(req.PodUid)
 		if found {
 			note = fmt.Sprintf("pod %s/%s confirmed running via /proc cgroup scan", req.PodNamespace, req.PodName)
@@ -158,6 +171,39 @@ func scanProcForPodUID(podUID string) bool {
 	return false
 }
 
+// FindContainerPID scans /proc/*/cgroup for a line containing podUID and returns
+// the lowest-numbered matching host PID (the container's root process).
+// The agent must have hostPID:true so all host PIDs are visible under /proc.
+func FindContainerPID(podUID string) (int32, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, fmt.Errorf("reading /proc: %w", err)
+	}
+	var lowest int32
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		cgroupData, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(cgroupData), podUID) {
+			if lowest == 0 || int32(pid) < lowest {
+				lowest = int32(pid)
+			}
+		}
+	}
+	if lowest == 0 {
+		return 0, fmt.Errorf("container PID not found for pod UID %s", podUID)
+	}
+	return lowest, nil
+}
+
 func (s *AgentServer) PreDumpRound(_ context.Context, req *agentpb.PreDumpRoundRequest) (*agentpb.PreDumpRoundResponse, error) {
 	log.Info("PreDumpRound called", "migration", req.MigrationName, "round", req.RoundNumber)
 	result, err := s.checkpointer.PreDump(context.Background(), criu.PreDumpOptions{
@@ -176,16 +222,36 @@ func (s *AgentServer) PreDumpRound(_ context.Context, req *agentpb.PreDumpRoundR
 }
 
 // Checkpoint performs the final (freezing) CRIU dump.
-// On kind/dev where CRIU lacks permissions or Linux support, a graceful fallback
-// writes a mock checkpoint manifest so the end-to-end flow can proceed.
+// When PODMOTION_MOCK_CRIU=true (dev/kind env var), a graceful fallback writes a mock
+// checkpoint manifest so the end-to-end flow can proceed without real CRIU support.
+// In production (PODMOTION_MOCK_CRIU unset), CRIU errors propagate up as failures.
 func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointRequest) (*agentpb.CheckpointResponse, error) {
 	log.Info("Checkpoint called", "migration", req.MigrationName)
 
 	imagesDir := fmt.Sprintf("/var/lib/podmotion/checkpoints/%s/final", req.MigrationName)
 
+	// Resolve the container root PID from the pod UID stored during PrepareSource.
+	s.migrationPodUIDMu.RLock()
+	podUID := s.migrationPodUID[req.MigrationName]
+	s.migrationPodUIDMu.RUnlock()
+
+	var containerPID int32
+	if podUID != "" {
+		pid, pidErr := FindContainerPID(podUID)
+		if pidErr != nil {
+			log.Error(pidErr, "Checkpoint: failed to resolve container root PID", "migration", req.MigrationName, "podUID", podUID)
+		} else {
+			containerPID = pid
+			log.Info("Checkpoint: found container root PID", "pid", containerPID, "podUID", podUID)
+		}
+	} else {
+		log.Info("Checkpoint: no pod UID recorded for migration — PID will be 0 (PrepareSource may not have been called)", "migration", req.MigrationName)
+	}
+
 	freezeStart := time.Now()
 	result, err := s.checkpointer.Dump(context.Background(), criu.DumpOptions{
 		ImagesDir: imagesDir,
+		Pid:       containerPID,
 		// TcpEstablished is set at the CRIU RPC level (criu_checkpointer.go); not in DumpOptions struct.
 	})
 
@@ -195,11 +261,19 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 	var fallbackNote string
 	var freezeDurationMs int64
 
+	mockCRIU := os.Getenv("PODMOTION_MOCK_CRIU") == "true"
+
 	if err != nil {
-		// CRIU failed — most likely running on kind/dev without full root or Linux kernel
-		// support. Write a mock checkpoint manifest so the operator can complete its state
-		// machine transitions and we can prove the end-to-end flow.
-		log.Info("Checkpoint: CRIU dump failed, writing mock checkpoint (kind/dev fallback)", "err", err)
+		log.Error(err, "Checkpoint: CRIU dump failed", "migration", req.MigrationName)
+
+		if !mockCRIU {
+			// In production, propagate the error — do not silently substitute a mock checkpoint.
+			return nil, fmt.Errorf("checkpoint failed: %w", err)
+		}
+
+		// PODMOTION_MOCK_CRIU=true — write a mock checkpoint manifest so the operator
+		// can complete its state machine transitions in kind/dev environments.
+		log.Info("Checkpoint: PODMOTION_MOCK_CRIU=true, writing mock checkpoint (kind/dev fallback)", "err", err)
 
 		if mkErr := os.MkdirAll(imagesDir, 0o755); mkErr != nil {
 			return nil, fmt.Errorf("checkpoint fallback: cannot create images dir: %w", mkErr)
