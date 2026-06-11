@@ -482,7 +482,7 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 
 	// Store the full filesystem dump path in CheckpointRef so reconcileRestoring can read it
 	// directly without reconstructing it. Both sides must use the identical path.
-	checkpointDir := fmt.Sprintf("/var/lib/podmotion/checkpoints/%s/final", pm.Name)
+	checkpointDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", pm.Name)
 	pm.Status.CheckpointRef = &corev1.LocalObjectReference{Name: checkpointDir}
 
 	// Propagate freeze duration into PreCopyStats so it is visible in status.
@@ -519,7 +519,7 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 	log := logf.FromContext(ctx)
 
 	// Determine the local checkpoint directory (operator runs on pm-control, same host as source agent).
-	checkpointDir := fmt.Sprintf("/var/lib/podmotion/checkpoints/%s/final", pm.Name)
+	checkpointDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", pm.Name)
 	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
 		checkpointDir = pm.Status.CheckpointRef.Name
 	}
@@ -572,7 +572,36 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 	log.Info("reconcileTransferring: checkpoint transferred successfully",
 		"migration", pm.Name, "destNode", destNode, "bytesWritten", putResp.BytesWritten)
 
+	// Zeroize the source-node checkpoint dir after successful transfer.
+	// The operator runs on the source node (pm-control) in the PoC so os.RemoveAll is local.
+	// In multi-node production this becomes a ZeroizeCheckpoint gRPC call to the source agent
+	// (proto addition tracked for M19 hardening sprint).
+	if err := zeroizeSourceCheckpoint(checkpointDir); err != nil {
+		log.Error(err, "source checkpoint zeroize failed — images remain on tmpfs until node reboot",
+			"migration", pm.Name, "dir", checkpointDir)
+		// Non-fatal: tmpfs is cleared on reboot; do not fail the migration over cleanup.
+	}
+
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoring)
+}
+
+// zeroizeSourceCheckpoint overwrites all checkpoint files with zeros then removes the dir.
+// Mirrors the server.zeroizeDir logic; duplicated here to avoid a cross-package dependency.
+func zeroizeSourceCheckpoint(dir string) error {
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			return nil
+		}
+		zeros := make([]byte, info.Size())
+		_, _ = f.WriteAt(zeros, 0)
+		f.Close()
+		return nil
+	})
+	return os.RemoveAll(dir)
 }
 
 // tarGzDir creates a gzip-compressed tar archive of all regular files in dir
@@ -659,7 +688,7 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 	// The path is the full filesystem path set in CheckpointRef.Name; fall back
 	// to the canonical pattern only if the ref was not set (e.g. controller restart
 	// before the fix was deployed).
-	checkpointRef := fmt.Sprintf("/var/lib/podmotion/checkpoints/%s/final", pm.Name)
+	checkpointRef := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", pm.Name)
 	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
 		checkpointRef = pm.Status.CheckpointRef.Name
 	}

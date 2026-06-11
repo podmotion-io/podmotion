@@ -914,15 +914,17 @@ func (s *AgentServer) Restore(_ context.Context, req *agentpb.RestoreRequest) (*
 
 	imagesDir := req.CheckpointRef
 	if imagesDir == "" {
-		imagesDir = fmt.Sprintf("/var/lib/podmotion/checkpoints/%s/final", req.MigrationName)
+		// Consistent with the source agent's ctrCheckpoint and PutCheckpointTar paths.
+		imagesDir = fmt.Sprintf("/run/podmotion/checkpoints/%s/final", req.MigrationName)
 	}
 
-	// Ensure images dir exists — on kind/dev the checkpoint was written on the source node
-	// and the destination node has no images dir yet. Create it so the fallback path fires
-	// rather than failing with an "opening images dir" error before CRIU is even invoked.
-	if mkErr := os.MkdirAll(imagesDir, 0o755); mkErr != nil {
+	// 0700: checkpoint images contain process memory and secrets.
+	if mkErr := os.MkdirAll(imagesDir, 0o700); mkErr != nil {
 		log.Info("Restore: cannot create images dir, proceeding to fallback", "err", mkErr)
 	}
+	// Zeroize checkpoint images after restore completes (success or failure) — the process
+	// tree is alive (or dead) at that point; the images are no longer needed.
+	defer func() { _ = zeroizeDir(imagesDir) }()
 
 	// Check if we have a config.json (produced by ctr checkpoint) — use join-ns restore:
 	// launch a fresh placeholder container then restore checkpoint state into its namespaces.
@@ -949,7 +951,7 @@ func (s *AgentServer) Restore(_ context.Context, req *agentpb.RestoreRequest) (*
 	t0 := time.Now()
 	result, err := s.checkpointer.Restore(context.Background(), criu.RestoreOptions{
 		ImagesDir:    imagesDir,
-		Detached:     true,
+		Detached:     false, // foreground CRIU — no ghost container (ADR-0046)
 		HostVethName: hostVeth,
 	})
 	if err != nil {
@@ -1072,13 +1074,20 @@ func (s *AgentServer) PutCheckpointTar(_ context.Context, req *agentpb.PutCheckp
 		return &agentpb.PutCheckpointTarResponse{Success: false, Error: "tar_data is empty"}, nil
 	}
 
-	// Stage on tmpfs, root-only permissions. Defer zeroize so checkpoint images
-	// (containing process memory and secrets) are scrubbed on all return paths.
+	// Stage on tmpfs (/run is tmpfs), root-only. Do NOT defer zeroize here — the Restore
+	// RPC reads these files after PutCheckpointTar returns. Zeroize is done by CleanupCheckpoint
+	// after restore completes (or by migration CR deletion finalizer).
 	destDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", req.MigrationName)
 	if err := os.MkdirAll(destDir, 0o700); err != nil {
 		return &agentpb.PutCheckpointTarResponse{Success: false, Error: fmt.Sprintf("mkdir %s: %v", destDir, err)}, nil
 	}
-	defer func() { _ = zeroizeDir(destDir) }()
+	// Zeroize on extraction failure so partial checkpoint data doesn't linger.
+	extractOK := false
+	defer func() {
+		if !extractOK {
+			_ = zeroizeDir(destDir)
+		}
+	}()
 
 	// Decompress and extract tar.
 	gzr, err := gzip.NewReader(bytes.NewReader(req.TarData))
@@ -1121,6 +1130,7 @@ func (s *AgentServer) PutCheckpointTar(_ context.Context, req *agentpb.PutCheckp
 		bytesWritten += n
 	}
 
+	extractOK = true // disarm the error-path zeroize defer
 	log.Info("PutCheckpointTar: extracted checkpoint images",
 		"migration", req.MigrationName,
 		"destDir", destDir,
