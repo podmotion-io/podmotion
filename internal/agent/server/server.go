@@ -8,6 +8,9 @@ Licensed under the Apache License, Version 2.0.
 package server
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -593,6 +596,72 @@ func (s *AgentServer) EstimateCheckpoint(ctx context.Context, req *agentpb.Estim
 		StorageTier:               1,
 		Migratable:                true,
 	}, nil
+}
+
+// PutCheckpointTar receives a gzip-compressed tar of checkpoint images from the operator
+// and extracts them into the migration's checkpoint directory on this (destination) node.
+// This implements the LAN cold-migration transfer path: the operator reads the source
+// checkpoint files (local on pm-control) and streams them here via gRPC unary call.
+func (s *AgentServer) PutCheckpointTar(_ context.Context, req *agentpb.PutCheckpointTarRequest) (*agentpb.PutCheckpointTarResponse, error) {
+	if req.MigrationName == "" {
+		return &agentpb.PutCheckpointTarResponse{Success: false, Error: "migration_name required"}, nil
+	}
+	if len(req.TarData) == 0 {
+		return &agentpb.PutCheckpointTarResponse{Success: false, Error: "tar_data is empty"}, nil
+	}
+
+	destDir := fmt.Sprintf("/var/lib/podmotion/checkpoints/%s/final", req.MigrationName)
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return &agentpb.PutCheckpointTarResponse{Success: false, Error: fmt.Sprintf("mkdir %s: %v", destDir, err)}, nil
+	}
+
+	// Decompress and extract tar.
+	gzr, err := gzip.NewReader(bytes.NewReader(req.TarData))
+	if err != nil {
+		return &agentpb.PutCheckpointTarResponse{Success: false, Error: fmt.Sprintf("gzip open: %v", err)}, nil
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+	var bytesWritten int64
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return &agentpb.PutCheckpointTarResponse{Success: false, Error: fmt.Sprintf("tar read: %v", err)}, nil
+		}
+
+		// Security: only allow plain files, no directory traversal.
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			continue
+		}
+		// Strip any leading path components — write all files flat into destDir.
+		filename := filepath.Base(hdr.Name)
+		if filename == "" || filename == "." || filename == ".." {
+			continue
+		}
+
+		outPath := filepath.Join(destDir, filename)
+		f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
+		if err != nil {
+			return &agentpb.PutCheckpointTarResponse{Success: false, Error: fmt.Sprintf("create %s: %v", outPath, err)}, nil
+		}
+		n, err := io.Copy(f, tr)
+		f.Close()
+		if err != nil {
+			return &agentpb.PutCheckpointTarResponse{Success: false, Error: fmt.Sprintf("write %s: %v", filename, err)}, nil
+		}
+		bytesWritten += n
+	}
+
+	log.Info("PutCheckpointTar: extracted checkpoint images",
+		"migration", req.MigrationName,
+		"destDir", destDir,
+		"bytesWritten", bytesWritten,
+		"tarSize", len(req.TarData))
+	return &agentpb.PutCheckpointTarResponse{Success: true, BytesWritten: bytesWritten}, nil
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
