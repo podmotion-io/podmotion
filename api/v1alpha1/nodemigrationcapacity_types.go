@@ -56,6 +56,12 @@ type NodeMigrationCapacitySpec struct {
 	// +kubebuilder:validation:Required
 	NodeName string `json:"nodeName"`
 
+	// AgentEndpoint is the gRPC endpoint of the agent on this node, in the form "ip:port".
+	// Set by the agent at startup so that the operator can reach systemd-based agents that
+	// do not run as Kubernetes pods and therefore have no pod IP discoverable via label selector.
+	// +optional
+	AgentEndpoint string `json:"agentEndpoint,omitempty"`
+
 	// CRIUVersion is the version of CRIU installed on the node (e.g. "4.2").
 	CRIUVersion string `json:"criuVersion"`
 

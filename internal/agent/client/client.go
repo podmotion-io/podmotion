@@ -19,9 +19,11 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 )
 
@@ -67,12 +69,12 @@ func (p *AgentClientPool) ForNode(ctx context.Context, nodeName string) (agentpb
 		return agentpb.NewMigrationAgentServiceClient(conn), nil
 	}
 
-	podIP, err := p.resolveAgentPodIP(ctx, nodeName)
+	// First try: resolve via pod label selector (DaemonSet deployments).
+	// Second try: read NMC spec.agentEndpoint (systemd agent deployments on VMs).
+	addr, err := p.resolveAgentAddr(ctx, nodeName)
 	if err != nil {
 		return nil, err
 	}
-
-	addr := fmt.Sprintf("%s:%s", podIP, p.port)
 	conn, err := p.dial(ctx, addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial agent on node %q (%s): %w", nodeName, addr, err)
@@ -81,6 +83,32 @@ func (p *AgentClientPool) ForNode(ctx context.Context, nodeName string) (agentpb
 	p.conns[nodeName] = conn
 	log.Info("Opened gRPC connection to node agent", "node", nodeName, "addr", addr)
 	return agentpb.NewMigrationAgentServiceClient(conn), nil
+}
+
+// resolveAgentAddr returns the "<ip>:<port>" address for the agent on the given node.
+// It first tries pod label-selector lookup (DaemonSet deployments). If no running pod is
+// found it falls back to reading spec.agentEndpoint from the NodeMigrationCapacity CR,
+// which the agent registers at startup when running as a systemd service.
+func (p *AgentClientPool) resolveAgentAddr(ctx context.Context, nodeName string) (string, error) {
+	podIP, podErr := p.resolveAgentPodIP(ctx, nodeName)
+	if podErr == nil && podIP != "" {
+		return fmt.Sprintf("%s:%s", podIP, p.port), nil
+	}
+	log.V(1).Info("No running agent pod found; falling back to NMC agentEndpoint",
+		"node", nodeName, "podErr", podErr)
+
+	if p.k8sClient == nil {
+		return "", fmt.Errorf("k8sClient is nil; cannot resolve NMC agent endpoint for node %q", nodeName)
+	}
+	nmc := &pmv1.NodeMigrationCapacity{}
+	if err := p.k8sClient.Get(ctx, types.NamespacedName{Name: nodeName}, nmc); err != nil {
+		return "", fmt.Errorf("no running agent pod for node %q and NMC lookup failed: %w", nodeName, err)
+	}
+	if nmc.Spec.AgentEndpoint == "" {
+		return "", fmt.Errorf("no running agent pod for node %q and NMC.spec.agentEndpoint is empty", nodeName)
+	}
+	log.Info("Resolved agent address from NMC agentEndpoint", "node", nodeName, "endpoint", nmc.Spec.AgentEndpoint)
+	return nmc.Spec.AgentEndpoint, nil
 }
 
 // resolveAgentPodIP finds the Running agent pod for the given node and returns its PodIP.
