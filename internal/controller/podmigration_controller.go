@@ -439,6 +439,12 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 	checkpointDir := fmt.Sprintf("/var/lib/podmotion/checkpoints/%s/final", pm.Name)
 	pm.Status.CheckpointRef = &corev1.LocalObjectReference{Name: checkpointDir}
 
+	// Propagate freeze duration into PreCopyStats so it is visible in status.
+	if pm.Status.PreCopyStats == nil {
+		pm.Status.PreCopyStats = &pmv1.PreCopyStats{}
+	}
+	pm.Status.PreCopyStats.FreezeDurationMs = checkpointResp.FreezeDurationMs
+
 	checkpointMsg := fmt.Sprintf("Checkpoint captured: size=%d bytes sha256=%s freeze=%dms",
 		checkpointResp.CheckpointSizeBytes, checkpointResp.CheckpointSha256, checkpointResp.FreezeDurationMs)
 	log.Info("CRIU checkpoint complete", "migration", pm.Name,
@@ -558,15 +564,19 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 		return ctrl.Result{}, r.Status().Update(ctx, pm)
 	}
 
-	// Warn if the pod appears to have started fresh rather than from a CRIU checkpoint.
-	// A CRIU-restored pod will typically have a non-zero RestoreDurationMs; a zero value
-	// combined with a mock error message indicates the pod started fresh.
+	// Fail loudly if the agent fell back to a mock-restore (pod started fresh instead of
+	// from a CRIU checkpoint). A silent warn here would set Restored=True on a fresh-started
+	// pod and mask the real failure. Treat this as a hard RestoreFailed.
 	if restoreResp != nil && restoreResp.ErrorMessage != "" &&
 		(strings.Contains(restoreResp.ErrorMessage, "mock-restore") ||
 			strings.Contains(restoreResp.ErrorMessage, "fallback")) {
-		log.Info("WARN: pod started fresh, not from checkpoint",
-			"migration", pm.Name,
-			"note", restoreResp.ErrorMessage)
+		msg := fmt.Sprintf("restore fallback: pod started fresh, not from CRIU checkpoint: %s", restoreResp.ErrorMessage)
+		log.Error(fmt.Errorf("mock-restore fallback"), msg, "migration", pm.Name)
+		setCondition(pm, conditionRestored, metav1.ConditionFalse, "RestoreFailed", msg)
+		if pm.Spec.RollbackOnFailure {
+			return r.initiateRollback(ctx, pm, msg)
+		}
+		return ctrl.Result{}, fmt.Errorf("%s", msg)
 	}
 
 	// GPU restore: reload GPU context after CRIU restore completes, if applicable.
@@ -716,10 +726,12 @@ func (r *PodMigrationReconciler) isFrozenWithoutRestore(pm *pmv1.PodMigration) b
 	if meta.FindStatusCondition(pm.Status.Conditions, conditionRestored) != nil {
 		return false
 	}
-	// Only activate crash-safe path when no checkpoint has been written yet.
-	// If CheckpointRef is already populated the Checkpoint gRPC completed and the
-	// normal state-machine path (Transferring → Restoring) must proceed instead.
-	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
+	// Only activate crash-safe path when the checkpoint HAS been written (CheckpointRef
+	// is populated) but restore has not yet happened — i.e. the controller crashed
+	// between a successful Checkpoint RPC and the start of reconcileRestoring.
+	// When CheckpointRef is nil the migration has not checkpointed yet — let it fall
+	// through to reconcileCheckpointing normally.
+	if pm.Status.CheckpointRef == nil || pm.Status.CheckpointRef.Name == "" {
 		return false
 	}
 	return true
