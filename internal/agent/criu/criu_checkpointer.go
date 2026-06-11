@@ -196,6 +196,11 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		AutoDedup:   proto.Bool(true),
 		ExtSharing:  proto.Bool(true),
 		ExtMasters:  proto.Bool(true),
+		// AutoExtMnt=true is equivalent to --ext-mount-map auto: CRIU automatically
+		// treats any bind-mounted file (e.g. /etc/resolv.conf, /etc/hosts injected by
+		// the kubelet) as an external mount rather than failing with "doesn't have a
+		// proper root mount". Required for k3s/containerd containers on Ubuntu 24.04.
+		AutoExtMnt: proto.Bool(true),
 		// Root tells CRIU where the container's rootfs is visible from the
 		// host mount namespace.  /proc/<pid>/root always works regardless of
 		// how the container runtime mounted it.
