@@ -22,6 +22,7 @@ import (
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -48,10 +49,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Try in-cluster config first (DaemonSet pod), fall back to kubeconfig file
+	// (bare binary on VM for PoC sprints).
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
-		log.Error(err, "Failed to build in-cluster kubeconfig")
-		os.Exit(1)
+		kubeconfig := os.Getenv("KUBECONFIG")
+		if kubeconfig == "" {
+			kubeconfig = "/etc/rancher/k3s/k3s.yaml" // k3s default
+		}
+		cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		if err != nil {
+			log.Error(err, "Failed to build kubeconfig (tried in-cluster and file)")
+			os.Exit(1)
+		}
+		log.Info("Using kubeconfig file", "path", kubeconfig)
 	}
 
 	registrar, regErr := nmcregistrar.New(cfg, nodeName)

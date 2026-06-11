@@ -215,10 +215,10 @@ func (r *Registrar) Register(ctx context.Context) error {
 			Name: r.nodeName,
 		},
 		Spec: pmv1.NodeMigrationCapacitySpec{
-			NodeName:      r.nodeName,
-			CRIUVersion:   criuVersion,
-			NRIEnabled:    false, // set by NRI probe in M5
-			AgentEndpoint: agentEndpoint,
+			NodeName:       r.nodeName,
+			CRIUVersion:    criuVersion,
+			NRIEnabled:     false, // set by NRI probe in M5
+			AgentEndpoint:  agentEndpoint,
 			KernelFeatures: kernelFeatures,
 			StorageCapability: pmv1.StorageCapability{
 				LonghornAvailable: longhornAvailable,

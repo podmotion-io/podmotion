@@ -62,6 +62,12 @@ spec:
             description: NodeMigrationCapacitySpec is set by the node agent at startup
               and updated periodically.
             properties:
+              agentEndpoint:
+                description: |-
+                  AgentEndpoint is the gRPC endpoint of the agent on this node, in the form "ip:port".
+                  Set by the agent at startup so that the operator can reach systemd-based agents that
+                  do not run as Kubernetes pods and therefore have no pod IP discoverable via label selector.
+                type: string
               criuVersion:
                 description: CRIUVersion is the version of CRIU installed on the node
                   (e.g. "4.2").
