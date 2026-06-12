@@ -42,6 +42,15 @@ COPY images/capi/ansible/roles/podmotion-node/files/nri.toml /etc/containerd/con
 COPY images/capi/ansible/roles/podmotion-node/files/sys-fs-bpf.mount /etc/systemd/system/sys-fs-bpf.mount
 RUN systemctl enable sys-fs-bpf.mount 2>/dev/null || true
 
+# Install compiled zero_window BPF objects for on-disk inspection and manual reload.
+# The agent binary embeds these via //go:embed; the on-disk copies allow bpftool
+# introspection and are required if the agent needs to reload after an OOM eviction.
+RUN mkdir -p /usr/lib/podmotion/bpf
+COPY bpf/zero_window_bpfel.o /usr/lib/podmotion/bpf/zero_window_bpfel.o
+COPY bpf/zero_window_bpfeb.o /usr/lib/podmotion/bpf/zero_window_bpfeb.o
+RUN chmod 644 /usr/lib/podmotion/bpf/zero_window_bpfel.o \
+           /usr/lib/podmotion/bpf/zero_window_bpfeb.o
+
 # Install real agent binary (compiled for linux/amd64)
 COPY bin/agent-linux-amd64 /usr/local/bin/podmotion-agent
 RUN chmod +x /usr/local/bin/podmotion-agent \

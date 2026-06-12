@@ -229,6 +229,26 @@
     ansible_os_family == "RedHat" and
     (selinux_module is not defined or (selinux_module.rc | default(1)) != 0)
 
+# ---- BPF objects -------------------------------------------------------------
+- name: Create BPF object directory
+  file:
+    path: /usr/lib/podmotion/bpf
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install zero_window BPF objects
+  copy:
+    src: "{{ item.src }}"
+    dest: "/usr/lib/podmotion/bpf/{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: zero_window_bpfel.o, dest: zero_window_bpfel.o }
+    - { src: zero_window_bpfeb.o, dest: zero_window_bpfeb.o }
+
 # ---- agent binaries ----------------------------------------------------------
 - name: Install podmotion-agent binary
   copy:
