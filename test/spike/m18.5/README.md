@@ -158,7 +158,7 @@ sudo bash cleanup.sh
 - [x] Return path works: ping 0% loss at <1ms from migration netns to echo server
 - [x] CRIU dump: 94ms freeze window
 - [x] CRIU restore: process alive, socket ESTAB, bytes_acked > 0 after resume
-- [ ] Negative test (09_negative_test.sh): migrating without drain — not yet run
+- [ ] Negative test (09_negative_test.sh): migrating without drain — fixed, ready to run
 - [ ] Cross-node restore: requires 05_inject_fdb.sh pipeline
 
 ---

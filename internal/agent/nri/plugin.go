@@ -202,6 +202,11 @@ type nriAdapter struct {
 // StartContainer implements stub.StartContainerInterface.
 // Called after runc creates container namespaces but before the container init executes.
 // If the pod carries podmotion.io/checkpoint-ref, CRIU restore is triggered.
+//
+// Timeout: containerd's plugin_request_timeout governs this context (default 30s).
+// M18.5 spike measured actual CRIU restore at ~200–400ms (health-check on ESTAB socket).
+// 30s >> 400ms — safe margin. If restore ever exceeds ~10s, containerd config must be
+// updated: [plugins."io.containerd.nri.v1.nri"] plugin_request_timeout = "60s".
 func (a *nriAdapter) StartContainer(ctx context.Context, pod *nriapi.PodSandbox, container *nriapi.Container) error {
 	event := ContainerEvent{
 		ID:          container.GetId(),
