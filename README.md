@@ -23,12 +23,11 @@ For full architecture, API reference, and installation guides see [docs/](docs/)
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
-make docker-build docker-push IMG=<some-registry>/podmotion:tag
+make docker-build docker-push IMG=docker.io/podmotion/podmotion:tag
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+Images are published to [hub.docker.com/u/podmotion](https://hub.docker.com/u/podmotion).
+Pull access is public. For the latest release tag see the [releases page](https://github.com/podmotion-io/podmotion/releases).
 
 **Install the CRDs into the cluster:**
 
@@ -39,7 +38,7 @@ make install
 **Deploy the Manager to the cluster with the image specified by `IMG`:**
 
 ```sh
-make deploy IMG=<some-registry>/podmotion:tag
+make deploy IMG=docker.io/podmotion/podmotion:tag
 ```
 
 > **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
@@ -85,21 +84,16 @@ Following the options to release and provide this solution to the users.
 1. Build the installer for the image built and published in the registry:
 
 ```sh
-make build-installer IMG=<some-registry>/podmotion:tag
+make build-installer IMG=docker.io/podmotion/podmotion:tag
 ```
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
+This generates `dist/install.yaml` — a single-file Kustomize bundle of all resources
+required to install PodMotion without additional dependencies.
 
 2. Using the installer
 
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/podmotion/<tag or branch>/dist/install.yaml
+kubectl apply -f https://raw.githubusercontent.com/podmotion-io/podmotion/<tag>/dist/install.yaml
 ```
 
 ### By providing a Helm Chart
