@@ -357,3 +357,127 @@ func TestTCPPreservationModeGating(t *testing.T) {
 		})
 	}
 }
+
+// TestDestinationNetnsReadyCondition verifies that reconcileDestinationPrewarm sets
+// DestinationNetnsReady=True for both TCPPreservationMode=None (skip path) and
+// TCPPreservationMode=Strict (active path). This is the M21 acceptance criterion:
+// "DestinationNetnsReady=True in status conditions".
+func TestDestinationNetnsReadyCondition(t *testing.T) {
+	tests := []struct {
+		name string
+		mode pmv1.TCPPreservationMode
+	}{
+		{"None_SkipPath", pmv1.TCPPreservationModeNone},
+		{"Strict_ActivePath", pmv1.TCPPreservationModeStrict},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := pmv1.AddToScheme(scheme); err != nil {
+				t.Fatalf("AddToScheme: %v", err)
+			}
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatalf("AddToScheme corev1: %v", err)
+			}
+			pm := &pmv1.PodMigration{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-netns", Namespace: "default"},
+				Spec: pmv1.PodMigrationSpec{
+					PodName:             "src-pod",
+					PodNamespace:        "default",
+					TCPPreservationMode: tc.mode,
+					TargetNodeName:      "dst-node",
+				},
+				Status: pmv1.PodMigrationStatus{
+					Phase:               pmv1.MigrationPhaseDestinationPrewarm,
+					SourceNodeName:      "src-node",
+					DestinationNodeName: "dst-node",
+				},
+			}
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(pm).
+				WithStatusSubresource(pm).
+				Build()
+			r := &PodMigrationReconciler{Client: fakeClient, Scheme: scheme}
+			ctx := context.Background()
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-netns", Namespace: "default"}}
+
+			// Two passes: first adds the finalizer, second executes the phase.
+			for i := 0; i < 2; i++ {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile pass %d: %v", i, err)
+				}
+			}
+
+			fresh := &pmv1.PodMigration{}
+			if err := fakeClient.Get(ctx, req.NamespacedName, fresh); err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if !meta.IsStatusConditionTrue(fresh.Status.Conditions, pmv1.ConditionDestinationNetnsReady) {
+				t.Errorf("mode=%s: expected DestinationNetnsReady=True after reconcileDestinationPrewarm", tc.mode)
+			}
+		})
+	}
+}
+
+// TestVXLANFDBUpdatedCondition verifies that reconcileOverlayHandoff sets
+// VXLANFDBUpdated=True for both TCPPreservationMode=None (skip path) and
+// TCPPreservationMode=Strict (active path). This is the M21 acceptance criterion:
+// "VXLANFDBUpdated=True in status conditions".
+func TestVXLANFDBUpdatedCondition(t *testing.T) {
+	tests := []struct {
+		name string
+		mode pmv1.TCPPreservationMode
+	}{
+		{"None_SkipPath", pmv1.TCPPreservationModeNone},
+		{"Strict_ActivePath", pmv1.TCPPreservationModeStrict},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := pmv1.AddToScheme(scheme); err != nil {
+				t.Fatalf("AddToScheme: %v", err)
+			}
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatalf("AddToScheme corev1: %v", err)
+			}
+			pm := &pmv1.PodMigration{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-fdb", Namespace: "default"},
+				Spec: pmv1.PodMigrationSpec{
+					PodName:             "src-pod",
+					PodNamespace:        "default",
+					TCPPreservationMode: tc.mode,
+					TargetNodeName:      "dst-node",
+				},
+				Status: pmv1.PodMigrationStatus{
+					Phase:               pmv1.MigrationPhaseOverlayHandoff,
+					SourceNodeName:      "src-node",
+					DestinationNodeName: "dst-node",
+				},
+			}
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(pm).
+				WithStatusSubresource(pm).
+				Build()
+			r := &PodMigrationReconciler{Client: fakeClient, Scheme: scheme}
+			ctx := context.Background()
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-fdb", Namespace: "default"}}
+
+			// Two passes: first adds the finalizer, second executes the phase.
+			for i := 0; i < 2; i++ {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile pass %d: %v", i, err)
+				}
+			}
+
+			fresh := &pmv1.PodMigration{}
+			if err := fakeClient.Get(ctx, req.NamespacedName, fresh); err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if !meta.IsStatusConditionTrue(fresh.Status.Conditions, pmv1.ConditionVXLANFDBUpdated) {
+				t.Errorf("mode=%s: expected VXLANFDBUpdated=True after reconcileOverlayHandoff", tc.mode)
+			}
+		})
+	}
+}
