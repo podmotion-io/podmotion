@@ -20,6 +20,15 @@ service MigrationAgentService {
   // PrepareDestinationNetns pre-stages the migration network namespace on the destination
   // node and returns the file descriptor path and VTEP MAC for overlay FDB injection.
   rpc PrepareDestinationNetns(PrepareDestinationNetnsRequest) returns (PrepareDestinationNetnsResponse);
+  // ArmZeroWindow attaches the zero_window eBPF program to the source pod veth TC egress,
+  // causing the kernel to advertise win=0 on all outgoing ACKs, stalling the peer sender.
+  // Must be called before FinalFreeze. The agent arms a watchdog that auto-disarms after
+  // FreezeWindowBudgetMs + margin if DisarmZeroWindow is not received in time.
+  rpc ArmZeroWindow(ArmZeroWindowRequest) returns (ArmZeroWindowResponse);
+  // DisarmZeroWindow detaches the zero_window eBPF program from the source pod veth,
+  // allowing the peer sender to resume. Must be called after CRIU restore is confirmed
+  // complete and all 6 ADR-0049 barrier predicates are satisfied.
+  rpc DisarmZeroWindow(DisarmZeroWindowRequest) returns (DisarmZeroWindowResponse);
   // Abort cancels an in-progress migration and triggers rollback.
   rpc Abort(AbortRequest) returns (AbortResponse);
   // EstimateCheckpoint performs a 10-second dirty page sampling without checkpointing.
@@ -193,6 +202,28 @@ message ReleaseCheckpointRequest {
 message ReleaseCheckpointResponse {
   bool   success = 1;
   string error   = 2;
+}
+
+message ArmZeroWindowRequest {
+  string migration_name         = 1;
+  string pod_uid                = 2; // used to resolve the source pod veth ifindex
+  int64  freeze_window_budget_ms = 3; // watchdog auto-disarm deadline from FreezeWindowBudgetMs
+}
+message ArmZeroWindowResponse {
+  bool   armed          = 1;
+  string blocking_reason = 2; // set if armed=false
+  int64  armed_at_ns    = 3; // CLOCK_REALTIME ns when TC filter was attached
+}
+
+message DisarmZeroWindowRequest {
+  string migration_name = 1;
+  string pod_uid        = 2;
+}
+message DisarmZeroWindowResponse {
+  bool   disarmed        = 1;
+  string blocking_reason = 2; // set if disarmed=false
+  int64  disarmed_at_ns  = 3; // CLOCK_REALTIME ns when TC filter was detached
+  int64  hold_duration_ms = 4; // wall time from arm to disarm
 }
 
 enum MigrationMode {
