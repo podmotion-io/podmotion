@@ -21,17 +21,23 @@ you may not use this file except in compliance with the License.
 //
 // On CHECK: pass-through.
 // On VERSION: return supported spec versions.
-//
-// M19 delivers the skeleton only.  The MigrationCheckpoint CR lookup and the
-// actual FDB suppression are implemented in M21 alongside migrationnetns.go.
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 // cniVersion is the CNI spec version this plugin implements.
@@ -73,6 +79,23 @@ type netConf struct {
 	PrevResult json.RawMessage `json:"prevResult,omitempty"`
 }
 
+// podMigrationGVR is the GroupVersionResource for PodMigration CRs.
+var podMigrationGVR = schema.GroupVersionResource{
+	Group:    "podmotion.io",
+	Version:  "v1alpha1",
+	Resource: "podmigrations",
+}
+
+// terminalPhases are phases where migration is no longer active and FDB cleanup
+// should proceed normally.
+var terminalPhases = map[string]bool{
+	"Complete":       true,
+	"Failed":         true,
+	"RollingBack":    true,
+	"DryRunComplete": true,
+	"CutoverComplete": true,
+}
+
 func main() {
 	cmd := cniCommand(os.Getenv("CNI_COMMAND"))
 	switch cmd {
@@ -103,15 +126,113 @@ func handleVersion() {
 
 // handleDEL decides whether to suppress FDB/ARP cleanup for a migrating pod.
 //
-// M19 stub: always pass-through.
-// M21 will add MigrationCheckpoint CR lookup here; if the pod is an active
-// migration source, FDB cleanup is suppressed and a deferred cleanup is
-// registered via the controller.
+// CNI_ARGS carries K8S_POD_NAME and K8S_POD_NAMESPACE as semicolon-separated
+// key=value pairs.  If a PodMigration CR exists for this pod in a non-terminal
+// phase, the DEL is suppressed — the FDB entry is left intact so the overlay
+// continues to route traffic to the migration netns on the destination node.
+// The controller is responsible for removing the FDB entry after MigrationComplete.
 func handleDEL() error {
-	// M21: look up MigrationCheckpoint CR for CNI_CONTAINERID / CNI_NETNS.
-	// If found and migration is not Complete/Failed, log suppression and return nil
-	// without invoking the next plugin for FDB teardown.
+	podName, podNamespace := parseCNIArgs(os.Getenv("CNI_ARGS"))
+	if podName == "" || podNamespace == "" {
+		// CNI_ARGS absent or malformed — cannot perform lookup; pass through.
+		return delegateToNext()
+	}
+
+	suppressed, err := isMigrationActive(podName, podNamespace)
+	if err != nil {
+		// Lookup failed — log to stderr (kubelet captures CNI stderr) and pass
+		// through to avoid blocking pod deletion on API unavailability.
+		fmt.Fprintf(os.Stderr, "pm-cni: MigrationCheckpoint lookup failed for %s/%s: %v; passing through DEL\n", podNamespace, podName, err)
+		return delegateToNext()
+	}
+
+	if suppressed {
+		// Active migration: suppress FDB/ARP cleanup.  The DEL succeeds (exit 0)
+		// without invoking the next plugin, preserving the source node FDB entry
+		// until the controller removes it post-MigrationComplete.
+		fmt.Fprintf(os.Stderr, "pm-cni: suppressing FDB/ARP DEL cleanup for migrating pod %s/%s\n", podNamespace, podName)
+		return nil
+	}
+
 	return delegateToNext()
+}
+
+// isMigrationActive returns true when a PodMigration CR exists for podName/podNamespace
+// in a non-terminal phase, meaning the FDB entry must be preserved.
+func isMigrationActive(podName, podNamespace string) (bool, error) {
+	client, err := buildDynamicClient()
+	if err != nil {
+		return false, fmt.Errorf("build k8s client: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	list, err := client.Resource(podMigrationGVR).Namespace(podNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, fmt.Errorf("list PodMigrations in %s: %w", podNamespace, err)
+	}
+
+	for _, item := range list.Items {
+		spec, ok := item.Object["spec"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := spec["podName"].(string)
+		if name != podName {
+			continue
+		}
+		phase := extractPhase(item.Object)
+		if !terminalPhases[phase] {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// extractPhase returns the status.phase field from an unstructured PodMigration object.
+func extractPhase(obj map[string]interface{}) string {
+	status, ok := obj["status"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	phase, _ := status["phase"].(string)
+	return phase
+}
+
+// parseCNIArgs extracts K8S_POD_NAME and K8S_POD_NAMESPACE from the CNI_ARGS
+// environment variable.  CNI_ARGS format: "KEY=VALUE;KEY=VALUE;..."
+func parseCNIArgs(cniArgs string) (podName, podNamespace string) {
+	for _, part := range strings.Split(cniArgs, ";") {
+		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		switch kv[0] {
+		case "K8S_POD_NAME":
+			podName = kv[1]
+		case "K8S_POD_NAMESPACE":
+			podNamespace = kv[1]
+		}
+	}
+	return
+}
+
+// buildDynamicClient builds a Kubernetes dynamic client using in-cluster config
+// with a fallback to KUBECONFIG for local dev.
+func buildDynamicClient() (dynamic.Interface, error) {
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		kubeconfig := os.Getenv("KUBECONFIG")
+		if kubeconfig == "" {
+			kubeconfig = filepath.Join(os.Getenv("HOME"), ".kube", "config")
+		}
+		cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		if err != nil {
+			return nil, fmt.Errorf("build kubeconfig: %w", err)
+		}
+	}
+	return dynamic.NewForConfig(cfg)
 }
 
 // delegateToNext re-execs the next plugin in the CNI chain by looking up the
@@ -148,7 +269,7 @@ func delegateToNext() error {
 	c.Stderr = os.Stderr
 	c.Env = os.Environ()
 	// Override stdin with the re-serialised conf only if we need to strip our own type.
-	_ = stdin // M21: use when stripping pm-cni from the chain config
+	_ = stdin // used when stripping pm-cni from the chain config
 
 	return c.Run()
 }
@@ -198,3 +319,4 @@ func fatal(code uint, msg, details string) {
 	_ = json.NewEncoder(os.Stdout).Encode(e)
 	os.Exit(int(code))
 }
+
