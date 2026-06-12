@@ -1,5 +1,5 @@
 # Image URL to use all building/pushing image targets
-IMG ?= docker.io/podmotion/podmotion:latest
+IMG ?= ghcr.io/podmotion-io/podmotion:latest
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -322,9 +322,9 @@ endef
 
 # ── PodMotion custom targets ──────────────────────────────────────────────────
 
-IMG_OPERATOR ?= podmotion/operator:dev
-IMG_AGENT    ?= podmotion/agent:dev
-KIND_NODE_IMG ?= podmotion/kind-node:dev
+IMG_OPERATOR  ?= ghcr.io/podmotion-io/operator:dev
+IMG_AGENT     ?= ghcr.io/podmotion-io/agent:dev
+KIND_NODE_IMG ?= ghcr.io/podmotion-io/kind-node:dev
 KIND_CLUSTER  ?= podmotion-dev
 
 ## kind-image: Build kind node image with CRIU and podmotion-agent

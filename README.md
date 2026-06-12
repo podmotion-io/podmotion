@@ -23,7 +23,7 @@ For full architecture, API reference, and installation guides see [docs/](docs/)
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
-make docker-build docker-push IMG=docker.io/podmotion/podmotion:tag
+make docker-build docker-push IMG=ghcr.io/podmotion-io/podmotion:tag
 ```
 
 Images are published to [hub.docker.com/u/podmotion](https://hub.docker.com/u/podmotion).
@@ -38,7 +38,7 @@ make install
 **Deploy the Manager to the cluster with the image specified by `IMG`:**
 
 ```sh
-make deploy IMG=docker.io/podmotion/podmotion:tag
+make deploy IMG=ghcr.io/podmotion-io/podmotion:tag
 ```
 
 > **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
@@ -84,7 +84,7 @@ Following the options to release and provide this solution to the users.
 1. Build the installer for the image built and published in the registry:
 
 ```sh
-make build-installer IMG=docker.io/podmotion/podmotion:tag
+make build-installer IMG=ghcr.io/podmotion-io/podmotion:tag
 ```
 
 This generates `dist/install.yaml` — a single-file Kustomize bundle of all resources
