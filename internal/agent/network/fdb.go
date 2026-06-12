@@ -133,22 +133,8 @@ func DiscoverVTEPMAC(ctx context.Context, flannelAnnotationJSON, ifName string) 
 	return iface.HardwareAddr, nil
 }
 
-// validateFDBEntry returns an error if any required field is missing or invalid.
-func validateFDBEntry(e FDBEntry) error {
-	if e.IfName == "" {
-		return fmt.Errorf("IfName must not be empty")
-	}
-	if e.PodIP == nil {
-		return fmt.Errorf("PodIP must not be nil")
-	}
-	if len(e.PodMAC) == 0 {
-		return fmt.Errorf("PodMAC must not be empty")
-	}
-	if e.VTEPIP == nil {
-		return fmt.Errorf("VTEPIP must not be nil")
-	}
-	return nil
-}
+// validateFDBEntry is defined in fdb_types.go (no build tag) so it is available
+// on all platforms including the fdb_stub.go (!linux) path.
 
 func ifaceIndex(name string) (int, error) {
 	iface, err := net.InterfaceByName(name)
