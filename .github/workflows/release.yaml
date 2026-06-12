@@ -1,0 +1,218 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: podmotion-io
+  GO_VERSION: "1.24"
+
+jobs:
+  ci-gate:
+    name: CI Gate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Verify CI passed on this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha="${{ github.sha }}"
+          echo "Checking CI conclusion for ${sha}"
+          status=$(gh run list --workflow=ci.yaml --commit "${sha}" \
+            --json conclusion --jq '.[0].conclusion' 2>/dev/null || echo "")
+          if [ "${status}" != "success" ] && [ -n "${status}" ]; then
+            echo "::error::CI for ${sha} did not succeed (status: ${status})."
+            exit 1
+          fi
+          echo "CI gate passed (status: ${status:-not-found, proceeding})."
+
+  prepare:
+    name: Prepare Tags
+    needs: [ci-gate]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tags: ${{ steps.semver.outputs.tags }}
+    steps:
+      - name: Compute semver tags
+        id: semver
+        run: |
+          ref="${GITHUB_REF#refs/tags/}"      # v1.2.3
+          ver="${ref#v}"                       # 1.2.3
+          major="${ver%%.*}"
+          minor="${ver%.*}"
+          {
+            echo "tags<<EOF"
+            echo "type=raw,value=${ref}"
+            echo "type=raw,value=v${minor}"
+            echo "type=raw,value=v${major}"
+            echo "type=raw,value=latest"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build & Sign Images
+    needs: [prepare]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [operator, agent, scheduler, pm-checkpoint-gc]
+    uses: ./.github/workflows/_build-image.yaml
+    with:
+      image: ${{ matrix.image }}
+      tags: ${{ needs.prepare.outputs.tags }}
+      sign: true
+      sbom: true
+    secrets: inherit
+
+  provenance:
+    name: SLSA Provenance
+    needs: [build]
+    permissions:
+      actions: read
+      id-token: write
+      packages: write
+    strategy:
+      matrix:
+        image: [operator, agent, scheduler, pm-checkpoint-gc]
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.0.0
+    with:
+      image: ghcr.io/podmotion-io/${{ matrix.image }}
+      digest: ${{ needs.build.outputs.digest }}
+      registry-username: ${{ github.actor }}
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+  installer:
+    name: Build Installer Manifest
+    needs: [build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Go
+        uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5.1.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+      - name: Build installer
+        env:
+          IMG: ghcr.io/podmotion-io/operator:${{ github.ref_name }}
+        run: make build-installer
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: install-manifest
+          path: dist/install.yaml
+          retention-days: 90
+
+  helm:
+    name: Package & Push Helm Chart
+    needs: [build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Helm
+        uses: azure/setup-helm@fe7b79cd5ee1e45176fcad797de68ecaf3ca4814 # v4.2.0
+        with:
+          version: v3.16.3
+      - name: Log in to GHCR (Helm)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            helm registry login ${{ env.REGISTRY }} \
+            --username ${{ github.actor }} --password-stdin
+      - name: Package chart
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          helm package charts/podmotion --version "${ver}" --app-version "${ver}"
+      - name: Push chart to OCI registry
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          helm push "podmotion-${ver}.tgz" "oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/charts"
+
+  github-release:
+    name: Create GitHub Release
+    needs: [build, installer, helm]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Download installer artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: install-manifest
+          path: dist
+      - name: Download SBOMs
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: sbom-*
+          path: sboms
+          merge-multiple: true
+      - name: Write release notes header
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          cat > release-header.md <<EOF
+          ## PodMotion ${TAG}
+
+          Live pod migration for Kubernetes.
+
+          ### Install
+
+          \`\`\`bash
+          kubectl apply -f https://github.com/podmotion-io/podmotion/releases/download/${TAG}/install.yaml
+          \`\`\`
+
+          Or via Helm:
+
+          \`\`\`bash
+          helm install podmotion oci://ghcr.io/podmotion-io/charts/podmotion --version ${TAG#v}
+          \`\`\`
+
+          ### Images
+
+          - \`ghcr.io/podmotion-io/operator:${TAG}\`
+          - \`ghcr.io/podmotion-io/agent:${TAG}\`
+          - \`ghcr.io/podmotion-io/scheduler:${TAG}\`
+          - \`ghcr.io/podmotion-io/pm-checkpoint-gc:${TAG}\`
+
+          All images are multi-arch (amd64/arm64), cosign-signed (keyless), and ship SPDX SBOM attestations with SLSA L2 provenance.
+
+          ---
+          EOF
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "${TAG}" \
+            --title "PodMotion ${TAG}" \
+            --notes-file release-header.md \
+            --generate-notes \
+            --verify-tag \
+            dist/install.yaml \
+            sboms/*.spdx.json

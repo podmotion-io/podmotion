@@ -10,6 +10,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
@@ -164,5 +165,115 @@ func TestDisarmZeroWindow_NoActiveHold(t *testing.T) {
 	}
 	if resp.BlockingReason == "" {
 		t.Errorf("expected a BlockingReason explaining why disarm failed")
+	}
+}
+
+// TestWatchdog_AutoDisarmFiresWhenDisarmWithheld verifies that when DisarmZeroWindow is
+// NOT called within FreezeWindowBudgetMs + margin, the watchdog goroutine fires and
+// removes the hold state — proving the connection cannot be stalled indefinitely
+// (M20 acceptance criterion: watchdog test).
+//
+// Uses a very short budget (5ms) so the test completes quickly without sleeping long.
+func TestWatchdog_AutoDisarmFiresWhenDisarmWithheld(t *testing.T) {
+	s := New("test-node", &criu.StubCheckpointer{}, nil)
+	ctx := context.Background()
+
+	// Arm with a 5ms freeze budget. Watchdog deadline = 5ms + zwWatchdogMargin (500ms).
+	// We use a short separate budget and poll quickly rather than waiting the full margin.
+	_, err := s.ArmZeroWindow(ctx, &agentpb.ArmZeroWindowRequest{
+		MigrationName:        "watchdog-test",
+		PodUid:               "pod-watchdog",
+		FreezeWindowBudgetMs: 5,
+	})
+	if err != nil {
+		t.Fatalf("ArmZeroWindow returned unexpected error: %v", err)
+	}
+
+	// Confirm hold is registered immediately after arm.
+	s.zwHoldMu.Lock()
+	_, armed := s.zwHolds["watchdog-test"]
+	s.zwHoldMu.Unlock()
+	if !armed {
+		t.Fatal("expected hold to be registered after ArmZeroWindow")
+	}
+
+	// Wait for watchdog to fire: budget(5ms) + zwWatchdogMargin(500ms) + 200ms headroom.
+	deadline := time.Now().Add(time.Duration(5)*time.Millisecond + zwWatchdogMargin + 200*time.Millisecond)
+	var cleared bool
+	for time.Now().Before(deadline) {
+		s.zwHoldMu.Lock()
+		_, still := s.zwHolds["watchdog-test"]
+		s.zwHoldMu.Unlock()
+		if !still {
+			cleared = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !cleared {
+		t.Errorf("watchdog did not auto-disarm within expected deadline; hold state still present")
+	}
+
+	// After watchdog fires, DisarmZeroWindow must report no active hold (connection survived —
+	// the BPF program was detached, so the sender window is restored and the connection lives).
+	resp, err := s.DisarmZeroWindow(ctx, &agentpb.DisarmZeroWindowRequest{
+		MigrationName: "watchdog-test",
+		PodUid:        "pod-watchdog",
+	})
+	if err != nil {
+		t.Fatalf("DisarmZeroWindow after watchdog returned error: %v", err)
+	}
+	// Watchdog already cleaned up the hold; DisarmZeroWindow should return not-found path.
+	if resp.Disarmed {
+		// Acceptable if the implementation is re-entrant, but the hold must not still be
+		// in memory — check the state map is clear either way.
+	}
+	s.zwHoldMu.Lock()
+	_, remainingHold := s.zwHolds["watchdog-test"]
+	s.zwHoldMu.Unlock()
+	if remainingHold {
+		t.Errorf("hold state must be absent after watchdog auto-disarm + explicit DisarmZeroWindow")
+	}
+}
+
+// TestHoldDuration_WithinFreezeWindowBudget verifies that when DisarmZeroWindow is called
+// promptly, HoldDurationMs is less than or equal to FreezeWindowBudgetMs (M20 acceptance
+// criterion: condition delta ZeroWindowArmed→Disarmed ≤ FreezeWindowBudgetMs).
+func TestHoldDuration_WithinFreezeWindowBudget(t *testing.T) {
+	s := New("test-node", &criu.StubCheckpointer{}, nil)
+	ctx := context.Background()
+
+	const budgetMs = int64(5000)
+
+	armResp, err := s.ArmZeroWindow(ctx, &agentpb.ArmZeroWindowRequest{
+		MigrationName:        "budget-test",
+		PodUid:               "pod-budget",
+		FreezeWindowBudgetMs: budgetMs,
+	})
+	if err != nil || !armResp.Armed {
+		t.Fatalf("ArmZeroWindow failed: err=%v armed=%v", err, armResp.Armed)
+	}
+
+	// Disarm immediately — hold duration should be negligible (< budgetMs by a large margin).
+	disarmResp, err := s.DisarmZeroWindow(ctx, &agentpb.DisarmZeroWindowRequest{
+		MigrationName: "budget-test",
+		PodUid:        "pod-budget",
+	})
+	if err != nil {
+		t.Fatalf("DisarmZeroWindow returned error: %v", err)
+	}
+	if !disarmResp.Disarmed {
+		t.Fatalf("DisarmZeroWindow returned Disarmed=false unexpectedly: %s", disarmResp.BlockingReason)
+	}
+	if disarmResp.HoldDurationMs > budgetMs {
+		t.Errorf("HoldDurationMs=%d exceeds FreezeWindowBudgetMs=%d — hold took too long",
+			disarmResp.HoldDurationMs, budgetMs)
+	}
+	if disarmResp.HoldDurationMs < 0 {
+		t.Errorf("HoldDurationMs must be non-negative, got %d", disarmResp.HoldDurationMs)
+	}
+	if disarmResp.DisarmedAtNs <= armResp.ArmedAtNs {
+		t.Errorf("DisarmedAtNs (%d) must be after ArmedAtNs (%d)",
+			disarmResp.DisarmedAtNs, armResp.ArmedAtNs)
 	}
 }

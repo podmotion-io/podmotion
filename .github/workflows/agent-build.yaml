@@ -1,0 +1,126 @@
+name: Agent Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Image to build"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - operator
+          - agent
+          - scheduler
+          - pm-checkpoint-gc
+      tag:
+        description: "Custom tag to push"
+        required: true
+        default: "dev"
+        type: string
+      reason:
+        description: "Reason for this build (logged in run summary)"
+        required: false
+        default: "agent-requested build"
+        type: string
+  repository_dispatch:
+    types: [agent-build-request]
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: podmotion-io
+
+jobs:
+  resolve:
+    name: Resolve Inputs
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      images: ${{ steps.set.outputs.images }}
+      tag: ${{ steps.set.outputs.tag }}
+      reason: ${{ steps.set.outputs.reason }}
+    steps:
+      - name: Resolve image list, tag, reason
+        id: set
+        env:
+          DISPATCH_IMAGE: ${{ inputs.image }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+          DISPATCH_REASON: ${{ inputs.reason }}
+          REPO_IMAGE: ${{ github.event.client_payload.image }}
+          REPO_TAG: ${{ github.event.client_payload.tag }}
+          REPO_REASON: ${{ github.event.client_payload.reason }}
+        run: |
+          img="${DISPATCH_IMAGE:-$REPO_IMAGE}"
+          tag="${DISPATCH_TAG:-$REPO_TAG}"
+          reason="${DISPATCH_REASON:-$REPO_REASON}"
+          img="${img:-all}"
+          tag="${tag:-dev}"
+          reason="${reason:-agent-requested build}"
+
+          if [ "${img}" = "all" ]; then
+            list='["operator","agent","scheduler","pm-checkpoint-gc"]'
+          else
+            list="[\"${img}\"]"
+          fi
+          {
+            echo "images=${list}"
+            echo "tag=${tag}"
+            echo "reason=${reason}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.image }}
+    needs: [resolve]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.resolve.outputs.images) }}
+    uses: ./.github/workflows/_build-image.yaml
+    with:
+      image: ${{ matrix.image }}
+      tags: |
+        type=raw,value=${{ needs.resolve.outputs.tag }}
+      sign: true
+      sbom: false
+    secrets: inherit
+
+  summary:
+    name: Run Summary
+    needs: [resolve, build]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Write summary
+        env:
+          IMAGES: ${{ needs.resolve.outputs.images }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          REASON: ${{ needs.resolve.outputs.reason }}
+          RESULT: ${{ needs.build.result }}
+        run: |
+          {
+            echo "## Agent Build Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Result | ${RESULT} |"
+            echo "| Tag | \`${TAG}\` |"
+            echo "| Reason | ${REASON} |"
+            echo "| Triggered by | ${{ github.actor }} (${{ github.event_name }}) |"
+            echo ""
+            echo "### Image references"
+            echo ""
+            for img in $(echo "${IMAGES}" | tr -d '[]"' | tr ',' ' '); do
+              echo "- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${img}:${TAG}\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
