@@ -15,7 +15,7 @@ CFLAGS      := -O2 -g -target bpf -D__TARGET_ARCH_x86 \
                -I/usr/include -I/usr/include/x86_64-linux-gnu \
                -Wall -Werror
 
-BPF_SRCS    := zero_window.c xdp_bridge.c
+BPF_SRCS    := zero_window.c xdp_bridge.c pm_relay.c pm_sk_lookup.c pm_xdp_vtep.c
 BPF_OBJECTS := $(BPF_SRCS:.c=.bpf.o)
 
 .PHONY: all clean generate
@@ -36,6 +36,21 @@ generate: $(BPF_OBJECTS)
 		-cflags "$(CFLAGS)" \
 		-output-dir ../internal/agent/network/bpfloader \
 		ZeroWindow ./zero_window.c
+	go run github.com/cilium/ebpf/cmd/bpf2go \
+		-cc $(CLANG) \
+		-cflags "$(CFLAGS)" \
+		-output-dir ../internal/agent/network/bpfloader \
+		PmRelay ./pm_relay.c
+	go run github.com/cilium/ebpf/cmd/bpf2go \
+		-cc $(CLANG) \
+		-cflags "$(CFLAGS)" \
+		-output-dir ../internal/agent/network/bpfloader \
+		PmSkLookup ./pm_sk_lookup.c
+	go run github.com/cilium/ebpf/cmd/bpf2go \
+		-cc $(CLANG) \
+		-cflags "$(CFLAGS)" \
+		-output-dir ../internal/agent/network/bpfloader \
+		PmXdpVtep ./pm_xdp_vtep.c
 	cp zero_window_bpfel.o ../internal/agent/network/bpfloader/zero_window_bpfel.o
 	cp zero_window_bpfeb.o ../internal/agent/network/bpfloader/zero_window_bpfeb.o
 

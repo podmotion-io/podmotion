@@ -29,6 +29,33 @@ import (
 // required for BTF-enabled CO-RE programs used by the cilium/ebpf loader.
 const kernelVersion59 = (5 << 16) | (9 << 8) | 0
 
+// SeqXlatKey is the 4-tuple key for PM_SEQ_XLAT map entries.
+type SeqXlatKey struct {
+	SrcIP   [4]byte
+	DstIP   [4]byte
+	SrcPort uint16
+	DstPort uint16
+}
+
+// SeqXlatEntry holds the sequence/ack/timestamp translation deltas for one
+// migrated TCP connection.  Fields are in host byte order.
+type SeqXlatEntry struct {
+	SeqDelta    int32
+	AckDelta    int32
+	TsDelta     int32
+	Wscale      uint8
+	SackPresent uint8
+	// State: 0=inactive, 1=active, 2=teardown.
+	State uint8
+}
+
+// VtepEntry describes the destination VTEP for a migrated pod IP.
+type VtepEntry struct {
+	DstVtepIP  [4]byte
+	DstIfindex uint32
+	VNI        uint32
+}
+
 // EBPFManager is the exported interface for callers outside the network package
 // (e.g. internal/agent/server) that need to arm/disarm eBPF programs.
 // It is identical to the unexported eBPFManager.
@@ -38,6 +65,17 @@ type EBPFManager interface {
 	ArmXDPBridge(ctx context.Context, srcIP, dstIP net.IP, genevePort uint16) error
 	DisarmXDPBridge(ctx context.Context, srcIP net.IP) error
 	CheckXDPHookConflict(ctx context.Context, ifindex uint32) (bool, error)
+	// ArmRelay attaches PM_RELAY_TC_EGRESS and PM_RELAY_TC_INGRESS to flannel.1
+	// (or the interface named by ifname) and seeds PM_SEQ_XLAT with the provided entry.
+	ArmRelay(ctx context.Context, ifname string, key SeqXlatKey, entry SeqXlatEntry) error
+	// DisarmRelay removes the PM_SEQ_XLAT entry for key and detaches relay programs
+	// when no entries remain.
+	DisarmRelay(ctx context.Context, key SeqXlatKey) error
+	// ArmVTEP populates PM_VTEP_MAP and attaches PM_XDP_VTEP to the destination
+	// VTEP interface (dstIfname) and PM_XDP_SRC_GUARD to the source interface (srcIfname).
+	ArmVTEP(ctx context.Context, podIP net.IP, ve VtepEntry, dstIfname, srcIfname string) error
+	// DisarmVTEP removes the PM_VTEP_MAP entry for podIP.
+	DisarmVTEP(ctx context.Context, podIP net.IP) error
 }
 
 // eBPFManager is the interface consumed by NetworkBridgeAgent.
@@ -66,6 +104,18 @@ type eBPFManager interface {
 	// identified by ifindex. Used by NetworkBridgeAgent to detect Cilium XDP
 	// conflicts and fall back to TC ingress mode.
 	CheckXDPHookConflict(ctx context.Context, ifindex uint32) (bool, error)
+
+	// ArmRelay attaches relay TC programs to ifname and seeds PM_SEQ_XLAT.
+	ArmRelay(ctx context.Context, ifname string, key SeqXlatKey, entry SeqXlatEntry) error
+
+	// DisarmRelay removes the PM_SEQ_XLAT entry and detaches when map is empty.
+	DisarmRelay(ctx context.Context, key SeqXlatKey) error
+
+	// ArmVTEP populates PM_VTEP_MAP and attaches XDP programs.
+	ArmVTEP(ctx context.Context, podIP net.IP, ve VtepEntry, dstIfname, srcIfname string) error
+
+	// DisarmVTEP removes the PM_VTEP_MAP entry for podIP.
+	DisarmVTEP(ctx context.Context, podIP net.IP) error
 }
 
 // NewEBPFManager is the exported constructor for callers outside the network
@@ -132,6 +182,26 @@ func (s *eBPFManagerStub) DisarmXDPBridge(ctx context.Context, srcIP net.IP) err
 func (s *eBPFManagerStub) CheckXDPHookConflict(ctx context.Context, ifindex uint32) (bool, error) {
 	logf.FromContext(ctx).Info("ebpf stub: CheckXDPHookConflict", "ifindex", ifindex)
 	return false, nil
+}
+
+func (s *eBPFManagerStub) ArmRelay(ctx context.Context, ifname string, key SeqXlatKey, entry SeqXlatEntry) error {
+	logf.FromContext(ctx).Info("ebpf stub: ArmRelay", "ifname", ifname, "srcPort", key.SrcPort, "dstPort", key.DstPort)
+	return nil
+}
+
+func (s *eBPFManagerStub) DisarmRelay(ctx context.Context, key SeqXlatKey) error {
+	logf.FromContext(ctx).Info("ebpf stub: DisarmRelay", "srcPort", key.SrcPort, "dstPort", key.DstPort)
+	return nil
+}
+
+func (s *eBPFManagerStub) ArmVTEP(ctx context.Context, podIP net.IP, ve VtepEntry, dstIfname, srcIfname string) error {
+	logf.FromContext(ctx).Info("ebpf stub: ArmVTEP", "podIP", podIP, "dstIfname", dstIfname, "srcIfname", srcIfname)
+	return nil
+}
+
+func (s *eBPFManagerStub) DisarmVTEP(ctx context.Context, podIP net.IP) error {
+	logf.FromContext(ctx).Info("ebpf stub: DisarmVTEP", "podIP", podIP)
+	return nil
 }
 
 // resolveIfindex converts an interface name (e.g. "veth1a2b3c") to its kernel ifindex.
