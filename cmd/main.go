@@ -227,7 +227,7 @@ func main() {
 	// Wire ReplicationMgr and StorageMgr so the PreMigrating state machine can advance.
 	// ReplicationManager drives the pre-copy dirty-page sync loop (sets MemorySynced=True).
 	// StorageMigrationManager drives storage pre-stage (sets StorageReadyForFreeze=True).
-	replicationMgr := &replication.ReplicationManager{Client: mgr.GetClient()}
+	replicationMgr := &replication.ReplicationManager{Client: mgr.GetClient(), AgentPool: agentPool}
 	storageMgr := storage.NewStorageMigrationManager(mgr.GetClient())
 
 	if err := (&controller.PodMigrationReconciler{
@@ -283,6 +283,10 @@ func main() {
 	}
 	if err := (&pmwebhook.PodMigrationDefaulter{}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to register webhook", "webhook", "PodMigrationDefaulter")
+		os.Exit(1)
+	}
+	if err := pmwebhook.NewPodMutatingWebhook(mgr.GetClient(), mgr.GetScheme()).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to register webhook", "webhook", "PodMutatingWebhook")
 		os.Exit(1)
 	}
 	if enableSpotReclaim {

@@ -17,6 +17,7 @@ rules:
   - ""
   resources:
   - persistentvolumeclaims
+  - resourcequotas
   verbs:
   - get
   - list

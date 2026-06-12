@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	"github.com/podmotion-io/podmotion/test/utils"
 )
 
 var _ = Describe("PostCopy migration", Ordered, func() {
@@ -46,7 +47,9 @@ var _ = Describe("PostCopy migration", Ordered, func() {
 	)
 
 	BeforeAll(func() {
-		k8s = testEnv.Client // assigned by suite_test.go
+		var err error
+		k8s, err = utils.NewPMClient()
+		Expect(err).NotTo(HaveOccurred(), "creating postcopy test client")
 
 		// Create namespace.
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}

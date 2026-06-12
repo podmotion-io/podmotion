@@ -17,13 +17,24 @@ package nri
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"time"
 
+	nriapi "github.com/containerd/nri/pkg/api"
+	"github.com/containerd/nri/pkg/stub"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 )
+
+// validCheckpointRef rejects any ref that is not a plain DNS-label-safe identifier.
+// A ref like "../../etc" will never match. This is defense-in-depth — the k8s API
+// server already constrains object names, but we validate here since the ref crosses
+// the annotation→filesystem boundary.
+var validCheckpointRef = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{0,61}[a-z0-9]$`)
 
 var log = logf.Log.WithName("nri-plugin")
 
@@ -36,11 +47,14 @@ const PluginIndex = "10"
 
 // ContainerEvent mirrors the subset of the NRI ContainerAdjustment event we care about.
 type ContainerEvent struct {
-	ID        string            `json:"id"`
-	Name      string            `json:"name"`
-	Namespace string            `json:"namespace"`
-	Pod       string            `json:"pod"`
-	Labels    map[string]string `json:"labels,omitempty"`
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	Namespace   string            `json:"namespace"`
+	Pod         string            `json:"pod"`
+	Labels      map[string]string `json:"labels,omitempty"`
+	// Annotations carries pod annotations forwarded by the NRI runtime. In real NRI v2,
+	// pod annotations appear here. The JSON stub must include them to test the restore path.
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 // Plugin is the NRI lifecycle hook handler.
@@ -48,11 +62,118 @@ type Plugin struct {
 	// OnStopping is called for each Stopping event.
 	// Set by the agent main to wire in the pre-dump trigger (M5).
 	OnStopping func(ctx context.Context, event ContainerEvent) error
+
+	// OnStartContainer is called when containerd fires the StartContainer lifecycle
+	// hook — after runc has created the container namespaces (PID, net, mnt) but
+	// before the container's init process begins executing. This is the correct moment
+	// for CRIU restore: namespaces exist, init PID is known, container is paused.
+	// The checkpointRef string is the value of the podmotion.io/checkpoint-ref annotation.
+	OnStartContainer func(ctx context.Context, event ContainerEvent, checkpointRef string) error
+
+	// k8sClient is used to verify PodMigration CRs before triggering CRIU restore,
+	// preventing annotation spoofing attacks. May be nil in unit-test stub mode.
+	k8sClient client.Client
+
+	// nodeName is the name of this node, used to validate the migration targets here.
+	nodeName string
 }
 
-// New creates a Plugin. onStopping may be nil (stub mode).
-func New(onStopping func(ctx context.Context, event ContainerEvent) error) *Plugin {
-	return &Plugin{OnStopping: onStopping}
+// New creates a Plugin. onStopping and onStartContainer may be nil (stub mode).
+// k8sClient and nodeName are used for PodMigration CR verification; pass nil/empty for tests.
+func New(
+	onStopping func(ctx context.Context, event ContainerEvent) error,
+	onStartContainer func(ctx context.Context, event ContainerEvent, checkpointRef string) error,
+) *Plugin {
+	return &Plugin{
+		OnStopping:       onStopping,
+		OnStartContainer: onStartContainer,
+	}
+}
+
+// WithK8sVerification sets the k8s client and node name for PodMigration CR verification.
+// Call this after New() when running in a real cluster to prevent annotation spoofing.
+func (p *Plugin) WithK8sVerification(c client.Client, nodeName string) *Plugin {
+	p.k8sClient = c
+	p.nodeName = nodeName
+	return p
+}
+
+// HandleStartContainer is called by the NRI runtime bridge when containerd fires the
+// StartContainer lifecycle hook — after runc builds namespaces, before the container
+// command executes. If the container carries podmotion.io/checkpoint-ref, the
+// OnStartContainer callback is invoked to trigger CRIU restore into the live namespaces.
+func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent) error {
+	log.Info("NRI StartContainer hook called",
+		"container", event.ID,
+		"name", event.Name,
+		"pod", event.Pod,
+		"namespace", event.Namespace,
+	)
+
+	// Real NRI v2: pod annotations propagate into the sandbox annotations map.
+	// JSON stub: annotations field carries them explicitly.
+	// Also accept the label form as a fallback (set by pod_webhook.go for broad compat).
+	checkpointRef := event.Annotations["podmotion.io/checkpoint-ref"]
+	if checkpointRef == "" {
+		checkpointRef = event.Labels["podmotion.io/checkpoint-ref"]
+	}
+	if checkpointRef == "" {
+		return nil // not a restore target
+	}
+
+	// Validate before the ref touches the filesystem — reject anything that isn't a
+	// plain identifier (no slashes, dots, or path traversal sequences).
+	if !validCheckpointRef.MatchString(checkpointRef) {
+		log.Error(nil, "NRI StartContainer: rejecting invalid checkpointRef — possible path traversal",
+			"checkpointRef", checkpointRef, "container", event.ID)
+		return fmt.Errorf("invalid checkpointRef %q: must match [a-z0-9][a-z0-9-]{0,61}[a-z0-9]", checkpointRef)
+	}
+
+	// Verify that a PodMigration CR with this checkpointRef actually exists and
+	// is in Restoring phase targeting this node. Prevents annotation spoofing.
+	if p.k8sClient != nil {
+		if err := p.verifyPodMigration(ctx, event.Namespace, checkpointRef); err != nil {
+			log.Error(err, "NRI StartContainer: PodMigration verification failed — blocking restore",
+				"checkpointRef", checkpointRef, "container", event.ID)
+			return fmt.Errorf("PodMigration verification failed: %w", err)
+		}
+	}
+
+	log.Info("NRI StartContainer: CRIU restore triggered",
+		"container", event.ID,
+		"checkpointRef", checkpointRef,
+	)
+
+	if p.OnStartContainer != nil {
+		return p.OnStartContainer(ctx, event, checkpointRef)
+	}
+	return nil
+}
+
+// verifyPodMigration ensures that a PodMigration CR matching the checkpointRef exists,
+// is in Restoring phase, and targets this node — blocking restore if not.
+func (p *Plugin) verifyPodMigration(ctx context.Context, namespace, checkpointRef string) error {
+	// List PodMigrations in the pod's namespace looking for one whose CheckpointRef matches.
+	pmList := &pmv1.PodMigrationList{}
+	if err := p.k8sClient.List(ctx, pmList, client.InNamespace(namespace)); err != nil {
+		return fmt.Errorf("list PodMigrations: %w", err)
+	}
+	for _, pm := range pmList.Items {
+		if pm.Status.CheckpointRef == nil || pm.Status.CheckpointRef.Name != checkpointRef {
+			continue
+		}
+		if pm.Status.Phase != pmv1.MigrationPhaseRestoring {
+			return fmt.Errorf("PodMigration %s/%s phase is %s, expected Restoring",
+				namespace, pm.Name, pm.Status.Phase)
+		}
+		if p.nodeName != "" && pm.Spec.DestinationNode != p.nodeName {
+			return fmt.Errorf("PodMigration %s/%s destinationNode %s != this node %s",
+				namespace, pm.Name, pm.Spec.DestinationNode, p.nodeName)
+		}
+		return nil // found and verified
+	}
+	// No matching PodMigration found — treat as spoofed annotation.
+	return fmt.Errorf("no PodMigration in %s with checkpointRef %q in Restoring phase", namespace, checkpointRef)
 }
 
 // HandleStopping is called by the NRI runtime bridge when containerd fires the
@@ -72,42 +193,108 @@ func (p *Plugin) HandleStopping(ctx context.Context, event ContainerEvent) error
 	return nil
 }
 
-// RunStub reads NRI events from stdin in the simple NRI v2 socket protocol and
-// dispatches to HandleStopping. This is the entry point when the binary is
-// exec'd by containerd's NRI infrastructure.
-//
-// In M4 this reads JSON lines from stdin for testability; in M5 it will use
-// the nri/pkg/api gRPC socket protocol.
-func (p *Plugin) RunStub(ctx context.Context) error {
-	log.Info("NRI plugin stub starting", "name", PluginName, "index", PluginIndex)
+// nriAdapter wraps Plugin to implement the containerd NRI stub interfaces.
+// containerd calls StartContainer and StopContainer on this type via the NRI gRPC socket.
+type nriAdapter struct {
+	plugin *Plugin
+}
 
-	dec := json.NewDecoder(os.Stdin)
+// StartContainer implements stub.StartContainerInterface.
+// Called after runc creates container namespaces but before the container init executes.
+// If the pod carries podmotion.io/checkpoint-ref, CRIU restore is triggered.
+func (a *nriAdapter) StartContainer(ctx context.Context, pod *nriapi.PodSandbox, container *nriapi.Container) error {
+	event := ContainerEvent{
+		ID:          container.GetId(),
+		Name:        container.GetName(),
+		Namespace:   pod.GetNamespace(),
+		Pod:         pod.GetName(),
+		Labels:      container.GetLabels(),
+		Annotations: pod.GetAnnotations(),
+	}
+	// Also merge container-level annotations (containerd may forward them on either).
+	if cAnnotations := container.GetAnnotations(); len(cAnnotations) > 0 {
+		if event.Annotations == nil {
+			event.Annotations = make(map[string]string)
+		}
+		for k, v := range cAnnotations {
+			if _, exists := event.Annotations[k]; !exists {
+				event.Annotations[k] = v
+			}
+		}
+	}
+	return a.plugin.HandleStartContainer(ctx, event)
+}
+
+// StopContainer implements stub.StopContainerInterface.
+// Called when a container is stopping; used for pre-dump trigger (M5).
+func (a *nriAdapter) StopContainer(ctx context.Context, pod *nriapi.PodSandbox, container *nriapi.Container) ([]*nriapi.ContainerUpdate, error) {
+	event := ContainerEvent{
+		ID:          container.GetId(),
+		Name:        container.GetName(),
+		Namespace:   pod.GetNamespace(),
+		Pod:         pod.GetName(),
+		Labels:      container.GetLabels(),
+		Annotations: pod.GetAnnotations(),
+	}
+	err := a.plugin.HandleStopping(ctx, event)
+	return nil, err
+}
+
+// nriSocketPath is the containerd NRI socket location.
+const nriSocketPath = "/var/run/nri/nri.sock"
+
+// Run connects to containerd's NRI socket via the real NRI v2 gRPC protocol and
+// dispatches lifecycle events to Plugin handlers. The agent calls this in a goroutine.
+//
+// NRI is an enhancement — if the socket is absent (containerd not configured for NRI),
+// Run waits and retries with backoff rather than failing. This keeps the core agent
+// gRPC server alive on clusters that don't have NRI enabled yet.
+func (p *Plugin) Run(ctx context.Context) error {
+	backoff := 5 * time.Second
+	const maxBackoff = 2 * time.Minute
+
 	for {
+		// Check socket before attempting connection to distinguish "not yet configured"
+		// (expected, warn-only) from a real handshake failure (unexpected, log error).
+		if _, err := os.Stat(nriSocketPath); os.IsNotExist(err) {
+			log.Info("NRI socket not found — containerd NRI not enabled; will retry",
+				"socket", nriSocketPath, "retryIn", backoff)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(backoff):
+				if backoff < maxBackoff {
+					backoff *= 2
+				}
+				continue
+			}
+		}
+
+		log.Info("NRI plugin connecting", "name", PluginName, "index", PluginIndex)
+		adapter := &nriAdapter{plugin: p}
+		s, err := stub.New(adapter,
+			stub.WithPluginName(PluginName),
+			stub.WithPluginIdx(PluginIndex),
+		)
+		if err != nil {
+			log.Error(err, "NRI stub.New failed — retrying", "retryIn", backoff)
+		} else if err = s.Start(ctx); err != nil {
+			log.Error(err, "NRI stub.Start failed — retrying", "retryIn", backoff)
+		} else {
+			// Connected — block until the stub disconnects or ctx is cancelled.
+			log.Info("NRI plugin connected", "name", PluginName)
+			s.Wait()
+			log.Info("NRI plugin disconnected — reconnecting", "name", PluginName)
+			backoff = 5 * time.Second // reset on clean disconnect
+		}
+
 		select {
 		case <-ctx.Done():
 			return nil
-		default:
-		}
-
-		var env struct {
-			Event string         `json:"event"`
-			Data  ContainerEvent `json:"data"`
-		}
-		if err := dec.Decode(&env); err != nil {
-			// EOF means containerd closed the connection — normal shutdown.
-			return nil
-		}
-
-		if env.Event != "Stopping" {
-			continue
-		}
-
-		hookCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		err := p.HandleStopping(hookCtx, env.Data)
-		cancel()
-		if err != nil {
-			// Log but don't propagate — a failed pre-dump hook must not block container stop.
-			log.Error(err, "NRI Stopping hook returned error", "container", env.Data.ID)
+		case <-time.After(backoff):
+			if backoff < maxBackoff {
+				backoff *= 2
+			}
 		}
 	}
 }

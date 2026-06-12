@@ -64,6 +64,19 @@ spec:
           spec:
             description: PodMigrationSpec defines the desired state of PodMigration.
             properties:
+              affinityMode:
+                default: strict
+                description: |-
+                  AffinityMode controls how PodMotion handles hard nodeAffinity / nodeSelector rules
+                  on the owning workload controller that pin pods to the source node.
+                  strict: reject at admission (default, safe for GitOps environments).
+                  patch: patch the Deployment/StatefulSet affinity at phase=Complete (requires M19 Part B).
+                  ignore: proceed without patching (standalone pods, no GitOps).
+                enum:
+                - strict
+                - patch
+                - ignore
+                type: string
               bandwidthLimitMbps:
                 default: 0
                 description: BandwidthLimitMbps caps per-migration transfer bandwidth.
@@ -145,11 +158,6 @@ spec:
                 maximum: 20
                 minimum: 1
                 type: integer
-              replacementPodName:
-                description: |-
-                  ReplacementPodName is the name of the replacement pod created by the workload
-                  controller after source pod deletion. Tracked by the PodMotion controller.
-                type: string
               rollbackOnFailure:
                 default: true
                 description: RollbackOnFailure unfreezes and restarts the source pod
@@ -201,6 +209,13 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              checkpointTransferred:
+                description: |-
+                  CheckpointTransferred is set true after the checkpoint tar has been durably written
+                  to the destination agent and the status has been persisted. Used as an idempotency
+                  marker: if the controller crashes after the Put but before transitioning to Restoring,
+                  the next reconcile skips the Get/Put and proceeds directly to gate removal + Restoring.
+                type: boolean
               cniProvider:
                 description: |-
                   CNIProvider is the detected CNI plugin on the source node (e.g. "calico", "cilium",
@@ -346,6 +361,13 @@ spec:
                 - freezeDurationMs
                 - roundsCompleted
                 type: object
+              replacementPodName:
+                description: |-
+                  ReplacementPodName is the name of the replacement pod created by the operator
+                  during live migration to receive the CRIU-restored process.
+                  Stored in Status (not Spec) because it is controller-derived runtime state,
+                  not user intent. Written once at Checkpointing and read by subsequent phases.
+                type: string
               sourceNodeName:
                 description: SourceNodeName is the node the pod was migrated from.
                 type: string

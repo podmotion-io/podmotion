@@ -162,6 +162,19 @@ func (v *PodMigrationValidator) validate(ctx context.Context, pm *pmv1.PodMigrat
 		}
 	}
 
+	// Rule 8b: hard nodeAffinity / nodeSelector pinning check
+	// If the source pod is pinned to its current node via hard constraints AND the caller
+	// has not opted out (affinityMode=patch|ignore), deny the migration.
+	if conflict, nodeName := detectHardNodeAffinity(pod); conflict {
+		switch pm.Spec.AffinityMode {
+		case pmv1.AffinityModePatch, pmv1.AffinityModeIgnore:
+			// Caller acknowledged the conflict — allow and let the controller handle it.
+		default: // AffinityModeStrict or unset → block
+			allErrs = append(allErrs, field.Forbidden(spec.Child("affinityMode"),
+				fmt.Sprintf("source pod has hard nodeAffinity pinning it to node %s; clear the affinity or set spec.affinityMode=patch|ignore before migrating", nodeName)))
+		}
+	}
+
 	// Rule 9: Tier 4 storage block
 	// Reject if any volume uses a hostPath, emptyDir with memory medium, or projected token volume
 	// when storageStrategy is not Skip (explicit user opt-out).
@@ -363,6 +376,49 @@ func statefulSetOwnerRef(pod *corev1.Pod) string {
 		}
 	}
 	return ""
+}
+
+// detectHardNodeAffinity returns (true, nodeName) if the pod has hard scheduling
+// constraints that pin it to a specific node:
+//   - NodeSelector containing kubernetes.io/hostname or node.kubernetes.io/instance-type
+//   - NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution with a MatchExpression
+//     using operator In on key kubernetes.io/hostname
+//
+// nodeName is the value found in those constraints (spec.nodeName as fallback).
+func detectHardNodeAffinity(pod *corev1.Pod) (conflict bool, nodeName string) {
+	sourceNode := pod.Spec.NodeName
+
+	// Check NodeSelector
+	for key, val := range pod.Spec.NodeSelector {
+		if key == "kubernetes.io/hostname" || key == "node.kubernetes.io/instance-type" {
+			return true, val
+		}
+	}
+
+	// Check NodeAffinity
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil {
+		return false, ""
+	}
+	required := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if required == nil {
+		return false, ""
+	}
+	for _, term := range required.NodeSelectorTerms {
+		for _, expr := range term.MatchExpressions {
+			if expr.Key == "kubernetes.io/hostname" && expr.Operator == corev1.NodeSelectorOpIn {
+				for _, v := range expr.Values {
+					if v == sourceNode {
+						return true, sourceNode
+					}
+				}
+				// Values exist but none match source node — still a pinning constraint.
+				if len(expr.Values) > 0 {
+					return true, expr.Values[0]
+				}
+			}
+		}
+	}
+	return false, ""
 }
 
 // mustMarshal marshals obj to JSON using the runtime codec; panics on error (should never happen).

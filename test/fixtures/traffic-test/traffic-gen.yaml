@@ -1,0 +1,58 @@
+# Continuous traffic generator — holds persistent connections through HAProxy
+# during live migration. Logs response body (pod name) so we can verify handoff.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: traffic-gen
+  namespace: pm-live-test
+spec:
+  nodeName: pm-control
+  restartPolicy: OnFailure
+  containers:
+  - name: gen
+    image: alpine/curl:latest
+    # Keep-alive requests every 0.5s through HAProxy TCP proxy.
+    # Captures curl exit code AND HTTP status so both connection-level and
+    # application-level failures are logged with distinct prefixes:
+    #   CURL_ERROR — curl non-zero exit (TCP reset, timeout, refused)
+    #   HTTP_ERROR — curl succeeded but non-200 response
+    command:
+    - sh
+    - -c
+    - |
+      echo "Starting traffic gen at $(date)"
+      CURL_ERRORS=0
+      HTTP_ERRORS=0
+      REQUESTS=0
+      while true; do
+        # Capture full output + write-out on a separate line
+        RESP=$(curl -s --max-time 3 --keepalive-time 30 \
+          -w "\nSTATUS:%{http_code} TIME:%{time_total}s CONNECT:%{time_connect}s" \
+          -H "Connection: keep-alive" \
+          http://haproxy-tcp-svc.pm-live-test.svc.cluster.local:8080/ 2>&1)
+        EXIT=$?
+        REQUESTS=$((REQUESTS+1))
+
+        if [ $EXIT -ne 0 ]; then
+          CURL_ERRORS=$((CURL_ERRORS+1))
+          echo "[$(date +%T)] CURL_ERROR #$CURL_ERRORS exit=$EXIT req=$REQUESTS"
+          sleep 0.5
+          continue
+        fi
+
+        CODE=$(echo "$RESP" | grep "^STATUS:" | grep -oE '[0-9]+' | head -1)
+        POD=$(echo "$RESP" | head -1)
+        if [ "$CODE" != "200" ]; then
+          HTTP_ERRORS=$((HTTP_ERRORS+1))
+          echo "[$(date +%T)] HTTP_ERROR #$HTTP_ERRORS code=$CODE req=$REQUESTS"
+        else
+          if [ $((REQUESTS % 20)) -eq 0 ]; then
+            echo "[$(date +%T)] OK req=$REQUESTS curl_err=$CURL_ERRORS http_err=$HTTP_ERRORS pod=$POD"
+          fi
+        fi
+        sleep 0.5
+      done
+    resources:
+      requests:
+        memory: "16Mi"
+        cpu: "10m"

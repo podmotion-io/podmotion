@@ -494,6 +494,59 @@ intervention for routine version bumps.
 - Test result artifacts stored in GitHub Actions cache keyed by `<component>-<version>-<sha>` — cache hit = instant quorum on re-run
 - The pipeline itself is agent-reviewed on each structural change (meta-certification: the CI system certifies itself)
 
+### Pre-Beta Chaos & Fidelity Testing (Required Gate)
+
+Before the beta release cut, PodMotion must pass a rich randomized multi-cluster test campaign
+targeting realistic live workloads under load. This is a **hard gate** — no beta cut until all
+runs are clean with zero errors and zero warnings in operator/agent logs.
+
+**Environments:**
+- AWS arm64: EKS clusters on Graviton instance types (m7g, c7g, r7g families); randomly varied sizes and AZs
+- AWS amd64: EKS clusters on x86-64 instance types (m7i, c7i, r7i families); same randomization axes
+- Local VMs arm64: multi-node Multipass/QEMU clusters on Apple Silicon workstation (current dev cluster: pm-control + pm-worker)
+- Local VMs amd64: multi-node QEMU clusters running under Rosetta or on a dedicated x86-64 machine
+
+All four environment buckets must pass. An architecture-only failure (e.g. passes arm64, fails amd64) is a blocking defect.
+
+**Workload spread (all must be covered):**
+
+| Category | Workload | Stateful? | Key migration challenge |
+|----------|----------|-----------|------------------------|
+| Web server | NGINX (small/medium/large replicas) | Stateless | Connection draining, topology spread |
+| Web server | Node.js / Go HTTP server under wrk/k6 load | Stateless | In-flight HTTP requests mid-migration |
+| Database | PostgreSQL (single + replication) | Stateful (RWO PVC) | Storage tier, PDB, checkpoint under write load |
+| Database | MySQL / MariaDB | Stateful (RWO PVC) | InnoDB dirty buffer pages, large memory footprint |
+| Cache | Redis standalone | Stateful (optional AOF) | Proved in NS#1 PoC; must hold under key churn |
+| Cache | Redis Cluster (6-node) | Stateful | Anti-affinity conflicts, slot rebalance |
+| Message broker | NATS / RabbitMQ | Stateful | In-flight messages, durable queue survival |
+| Mixed | Helm-deployed multi-tier app (web + DB + cache) | Mixed | GitOps drift, service mesh, end-to-end traffic |
+
+**Randomization axes:**
+- Architecture: arm64 (Graviton / Apple Silicon), amd64 (x86-64 Intel/AMD) — both must pass all workloads
+- Pod memory footprint: 64 MB, 256 MB, 1 GB, 4 GB (tests dirty-page convergence thresholds)
+- Write rate: idle, 10 MB/s, 100 MB/s (tests PreCopy round convergence and ForceFreeze path)
+- Number of open TCP connections: 0, 10, 1 000 (tests NetworkContinuity tiers)
+- PVC size: none, 1 GB, 100 GB (tests storage tier selection and cutover latency)
+- Concurrent migrations: 1, 4, 8 simultaneous PodMigration CRs (tests slot reservation and quota races)
+- Cluster node count: 3, 6, 12 nodes
+
+**Pass criteria (all required, no exceptions):**
+1. Zero `ERROR` or `WARN` log lines in operator pod and agent DaemonSet across the full run
+2. Zero failed PodMigration CRs (all reach `phase=Complete` or explicit `DryRunComplete`)
+3. Zero data loss: workload validation script confirms all keys/rows/messages present post-migration
+4. Zero service disruption exceeding the migration SLA (cold: <30s, live: <500ms)
+5. Source pod deleted if and only if `TrafficVerified=True` (verified by log audit)
+6. GitOps controllers (ArgoCD/Flux, if present) resumed cleanly — no drift alert after migration
+7. Checkpoint directories cleaned up (no residue in `/run/podmotion/checkpoints/`) after GC
+8. `make beta-gate` passes (all Tier 1 matrix entries signed off)
+
+**Tooling required (pre-existing or to be built):**
+- `test/chaos/workload_generator.go` — parameterized workload deployer; accepts randomization seed
+- `test/chaos/cluster_matrix.go` — AWS cluster provisioner driven by a YAML matrix config
+- `test/chaos/validator.go` — post-migration data-integrity checker per workload type
+- Log audit script: `scripts/beta-log-audit.sh` — greps operator + agent logs for ERROR/WARN, fails CI on any hit
+- `make pre-beta-chaos` target — drives the full campaign, blocks on pass criteria above
+
 ### Beta Release Presentations (three-audience deliverable)
 Three standalone decks generated at beta cut — one per audience, all sourced from the same
 living content model so they stay in sync as the product evolves:

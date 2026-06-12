@@ -1,0 +1,43 @@
+# HAProxy TCP proxy for live migration connection-continuity testing.
+# Sits between test clients and the migrating service.
+# Stats socket exposes active_conn and error counts — polled during migration.
+#
+# Deploy in the same namespace as the workload under test.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: haproxy-tcp-cfg
+  namespace: pm-live-test
+data:
+  haproxy.cfg: |
+    global
+      stats socket /var/run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+      log stdout format raw local0 info
+
+    defaults
+      mode tcp
+      log global
+      option tcplog
+      option dontlognull
+      timeout connect 5s
+      timeout client  60s
+      timeout server  60s
+      retries 0           # no retries — a reset is a reset; we want to see it
+
+    frontend tcp-in
+      bind *:8080
+      default_backend migrating-svc
+
+    backend migrating-svc
+      balance roundrobin
+      option tcp-check
+      # Points at the K8s Service — EndpointSlice update is what keeps this alive
+      server svc nginx-live-svc.pm-live-test.svc.cluster.local:80 check inter 1s rise 1 fall 1
+
+    listen stats
+      bind *:9090
+      mode http
+      stats enable
+      stats uri /stats
+      stats refresh 1s
+      stats show-legends

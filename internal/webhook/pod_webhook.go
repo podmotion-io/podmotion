@@ -16,6 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -59,6 +60,17 @@ func NewPodMutatingWebhook(c client.Client, scheme *runtime.Scheme) *PodMutating
 	}
 }
 
+// SetupWithManager registers the mutating webhook with the controller-runtime manager.
+func (w *PodMutatingWebhook) SetupWithManager(mgr ctrl.Manager) error {
+	w.Client = mgr.GetClient()
+	w.decoder = admission.NewDecoder(mgr.GetScheme())
+	mgr.GetWebhookServer().Register(
+		"/mutate-core-v1-pod",
+		&admission.Webhook{Handler: w},
+	)
+	return nil
+}
+
 // Handle is the admission handler. Only acts on pods carrying the migration-name label.
 func (w *PodMutatingWebhook) Handle(ctx context.Context, req admission.Request) admission.Response {
 	pod := &corev1.Pod{}
@@ -84,6 +96,47 @@ func (w *PodMutatingWebhook) Handle(ctx context.Context, req admission.Request) 
 		return admission.Allowed("PodMigration not found; no mutation applied")
 	}
 
+	// Fix 1 — Fetch source pod and merge its labels; also copy service-mesh annotations (Fix 3).
+	srcPod := &corev1.Pod{}
+	if err := w.Client.Get(ctx, types.NamespacedName{
+		Name:      pm.Spec.PodName,
+		Namespace: req.Namespace,
+	}, srcPod); err == nil {
+		// Merge source labels first; podmotion.io/* labels will overlay below.
+		if pod.Labels == nil {
+			pod.Labels = make(map[string]string)
+		}
+		for k, v := range srcPod.Labels {
+			if _, exists := pod.Labels[k]; !exists {
+				pod.Labels[k] = v
+			}
+		}
+
+		// Fix 3 — Copy service-mesh injection annotations from source pod.
+		// If absent on the replacement pod, Istio/Linkerd will inject a new proxy
+		// sidecar — its iptables rules intercept CRIU-restored TCP sockets, causing
+		// TCP RST on all restored connections immediately post-restore.
+		meshAnnotations := []string{
+			"sidecar.istio.io/inject",
+			"sidecar.istio.io/status",
+			"traffic.sidecar.istio.io/excludeInboundPorts",
+			"traffic.sidecar.istio.io/excludeOutboundPorts",
+			"traffic.sidecar.istio.io/includeInboundPorts",
+			"linkerd.io/inject",
+			"linkerd.io/proxy-injector-webhook",
+		}
+		for _, ann := range meshAnnotations {
+			if v, ok := srcPod.Annotations[ann]; ok {
+				if pod.Annotations == nil {
+					pod.Annotations = make(map[string]string)
+				}
+				if _, exists := pod.Annotations[ann]; !exists {
+					pod.Annotations[ann] = v
+				}
+			}
+		}
+	}
+
 	original := pod.DeepCopy()
 
 	// 1. Inject schedulerName so MigrationAwareFilter/Score routes this pod.
@@ -104,12 +157,20 @@ func (w *PodMutatingWebhook) Handle(ctx context.Context, req admission.Request) 
 			corev1.PodSchedulingGate{Name: SchedulingGateName})
 	}
 
-	// 3. Inject checkpoint-ref annotation so the NRI plugin can locate images.
+	// 3. Inject checkpoint-ref annotation and label so the NRI plugin can locate images.
+	// Annotation: human-visible, used by the NRI plugin when containerd forwards pod
+	// annotations into sandbox annotations (real NRI v2 gRPC path).
+	// Label: also set so the NRI JSON stub path (event.Labels) and any label-selector
+	// tooling can see it. Both must be kept in sync.
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
 	}
+	if pod.Labels == nil {
+		pod.Labels = make(map[string]string)
+	}
 	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
 		pod.Annotations[AnnotationCheckpointRef] = pm.Status.CheckpointRef.Name
+		pod.Labels[AnnotationCheckpointRef] = pm.Status.CheckpointRef.Name
 	}
 
 	// 4. Inject CNI-specific IPAM annotation so the destination pod receives the
@@ -117,6 +178,16 @@ func (w *PodMutatingWebhook) Handle(ctx context.Context, req admission.Request) 
 	//    CRIU does NOT overwrite the IP — the CNI annotation is authoritative (ADR-0046).
 	if pm.Spec.SourcePodIP != "" {
 		injectIPAMAnnotation(pod, pm.Spec.SourcePodIP, pm.Status.CNIProvider)
+	}
+
+	// Fix 2 — Patch all DoNotSchedule topology spread constraints to ScheduleAnyway.
+	// MigrationAwareFilter pins the destination node; the built-in topology spread
+	// plugin must not override it and leave the replacement pod Pending after
+	// source deletion.
+	for i := range pod.Spec.TopologySpreadConstraints {
+		if pod.Spec.TopologySpreadConstraints[i].WhenUnsatisfiable == corev1.DoNotSchedule {
+			pod.Spec.TopologySpreadConstraints[i].WhenUnsatisfiable = corev1.ScheduleAnyway
+		}
 	}
 
 	log.Info("injected migration annotations",

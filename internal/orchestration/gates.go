@@ -240,6 +240,31 @@ const (
 	// CiliumEndpoint.Status.State=="ready". For non-IP-mobility CNIs set immediately.
 	// The eBPF hold must not be released until both this and TrafficVerified are True.
 	ConditionDataplaneReconciled = "DataplaneReconciled"
+
+	// ConditionAffinityConflict is set True (with reason) when the source pod's owning
+	// workload controller has hard nodeAffinity or nodeSelector targeting the source node
+	// AND affinityMode=strict. Migration is blocked at Validating with this condition.
+	ConditionAffinityConflict = "AffinityConflict"
+
+	// ConditionAntiAffinityConflict is set True when the destination node already hosts
+	// a pod that violates the migrating pod's requiredDuringScheduling podAntiAffinity.
+	// Migration is blocked at PreMigrating before source pod deletion.
+	ConditionAntiAffinityConflict = "AntiAffinityConflict"
+
+	// ConditionPDBAllowsDeletion is set False when a matching PodDisruptionBudget has
+	// DisruptionsAllowed==0 and blocks source pod deletion. Set True when all PDBs allow it.
+	ConditionPDBAllowsDeletion = "PDBAllowsDeletion"
+
+	// ConditionResourceQuotaCapacity is set False when the namespace's pod ResourceQuota
+	// is at capacity and source pod deletion must be deferred to avoid a race window.
+	ConditionResourceQuotaCapacity = "ResourceQuotaCapacity"
+
+	// ConditionGitOpsDriftWarning is set True at phase=Complete when the migration
+	// succeeded but the owning workload controller's affinity/nodeSelector still targets
+	// the source node (affinityMode=strict or affinityMode=ignore). The next rollout or
+	// GitOps sync will re-land pods on the original node unless the user updates the spec.
+	// Surfaces in kubectl podmotion status as a post-migration warning.
+	ConditionGitOpsDriftWarning = "GitOpsDriftWarning"
 )
 
 // CutoverCoordinator orchestrates the synchronized cutover across all three pipelines.

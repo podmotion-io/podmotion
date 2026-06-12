@@ -60,8 +60,12 @@ type PreDumpOptions struct {
 	ImagesDir string
 	// PrevImagesDir is the previous round's images dir (empty for round 0).
 	PrevImagesDir string
-	// TrackMem enables dirty page tracking for the next round.
+	// TrackMem is deprecated: VM_READ mode (process_vm_readv) is used instead,
+	// which does not require CONFIG_MEM_SOFT_DIRTY. Field retained for API compat.
 	TrackMem bool
+	// Pid is the host-namespace PID of the container's root process.
+	// Must be set to target the correct process tree; zero causes CRIU to dump its own cgroup.
+	Pid int32
 }
 
 // DumpOptions configures the final (freezing) CRIU dump.

@@ -1,0 +1,59 @@
+# nginx-live.yaml — Bare Pod fixture for NS#3 stateless live migration E2E tests.
+#
+# We intentionally use a bare Pod (no Deployment/ReplicaSet) so that:
+#   1. There is no RS controller that could spawn a replacement pod when the
+#      source is deleted, masking whether CRIU actually worked.
+#   2. The HTTP-200 assertion can be tied unambiguously to pm.Status.ReplacementPodName.
+#
+# The trade-off is that selector-label-stripping (pod-template-hash removal) is
+# tested separately in the "with-deployment" fixture (post-NS#3).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pm-e2e-live
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pm-test-nginx-live
+  namespace: pm-e2e-live
+  labels:
+    app: pm-test-nginx-live
+    podmotion.io/test-workload: "true"
+spec:
+  containers:
+    - name: nginx
+      image: nginx:1.27-alpine
+      ports:
+        - containerPort: 80
+      readinessProbe:
+        httpGet:
+          path: /
+          port: 80
+        initialDelaySeconds: 2
+        periodSeconds: 2
+      livenessProbe:
+        httpGet:
+          path: /
+          port: 80
+        initialDelaySeconds: 5
+        periodSeconds: 5
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pm-test-nginx-live
+  namespace: pm-e2e-live
+spec:
+  selector:
+    app: pm-test-nginx-live
+  ports:
+    - port: 80
+      targetPort: 80

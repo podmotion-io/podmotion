@@ -1,0 +1,80 @@
+# Database load generator — runs continuous write + read transactions through
+# PgBouncer against the migrating PostgreSQL pod.
+#
+# Two transaction patterns:
+#   write_loop: increments counters.value via bump_counter() in a transaction.
+#               Any lost write (PostgreSQL died mid-transaction) shows up as a
+#               gap in the value sequence on the restored pod.
+#   read_loop:  SELECT to verify the connection is live; counts failures.
+#
+# On exit or failure the pod logs a summary: total_writes, total_errors, error_rate.
+# The e2e test reads this summary to assert error_rate == 0 post-migration.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: db-load-gen
+  namespace: pm-db-test
+spec:
+  nodeName: pm-control
+  restartPolicy: OnFailure
+  containers:
+  - name: load-gen
+    image: postgres:16-alpine
+    env:
+    - name: PGHOST
+      value: pgbouncer-svc.pm-db-test.svc.cluster.local
+    - name: PGPORT
+      value: "5432"
+    - name: PGDATABASE
+      value: pmtest
+    - name: PGUSER
+      value: pmuser
+    - name: PGPASSWORD
+      value: pmpass
+    command:
+    - sh
+    - -c
+    - |
+      echo "DB load gen starting at $(date)"
+      WRITES=0
+      ERRORS=0
+      RECONNECTS=0
+      LAST_SEQ=0
+
+      while true; do
+        # Write transaction via bump_counter(); capture full stderr separately.
+        # Using explicit BEGIN/COMMIT so a mid-flight abort produces a non-zero exit code.
+        RESULT=$(psql -t -A -c "BEGIN; SELECT bump_counter('writes'); COMMIT;" 2>&1)
+        EXIT=$?
+
+        if [ $EXIT -ne 0 ]; then
+          # psql exited non-zero — connection failure, FATAL, server restart, etc.
+          ERRORS=$((ERRORS+1))
+          RECONNECTS=$((RECONNECTS+1))
+          echo "[$(date +%T)] WRITE_ERROR #$ERRORS exit=$EXIT: $RESULT"
+          sleep 0.2
+          continue
+        fi
+
+        # Even on exit=0, verify the sequence strictly increased.
+        # A stale or replayed transaction could return the same value twice.
+        SEQ=$(echo "$RESULT" | grep -oE '^[0-9]+$' | head -1)
+        if [ -z "$SEQ" ]; then
+          ERRORS=$((ERRORS+1))
+          echo "[$(date +%T)] WRITE_ERROR #$ERRORS: no sequence in response: $RESULT"
+        elif [ "$SEQ" -le "$LAST_SEQ" ]; then
+          ERRORS=$((ERRORS+1))
+          echo "[$(date +%T)] WRITE_ERROR #$ERRORS: sequence regression: was $LAST_SEQ now $SEQ (duplicate/lost write)"
+        else
+          LAST_SEQ=$SEQ
+          WRITES=$((WRITES+1))
+          if [ $((WRITES % 50)) -eq 0 ]; then
+            echo "[$(date +%T)] writes=$WRITES errors=$ERRORS seq=$SEQ reconnects=$RECONNECTS"
+          fi
+        fi
+        sleep 0.1
+      done
+    resources:
+      requests:
+        memory: "32Mi"
+        cpu: "50m"

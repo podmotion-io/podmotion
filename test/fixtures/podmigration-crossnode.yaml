@@ -1,0 +1,24 @@
+# podmigration-crossnode.yaml — Manual test fixture for cross-node stateless migration.
+#
+# Apply AFTER the source pod is running:
+#   kubectl apply -f test/e2e/fixtures/nginx-live.yaml
+#   kubectl apply -f test/fixtures/podmigration-crossnode.yaml
+#
+# IMPORTANT: use spec.targetNodeName (not spec.destinationNode) to pin the destination.
+# spec.destinationNode is an internal controller field written after capacity reservation.
+# spec.targetNodeName is the user-facing input read by the controller and admission webhook.
+apiVersion: migration.podmotion.io/v1alpha1
+kind: PodMigration
+metadata:
+  name: nginx-live-crossnode
+  namespace: pm-e2e-live
+spec:
+  podName: pm-test-nginx-live
+  podNamespace: pm-e2e-live
+  targetNodeName: pm-control       # destination node — must differ from source (pm-worker)
+  mode: PreCopy
+  preCopyMaxRounds: 3
+  preCopyDirtyThresholdMB: 64
+  completionTimeoutSeconds: 300
+  rollbackOnFailure: true
+  affinityMode: ignore             # bare pod, no workload controller affinity to check

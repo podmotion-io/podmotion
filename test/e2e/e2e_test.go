@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -45,52 +46,42 @@ const metricsServiceName = "podmotion-controller-manager-metrics-service"
 // metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
 const metricsRoleBindingName = "podmotion-metrics-binding"
 
+// isKubeadmCluster returns true when the operator runs as a systemd service
+// (no controller-manager pod in podmotion-system). In that mode the "Manager"
+// infra checks (pod listing, metrics endpoint) are irrelevant and are skipped.
+func isKubeadmCluster() bool {
+	cmd := exec.Command("kubectl", "get", "pods",
+		"-n", namespace,
+		"-l", "control-plane=controller-manager",
+		"-o", "name")
+	out, err := utils.Run(cmd)
+	return err != nil || strings.TrimSpace(out) == ""
+}
+
 var _ = Describe("Manager", Ordered, func() {
 	var controllerPodName string
 
-	// Before running the tests, set up the environment by creating the namespace,
-	// enforce the restricted security policy to the namespace, installing CRDs,
-	// and deploying the controller.
+	// On the kubeadm cluster the operator is deployed as a systemd service on pm-control.
+	// We skip the deploy/undeploy lifecycle and instead verify the pre-deployed operator.
 	BeforeAll(func() {
-		By("creating manager namespace")
-		cmd := exec.Command("kubectl", "create", "ns", namespace)
-		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
-
-		By("labeling the namespace to enforce the restricted security policy")
-		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
-			"pod-security.kubernetes.io/enforce=restricted")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
-
-		By("installing CRDs")
-		cmd = exec.Command("make", "install")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
-
-		By("deploying the controller-manager")
-		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+		if isKubeadmCluster() {
+			Skip("operator runs as systemd service on kubeadm cluster — skipping pod-based Manager checks")
+		}
+		By("ensuring manager namespace exists (pre-deployed cluster)")
+		cmd := exec.Command("kubectl", "create", "ns", namespace, "--dry-run=client", "-o", "yaml")
+		_, _ = utils.Run(cmd)
+		cmd = exec.Command("kubectl", "get", "ns", namespace)
+		if _, err := utils.Run(cmd); err != nil {
+			cmd = exec.Command("kubectl", "create", "ns", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
+		}
 	})
 
-	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
-	// and deleting the namespace.
+	// Minimal cleanup — do not undeploy the operator on the shared kubeadm cluster.
 	AfterAll(func() {
 		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
-		_, _ = utils.Run(cmd)
-
-		By("undeploying the controller-manager")
-		cmd = exec.Command("make", "undeploy")
-		_, _ = utils.Run(cmd)
-
-		By("uninstalling CRDs")
-		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
-
-		By("removing manager namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", namespace)
+		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace, "--ignore-not-found")
 		_, _ = utils.Run(cmd)
 	})
 

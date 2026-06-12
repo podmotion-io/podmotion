@@ -121,10 +121,31 @@ func main() {
 		}
 	}()
 
-	// Start NRI plugin stub. The real pre-dump trigger lands in M5.
-	nriPlugin := nri.New(nil)
+	// Start NRI plugin. OnStartContainer triggers CRIU restore when a replacement pod
+	// bearing podmotion.io/checkpoint-ref starts on this node (North Star #2 path).
+	nriPlugin := nri.New(
+		nil, // OnStopping: pre-dump trigger wired in M5
+		func(ctx context.Context, event nri.ContainerEvent, checkpointRef string) error {
+			// checkpointRef is already validated by HandleStartContainer regex before
+			// this callback is invoked, so concatenation is safe here.
+			checkpointDir := "/run/podmotion/checkpoints/" + checkpointRef + "/final"
+			log.Info("NRI StartContainer: invoking CRIU restore",
+				"container", event.ID,
+				"pod", event.Pod,
+				"checkpointRef", checkpointRef,
+				"checkpointDir", checkpointDir,
+			)
+			pid, err := agentSrv.JoinNsRestore(checkpointRef, checkpointDir)
+			if err != nil {
+				log.Error(err, "NRI CRIU restore failed", "container", event.ID)
+				return err
+			}
+			log.Info("NRI CRIU restore complete", "container", event.ID, "restoredPID", pid)
+			return nil
+		},
+	).WithK8sVerification(k8sClient, nodeName)
 	go func() {
-		if err := nriPlugin.RunStub(ctx); err != nil {
+		if err := nriPlugin.Run(ctx); err != nil {
 			log.Error(err, "NRI plugin exited with error")
 		}
 	}()
