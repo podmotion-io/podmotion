@@ -285,16 +285,27 @@ func (r *PodMigrationReconciler) reconcileDestinationPrewarm(ctx context.Context
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhasePreCopyMemory)
 	}
 
-	// Full implementation in M21 (Overlay/Network discipline).
-	// The PrepareDestinationNetns RPC result sets DestinationNetnsReady once the
-	// pre-staged netns has the source IP bound and AF_BRIDGE/AF_INET entries injected.
-	log.Info("DestinationPrewarm: pre-staging migration netns on destination node (ADR-0048)", "migration", pm.Name)
-	setCondition(pm, pmv1.ConditionDestinationNetnsReady, metav1.ConditionTrue,
-		"NetnsReady", "destination migration netns pre-staged with source IP and overlay routing")
+	// TODO(M22): Wire PrepareDestinationNetns agent RPC here.
+	// The condition must only be set to True after a verified RPC success
+	// (ConfirmOverlayReady read-back per ADR-0049 §5 barriers C-E).
+	// Until that wiring exists, TCPPreservationMode=Strict migrations are
+	// blocked here rather than advancing with a false-positive condition.
+	//
+	// Setting DestinationNetnsReady=True without the RPC having run would
+	// assert that the source IP is bound and AF_BRIDGE/AF_INET entries are
+	// injected when nothing has executed — advancing to RestoreSocketReattach
+	// would then delete the source pod and black-hole the source pod IP,
+	// RST-ing every in-flight TCP connection (M19.5 CRITICAL bar).
+	log.Error(nil, "DestinationPrewarm: PrepareDestinationNetns RPC not yet wired (M22) — blocking Strict migration",
+		"migration", pm.Name, "mode", pm.Spec.TCPPreservationMode)
+	setCondition(pm, pmv1.ConditionDestinationNetnsReady, metav1.ConditionFalse,
+		"RPCNotWired", "SCAFFOLDING: PrepareDestinationNetns agent RPC not yet implemented (M22); "+
+			"TCPPreservationMode=Strict migrations blocked until wired")
 	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
-	return r.transitionTo(ctx, pm, pmv1.MigrationPhasePreCopyMemory)
+	// Requeue with backoff; will re-enter this handler until the RPC is wired.
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
 // reconcilePreCopyMemory drives the iterative dirty-page pre-copy loop.
@@ -489,15 +500,24 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoreSocketReattach)
 	}
 
-	// Full two-sided AF_BRIDGE FDB + AF_INET neighbor injection in M21.
-	// VTEP MAC discovery via flannel annotation is handled by the network agent.
-	log.Info("OverlayHandoff: injecting VXLAN FDB + neighbor entries on both nodes (ADR-0048)", "migration", pm.Name)
-	setCondition(pm, pmv1.ConditionVXLANFDBUpdated, metav1.ConditionTrue,
-		"FDBInjected", "AF_BRIDGE FDB and AF_INET neighbor entries injected on both nodes")
+	// TODO(M22): Wire AddFDBEntry (source+destination nodes) + ConfirmOverlayReady RPC here.
+	// VXLANFDBUpdated must only be set True after RTM_GETNEIGH read-back confirms both
+	// AF_BRIDGE and AF_INET entries are installed (ADR-0049 §5 barrier D).
+	// Until that wiring exists, TCPPreservationMode=Strict migrations are blocked here.
+	//
+	// Setting VXLANFDBUpdated=True without the RPC having run would falsely assert that
+	// VXLAN FDB and neighbor entries are installed on both nodes when nothing has executed.
+	// Advancing to RestoreSocketReattach from this state destroys in-flight TCP connections
+	// (M19.5 CRITICAL: TCP RST on migrating connection).
+	log.Error(nil, "OverlayHandoff: FDB injection RPCs not yet wired (M22) — blocking Strict migration",
+		"migration", pm.Name, "mode", pm.Spec.TCPPreservationMode)
+	setCondition(pm, pmv1.ConditionVXLANFDBUpdated, metav1.ConditionFalse,
+		"RPCNotWired", "SCAFFOLDING: AddFDBEntry/ConfirmOverlayReady agent RPCs not yet implemented (M22); "+
+			"TCPPreservationMode=Strict migrations blocked until wired")
 	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
-	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoreSocketReattach)
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
 // reconcileRestoreSocketReattach executes CRIU restore on the destination and reattaches
@@ -932,6 +952,28 @@ func (r *PodMigrationReconciler) reconcileValidating(ctx context.Context, pm *pm
 			return r.failMigration(ctx, pm, fmt.Sprintf("source node NMC not ready: %v", nmcErr))
 		}
 		pm.Status.SourceNodeName = pod.Spec.NodeName
+	}
+
+	// Anti-affinity pre-flight check (ADR-0047 gate, must run BEFORE DestinationPrewarm).
+	// Performing this here — in Validating — ensures no destination network state is
+	// created before topology constraints are evaluated.  Moving it to PreCopyMemory
+	// (as in the legacy path) would allow a conflicting migration to bind the source IP
+	// on the destination node before the conflict is detected.
+	destNode := pm.Spec.TargetNodeName
+	if destNode == "" {
+		destNode = pm.Status.DestinationNodeName
+	}
+	if destNode != "" {
+		if err := r.checkAntiAffinityConflict(ctx, pm, destNode); err != nil {
+			if statusErr := r.statusUpdate(ctx, pm); statusErr != nil {
+				return ctrl.Result{}, statusErr
+			}
+			// Requeue — destination may become suitable once the conflicting pod moves.
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		if statusErr := r.statusUpdate(ctx, pm); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
 	}
 
 	setCondition(pm, conditionValidated, metav1.ConditionTrue, "Validated", "Pod and node checks passed")

@@ -358,17 +358,24 @@ func TestTCPPreservationModeGating(t *testing.T) {
 	}
 }
 
-// TestDestinationNetnsReadyCondition verifies that reconcileDestinationPrewarm sets
-// DestinationNetnsReady=True for both TCPPreservationMode=None (skip path) and
-// TCPPreservationMode=Strict (active path). This is the M21 acceptance criterion:
-// "DestinationNetnsReady=True in status conditions".
+// TestDestinationNetnsReadyCondition verifies the correct behaviour of reconcileDestinationPrewarm:
+//
+//   - TCPPreservationMode=None: fast-path, DestinationNetnsReady set True immediately (no RPC needed).
+//   - TCPPreservationMode=Strict: blocked — PrepareDestinationNetns RPC not yet wired (M22).
+//     DestinationNetnsReady is set to False with reason "RPCNotWired". Setting it True without
+//     a real RPC would advance the state machine past OverlayHandoff and delete the source pod
+//     without any actual netns/FDB state being created, black-holing the source IP and RST-ing
+//     every in-flight TCP connection (M19.5 CRITICAL bar). This test guards against regression.
 func TestDestinationNetnsReadyCondition(t *testing.T) {
 	tests := []struct {
-		name string
-		mode pmv1.TCPPreservationMode
+		name        string
+		mode        pmv1.TCPPreservationMode
+		expectTrue  bool
+		expectFalse bool
 	}{
-		{"None_SkipPath", pmv1.TCPPreservationModeNone},
-		{"Strict_ActivePath", pmv1.TCPPreservationModeStrict},
+		{"None_SkipPath", pmv1.TCPPreservationModeNone, true, false},
+		// Strict_ActivePath must block until the RPC is wired (M22).
+		{"Strict_BlockedPendingRPC", pmv1.TCPPreservationModeStrict, false, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -413,24 +420,34 @@ func TestDestinationNetnsReadyCondition(t *testing.T) {
 			if err := fakeClient.Get(ctx, req.NamespacedName, fresh); err != nil {
 				t.Fatalf("Get: %v", err)
 			}
-			if !meta.IsStatusConditionTrue(fresh.Status.Conditions, pmv1.ConditionDestinationNetnsReady) {
+			if tc.expectTrue && !meta.IsStatusConditionTrue(fresh.Status.Conditions, pmv1.ConditionDestinationNetnsReady) {
 				t.Errorf("mode=%s: expected DestinationNetnsReady=True after reconcileDestinationPrewarm", tc.mode)
+			}
+			if tc.expectFalse && meta.IsStatusConditionTrue(fresh.Status.Conditions, pmv1.ConditionDestinationNetnsReady) {
+				t.Errorf("mode=%s: DestinationNetnsReady must not be True without PrepareDestinationNetns RPC (M22 gate)", tc.mode)
 			}
 		})
 	}
 }
 
-// TestVXLANFDBUpdatedCondition verifies that reconcileOverlayHandoff sets
-// VXLANFDBUpdated=True for both TCPPreservationMode=None (skip path) and
-// TCPPreservationMode=Strict (active path). This is the M21 acceptance criterion:
-// "VXLANFDBUpdated=True in status conditions".
+// TestVXLANFDBUpdatedCondition verifies the correct behaviour of reconcileOverlayHandoff:
+//
+//   - TCPPreservationMode=None: fast-path, VXLANFDBUpdated set True immediately (no RPC needed).
+//   - TCPPreservationMode=Strict: blocked — AddFDBEntry/ConfirmOverlayReady RPCs not yet wired (M22).
+//     VXLANFDBUpdated is set to False with reason "RPCNotWired". Setting it True without a real
+//     RPC would advance the state machine to RestoreSocketReattach and delete the source pod
+//     against a dataplane that was never configured — RST-ing every in-flight TCP connection
+//     (M19.5 CRITICAL bar). This test guards against regression.
 func TestVXLANFDBUpdatedCondition(t *testing.T) {
 	tests := []struct {
-		name string
-		mode pmv1.TCPPreservationMode
+		name        string
+		mode        pmv1.TCPPreservationMode
+		expectTrue  bool
+		expectFalse bool
 	}{
-		{"None_SkipPath", pmv1.TCPPreservationModeNone},
-		{"Strict_ActivePath", pmv1.TCPPreservationModeStrict},
+		{"None_SkipPath", pmv1.TCPPreservationModeNone, true, false},
+		// Strict_ActivePath must block until AddFDBEntry/ConfirmOverlayReady RPCs are wired (M22).
+		{"Strict_BlockedPendingRPC", pmv1.TCPPreservationModeStrict, false, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -475,8 +492,11 @@ func TestVXLANFDBUpdatedCondition(t *testing.T) {
 			if err := fakeClient.Get(ctx, req.NamespacedName, fresh); err != nil {
 				t.Fatalf("Get: %v", err)
 			}
-			if !meta.IsStatusConditionTrue(fresh.Status.Conditions, pmv1.ConditionVXLANFDBUpdated) {
+			if tc.expectTrue && !meta.IsStatusConditionTrue(fresh.Status.Conditions, pmv1.ConditionVXLANFDBUpdated) {
 				t.Errorf("mode=%s: expected VXLANFDBUpdated=True after reconcileOverlayHandoff", tc.mode)
+			}
+			if tc.expectFalse && meta.IsStatusConditionTrue(fresh.Status.Conditions, pmv1.ConditionVXLANFDBUpdated) {
+				t.Errorf("mode=%s: VXLANFDBUpdated must not be True without AddFDBEntry/ConfirmOverlayReady RPC (M22 gate)", tc.mode)
 			}
 		})
 	}
