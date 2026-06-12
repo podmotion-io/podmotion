@@ -327,7 +327,22 @@ IMG_AGENT     ?= ghcr.io/podmotion-io/agent:dev
 KIND_NODE_IMG ?= ghcr.io/podmotion-io/kind-node:dev
 KIND_CLUSTER  ?= podmotion-dev
 
-## kind-image: Build kind node image with CRIU and podmotion-agent
+## bpf-copy: Copy compiled zero_window BPF objects into Ansible files dir for CAPI AMI builds.
+## Must be run after 'make bpf-objects' (requires clang on Linux host).
+.PHONY: bpf-copy
+bpf-copy:
+	cp bpf/zero_window_bpfel.o images/capi/ansible/roles/podmotion-node/files/zero_window_bpfel.o
+	cp bpf/zero_window_bpfeb.o images/capi/ansible/roles/podmotion-node/files/zero_window_bpfeb.o
+
+## bpf-objects: Compile zero_window.c to BPF ELF objects (requires clang ≥14 on Linux host).
+.PHONY: bpf-objects
+bpf-objects:
+	$(MAKE) -C bpf all
+
+## kind-image: Build kind node image with CRIU and podmotion-agent.
+## Prereq: bin/agent-linux-amd64 must exist (run 'make build-agent-linux-amd64' first).
+## The bpf/ .o files are read from the repo root context; run 'make bpf-objects' first
+## on a Linux host with clang ≥14 if the placeholder .o files need replacing.
 .PHONY: kind-image
 kind-image:
 	docker build -f images/kind/Dockerfile -t podmotion-node:dev .
