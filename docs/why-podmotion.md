@@ -9,9 +9,9 @@ Every client with an open connection continues unaware. No RST. No reconnect. No
 Not "the connection survives through reconnect logic." Not "the main container survives."
 Every container. Every client. Zero awareness. That is the bar.
 
-This is what live VM migration achieves at the VM layer. PodMotion achieves it at the pod layer,
-on stock Kubernetes, on stock kernels, with no changes to the application and no changes to
-the client.
+This is what live VM migration (OpenStack Nova live migration, live VM migration) achieves at the
+VM layer. PodMotion achieves it at the pod layer, on stock Kubernetes, on stock kernels, with
+no changes to the application and no changes to the client.
 
 ---
 
