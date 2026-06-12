@@ -346,12 +346,12 @@ func (x *PreDumpRoundResponse) GetThresholdReached() bool {
 }
 
 type CheckpointRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	MigrationName string                 `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`
-	// field 2 reserved: tcp_established removed in M19 (ADR-0047)
-	ApplyZeroWindow bool `protobuf:"varint,3,opt,name=apply_zero_window,json=applyZeroWindow,proto3" json:"apply_zero_window,omitempty"` // engage eBPF zero-window hold before freeze
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	MigrationName     string                 `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`
+	ApplyZeroWindow   bool                   `protobuf:"varint,3,opt,name=apply_zero_window,json=applyZeroWindow,proto3" json:"apply_zero_window,omitempty"`    // engage eBPF zero-window hold before freeze
+	WorkloadNamespace string                 `protobuf:"bytes,4,opt,name=workload_namespace,json=workloadNamespace,proto3" json:"workload_namespace,omitempty"` // namespace of the migrating pod's PodMigration CR (not operator ns)
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *CheckpointRequest) Reset() {
@@ -396,6 +396,13 @@ func (x *CheckpointRequest) GetApplyZeroWindow() bool {
 		return x.ApplyZeroWindow
 	}
 	return false
+}
+
+func (x *CheckpointRequest) GetWorkloadNamespace() string {
+	if x != nil {
+		return x.WorkloadNamespace
+	}
+	return ""
 }
 
 type CheckpointResponse struct {
@@ -825,13 +832,12 @@ func (x *PrepareDestinationNetnsResponse) GetDestVtepMac() string {
 }
 
 type RestoreRequest struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	MigrationName  string                 `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`
-	CheckpointRef  string                 `protobuf:"bytes,2,opt,name=checkpoint_ref,json=checkpointRef,proto3" json:"checkpoint_ref,omitempty"`      // OCI image ref or direct P2P staging path
-	SourceNodeAddr string                 `protobuf:"bytes,3,opt,name=source_node_addr,json=sourceNodeAddr,proto3" json:"source_node_addr,omitempty"` // for DirectP2P mode
-	// field 4 reserved: network_continuity bool removed; use TCPPreservationMode on the CR
-	DestNetnsFd             string `protobuf:"bytes,5,opt,name=dest_netns_fd,json=destNetnsFd,proto3" json:"dest_netns_fd,omitempty"`                                        // pre-staged netns path from PrepareDestinationNetns
-	SourceFreezeTimestampNs int64  `protobuf:"varint,6,opt,name=source_freeze_timestamp_ns,json=sourceFreezeTimestampNs,proto3" json:"source_freeze_timestamp_ns,omitempty"` // CLOCK_REALTIME ns at source freeze for seq-xlat
+	state                   protoimpl.MessageState `protogen:"open.v1"`
+	MigrationName           string                 `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`
+	CheckpointRef           string                 `protobuf:"bytes,2,opt,name=checkpoint_ref,json=checkpointRef,proto3" json:"checkpoint_ref,omitempty"`                                    // OCI image ref or direct P2P staging path
+	SourceNodeAddr          string                 `protobuf:"bytes,3,opt,name=source_node_addr,json=sourceNodeAddr,proto3" json:"source_node_addr,omitempty"`                               // for DirectP2P mode
+	DestNetnsFd             string                 `protobuf:"bytes,5,opt,name=dest_netns_fd,json=destNetnsFd,proto3" json:"dest_netns_fd,omitempty"`                                        // pre-staged netns path from PrepareDestinationNetns
+	SourceFreezeTimestampNs int64                  `protobuf:"varint,6,opt,name=source_freeze_timestamp_ns,json=sourceFreezeTimestampNs,proto3" json:"source_freeze_timestamp_ns,omitempty"` // CLOCK_REALTIME ns at source freeze for seq-xlat
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
 }
@@ -1675,10 +1681,11 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\x14PreDumpRoundResponse\x12$\n" +
 	"\x0edirty_pages_mb\x18\x01 \x01(\x03R\fdirtyPagesMb\x12*\n" +
 	"\x11round_duration_ms\x18\x02 \x01(\x03R\x0froundDurationMs\x12+\n" +
-	"\x11threshold_reached\x18\x03 \x01(\bR\x10thresholdReached\"f\n" +
+	"\x11threshold_reached\x18\x03 \x01(\bR\x10thresholdReached\"\xac\x01\n" +
 	"\x11CheckpointRequest\x12%\n" +
 	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12*\n" +
-	"\x11apply_zero_window\x18\x03 \x01(\bR\x0fapplyZeroWindow\"\xa3\x01\n" +
+	"\x11apply_zero_window\x18\x03 \x01(\bR\x0fapplyZeroWindow\x12-\n" +
+	"\x12workload_namespace\x18\x04 \x01(\tR\x11workloadNamespaceJ\x04\b\x02\x10\x03R\x0ftcp_established\"\xa3\x01\n" +
 	"\x12CheckpointResponse\x12,\n" +
 	"\x12freeze_duration_ms\x18\x01 \x01(\x03R\x10freezeDurationMs\x12+\n" +
 	"\x11checkpoint_sha256\x18\x02 \x01(\tR\x10checkpointSha256\x122\n" +
@@ -1712,13 +1719,13 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\x05ready\x18\x01 \x01(\bR\x05ready\x12'\n" +
 	"\x0fblocking_reason\x18\x02 \x01(\tR\x0eblockingReason\x12\"\n" +
 	"\rdest_netns_fd\x18\x03 \x01(\tR\vdestNetnsFd\x12\"\n" +
-	"\rdest_vtep_mac\x18\x04 \x01(\tR\vdestVtepMac\"\xe9\x01\n" +
+	"\rdest_vtep_mac\x18\x04 \x01(\tR\vdestVtepMac\"\x83\x02\n" +
 	"\x0eRestoreRequest\x12%\n" +
 	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12%\n" +
 	"\x0echeckpoint_ref\x18\x02 \x01(\tR\rcheckpointRef\x12(\n" +
 	"\x10source_node_addr\x18\x03 \x01(\tR\x0esourceNodeAddr\x12\"\n" +
 	"\rdest_netns_fd\x18\x05 \x01(\tR\vdestNetnsFd\x12;\n" +
-	"\x1asource_freeze_timestamp_ns\x18\x06 \x01(\x03R\x17sourceFreezeTimestampNs\"\x80\x01\n" +
+	"\x1asource_freeze_timestamp_ns\x18\x06 \x01(\x03R\x17sourceFreezeTimestampNsJ\x04\b\x04\x10\x05R\x12network_continuity\"\x80\x01\n" +
 	"\x0fRestoreResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12.\n" +

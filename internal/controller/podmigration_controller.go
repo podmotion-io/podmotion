@@ -530,28 +530,38 @@ func (r *PodMigrationReconciler) reconcileTCPVerifying(ctx context.Context, pm *
 	// TCP probe: verify /proc/<pid>/net/tcp[6] 4-tuples match inventory with snd_nxt/rcv_nxt within ±MSS.
 	// SQL probe is executed when ApplicationProbe.Protocol=SQL.
 	// Connection count parity check: destination ESTABLISHED count == source inventory count.
-	// Full probe implementation in M20/M21 (TCP/network agent disciplines).
-	tcpVerified := true // stub — full probes in M20
-	if !tcpVerified {
-		msg := "TCP sequence continuity verification failed: snd_nxt/rcv_nxt outside ±MSS tolerance"
-		setCondition(pm, pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionFalse,
-			"SequenceMismatch", msg)
-		if err := r.Status().Update(ctx, pm); err != nil {
-			return ctrl.Result{}, err
-		}
-		switch pm.Spec.TCPPreservationMode {
-		case pmv1.TCPPreservationModeStrict:
-			return r.initiateRollback(ctx, pm, msg)
-		case pmv1.TCPPreservationModeBestEffort:
-			log.Info("TCPVerifying: sequence mismatch (warn-only, BestEffort mode)", "migration", pm.Name)
-		}
+	//
+	// M20/M21 SAFETY GATE: Real probe implementation lands in M20/M21 (TCP/network agent disciplines).
+	// Until then, Strict/BestEffort is blocked at admission by the webhook (TCPPreservation feature gate).
+	// If somehow a Strict/BestEffort migration reaches this phase (e.g. gate was on, then turned off,
+	// or object was patched), we MUST NOT set TCPSequenceContinuityVerified=True from a stub — that
+	// would report success while every TCP connection is being RST. Fail closed.
+	//
+	// For TCPPreservationMode=None: skip is correct — no TCP state to verify.
+	// For Strict/BestEffort: return a requeue error so the migration stalls rather than
+	// silently proceeding to CutoverComplete and deleting the source pod on a lie.
+	// When M20 lands the real probe, replace this block with actual /proc/net/tcp reads.
+	msg := "TCPVerifying: real TCP sequence probe not yet implemented (M20); " +
+		"refusing to set TCPSequenceContinuityVerified=True from a stub — " +
+		"this prevents silent TCP RST on cutover (ADR-0047 §critical)"
+	log.Error(nil, msg, "migration", pm.Name, "mode", pm.Spec.TCPPreservationMode)
+	setCondition(pm, pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionFalse,
+		"ProbeNotImplemented", msg)
+	if err := r.Status().Update(ctx, pm); err != nil {
+		return ctrl.Result{}, err
+	}
+	switch pm.Spec.TCPPreservationMode {
+	case pmv1.TCPPreservationModeStrict:
+		return r.initiateRollback(ctx, pm, msg)
+	default:
+		// BestEffort: log error but do not rollback; warn and proceed without TCP verification.
+		// This is still a degraded path — set False so operators can observe the gap.
+		log.Error(nil, "TCPVerifying: BestEffort — proceeding without TCP verification (probe not implemented)", "migration", pm.Name)
 	}
 
-	log.Info("TCPVerifying: TCP sequence continuity verified", "migration", pm.Name)
-	setCondition(pm, pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionTrue,
-		"SequenceContinuous", "TCP 4-tuples and snd_nxt/rcv_nxt verified within ±MSS post-restore")
-	setCondition(pm, pmv1.ConditionConnectionCountParity, metav1.ConditionTrue,
-		"ParityConfirmed", "destination ESTABLISHED count matches source socket inventory")
+	// Do NOT set TCPSequenceContinuityVerified=True here — the condition remains False.
+	// Only advance to ServiceVerifying; source pod deletion in CutoverComplete will re-check
+	// this condition for Strict mode.
 	if err := r.Status().Update(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -580,6 +590,8 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 		}
 	}
 
+	strictMode := pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict
+
 	if r.TrafficVerifier != nil {
 		req := traffic.VerifyRequest{
 			Namespace:      pm.Spec.PodNamespace,
@@ -592,10 +604,40 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 			Mode:           traffic.VerificationModeEndpointSlice,
 		}
 		if err := r.TrafficVerifier.Verify(ctx, req); err != nil {
+			if strictMode {
+				// Strict mode: verifier error is a hard block — do not proceed to CutoverComplete.
+				// Setting TrafficVerified=False (not True) so CutoverComplete's defensive re-check
+				// will also block deletion of the source pod.
+				msg := fmt.Sprintf("ServiceVerifying: HTTP/endpoint verification failed in Strict mode: %v", err)
+				log.Error(err, "ServiceVerifying: hard-blocking CutoverComplete — Strict mode requires real verification", "migration", pm.Name)
+				setCondition(pm, conditionTrafficVerified, metav1.ConditionFalse, "VerificationFailed", msg)
+				if updateErr := r.Status().Update(ctx, pm); updateErr != nil {
+					return ctrl.Result{}, updateErr
+				}
+				return r.initiateRollback(ctx, pm, msg)
+			}
+			// BestEffort/None: warn-only per ADR-0019, but still set False so operators can observe.
 			log.Info("ServiceVerifying: HTTP/endpoint verification failed (warn-only, ADR-0019)", "migration", pm.Name, "err", err)
+			setCondition(pm, conditionTrafficVerified, metav1.ConditionFalse, "VerificationFailed",
+				fmt.Sprintf("verification failed (non-Strict, proceeding): %v", err))
+			if updateErr := r.Status().Update(ctx, pm); updateErr != nil {
+				return ctrl.Result{}, updateErr
+			}
+			return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
 		}
 	} else {
-		log.Info("ServiceVerifying: TrafficVerifier not wired; skipping", "migration", pm.Name)
+		if strictMode {
+			// Strict mode with no verifier wired: this is a controller misconfiguration.
+			// Block CutoverComplete rather than deleting the source pod on an unverified switchover.
+			msg := "ServiceVerifying: TrafficVerifier not wired but TCPPreservationMode=Strict requires real verification; blocking CutoverComplete to prevent source pod deletion without proof of service liveness"
+			log.Error(nil, msg, "migration", pm.Name)
+			setCondition(pm, conditionTrafficVerified, metav1.ConditionFalse, "VerifierNotWired", msg)
+			if updateErr := r.Status().Update(ctx, pm); updateErr != nil {
+				return ctrl.Result{}, updateErr
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		log.Info("ServiceVerifying: TrafficVerifier not wired; skipping (non-Strict mode)", "migration", pm.Name)
 	}
 
 	setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "ServiceVerified",
@@ -634,6 +676,33 @@ func (r *PodMigrationReconciler) reconcileCutoverComplete(ctx context.Context, p
 	}
 	if err := r.checkResourceQuotaCapacity(ctx, pm); err != nil {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Defensive re-check (ADR-0012 safety contract): re-read the conditions immediately before
+	// deleting the source pod, regardless of how we arrived at CutoverComplete phase.
+	// The source pod is the only surviving copy of process state. Do NOT delete it unless:
+	//   1. TrafficVerified=True (destination is serving real traffic), AND
+	//   2. For Strict/BestEffort: TCPSequenceContinuityVerified=True (TCP continuity confirmed).
+	// The phase transition alone is NOT sufficient because Status is a writable subresource
+	// and can be externally patched to Phase=CutoverComplete.
+	{
+		// Re-fetch to get the latest conditions (not stale in-memory state).
+		freshPM := &pmv1.PodMigration{}
+		if fetchErr := r.Get(ctx, client.ObjectKeyFromObject(pm), freshPM); fetchErr != nil {
+			log.Error(fetchErr, "CutoverComplete: failed to re-fetch PodMigration before source pod deletion — requeuing for safety", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		if !meta.IsStatusConditionTrue(freshPM.Status.Conditions, conditionTrafficVerified) {
+			log.Error(nil, "CutoverComplete: SAFETY BLOCK — TrafficVerified is not True; refusing to delete source pod (ADR-0012)", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		if freshPM.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict ||
+			freshPM.Spec.TCPPreservationMode == pmv1.TCPPreservationModeBestEffort {
+			if !meta.IsStatusConditionTrue(freshPM.Status.Conditions, pmv1.ConditionTCPSequenceContinuityVerified) {
+				log.Error(nil, "CutoverComplete: SAFETY BLOCK — TCPSequenceContinuityVerified is not True in Strict/BestEffort mode; refusing to delete source pod (ADR-0012)", "migration", pm.Name)
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
+		}
 	}
 
 	sourcePod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
@@ -1108,9 +1177,12 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 	}
 
 	// Step 2b: Checkpoint — freeze and dump via real CRIU gRPC call.
+	// WorkloadNamespace must be the pod's namespace (NOT the operator namespace) so the
+	// agent can look up the PodMigration CR in the correct namespace (ADR-0047 §safety).
 	checkpointResp, err := agentClient.Checkpoint(ctx, &agentpb.CheckpointRequest{
-		MigrationName:   pm.Name,
-		ApplyZeroWindow: pm.Spec.TCPPreservationMode != pmv1.TCPPreservationModeNone,
+		MigrationName:      pm.Name,
+		ApplyZeroWindow:    pm.Spec.TCPPreservationMode != pmv1.TCPPreservationModeNone,
+		WorkloadNamespace:  pm.Spec.PodNamespace,
 	})
 	if err != nil {
 		errStr := err.Error()

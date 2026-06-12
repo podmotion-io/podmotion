@@ -1,0 +1,100 @@
+PodMotion
+
+Copyright 2026 PodMotion Authors
+
+This product includes software developed by the PodMotion project (https://podmotion.io).
+
+Third-Party Notices
+
+The following Go modules are used by PodMotion and may carry their own NOTICE or attribution
+requirements. Downstream redistributors must satisfy these requirements independently.
+
+--------------------------------------------------------------------------------
+github.com/checkpoint-restore/go-criu
+Version: see go.mod
+License: LGPL-2.1-only
+Attribution: go-criu is the official Go binding for CRIU. It is imported as a Go module
+  and NOT compiled into any PodMotion binary in a way that triggers LGPL copyleft
+  obligations for PodMotion's own source code. Downstream redistributors who modify
+  go-criu must make those modifications available under LGPL-2.1.
+Note: CRIU itself (criu/criu) is GPLv2 and is invoked exclusively as an external
+  subprocess via exec.Command (see ADR-0002). It is never statically linked into any
+  PodMotion binary. This subprocess firewall preserves PodMotion's Apache 2.0 licensing.
+
+--------------------------------------------------------------------------------
+sigs.k8s.io/controller-runtime
+Version: see go.mod
+License: Apache-2.0
+Attribution: Copyright The Kubernetes Authors.
+  NOTICE: https://github.com/kubernetes-sigs/controller-runtime/blob/main/NOTICE
+
+--------------------------------------------------------------------------------
+go.etcd.io/etcd/client/v3
+Version: see go.mod
+License: Apache-2.0
+Attribution: Copyright The etcd Authors.
+  NOTICE: https://github.com/etcd-io/etcd/blob/main/NOTICE
+
+--------------------------------------------------------------------------------
+github.com/cilium/ebpf
+Version: see go.mod
+License: MIT
+Attribution: Copyright Authors of github.com/cilium/ebpf.
+
+--------------------------------------------------------------------------------
+github.com/vishvananda/netlink
+Version: see go.mod
+License: Apache-2.0
+Attribution: Copyright 2014 Docker, Inc.
+
+--------------------------------------------------------------------------------
+k8s.io/client-go
+Version: see go.mod
+License: Apache-2.0
+Attribution: Copyright The Kubernetes Authors.
+  NOTICE: https://github.com/kubernetes/client-go/blob/master/NOTICE
+
+--------------------------------------------------------------------------------
+k8s.io/apimachinery
+Version: see go.mod
+License: Apache-2.0
+Attribution: Copyright The Kubernetes Authors.
+
+--------------------------------------------------------------------------------
+k8s.io/api
+Version: see go.mod
+License: Apache-2.0
+Attribution: Copyright The Kubernetes Authors.
+
+--------------------------------------------------------------------------------
+google.golang.org/grpc
+Version: see go.mod
+License: Apache-2.0
+Attribution: Copyright 2014 gRPC authors.
+
+--------------------------------------------------------------------------------
+google.golang.org/protobuf
+Version: see go.mod
+License: BSD-3-Clause
+Attribution: Copyright 2018 The Go Authors. All rights reserved.
+
+--------------------------------------------------------------------------------
+github.com/prometheus/client_golang
+Version: see go.mod
+License: Apache-2.0
+Attribution: Copyright 2012-2015 The Prometheus Authors.
+  NOTICE: https://github.com/prometheus/client_golang/blob/main/NOTICE
+
+--------------------------------------------------------------------------------
+github.com/go-logr/logr
+Version: see go.mod
+License: Apache-2.0
+Attribution: Copyright 2019 The logr Authors.
+
+--------------------------------------------------------------------------------
+
+NOTE TO MAINTAINERS: This file must be updated whenever a new Go dependency is added
+that carries its own NOTICE obligations (any dependency whose license requires
+attribution text to be preserved in derivative works). Run `go mod tidy` and inspect
+new entries in go.sum. For GPL/LGPL-licensed packages, verify the subprocess firewall
+is maintained and document the isolation here.

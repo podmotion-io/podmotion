@@ -193,6 +193,22 @@ func (v *PodMigrationValidator) validate(ctx context.Context, pm *pmv1.PodMigrat
 			"GPU migration requires --feature-gates=GPUMigration=true"))
 	}
 
+	// Rule 10b: TCPPreservationMode=Strict/BestEffort admission gate (ADR-0047 critical safety).
+	// The full TCP preservation pipeline (eBPF zero-window hold, overlay FDB handoff via ADR-0048,
+	// PrepareDestinationNetns wiring, real TCP sequence verification) is NOT implemented until
+	// M20/M21. Admitting Strict/BestEffort today would guarantee TCP RST on every migrated
+	// connection while reporting success to the operator. Hard-block until the TCPPreservation
+	// feature gate is explicitly enabled by the operator.
+	if pm.Spec.TCPPreservationMode == "Strict" || pm.Spec.TCPPreservationMode == "BestEffort" {
+		if !featuregate.IsEnabled(featuregate.TCPPreservation) {
+			allErrs = append(allErrs, field.Forbidden(spec.Child("tcpPreservationMode"),
+				fmt.Sprintf("TCPPreservationMode=%s is not yet implemented: eBPF zero-window hold, overlay FDB handoff (ADR-0048), and TCP sequence verification are all stubs in this release. "+
+					"Enabling this mode would silently RST every preserved TCP connection while reporting success. "+
+					"Enable --feature-gates=TCPPreservation=true only after M21 lands the full implementation.",
+					pm.Spec.TCPPreservationMode)))
+		}
+	}
+
 	// Rule 11: destinationCluster cross-cluster checks (ADR-0022, ADR-0034)
 	if pm.Spec.DestinationCluster != "" {
 		// Verify remote cluster connectivity.

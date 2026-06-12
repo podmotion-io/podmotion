@@ -124,6 +124,47 @@ spec:
                     - patch
                     - ignore
                     type: string
+                  applicationProbe:
+                    description: |-
+                      ApplicationProbe is an optional post-restore application-level health check.
+                      When set, the operator executes this probe before declaring phase=Complete.
+                    properties:
+                      grpcService:
+                        description: GRPCService is the fully-qualified gRPC service
+                          name for gRPC probes.
+                        type: string
+                      path:
+                        description: Path is the HTTP path for HTTP probes (e.g. "/healthz").
+                        type: string
+                      port:
+                        description: Port is the target port for HTTP, gRPC, and TCP
+                          probes.
+                        format: int32
+                        maximum: 65535
+                        minimum: 1
+                        type: integer
+                      protocol:
+                        description: Protocol selects the probe type.
+                        enum:
+                        - SQL
+                        - HTTP
+                        - gRPC
+                        - TCP
+                        type: string
+                      query:
+                        description: Query is the SQL query for SQL probes (e.g. "SELECT
+                          1").
+                        type: string
+                      timeoutSeconds:
+                        default: 5
+                        description: TimeoutSeconds is the probe deadline. Defaults
+                          to 5.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    required:
+                    - protocol
+                    type: object
                   bandwidthLimitMbps:
                     default: 0
                     description: BandwidthLimitMbps caps per-migration transfer bandwidth.
@@ -154,6 +195,16 @@ spec:
                     description: DryRun runs the estimation pipeline only; does not
                       touch the running pod.
                     type: boolean
+                  freezeWindowBudgetMs:
+                    default: 500
+                    description: |-
+                      FreezeWindowBudgetMs is the maximum allowed wall-clock milliseconds for the full
+                      ZW-arm-to-ZW-disarm critical path (ADR-0049). Migrations that exceed this budget
+                      are aborted and the source pod is thawed.
+                    format: int32
+                    maximum: 10000
+                    minimum: 50
+                    type: integer
                   migrationPolicyRef:
                     description: MigrationPolicyRef is the owning MigrationPolicy
                       (may be empty for manual migrations).
@@ -177,13 +228,6 @@ spec:
                     - PostCopy
                     - Cold
                     type: string
-                  networkContinuity:
-                    default: false
-                    description: |-
-                      NetworkContinuity enables TCP connection preservation via eBPF bridge and IP handoff.
-                      Requires CNI support — see NodeMigrationCapacity.status.cniIPMobilitySupported.
-                      Defaults to false; eBPF bridge is not yet implemented (use TIER_4 cold migration path).
-                    type: boolean
                   podName:
                     description: PodName is the name of the source pod to migrate.
                     type: string
@@ -234,6 +278,18 @@ spec:
                   targetNodeName:
                     description: TargetNodeName pins the destination node. If empty,
                       the scheduler plugin selects.
+                    type: string
+                  tcpPreservationMode:
+                    default: None
+                    description: |-
+                      TCPPreservationMode controls TCP connection continuity behavior during migration.
+                      Strict triggers hard rollback if TCPSequenceContinuityVerified=False (ADR-0019 Amendment A).
+                      BestEffort emits a warning condition only.
+                      None skips the TCPVerifying phase entirely (stateless workloads).
+                    enum:
+                    - Strict
+                    - BestEffort
+                    - None
                     type: string
                 required:
                 - podName

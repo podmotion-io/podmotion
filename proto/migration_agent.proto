@@ -69,8 +69,10 @@ message PreDumpRoundResponse {
 
 message CheckpointRequest {
   string migration_name        = 1;
-  // field 2 reserved: tcp_established removed in M19 (ADR-0047)
+  reserved 2;
+  reserved "tcp_established";
   bool   apply_zero_window     = 3; // engage eBPF zero-window hold before freeze
+  string workload_namespace    = 4; // namespace of the migrating pod's PodMigration CR (not operator ns)
 }
 message CheckpointResponse {
   int64  freeze_duration_ms   = 1;
@@ -120,7 +122,8 @@ message RestoreRequest {
   string migration_name              = 1;
   string checkpoint_ref              = 2; // OCI image ref or direct P2P staging path
   string source_node_addr            = 3; // for DirectP2P mode
-  // field 4 reserved: network_continuity bool removed; use TCPPreservationMode on the CR
+  reserved 4;
+  reserved "network_continuity";
   string dest_netns_fd               = 5; // pre-staged netns path from PrepareDestinationNetns
   int64  source_freeze_timestamp_ns  = 6; // CLOCK_REALTIME ns at source freeze for seq-xlat
 }

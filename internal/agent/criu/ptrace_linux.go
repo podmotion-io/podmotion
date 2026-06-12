@@ -20,9 +20,7 @@ import (
 // PTRACE_INTERRUPT returns EPERM.  Removing the preflight lets CRIU manage
 // all ptrace state itself without interference.
 //
-// TODO: re-enable preflight using PTRACE_ATTACH / PTRACE_DETACH (not SEIZE)
-// once the CRIU RPC integration is stable, or move to a read-only capability
-// check (cap.Get) that never touches the tracee.
+// TODO(podmotion-io/podmotion#<issue>): re-enable preflight using PTRACE_ATTACH / PTRACE_DETACH (not SEIZE) — PTRACE_SEIZE requires CAP_SYS_PTRACE which is not available in all pod security profiles. Track under M15 security hardening.
 func ptracePreflight(pid int32) error {
 	// Suppress unused import warnings — syscall/unix are kept for future use.
 	_ = unix.PTRACE_SEIZE
