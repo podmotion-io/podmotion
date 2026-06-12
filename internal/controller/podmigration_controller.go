@@ -123,6 +123,7 @@ type PodMigrationReconciler struct {
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
+// Reconcile implements the PodMigration state machine. It is called by controller-runtime whenever a PodMigration object is created, updated, or re-queued. Each call advances the migration by exactly one phase transition, persists status, and re-queues if further work remains. See CLAUDE.md §PodMigration state machine for the full phase diagram.
 func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -329,9 +330,9 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 		return r.failMigration(ctx, pm, fmt.Sprintf("pre-copy aborted: %s", memoryCond.Message))
 	}
 
-	// ADR-0028: v0.1 fast-path — if NetworkContinuity is false, set NetworkBridgeArmed=True
+	// ADR-0028: v0.1 fast-path — if TCPPreservationMode=None, set NetworkBridgeArmed=True
 	// immediately without waiting for the eBPF agent (TIER_4 cold migration).
-	if !pm.Spec.NetworkContinuity && !networkBridgeArmed {
+	if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeNone && !networkBridgeArmed {
 		setCondition(pm, conditionNetworkBridgeArmed, metav1.ConditionTrue,
 			"TIER4FastPath", "v0.1 cold migration: no eBPF bridge needed (ADR-0028)")
 		if err := r.Status().Update(ctx, pm); err != nil {
@@ -616,8 +617,8 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 	// Step 2b: Checkpoint — freeze and dump via real CRIU gRPC call.
 	checkpointResp, err := agentClient.Checkpoint(ctx, &agentpb.CheckpointRequest{
 		MigrationName:   pm.Name,
-		TcpEstablished:  pm.Spec.NetworkContinuity,
-		ApplyZeroWindow: pm.Spec.NetworkContinuity,
+		TcpEstablished:  pm.Spec.TCPPreservationMode != pmv1.TCPPreservationModeNone,
+		ApplyZeroWindow: pm.Spec.TCPPreservationMode != pmv1.TCPPreservationModeNone,
 	})
 	if err != nil {
 		errStr := err.Error()
