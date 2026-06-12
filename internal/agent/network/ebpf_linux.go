@@ -240,12 +240,12 @@ func ensureClsactQdisc(ifindex int) error {
 	payload := append(tcBytes, kind...)
 
 	hdr := unix.NlMsghdr{
-		Len:   uint32(unix.NLMSG_HDRSIZE + len(payload)),
+		Len:   uint32(nlmsgHdrSize + len(payload)),
 		Type:  rtmNewQdisc,
 		Flags: unix.NLM_F_REQUEST | unix.NLM_F_CREATE | unix.NLM_F_EXCL,
 		Seq:   1,
 	}
-	hdrBytes := (*[unix.NLMSG_HDRSIZE]byte)(unsafe.Pointer(&hdr))[:]
+	hdrBytes := (*[nlmsgHdrSize]byte)(unsafe.Pointer(&hdr))[:]
 	msg := append(hdrBytes, payload...)
 	// Pad to 4-byte boundary.
 	for len(msg)%4 != 0 {
@@ -261,12 +261,12 @@ func ensureClsactQdisc(ifindex int) error {
 	if err != nil {
 		return fmt.Errorf("RTM_NEWQDISC read: %w", err)
 	}
-	if n < unix.NLMSG_HDRSIZE {
+	if n < nlmsgHdrSize {
 		return fmt.Errorf("RTM_NEWQDISC: short reply (%d bytes)", n)
 	}
 	replyHdr := (*unix.NlMsghdr)(unsafe.Pointer(&buf[0]))
 	if replyHdr.Type == unix.NLMSG_ERROR {
-		errno := int32(binary.LittleEndian.Uint32(buf[unix.NLMSG_HDRSIZE:]))
+		errno := int32(binary.LittleEndian.Uint32(buf[nlmsgHdrSize:]))
 		if errno != 0 && errno != -int32(syscall.EEXIST) {
 			return fmt.Errorf("RTM_NEWQDISC: kernel error %d", errno)
 		}
@@ -333,12 +333,12 @@ func attachTCEgress(ifindex int, prog *ebpf.Program) (uint32, error) {
 	payload = append(tcBytesH, attrs...)
 
 	hdr := unix.NlMsghdr{
-		Len:   uint32(unix.NLMSG_HDRSIZE + len(payload)),
+		Len:   uint32(nlmsgHdrSize + len(payload)),
 		Type:  rtmNewFilter,
 		Flags: unix.NLM_F_REQUEST | unix.NLM_F_CREATE | unix.NLM_F_REPLACE,
 		Seq:   2,
 	}
-	hdrBytes := (*[unix.NLMSG_HDRSIZE]byte)(unsafe.Pointer(&hdr))[:]
+	hdrBytes := (*[nlmsgHdrSize]byte)(unsafe.Pointer(&hdr))[:]
 	msg := append(hdrBytes, payload...)
 	for len(msg)%4 != 0 {
 		msg = append(msg, 0)
@@ -353,12 +353,12 @@ func attachTCEgress(ifindex int, prog *ebpf.Program) (uint32, error) {
 	if err != nil {
 		return 0, fmt.Errorf("RTM_NEWTFILTER read: %w", err)
 	}
-	if n < unix.NLMSG_HDRSIZE {
+	if n < nlmsgHdrSize {
 		return 0, fmt.Errorf("RTM_NEWTFILTER: short reply (%d bytes)", n)
 	}
 	replyHdr := (*unix.NlMsghdr)(unsafe.Pointer(&buf[0]))
 	if replyHdr.Type == unix.NLMSG_ERROR {
-		errno := int32(binary.LittleEndian.Uint32(buf[unix.NLMSG_HDRSIZE:]))
+		errno := int32(binary.LittleEndian.Uint32(buf[nlmsgHdrSize:]))
 		if errno != 0 {
 			return 0, fmt.Errorf("RTM_NEWTFILTER: kernel error %d", errno)
 		}
@@ -398,12 +398,12 @@ func detachTCEgress(ifindex int, handle uint32) error {
 	payload := append(tcBytes, kind...)
 
 	hdr := unix.NlMsghdr{
-		Len:   uint32(unix.NLMSG_HDRSIZE + len(payload)),
+		Len:   uint32(nlmsgHdrSize + len(payload)),
 		Type:  rtmDelFilter,
 		Flags: unix.NLM_F_REQUEST,
 		Seq:   3,
 	}
-	hdrBytes := (*[unix.NLMSG_HDRSIZE]byte)(unsafe.Pointer(&hdr))[:]
+	hdrBytes := (*[nlmsgHdrSize]byte)(unsafe.Pointer(&hdr))[:]
 	msg := append(hdrBytes, payload...)
 	for len(msg)%4 != 0 {
 		msg = append(msg, 0)
@@ -418,12 +418,12 @@ func detachTCEgress(ifindex int, handle uint32) error {
 	if err != nil {
 		return fmt.Errorf("RTM_DELTFILTER read: %w", err)
 	}
-	if n < unix.NLMSG_HDRSIZE {
+	if n < nlmsgHdrSize {
 		return fmt.Errorf("RTM_DELTFILTER: short reply (%d bytes)", n)
 	}
 	replyHdr := (*unix.NlMsghdr)(unsafe.Pointer(&buf[0]))
 	if replyHdr.Type == unix.NLMSG_ERROR {
-		errno := int32(binary.LittleEndian.Uint32(buf[unix.NLMSG_HDRSIZE:]))
+		errno := int32(binary.LittleEndian.Uint32(buf[nlmsgHdrSize:]))
 		if errno != 0 && errno != -int32(syscall.ENOENT) {
 			return fmt.Errorf("RTM_DELTFILTER: kernel error %d", errno)
 		}
