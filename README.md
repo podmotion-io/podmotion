@@ -106,6 +106,18 @@ helm install podmotion ./charts/podmotion --namespace podmotion-system --create-
 
 For available configuration options see the [values reference](charts/podmotion/values.yaml).
 
+## Operator Documentation
+
+Key references for operating PodMotion:
+
+| Document | Description |
+|----------|-------------|
+| [docs/zero-window-hold-operator-controls.md](docs/zero-window-hold-operator-controls.md) | How to configure and observe the zero-window TCP hold (`spec.tcpPreservationMode`, `spec.freezeWindowBudgetMs`, `ZeroWindowArmed`/`ZeroWindowDisarmed` conditions). |
+| [docs/adr/conditions-vocabulary.md](docs/adr/conditions-vocabulary.md) | Authoritative vocabulary for all `PodMigration` status condition Types and CamelCase Reasons per K8s API conventions. |
+| [docs/adr/0049-zero-window-hold.md](docs/adr/0049-zero-window-hold.md) | ADR: zero-window hold mechanism, relay ARM/DISARM atomicity, and TCP socket preservation ordering (6-predicate barrier). |
+| [docs/adr/0047-tcp-first-migration-architecture.md](docs/adr/0047-tcp-first-migration-architecture.md) | ADR: TCP-first 12-phase migration pipeline. |
+| [docs/adr/0012-traffic-verification-gate.md](docs/adr/0012-traffic-verification-gate.md) | ADR: source pod NEVER deleted until `TrafficVerified=True`. |
+
 ## Contributing
 Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
