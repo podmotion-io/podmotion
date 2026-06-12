@@ -16,6 +16,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -28,8 +29,10 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -41,6 +44,19 @@ import (
 )
 
 var log = logf.Log.WithName("agent-server")
+
+// Sentinel errors used for structured error classification (errors.Is/As).
+// Prefer these over string matching so callers remain stable across CRIU/kernel version changes.
+
+// ErrCtrInFlightTCP is returned by ctrCheckpoint when the containerd-native checkpoint fails
+// because in-flight TCP sockets are present. The caller should fall back to raw CRIU with
+// TcpSkipInFlight=true.
+var ErrCtrInFlightTCP = errors.New("ctr checkpoint: in-flight TCP sockets detected")
+
+// ErrCRIUCapability aliases the sentinel from the criu package so server-layer code can use
+// errors.Is without importing the criu package directly in every call site.
+// Surface as gRPC codes.FailedPrecondition at the gRPC boundary.
+var ErrCRIUCapability = criu.ErrCRIUCapability
 
 // AgentServer implements agentpb.MigrationAgentServiceServer.
 // One instance runs per node agent process.
@@ -312,6 +328,14 @@ func ctrCheckpoint(taskID, imagesDir string) (int64, error) {
 		"--image-path", imagesDir, taskID)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		// Detect in-flight TCP socket failure by inspecting the combined output from ctr/CRIU.
+		// Wrap with ErrCtrInFlightTCP so callers can use errors.Is instead of string matching.
+		outStr := string(out)
+		if strings.Contains(outStr, "In-flight") ||
+			strings.Contains(outStr, "in-flight") ||
+			strings.Contains(outStr, "inet") {
+			return 0, fmt.Errorf("ctr tasks checkpoint: %w\noutput: %s", ErrCtrInFlightTCP, outStr)
+		}
 		return 0, fmt.Errorf("ctr tasks checkpoint: %w\noutput: %s", err, out)
 	}
 
@@ -410,8 +434,10 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd string) (int, error
 	dataDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/data", migrationName)
 	secretsDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/secrets", migrationName)
 	termlogFile := fmt.Sprintf("/var/lib/podmotion/restore/%s/termination-log", migrationName)
-	_ = os.MkdirAll(dataDir, 0o755)
-	_ = os.MkdirAll(secretsDir, 0o755)
+	// 0o700: data dir may contain PV data; secrets dir holds service-account tokens.
+	// World-readable (0o755) is inappropriate for either (M19.5 criterion 10).
+	_ = os.MkdirAll(dataDir, 0o700)
+	_ = os.MkdirAll(secretsDir, 0o700)
 	_ = os.WriteFile(termlogFile, nil, 0o644)
 	// Create missing mount target directories inside rootfs (CRIU bind-mounts into these).
 	_ = os.MkdirAll(filepath.Join(rootfsDir, "run/secrets/kubernetes.io/serviceaccount"), 0o755)
@@ -429,11 +455,20 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd string) (int, error
 	//     netns so TCP connections survive across the overlay handoff (ADR-0048).
 	//   empty → --empty-ns net: create a fresh netns (stateless cold migration).
 	restoreLogPath := filepath.Join(checkpointDir, "restore.log")
+	// TCP flag is tier-driven: when restoring into a pre-staged migration netns (join-ns path,
+	// TCPPreservationMode=Strict/BestEffort) we MUST pass --tcp-established so CRIU restores
+	// the socket state table and TCP seq numbers. --tcp-close (the default) sends RST on every
+	// established connection, directly defeating the join-ns TCP-preservation purpose (ADR-0048).
+	// For the stateless cold path (destNetnsFd=="") --tcp-close is the correct/safe default.
+	tcpFlag := "--tcp-close"
+	if destNetnsFd != "" {
+		tcpFlag = "--tcp-established"
+	}
 	criuArgs := []string{
 		"restore",
 		"--images-dir", checkpointDir,
 		"--root", rootfsDir,
-		"--tcp-close",
+		tcpFlag,
 		"--mntns-compat-mode",
 		"--manage-cgroups=ignore",
 		// /dev/null is the ext_key for all Kubernetes masked-path tmpfs bind-mounts.
@@ -807,11 +842,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 				// will be closed on restore — this is a deliberate behavior change, logged below).
 				// Any other ctr error (OOM, permission, corrupt task) is fatal and returned directly
 				// to avoid a double-freeze and to surface the real cause.
-				errStr := ctrErr.Error()
-				isInFlightTCP := strings.Contains(errStr, "In-flight") ||
-					strings.Contains(errStr, "in-flight") ||
-					strings.Contains(errStr, "inet")
-				if !isInFlightTCP {
+				if !errors.Is(ctrErr, ErrCtrInFlightTCP) {
 					return nil, fmt.Errorf("checkpoint failed (ctr): %w", ctrErr)
 				}
 				log.Info("Checkpoint: ctr failed due to in-flight TCP — falling back to raw CRIU (TcpClose=true: established connections will be dropped on restore)",
@@ -905,6 +936,12 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		log.Error(err, "Checkpoint: CRIU dump failed", "migration", req.MigrationName)
 
 		if !mockCRIU {
+			// Return codes.FailedPrecondition for capability/ptrace errors so the controller
+			// can use grpcStatus.Code() == codes.FailedPrecondition instead of string matching
+			// (M19.5 criterion 13: error classification via errors.Is/As not string matching).
+			if errors.Is(err, ErrCRIUCapability) {
+				return nil, status.Errorf(codes.FailedPrecondition, "checkpoint failed: %v", err)
+			}
 			// In production, propagate the error — do not silently substitute a mock checkpoint.
 			return nil, fmt.Errorf("checkpoint failed: %w", err)
 		}
