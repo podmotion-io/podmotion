@@ -286,6 +286,10 @@ const (
 	// ConditionZeroWindowArmed is True when the TC-BPF zero-window hold program has
 	// been loaded and armed on the source pod's veth (ADR-0049).
 	ConditionZeroWindowArmed = "ZeroWindowArmed"
+	// ConditionZeroWindowDisarmed is True when the TC-BPF zero-window hold has been
+	// successfully disarmed after FinalFreeze. The condition message carries the
+	// arm-to-disarm hold duration in milliseconds for budget verification (ADR-0049).
+	ConditionZeroWindowDisarmed = "ZeroWindowDisarmed"
 	// ConditionVXLANFDBUpdated is True when the two-sided AF_BRIDGE FDB and AF_INET
 	// neighbor entries have been injected on both nodes (ADR-0048).
 	ConditionVXLANFDBUpdated = "VXLANFDBUpdated"
