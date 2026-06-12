@@ -23,6 +23,7 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/pkt_cls.h>
+#include <linux/in.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 

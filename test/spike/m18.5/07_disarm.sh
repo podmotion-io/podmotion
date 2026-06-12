@@ -34,5 +34,14 @@ if [[ "${FREEZE_START_NS}" != "0" ]]; then
 fi
 
 echo "[disarm] zero-window hold DISARMED — peer sender will resume within 1 RTT"
+
+# Resume the (possibly paused) restored process sender thread via SIGUSR2
+RESTORED_PID=$(cat "${LOG_DIR}/restored_pid" 2>/dev/null || echo "")
+CLIENT_PID=$(cat "${LOG_DIR}/client.pid" 2>/dev/null || echo "")
+RESUME_PID="${RESTORED_PID:-${CLIENT_PID}}"
+if [[ -n "${RESUME_PID}" ]]; then
+    kill -SIGUSR2 "${RESUME_PID}" 2>/dev/null && echo "[disarm] SIGUSR2 sent to ${RESUME_PID} — sender resuming" || true
+fi
+
 echo ""
 echo "[disarm] proceed to: 08_verify.sh to check seq continuity"

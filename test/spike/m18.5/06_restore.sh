@@ -11,14 +11,21 @@ set -euo pipefail
 LOG_DIR="${LOG_DIR:-/tmp/pm-spike}"
 CHECKPOINT_DIR="${LOG_DIR}/checkpoint"
 MIGRATION_NETNS="${MIGRATION_NETNS:-pm-migration}"
-SOURCE_HOST="${SOURCE_HOST:-ubuntu@192.168.252.8}"
+SOURCE_HOST="${SOURCE_HOST:-root@192.168.252.8}"
+FLANNEL_BRIDGE="${FLANNEL_BRIDGE:-cni0}"
 
-# Ensure checkpoint images are present
+# Ensure checkpoint images are present (they should be on the same node)
 if [[ ! -d "${CHECKPOINT_DIR}" ]] || [[ -z "$(ls -A ${CHECKPOINT_DIR} 2>/dev/null)" ]]; then
-    echo "[restore] FATAL: checkpoint dir empty — copying from pm-worker"
-    mkdir -p "${CHECKPOINT_DIR}"
-    chmod 0700 "${CHECKPOINT_DIR}"
-    scp -r "${SOURCE_HOST}:${CHECKPOINT_DIR}/" "${LOG_DIR}/"
+    echo "[restore] checkpoint dir empty or missing"
+    if [[ "${SOURCE_HOST}" != "local" ]]; then
+        echo "[restore] copying from ${SOURCE_HOST}..."
+        mkdir -p "${CHECKPOINT_DIR}"
+        chmod 0700 "${CHECKPOINT_DIR}"
+        scp -r "${SOURCE_HOST}:${CHECKPOINT_DIR}/" "${LOG_DIR}/"
+    else
+        echo "[restore] FATAL: no checkpoint images found"
+        exit 1
+    fi
 fi
 
 NETNS_PATH="/var/run/netns/${MIGRATION_NETNS}"
@@ -33,22 +40,37 @@ echo "[restore] checkpoint dir: ${CHECKPOINT_DIR}"
 
 RESTORE_START_NS=$(date +%s%N)
 
-# CRIU restore with --join-ns net:<netns_fd>
+# CRIU restore with --join-ns net:<netns_path>
 # The restored process will live in the migration netns with its original IP.
 # --restore-detached: NOT used (ADR: causes ghost container)
 # --tcp-established: required to restore the TCP sockets in repair mode
+# Background: criu restore blocks until the restored process exits.
+#
+# No mount namespace flags needed: the source process was launched with
+# nsenter --net (not ip netns exec), so it was always in the host mount
+# namespace. CRIU and the target both see the same mount IDs — no special
+# --enable-external-masters / --mntns-compat-mode needed.
 criu restore \
     --images-dir "${CHECKPOINT_DIR}" \
     --log-file "${LOG_DIR}/criu_restore.log" \
-    --log-level 4 \
+    --verbosity=4 \
     --tcp-established \
     --shell-job \
     --file-locks \
     --join-ns "net:${NETNS_PATH}" \
-    --detach \
-    2>&1 | tee "${LOG_DIR}/criu_restore_stdout.log"
+    --external "veth[eth0]:veth-mig@${FLANNEL_BRIDGE:-cni0}" \
+    2>&1 | tee "${LOG_DIR}/criu_restore_stdout.log" &
 
-CRIU_EXIT=$?
+CRIU_BG_PID=$!
+# Wait briefly for CRIU to start the restore (it fails fast if it can't restore)
+sleep 2
+# Check if CRIU failed immediately
+if ! kill -0 "${CRIU_BG_PID}" 2>/dev/null; then
+    wait "${CRIU_BG_PID}"
+    CRIU_EXIT=$?
+else
+    CRIU_EXIT=0
+fi
 RESTORE_END_NS=$(date +%s%N)
 RESTORE_ELAPSED_MS=$(( (RESTORE_END_NS - RESTORE_START_NS) / 1000000 ))
 

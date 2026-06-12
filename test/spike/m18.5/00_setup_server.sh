@@ -38,13 +38,16 @@ ip link set veth-srv-pod  netns "${SERVER_NETNS}"
 ip link set veth-srv master "${FLANNEL_BRIDGE}"
 ip link set veth-srv up
 
-# Netns side: assign server IP
-ip netns exec "${SERVER_NETNS}" ip addr add "${SERVER_IP}/32" dev veth-srv-pod
+# Netns side: assign server IP in the same /24 as the flannel bridge (cni0 = 10.244.0.1/24)
+# Using /24 ensures the netns answers ARP for this IP correctly.
+BRIDGE_CIDR="${BRIDGE_CIDR:-24}"
+ip netns exec "${SERVER_NETNS}" ip addr add "${SERVER_IP}/${BRIDGE_CIDR}" dev veth-srv-pod
 ip netns exec "${SERVER_NETNS}" ip link set veth-srv-pod up
-ip netns exec "${SERVER_NETNS}" ip route add default via "${SERVER_IP%.*}.1" dev veth-srv-pod || true
+# Route via the bridge gateway (cni0 is the default gw for this subnet)
+BRIDGE_GW="${BRIDGE_GW:-10.244.0.1}"
+ip netns exec "${SERVER_NETNS}" ip route add default via "${BRIDGE_GW}" dev veth-srv-pod || true
 
-# Add host route so the flannel bridge can reach the server IP
-ip route add "${SERVER_IP}/32" dev veth-srv 2>/dev/null || true
+# No extra host route needed — cni0 bridge already owns 10.244.0.0/24
 
 echo "[server] server IP ${SERVER_IP} reachable via ${FLANNEL_BRIDGE}"
 
@@ -81,8 +84,7 @@ echo "[server] PID $(cat ${LOG_DIR}/server.pid)"
 # Wait for port to be reachable
 echo -n "[server] waiting for port to open"
 for i in $(seq 1 20); do
-    if ip netns exec "${SERVER_NETNS}" bash -c \
-           "echo -n | nc -z ${SERVER_IP} ${SERVER_PORT} 2>/dev/null"; then
+    if timeout 1 socat /dev/null "TCP:${SERVER_IP}:${SERVER_PORT},connect-timeout=1" 2>/dev/null; then
         echo " OK"
         break
     fi

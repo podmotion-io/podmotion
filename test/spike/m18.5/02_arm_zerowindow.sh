@@ -20,6 +20,33 @@ if [[ ! -f "${BPF_OBJ}" ]]; then
     exit 1
 fi
 
+# Pause traffic generator BEFORE arming hold so the kernel send buffer drains
+# naturally while ACKs can still flow. Correct production ordering:
+#   (1) signal app to stop new writes
+#   (2) wait for kernel buffer to drain (notsent == 0)
+#   (3) arm zero-window hold to freeze the peer
+TGEN_HOST_PID=$(cat "${LOG_DIR}/tgen_host_pid" 2>/dev/null || echo "")
+if [[ -n "${TGEN_HOST_PID}" ]]; then
+    echo "[arm-zw] pausing traffic generator (SIGUSR1) — draining kernel send buffer first"
+    # kill may need sudo if the process runs as root (ip netns exec runs as root)
+    kill -USR1 "${TGEN_HOST_PID}" 2>/dev/null || \
+        ([ -x /usr/bin/sudo ] && /usr/bin/sudo kill -USR1 "${TGEN_HOST_PID}" 2>/dev/null) || true
+    # Brief wait for kernel to transmit buffered data and receive ACKs (~2 RTTs)
+    VETH_HOST=$(cat "${LOG_DIR}/veth_name" 2>/dev/null || echo "veth-spike")
+    POD_NETNS="${POD_NETNS:-pm-spike-pod}"
+    for i in $(seq 1 30); do
+        NS=$(ip netns exec "${POD_NETNS}" ss -tin 2>/dev/null \
+            | grep -A3 "10.244.0" | grep -oE 'notsent:[0-9]+' | cut -d: -f2 | head -1 || true)
+        # notsent absent in ss output means it is 0 (field omitted when zero)
+        if [[ -z "${NS}" ]] || [[ "${NS}" == "0" ]]; then
+            echo "[arm-zw] kernel buffer drained (notsent=${NS:-0}) after ${i}x100ms"
+            break
+        fi
+        echo "[arm-zw] waiting for kernel buffer drain: notsent=${NS}"
+        sleep 0.1
+    done
+fi
+
 echo "[arm-zw] arming zero-window hold on ${VETH_NAME} TC egress"
 
 # Add clsact qdisc if not present (idempotent)

@@ -28,31 +28,15 @@ if ip netns list 2>/dev/null | grep -q "^${MIGRATION_NETNS}"; then
 fi
 ip link del veth-mig 2>/dev/null || true
 
-echo "[dest-netns] creating migration netns ${MIGRATION_NETNS}"
+echo "[dest-netns] creating bare migration netns ${MIGRATION_NETNS} (no eth0)"
+# No veth or IP is pre-staged here. CRIU will create eth0 inside this netns
+# during restore using --external veth[eth0]:veth-mig@BRIDGE. CRIU restores
+# the IP address and routes from the checkpoint images.
+# Pre-staging eth0 caused EEXIST (Can't restore link: -17) because CRIU
+# tried to create eth0 again inside --join-ns netns.
 ip netns add "${MIGRATION_NETNS}"
 
-# Create veth pair: veth-mig (host) <-> eth0 (migration netns)
-ip link add veth-mig type veth peer name eth0
-ip link set eth0 netns "${MIGRATION_NETNS}"
-
-# Host side: wire into flannel bridge
-ip link set veth-mig master "${FLANNEL_BRIDGE}"
-ip link set veth-mig up
-
-# Migration netns: assign the SOURCE pod IP as primary address
-# (it will be a "foreign" IP from the flannel perspective of pm-control,
-#  but that's fine — the FDB injection will route traffic here)
-ip netns exec "${MIGRATION_NETNS}" ip addr add "${POD_IP}/32" dev eth0
-ip netns exec "${MIGRATION_NETNS}" ip link set eth0 up
-ip netns exec "${MIGRATION_NETNS}" ip link set lo up
-
-# Default route inside migration netns via flannel bridge gateway
-FLANNEL_GW=$(ip -4 addr show "${FLANNEL_BRIDGE}" | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
-if [[ -n "${FLANNEL_GW}" ]]; then
-    ip netns exec "${MIGRATION_NETNS}" ip route add default via "${FLANNEL_GW}"
-fi
-
-echo "[dest-netns] migration netns ready: pod IP ${POD_IP} assigned to eth0 in ${MIGRATION_NETNS}"
+echo "[dest-netns] bare migration netns ready: ${MIGRATION_NETNS}"
 
 # Export the migration netns fd path (CRIU needs a file descriptor or path)
 NETNS_PATH="/var/run/netns/${MIGRATION_NETNS}"
@@ -84,22 +68,15 @@ DEST_VTEP_IP=$(ip -4 addr show "${VTEP_DEV}" | grep 'inet ' | awk '{print $2}' |
 echo "${DEST_VTEP_IP}" > "${LOG_DIR}/dest_vtep_ip"
 echo "[dest-netns] destination VTEP IP: ${DEST_VTEP_IP}"
 
-# Discover the migration netns veth MAC (the pod's apparent MAC in flannel)
-MIG_VETH_MAC=$(ip netns exec "${MIGRATION_NETNS}" ip link show eth0 | awk '/link\/ether/{print $2}')
-echo "${MIG_VETH_MAC}" > "${LOG_DIR}/pod_veth_mac"
-echo "[dest-netns] migration netns veth MAC: ${MIG_VETH_MAC}"
+# Note: eth0 and veth-mig are created by CRIU during restore
+# (--external veth[eth0]:veth-mig@BRIDGE). MAC is unknown until after restore.
+echo "[dest-netns] eth0/veth-mig will be created by CRIU restore"
 
-# Attach seq_xlat_noop observer BPF to the host side of the migration veth
-# This logs seq numbers for every TCP packet crossing the relay boundary
+# BPF observer attached AFTER CRIU restore creates veth-mig
+# (see post-restore step in 07_disarm.sh or verify script)
 SPIKE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BPF_OBJ="${SPIKE_DIR}/bpf/seq_xlat_noop.o"
-if [[ -f "${BPF_OBJ}" ]]; then
-    tc qdisc add dev veth-mig clsact 2>/dev/null || true
-    tc filter del dev veth-mig ingress 2>/dev/null || true
-    tc filter add dev veth-mig ingress bpf direct-action obj "${BPF_OBJ}" sec tc
-    echo "[dest-netns] seq observer BPF attached to veth-mig ingress"
-    echo "[dest-netns] trace: cat /sys/kernel/debug/tracing/trace_pipe | grep pm-relay"
-fi
+echo "[dest-netns] BPF observer will be attached to veth-mig after CRIU restore"
 
 echo ""
 echo "[dest-netns] DESTINATION NETNS READY"
@@ -108,7 +85,7 @@ echo ""
 echo "[dest-netns] Copy these values to pm-worker for FDB injection (05_inject_fdb.sh):"
 echo "  DEST_VTEP_MAC=${DEST_VTEP_MAC}"
 echo "  DEST_VTEP_IP=${DEST_VTEP_IP}"
-echo "  POD_VETH_MAC=${MIG_VETH_MAC}"
+echo "  POD_VETH_MAC=(determined after CRIU restore creates veth-mig)"
 echo ""
 echo "[dest-netns] Start tcpdump on destination to capture return path:"
 echo "  tcpdump -i ${VTEP_DEV} -w ${LOG_DIR}/capture_dest.pcap -s 128 'tcp'"
