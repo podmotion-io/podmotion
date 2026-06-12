@@ -166,10 +166,19 @@ diagnosis, actionable message. This is documented in ADR-0054.
 
 The same logic applies to every external LB type. The beta release ships validators for
 AWS ALB and NLB; the validator interface is open and documented so operators can register
-any LB type. If no validator is registered for a given LB type, the migration is blocked
-with `UnknownLoadBalancerType` — requiring the operator to explicitly acknowledge the risk
-via `onValidationFailure: Skip` rather than discovering it in production. Additional
-validators (Nginx Ingress, Istio, MetalLB, GCP, Azure) are tracked in the M22 milestone.
+any LB type. Additional validators (Nginx Ingress, Istio, MetalLB, GCP, Azure) are tracked
+in the M22 milestone.
+
+Operators who want to migrate and handle traffic routing themselves — pointing a new LB at
+the destination manually, cutting over DNS, or running an unsupported LB type — can bypass
+the preflight entirely. All LB-related checks (`LBRouteReachable`, `UnknownLoadBalancerType`,
+`EndpointSliceReady`) are in the `allowForce` category: set `onValidationFailure: Skip` in
+`MigrationPolicy` or pass `--bypass-preflight --reason "manual cutover"` on the CLI. The
+pod migrates; traffic routing is the operator's responsibility.
+
+What cannot be bypassed are the checks that protect migration correctness itself:
+destination node readiness, source pod liveness, checkpoint directory permissions, and
+concurrent migration exclusion. Those are hard gates with no override.
 
 This is the only limitation. And it is not a defect — it is the correct behavior for
 a system that would rather refuse than silently corrupt.
