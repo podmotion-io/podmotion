@@ -26,7 +26,7 @@ For full architecture, API reference, and installation guides see [docs/](docs/)
 make docker-build docker-push IMG=ghcr.io/podmotion-io/podmotion:tag
 ```
 
-Images are published to [hub.docker.com/u/podmotion](https://hub.docker.com/u/podmotion).
+Images are published to [ghcr.io/podmotion-io](https://github.com/orgs/podmotion-io/packages).
 Pull access is public. For the latest release tag see the [releases page](https://github.com/podmotion-io/podmotion/releases).
 
 **Install the CRDs into the cluster:**
