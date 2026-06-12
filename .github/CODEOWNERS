@@ -1,0 +1,18 @@
+# PodMotion CODEOWNERS
+# Every path is owned by the maintainers team by default.
+# Security-sensitive paths additionally require a security reviewer.
+# Order matters: the last matching pattern wins — default is listed first.
+
+*                           @podmotion-io/maintainers
+
+# Security-sensitive paths — require maintainer + security reviewer.
+/bpf/                       @podmotion-io/maintainers @podmotion-io/security-reviewers
+/internal/agent/            @podmotion-io/maintainers @podmotion-io/security-reviewers
+/pkg/nri/                   @podmotion-io/maintainers @podmotion-io/security-reviewers
+/pkg/restore/               @podmotion-io/maintainers @podmotion-io/security-reviewers
+/docs/legal/                @podmotion-io/maintainers @podmotion-io/security-reviewers
+
+# Governance and security policy changes also require security reviewers.
+/SECURITY.md                @podmotion-io/maintainers @podmotion-io/security-reviewers
+/GOVERNANCE.md              @podmotion-io/maintainers @podmotion-io/security-reviewers
+/.github/CODEOWNERS         @podmotion-io/maintainers @podmotion-io/security-reviewers

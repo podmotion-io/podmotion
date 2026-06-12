@@ -1,0 +1,145 @@
+name: Reusable Build Image
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "Image short name (operator|agent|scheduler|pm-checkpoint-gc)"
+        required: true
+        type: string
+      tags:
+        description: "docker/metadata-action tags block (newline-separated)"
+        required: true
+        type: string
+      sign:
+        description: "Sign the image with cosign keyless"
+        required: false
+        default: true
+        type: boolean
+      sbom:
+        description: "Generate SBOM with syft and attest"
+        required: false
+        default: true
+        type: boolean
+    outputs:
+      digest:
+        description: "Pushed image digest"
+        value: ${{ jobs.build.outputs.digest }}
+      image-ref:
+        description: "Fully-qualified image ref (without tag)"
+        value: ${{ jobs.build.outputs.image-ref }}
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: podmotion-io
+
+jobs:
+  build:
+    name: Build ${{ inputs.image }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ inputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign
+        if: ${{ inputs.sign }}
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ inputs.image }}
+          tags: ${{ inputs.tags }}
+          labels: |
+            org.opencontainers.image.title=podmotion-${{ inputs.image }}
+            org.opencontainers.image.description=PodMotion ${{ inputs.image }} — live pod migration for Kubernetes
+            org.opencontainers.image.url=https://podmotion.io
+            org.opencontainers.image.source=https://github.com/podmotion-io/podmotion
+            org.opencontainers.image.licenses=Apache-2.0
+          annotations: |
+            org.opencontainers.image.title=podmotion-${{ inputs.image }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          file: ./cmd/${{ inputs.image }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha,scope=${{ inputs.image }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image }}
+
+      - name: Sign image (keyless)
+        if: ${{ inputs.sign }}
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          images=""
+          for tag in ${TAGS}; do
+            images="${images} ${tag}@${DIGEST}"
+          done
+          cosign sign --yes ${images}
+
+      - name: Install syft
+        if: ${{ inputs.sbom }}
+        uses: anchore/sbom-action/download-syft@55dc4ee22412511ee8c3142cbea40418e6cec693 # v0.17.8
+
+      - name: Generate SBOM (SPDX-JSON)
+        if: ${{ inputs.sbom }}
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ inputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          syft "${IMAGE_REF}@${DIGEST}" -o spdx-json="sbom-${{ inputs.image }}.spdx.json"
+
+      - name: Attest SBOM
+        if: ${{ inputs.sbom }}
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ inputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign attest --yes \
+            --predicate "sbom-${{ inputs.image }}.spdx.json" \
+            --type spdxjson \
+            "${IMAGE_REF}@${DIGEST}"
+
+      - name: Upload SBOM artifact
+        if: ${{ inputs.sbom }}
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: sbom-${{ inputs.image }}
+          path: sbom-${{ inputs.image }}.spdx.json
+          retention-days: 30
