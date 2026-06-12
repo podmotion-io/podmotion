@@ -110,7 +110,8 @@ const (
 )
 
 // MigrationPhase represents the current phase of a PodMigration.
-// +kubebuilder:validation:Enum=Pending;Validating;PreMigrating;Checkpointing;Transferring;Restoring;Verifying;Complete;Failed;RollingBack;DryRunComplete
+// The 12-phase pipeline replaces the earlier 8-phase pipeline per ADR-0047.
+// +kubebuilder:validation:Enum=Pending;SocketInventory;Validating;DestinationPrewarm;PreCopyMemory;ZeroWindowArm;FinalFreezeStateCapture;OverlayHandoff;RestoreSocketReattach;DisengageHold;TCPVerifying;ServiceVerifying;CutoverComplete;Complete;Failed;RollingBack;DryRunComplete
 type MigrationPhase string
 
 const (
@@ -125,6 +126,22 @@ const (
 	MigrationPhaseFailed         MigrationPhase = "Failed"
 	MigrationPhaseRollingBack    MigrationPhase = "RollingBack"
 	MigrationPhaseDryRunComplete MigrationPhase = "DryRunComplete"
+
+	// 12-phase pipeline phases per ADR-0047 (TCP-first migration architecture).
+	// These replace the 8-phase pipeline for TCPPreservationMode=Strict/BestEffort.
+	// TCPPreservationMode=None degenerates through the subset of phases that apply
+	// to stateless workloads (SocketInventory and TCPVerifying are skipped).
+	MigrationPhaseSocketInventory        MigrationPhase = "SocketInventory"
+	MigrationPhaseDestinationPrewarm     MigrationPhase = "DestinationPrewarm"
+	MigrationPhasePreCopyMemory          MigrationPhase = "PreCopyMemory"
+	MigrationPhaseZeroWindowArm          MigrationPhase = "ZeroWindowArm"
+	MigrationPhaseFinalFreezeStateCapture MigrationPhase = "FinalFreezeStateCapture"
+	MigrationPhaseOverlayHandoff         MigrationPhase = "OverlayHandoff"
+	MigrationPhaseRestoreSocketReattach  MigrationPhase = "RestoreSocketReattach"
+	MigrationPhaseDisengageHold          MigrationPhase = "DisengageHold"
+	MigrationPhaseTCPVerifying           MigrationPhase = "TCPVerifying"
+	MigrationPhaseServiceVerifying       MigrationPhase = "ServiceVerifying"
+	MigrationPhaseCutoverComplete        MigrationPhase = "CutoverComplete"
 )
 
 // AffinityMode controls how PodMotion handles hard nodeAffinity and nodeSelector rules
