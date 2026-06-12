@@ -1,6 +1,6 @@
 # PodMotion
 
-Live pod migration for Kubernetes — the container equivalent of live VM migration.
+Live pod migration for Kubernetes — live VM migration (OpenStack/live VM migration) at the pod layer.
 
 ## Description
 
