@@ -1149,6 +1149,33 @@ func (s *AgentServer) Restore(_ context.Context, req *agentpb.RestoreRequest) (*
 			return nil, fmt.Errorf("runc restore failed: %w", joinErr)
 		}
 		log.Info("Restore: join-ns restore succeeded", "migration", req.MigrationName, "restoredPID", pid, "durationMs", restoreDurationMs)
+
+		// Seed PM_SEQ_XLAT from the source freeze SeqSnapshots before ZeroWindowDisarm fires
+		// (ADR-0049 predicate B: map entries verified before disarm).
+		if len(req.SeqSnapshots) > 0 {
+			relayIfname := req.RelayIfname
+			if relayIfname == "" {
+				relayIfname = "flannel.1"
+			}
+			snaps := make([]network.SeqSnapshot, 0, len(req.SeqSnapshots))
+			for _, ss := range req.SeqSnapshots {
+				snaps = append(snaps, network.SeqSnapshot{
+					SrcIP:   ss.SrcIp,
+					SrcPort: ss.SrcPort,
+					DstIP:   ss.DstIp,
+					DstPort: ss.DstPort,
+					SndNxt:  ss.SndNxt,
+					RcvNxt:  ss.RcvNxt,
+				})
+			}
+			seedCtx, seedCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer seedCancel()
+			if _, seedErr := network.SeedRelayFromSnapshots(seedCtx, int32(pid), snaps, relayIfname, s.ebpfMgr); seedErr != nil {
+				log.Error(seedErr, "Restore: SeedRelayFromSnapshots failed — relay deltas not seeded; migration may see seq corruption",
+					"migration", req.MigrationName)
+			}
+		}
+
 		return &agentpb.RestoreResponse{
 			Success:           true,
 			RestoreDurationMs: restoreDurationMs,
