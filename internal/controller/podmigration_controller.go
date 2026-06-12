@@ -247,7 +247,7 @@ func (r *PodMigrationReconciler) reconcileSocketInventory(ctx context.Context, p
 		log.Info("SocketInventory: skipped (TCPPreservationMode=None)", "migration", pm.Name)
 		setCondition(pm, pmv1.ConditionSocketInventoryComplete, metav1.ConditionTrue,
 			"Skipped", "TCPPreservationMode=None: socket inventory not required")
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseValidating)
@@ -259,7 +259,7 @@ func (r *PodMigrationReconciler) reconcileSocketInventory(ctx context.Context, p
 	log.Info("SocketInventory: recording TCP 4-tuples from source pod", "migration", pm.Name)
 	setCondition(pm, pmv1.ConditionSocketInventoryComplete, metav1.ConditionTrue,
 		"InventoryRecorded", "TCP socket inventory recorded from source pod netns")
-	if err := r.Status().Update(ctx, pm); err != nil {
+	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseValidating)
@@ -279,7 +279,7 @@ func (r *PodMigrationReconciler) reconcileDestinationPrewarm(ctx context.Context
 		log.Info("DestinationPrewarm: skipped (TCPPreservationMode=None)", "migration", pm.Name)
 		setCondition(pm, pmv1.ConditionDestinationNetnsReady, metav1.ConditionTrue,
 			"Skipped", "TCPPreservationMode=None: destination netns pre-staging not required")
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhasePreCopyMemory)
@@ -291,7 +291,7 @@ func (r *PodMigrationReconciler) reconcileDestinationPrewarm(ctx context.Context
 	log.Info("DestinationPrewarm: pre-staging migration netns on destination node (ADR-0048)", "migration", pm.Name)
 	setCondition(pm, pmv1.ConditionDestinationNetnsReady, metav1.ConditionTrue,
 		"NetnsReady", "destination migration netns pre-staged with source IP and overlay routing")
-	if err := r.Status().Update(ctx, pm); err != nil {
+	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhasePreCopyMemory)
@@ -314,7 +314,7 @@ func (r *PodMigrationReconciler) reconcilePreCopyMemory(ctx context.Context, pm 
 		if memoryCond == nil {
 			setCondition(pm, conditionMemorySynced, metav1.ConditionTrue,
 				"ColdModeFastPath", "Cold migration: pre-copy skipped")
-			if err := r.Status().Update(ctx, pm); err != nil {
+			if err := r.statusUpdate(ctx, pm); err != nil {
 				return ctrl.Result{}, err
 			}
 			memorySynced = true
@@ -324,7 +324,7 @@ func (r *PodMigrationReconciler) reconcilePreCopyMemory(ctx context.Context, pm 
 	if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeNone && !networkBridgeArmed {
 		setCondition(pm, conditionNetworkBridgeArmed, metav1.ConditionTrue,
 			"TIER4FastPath", "v0.1 cold migration: no eBPF bridge needed (ADR-0028)")
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 		networkBridgeArmed = true
@@ -333,7 +333,7 @@ func (r *PodMigrationReconciler) reconcilePreCopyMemory(ctx context.Context, pm 
 	if !storageReady && r.StorageMgr == nil {
 		setCondition(pm, conditionStorageReady, metav1.ConditionTrue,
 			"StatelessFastPath", "No PVC volumes: storage pre-stage not required")
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 		storageReady = true
@@ -385,7 +385,7 @@ func (r *PodMigrationReconciler) reconcileZeroWindowArm(ctx context.Context, pm 
 		log.Info("ZeroWindowArm: skipped (TCPPreservationMode=None)", "migration", pm.Name)
 		setCondition(pm, pmv1.ConditionZeroWindowArmed, metav1.ConditionTrue,
 			"Skipped", "TCPPreservationMode=None: zero-window hold not required")
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseFinalFreezeStateCapture)
@@ -397,7 +397,7 @@ func (r *PodMigrationReconciler) reconcileZeroWindowArm(ctx context.Context, pm 
 	log.Info("ZeroWindowArm: arming TC-BPF zero-window hold on source veth (ADR-0049)", "migration", pm.Name)
 	setCondition(pm, pmv1.ConditionZeroWindowArmed, metav1.ConditionTrue,
 		"Armed", "TC-BPF zero-window hold program loaded and armed on source pod veth")
-	if err := r.Status().Update(ctx, pm); err != nil {
+	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseFinalFreezeStateCapture)
@@ -437,7 +437,7 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 		log.Info("OverlayHandoff: skipped (TCPPreservationMode=None)", "migration", pm.Name)
 		setCondition(pm, pmv1.ConditionVXLANFDBUpdated, metav1.ConditionTrue,
 			"Skipped", "TCPPreservationMode=None: overlay FDB injection not required")
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoreSocketReattach)
@@ -448,7 +448,7 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 	log.Info("OverlayHandoff: injecting VXLAN FDB + neighbor entries on both nodes (ADR-0048)", "migration", pm.Name)
 	setCondition(pm, pmv1.ConditionVXLANFDBUpdated, metav1.ConditionTrue,
 		"FDBInjected", "AF_BRIDGE FDB and AF_INET neighbor entries injected on both nodes")
-	if err := r.Status().Update(ctx, pm); err != nil {
+	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoreSocketReattach)
@@ -488,7 +488,7 @@ func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm 
 		log.Info("DisengageHold: skipped (TCPPreservationMode=None)", "migration", pm.Name)
 		setCondition(pm, pmv1.ConditionRelayProgramsLoaded, metav1.ConditionTrue,
 			"Skipped", "TCPPreservationMode=None: relay disarm not required")
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseTCPVerifying)
@@ -499,7 +499,7 @@ func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm 
 	log.Info("DisengageHold: disarming ZW hold and loading PM_SEQ_XLAT relay programs (ADR-0049)", "migration", pm.Name)
 	setCondition(pm, pmv1.ConditionRelayProgramsLoaded, metav1.ConditionTrue,
 		"RelayLoaded", "TC-BPF relay programs and PM_SEQ_XLAT maps loaded on destination node; ZW hold disarmed")
-	if err := r.Status().Update(ctx, pm); err != nil {
+	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseTCPVerifying)
@@ -521,7 +521,7 @@ func (r *PodMigrationReconciler) reconcileTCPVerifying(ctx context.Context, pm *
 		log.Info("TCPVerifying: skipped (TCPPreservationMode=None)", "migration", pm.Name)
 		setCondition(pm, pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionTrue,
 			"Skipped", "TCPPreservationMode=None: TCP sequence verification not required")
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseServiceVerifying)
@@ -547,7 +547,7 @@ func (r *PodMigrationReconciler) reconcileTCPVerifying(ctx context.Context, pm *
 	log.Error(nil, msg, "migration", pm.Name, "mode", pm.Spec.TCPPreservationMode)
 	setCondition(pm, pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionFalse,
 		"ProbeNotImplemented", msg)
-	if err := r.Status().Update(ctx, pm); err != nil {
+	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
 	switch pm.Spec.TCPPreservationMode {
@@ -562,7 +562,7 @@ func (r *PodMigrationReconciler) reconcileTCPVerifying(ctx context.Context, pm *
 	// Do NOT set TCPSequenceContinuityVerified=True here — the condition remains False.
 	// Only advance to ServiceVerifying; source pod deletion in CutoverComplete will re-check
 	// this condition for Strict mode.
-	if err := r.Status().Update(ctx, pm); err != nil {
+	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseServiceVerifying)
@@ -611,7 +611,7 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 				msg := fmt.Sprintf("ServiceVerifying: HTTP/endpoint verification failed in Strict mode: %v", err)
 				log.Error(err, "ServiceVerifying: hard-blocking CutoverComplete — Strict mode requires real verification", "migration", pm.Name)
 				setCondition(pm, conditionTrafficVerified, metav1.ConditionFalse, "VerificationFailed", msg)
-				if updateErr := r.Status().Update(ctx, pm); updateErr != nil {
+				if updateErr := r.statusUpdate(ctx, pm); updateErr != nil {
 					return ctrl.Result{}, updateErr
 				}
 				return r.initiateRollback(ctx, pm, msg)
@@ -620,7 +620,7 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 			log.Info("ServiceVerifying: HTTP/endpoint verification failed (warn-only, ADR-0019)", "migration", pm.Name, "err", err)
 			setCondition(pm, conditionTrafficVerified, metav1.ConditionFalse, "VerificationFailed",
 				fmt.Sprintf("verification failed (non-Strict, proceeding): %v", err))
-			if updateErr := r.Status().Update(ctx, pm); updateErr != nil {
+			if updateErr := r.statusUpdate(ctx, pm); updateErr != nil {
 				return ctrl.Result{}, updateErr
 			}
 			return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
@@ -632,7 +632,7 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 			msg := "ServiceVerifying: TrafficVerifier not wired but TCPPreservationMode=Strict requires real verification; blocking CutoverComplete to prevent source pod deletion without proof of service liveness"
 			log.Error(nil, msg, "migration", pm.Name)
 			setCondition(pm, conditionTrafficVerified, metav1.ConditionFalse, "VerifierNotWired", msg)
-			if updateErr := r.Status().Update(ctx, pm); updateErr != nil {
+			if updateErr := r.statusUpdate(ctx, pm); updateErr != nil {
 				return ctrl.Result{}, updateErr
 			}
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -642,7 +642,7 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 
 	setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "ServiceVerified",
 		"HTTP/endpoint readiness confirmed at destination pod")
-	if err := r.Status().Update(ctx, pm); err != nil {
+	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
@@ -666,7 +666,7 @@ func (r *PodMigrationReconciler) reconcileCutoverComplete(ctx context.Context, p
 		}
 		setCondition(pm, conditionDestinationVolumeReady, metav1.ConditionTrue,
 			"VolumeAttached", "RWO PVC attached on destination node (or no PVCs)")
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -780,7 +780,7 @@ func (r *PodMigrationReconciler) reconcileDryRun(ctx context.Context, pm *pmv1.P
 	pm.Status.DryRunEstimate = estimate
 	pm.Status.Phase = pmv1.MigrationPhaseDryRunComplete
 	setCondition(pm, conditionValidated, metav1.ConditionTrue, "DryRunComplete", "Estimation succeeded")
-	return ctrl.Result{}, r.Status().Update(ctx, pm)
+	return ctrl.Result{}, r.statusUpdate(ctx, pm)
 }
 
 func (r *PodMigrationReconciler) reconcileValidating(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
@@ -870,7 +870,7 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 		}
 		setCondition(pm, conditionGitOpsSuspended, metav1.ConditionTrue, "Suspended",
 			"GitOps controller suspended for migration window (or no GitOps controller detected)")
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -897,7 +897,7 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 	if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeNone && !networkBridgeArmed {
 		setCondition(pm, conditionNetworkBridgeArmed, metav1.ConditionTrue,
 			"TIER4FastPath", "v0.1 cold migration: no eBPF bridge needed (ADR-0028)")
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 		networkBridgeArmed = true
@@ -911,7 +911,7 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 		if memoryCond == nil {
 			setCondition(pm, conditionMemorySynced, metav1.ConditionTrue,
 				"ColdModeFastPath", "Cold migration: pre-copy skipped")
-			if err := r.Status().Update(ctx, pm); err != nil {
+			if err := r.statusUpdate(ctx, pm); err != nil {
 				return ctrl.Result{}, err
 			}
 			memorySynced = true
@@ -936,7 +936,7 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 		if !hasPVCs {
 			setCondition(pm, conditionStorageReady, metav1.ConditionTrue,
 				"StatelessFastPath", "No PVC volumes: storage pre-stage not required")
-			if err := r.Status().Update(ctx, pm); err != nil {
+			if err := r.statusUpdate(ctx, pm); err != nil {
 				return ctrl.Result{}, err
 			}
 			storageReady = true
@@ -952,12 +952,12 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 	}
 	if destNodeForAntiAff != "" && !meta.IsStatusConditionTrue(pm.Status.Conditions, orchestration.ConditionAntiAffinityConflict) {
 		if err := r.checkAntiAffinityConflict(ctx, pm, destNodeForAntiAff); err != nil {
-			if err := r.Status().Update(ctx, pm); err != nil {
+			if err := r.statusUpdate(ctx, pm); err != nil {
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -985,7 +985,7 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 			}
 			setCondition(pm, conditionCapacityReserved, metav1.ConditionTrue, "Reserved",
 				fmt.Sprintf("capacity slot reserved on destination node %s", destNode))
-			if err := r.Status().Update(ctx, pm); err != nil {
+			if err := r.statusUpdate(ctx, pm); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -1073,7 +1073,7 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		if err == nil && !nmc.Spec.KernelFeatures.Userfaultfd {
 			msg := "PostCopy mode requires CONFIG_USERFAULTFD on source node (kernel feature absent)"
 			setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CheckpointFailed", msg)
-			return ctrl.Result{}, r.Status().Update(ctx, pm)
+			return ctrl.Result{}, r.statusUpdate(ctx, pm)
 		}
 	}
 
@@ -1082,7 +1082,7 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		log.Error(nil, "AgentPool is nil — cannot issue Checkpoint RPC; requeuing", "migration", pm.Name)
 		setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "AgentPoolUnavailable",
 			"AgentPool not wired; waiting for agent pool to become available")
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
@@ -1104,7 +1104,7 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		log.Error(err, "Failed to connect to source agent", "node", sourceNode)
 		setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CheckpointFailed",
 			fmt.Sprintf("agent connection failed: %v", err))
-		return ctrl.Result{}, r.Status().Update(ctx, pm)
+		return ctrl.Result{}, r.statusUpdate(ctx, pm)
 	}
 
 	// Step 1: PrepareSource — verify the pod is still migratable.
@@ -1125,7 +1125,7 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 			reason = err.Error()
 		}
 		setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CheckpointFailed", reason)
-		return ctrl.Result{}, r.Status().Update(ctx, pm)
+		return ctrl.Result{}, r.statusUpdate(ctx, pm)
 	}
 
 	// Step 1b: GPU gate check and pre-checkpoint.
@@ -1144,7 +1144,7 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		gpuDir := fmt.Sprintf("/tmp/podmotion/%s/gpu", pm.Name)
 		if _, err := gpuCP.Checkpoint(ctx, pm.Spec.PodName, pm.Spec.PodNamespace, gpuDir); err != nil {
 			setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "GPUCheckpointFailed", err.Error())
-			return ctrl.Result{}, r.Status().Update(ctx, pm)
+			return ctrl.Result{}, r.statusUpdate(ctx, pm)
 		}
 		log.Info("GPU checkpoint captured", "migration", pm.Name, "gpuDir", gpuDir)
 	}
@@ -1187,20 +1187,24 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 	if err != nil {
 		errStr := err.Error()
 		// Distinguish transient connection errors from hard capability failures.
-		if grpcStatus, ok := status.FromError(err); ok && grpcStatus.Code() == codes.Unavailable {
-			log.Error(err, "Checkpoint RPC unavailable — requeuing", "migration", pm.Name)
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
-		if strings.Contains(errStr, "ptrace") || strings.Contains(errStr, "EPERM") ||
-			strings.Contains(errStr, "capability") || strings.Contains(errStr, "permission denied") {
-			log.Error(err, "Checkpoint RPC failed: CRIU capability/ptrace error", "migration", pm.Name)
-			setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CRIUCapabilityError",
-				fmt.Sprintf("CRIU ptrace/capability error: %v", err))
-			return ctrl.Result{}, r.Status().Update(ctx, pm)
+		if grpcStatus, ok := status.FromError(err); ok {
+			switch grpcStatus.Code() {
+			case codes.Unavailable:
+				log.Error(err, "Checkpoint RPC unavailable — requeuing", "migration", pm.Name)
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			case codes.FailedPrecondition:
+				// Agent returned codes.FailedPrecondition for ErrCRIUCapability (missing
+				// CAP_SYS_PTRACE or blocking seccomp). Hard failure — do not retry.
+				// (M19.5 criterion 13: use grpcStatus.Code() not string matching.)
+				log.Error(err, "Checkpoint RPC failed: CRIU capability/ptrace error", "migration", pm.Name)
+				setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CRIUCapabilityError",
+					fmt.Sprintf("CRIU ptrace/capability error: %v", err))
+				return ctrl.Result{}, r.statusUpdate(ctx, pm)
+			}
 		}
 		log.Error(err, "Checkpoint RPC failed", "migration", pm.Name)
 		setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CheckpointFailed", errStr)
-		return ctrl.Result{}, r.Status().Update(ctx, pm)
+		return ctrl.Result{}, r.statusUpdate(ctx, pm)
 	}
 
 	// Gate: treat a zero-byte checkpoint as an incomplete dump and requeue.
@@ -1245,7 +1249,7 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 	// can be empty if this reconcile was fetched from cache before the status write landed.
 	if pm.Status.DestinationNodeName == "" && pm.Spec.TargetNodeName != "" {
 		pm.Status.DestinationNodeName = pm.Spec.TargetNodeName
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, fmt.Errorf("setting DestinationNodeName in Checkpointing phase: %w", err)
 		}
 		log.Info("set DestinationNodeName from spec.targetNodeName in Checkpointing phase",
@@ -1354,7 +1358,7 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 		// sees CheckpointTransferred=true and skips straight to the release call,
 		// which is idempotent on an already-absent dir.
 		pm.Status.CheckpointTransferred = true
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, fmt.Errorf("persist CheckpointTransferred: %w", err)
 		}
 
@@ -1395,7 +1399,7 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 		} else {
 			setCondition(pm, conditionSchedulingGateRemoved, metav1.ConditionTrue,
 				"GateRemoved", "podmotion.io/awaiting-checkpoint gate removed post-transfer")
-			if err := r.Status().Update(ctx, pm); err != nil {
+			if err := r.statusUpdate(ctx, pm); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -1503,7 +1507,7 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 		// Fallback: populate from spec.targetNodeName if status was not set during pre-migration.
 		if pm.Spec.TargetNodeName != "" {
 			pm.Status.DestinationNodeName = pm.Spec.TargetNodeName
-			if err := r.Status().Update(ctx, pm); err != nil {
+			if err := r.statusUpdate(ctx, pm); err != nil {
 				return ctrl.Result{}, err
 			}
 			destNode = pm.Spec.TargetNodeName
@@ -1526,7 +1530,7 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 		log.Error(err, "Failed to connect to destination agent", "node", destNode)
 		setCondition(pm, conditionRestored, metav1.ConditionFalse, "RestoreFailed",
 			fmt.Sprintf("agent connection failed: %v", err))
-		return ctrl.Result{}, r.Status().Update(ctx, pm)
+		return ctrl.Result{}, r.statusUpdate(ctx, pm)
 	}
 
 	// PrepareDestination: pre-allocate the checkpoint directory and any cgroup/netns
@@ -1540,7 +1544,7 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 		log.Error(err, "PrepareDestination RPC failed", "node", destNode)
 		setCondition(pm, conditionRestored, metav1.ConditionFalse, "RestoreFailed",
 			fmt.Sprintf("PrepareDestination failed: %v", err))
-		return ctrl.Result{}, r.Status().Update(ctx, pm)
+		return ctrl.Result{}, r.statusUpdate(ctx, pm)
 	}
 	if !prepDestResp.Ready {
 		msg := prepDestResp.BlockingReason
@@ -1576,7 +1580,7 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 		if pm.Spec.RollbackOnFailure {
 			return r.initiateRollback(ctx, pm, msg)
 		}
-		return ctrl.Result{}, r.Status().Update(ctx, pm)
+		return ctrl.Result{}, r.statusUpdate(ctx, pm)
 	}
 
 	// Fail loudly if the agent fell back to a mock-restore (pod started fresh instead of
@@ -1623,7 +1627,7 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 		}
 		setCondition(pm, conditionDestinationVolumeReady, metav1.ConditionTrue,
 			"VolumeAttached", "RWO PVC attached on destination node")
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -1635,14 +1639,14 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 			msg := fmt.Sprintf("post-restore security context mismatch: %v", err)
 			log.Error(err, "security context verification failed", "migration", pm.Name)
 			setCondition(pm, conditionSecurityContextVerified, metav1.ConditionFalse, "Mismatch", msg)
-			if err2 := r.Status().Update(ctx, pm); err2 != nil {
+			if err2 := r.statusUpdate(ctx, pm); err2 != nil {
 				return ctrl.Result{}, err2
 			}
 			return r.failMigration(ctx, pm, msg)
 		}
 		setCondition(pm, conditionSecurityContextVerified, metav1.ConditionTrue,
 			"Verified", "Restored process security context matches checkpoint attestation")
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -1708,7 +1712,7 @@ func (r *PodMigrationReconciler) reconcileRestoringNRI(ctx context.Context, pm *
 		if pm.Spec.RollbackOnFailure {
 			return r.initiateRollback(ctx, pm, msg)
 		}
-		return ctrl.Result{}, r.Status().Update(ctx, pm)
+		return ctrl.Result{}, r.statusUpdate(ctx, pm)
 	}
 
 	// Wait for Running + at least one container Ready (NRI hook completed).
@@ -1771,7 +1775,7 @@ func (r *PodMigrationReconciler) reconcileRestoringNRI(ctx context.Context, pm *
 			"VolumeAttached", "RWO PVC attached on destination node (or no PVCs)")
 	}
 
-	if err := r.Status().Update(ctx, pm); err != nil {
+	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseVerifying)
@@ -1823,7 +1827,7 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 			log.Info("TrafficVerifier not wired; skipping verification", "migration", pm.Name)
 			setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "TrafficVerified", "Skipped: no verifier wired")
 		}
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -1843,7 +1847,7 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 		}
 		setCondition(pm, conditionDestinationVolumeReady, metav1.ConditionTrue,
 			"VolumeAttached", "RWO PVC attached on destination node (or no PVCs)")
-		if err := r.Status().Update(ctx, pm); err != nil {
+		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -1932,7 +1936,7 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 	pm.Status.Phase = pmv1.MigrationPhaseFailed
 	setCondition(pm, "RolledBack", metav1.ConditionTrue, "RollbackComplete", "Source pod restored to live state")
 	r.releaseDestinationCapacity(ctx, pm)
-	return ctrl.Result{}, r.Status().Update(ctx, pm)
+	return ctrl.Result{}, r.statusUpdate(ctx, pm)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -2406,6 +2410,23 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	})
 }
 
+
+// statusUpdate persists pm.Status via a fresh re-fetch + retry.RetryOnConflict loop so that
+// concurrent controller reconcile loops (or the status verifier goroutine) do not cause stale
+// resourceVersion Conflict errors to propagate as hard failures (M19.5 criterion 12).
+// All Status().Update call sites must use this instead of bare r.statusUpdate(ctx, pm).
+func (r *PodMigrationReconciler) statusUpdate(ctx context.Context, pm *pmv1.PodMigration) error {
+	key := client.ObjectKeyFromObject(pm)
+	want := pm.Status.DeepCopy()
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &pmv1.PodMigration{}
+		if err := r.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		fresh.Status = *want
+		return r.Status().Update(ctx, fresh)
+	})
+}
 
 // getRSSelector fetches the ReplicaSet's spec.selector.matchLabels keys and adds them
 // to the strip set. Non-fatal on any error — worst case we strip only pod-template-hash.

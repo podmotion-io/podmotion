@@ -28,6 +28,11 @@ import (
 
 const defaultCRIUBinaryPath = "/usr/local/sbin/criu"
 
+// ErrCRIUCapability is a sentinel returned (wrapped) when CRIU or a preflight check fails
+// because CAP_SYS_PTRACE is missing or a seccomp profile is blocking ptrace. Callers use
+// errors.Is/As to distinguish this from transient or configuration errors (M19.5 criterion 13).
+var ErrCRIUCapability = errors.New("CRIU capability/ptrace error")
+
 // CRIUCheckpointer implements Checkpointer using go-criu/v7 RPC to invoke
 // CRIU as a subprocess (ADR-0002 — never statically link GPLv2 code).
 type CRIUCheckpointer struct {
@@ -130,7 +135,9 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		return CheckpointResult{}, fmt.Errorf("context cancelled before Dump: %w", err)
 	}
 
-	if err := os.MkdirAll(opts.ImagesDir, 0o755); err != nil {
+	// 0o700: checkpoint images contain verbatim process memory and must be root-only.
+	// PreDump and Restore already use 0o700; Dump must match for consistency (M19.5 criterion 9).
+	if err := os.MkdirAll(opts.ImagesDir, 0o700); err != nil {
 		return CheckpointResult{}, fmt.Errorf("creating images dir %s: %w", opts.ImagesDir, err)
 	}
 
@@ -154,7 +161,9 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 			"pid", opts.Pid,
 			"imagesDir", opts.ImagesDir,
 		)
-		return CheckpointResult{}, fmt.Errorf("CRIU preflight failed: %w", err)
+		// Wrap with ErrCRIUCapability so callers can use errors.Is instead of string matching
+		// (M19.5 criterion 13: error classification via errors.Is/As not string matching).
+		return CheckpointResult{}, fmt.Errorf("CRIU preflight failed: %w: %w", ErrCRIUCapability, err)
 	}
 	logger.Info("CRIU ptrace preflight passed", "pid", opts.Pid)
 
