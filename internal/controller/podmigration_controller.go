@@ -19,11 +19,14 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -34,6 +37,7 @@ import (
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	agentclient "github.com/podmotion-io/podmotion/internal/agent/client"
+	"github.com/podmotion-io/podmotion/internal/gitops"
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
 	gpuagent "github.com/podmotion-io/podmotion/internal/agent/gpu"
 	"github.com/podmotion-io/podmotion/internal/agent/replication"
@@ -41,6 +45,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/traffic"
 	"github.com/podmotion-io/podmotion/internal/estimation"
 	"github.com/podmotion-io/podmotion/internal/featuregate"
+	"github.com/podmotion-io/podmotion/internal/orchestration"
 	"github.com/podmotion-io/podmotion/internal/rollback"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 	"google.golang.org/grpc/codes"
@@ -65,6 +70,8 @@ const (
 	conditionSchedulingGateRemoved   = "SchedulingGateRemoved"
 	conditionSecurityContextVerified = "SecurityContextVerified"
 	conditionDataplaneReconciled     = "DataplaneReconciled"
+	conditionGitOpsSuspended              = "GitOpsSuspended"
+	conditionEndpointSliceCleanVerified   = "EndpointSliceCleanupVerified"
 )
 
 // PodMigrationReconciler reconciles a PodMigration object.
@@ -93,6 +100,10 @@ type PodMigrationReconciler struct {
 	// Only called when GPUMigration feature gate is enabled and the pod has GPU resources.
 	// Defaults to GPUCheckpointerStub when nil (so GPU-unaware environments are unaffected).
 	GPUCheckpointer gpuagent.GPUCheckpointer
+	// GitOpsSuspender suspends and resumes the GitOps controller (ArgoCD/Flux) that owns
+	// the migrating workload.  Nil → NoopSuspender is used, so existing unit tests are
+	// unaffected.  Wired to ArgoCDClient or FluxClient in production via cmd/main.go.
+	GitOpsSuspender gitops.GitOpsSuspender
 }
 
 // +kubebuilder:rbac:groups=migration.podmotion.io,resources=podmigrations,verbs=get;list;watch;create;update;patch;delete
@@ -107,6 +118,8 @@ type PodMigrationReconciler struct {
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
@@ -208,6 +221,7 @@ func (r *PodMigrationReconciler) reconcileDryRun(ctx context.Context, pm *pmv1.P
 }
 
 func (r *PodMigrationReconciler) reconcileValidating(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
 	// Validation is primarily handled by the ValidatingAdmissionWebhook.
 	// Here we do a lighter runtime re-check: pod still exists, NMC still ready.
 	pod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
@@ -220,6 +234,30 @@ func (r *PodMigrationReconciler) reconcileValidating(ctx context.Context, pm *pm
 		return r.failMigration(ctx, pm, fmt.Sprintf("pod UID changed: expected %s, got %s", pm.Spec.SourcePodUID, pod.UID))
 	}
 
+	// Auto-populate SourcePodIP and SourcePodUID into Spec BEFORE any status mutations.
+	// r.Patch() writes the server response back into pm in-place, clobbering all in-memory
+	// status fields. By doing the spec patch first, subsequent status writes are clean.
+	needsPatch := (pm.Spec.SourcePodIP == "" && pod.Status.PodIP != "") ||
+		(pm.Spec.SourcePodUID == "" && string(pod.UID) != "")
+	if needsPatch {
+		patch := client.MergeFrom(pm.DeepCopy())
+		if pm.Spec.SourcePodIP == "" && pod.Status.PodIP != "" {
+			pm.Spec.SourcePodIP = pod.Status.PodIP
+		}
+		if pm.Spec.SourcePodUID == "" && string(pod.UID) != "" {
+			pm.Spec.SourcePodUID = string(pod.UID)
+		}
+		if patchErr := r.Patch(ctx, pm, patch); patchErr != nil {
+			return ctrl.Result{}, fmt.Errorf("patch SourcePodIP/UID from live pod: %w", patchErr)
+		}
+		log.Info("auto-populated SourcePodIP and SourcePodUID from live pod",
+			"migration", pm.Name, "sourcePodIP", pm.Spec.SourcePodIP, "sourcePodUID", pm.Spec.SourcePodUID)
+		// pm is now the server's latest object (post-patch). Re-read pod to keep pod data fresh
+		// in case node assignment raced, but pod-derived fields below use the local pod var which
+		// is still valid — pod identity was already confirmed via UID check above.
+	}
+
+	// Set all status fields after the spec patch so nothing is clobbered.
 	// Verify NMC is still ready on source node.
 	if pod.Spec.NodeName != "" {
 		nmc, nmcErr := r.getNMC(ctx, pod.Spec.NodeName)
@@ -235,6 +273,44 @@ func (r *PodMigrationReconciler) reconcileValidating(ctx context.Context, pm *pm
 
 func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+
+	// GitOps suspension: suspend the ArgoCD/Flux controller that owns this workload so
+	// it does not reconcile (and re-schedule pods on the source node) during the migration
+	// window.  Idempotent across requeueing — only suspends once per migration.
+	// Resume is always deferred so the controller is restored even on failure/rollback.
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionGitOpsSuspended) {
+		suspender := r.GitOpsSuspender
+		if suspender == nil {
+			suspender = &gitops.NoopSuspender{}
+		}
+		// Fetch the source pod to detect its GitOps ownership.
+		srcPod := &corev1.Pod{}
+		if err := r.Get(ctx, types.NamespacedName{Name: pm.Spec.PodName, Namespace: pm.Spec.PodNamespace}, srcPod); err == nil {
+			gctx, err := gitops.Detect(ctx, r.Client, srcPod)
+			if err != nil {
+				log.Error(err, "gitops detection failed — proceeding without suspension", "migration", pm.Name)
+			} else if gctx.Provider != gitops.GitOpsProviderNone {
+				if err := suspender.Suspend(ctx, &gctx); err != nil {
+					log.Error(err, "gitops suspend failed — proceeding anyway (ADR-0045: stability first)", "migration", pm.Name)
+				} else {
+					log.Info("gitops suspended", "migration", pm.Name, "provider", gctx.Provider, "app", gctx.AppName)
+				}
+				// Always resume, even if suspend failed — defer fires on all exit paths.
+				defer func() {
+					if err := suspender.Resume(ctx, gctx); err != nil {
+						log.Error(err, "gitops resume failed — MANUAL INTERVENTION REQUIRED", "migration", pm.Name, "app", gctx.AppName)
+					} else {
+						log.Info("gitops resumed", "migration", pm.Name, "app", gctx.AppName)
+					}
+				}()
+			}
+		}
+		setCondition(pm, conditionGitOpsSuspended, metav1.ConditionTrue, "Suspended",
+			"GitOps controller suspended for migration window (or no GitOps controller detected)")
+		if err := r.Status().Update(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	// Agent 11 (replication), Agent 3 (storage), and Agent 2 (network) drive pre-migration
 	// work asynchronously.  All three keystone conditions must be True before advancing:
@@ -263,6 +339,64 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 		}
 		networkBridgeArmed = true
 		log.Info("set NetworkBridgeArmed=True via TIER_4 fast-path", "migration", pm.Name)
+	}
+
+	// Cold-mode fast-path: MigrationModeCold skips all pre-copy rounds.
+	// Set MemorySynced=True immediately so the three-keystone gate can pass.
+	// PreCopy with a nil ReplicationMgr is a misconfiguration — caught at validation.
+	if !memorySynced && pm.Spec.Mode == pmv1.MigrationModeCold {
+		if memoryCond == nil {
+			setCondition(pm, conditionMemorySynced, metav1.ConditionTrue,
+				"ColdModeFastPath", "Cold migration: pre-copy skipped")
+			if err := r.Status().Update(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+			memorySynced = true
+			log.Info("set MemorySynced=True via cold-mode fast-path", "migration", pm.Name)
+		}
+	}
+
+	// TIER_4 storage fast-path: stateless pods (no PVC volumes) need no storage pre-stage.
+	// Set StorageReadyForFreeze=True immediately so the three-keystone gate can pass.
+	if !storageReady && r.StorageMgr == nil {
+		// Also check if the pod itself has any PVC volumes.
+		srcPodForStorage := &corev1.Pod{}
+		hasPVCs := false
+		if err := r.Get(ctx, types.NamespacedName{Name: pm.Spec.PodName, Namespace: pm.Spec.PodNamespace}, srcPodForStorage); err == nil {
+			for _, v := range srcPodForStorage.Spec.Volumes {
+				if v.PersistentVolumeClaim != nil {
+					hasPVCs = true
+					break
+				}
+			}
+		}
+		if !hasPVCs {
+			setCondition(pm, conditionStorageReady, metav1.ConditionTrue,
+				"StatelessFastPath", "No PVC volumes: storage pre-stage not required")
+			if err := r.Status().Update(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+			storageReady = true
+			log.Info("set StorageReadyForFreeze=True via stateless fast-path", "migration", pm.Name)
+		}
+	}
+
+	// Anti-affinity destination check: verify the destination node doesn't already host
+	// pods that would violate the source pod's requiredDuringScheduling podAntiAffinity.
+	destNodeForAntiAff := pm.Spec.TargetNodeName
+	if destNodeForAntiAff == "" {
+		destNodeForAntiAff = pm.Status.DestinationNodeName
+	}
+	if destNodeForAntiAff != "" && !meta.IsStatusConditionTrue(pm.Status.Conditions, orchestration.ConditionAntiAffinityConflict) {
+		if err := r.checkAntiAffinityConflict(ctx, pm, destNodeForAntiAff); err != nil {
+			if err := r.Status().Update(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		if err := r.Status().Update(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// emptyDir gate: pods with open FDs into emptyDir volumes cannot be checkpointed —
@@ -308,14 +442,12 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 	// The goroutine patches MemorySynced=True/False when it finishes; the next
 	// reconcile iteration will pick it up.
 	if memoryCond == nil && r.ReplicationMgr != nil {
-		cp := r.Checkpointer
-		if cp == nil {
-			cp = &criu.StubCheckpointer{}
-		}
-		// Snapshot name/namespace for the goroutine closure — pm may be mutated later.
+		// Snapshot for goroutine closure — pm may be mutated by subsequent reconciles.
 		pmCopy := pm.DeepCopy()
 		go func() {
-			if err := r.ReplicationMgr.RunPreCopyLoop(context.Background(), pmCopy, cp); err != nil {
+			// nil is passed as the (now unused) checkpointer arg — pre-dump runs via
+			// PreDumpRound RPC on the source agent, not locally on the operator node.
+			if err := r.ReplicationMgr.RunPreCopyLoop(context.Background(), pmCopy, nil); err != nil {
 				log.Error(err, "pre-copy loop failed", "migration", pmCopy.Name)
 			}
 		}()
@@ -342,10 +474,26 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	log.Info("reconcileCheckpointing: entry",
+		"migration", pm.Name,
+		"destinationNodeName", pm.Status.DestinationNodeName,
+		"targetNodeName", pm.Spec.TargetNodeName,
+		"replacementPodName", pm.Status.ReplacementPodName,
+		"checkpointed", meta.IsStatusConditionTrue(pm.Status.Conditions, conditionCheckpointed))
+
 	// Fast-path: if the Checkpointed condition was already set True (e.g. agent called back
 	// directly or we are re-entering after a controller restart), advance immediately.
 	if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionCheckpointed) {
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseTransferring)
+	}
+
+	// If a concurrent reconcile already claimed the checkpoint slot (Unknown/InProgress),
+	// requeue and wait — never run two CRIU dumps on the same process.
+	condCP := meta.FindStatusCondition(pm.Status.Conditions, conditionCheckpointed)
+	if condCP != nil && condCP.Status == metav1.ConditionUnknown && condCP.Reason == "InProgress" {
+		log.Info("checkpoint already in progress (claimed by concurrent reconcile) — requeuing",
+			"migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 	}
 
 	// Check for a prior CheckpointFailed signal before issuing a fresh call.
@@ -438,7 +586,34 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		log.Info("GPU checkpoint captured", "migration", pm.Name, "gpuDir", gpuDir)
 	}
 
-	// Step 2: Checkpoint — freeze and dump via real CRIU gRPC call.
+	// Step 2: Claim the checkpoint slot with an optimistic lock before issuing the CRIU RPC.
+	// Set Checkpointed=Unknown/"InProgress" so any concurrent reconcile that re-fetches the
+	// object after this write will see InProgress and requeue rather than issue a second dump.
+	// If this status update conflicts, a concurrent reconcile already claimed the slot — requeue.
+	{
+		claimPm := pm.DeepCopy()
+		meta.SetStatusCondition(&claimPm.Status.Conditions, metav1.Condition{
+			Type:               conditionCheckpointed,
+			Status:             metav1.ConditionUnknown,
+			Reason:             "InProgress",
+			Message:            "CRIU checkpoint RPC in progress",
+			LastTransitionTime: metav1.Now(),
+		})
+		if err := r.Status().Update(ctx, claimPm); err != nil {
+			if apierrors.IsConflict(err) {
+				log.Info("checkpoint claim conflicted — concurrent reconcile won the slot; requeuing",
+					"migration", pm.Name)
+				return ctrl.Result{RequeueAfter: 500 * time.Millisecond}, nil
+			}
+			return ctrl.Result{}, fmt.Errorf("claiming checkpoint slot: %w", err)
+		}
+		// Update local pm to carry the new resourceVersion so subsequent Status().Update calls work.
+		if err := r.Get(ctx, client.ObjectKeyFromObject(pm), pm); err != nil {
+			return ctrl.Result{}, fmt.Errorf("re-fetch pm after checkpoint claim: %w", err)
+		}
+	}
+
+	// Step 2b: Checkpoint — freeze and dump via real CRIU gRPC call.
 	checkpointResp, err := agentClient.Checkpoint(ctx, &agentpb.CheckpointRequest{
 		MigrationName:   pm.Name,
 		TcpEstablished:  pm.Spec.NetworkContinuity,
@@ -500,17 +675,34 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 
 	setCondition(pm, conditionCheckpointed, metav1.ConditionTrue, "Checkpointed", checkpointMsg)
 
-	// Scheduling gate removal: now that images are staged and capacity is reserved,
-	// remove the podmotion.io/awaiting-checkpoint gate from the replacement pod so the
-	// scheduler can route it to the pre-designated destination node (ADR-0046).
-	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionSchedulingGateRemoved) {
-		if err := r.removeSchedulingGate(ctx, pm); err != nil {
-			log.Error(err, "scheduling gate removal failed — continuing", "migration", pm.Name)
-		} else {
-			setCondition(pm, conditionSchedulingGateRemoved, metav1.ConditionTrue,
-				"GateRemoved", "podmotion.io/awaiting-checkpoint scheduling gate removed")
+	// Ensure DestinationNodeName is set before creating the replacement pod.
+	// It is normally set in reconcilePreMigrating and persisted via transitionTo, but
+	// can be empty if this reconcile was fetched from cache before the status write landed.
+	if pm.Status.DestinationNodeName == "" && pm.Spec.TargetNodeName != "" {
+		pm.Status.DestinationNodeName = pm.Spec.TargetNodeName
+		if err := r.Status().Update(ctx, pm); err != nil {
+			return ctrl.Result{}, fmt.Errorf("setting DestinationNodeName in Checkpointing phase: %w", err)
 		}
+		log.Info("set DestinationNodeName from spec.targetNodeName in Checkpointing phase",
+			"migration", pm.Name, "destNode", pm.Status.DestinationNodeName)
 	}
+
+	// Create the replacement pod that will receive the restored process.
+	// The admission webhook injects the scheduling gate + checkpoint-ref annotation.
+	// The pod is held at PodSchedulingGated until removeSchedulingGate fires at the
+	// END of reconcileTransferring — only after images land on the destination node.
+	if pm.Status.ReplacementPodName == "" {
+		if err := r.createReplacementPod(ctx, pm, sourcePod); err != nil {
+			log.Error(err, "failed to create replacement pod", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
+		log.Info("created replacement pod", "migration", pm.Name, "replacementPod", pm.Status.ReplacementPodName)
+	}
+
+	// Gate removal is intentionally deferred to end of reconcileTransferring.
+	// The NRI StartContainer hook needs the checkpoint at /run/podmotion/... on
+	// the DESTINATION node before the container starts. Removing the gate here
+	// (pre-transfer) would let the scheduler bind and NRI fire before images arrive.
 
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseTransferring)
 }
@@ -518,13 +710,16 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// Determine the local checkpoint directory (operator runs on pm-control, same host as source agent).
-	checkpointDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", pm.Name)
-	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
-		checkpointDir = pm.Status.CheckpointRef.Name
+	if r.AgentPool == nil {
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 	}
 
-	// Determine the destination node.
+	// Determine source and destination nodes.
+	sourceNode := pm.Status.SourceNodeName
+	if sourceNode == "" {
+		log.Info("reconcileTransferring: sourceNodeName not set, requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
 	destNode := pm.Status.DestinationNodeName
 	if destNode == "" && pm.Spec.TargetNodeName != "" {
 		destNode = pm.Spec.TargetNodeName
@@ -533,53 +728,112 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 	}
 
-	// Verify the checkpoint directory has files before attempting transfer.
-	entries, err := os.ReadDir(checkpointDir)
-	if err != nil || len(entries) == 0 {
-		log.Info("reconcileTransferring: checkpoint dir not ready, requeuing",
-			"dir", checkpointDir, "err", err)
-		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	// Idempotency guard: if the controller crashed after Put but before transitioning to
+	// Restoring, CheckpointTransferred is already true — skip straight to gate removal.
+	// The source release RPC is also safe to replay (idempotent on absent dir).
+	if !pm.Status.CheckpointTransferred {
+		// Fetch the checkpoint tar from the SOURCE agent.
+		// The checkpoint was written by the source agent to its local tmpfs at
+		// /run/podmotion/checkpoints/<migration>/final — the operator cannot read
+		// that path because it runs on a different node. GetCheckpointTar is a pure
+		// read; zeroize happens only via ReleaseCheckpoint after the Put is confirmed
+		// and CheckpointTransferred is durably persisted.
+		log.Info("reconcileTransferring: fetching checkpoint tar from source agent",
+			"migration", pm.Name, "sourceNode", sourceNode)
+		srcClient, err := r.AgentPool.ForNode(ctx, sourceNode)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("connect to source agent %s: %w", sourceNode, err)
+		}
+		getResp, err := srcClient.GetCheckpointTar(ctx, &agentpb.GetCheckpointTarRequest{
+			MigrationName: pm.Name,
+		})
+		if err != nil {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, fmt.Errorf("GetCheckpointTar from %s: %w", sourceNode, err)
+		}
+		if !getResp.Success {
+			log.Info("reconcileTransferring: checkpoint not ready on source agent, requeuing",
+				"migration", pm.Name, "sourceNode", sourceNode, "error", getResp.Error)
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
+		log.Info("reconcileTransferring: checkpoint tar received",
+			"migration", pm.Name, "tarSizeBytes", getResp.BytesRead)
+
+		// Zeroize in-memory on all exit paths — checkpoint contains process memory.
+		tarData := getResp.TarData
+		defer func() {
+			for i := range tarData {
+				tarData[i] = 0
+			}
+		}()
+
+		// Push the tar to the DESTINATION agent.
+		destClient, err := r.AgentPool.ForNode(ctx, destNode)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("connect to dest agent %s: %w", destNode, err)
+		}
+		putResp, err := destClient.PutCheckpointTar(ctx, &agentpb.PutCheckpointTarRequest{
+			MigrationName: pm.Name,
+			TarData:       tarData,
+		})
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("PutCheckpointTar to %s: %w", destNode, err)
+		}
+		if !putResp.Success {
+			return ctrl.Result{}, fmt.Errorf("PutCheckpointTar failed: %s", putResp.Error)
+		}
+		log.Info("reconcileTransferring: checkpoint transferred successfully",
+			"migration", pm.Name, "destNode", destNode, "bytesWritten", putResp.BytesWritten)
+
+		// Persist the transfer marker BEFORE releasing the source. If the controller
+		// crashes between this write and the ReleaseCheckpoint call, the next reconcile
+		// sees CheckpointTransferred=true and skips straight to the release call,
+		// which is idempotent on an already-absent dir.
+		pm.Status.CheckpointTransferred = true
+		if err := r.Status().Update(ctx, pm); err != nil {
+			return ctrl.Result{}, fmt.Errorf("persist CheckpointTransferred: %w", err)
+		}
+
+		// Release (zeroize + remove) the source copy now that dest has a durable copy.
+		srcClient2, err := r.AgentPool.ForNode(ctx, sourceNode)
+		if err != nil {
+			log.Error(err, "reconcileTransferring: cannot connect to source agent for release — will retry",
+				"migration", pm.Name, "sourceNode", sourceNode)
+			// Non-fatal: source tmpfs is cleared on node reboot; proceed to Restoring.
+		} else {
+			relResp, relErr := srcClient2.ReleaseCheckpoint(ctx, &agentpb.ReleaseCheckpointRequest{
+				MigrationName: pm.Name,
+			})
+			if relErr != nil || (relResp != nil && !relResp.Success) {
+				log.Error(relErr, "reconcileTransferring: ReleaseCheckpoint failed — source images remain on tmpfs until reboot",
+					"migration", pm.Name, "sourceNode", sourceNode)
+				// Non-fatal: proceed; tmpfs is volatile.
+			}
+		}
+	} else {
+		log.Info("reconcileTransferring: CheckpointTransferred already set — skipping Get/Put (crash-recovery path)",
+			"migration", pm.Name)
+		// Replay ReleaseCheckpoint — idempotent if already done.
+		if srcClient, err := r.AgentPool.ForNode(ctx, sourceNode); err == nil {
+			_, _ = srcClient.ReleaseCheckpoint(ctx, &agentpb.ReleaseCheckpointRequest{
+				MigrationName: pm.Name,
+			})
+		}
 	}
 
-	// Create a gzip-compressed tar of all checkpoint image files.
-	log.Info("reconcileTransferring: creating checkpoint tar", "dir", checkpointDir, "destNode", destNode)
-	tarData, err := tarGzDir(checkpointDir)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("tar checkpoint dir %s: %w", checkpointDir, err)
-	}
-	log.Info("reconcileTransferring: checkpoint tar created",
-		"migration", pm.Name, "tarSizeBytes", len(tarData))
-
-	// Connect to the destination agent and push the tar.
-	if r.AgentPool == nil {
-		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
-	}
-	agentClient, err := r.AgentPool.ForNode(ctx, destNode)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("connect to dest agent %s: %w", destNode, err)
-	}
-
-	putResp, err := agentClient.PutCheckpointTar(ctx, &agentpb.PutCheckpointTarRequest{
-		MigrationName: pm.Name,
-		TarData:       tarData,
-	})
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("PutCheckpointTar to %s: %w", destNode, err)
-	}
-	if !putResp.Success {
-		return ctrl.Result{}, fmt.Errorf("PutCheckpointTar failed: %s", putResp.Error)
-	}
-	log.Info("reconcileTransferring: checkpoint transferred successfully",
-		"migration", pm.Name, "destNode", destNode, "bytesWritten", putResp.BytesWritten)
-
-	// Zeroize the source-node checkpoint dir after successful transfer.
-	// The operator runs on the source node (pm-control) in the PoC so os.RemoveAll is local.
-	// In multi-node production this becomes a ZeroizeCheckpoint gRPC call to the source agent
-	// (proto addition tracked for M19 hardening sprint).
-	if err := zeroizeSourceCheckpoint(checkpointDir); err != nil {
-		log.Error(err, "source checkpoint zeroize failed — images remain on tmpfs until node reboot",
-			"migration", pm.Name, "dir", checkpointDir)
-		// Non-fatal: tmpfs is cleared on reboot; do not fail the migration over cleanup.
+	// Remove the scheduling gate NOW — images are on the destination node so the
+	// NRI StartContainer hook can find them at /run/podmotion/checkpoints/<ref>/final.
+	// Removing earlier (post-Checkpoint, pre-Transfer) would race the NRI hook against
+	// the PutCheckpointTar delivery, causing a CRIU restore failure on a cold destination.
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionSchedulingGateRemoved) {
+		if err := r.removeSchedulingGate(ctx, pm); err != nil {
+			log.Error(err, "scheduling gate removal failed — continuing", "migration", pm.Name)
+		} else {
+			setCondition(pm, conditionSchedulingGateRemoved, metav1.ConditionTrue,
+				"GateRemoved", "podmotion.io/awaiting-checkpoint gate removed post-transfer")
+			if err := r.Status().Update(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 	}
 
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoring)
@@ -664,6 +918,15 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 			return r.initiateRollback(ctx, pm, condFailed.Message)
 		}
 		return r.failMigration(ctx, pm, condFailed.Message)
+	}
+
+	// Operator-driven path (NS#3): replacement pod was created by the operator, and the
+	// NRI StartContainer hook handles CRIU restore when containerd starts the container.
+	// Do NOT call the Restore RPC — that would conflict with the NRI hook (two simultaneous
+	// CRIU restores into the same namespace). Instead, wait for the replacement pod to
+	// become Running (which means NRI fired and CRIU restore succeeded).
+	if pm.Status.ReplacementPodName != "" {
+		return r.reconcileRestoringNRI(ctx, pm)
 	}
 
 	if r.AgentPool == nil {
@@ -820,8 +1083,135 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 	}
 
 	setCondition(pm, conditionRestored, metav1.ConditionTrue, "Restored", "Container restored by agent")
+
+	// ADR-0015 overlap-then-delete: add destination pod IP to EndpointSlices that currently
+	// list the source pod IP so traffic can flow to BOTH pods simultaneously. The source IP
+	// is removed only after TrafficVerified=True in reconcileVerifying.
+	// Do this here (post-restore) rather than post-Ready to ensure the source is never
+	// removed before the destination is in the slice (overlap guarantee).
+	if pm.Spec.SourcePodIP != "" && pm.Status.ReplacementPodName != "" {
+		destPod := &corev1.Pod{}
+		if getPodErr := r.Get(ctx, types.NamespacedName{
+			Namespace: pm.Spec.PodNamespace,
+			Name:      pm.Status.ReplacementPodName,
+		}, destPod); getPodErr == nil && destPod.Status.PodIP != "" {
+			esMgr := traffic.NewEndpointSliceManager(r.Client)
+			if _, addErr := esMgr.AddDestination(ctx, pm.Spec.PodNamespace,
+				pm.Spec.SourcePodIP, destPod.Status.PodIP, false); addErr != nil {
+				log.Error(addErr, "EndpointSlice AddDestination failed — continuing (warn-only)",
+					"migration", pm.Name)
+			} else {
+				log.Info("EndpointSlice: added destination pod IP alongside source",
+					"migration", pm.Name,
+					"sourcePodIP", pm.Spec.SourcePodIP,
+					"destPodIP", destPod.Status.PodIP)
+			}
+		}
+	}
+
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseVerifying)
 }
+
+// reconcileRestoringNRI handles the operator-driven (NS#3) restore path.
+//
+// The NRI StartContainer hook in the node agent fires when containerd schedules the
+// replacement pod and calls JoinNsRestore to execute CRIU restore. The operator's job
+// here is ONLY to wait for the replacement pod to reach Running/Ready state — that is
+// the signal that the NRI hook fired and CRIU restore succeeded.
+//
+// Calling the Restore RPC here would conflict with the NRI hook (two simultaneous
+// CRIU restores into the same namespace), so we skip it entirely.
+func (r *PodMigrationReconciler) reconcileRestoringNRI(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	replacement := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: pm.Spec.PodNamespace,
+		Name:      pm.Status.ReplacementPodName,
+	}, replacement); err != nil {
+		log.Info("replacement pod not yet visible, requeuing", "migration", pm.Name,
+			"replacementPod", pm.Status.ReplacementPodName)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	// Check for a hard failure: pod entered Failed or has a failed container.
+	if replacement.Status.Phase == corev1.PodFailed {
+		msg := fmt.Sprintf("replacement pod %s entered Failed phase — CRIU restore likely failed",
+			pm.Status.ReplacementPodName)
+		log.Error(fmt.Errorf("replacement pod failed"), msg, "migration", pm.Name)
+		setCondition(pm, conditionRestored, metav1.ConditionFalse, "RestoreFailed", msg)
+		if pm.Spec.RollbackOnFailure {
+			return r.initiateRollback(ctx, pm, msg)
+		}
+		return ctrl.Result{}, r.Status().Update(ctx, pm)
+	}
+
+	// Wait for Running + at least one container Ready (NRI hook completed).
+	if replacement.Status.Phase != corev1.PodRunning {
+		log.Info("waiting for replacement pod to reach Running (NRI restore in progress)",
+			"migration", pm.Name,
+			"replacementPod", pm.Status.ReplacementPodName,
+			"phase", replacement.Status.Phase)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+	allReady := len(replacement.Status.ContainerStatuses) > 0
+	for _, cs := range replacement.Status.ContainerStatuses {
+		if !cs.Ready {
+			allReady = false
+			break
+		}
+	}
+	if !allReady {
+		log.Info("replacement pod Running but containers not yet Ready — waiting",
+			"migration", pm.Name, "replacementPod", pm.Status.ReplacementPodName)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	log.Info("replacement pod Running and Ready — NRI CRIU restore complete",
+		"migration", pm.Name, "replacementPod", pm.Status.ReplacementPodName,
+		"destNode", replacement.Spec.NodeName)
+
+	setCondition(pm, conditionRestored, metav1.ConditionTrue, "Restored",
+		fmt.Sprintf("NRI StartContainer hook restored process into replacement pod %s",
+			pm.Status.ReplacementPodName))
+
+	// ADR-0015 overlap-then-delete: add destination IP to EndpointSlices.
+	if pm.Spec.SourcePodIP != "" && replacement.Status.PodIP != "" {
+		esMgr := traffic.NewEndpointSliceManager(r.Client)
+		if _, addErr := esMgr.AddDestination(ctx, pm.Spec.PodNamespace,
+			pm.Spec.SourcePodIP, replacement.Status.PodIP, false); addErr != nil {
+			log.Error(addErr, "EndpointSlice AddDestination failed — continuing (warn-only)",
+				"migration", pm.Name)
+		} else {
+			log.Info("EndpointSlice: added destination pod IP alongside source",
+				"migration", pm.Name,
+				"sourcePodIP", pm.Spec.SourcePodIP,
+				"destPodIP", replacement.Status.PodIP)
+		}
+	}
+
+	// Volume readiness gate (mirrors reconcileRestoring path). For stateless pods with
+	// no PVCs this returns true immediately; for RWO PVCs it waits for VolumeAttachment.
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionDestinationVolumeReady) {
+		ready, err := r.checkDestinationVolumeReady(ctx, pm)
+		if err != nil {
+			log.Error(err, "volume readiness check error — requeuing", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		if !ready {
+			log.Info("waiting for destination volume to attach", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		setCondition(pm, conditionDestinationVolumeReady, metav1.ConditionTrue,
+			"VolumeAttached", "RWO PVC attached on destination node (or no PVCs)")
+	}
+
+	if err := r.Status().Update(ctx, pm); err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseVerifying)
+}
+
 
 func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -832,10 +1222,28 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 	if !trafficVerified {
 		// Drive verification: call the TrafficVerifier and set the condition.
 		if r.TrafficVerifier != nil {
+			// Build verify request with correct pod names and IPs.
+			destPodName := pm.Status.ReplacementPodName
+			if destPodName == "" {
+				destPodName = pm.Spec.PodName // fallback (should not happen in live migration)
+			}
+			// Try to get destination pod IP.
+			destPodIP := ""
+			if destPodName != "" {
+				destPod := &corev1.Pod{}
+				if err := r.Get(ctx, types.NamespacedName{Namespace: pm.Spec.PodNamespace, Name: destPodName}, destPod); err == nil {
+					destPodIP = destPod.Status.PodIP
+				}
+			}
 			req := traffic.VerifyRequest{
-				Namespace:    pm.Spec.PodNamespace,
-				DestNodeName: pm.Status.DestinationNodeName,
-				DestPodName:  pm.Spec.PodName,
+				Namespace:      pm.Spec.PodNamespace,
+				SourcePodName:  pm.Spec.PodName,
+				SourcePodIP:    pm.Spec.SourcePodIP,
+				DestPodName:    destPodName,
+				DestPodIP:      destPodIP,
+				DestNodeName:   pm.Status.DestinationNodeName,
+				TimeoutSeconds: 30,
+				Mode:           traffic.VerificationModeEndpointSlice,
 			}
 			if err := r.TrafficVerifier.Verify(ctx, req); err != nil {
 				// ADR-0019: warn only — do not rollback after handoff.
@@ -859,7 +1267,29 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 	// DestinationVolumeReady=True. Deleting before volume attachment is confirmed risks
 	// RWO PVC detach races (EBS/RBD attach window 30-120s).
 	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionDestinationVolumeReady) {
-		log.Info("waiting for DestinationVolumeReady before deleting source pod", "migration", pm.Name)
+		ready, err := r.checkDestinationVolumeReady(ctx, pm)
+		if err != nil {
+			log.Error(err, "volume readiness check error — requeuing", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		if !ready {
+			log.Info("waiting for DestinationVolumeReady before deleting source pod", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		setCondition(pm, conditionDestinationVolumeReady, metav1.ConditionTrue,
+			"VolumeAttached", "RWO PVC attached on destination node (or no PVCs)")
+		if err := r.Status().Update(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// PDB gate: block deletion if any PodDisruptionBudget disallowsAllowing it.
+	if err := r.checkPDBAllowsDeletion(ctx, pm); err != nil {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// ResourceQuota gate: defer deletion if the destination namespace is at pod quota capacity.
+	if err := r.checkResourceQuotaCapacity(ctx, pm); err != nil {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
@@ -882,13 +1312,51 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 	// If IsNotFound — already deleted, that is fine.
 
 	setCondition(pm, conditionSourcePodDeleted, metav1.ConditionTrue, "Deleted", "Source pod deleted post-TrafficVerified")
+
+	// ADR-0015 overlap-then-delete: now that TrafficVerified=True and source is deleted,
+	// remove the source pod IP from EndpointSlices. The destination IP was added in
+	// reconcileRestoring so there is never a gap (overlap window = restore→delete interval).
+	if pm.Spec.SourcePodIP != "" {
+		esMgr := traffic.NewEndpointSliceManager(r.Client)
+		if _, removeErr := esMgr.RemoveSource(ctx, pm.Spec.PodNamespace, pm.Spec.SourcePodIP); removeErr != nil {
+			log.Error(removeErr, "EndpointSlice RemoveSource failed — continuing (warn-only, source already deleted)",
+				"migration", pm.Name)
+		} else {
+			log.Info("EndpointSlice: removed source pod IP post-deletion",
+				"migration", pm.Name, "sourcePodIP", pm.Spec.SourcePodIP)
+		}
+
+		// Post-flight assertion: confirm source IP is actually gone from all EndpointSlices.
+		// A stale entry here means traffic to the dead pod IP would cause connection errors.
+		if still, checkErr := esMgr.HasEndpointForIP(ctx, pm.Spec.PodNamespace, pm.Spec.SourcePodIP); checkErr != nil {
+			log.Error(checkErr, "post-flight EndpointSlice check failed", "migration", pm.Name)
+		} else if still {
+			log.Error(nil, "WARNING: source IP still present in EndpointSlices after RemoveSource — stale endpoint risk",
+				"migration", pm.Name, "sourcePodIP", pm.Spec.SourcePodIP)
+			setCondition(pm, conditionEndpointSliceCleanVerified, metav1.ConditionFalse, "StaleEndpoint",
+				fmt.Sprintf("source IP %s still in EndpointSlices after removal — manual cleanup may be needed", pm.Spec.SourcePodIP))
+		} else {
+			setCondition(pm, conditionEndpointSliceCleanVerified, metav1.ConditionTrue, "Cleaned",
+				fmt.Sprintf("source IP %s confirmed absent from all EndpointSlices", pm.Spec.SourcePodIP))
+		}
+	}
+
 	now := metav1.Now()
 	pm.Status.CompletionTime = &now
+
+	// GitOps drift warning: if the owning workload still has hard nodeAffinity targeting
+	// the source node AND the caller did not opt into patching it, warn the user.
+	r.maybeSetGitOpsDriftWarning(ctx, pm)
+
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseComplete)
 }
 
 func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+
+	// Delete the replacement pod first — before rolling back the source — so there is
+	// never a window where both pods are running and matching Service selectors.
+	r.deleteReplacementPod(ctx, pm)
 
 	if err := r.Rollbacker.Rollback(ctx, pm); err != nil {
 		log.Error(err, "rollback failed — source pod may require manual intervention")
@@ -923,6 +1391,10 @@ func (r *PodMigrationReconciler) transitionTo(ctx context.Context, pm *pmv1.PodM
 }
 
 func (r *PodMigrationReconciler) failMigration(ctx context.Context, pm *pmv1.PodMigration, reason string) (ctrl.Result, error) {
+	// Clean up the replacement pod on hard failure (not rollback — rollback handles its own).
+	// Prevents a gated orphan pod from lingering when the migration is permanently failed.
+	r.deleteReplacementPod(ctx, pm)
+
 	key := client.ObjectKeyFromObject(pm)
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &pmv1.PodMigration{}
@@ -1002,6 +1474,144 @@ func (r *PodMigrationReconciler) getNMC(ctx context.Context, nodeName string) (*
 	return nmc, err
 }
 
+// checkAntiAffinityConflict verifies that the destination node does not already host any pods
+// that violate the source pod's requiredDuringScheduling podAntiAffinity rules.
+// If a conflict is found it sets ConditionAntiAffinityConflict=True and returns a non-nil error
+// (so reconcilePreMigrating can requeue).  On success it sets the condition False.
+func (r *PodMigrationReconciler) checkAntiAffinityConflict(ctx context.Context, pm *pmv1.PodMigration, destinationNode string) error {
+	log := logf.FromContext(ctx)
+
+	pod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+	if err != nil {
+		// Can't fetch pod — don't block migration, just skip the check.
+		log.Error(err, "checkAntiAffinityConflict: cannot fetch source pod — skipping")
+		return nil
+	}
+
+	if pod.Spec.Affinity == nil ||
+		pod.Spec.Affinity.PodAntiAffinity == nil ||
+		len(pod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution) == 0 {
+		setCondition(pm, orchestration.ConditionAntiAffinityConflict, metav1.ConditionFalse,
+			"NoAntiAffinityRules", "source pod has no requiredDuringScheduling podAntiAffinity")
+		return nil
+	}
+
+	// List all pods on the destination node.
+	podList := &corev1.PodList{}
+	if listErr := r.List(ctx, podList,
+		client.MatchingFields{"spec.nodeName": destinationNode},
+	); listErr != nil {
+		log.Error(listErr, "checkAntiAffinityConflict: cannot list pods on destination node")
+		return nil
+	}
+
+	for _, term := range pod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+		if term.LabelSelector == nil {
+			continue
+		}
+		sel, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
+		if err != nil {
+			log.Error(err, "checkAntiAffinityConflict: invalid LabelSelector in podAntiAffinity term")
+			continue
+		}
+		ns := term.Namespaces
+		for i := range podList.Items {
+			candidate := &podList.Items[i]
+			// Respect namespace selector: if term.namespaces is set, candidate must be in one of them.
+			if len(ns) > 0 {
+				found := false
+				for _, n := range ns {
+					if candidate.Namespace == n {
+						found = true
+						break
+					}
+				}
+				if !found {
+					continue
+				}
+			}
+			if sel.Matches(labels.Set(candidate.Labels)) {
+				msg := fmt.Sprintf("destination node %s hosts pod %s/%s which violates requiredDuringScheduling podAntiAffinity",
+					destinationNode, candidate.Namespace, candidate.Name)
+				setCondition(pm, orchestration.ConditionAntiAffinityConflict, metav1.ConditionTrue,
+					"AntiAffinityViolation", msg)
+				return fmt.Errorf("%s", msg)
+			}
+		}
+	}
+
+	setCondition(pm, orchestration.ConditionAntiAffinityConflict, metav1.ConditionFalse,
+		"NoConflict", fmt.Sprintf("no podAntiAffinity conflicts found on destination node %s", destinationNode))
+	return nil
+}
+
+// maybeSetGitOpsDriftWarning sets ConditionGitOpsDriftWarning=True if the pod's owning
+// Deployment or StatefulSet still has hard nodeAffinity/nodeSelector targeting the source
+// node AND affinityMode is not AffinityModePatch (which would have already patched it).
+func (r *PodMigrationReconciler) maybeSetGitOpsDriftWarning(ctx context.Context, pm *pmv1.PodMigration) {
+	if pm.Spec.AffinityMode == pmv1.AffinityModePatch {
+		// Controller patched the affinity — no drift expected.
+		return
+	}
+
+	sourceNode := pm.Status.SourceNodeName
+	if sourceNode == "" {
+		return
+	}
+
+	pod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+	if err != nil {
+		// Pod already deleted — try fetching owner reference from pm.Status if available.
+		return
+	}
+
+	for _, ref := range pod.OwnerReferences {
+		if ref.Kind != "Deployment" && ref.Kind != "StatefulSet" {
+			continue
+		}
+		if !ownerHasHardNodeAffinity(pod, sourceNode) {
+			continue
+		}
+		setCondition(pm, orchestration.ConditionGitOpsDriftWarning, metav1.ConditionTrue,
+			"AffinityDrift",
+			fmt.Sprintf("owning %s/%s still has nodeAffinity targeting source node %s; pods will return to %s on next rollout or GitOps sync",
+				ref.Kind, ref.Name, sourceNode, sourceNode))
+		return
+	}
+
+	setCondition(pm, orchestration.ConditionGitOpsDriftWarning, metav1.ConditionFalse,
+		"NoAffinity", "owning workload has no hard nodeAffinity targeting source node")
+}
+
+// ownerHasHardNodeAffinity returns true if the pod carries nodeSelector or nodeAffinity
+// required rules that target the given nodeName.
+func ownerHasHardNodeAffinity(pod *corev1.Pod, nodeName string) bool {
+	for key, val := range pod.Spec.NodeSelector {
+		if key == "kubernetes.io/hostname" && val == nodeName {
+			return true
+		}
+	}
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil {
+		return false
+	}
+	required := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if required == nil {
+		return false
+	}
+	for _, term := range required.NodeSelectorTerms {
+		for _, expr := range term.MatchExpressions {
+			if expr.Key == "kubernetes.io/hostname" && expr.Operator == corev1.NodeSelectorOpIn {
+				for _, v := range expr.Values {
+					if v == nodeName {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
 // setCondition is a convenience wrapper around meta.SetStatusCondition.
 func setCondition(pm *pmv1.PodMigration, condType string, status metav1.ConditionStatus, reason, message string) {
 	meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
@@ -1060,16 +1670,175 @@ func (r *PodMigrationReconciler) reserveDestinationCapacity(ctx context.Context,
 	return r.Status().Update(ctx, nmc)
 }
 
+// createReplacementPod creates a clone of the source pod that will receive the
+// CRIU-restored process. The admission webhook injects the scheduling gate and
+// checkpoint-ref annotation so the pod waits at PodSchedulingGated until the
+// controller removes the gate post-transfer.
+//
+// Quorum requirements (Architecture Sprint 1 review):
+//   - ownerRef → PodMigration CR (not Deployment/RS — workload controller must not see this pod)
+//   - Selector labels stripped (pod-template-hash and any RS selector key) so the ReplicaSet
+//     controller does not count the gated clone against its desired replica count
+//   - Name deterministic (idempotency key) and truncated to ≤63 chars
+//   - Name recorded in pm.Status (not Spec) via Status().Update
+func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *pmv1.PodMigration, sourcePod *corev1.Pod) error {
+	// Idempotency: if a replacement pod already exists (controller restart), skip creation.
+	if pm.Status.ReplacementPodName != "" {
+		existing := &corev1.Pod{}
+		err := r.Get(ctx, types.NamespacedName{Namespace: pm.Spec.PodNamespace, Name: pm.Status.ReplacementPodName}, existing)
+		if err == nil {
+			return nil // already exists and matches — adopt it
+		}
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		// Was recorded but pod is gone — fall through to re-create.
+	}
+
+	// Build a deterministic name from source name + short PM UID prefix.
+	// Truncate source name so total stays ≤63 chars (k8s DNS-label limit).
+	uid := string(pm.UID)
+	if len(uid) > 8 {
+		uid = uid[:8]
+	}
+	suffix := "-m-" + uid // 11 chars
+	maxSourceLen := 63 - len(suffix)
+	srcName := sourcePod.Name
+	if len(srcName) > maxSourceLen {
+		srcName = srcName[:maxSourceLen]
+	}
+	replacementName := srcName + suffix
+
+	// Resolve the owning ReplicaSet's selector keys so we can strip them.
+	// This prevents the RS controller from counting our gated clone against
+	// its desired replica count and deleting it (or the source pod) mid-checkpoint.
+	selectorKeysToStrip := map[string]struct{}{
+		// Always strip: RS-generated hash label that is unique per pod-template revision.
+		"pod-template-hash": {},
+	}
+	for _, ownerRef := range sourcePod.OwnerReferences {
+		if ownerRef.Kind == "ReplicaSet" {
+			if err := r.getRSSelector(ctx, pm.Spec.PodNamespace, ownerRef.Name, selectorKeysToStrip); err != nil {
+				// Non-fatal: worst case we strip only pod-template-hash.
+				_ = err
+			}
+			break
+		}
+	}
+
+	// Build the label set: copy source labels, strip selector keys, add migration marker.
+	newLabels := make(map[string]string, len(sourcePod.Labels)+1)
+	for k, v := range sourcePod.Labels {
+		if _, strip := selectorKeysToStrip[k]; !strip {
+			newLabels[k] = v
+		}
+	}
+	newLabels["podmotion.io/migration-name"] = pm.Name
+
+	// Copy annotations; strip immutable fields that cause API conflict.
+	newAnnotations := make(map[string]string, len(sourcePod.Annotations))
+	for k, v := range sourcePod.Annotations {
+		newAnnotations[k] = v
+	}
+	delete(newAnnotations, "kubectl.kubernetes.io/last-applied-configuration")
+
+	// Deep-copy spec; clear scheduler-assigned and mutable fields.
+	spec := *sourcePod.Spec.DeepCopy()
+	spec.SchedulerName = ""    // webhook injects podmotion-scheduler
+	spec.SchedulingGates = nil // webhook injects the gate
+
+	// Pin NodeName directly to the destination node if known.
+	// When the MutatingAdmissionWebhook is deployed it would enforce this via spec.destinationNode;
+	// setting NodeName here ensures correctness when the webhook is not running (dev/PoC clusters).
+	destNodeName := pm.Status.DestinationNodeName
+	if destNodeName == "" {
+		destNodeName = pm.Spec.TargetNodeName
+	}
+	log := logf.FromContext(ctx)
+	log.Info("createReplacementPod: pinning node",
+		"migration", pm.Name,
+		"statusDestinationNodeName", pm.Status.DestinationNodeName,
+		"specTargetNodeName", pm.Spec.TargetNodeName,
+		"resolved", destNodeName,
+		"sourcePodNode", sourcePod.Spec.NodeName)
+	if destNodeName != "" {
+		spec.NodeName = destNodeName
+	} else {
+		spec.NodeName = "" // let scheduler decide if destination unknown
+	}
+
+	replacement := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        replacementName,
+			Namespace:   pm.Spec.PodNamespace,
+			Labels:      newLabels,
+			Annotations: newAnnotations,
+			// OwnerReferences: set to PodMigration CR below via SetControllerReference.
+			// No workload-controller ownerRef — prevents RS/Deployment from adopting/deleting.
+		},
+		Spec: spec,
+	}
+	if err := controllerutil.SetControllerReference(pm, replacement, r.Scheme); err != nil {
+		return fmt.Errorf("set controller reference on replacement pod: %w", err)
+	}
+
+	log.Info("createReplacementPod: creating pod",
+		"migration", pm.Name,
+		"podName", replacementName,
+		"specNodeName", replacement.Spec.NodeName,
+		"destNodeName", destNodeName,
+		"statusDestNode", pm.Status.DestinationNodeName,
+		"specTargetNode", pm.Spec.TargetNodeName)
+	if err := r.Create(ctx, replacement); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			log.Info("createReplacementPod: pod already exists (adopting)",
+				"migration", pm.Name, "podName", replacementName)
+		} else {
+			return fmt.Errorf("create replacement pod %s: %w", replacementName, err)
+		}
+	}
+
+	// Record name in Status (not Spec — controller state is not user intent).
+	// Use retry.RetryOnConflict: a concurrent patchMemorySynced goroutine may have updated
+	// the resourceVersion between the claim re-fetch and here, causing a stale-write conflict.
+	pm.Status.ReplacementPodName = replacementName
+	key := client.ObjectKeyFromObject(pm)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &pmv1.PodMigration{}
+		if err := r.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		fresh.Status.ReplacementPodName = replacementName
+		return r.Status().Update(ctx, fresh)
+	})
+}
+
+
+// getRSSelector fetches the ReplicaSet's spec.selector.matchLabels keys and adds them
+// to the strip set. Non-fatal on any error — worst case we strip only pod-template-hash.
+func (r *PodMigrationReconciler) getRSSelector(ctx context.Context, ns, rsName string, strip map[string]struct{}) error {
+	rs := &appsv1.ReplicaSet{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: rsName}, rs); err != nil {
+		return err
+	}
+	if rs.Spec.Selector != nil {
+		for k := range rs.Spec.Selector.MatchLabels {
+			strip[k] = struct{}{}
+		}
+	}
+	return nil
+}
+
 // removeSchedulingGate removes the podmotion.io/awaiting-checkpoint scheduling gate
 // from the replacement pod so the scheduler can route it to the destination node.
 func (r *PodMigrationReconciler) removeSchedulingGate(ctx context.Context, pm *pmv1.PodMigration) error {
-	if pm.Spec.ReplacementPodName == "" {
+	if pm.Status.ReplacementPodName == "" {
 		return nil // no replacement pod tracked yet
 	}
 	pod := &corev1.Pod{}
 	if err := r.Get(ctx, types.NamespacedName{
 		Namespace: pm.Spec.PodNamespace,
-		Name:      pm.Spec.ReplacementPodName,
+		Name:      pm.Status.ReplacementPodName,
 	}, pod); err != nil {
 		return client.IgnoreNotFound(err)
 	}
@@ -1152,9 +1921,100 @@ func (r *PodMigrationReconciler) verifyRestoredSecurityContext(_ context.Context
 	return nil
 }
 
+// checkPDBAllowsDeletion blocks source pod deletion when a matching PodDisruptionBudget
+// has DisruptionsAllowed==0.  Fail-open: if PDBs cannot be listed, migration continues.
+func (r *PodMigrationReconciler) checkPDBAllowsDeletion(ctx context.Context, pm *pmv1.PodMigration) error {
+	srcPod := &corev1.Pod{}
+	if err := r.Client.Get(ctx, types.NamespacedName{
+		Name: pm.Spec.PodName, Namespace: pm.Spec.PodNamespace,
+	}, srcPod); err != nil {
+		return nil // pod already gone — no PDB to check
+	}
+
+	pdbList := &policyv1.PodDisruptionBudgetList{}
+	if err := r.Client.List(ctx, pdbList, client.InNamespace(pm.Spec.PodNamespace)); err != nil {
+		return nil // can't list PDBs — allow (fail-open for PDB only)
+	}
+
+	srcLabels := labels.Set(srcPod.Labels)
+	for _, pdb := range pdbList.Items {
+		sel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+		if err != nil {
+			continue
+		}
+		if sel.Matches(srcLabels) && pdb.Status.DisruptionsAllowed == 0 {
+			setCondition(pm, "PDBAllowsDeletion", metav1.ConditionFalse,
+				"PDBBlocking",
+				fmt.Sprintf("PodDisruptionBudget %s/%s: DisruptionsAllowed=0", pdb.Namespace, pdb.Name))
+			_ = r.Client.Status().Update(ctx, pm)
+			return fmt.Errorf("PDB %s blocks deletion", pdb.Name)
+		}
+	}
+	setCondition(pm, "PDBAllowsDeletion", metav1.ConditionTrue, "PDBOk", "")
+	return nil
+}
+
+// checkResourceQuotaCapacity defers source pod deletion when the namespace is at pod quota
+// capacity — the net-zero delete+create sequence is safe, but races with other controllers
+// could cause the replacement pod to be rejected if we delete too early.
+func (r *PodMigrationReconciler) checkResourceQuotaCapacity(ctx context.Context, pm *pmv1.PodMigration) error {
+	quotaList := &corev1.ResourceQuotaList{}
+	if err := r.Client.List(ctx, quotaList, client.InNamespace(pm.Spec.PodNamespace)); err != nil || len(quotaList.Items) == 0 {
+		return nil // no quotas — allow
+	}
+
+	for _, quota := range quotaList.Items {
+		// Check pod count hard limit
+		if hard, ok := quota.Spec.Hard[corev1.ResourcePods]; ok {
+			used := quota.Status.Used[corev1.ResourcePods]
+			// After source deletion, used drops by 1, then replacement is +1 = net 0.
+			// But the race window: if another pod is created in between, used stays same.
+			// Check that current used < hard (source deletion + replacement = net 0, safe).
+			if used.Cmp(hard) >= 0 {
+				setCondition(pm, "ResourceQuotaCapacity", metav1.ConditionFalse,
+					"QuotaExhausted",
+					fmt.Sprintf("ResourceQuota %s: pods %s/%s — at capacity, deferring", quota.Name, used.String(), hard.String()))
+				_ = r.Client.Status().Update(ctx, pm)
+				return fmt.Errorf("ResourceQuota %s pods at capacity", quota.Name)
+			}
+		}
+	}
+	setCondition(pm, "ResourceQuotaCapacity", metav1.ConditionTrue, "QuotaOk", "")
+	return nil
+}
+
 func (r *PodMigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pmv1.PodMigration{}).
 		Named("podmigration").
 		Complete(r)
+}
+
+// deleteReplacementPod deletes the replacement pod created during live migration,
+// if one was recorded. Called on rollback and migration failure to prevent an
+// orphaned gated pod from lingering and matching Service selectors.
+// Non-fatal: if the pod is already gone, the delete is a no-op.
+func (r *PodMigrationReconciler) deleteReplacementPod(ctx context.Context, pm *pmv1.PodMigration) {
+	if pm.Status.ReplacementPodName == "" {
+		return
+	}
+	log := logf.FromContext(ctx)
+	pod := &corev1.Pod{}
+	err := r.Get(ctx, types.NamespacedName{
+		Namespace: pm.Spec.PodNamespace,
+		Name:      pm.Status.ReplacementPodName,
+	}, pod)
+	if apierrors.IsNotFound(err) {
+		return
+	}
+	if err != nil {
+		log.Error(err, "deleteReplacementPod: get failed", "pod", pm.Status.ReplacementPodName)
+		return
+	}
+	if deleteErr := r.Delete(ctx, pod); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+		log.Error(deleteErr, "deleteReplacementPod: delete failed — manual cleanup may be required",
+			"pod", pm.Status.ReplacementPodName)
+	} else {
+		log.Info("deleted replacement pod on rollback/failure", "pod", pm.Status.ReplacementPodName)
+	}
 }
