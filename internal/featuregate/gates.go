@@ -24,12 +24,21 @@ const (
 	// Permanently disabled by default — CUDA checkpoint is an experimental NVIDIA feature
 	// with driver constraints (525+) and potential instability under workload. See ADR-0032.
 	GPUMigration FeatureGate = "GPUMigration"
+
+	// TCPPreservation gates TCPPreservationMode=Strict and TCPPreservationMode=BestEffort.
+	// DISABLED by default. The full pipeline (eBPF zero-window hold, overlay FDB handoff
+	// per ADR-0048, PrepareDestinationNetns wiring, real TCP sequence verification per
+	// ADR-0019 Amendment A) is not complete until M21. Admitting Strict/BestEffort before
+	// then guarantees TCP RST on every migrated connection while reporting success.
+	// Enable ONLY after M21 lands all sub-components and E2E TCP continuity tests pass.
+	TCPPreservation FeatureGate = "TCPPreservation"
 )
 
 // DefaultGates defines the default enabled state for each gate.
 // All experimental gates default to false — explicit operator opt-in required.
 var DefaultGates = map[FeatureGate]bool{
-	GPUMigration: false,
+	GPUMigration:    false,
+	TCPPreservation: false,
 }
 
 var (

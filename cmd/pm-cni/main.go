@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 )
 
 // cniVersion is the CNI spec version this plugin implements.
@@ -162,21 +163,28 @@ func readNetConf() (*netConf, error) {
 }
 
 // findPlugin searches CNI_PATH (colon-separated directories) for the named plugin binary.
+// Directories are searched in order; the first match is returned.
+// This implementation avoids os.Setenv (which is not goroutine-safe and mutates the process
+// environment for all goroutines) in favour of direct filepath.Join lookups.
 func findPlugin(name, cniPath string) (string, error) {
 	if cniPath == "" {
 		cniPath = "/opt/cni/bin"
 	}
-	// Use exec.LookPath with a PATH set to cniPath so we find the binary in
-	// the first matching directory.  We replace os.Getenv("PATH") temporarily
-	// via a synthetic PATH value rather than modifying the process environment.
-	origPath := os.Getenv("PATH")
-	_ = os.Setenv("PATH", cniPath)
-	p, err := exec.LookPath(name)
-	_ = os.Setenv("PATH", origPath)
-	if err != nil {
-		return "", fmt.Errorf("plugin %q not found in CNI_PATH %q: %w", name, cniPath, err)
+	for _, dir := range filepath.SplitList(cniPath) {
+		if dir == "" {
+			continue
+		}
+		candidate := filepath.Join(dir, name)
+		info, err := os.Stat(candidate)
+		if err != nil {
+			continue
+		}
+		// Must be a regular file (or symlink to one) and executable.
+		if info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
+			return candidate, nil
+		}
 	}
-	return p, nil
+	return "", fmt.Errorf("plugin %q not found in CNI_PATH %q", name, cniPath)
 }
 
 // fatal writes a CNI error response to stdout and exits with code.

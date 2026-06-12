@@ -854,18 +854,33 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 	}
 
 	// Resolve TCPPreservationMode from the PodMigration CR so TcpEstablished is tier-driven.
-	// When the k8s client is unavailable (dev/stub mode) the mode defaults to None.
+	// The CR lives in the WORKLOAD namespace (not the operator namespace). The caller MUST
+	// populate req.WorkloadNamespace; if it is empty and the k8s client is available we
+	// fail the checkpoint rather than silently degrading to stateless (ADR-0047 §safety).
 	tcpEstablished := false
 	if s.k8sClient != nil {
-		pmNs := os.Getenv("POD_NAMESPACE")
-		if pmNs == "" {
-			pmNs = "podmotion-system"
+		// WorkloadNamespace is the namespace of the migrating pod's PodMigration CR.
+		// It is set by the controller in CheckpointRequest.WorkloadNamespace.
+		// Falling back to POD_NAMESPACE (operator namespace) is WRONG for cross-namespace pods
+		// and is the source of the silent-stateless-downgrade bug fixed here.
+		workloadNs := req.WorkloadNamespace
+		if workloadNs == "" {
+			// WorkloadNamespace not provided: fail closed — we cannot determine the mode.
+			// Return an error rather than silently dumping stateless for an unknown mode.
+			return nil, fmt.Errorf("checkpoint: WorkloadNamespace is empty in CheckpointRequest; cannot resolve TCPPreservationMode — refusing to dump to avoid silent stateless downgrade")
 		}
 		pm := &pmv1.PodMigration{}
-		if lookupErr := s.k8sClient.Get(context.Background(), types.NamespacedName{
+		lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer lookupCancel()
+		if lookupErr := s.k8sClient.Get(lookupCtx, types.NamespacedName{
 			Name:      req.MigrationName,
-			Namespace: pmNs,
-		}, pm); lookupErr == nil {
+			Namespace: workloadNs,
+		}, pm); lookupErr != nil {
+			// Lookup failed: for a migration in Strict/BestEffort mode we must not silently
+			// downgrade to stateless — fail the checkpoint so the controller can retry or rollback.
+			return nil, fmt.Errorf("checkpoint: failed to look up PodMigration CR %s/%s: %w — cannot determine TCPPreservationMode; refusing to dump to avoid silent stateless downgrade",
+				workloadNs, req.MigrationName, lookupErr)
+		} else {
 			mode := pm.Spec.TCPPreservationMode
 			tcpEstablished = mode == pmv1.TCPPreservationModeStrict || mode == pmv1.TCPPreservationModeBestEffort
 		}

@@ -160,7 +160,7 @@ func main() {
 		}
 	}
 
-	// TODO(M1): start metrics server on :9091
+	// TODO(podmotion-io/podmotion#<issue>, M1): start metrics server on :9091 (Prometheus /metrics endpoint for agent DaemonSet scraping).
 
 	// Heartbeat loop — updates NMC status.lastHeartbeat every 30s.
 	// Sets status.ready=false on shutdown so the scheduler stops sending migrations here.
