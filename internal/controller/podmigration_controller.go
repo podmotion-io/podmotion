@@ -372,8 +372,12 @@ func (r *PodMigrationReconciler) reconcilePreCopyMemory(ctx context.Context, pm 
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
-// reconcileZeroWindowArm loads the TC-BPF zero-window hold program on the source pod veth (ADR-0049).
-// Sets ZeroWindowArmed=True when the program is attached and armed.
+// reconcileZeroWindowArm calls ArmZeroWindow on the source node agent, which:
+//   - attaches the TC-BPF zero-window hold to the source pod's veth (ADR-0049),
+//   - polls tcpi_unacked==0 (predicate A of the 6-predicate ARM barrier), and
+//   - starts the watchdog goroutine that auto-disarms after FreezeWindowBudgetMs + margin.
+//
+// Sets ZeroWindowArmed=True with the armed_at_ns timestamp when the agent confirms the hold.
 func (r *PodMigrationReconciler) reconcileZeroWindowArm(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -391,12 +395,54 @@ func (r *PodMigrationReconciler) reconcileZeroWindowArm(ctx context.Context, pm 
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseFinalFreezeStateCapture)
 	}
 
-	// Full TC-BPF loading in M21 (eBPF discipline). The six-predicate relay ARM atomicity
-	// barrier described in ADR-0049 is implemented by the node agent. The controller only
-	// needs to observe ZeroWindowArmed=True before advancing.
-	log.Info("ZeroWindowArm: arming TC-BPF zero-window hold on source veth (ADR-0049)", "migration", pm.Name)
-	setCondition(pm, pmv1.ConditionZeroWindowArmed, metav1.ConditionTrue,
-		"Armed", "TC-BPF zero-window hold program loaded and armed on source pod veth")
+	if r.AgentPool == nil {
+		log.Error(nil, "ZeroWindowArm: AgentPool not wired — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	sourceNode := pm.Status.SourceNodeName
+	if sourceNode == "" {
+		log.Error(nil, "ZeroWindowArm: SourceNodeName not set — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	agentClient, err := r.AgentPool.ForNode(ctx, sourceNode)
+	if err != nil {
+		log.Error(err, "ZeroWindowArm: cannot connect to source agent — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	budget := int64(pm.Spec.FreezeWindowBudgetMs)
+	if budget <= 0 {
+		budget = 500 // default 500ms if not specified
+	}
+
+	sourcePod, podErr := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+	podUID := pm.Spec.SourcePodUID
+	if podErr == nil && string(sourcePod.UID) != "" {
+		podUID = string(sourcePod.UID)
+	}
+
+	log.Info("ZeroWindowArm: calling ArmZeroWindow on source agent (ADR-0049)",
+		"migration", pm.Name, "node", sourceNode, "budgetMs", budget)
+	resp, err := agentClient.ArmZeroWindow(ctx, &agentpb.ArmZeroWindowRequest{
+		MigrationName:        pm.Name,
+		PodUid:               podUID,
+		FreezeWindowBudgetMs: budget,
+	})
+	if err != nil {
+		log.Error(err, "ZeroWindowArm: ArmZeroWindow RPC failed — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	if !resp.Armed {
+		log.Error(nil, "ZeroWindowArm: agent returned armed=false — requeuing",
+			"migration", pm.Name, "reason", resp.BlockingReason)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	msg := fmt.Sprintf("TC-BPF zero-window hold armed on source veth; armed_at_ns=%d; tcpi_unacked drained (ADR-0049 predicate A)", resp.ArmedAtNs)
+	log.Info("ZeroWindowArm: hold armed", "migration", pm.Name, "armedAtNs", resp.ArmedAtNs)
+	setCondition(pm, pmv1.ConditionZeroWindowArmed, metav1.ConditionTrue, "Armed", msg)
 	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -475,8 +521,9 @@ func (r *PodMigrationReconciler) reconcileRestoreSocketReattach(ctx context.Cont
 	return result, err
 }
 
-// reconcileDisengageHold disarms the TC-BPF zero-window hold and loads the PM_SEQ_XLAT relay
-// programs on the destination node (ADR-0049). Sets RelayProgramsLoaded=True.
+// reconcileDisengageHold disarms the TC-BPF zero-window hold via DisarmZeroWindow RPC and
+// records the ZeroWindowDisarmed condition with timestamp and hold duration. Also sets
+// RelayProgramsLoaded=True (PM_SEQ_XLAT relay wiring is M22; this is the M20 disarm gate).
 func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -486,6 +533,8 @@ func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm 
 
 	if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeNone {
 		log.Info("DisengageHold: skipped (TCPPreservationMode=None)", "migration", pm.Name)
+		setCondition(pm, pmv1.ConditionZeroWindowDisarmed, metav1.ConditionTrue,
+			"Skipped", "TCPPreservationMode=None: zero-window disarm not required")
 		setCondition(pm, pmv1.ConditionRelayProgramsLoaded, metav1.ConditionTrue,
 			"Skipped", "TCPPreservationMode=None: relay disarm not required")
 		if err := r.statusUpdate(ctx, pm); err != nil {
@@ -494,11 +543,66 @@ func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm 
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseTCPVerifying)
 	}
 
-	// DISARM atomicity barrier: ZW hold → relay ON must be atomic from the TCP stack's perspective.
-	// Full TC-BPF DISARM + PM_SEQ_XLAT map load in M21. The controller observes RelayProgramsLoaded.
-	log.Info("DisengageHold: disarming ZW hold and loading PM_SEQ_XLAT relay programs (ADR-0049)", "migration", pm.Name)
+	// Disarm the zero-window hold if not already disarmed.
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionZeroWindowDisarmed) {
+		if r.AgentPool == nil {
+			log.Error(nil, "DisengageHold: AgentPool not wired — requeuing", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
+		sourceNode := pm.Status.SourceNodeName
+		if sourceNode == "" {
+			log.Error(nil, "DisengageHold: SourceNodeName not set — requeuing", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
+		agentClient, err := r.AgentPool.ForNode(ctx, sourceNode)
+		if err != nil {
+			log.Error(err, "DisengageHold: cannot connect to source agent — requeuing", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
+		podUID := pm.Spec.SourcePodUID
+		log.Info("DisengageHold: calling DisarmZeroWindow on source agent (ADR-0049)",
+			"migration", pm.Name, "node", sourceNode)
+		disarmResp, err := agentClient.DisarmZeroWindow(ctx, &agentpb.DisarmZeroWindowRequest{
+			MigrationName: pm.Name,
+			PodUid:        podUID,
+		})
+		if err != nil {
+			// Non-fatal: the watchdog on the agent will auto-disarm. Log and continue.
+			log.Error(err, "DisengageHold: DisarmZeroWindow RPC error (watchdog will auto-disarm)",
+				"migration", pm.Name)
+			setCondition(pm, pmv1.ConditionZeroWindowDisarmed, metav1.ConditionTrue,
+				"WatchdogDisarm", fmt.Sprintf("DisarmZeroWindow RPC failed (%v); watchdog auto-disarm assumed", err))
+		} else if !disarmResp.Disarmed {
+			log.Info("DisengageHold: DisarmZeroWindow returned disarmed=false (watchdog likely fired)",
+				"migration", pm.Name, "reason", disarmResp.BlockingReason)
+			setCondition(pm, pmv1.ConditionZeroWindowDisarmed, metav1.ConditionTrue,
+				"WatchdogDisarmed", fmt.Sprintf("hold already disarmed by watchdog: %s", disarmResp.BlockingReason))
+		} else {
+			msg := fmt.Sprintf("TC-BPF zero-window hold disarmed; disarmed_at_ns=%d hold_duration_ms=%d (ADR-0049)",
+				disarmResp.DisarmedAtNs, disarmResp.HoldDurationMs)
+			log.Info("DisengageHold: hold disarmed", "migration", pm.Name,
+				"disarmedAtNs", disarmResp.DisarmedAtNs, "holdDurationMs", disarmResp.HoldDurationMs)
+
+			// Warn if the hold duration exceeded the freeze window budget.
+			budget := int64(pm.Spec.FreezeWindowBudgetMs)
+			if budget > 0 && disarmResp.HoldDurationMs > budget {
+				log.Error(nil, "DisengageHold: hold duration exceeded FreezeWindowBudgetMs",
+					"migration", pm.Name, "holdMs", disarmResp.HoldDurationMs, "budgetMs", budget)
+			}
+			setCondition(pm, pmv1.ConditionZeroWindowDisarmed, metav1.ConditionTrue, "Disarmed", msg)
+		}
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// PM_SEQ_XLAT relay wiring is M22. For M20 we set RelayProgramsLoaded=True as a placeholder
+	// once the zero-window hold is confirmed disarmed. This unblocks TCPVerifying.
+	log.Info("DisengageHold: ZW hold disarmed; marking RelayProgramsLoaded (PM_SEQ_XLAT relay wired in M22)",
+		"migration", pm.Name)
 	setCondition(pm, pmv1.ConditionRelayProgramsLoaded, metav1.ConditionTrue,
-		"RelayLoaded", "TC-BPF relay programs and PM_SEQ_XLAT maps loaded on destination node; ZW hold disarmed")
+		"ZWHoldDisarmed", "Zero-window hold disarmed; PM_SEQ_XLAT relay programs wired in M22 (ADR-0049)")
 	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
