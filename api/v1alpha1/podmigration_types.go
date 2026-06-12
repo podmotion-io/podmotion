@@ -274,6 +274,8 @@ type PodMigrationSpec struct {
 
 // Operator-facing status condition type constants for PodMigration.
 // These are set on PodMigrationStatus.Conditions by the network and TCP reconcile phases.
+// Authoritative vocabulary (all 11 types, CamelCase Reasons per K8s conventions):
+// docs/adr/conditions-vocabulary.md
 const (
 	// ConditionSocketInventoryComplete is True when the source pod socket table has
 	// been fully enumerated and all TCP 4-tuples recorded.
@@ -296,6 +298,19 @@ const (
 	// ConditionRelayProgramsLoaded is True when all TC-BPF relay programs (PM_SEQ_XLAT
 	// maps included) have been loaded and attached on the destination node (ADR-0049).
 	ConditionRelayProgramsLoaded = "RelayProgramsLoaded"
+	// ConditionRelayArmed is True when the 6-predicate ARM barrier is satisfied and the
+	// TC-BPF relay has transitioned from STANDBY to ARMED (ADR-0049).
+	ConditionRelayArmed = "RelayArmed"
+	// ConditionOverlayReady is True when FDB injection, conntrack NOTRACK, and probe
+	// traversal through the VXLAN tunnel are all confirmed (ADR-0048).
+	ConditionOverlayReady = "OverlayReady"
+	// ConditionTCPVerified is the aggregate TCP verification result. True only when
+	// TCPSequenceContinuityVerified=True and ConnectionCountParity=True.
+	// False triggers hard rollback when TCPPreservationMode=Strict (ADR-0019 Amendment A).
+	ConditionTCPVerified = "TCPVerified"
+	// ConditionServiceVerified is True when the application-level probe configured in
+	// spec.applicationProbe returns healthy from the destination pod post-restore.
+	ConditionServiceVerified = "ServiceVerified"
 )
 
 // PreCopyStats records metrics from the iterative pre-copy phase.
