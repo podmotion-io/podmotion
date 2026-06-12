@@ -132,6 +132,49 @@ PodMotion is the answer to the question the community delayed asking.
 
 ---
 
+## The one boundary: external traffic routing
+
+PodMotion owns the in-flight connection story completely. CRIU + eBPF preserves every
+already-open TCP socket with seq_delta=0 — every client that had a connection before the
+migration still has that exact connection after.
+
+There is one thing PodMotion cannot own silently: **where new connections go after the
+pod has moved.**
+
+A new connection arrives at a load balancer. The load balancer decides which node to
+route it to. If it still sends to the source node — where the pod no longer runs — the
+new connection fails. This is not a PodMotion failure. It is a load balancer
+configuration problem. But PodMotion is responsible for not letting a migration proceed
+until that configuration problem is known to be solved.
+
+**PodMotion's answer is a hard stop, not a silent failure.**
+
+If you try to migrate a pod and the destination node is not registered in your AWS ALB
+Target Group, PodMotion blocks the migration before the first CRIU pre-dump with a clear
+status condition:
+
+```
+TrafficRoutingPreflightPassed = False
+Reason: AWSALBNodeNotRegistered
+"Destination node ip-10-0-1-45.ec2.internal is not a registered target in
+ target group arn:aws:elasticloadbalancing:us-east-1:123:targetgroup/prod-api/abc.
+ Register the destination node or set autoRegister=true in MigrationPolicy."
+```
+
+No partial attempt. No optimistic "migrate and hope the LB follows." Hard stop, clear
+diagnosis, actionable message. This is documented in ADR-0054.
+
+The same logic applies to every external LB type: NLB, Nginx Ingress, Istio, MetalLB,
+GCP Cloud Load Balancer, Azure Load Balancer. PodMotion ships a validator for each. If
+no validator is registered for a given LB type, the migration is blocked with
+`UnknownLoadBalancerType` — requiring the operator to explicitly acknowledge the risk
+via `onValidationFailure: Skip` rather than discovering it in production.
+
+This is the only limitation. And it is not a defect — it is the correct behavior for
+a system that would rather refuse than silently corrupt.
+
+---
+
 ## Key claims (verifiable)
 
 All claims below are backed by reproducible test artifacts in `test/spike/m18.5/`.
