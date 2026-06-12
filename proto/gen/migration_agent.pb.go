@@ -847,6 +847,12 @@ type RestoreRequest struct {
 	SourceNodeAddr          string                 `protobuf:"bytes,3,opt,name=source_node_addr,json=sourceNodeAddr,proto3" json:"source_node_addr,omitempty"`                               // for DirectP2P mode
 	DestNetnsFd             string                 `protobuf:"bytes,5,opt,name=dest_netns_fd,json=destNetnsFd,proto3" json:"dest_netns_fd,omitempty"`                                        // pre-staged netns path from PrepareDestinationNetns
 	SourceFreezeTimestampNs int64                  `protobuf:"varint,6,opt,name=source_freeze_timestamp_ns,json=sourceFreezeTimestampNs,proto3" json:"source_freeze_timestamp_ns,omitempty"` // CLOCK_REALTIME ns at source freeze for seq-xlat
+	// SeqSnapshots carries per-connection TCP sequence state from the source freeze instant
+	// so the destination can seed PM_SEQ_XLAT before ZeroWindowDisarm (ADR-0049 predicate B).
+	SeqSnapshots            []*SeqSnapshot         `protobuf:"bytes,7,rep,name=seq_snapshots,json=seqSnapshots,proto3" json:"seq_snapshots,omitempty"`
+	// RelayIfname is the overlay interface name on the destination where PM_RELAY_TC programs
+	// are attached (typically "flannel.1"). Empty means use the default "flannel.1".
+	RelayIfname             string                 `protobuf:"bytes,8,opt,name=relay_ifname,json=relayIfname,proto3" json:"relay_ifname,omitempty"`
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
 }
@@ -914,6 +920,20 @@ func (x *RestoreRequest) GetSourceFreezeTimestampNs() int64 {
 		return x.SourceFreezeTimestampNs
 	}
 	return 0
+}
+
+func (x *RestoreRequest) GetSeqSnapshots() []*SeqSnapshot {
+	if x != nil {
+		return x.SeqSnapshots
+	}
+	return nil
+}
+
+func (x *RestoreRequest) GetRelayIfname() string {
+	if x != nil {
+		return x.RelayIfname
+	}
+	return ""
 }
 
 type RestoreResponse struct {
