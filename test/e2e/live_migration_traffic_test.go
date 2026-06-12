@@ -121,7 +121,7 @@ var _ = Describe("Live migration traffic continuity", Label("live-traffic"), Ord
 				PodNamespace:            liveTrafficNS,
 				TargetNodeName:          "pm-control",
 				Mode:                    pmv1.MigrationModePreCopy,
-				NetworkContinuity:       false,
+				TCPPreservationMode:     pmv1.TCPPreservationModeNone,
 				PreCopyMaxRounds:        5,
 				PreCopyDirtyThresholdMB: 16,
 				CompletionTimeoutSeconds: 600,

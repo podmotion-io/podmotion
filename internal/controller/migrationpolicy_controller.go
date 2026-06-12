@@ -224,7 +224,7 @@ func (r *MigrationPolicyReconciler) buildPodMigration(policy *pmv1.MigrationPoli
 			spec.CompletionTimeoutSeconds = d.CompletionTimeoutSeconds
 		}
 		spec.StorageStrategy = d.StorageStrategy
-		spec.NetworkContinuity = d.NetworkContinuity
+		spec.TCPPreservationMode = d.TCPPreservationMode
 		spec.RollbackOnFailure = d.RollbackOnFailure
 	}
 	return &pmv1.PodMigration{
@@ -351,7 +351,7 @@ func (r *MigrationPolicyReconciler) buildStatefulSetPodMigration(policy *pmv1.Mi
 			spec.CompletionTimeoutSeconds = d.CompletionTimeoutSeconds
 		}
 		spec.StorageStrategy = d.StorageStrategy
-		spec.NetworkContinuity = d.NetworkContinuity
+		spec.TCPPreservationMode = d.TCPPreservationMode
 		spec.RollbackOnFailure = d.RollbackOnFailure
 	}
 	return &pmv1.PodMigration{

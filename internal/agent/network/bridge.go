@@ -48,10 +48,10 @@ type BridgeConfig struct {
 	// GenevePort is the UDP port for the GENEVE tunnel (host byte order).
 	// Defaults to 6081 (IANA-assigned GENEVE port).
 	GenevePort uint16
-	// NetworkContinuity mirrors PodMigrationSpec.NetworkContinuity.
-	// False → TIER_4 fast-path: NetworkBridgeArmed is set immediately without
+	// TCPPreservationMode mirrors PodMigrationSpec.TCPPreservationMode.
+	// None → TIER_4 fast-path: NetworkBridgeArmed is set immediately without
 	// loading any eBPF programs. (ADR-0028)
-	NetworkContinuity bool
+	TCPPreservationMode pmv1.TCPPreservationMode
 	// CNIPlugin is the detected primary CNI (e.g. "calico", "cilium", "flannel").
 	// Used for Flannel live-migration rejection and Cilium XDP conflict detection.
 	CNIPlugin string
@@ -64,9 +64,9 @@ type BridgeConfig struct {
 }
 
 // NetworkBridgeAgent implements orchestration.NetworkPipeline for v0.1/v0.2.
-// In v0.1 (TIER_4, NetworkContinuity=false) all eBPF operations are bypassed and
+// In v0.1 (TIER_4, TCPPreservationMode=None) all eBPF operations are bypassed and
 // NetworkBridgeArmed is set immediately so the gate proceeds to Checkpointing.
-// In v0.2 (NetworkContinuity=true) the agent arms zero-window hold, waits for
+// In v0.2 (TCPPreservationMode=Strict|BestEffort) the agent arms zero-window hold, waits for
 // the freeze signal from the compute pipeline, then arms the XDP bridge.
 type NetworkBridgeAgent struct {
 	Client    client.Client
@@ -100,7 +100,7 @@ func NewNetworkBridgeAgent(c client.Client, pm *pmv1.PodMigration, cfg BridgeCon
 func (a *NetworkBridgeAgent) ArmBridge(ctx context.Context) (<-chan orchestration.BridgeStatus, error) {
 	ch := make(chan orchestration.BridgeStatus, 1)
 
-	if !a.Config.NetworkContinuity {
+	if a.Config.TCPPreservationMode == pmv1.TCPPreservationModeNone {
 		// ADR-0028: TIER_4 fast-path — cold migration, no TCP preservation needed.
 		go func() {
 			defer close(ch)
@@ -113,9 +113,9 @@ func (a *NetworkBridgeAgent) ArmBridge(ctx context.Context) (<-chan orchestratio
 		return ch, nil
 	}
 
-	// Flannel does not support IP mobility — NetworkContinuity=true is invalid.
+	// Flannel does not support IP mobility — TCPPreservationMode=Strict/BestEffort is invalid.
 	if strings.Contains(strings.ToLower(a.Config.CNIPlugin), "flannel") {
-		return nil, fmt.Errorf("NetworkContinuity=true not supported for Flannel CNI; use NetworkContinuity=false (cold migration only)")
+		return nil, fmt.Errorf("TCPPreservationMode=%s not supported for Flannel CNI; use TCPPreservationMode=None (cold migration only)", a.Config.TCPPreservationMode)
 	}
 
 	// v0.2 path — run as a goroutine so ArmBridge returns immediately.
@@ -249,7 +249,7 @@ func (a *NetworkBridgeAgent) waitForFreeze(ctx context.Context) error {
 // Updates routing (gARP / CNI API) so that traffic reaches the destination pod.
 // In v0.1 this is a no-op because the EndpointSlice manager in Agent 12 handles routing.
 func (a *NetworkBridgeAgent) Handoff(ctx context.Context) error {
-	logf.FromContext(ctx).Info("NetworkBridgeAgent.Handoff", "networkContinuity", a.Config.NetworkContinuity)
+	logf.FromContext(ctx).Info("NetworkBridgeAgent.Handoff", "tcpPreservationMode", a.Config.TCPPreservationMode)
 	// gARP / BGP /32 host-route announcement deferred to v0.2.
 	return nil
 }
@@ -258,7 +258,7 @@ func (a *NetworkBridgeAgent) Handoff(ctx context.Context) error {
 // Disarms both eBPF programs.  Non-fatal — retried via finalizer if it fails.
 func (a *NetworkBridgeAgent) Teardown(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	if !a.Config.NetworkContinuity {
+	if a.Config.TCPPreservationMode == pmv1.TCPPreservationModeNone {
 		return nil
 	}
 

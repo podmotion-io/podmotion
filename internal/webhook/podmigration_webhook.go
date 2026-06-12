@@ -337,15 +337,15 @@ func (d *PodMigrationDefaulter) applyDefaults(ctx context.Context, pm *pmv1.PodM
 		}
 	}
 
-	// Rule 8: networkContinuity downgrade — if requested but CNI doesn't support IP mobility,
-	// downgrade silently and annotate. This is a warning, not a rejection.
-	if pm.Spec.NetworkContinuity && pm.Spec.TargetNodeName != "" {
+	// Rule 8: TCPPreservationMode downgrade — if Strict/BestEffort requested but CNI doesn't
+	// support IP mobility, downgrade to None silently and annotate.
+	if pm.Spec.TCPPreservationMode != pmv1.TCPPreservationModeNone && pm.Spec.TargetNodeName != "" {
 		nmc, err := d.getNMC(ctx, pm.Spec.TargetNodeName)
 		if err == nil && !nmc.Spec.NetworkCapability.IPMobilitySupported {
-			webhookLog.Info("downgrading networkContinuity to false: CNI does not support IP mobility",
+			webhookLog.Info("downgrading tcpPreservationMode to None: CNI does not support IP mobility",
 				"migration", pm.Name, "targetNode", pm.Spec.TargetNodeName,
 				"cni", nmc.Spec.NetworkCapability.CNIPlugin)
-			pm.Spec.NetworkContinuity = false
+			pm.Spec.TCPPreservationMode = pmv1.TCPPreservationModeNone
 			if pm.Annotations == nil {
 				pm.Annotations = make(map[string]string)
 			}

@@ -129,7 +129,7 @@ var _ = Describe("Live database migration", Label("live-db"), Ordered, func() {
 				PodNamespace:            dbTestNS,
 				TargetNodeName:          "pm-control",
 				Mode:                    pmv1.MigrationModePreCopy,
-				NetworkContinuity:       false,
+				TCPPreservationMode:     pmv1.TCPPreservationModeNone,
 				PreCopyMaxRounds:        5,
 				PreCopyDirtyThresholdMB: 32, // DB pages are dirtier than nginx
 				CompletionTimeoutSeconds: 720,

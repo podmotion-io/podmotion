@@ -540,7 +540,7 @@ func createLiveMigration(ctx context.Context, c client.Client, sourcePod *corev1
 			PodNamespace:             nginxLiveNamespace,
 			Mode:                     pmv1.MigrationModeCold,
 			TargetNodeName:           targetNode,
-			NetworkContinuity:        false,
+			TCPPreservationMode:      pmv1.TCPPreservationModeNone,
 			RollbackOnFailure:        true,
 			CompletionTimeoutSeconds: int32(liveMigrationTimeout.Seconds()),
 		},

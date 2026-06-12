@@ -12,14 +12,79 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// TCPPreservationMode controls how the operator handles active TCP connections during migration.
+// +kubebuilder:validation:Enum=Strict;BestEffort;None
+type TCPPreservationMode string
+
+const (
+	// TCPPreservationModeStrict requires full TCP sequence continuity. If
+	// TCPSequenceContinuityVerified=False after restore, the operator triggers hard rollback.
+	// See ADR-0019 Amendment A.
+	TCPPreservationModeStrict TCPPreservationMode = "Strict"
+	// TCPPreservationModeBestEffort attempts TCP preservation but emits a warning condition
+	// instead of rolling back when TCPSequenceContinuityVerified=False.
+	TCPPreservationModeBestEffort TCPPreservationMode = "BestEffort"
+	// TCPPreservationModeNone skips the TCPVerifying phase entirely. Stateless workloads only.
+	TCPPreservationModeNone TCPPreservationMode = "None"
+)
+
+// ApplicationProbeProtocol selects the liveness/readiness probe used by ApplicationProbeSpec.
+// +kubebuilder:validation:Enum=SQL;HTTP;gRPC;TCP
+type ApplicationProbeProtocol string
+
+const (
+	ApplicationProbeProtocolSQL  ApplicationProbeProtocol = "SQL"
+	ApplicationProbeProtocolHTTP ApplicationProbeProtocol = "HTTP"
+	ApplicationProbeProtocolGRPC ApplicationProbeProtocol = "gRPC"
+	ApplicationProbeProtocolTCP  ApplicationProbeProtocol = "TCP"
+)
+
+// ApplicationProbeSpec defines a post-restore application-level health check.
+type ApplicationProbeSpec struct {
+	// Protocol selects the probe type.
+	// +kubebuilder:validation:Required
+	Protocol ApplicationProbeProtocol `json:"protocol"`
+
+	// Port is the target port for HTTP, gRPC, and TCP probes.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +optional
+	Port int32 `json:"port,omitempty"`
+
+	// Path is the HTTP path for HTTP probes (e.g. "/healthz").
+	// +optional
+	Path string `json:"path,omitempty"`
+
+	// Query is the SQL query for SQL probes (e.g. "SELECT 1").
+	// +optional
+	Query string `json:"query,omitempty"`
+
+	// GRPCService is the fully-qualified gRPC service name for gRPC probes.
+	// +optional
+	GRPCService string `json:"grpcService,omitempty"`
+
+	// TimeoutSeconds is the probe deadline. Defaults to 5.
+	// +kubebuilder:default=5
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
+}
+
 // MigrationMode controls the memory transfer strategy.
 // +kubebuilder:validation:Enum=PreCopy;PostCopy;Cold
 type MigrationMode string
 
 const (
-	MigrationModePreCopy  MigrationMode = "PreCopy"
+	// MigrationModePreCopy iteratively copies dirty memory pages while the pod
+	// continues running, resulting in a short final freeze window (<100ms).
+	MigrationModePreCopy MigrationMode = "PreCopy"
+	// MigrationModePostCopy freezes the pod immediately, transfers a minimal
+	// checkpoint, then faults pages on-demand at the destination. Requires
+	// CONFIG_USERFAULTFD=y on the destination node kernel.
 	MigrationModePostCopy MigrationMode = "PostCopy"
-	MigrationModeCold     MigrationMode = "Cold"
+	// MigrationModeCold freezes the pod for the entire checkpoint-and-transfer
+	// sequence. Simplest migration path but incurs the highest downtime.
+	MigrationModeCold MigrationMode = "Cold"
 )
 
 // StorageStrategy overrides automatic storage tier selection.
@@ -27,11 +92,21 @@ const (
 type StorageStrategy string
 
 const (
-	StorageStrategyAuto          StorageStrategy = "Auto"
-	StorageStrategySkip          StorageStrategy = "Skip"
-	StorageStrategySync          StorageStrategy = "Sync"
+	// StorageStrategyAuto detects the storage class and selects the appropriate
+	// tier (0–4) automatically. This is the default strategy.
+	StorageStrategyAuto StorageStrategy = "Auto"
+	// StorageStrategySkip re-attaches RWX volumes on the destination node without
+	// migrating volume data. No data movement occurs.
+	StorageStrategySkip StorageStrategy = "Skip"
+	// StorageStrategySync migrates data via rsync over SSH for non-CSI storage
+	// classes (tier 3).
+	StorageStrategySync StorageStrategy = "Sync"
+	// StorageStrategySnapshotClone migrates data using a CSI VolumeSnapshot
+	// followed by a volume clone (tier 2).
 	StorageStrategySnapshotClone StorageStrategy = "SnapshotClone"
-	StorageStrategyDualEngine    StorageStrategy = "DualEngine"
+	// StorageStrategyDualEngine migrates data using Longhorn dual-engine live
+	// replication, enabling live volume migration with no I/O interruption (tier 1).
+	StorageStrategyDualEngine StorageStrategy = "DualEngine"
 )
 
 // MigrationPhase represents the current phase of a PodMigration.
@@ -125,11 +200,25 @@ type PodMigrationSpec struct {
 	// +kubebuilder:default=Auto
 	StorageStrategy StorageStrategy `json:"storageStrategy,omitempty"`
 
-	// NetworkContinuity enables TCP connection preservation via eBPF bridge and IP handoff.
-	// Requires CNI support — see NodeMigrationCapacity.status.cniIPMobilitySupported.
-	// Defaults to false; eBPF bridge is not yet implemented (use TIER_4 cold migration path).
-	// +kubebuilder:default=false
-	NetworkContinuity bool `json:"networkContinuity,omitempty"`
+	// TCPPreservationMode controls TCP connection continuity behavior during migration.
+	// Strict triggers hard rollback if TCPSequenceContinuityVerified=False (ADR-0019 Amendment A).
+	// BestEffort emits a warning condition only.
+	// None skips the TCPVerifying phase entirely (stateless workloads).
+	// +kubebuilder:default=None
+	TCPPreservationMode TCPPreservationMode `json:"tcpPreservationMode,omitempty"`
+
+	// FreezeWindowBudgetMs is the maximum allowed wall-clock milliseconds for the full
+	// ZW-arm-to-ZW-disarm critical path (ADR-0049). Migrations that exceed this budget
+	// are aborted and the source pod is thawed.
+	// +kubebuilder:default=500
+	// +kubebuilder:validation:Minimum=50
+	// +kubebuilder:validation:Maximum=10000
+	FreezeWindowBudgetMs int32 `json:"freezeWindowBudgetMs,omitempty"`
+
+	// ApplicationProbe is an optional post-restore application-level health check.
+	// When set, the operator executes this probe before declaring phase=Complete.
+	// +optional
+	ApplicationProbe *ApplicationProbeSpec `json:"applicationProbe,omitempty"`
 
 	// DryRun runs the estimation pipeline only; does not touch the running pod.
 	// +kubebuilder:default=false
@@ -165,6 +254,32 @@ type PodMigrationSpec struct {
 	// +optional
 	AffinityMode AffinityMode `json:"affinityMode,omitempty"`
 }
+
+// Operator-facing status condition type constants for PodMigration.
+// These are set on PodMigrationStatus.Conditions by the network and TCP reconcile phases.
+const (
+	// ConditionSocketInventoryComplete is True when the source pod socket table has
+	// been fully enumerated and all TCP 4-tuples recorded.
+	ConditionSocketInventoryComplete = "SocketInventoryComplete"
+	// ConditionDestinationNetnsReady is True when the pre-staged migration netns on
+	// the destination node is configured with the correct IP and routing (ADR-0048).
+	ConditionDestinationNetnsReady = "DestinationNetnsReady"
+	// ConditionZeroWindowArmed is True when the TC-BPF zero-window hold program has
+	// been loaded and armed on the source pod's veth (ADR-0049).
+	ConditionZeroWindowArmed = "ZeroWindowArmed"
+	// ConditionVXLANFDBUpdated is True when the two-sided AF_BRIDGE FDB and AF_INET
+	// neighbor entries have been injected on both nodes (ADR-0048).
+	ConditionVXLANFDBUpdated = "VXLANFDBUpdated"
+	// ConditionTCPSequenceContinuityVerified is True when all migrated connections
+	// have been confirmed to have seq_delta=0 post-restore (ADR-0049).
+	ConditionTCPSequenceContinuityVerified = "TCPSequenceContinuityVerified"
+	// ConditionConnectionCountParity is True when the destination pod reports the same
+	// number of ESTABLISHED connections as were inventoried on the source pod.
+	ConditionConnectionCountParity = "ConnectionCountParity"
+	// ConditionRelayProgramsLoaded is True when all TC-BPF relay programs (PM_SEQ_XLAT
+	// maps included) have been loaded and attached on the destination node (ADR-0049).
+	ConditionRelayProgramsLoaded = "RelayProgramsLoaded"
+)
 
 // PreCopyStats records metrics from the iterative pre-copy phase.
 type PreCopyStats struct {
@@ -264,6 +379,7 @@ type PodMigrationStatus struct {
 // +kubebuilder:resource:scope=Namespaced,shortName=pm,categories=podmotion
 // +kubebuilder:printcolumn:name="Pod",type=string,JSONPath=`.spec.podName`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="TCPMode",type=string,JSONPath=`.spec.tcpPreservationMode`
 // +kubebuilder:printcolumn:name="Source",type=string,JSONPath=`.status.sourceNodeName`
 // +kubebuilder:printcolumn:name="Dest",type=string,JSONPath=`.status.destinationNodeName`
 // +kubebuilder:printcolumn:name="Mode",type=string,JSONPath=`.spec.mode`
