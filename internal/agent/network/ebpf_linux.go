@@ -146,6 +146,10 @@ func (m *ciliumEBPFManager) ensureLoaded(ctx context.Context) error {
 // additional dependencies (ADR preference: custom over packages).
 // ──────────────────────────────────────────────────────────────────────────────
 
+// nlmsgHdrSize is sizeof(unix.NlMsghdr) = 16.
+// unix.NLMSG_HDRSIZE is not always exported; local const ensures cross-compilation.
+const nlmsgHdrSize = 16
+
 // TC netlink constants not yet in golang.org/x/sys/unix.
 const (
 	tcHandleRoot    = 0xFFFFFFFF
