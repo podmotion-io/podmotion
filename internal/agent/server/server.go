@@ -72,7 +72,7 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 // (created by runc) and restores the checkpointed process tree.
 // migrationName is used for log tagging; checkpointDir is the tmpfs images path.
 func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir string) (int, error) {
-	return joinNsRestore(migrationName, checkpointDir)
+	return joinNsRestore(migrationName, checkpointDir, "")
 }
 
 // ListenAndServe starts the gRPC server on addr (default ":9090").
@@ -334,20 +334,22 @@ func ctrCheckpoint(taskID, imagesDir string) (int64, error) {
 	return total, nil
 }
 
-// joinNsRestore restores a checkpointed container using a standalone overlayfs rootfs and
-// CRIU's --empty-ns net mode. This handles the cross-node case where source-node-specific
-// bind-mounts (veth peers, sandboxed netns, masked proc paths) cannot be recreated.
+// joinNsRestore restores a checkpointed container using a standalone overlayfs rootfs.
+// When destNetnsFd is non-empty (a /proc/<pid>/fd/<n> path to a pre-staged migration netns),
+// CRIU uses --join-ns net:<destNetnsFd> to restore TCP connections into the pre-staged netns
+// (required for TCPPreservationMode=Strict/BestEffort per ADR-0048).
+// When destNetnsFd is empty, CRIU falls back to --empty-ns net (stateless cold migration).
 //
 // Approach:
 //  1. Patch checkpoint images: remove null-ext_key masked mounts, strip extRootNetNS from
 //     netns image, remove VETH entry from netdev image (loopback only).
 //  2. Mount an overlayfs rootfs from containerd snapshot layers.
-//  3. Run CRIU restore with --root <overlayfs> --empty-ns net plus --ext-mount-map for every
-//     external mount (serviceaccount, data, termination-log, dev/null masked paths, etc.).
-//  4. Bring up loopback in the restored process's new network namespace.
+//  3. Run CRIU restore with --root <overlayfs> and the appropriate netns flag plus
+//     --ext-mount-map for every external mount.
+//  4. Bring up loopback in the restored process's network namespace.
 //
 // Returns the host PID of the restored process.
-func joinNsRestore(migrationName, checkpointDir string) (int, error) {
+func joinNsRestore(migrationName, checkpointDir, destNetnsFd string) (int, error) {
 	cfgPath := filepath.Join(checkpointDir, "config.json")
 	cfgData, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -421,7 +423,11 @@ func joinNsRestore(migrationName, checkpointDir string) (int, error) {
 		}
 	}
 
-	// Step 4: CRIU restore — standalone rootfs, empty net namespace.
+	// Step 4: CRIU restore — standalone rootfs.
+	// Network namespace selection:
+	//   destNetnsFd non-empty → --join-ns net:<path>: restore into the pre-staged migration
+	//     netns so TCP connections survive across the overlay handoff (ADR-0048).
+	//   empty → --empty-ns net: create a fresh netns (stateless cold migration).
 	restoreLogPath := filepath.Join(checkpointDir, "restore.log")
 	criuArgs := []string{
 		"restore",
@@ -443,13 +449,16 @@ func joinNsRestore(migrationName, checkpointDir string) (int, error) {
 		"--ext-mount-map", "/etc/resolv.conf:/etc/resolv.conf",
 		"--ext-mount-map", "/etc/hostname:/etc/hostname",
 		"--ext-mount-map", "/etc/hosts:/etc/hosts",
-		// Create a fresh network namespace; the veth peer doesn't exist cross-node.
-		"--empty-ns", "net",
 		// No --restore-detached: CRIU runs foreground as the restored process's init/parent.
 		// --restore-detached would cause CRIU to exit-0 and orphan the process (ghost
 		// container — PID visible in /proc but not tracked by any supervisor).
 		"-v4",
 		"-o", restoreLogPath,
+	}
+	if destNetnsFd != "" {
+		criuArgs = append(criuArgs, "--join-ns", "net:"+destNetnsFd)
+	} else {
+		criuArgs = append(criuArgs, "--empty-ns", "net")
 	}
 	criuCmd := exec.Command("/usr/local/sbin/criu", criuArgs...)
 	if err := criuCmd.Start(); err != nil {
@@ -844,11 +853,29 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		return nil, fmt.Errorf("checkpoint: cannot create images dir %s: %w", imagesDir, mkErr)
 	}
 
+	// Resolve TCPPreservationMode from the PodMigration CR so TcpEstablished is tier-driven.
+	// When the k8s client is unavailable (dev/stub mode) the mode defaults to None.
+	tcpEstablished := false
+	if s.k8sClient != nil {
+		pmNs := os.Getenv("POD_NAMESPACE")
+		if pmNs == "" {
+			pmNs = "podmotion-system"
+		}
+		pm := &pmv1.PodMigration{}
+		if lookupErr := s.k8sClient.Get(context.Background(), types.NamespacedName{
+			Name:      req.MigrationName,
+			Namespace: pmNs,
+		}, pm); lookupErr == nil {
+			mode := pm.Spec.TCPPreservationMode
+			tcpEstablished = mode == pmv1.TCPPreservationModeStrict || mode == pmv1.TCPPreservationModeBestEffort
+		}
+	}
+
 	freezeStart := time.Now()
 	result, err := s.checkpointer.Dump(context.Background(), criu.DumpOptions{
-		ImagesDir: imagesDir,
-		Pid:       containerPID,
-		// TcpEstablished is set at the CRIU RPC level (criu_checkpointer.go); not in DumpOptions struct.
+		ImagesDir:      imagesDir,
+		Pid:            containerPID,
+		TcpEstablished: tcpEstablished,
 	})
 
 	var checkpointPath string
@@ -1006,9 +1033,10 @@ func (s *AgentServer) Restore(_ context.Context, req *agentpb.RestoreRequest) (*
 	// launch a fresh placeholder container then restore checkpoint state into its namespaces.
 	cfgPath := filepath.Join(imagesDir, "config.json")
 	if _, statErr := os.Stat(cfgPath); statErr == nil {
-		log.Info("Restore: config.json found — using join-ns restore (ctr placeholder + CRIU)")
+		log.Info("Restore: config.json found — using join-ns restore (ctr placeholder + CRIU)",
+			"destNetnsFd", req.DestNetnsFd)
 		restoreStart := time.Now()
-		pid, joinErr := joinNsRestore(req.MigrationName, imagesDir)
+		pid, joinErr := joinNsRestore(req.MigrationName, imagesDir, req.DestNetnsFd)
 		restoreDurationMs := time.Since(restoreStart).Milliseconds()
 		if joinErr != nil {
 			return nil, fmt.Errorf("runc restore failed: %w", joinErr)

@@ -49,6 +49,53 @@ func TestCRIUCheckpointer_DarwinReturnsError(t *testing.T) {
 	})
 }
 
+// TestDumpOptions_TcpEstablishedTier verifies that TcpEstablished is propagated correctly
+// from the tier (TCPPreservationMode) into DumpOptions and RestoreOptions.
+// The StubCheckpointer records options so we can assert without invoking real CRIU.
+func TestDumpOptions_TcpEstablishedTier(t *testing.T) {
+	type row struct {
+		name           string
+		tcpEstablished bool
+		wantTCP        bool
+	}
+	rows := []row{
+		{name: "None_stateless", tcpEstablished: false, wantTCP: false},
+		{name: "BestEffort_tier", tcpEstablished: true, wantTCP: true},
+		{name: "Strict_tier", tcpEstablished: true, wantTCP: true},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			stub := &criu.StubCheckpointer{}
+			opts := criu.DumpOptions{
+				ImagesDir:      t.TempDir(),
+				TcpEstablished: r.tcpEstablished,
+			}
+			_, _ = stub.Dump(context.Background(), opts)
+			if len(stub.DumpCalls) != 1 {
+				t.Fatalf("expected 1 Dump call, got %d", len(stub.DumpCalls))
+			}
+			got := stub.DumpCalls[0].TcpEstablished
+			if got != r.wantTCP {
+				t.Errorf("TcpEstablished: got %v, want %v", got, r.wantTCP)
+			}
+
+			stubR := &criu.StubCheckpointer{}
+			ropts := criu.RestoreOptions{
+				ImagesDir:      t.TempDir(),
+				TcpEstablished: r.tcpEstablished,
+			}
+			_, _ = stubR.Restore(context.Background(), ropts)
+			if len(stubR.RestoreCalls) != 1 {
+				t.Fatalf("expected 1 Restore call, got %d", len(stubR.RestoreCalls))
+			}
+			gotR := stubR.RestoreCalls[0].TcpEstablished
+			if gotR != r.wantTCP {
+				t.Errorf("Restore TcpEstablished: got %v, want %v", gotR, r.wantTCP)
+			}
+		})
+	}
+}
+
 func assertDarwinError(t *testing.T, err error) {
 	t.Helper()
 	if err == nil {

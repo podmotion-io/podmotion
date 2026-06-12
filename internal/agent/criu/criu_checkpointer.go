@@ -160,7 +160,7 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 
 	// Build CRIU opts tuned for a containerised process on a kind (Docker-based)
 	// node.  Key choices:
-	//   - TcpEstablished=false  — cold migration; TCP connections break at cutover
+	//   - TcpEstablished — driven from opts; true when TCPPreservationMode is Strict or BestEffort
 	//   - ShellJob=false        — container init is not a shell job
 	//   - ExtSharing=true       — overlay rootfs shares mount subtrees externally
 	//   - ExtMasters=true       — overlay upper/work dirs are external mount masters
@@ -174,7 +174,7 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		LogLevel:       proto.Int32(4),
 		Pid:            proto.Int32(opts.Pid),
 		LeaveRunning:   proto.Bool(opts.LeaveRunning),
-		TcpEstablished: proto.Bool(false),
+		TcpEstablished: proto.Bool(opts.TcpEstablished),
 		TcpClose:       proto.Bool(true),
 		// TcpSkipInFlight skips TCP sockets with in-flight data — avoids iptables
 		// network-lock scripts (iptables-restore) that are absent in kind agent images.
@@ -316,7 +316,7 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 		ImagesDirFd:     proto.Int32(int32(imgDirFd.Fd())),
 		LogFile:         proto.String("restore.log"),
 		LogLevel:        proto.Int32(4),
-		TcpEstablished:  proto.Bool(false),
+		TcpEstablished:  proto.Bool(opts.TcpEstablished),
 		TcpClose:        proto.Bool(true),
 		TcpSkipInFlight: proto.Bool(true),
 		// NetworkLock=SKIP: no iptables-restore needed on destination either.
