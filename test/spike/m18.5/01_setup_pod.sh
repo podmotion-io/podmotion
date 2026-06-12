@@ -160,6 +160,8 @@ def receiver(sock):
                             print(f"[traffic] *** {gap} ***", flush=True)
                         expected = recv_seq + 1
         except Exception as e:
+            # ECONNRESET, EOF, or any recv error: mark running=False and exit.
+            # No silent reconnect — any reconnect would hide migration failures.
             with stats_lock:
                 stats["errors"] += 1
                 stats["running"] = False

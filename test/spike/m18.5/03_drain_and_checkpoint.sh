@@ -71,18 +71,13 @@ while true; do
     UNACKED="${UNACKED:-0}"
     NOTSENT="${NOTSENT:-0}"
 
+    # ADR-0049: strictly require unacked==0 — notsent=0 fallback removed.
+    # notsent=0 with unacked>0 means bytes are in-flight, not yet ACK'd by the peer.
+    # Dumping in that state causes the restored socket to retransmit already-received
+    # data, which produces seq gaps at the application layer. No fallback permitted.
     if [[ "${UNACKED}" == "0" ]]; then
         ELAPSED_MS=$(( ($(date +%s%N) - DRAIN_START_NS) / 1000000 ))
         echo "[checkpoint] send buffer drained in ${ELAPSED_MS}ms (unacked=0)"
-        DRAINED=true
-        break
-    fi
-
-    # Secondary: notsent=0 means nothing more to send — existing unacked is in-flight
-    # and the peer has received it. This is the correct drain state under zero-window hold.
-    if [[ "${NOTSENT}" == "0" ]] && [[ "${UNACKED}" != "0" ]]; then
-        ELAPSED_MS=$(( ($(date +%s%N) - DRAIN_START_NS) / 1000000 ))
-        echo "[checkpoint] notsent=0, unacked=${UNACKED} (in-flight, peer received) — drain sufficient for CRIU"
         DRAINED=true
         break
     fi

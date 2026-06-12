@@ -21,6 +21,7 @@ See [ADR-0038](adr/0038-ecosystem-delta-model.md) for the strategic rationale.
 | 6 | **SELinux policy for CRIU** | Red Hat | Upstream SELinux policy module for CRIU ptrace + bpf(2) syscalls | `selinux/podmotion.te` (drafted, needs upstream review + ship) | ⏳ waiting |
 | 7 | **GPU checkpoint GA** | NVIDIA | `cuda-checkpoint` public API, stable CLI flags, documentation | `internal/agent/gpu/` — behind `GPUMigration` feature gate (ADR-0032) | ⏳ waiting |
 | 8 | **Multi-cluster control plane** | CNCF / community | Standard cross-cluster workload identity and control plane federation | `internal/multicluster/` — `ClusterFederator` interface (ADR-0022, M19+) | 🗓 deferred post-v1.0 |
+| 9 | **Cross-node TCP migration: same-subnet IP retained across flannel VXLAN** | Flannel / CNI ecosystem | Flannel does not support a first-class API for injecting FDB+neighbor entries to redirect a foreign-subnet pod IP to a destination VTEP. PodMotion does this today via direct `bridge fdb append` + `ip neigh replace` (the `05_inject_fdb.sh` approach). A CNI-aware API would be cleaner and more portable. | `internal/agent/network/fdb_injector.go` — `FDBInjectionStrategy` interface (M20+) | 🔄 workaround in place (direct netlink) |
 
 ---
 

@@ -62,17 +62,29 @@ criu restore \
     2>&1 | tee "${LOG_DIR}/criu_restore_stdout.log" &
 
 CRIU_BG_PID=$!
-# Wait briefly for CRIU to start the restore (it fails fast if it can't restore)
-sleep 2
-# Check if CRIU failed immediately
-if ! kill -0 "${CRIU_BG_PID}" 2>/dev/null; then
-    wait "${CRIU_BG_PID}"
-    CRIU_EXIT=$?
-else
-    CRIU_EXIT=0
-fi
+
+# Poll for a live process in the migration netns (up to 5s, 50ms intervals).
+# Replaces the hard sleep 2 — CRIU restore typically completes in 200-400ms;
+# waiting the full 2s is dead time in the freeze window.
+CRIU_EXIT=0
+RESTORED_EARLY=""
+for i in $(seq 1 100); do
+    sleep 0.05
+    if ! kill -0 "${CRIU_BG_PID}" 2>/dev/null; then
+        wait "${CRIU_BG_PID}"
+        CRIU_EXIT=$?
+        break
+    fi
+    # CRIU restore is backgrounded and will run until the restored process exits.
+    # Detect liveness: check for any established TCP socket in the migration netns.
+    if ip netns exec "${MIGRATION_NETNS}" ss -tn 2>/dev/null | grep -q "ESTAB"; then
+        RESTORED_EARLY="yes"
+        break
+    fi
+done
 RESTORE_END_NS=$(date +%s%N)
 RESTORE_ELAPSED_MS=$(( (RESTORE_END_NS - RESTORE_START_NS) / 1000000 ))
+echo "[restore] health-check: ${RESTORED_EARLY:+socket ESTAB in ${RESTORE_ELAPSED_MS}ms}${RESTORED_EARLY:-CRIU bg still running after ${RESTORE_ELAPSED_MS}ms}"
 
 if [[ ${CRIU_EXIT} -ne 0 ]]; then
     echo "[restore] FATAL: CRIU restore failed (exit ${CRIU_EXIT})"
