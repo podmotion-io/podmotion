@@ -19,17 +19,18 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	MigrationAgentService_PrepareSource_FullMethodName      = "/podmotion.agent.v1.MigrationAgentService/PrepareSource"
-	MigrationAgentService_PreDumpRound_FullMethodName       = "/podmotion.agent.v1.MigrationAgentService/PreDumpRound"
-	MigrationAgentService_Checkpoint_FullMethodName         = "/podmotion.agent.v1.MigrationAgentService/Checkpoint"
-	MigrationAgentService_PrepareDestination_FullMethodName = "/podmotion.agent.v1.MigrationAgentService/PrepareDestination"
-	MigrationAgentService_Restore_FullMethodName            = "/podmotion.agent.v1.MigrationAgentService/Restore"
-	MigrationAgentService_Verify_FullMethodName             = "/podmotion.agent.v1.MigrationAgentService/Verify"
-	MigrationAgentService_Abort_FullMethodName              = "/podmotion.agent.v1.MigrationAgentService/Abort"
-	MigrationAgentService_EstimateCheckpoint_FullMethodName = "/podmotion.agent.v1.MigrationAgentService/EstimateCheckpoint"
-	MigrationAgentService_PutCheckpointTar_FullMethodName   = "/podmotion.agent.v1.MigrationAgentService/PutCheckpointTar"
-	MigrationAgentService_GetCheckpointTar_FullMethodName   = "/podmotion.agent.v1.MigrationAgentService/GetCheckpointTar"
-	MigrationAgentService_ReleaseCheckpoint_FullMethodName  = "/podmotion.agent.v1.MigrationAgentService/ReleaseCheckpoint"
+	MigrationAgentService_PrepareSource_FullMethodName           = "/podmotion.agent.v1.MigrationAgentService/PrepareSource"
+	MigrationAgentService_PreDumpRound_FullMethodName            = "/podmotion.agent.v1.MigrationAgentService/PreDumpRound"
+	MigrationAgentService_Checkpoint_FullMethodName              = "/podmotion.agent.v1.MigrationAgentService/Checkpoint"
+	MigrationAgentService_PrepareDestination_FullMethodName      = "/podmotion.agent.v1.MigrationAgentService/PrepareDestination"
+	MigrationAgentService_Restore_FullMethodName                 = "/podmotion.agent.v1.MigrationAgentService/Restore"
+	MigrationAgentService_Verify_FullMethodName                  = "/podmotion.agent.v1.MigrationAgentService/Verify"
+	MigrationAgentService_PrepareDestinationNetns_FullMethodName = "/podmotion.agent.v1.MigrationAgentService/PrepareDestinationNetns"
+	MigrationAgentService_Abort_FullMethodName                   = "/podmotion.agent.v1.MigrationAgentService/Abort"
+	MigrationAgentService_EstimateCheckpoint_FullMethodName      = "/podmotion.agent.v1.MigrationAgentService/EstimateCheckpoint"
+	MigrationAgentService_PutCheckpointTar_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/PutCheckpointTar"
+	MigrationAgentService_GetCheckpointTar_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/GetCheckpointTar"
+	MigrationAgentService_ReleaseCheckpoint_FullMethodName       = "/podmotion.agent.v1.MigrationAgentService/ReleaseCheckpoint"
 )
 
 // MigrationAgentServiceClient is the client API for MigrationAgentService service.
@@ -50,6 +51,9 @@ type MigrationAgentServiceClient interface {
 	Restore(ctx context.Context, in *RestoreRequest, opts ...grpc.CallOption) (*RestoreResponse, error)
 	// Verify confirms the restored pod is healthy and accepting traffic.
 	Verify(ctx context.Context, in *VerifyRequest, opts ...grpc.CallOption) (*VerifyResponse, error)
+	// PrepareDestinationNetns pre-stages the migration network namespace on the destination
+	// node and returns the file descriptor path and VTEP MAC for overlay FDB injection.
+	PrepareDestinationNetns(ctx context.Context, in *PrepareDestinationNetnsRequest, opts ...grpc.CallOption) (*PrepareDestinationNetnsResponse, error)
 	// Abort cancels an in-progress migration and triggers rollback.
 	Abort(ctx context.Context, in *AbortRequest, opts ...grpc.CallOption) (*AbortResponse, error)
 	// EstimateCheckpoint performs a 10-second dirty page sampling without checkpointing.
@@ -139,6 +143,16 @@ func (c *migrationAgentServiceClient) Verify(ctx context.Context, in *VerifyRequ
 	return out, nil
 }
 
+func (c *migrationAgentServiceClient) PrepareDestinationNetns(ctx context.Context, in *PrepareDestinationNetnsRequest, opts ...grpc.CallOption) (*PrepareDestinationNetnsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PrepareDestinationNetnsResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_PrepareDestinationNetns_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *migrationAgentServiceClient) Abort(ctx context.Context, in *AbortRequest, opts ...grpc.CallOption) (*AbortResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(AbortResponse)
@@ -207,6 +221,9 @@ type MigrationAgentServiceServer interface {
 	Restore(context.Context, *RestoreRequest) (*RestoreResponse, error)
 	// Verify confirms the restored pod is healthy and accepting traffic.
 	Verify(context.Context, *VerifyRequest) (*VerifyResponse, error)
+	// PrepareDestinationNetns pre-stages the migration network namespace on the destination
+	// node and returns the file descriptor path and VTEP MAC for overlay FDB injection.
+	PrepareDestinationNetns(context.Context, *PrepareDestinationNetnsRequest) (*PrepareDestinationNetnsResponse, error)
 	// Abort cancels an in-progress migration and triggers rollback.
 	Abort(context.Context, *AbortRequest) (*AbortResponse, error)
 	// EstimateCheckpoint performs a 10-second dirty page sampling without checkpointing.
@@ -253,6 +270,9 @@ func (UnimplementedMigrationAgentServiceServer) Restore(context.Context, *Restor
 }
 func (UnimplementedMigrationAgentServiceServer) Verify(context.Context, *VerifyRequest) (*VerifyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Verify not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) PrepareDestinationNetns(context.Context, *PrepareDestinationNetnsRequest) (*PrepareDestinationNetnsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PrepareDestinationNetns not implemented")
 }
 func (UnimplementedMigrationAgentServiceServer) Abort(context.Context, *AbortRequest) (*AbortResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Abort not implemented")
@@ -398,6 +418,24 @@ func _MigrationAgentService_Verify_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MigrationAgentService_PrepareDestinationNetns_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PrepareDestinationNetnsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).PrepareDestinationNetns(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_PrepareDestinationNetns_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).PrepareDestinationNetns(ctx, req.(*PrepareDestinationNetnsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MigrationAgentService_Abort_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(AbortRequest)
 	if err := dec(in); err != nil {
@@ -518,6 +556,10 @@ var MigrationAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Verify",
 			Handler:    _MigrationAgentService_Verify_Handler,
+		},
+		{
+			MethodName: "PrepareDestinationNetns",
+			Handler:    _MigrationAgentService_PrepareDestinationNetns_Handler,
 		},
 		{
 			MethodName: "Abort",
