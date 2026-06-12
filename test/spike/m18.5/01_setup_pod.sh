@@ -87,6 +87,13 @@ Also acts as a server on LOOPBACK_PORT — the monitor script reads stats from t
 """
 import socket, time, threading, sys, os, signal, json
 
+# Close stdin (fd 0) so CRIU doesn't checkpoint it.
+# stdout/stderr are fine — inherited from parent in the SAME mount namespace.
+try:
+    os.close(0)
+except OSError:
+    pass
+
 SERVER_IP   = os.getenv("SERVER_IP",   "10.244.0.50")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "9000"))
 SEND_INTERVAL_MS = float(os.getenv("SEND_INTERVAL_MS", "50"))
@@ -95,7 +102,7 @@ LOG_DIR     = os.getenv("LOG_DIR", "/tmp/pm-spike")
 stats = {
     "sent": 0, "received": 0, "errors": 0,
     "last_sent_seq": 0, "last_recv_seq": 0,
-    "gaps": [], "running": True,
+    "gaps": [], "running": True, "paused": False,
 }
 stats_lock = threading.Lock()
 
@@ -105,6 +112,9 @@ def sender(sock):
         with stats_lock:
             if not stats["running"]:
                 break
+            if stats["paused"]:
+                time.sleep(0.05)
+                continue
         msg = f"SEQ:{seq}:{'x' * 128}\n"
         try:
             sock.sendall(msg.encode())
@@ -199,8 +209,20 @@ def on_signal(sig, frame):
     print(f"[traffic] FINAL: {json.dumps(stats)}", flush=True)
     sys.exit(0)
 
+def on_pause(sig, frame):
+    with stats_lock:
+        stats["paused"] = True
+    print("[traffic] PAUSED (SIGUSR1) — holding connection open, stopping sends", flush=True)
+
+def on_resume(sig, frame):
+    with stats_lock:
+        stats["paused"] = False
+    print("[traffic] RESUMED (SIGUSR2) — sender restarting", flush=True)
+
 signal.signal(signal.SIGTERM, on_signal)
 signal.signal(signal.SIGINT,  on_signal)
+signal.signal(signal.SIGUSR1, on_pause)
+signal.signal(signal.SIGUSR2, on_resume)
 
 t_send.join()
 t_recv.join()
@@ -211,10 +233,25 @@ PYEOF
 chmod +x "${LOG_DIR}/traffic_gen.py"
 
 echo "[pod] starting traffic generator inside ${POD_NETNS}"
+# unshare -m: give the process its own mount namespace so CRIU doesn't see
+# host kubelet projected volume mounts (which have unreachable sharing).
+# The network namespace is still the pod netns (set by ip netns exec).
+# Run in the pod's network namespace only (no mount namespace isolation).
+# CRIU will use --ext-mount-map auto + --enable-external-masters to handle
+# host-specific mounts (boot/efi, kubelet projected volumes).
+# stdin from /dev/null is fine — CRIU will map it as an external mount.
+# Use nsenter --net (not ip netns exec) so the process enters ONLY the network
+# namespace, staying in the host mount namespace. ip netns exec creates an extra
+# unshare(CLONE_NEWNS) which gives the process a different mount namespace from
+# the host, causing CRIU mount ID mismatches and sysfs unmount failures.
+# With nsenter --net, CRIU sees the host mount namespace for both itself and the
+# target process — all mount IDs are consistent and CRIU needs no special flags.
+# stdout/stderr: opened as regular files here (in host mount namespace).
+# They will have correct mnt_ids since both parent and child are in host mnt ns.
 SERVER_IP="${SERVER_IP}" SERVER_PORT="${SERVER_PORT}" \
 LOG_DIR="${LOG_DIR}" \
-ip netns exec "${POD_NETNS}" python3 "${LOG_DIR}/traffic_gen.py" \
-    > "${LOG_DIR}/client.log" 2>&1 &
+nsenter --net="/var/run/netns/${POD_NETNS}" -- python3 "${LOG_DIR}/traffic_gen.py" \
+    < /dev/null > "${LOG_DIR}/client.log" 2>&1 &
 
 TGEN_PID=$!
 echo "${TGEN_PID}" > "${LOG_DIR}/tgen_host_pid"

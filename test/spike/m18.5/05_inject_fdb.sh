@@ -21,7 +21,7 @@ LOG_DIR="${LOG_DIR:-/tmp/pm-spike}"
 VTEP_DEV="${VTEP_DEV:-flannel.1}"
 POD_IP="${POD_IP:-10.244.1.50}"
 POD_NETNS="${POD_NETNS:-pm-spike-pod}"
-DEST_HOST="${DEST_HOST:-ubuntu@192.168.252.7}"
+DEST_HOST="${DEST_HOST:-root@192.168.252.7}"
 DEST_VTEP_DEV="${DEST_VTEP_DEV:-flannel.1}"
 
 # Read values written by 04_stage_destnetns.sh (scp'd from pm-control)
@@ -77,29 +77,33 @@ inject_fdb_local() {
 inject_fdb_remote() {
     echo "[fdb] === DESTINATION NODE (pm-control) ==="
 
-    # Run the same injection on pm-control via ssh.
-    # In production this is the ConfirmOverlayReady gRPC call; here it's ssh.
+    # On the destination, after VXLAN decap, flannel.1 forwards the inner IP packet.
+    # The kernel normally routes 10.244.1.x via flannel.1 (back to pm-worker).
+    # We add a more-specific /32 host route directing 10.244.1.50 to cni0 (local).
+    # Then a bridge FDB entry on cni0 so frames to pod_veth_mac go to veth-mig port.
+    # The AF_INET neighbor on cni0 lets the kernel resolve 10.244.1.50 → pod MAC.
     ssh "${DEST_HOST}" sudo bash << REMOTE_INJECT
 set -euo pipefail
 POD_VETH_MAC="${POD_VETH_MAC}"
 POD_IP="${POD_IP}"
-DEST_VTEP_MAC="${DEST_VTEP_MAC}"
-VTEP_DEV="${DEST_VTEP_DEV}"
+FLANNEL_BRIDGE="${FLANNEL_BRIDGE:-cni0}"
+MIG_VETH="${MIG_VETH:-veth-mig}"
 
-echo "[fdb-remote] dest: AF_BRIDGE FDB: \${POD_VETH_MAC} → local (self)"
-# On the destination node, the FDB entry says: this MAC is reachable locally
-# (we already have a veth with this MAC in the migration netns).
-# Use the "self" flag to indicate local delivery.
-bridge fdb replace "\${POD_VETH_MAC}" dev "\${VTEP_DEV}" local self permanent 2>/dev/null || \
-    bridge fdb add    "\${POD_VETH_MAC}" dev "\${VTEP_DEV}" local self permanent
+echo "[fdb-remote] dest: /32 host route ${POD_IP} → \${FLANNEL_BRIDGE} (local delivery)"
+ip route replace "\${POD_IP}/32" dev "\${FLANNEL_BRIDGE}"
 
-echo "[fdb-remote] dest: AF_INET neighbor: \${POD_IP} → \${POD_VETH_MAC}"
-ip neigh replace "\${POD_IP}" dev "\${VTEP_DEV}" \
+echo "[fdb-remote] dest: AF_INET neighbor on bridge: \${POD_IP} → \${POD_VETH_MAC}"
+ip neigh replace "\${POD_IP}" dev "\${FLANNEL_BRIDGE}" \
     lladdr "\${POD_VETH_MAC}" nud permanent
 
+echo "[fdb-remote] dest: bridge FDB on cni0: \${POD_VETH_MAC} → \${MIG_VETH}"
+bridge fdb replace "\${POD_VETH_MAC}" dev "\${MIG_VETH}" master permanent 2>/dev/null || \
+    bridge fdb add "\${POD_VETH_MAC}" dev "\${MIG_VETH}" master permanent
+
 echo "[fdb-remote] dest entries verified:"
-bridge fdb show dev "\${VTEP_DEV}" | grep -i "\${POD_VETH_MAC}" || true
-ip neigh show dev "\${VTEP_DEV}" | grep "\${POD_IP}" || true
+ip route show "\${POD_IP}/32" || echo "  route: MISSING"
+ip neigh show dev "\${FLANNEL_BRIDGE}" | grep "\${POD_IP}" || echo "  neigh: MISSING"
+bridge fdb show dev "\${MIG_VETH}" | grep -i "\${POD_VETH_MAC}" || echo "  fdb: MISSING"
 REMOTE_INJECT
 }
 
@@ -167,8 +171,14 @@ verify_local() {
 
 verify_remote() {
     RESULT=$(ssh "${DEST_HOST}" sudo bash << REMOTE_VERIFY
-ip neigh show dev "${DEST_VTEP_DEV}" | grep "${POD_IP}" || echo "MISSING_NEIGH"
-bridge fdb show dev "${DEST_VTEP_DEV}" | grep -i "${POD_VETH_MAC}" || echo "MISSING_FDB"
+POD_IP="${POD_IP}"
+POD_VETH_MAC="${POD_VETH_MAC}"
+FLANNEL_BRIDGE="${FLANNEL_BRIDGE:-cni0}"
+MIG_VETH="${MIG_VETH:-veth-mig}"
+ip route show "\${POD_IP}/32" | grep -q "\${POD_IP}" || echo "MISSING_ROUTE"
+ip neigh show dev "\${FLANNEL_BRIDGE}" | grep -q "\${POD_IP}" || echo "MISSING_NEIGH"
+bridge fdb show dev "\${MIG_VETH}" | grep -qi "\${POD_VETH_MAC}" || echo "MISSING_FDB"
+echo "OK"
 REMOTE_VERIFY
 )
     if echo "${RESULT}" | grep -q "MISSING"; then

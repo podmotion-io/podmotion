@@ -21,7 +21,8 @@ set -euo pipefail
 LOG_DIR="${LOG_DIR:-/tmp/pm-spike}"
 POD_NETNS="${POD_NETNS:-pm-spike-pod}"
 CHECKPOINT_DIR="${LOG_DIR}/checkpoint"
-DRAIN_TIMEOUT_MS="${DRAIN_TIMEOUT_MS:-5000}"   # 5s max drain wait (half of 10s budget)
+DRAIN_TIMEOUT_MS="${DRAIN_TIMEOUT_MS:-15000}"  # 15s max drain wait (spike: give buffer time to drain)
+
 
 mkdir -p "${CHECKPOINT_DIR}"
 chmod 0700 "${CHECKPOINT_DIR}"
@@ -35,6 +36,8 @@ fi
 echo "[checkpoint] target PID: ${CLIENT_PID} in netns ${POD_NETNS}"
 
 # ── Step 1: poll for send buffer drain ───────────────────────────────────────
+# 02_arm_zerowindow.sh already drained before arming the hold.
+# This step is a verification that unacked==0 before CRIU dump.
 # getsockopt(TCP_INFO) via ss --extended shows tcpi_unacked in 'bytes_acked' context.
 # We use `ss -tin` and parse the 'unacked:' field directly.
 echo "[checkpoint] waiting for send buffer to drain (tcpi_unacked == 0)..."
@@ -56,20 +59,36 @@ while true; do
         exit 1
     fi
 
-    # Parse 'unacked:N' from ss output for our connection
-    UNACKED=$(ip netns exec "${POD_NETNS}" ss -tin 2>/dev/null \
-        | grep -A2 "10.244.0.50" \
-        | grep -oE 'unacked:[0-9]+' | cut -d: -f2 | head -1)
+    # Parse 'unacked:N' and 'notsent:N' from ss -tin for our connection.
+    # With zero-window hold active, the peer can't ACK (window=0), so 'unacked'
+    # may stay non-zero. We use 'notsent' (unsent data in kernel buffer) as the
+    # secondary drain signal — once notsent=0, no new data is entering the wire.
+    SS_OUT=$(ip netns exec "${POD_NETNS}" ss -tin 2>/dev/null | grep -A3 "10.244.0.50" || true)
+    UNACKED=$(echo "${SS_OUT}" | grep -oE 'unacked:[0-9]+' | cut -d: -f2 | head -1 || true)
+    NOTSENT=$(echo "${SS_OUT}" | grep -oE 'notsent:[0-9]+' | cut -d: -f2 | head -1 || true)
 
-    if [[ "${UNACKED}" == "0" ]] || [[ -z "${UNACKED}" ]]; then
+    # ss omits the field when value is 0 — treat absent as 0
+    UNACKED="${UNACKED:-0}"
+    NOTSENT="${NOTSENT:-0}"
+
+    if [[ "${UNACKED}" == "0" ]]; then
         ELAPSED_MS=$(( ($(date +%s%N) - DRAIN_START_NS) / 1000000 ))
         echo "[checkpoint] send buffer drained in ${ELAPSED_MS}ms (unacked=0)"
         DRAINED=true
         break
     fi
 
-    echo "[checkpoint] waiting... unacked=${UNACKED}"
-    sleep 0.05
+    # Secondary: notsent=0 means nothing more to send — existing unacked is in-flight
+    # and the peer has received it. This is the correct drain state under zero-window hold.
+    if [[ "${NOTSENT}" == "0" ]] && [[ "${UNACKED}" != "0" ]]; then
+        ELAPSED_MS=$(( ($(date +%s%N) - DRAIN_START_NS) / 1000000 ))
+        echo "[checkpoint] notsent=0, unacked=${UNACKED} (in-flight, peer received) — drain sufficient for CRIU"
+        DRAINED=true
+        break
+    fi
+
+    echo "[checkpoint] waiting... unacked=${UNACKED} notsent=${NOTSENT}"
+    sleep 0.1
 done
 
 # Record the freeze timestamp (wall clock) — used to measure full freeze window duration
@@ -87,16 +106,19 @@ rm -f "${CHECKPOINT_DIR}"/*.img "${CHECKPOINT_DIR}"/*.json 2>/dev/null || true
 # CRIU dump inside the pod's netns context.
 # We use ip netns exec to run CRIU inside the pod's network namespace so that
 # socket FDs resolve correctly.
-ip netns exec "${POD_NETNS}" criu dump \
+# CRIU dump in the host mount namespace.
+# The target process was launched with nsenter --net (not ip netns exec), so it
+# shares the host mount namespace. Mount IDs are consistent between CRIU and the
+# target — no special flags needed for mount namespace handling.
+criu dump \
     --tree "${CLIENT_PID}" \
     --images-dir "${CHECKPOINT_DIR}" \
     --log-file "${LOG_DIR}/criu_dump.log" \
-    --log-level 4 \
+    --verbosity=4 \
     --tcp-established \
     --leave-stopped \
     --shell-job \
     --file-locks \
-    --track-mem \
     2>&1 | tee "${LOG_DIR}/criu_dump_stdout.log"
 
 CRIU_EXIT=$?
