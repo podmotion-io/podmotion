@@ -106,6 +106,12 @@ type MigrationPolicySpec struct {
 	// Auto-detected when ArgoCD or Flux CRDs are present on the cluster.
 	// +optional
 	GitOpsAwareness *GitOpsAwarenessConfig `json:"gitOpsAwareness,omitempty"`
+
+	// AffinityMode sets the default affinityMode for all PodMigrations triggered by this policy.
+	// Individual PodMigration CRs may override this. Defaults to strict.
+	// +kubebuilder:default=strict
+	// +optional
+	AffinityMode AffinityMode `json:"affinityMode,omitempty"`
 }
 
 // GitOpsAwarenessConfig controls PodMotion's GitOps suspension behaviour.

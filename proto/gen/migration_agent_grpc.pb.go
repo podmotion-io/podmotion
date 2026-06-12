@@ -28,6 +28,8 @@ const (
 	MigrationAgentService_Abort_FullMethodName              = "/podmotion.agent.v1.MigrationAgentService/Abort"
 	MigrationAgentService_EstimateCheckpoint_FullMethodName = "/podmotion.agent.v1.MigrationAgentService/EstimateCheckpoint"
 	MigrationAgentService_PutCheckpointTar_FullMethodName   = "/podmotion.agent.v1.MigrationAgentService/PutCheckpointTar"
+	MigrationAgentService_GetCheckpointTar_FullMethodName   = "/podmotion.agent.v1.MigrationAgentService/GetCheckpointTar"
+	MigrationAgentService_ReleaseCheckpoint_FullMethodName  = "/podmotion.agent.v1.MigrationAgentService/ReleaseCheckpoint"
 )
 
 // MigrationAgentServiceClient is the client API for MigrationAgentService service.
@@ -57,6 +59,16 @@ type MigrationAgentServiceClient interface {
 	// Used for same-cluster (LAN) cold migration where the operator can read source
 	// checkpoint files directly and push them to the destination agent.
 	PutCheckpointTar(ctx context.Context, in *PutCheckpointTarRequest, opts ...grpc.CallOption) (*PutCheckpointTarResponse, error)
+	// GetCheckpointTar reads the checkpoint image directory on the source agent and
+	// returns a gzip-compressed tar of all files. This is a pure read — it does NOT
+	// zeroize the source. The controller calls this, then PutCheckpointTar, then persists
+	// CheckpointTransferred=true, then calls ReleaseCheckpoint to destroy the source copy.
+	GetCheckpointTar(ctx context.Context, in *GetCheckpointTarRequest, opts ...grpc.CallOption) (*GetCheckpointTarResponse, error)
+	// ReleaseCheckpoint zeroizes and removes the checkpoint directory on this (source) node.
+	// Called by the controller only after PutCheckpointTar has succeeded AND
+	// pm.Status.CheckpointTransferred has been durably persisted. Idempotent: returns
+	// success if the directory is already absent (handles controller-restart replay).
+	ReleaseCheckpoint(ctx context.Context, in *ReleaseCheckpointRequest, opts ...grpc.CallOption) (*ReleaseCheckpointResponse, error)
 }
 
 type migrationAgentServiceClient struct {
@@ -157,6 +169,26 @@ func (c *migrationAgentServiceClient) PutCheckpointTar(ctx context.Context, in *
 	return out, nil
 }
 
+func (c *migrationAgentServiceClient) GetCheckpointTar(ctx context.Context, in *GetCheckpointTarRequest, opts ...grpc.CallOption) (*GetCheckpointTarResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetCheckpointTarResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_GetCheckpointTar_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *migrationAgentServiceClient) ReleaseCheckpoint(ctx context.Context, in *ReleaseCheckpointRequest, opts ...grpc.CallOption) (*ReleaseCheckpointResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseCheckpointResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_ReleaseCheckpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MigrationAgentServiceServer is the server API for MigrationAgentService service.
 // All implementations must embed UnimplementedMigrationAgentServiceServer
 // for forward compatibility.
@@ -184,6 +216,16 @@ type MigrationAgentServiceServer interface {
 	// Used for same-cluster (LAN) cold migration where the operator can read source
 	// checkpoint files directly and push them to the destination agent.
 	PutCheckpointTar(context.Context, *PutCheckpointTarRequest) (*PutCheckpointTarResponse, error)
+	// GetCheckpointTar reads the checkpoint image directory on the source agent and
+	// returns a gzip-compressed tar of all files. This is a pure read — it does NOT
+	// zeroize the source. The controller calls this, then PutCheckpointTar, then persists
+	// CheckpointTransferred=true, then calls ReleaseCheckpoint to destroy the source copy.
+	GetCheckpointTar(context.Context, *GetCheckpointTarRequest) (*GetCheckpointTarResponse, error)
+	// ReleaseCheckpoint zeroizes and removes the checkpoint directory on this (source) node.
+	// Called by the controller only after PutCheckpointTar has succeeded AND
+	// pm.Status.CheckpointTransferred has been durably persisted. Idempotent: returns
+	// success if the directory is already absent (handles controller-restart replay).
+	ReleaseCheckpoint(context.Context, *ReleaseCheckpointRequest) (*ReleaseCheckpointResponse, error)
 	mustEmbedUnimplementedMigrationAgentServiceServer()
 }
 
@@ -220,6 +262,12 @@ func (UnimplementedMigrationAgentServiceServer) EstimateCheckpoint(context.Conte
 }
 func (UnimplementedMigrationAgentServiceServer) PutCheckpointTar(context.Context, *PutCheckpointTarRequest) (*PutCheckpointTarResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PutCheckpointTar not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) GetCheckpointTar(context.Context, *GetCheckpointTarRequest) (*GetCheckpointTarResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetCheckpointTar not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) ReleaseCheckpoint(context.Context, *ReleaseCheckpointRequest) (*ReleaseCheckpointResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseCheckpoint not implemented")
 }
 func (UnimplementedMigrationAgentServiceServer) mustEmbedUnimplementedMigrationAgentServiceServer() {}
 func (UnimplementedMigrationAgentServiceServer) testEmbeddedByValue()                               {}
@@ -404,6 +452,42 @@ func _MigrationAgentService_PutCheckpointTar_Handler(srv interface{}, ctx contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MigrationAgentService_GetCheckpointTar_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetCheckpointTarRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).GetCheckpointTar(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_GetCheckpointTar_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).GetCheckpointTar(ctx, req.(*GetCheckpointTarRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MigrationAgentService_ReleaseCheckpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseCheckpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).ReleaseCheckpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_ReleaseCheckpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).ReleaseCheckpoint(ctx, req.(*ReleaseCheckpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // MigrationAgentService_ServiceDesc is the grpc.ServiceDesc for MigrationAgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -446,6 +530,14 @@ var MigrationAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PutCheckpointTar",
 			Handler:    _MigrationAgentService_PutCheckpointTar_Handler,
+		},
+		{
+			MethodName: "GetCheckpointTar",
+			Handler:    _MigrationAgentService_GetCheckpointTar_Handler,
+		},
+		{
+			MethodName: "ReleaseCheckpoint",
+			Handler:    _MigrationAgentService_ReleaseCheckpoint_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

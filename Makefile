@@ -58,8 +58,24 @@ manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and Cust
 	"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 
 .PHONY: generate
-generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
+generate: controller-gen bpf-generate ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	"$(CONTROLLER_GEN)" object:headerFile="hack/boilerplate.go.txt",year=$(YEAR) paths="./..."
+
+# bpf-generate requires clang and libbpf-dev on the build host (apt-get install clang libbpf-dev).
+# Also requires github.com/cilium/ebpf in go.mod: run `go get github.com/cilium/ebpf@latest` first.
+GO ?= go
+.PHONY: bpf-generate
+bpf-generate: ## Generate Go bindings for BPF C programs via bpf2go
+	$(GO) run github.com/cilium/ebpf/cmd/bpf2go \
+		-target amd64 \
+		-output-dir internal/agent/network/bpf \
+		ZeroWindow bpf/zero_window.c -- \
+		-I/usr/include/linux -I/usr/include
+	$(GO) run github.com/cilium/ebpf/cmd/bpf2go \
+		-target amd64 \
+		-output-dir internal/agent/network/bpf \
+		XDPBridge bpf/xdp_bridge.c -- \
+		-I/usr/include/linux -I/usr/include
 
 .PHONY: fmt
 fmt: ## Run go fmt against code.
@@ -73,36 +89,65 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
-# TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
-# The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
-# kubectl kuberc is disabled by default for test isolation; enable with:
-# - KUBECTL_KUBERC=true
-# CertManager is installed by default; skip with:
-# - CERT_MANAGER_INSTALL_SKIP=true
-KIND_CLUSTER ?= podmotion-test-e2e
+# E2E tests target the real kubeadm cluster (pm-control: 192.168.252.7, pm-worker: 192.168.252.8).
+# Kind cluster creation is intentionally skipped.
+# The kubeadm cluster must be reachable via KUBECONFIG (default: ~/.kube/config).
+# Start the kubectl proxy tunnel first: ~/.local/bin/pm-kubectl-proxy.sh
+#
+# Optional env vars:
+#   CERT_MANAGER_INSTALL_SKIP=true  — skip cert-manager installation (default: skip on kubeadm)
+#   KUBECONFIG                      — path to kubeconfig (default: ~/.kube/config)
+#   E2E_LABEL_FILTER                — Ginkgo label filter (e.g. "northstar" for NS#3 only)
+
+E2E_TIMEOUT ?= 30m
+E2E_LABEL_FILTER ?=
 
 .PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
-	@command -v $(KIND) >/dev/null 2>&1 || { \
-		echo "Kind is not installed. Please install Kind manually."; \
+setup-test-e2e: ## Verify kubeadm cluster is reachable before running e2e tests
+	@echo "==> Verifying kubeadm cluster connectivity..."
+	@kubectl cluster-info 2>/dev/null || { \
+		echo "ERROR: kubectl cannot reach the cluster."; \
+		echo "       Start the proxy: ~/.local/bin/pm-kubectl-proxy.sh"; \
+		echo "       Then ensure KUBECONFIG points to a config using http://127.0.0.1:8001"; \
 		exit 1; \
 	}
-	@case "$$($(KIND) get clusters)" in \
-		*"$(KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
-		*) \
-			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
-	esac
+	@kubectl get nodes 2>/dev/null || { echo "ERROR: cannot list nodes"; exit 1; }
+	@echo "==> Cluster reachable. Nodes:"; kubectl get nodes -o wide
 
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
-	$(MAKE) cleanup-test-e2e
+test-e2e: setup-test-e2e ## Run the e2e tests against the kubeadm cluster.
+	CERT_MANAGER_INSTALL_SKIP=true \
+	go test -tags=e2e ./test/e2e/ -v -ginkgo.v \
+		-timeout $(E2E_TIMEOUT) \
+		$(if $(E2E_LABEL_FILTER),--ginkgo.label-filter=$(E2E_LABEL_FILTER),)
+
+.PHONY: test-e2e-northstar
+test-e2e-northstar: setup-test-e2e ## Run only the NS#3 North Star stateless migration test.
+	CERT_MANAGER_INSTALL_SKIP=true \
+	go test -tags=e2e ./test/e2e/ -v -ginkgo.v \
+		-timeout 15m \
+		--ginkgo.label-filter=northstar
 
 .PHONY: cleanup-test-e2e
-cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
-	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+cleanup-test-e2e: ## No-op on kubeadm — cluster is persistent; test namespaces are cleaned by AfterAll.
+	@echo "cleanup-test-e2e: kubeadm cluster is persistent — no teardown needed."
+
+##@ Pre-deploy gate
+
+# pre-deploy runs the e2e suite and aborts the deploy if any test fails.
+# Invoke before pushing binaries to production nodes:
+#   make pre-deploy && make build-linux && NODE_IP=... ./scripts/deploy-node.sh
+.PHONY: pre-deploy
+pre-deploy: ## Run e2e gate tests — exit non-zero if any test fails (required before deploy).
+	@echo "==> Running pre-deploy test gate..."
+	@$(MAKE) test-e2e-northstar || { \
+		echo ""; \
+		echo "ERROR: pre-deploy gate FAILED — do NOT deploy to production nodes."; \
+		echo "       Fix the failing tests before running scripts/deploy-node.sh"; \
+		exit 1; \
+	}
+	@echo ""
+	@echo "==> pre-deploy gate PASSED — safe to deploy."
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -121,6 +166,13 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
+
+.PHONY: build-linux
+build-linux: ## Build operator and agent for linux/arm64 and linux/amd64 (no cgo)
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/podmotion-manager-arm64 ./cmd/main.go
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/podmotion-manager-amd64 ./cmd/main.go
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/podmotion-agent-arm64 ./cmd/agent/main.go
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/podmotion-agent-amd64 ./cmd/agent/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.

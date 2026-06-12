@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -32,39 +33,68 @@ import (
 )
 
 var (
-	// managerImage is the manager image to be built and loaded for testing.
+	// managerImage is unused when targeting a pre-deployed kubeadm cluster.
 	managerImage = "example.com/podmotion:v0.0.1"
 	// shouldCleanupCertManager tracks whether CertManager was installed by this suite.
 	shouldCleanupCertManager = false
 )
 
-// TestE2E runs the e2e test suite to validate the solution in an isolated environment.
-// The default setup requires Kind and CertManager.
+// TestE2E runs the e2e test suite against the kubeadm cluster.
 //
-// To enable kubectl kuberc (use custom kubectl configurations), set: KUBECTL_KUBERC=true
-// By default, kuberc is disabled to ensure consistent test behavior across different environments.
-// To skip CertManager installation, set: CERT_MANAGER_INSTALL_SKIP=true
+// Cluster selection (in priority order):
+//   1. KUBECONFIG env var — explicit kubeconfig path
+//   2. ~/.kube/config     — default kubeconfig
+//
+// Kind cluster creation is intentionally skipped; tests run against a real kubeadm
+// cluster (pm-control: 192.168.252.7, pm-worker: 192.168.252.8).
+//
+// Optional env vars:
+//   CERT_MANAGER_INSTALL_SKIP=true  — skip cert-manager installation check
+//   KUBECTL_KUBERC=true             — re-enable kubectl kuberc
 func TestE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
-	_, _ = fmt.Fprintf(GinkgoWriter, "Starting podmotion e2e test suite\n")
+	_, _ = fmt.Fprintf(GinkgoWriter, "Starting podmotion e2e test suite (kubeadm cluster)\n")
 	RunSpecs(t, "e2e suite")
 }
 
 var _ = BeforeSuite(func() {
-	By("building the manager image")
-	cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", managerImage))
-	_, err := utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager image")
-
-	// TODO(user): If you want to change the e2e test vendor from Kind,
-	// ensure the image is built and available, then remove the following block.
-	By("loading the manager image on Kind")
-	err = utils.LoadImageToKindClusterWithName(managerImage)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager image into Kind")
+	// Skip image build and Kind loading — the kubeadm cluster already has
+	// the operator and agent running as systemd services on pm-control/pm-worker.
+	_, _ = fmt.Fprintf(GinkgoWriter,
+		"BeforeSuite: targeting kubeadm cluster (skipping docker-build and kind image load)\n")
 
 	configureKubectlKubeRC()
 	setupCertManager()
+	resetNodeMigrationCapacity()
 })
+
+// resetNodeMigrationCapacity resets stale activeDestinationMigrations /
+// activeSourceMigrations counts on all NMC objects before the test suite runs.
+// On the shared kubeadm cluster previous test runs may leave stale counters
+// when migrations are cleaned up without the operator decrementing the NMC.
+func resetNodeMigrationCapacity() {
+	By("resetting stale NodeMigrationCapacity active migration counts")
+	patch := `{"status":{"activeDestinationMigrations":0,"activeSourceMigrations":0}}`
+	cmd := exec.Command("kubectl", "get", "nodemigrationcapacities",
+		"-o", "jsonpath={.items[*].metadata.name}")
+	out, err := utils.Run(cmd)
+	if err != nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "warning: could not list NMCs: %v\n", err)
+		return
+	}
+	for _, name := range strings.Fields(out) {
+		patchCmd := exec.Command("kubectl", "patch", "nodemigrationcapacity", name,
+			"--subresource=status",
+			"--type=merge",
+			fmt.Sprintf("--patch=%s", patch))
+		if _, patchErr := utils.Run(patchCmd); patchErr != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter,
+				"warning: could not reset NMC %s: %v\n", name, patchErr)
+		} else {
+			_, _ = fmt.Fprintf(GinkgoWriter, "reset NMC %s active counts to 0\n", name)
+		}
+	}
+}
 
 var _ = AfterSuite(func() {
 	teardownCertManager()

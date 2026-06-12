@@ -52,6 +52,28 @@ const (
 	MigrationPhaseDryRunComplete MigrationPhase = "DryRunComplete"
 )
 
+// AffinityMode controls how PodMotion handles hard nodeAffinity and nodeSelector rules
+// that pin the source pod to its current node.
+// +kubebuilder:validation:Enum=strict;patch;ignore
+type AffinityMode string
+
+const (
+	// AffinityModeStrict rejects the migration at admission if the owning workload controller
+	// has requiredDuringSchedulingIgnoredDuringExecution nodeAffinity or nodeSelector targeting
+	// the source node. The user must clear the affinity before migrating. Default.
+	AffinityModeStrict AffinityMode = "strict"
+
+	// AffinityModePatch allows migration to proceed and patches the owning workload controller's
+	// affinity/nodeSelector at phase=Complete to reflect the destination node.
+	// Requires affinityMode=patch AND GitOpsAwareness.enabled=true (the patch fires inside
+	// the GitOps suspension window). See ADR-0046-C1. Post-beta only.
+	AffinityModePatch AffinityMode = "patch"
+
+	// AffinityModeIgnore proceeds without patching. The workload spec remains dirty — use
+	// only for statically-owned pods with no GitOps controller and no future rollouts.
+	AffinityModeIgnore AffinityMode = "ignore"
+)
+
 // PodMigrationSpec defines the desired state of PodMigration.
 type PodMigrationSpec struct {
 	// PodName is the name of the source pod to migrate.
@@ -128,16 +150,20 @@ type PodMigrationSpec struct {
 	// +optional
 	DestinationNode string `json:"destinationNode,omitempty"`
 
-	// ReplacementPodName is the name of the replacement pod created by the workload
-	// controller after source pod deletion. Tracked by the PodMotion controller.
-	// +optional
-	ReplacementPodName string `json:"replacementPodName,omitempty"`
-
 	// SourcePodIP is the original IP of the source pod. Injected as a CNI IPAM
 	// annotation on the replacement pod at admission so the original IP is pinned
 	// at CNI ADD time (Calico / Cilium only; Flannel does not support IP mobility).
 	// +optional
 	SourcePodIP string `json:"sourcePodIP,omitempty"`
+
+	// AffinityMode controls how PodMotion handles hard nodeAffinity / nodeSelector rules
+	// on the owning workload controller that pin pods to the source node.
+	// strict: reject at admission (default, safe for GitOps environments).
+	// patch: patch the Deployment/StatefulSet affinity at phase=Complete (requires M19 Part B).
+	// ignore: proceed without patching (standalone pods, no GitOps).
+	// +kubebuilder:default=strict
+	// +optional
+	AffinityMode AffinityMode `json:"affinityMode,omitempty"`
 }
 
 // PreCopyStats records metrics from the iterative pre-copy phase.
@@ -185,6 +211,13 @@ type PodMigrationStatus struct {
 	// +optional
 	DestinationNodeName string `json:"destinationNodeName,omitempty"`
 
+	// ReplacementPodName is the name of the replacement pod created by the operator
+	// during live migration to receive the CRIU-restored process.
+	// Stored in Status (not Spec) because it is controller-derived runtime state,
+	// not user intent. Written once at Checkpointing and read by subsequent phases.
+	// +optional
+	ReplacementPodName string `json:"replacementPodName,omitempty"`
+
 	// CheckpointRef references the MigrationCheckpoint holding the checkpoint artifact.
 	// +optional
 	CheckpointRef *corev1.LocalObjectReference `json:"checkpointRef,omitempty"`
@@ -217,6 +250,13 @@ type PodMigrationStatus struct {
 	// "flannel"). Set during Validating phase and read by the webhook's IPAM annotation logic.
 	// +optional
 	CNIProvider string `json:"cniProvider,omitempty"`
+
+	// CheckpointTransferred is set true after the checkpoint tar has been durably written
+	// to the destination agent and the status has been persisted. Used as an idempotency
+	// marker: if the controller crashes after the Put but before transitioning to Restoring,
+	// the next reconcile skips the Get/Put and proceeds directly to gate removal + Restoring.
+	// +optional
+	CheckpointTransferred bool `json:"checkpointTransferred,omitempty"`
 }
 
 // +kubebuilder:object:root=true

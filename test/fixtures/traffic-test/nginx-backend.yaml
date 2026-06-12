@@ -1,0 +1,73 @@
+# Stateless nginx backend — the pod we will live-migrate.
+# Returns its own pod name + node name so we can confirm which pod answered.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pm-live-test
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-id-cfg
+  namespace: pm-live-test
+data:
+  default.conf: |
+    server {
+      listen 80;
+      location / {
+        add_header X-Pod-Name $hostname always;
+        add_header X-Served-By $hostname always;
+        return 200 "pod=$hostname\n";
+      }
+      location /healthz {
+        return 200 "ok\n";
+      }
+    }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-live-src
+  namespace: pm-live-test
+  labels:
+    app: nginx-live
+spec:
+  nodeName: pm-worker
+  containers:
+  - name: nginx
+    image: nginx:1.25-alpine
+    ports:
+    - containerPort: 80
+    volumeMounts:
+    - name: cfg
+      mountPath: /etc/nginx/conf.d/default.conf
+      subPath: default.conf
+    resources:
+      requests:
+        memory: "32Mi"
+        cpu: "50m"
+      limits:
+        memory: "64Mi"
+        cpu: "100m"
+    readinessProbe:
+      httpGet:
+        path: /healthz
+        port: 80
+      initialDelaySeconds: 2
+      periodSeconds: 1
+  volumes:
+  - name: cfg
+    configMap:
+      name: nginx-id-cfg
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-live-svc
+  namespace: pm-live-test
+spec:
+  selector:
+    app: nginx-live
+  ports:
+  - port: 80
+    targetPort: 80

@@ -229,6 +229,7 @@ type PreDumpRoundRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	MigrationName string                 `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`
 	RoundNumber   int32                  `protobuf:"varint,2,opt,name=round_number,json=roundNumber,proto3" json:"round_number,omitempty"`
+	PodUid        string                 `protobuf:"bytes,3,opt,name=pod_uid,json=podUid,proto3" json:"pod_uid,omitempty"` // used to resolve the container root PID via cgroup walk
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -275,6 +276,13 @@ func (x *PreDumpRoundRequest) GetRoundNumber() int32 {
 		return x.RoundNumber
 	}
 	return 0
+}
+
+func (x *PreDumpRoundRequest) GetPodUid() string {
+	if x != nil {
+		return x.PodUid
+	}
+	return ""
 }
 
 type PreDumpRoundResponse struct {
@@ -1201,6 +1209,222 @@ func (x *PutCheckpointTarResponse) GetBytesWritten() int64 {
 	return 0
 }
 
+type GetCheckpointTarRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MigrationName string                 `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"` // identifies the checkpoint directory on the source node
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetCheckpointTarRequest) Reset() {
+	*x = GetCheckpointTarRequest{}
+	mi := &file_migration_agent_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetCheckpointTarRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetCheckpointTarRequest) ProtoMessage() {}
+
+func (x *GetCheckpointTarRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_migration_agent_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetCheckpointTarRequest.ProtoReflect.Descriptor instead.
+func (*GetCheckpointTarRequest) Descriptor() ([]byte, []int) {
+	return file_migration_agent_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *GetCheckpointTarRequest) GetMigrationName() string {
+	if x != nil {
+		return x.MigrationName
+	}
+	return ""
+}
+
+type GetCheckpointTarResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	TarData       []byte                 `protobuf:"bytes,3,opt,name=tar_data,json=tarData,proto3" json:"tar_data,omitempty"` // gzip-compressed tar of the checkpoint final/ directory
+	BytesRead     int64                  `protobuf:"varint,4,opt,name=bytes_read,json=bytesRead,proto3" json:"bytes_read,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetCheckpointTarResponse) Reset() {
+	*x = GetCheckpointTarResponse{}
+	mi := &file_migration_agent_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetCheckpointTarResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetCheckpointTarResponse) ProtoMessage() {}
+
+func (x *GetCheckpointTarResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_migration_agent_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetCheckpointTarResponse.ProtoReflect.Descriptor instead.
+func (*GetCheckpointTarResponse) Descriptor() ([]byte, []int) {
+	return file_migration_agent_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *GetCheckpointTarResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *GetCheckpointTarResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (x *GetCheckpointTarResponse) GetTarData() []byte {
+	if x != nil {
+		return x.TarData
+	}
+	return nil
+}
+
+func (x *GetCheckpointTarResponse) GetBytesRead() int64 {
+	if x != nil {
+		return x.BytesRead
+	}
+	return 0
+}
+
+type ReleaseCheckpointRequest struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	MigrationName      string                 `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`
+	MigrationNamespace string                 `protobuf:"bytes,2,opt,name=migration_namespace,json=migrationNamespace,proto3" json:"migration_namespace,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *ReleaseCheckpointRequest) Reset() {
+	*x = ReleaseCheckpointRequest{}
+	mi := &file_migration_agent_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReleaseCheckpointRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReleaseCheckpointRequest) ProtoMessage() {}
+
+func (x *ReleaseCheckpointRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_migration_agent_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReleaseCheckpointRequest.ProtoReflect.Descriptor instead.
+func (*ReleaseCheckpointRequest) Descriptor() ([]byte, []int) {
+	return file_migration_agent_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *ReleaseCheckpointRequest) GetMigrationName() string {
+	if x != nil {
+		return x.MigrationName
+	}
+	return ""
+}
+
+func (x *ReleaseCheckpointRequest) GetMigrationNamespace() string {
+	if x != nil {
+		return x.MigrationNamespace
+	}
+	return ""
+}
+
+type ReleaseCheckpointResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReleaseCheckpointResponse) Reset() {
+	*x = ReleaseCheckpointResponse{}
+	mi := &file_migration_agent_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReleaseCheckpointResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReleaseCheckpointResponse) ProtoMessage() {}
+
+func (x *ReleaseCheckpointResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_migration_agent_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReleaseCheckpointResponse.ProtoReflect.Descriptor instead.
+func (*ReleaseCheckpointResponse) Descriptor() ([]byte, []int) {
+	return file_migration_agent_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *ReleaseCheckpointResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *ReleaseCheckpointResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 var File_migration_agent_proto protoreflect.FileDescriptor
 
 const file_migration_agent_proto_rawDesc = "" +
@@ -1219,10 +1443,11 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\x0fblocking_reason\x18\x02 \x01(\tR\x0eblockingReason\x12!\n" +
 	"\fstorage_tier\x18\x03 \x01(\x05R\vstorageTier\x12\"\n" +
 	"\rcni_ip_mobile\x18\x04 \x01(\bR\vcniIpMobile\x120\n" +
-	"\x14tcp_connection_count\x18\x05 \x01(\x05R\x12tcpConnectionCount\"_\n" +
+	"\x14tcp_connection_count\x18\x05 \x01(\x05R\x12tcpConnectionCount\"x\n" +
 	"\x13PreDumpRoundRequest\x12%\n" +
 	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12!\n" +
-	"\fround_number\x18\x02 \x01(\x05R\vroundNumber\"\x95\x01\n" +
+	"\fround_number\x18\x02 \x01(\x05R\vroundNumber\x12\x17\n" +
+	"\apod_uid\x18\x03 \x01(\tR\x06podUid\"\x95\x01\n" +
 	"\x14PreDumpRoundResponse\x12$\n" +
 	"\x0edirty_pages_mb\x18\x01 \x01(\x03R\fdirtyPagesMb\x12*\n" +
 	"\x11round_duration_ms\x18\x02 \x01(\x03R\x0froundDurationMs\x12+\n" +
@@ -1290,12 +1515,26 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\x18PutCheckpointTarResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12#\n" +
-	"\rbytes_written\x18\x03 \x01(\x03R\fbytesWritten*\x83\x01\n" +
+	"\rbytes_written\x18\x03 \x01(\x03R\fbytesWritten\"@\n" +
+	"\x17GetCheckpointTarRequest\x12%\n" +
+	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\"\x84\x01\n" +
+	"\x18GetCheckpointTarResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\x12\x19\n" +
+	"\btar_data\x18\x03 \x01(\fR\atarData\x12\x1d\n" +
+	"\n" +
+	"bytes_read\x18\x04 \x01(\x03R\tbytesRead\"r\n" +
+	"\x18ReleaseCheckpointRequest\x12%\n" +
+	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12/\n" +
+	"\x13migration_namespace\x18\x02 \x01(\tR\x12migrationNamespace\"K\n" +
+	"\x19ReleaseCheckpointResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error*\x83\x01\n" +
 	"\rMigrationMode\x12\x1e\n" +
 	"\x1aMIGRATION_MODE_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17MIGRATION_MODE_PRE_COPY\x10\x01\x12\x1c\n" +
 	"\x18MIGRATION_MODE_POST_COPY\x10\x02\x12\x17\n" +
-	"\x13MIGRATION_MODE_COLD\x10\x032\x89\a\n" +
+	"\x13MIGRATION_MODE_COLD\x10\x032\xea\b\n" +
 	"\x15MigrationAgentService\x12d\n" +
 	"\rPrepareSource\x12(.podmotion.agent.v1.PrepareSourceRequest\x1a).podmotion.agent.v1.PrepareSourceResponse\x12a\n" +
 	"\fPreDumpRound\x12'.podmotion.agent.v1.PreDumpRoundRequest\x1a(.podmotion.agent.v1.PreDumpRoundResponse\x12[\n" +
@@ -1306,7 +1545,9 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\x06Verify\x12!.podmotion.agent.v1.VerifyRequest\x1a\".podmotion.agent.v1.VerifyResponse\x12L\n" +
 	"\x05Abort\x12 .podmotion.agent.v1.AbortRequest\x1a!.podmotion.agent.v1.AbortResponse\x12s\n" +
 	"\x12EstimateCheckpoint\x12-.podmotion.agent.v1.EstimateCheckpointRequest\x1a..podmotion.agent.v1.EstimateCheckpointResponse\x12m\n" +
-	"\x10PutCheckpointTar\x12+.podmotion.agent.v1.PutCheckpointTarRequest\x1a,.podmotion.agent.v1.PutCheckpointTarResponseB5Z3github.com/podmotion-io/podmotion/proto/gen;agentpbb\x06proto3"
+	"\x10PutCheckpointTar\x12+.podmotion.agent.v1.PutCheckpointTarRequest\x1a,.podmotion.agent.v1.PutCheckpointTarResponse\x12m\n" +
+	"\x10GetCheckpointTar\x12+.podmotion.agent.v1.GetCheckpointTarRequest\x1a,.podmotion.agent.v1.GetCheckpointTarResponse\x12p\n" +
+	"\x11ReleaseCheckpoint\x12,.podmotion.agent.v1.ReleaseCheckpointRequest\x1a-.podmotion.agent.v1.ReleaseCheckpointResponseB5Z3github.com/podmotion-io/podmotion/proto/gen;agentpbb\x06proto3"
 
 var (
 	file_migration_agent_proto_rawDescOnce sync.Once
@@ -1321,7 +1562,7 @@ func file_migration_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_migration_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_migration_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_migration_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
 var file_migration_agent_proto_goTypes = []any{
 	(MigrationMode)(0),                 // 0: podmotion.agent.v1.MigrationMode
 	(*PrepareSourceRequest)(nil),       // 1: podmotion.agent.v1.PrepareSourceRequest
@@ -1342,6 +1583,10 @@ var file_migration_agent_proto_goTypes = []any{
 	(*EstimateCheckpointResponse)(nil), // 16: podmotion.agent.v1.EstimateCheckpointResponse
 	(*PutCheckpointTarRequest)(nil),    // 17: podmotion.agent.v1.PutCheckpointTarRequest
 	(*PutCheckpointTarResponse)(nil),   // 18: podmotion.agent.v1.PutCheckpointTarResponse
+	(*GetCheckpointTarRequest)(nil),    // 19: podmotion.agent.v1.GetCheckpointTarRequest
+	(*GetCheckpointTarResponse)(nil),   // 20: podmotion.agent.v1.GetCheckpointTarResponse
+	(*ReleaseCheckpointRequest)(nil),   // 21: podmotion.agent.v1.ReleaseCheckpointRequest
+	(*ReleaseCheckpointResponse)(nil),  // 22: podmotion.agent.v1.ReleaseCheckpointResponse
 }
 var file_migration_agent_proto_depIdxs = []int32{
 	0,  // 0: podmotion.agent.v1.PrepareSourceRequest.mode:type_name -> podmotion.agent.v1.MigrationMode
@@ -1354,17 +1599,21 @@ var file_migration_agent_proto_depIdxs = []int32{
 	13, // 7: podmotion.agent.v1.MigrationAgentService.Abort:input_type -> podmotion.agent.v1.AbortRequest
 	15, // 8: podmotion.agent.v1.MigrationAgentService.EstimateCheckpoint:input_type -> podmotion.agent.v1.EstimateCheckpointRequest
 	17, // 9: podmotion.agent.v1.MigrationAgentService.PutCheckpointTar:input_type -> podmotion.agent.v1.PutCheckpointTarRequest
-	2,  // 10: podmotion.agent.v1.MigrationAgentService.PrepareSource:output_type -> podmotion.agent.v1.PrepareSourceResponse
-	4,  // 11: podmotion.agent.v1.MigrationAgentService.PreDumpRound:output_type -> podmotion.agent.v1.PreDumpRoundResponse
-	6,  // 12: podmotion.agent.v1.MigrationAgentService.Checkpoint:output_type -> podmotion.agent.v1.CheckpointResponse
-	8,  // 13: podmotion.agent.v1.MigrationAgentService.PrepareDestination:output_type -> podmotion.agent.v1.PrepareDestinationResponse
-	10, // 14: podmotion.agent.v1.MigrationAgentService.Restore:output_type -> podmotion.agent.v1.RestoreResponse
-	12, // 15: podmotion.agent.v1.MigrationAgentService.Verify:output_type -> podmotion.agent.v1.VerifyResponse
-	14, // 16: podmotion.agent.v1.MigrationAgentService.Abort:output_type -> podmotion.agent.v1.AbortResponse
-	16, // 17: podmotion.agent.v1.MigrationAgentService.EstimateCheckpoint:output_type -> podmotion.agent.v1.EstimateCheckpointResponse
-	18, // 18: podmotion.agent.v1.MigrationAgentService.PutCheckpointTar:output_type -> podmotion.agent.v1.PutCheckpointTarResponse
-	10, // [10:19] is the sub-list for method output_type
-	1,  // [1:10] is the sub-list for method input_type
+	19, // 10: podmotion.agent.v1.MigrationAgentService.GetCheckpointTar:input_type -> podmotion.agent.v1.GetCheckpointTarRequest
+	21, // 11: podmotion.agent.v1.MigrationAgentService.ReleaseCheckpoint:input_type -> podmotion.agent.v1.ReleaseCheckpointRequest
+	2,  // 12: podmotion.agent.v1.MigrationAgentService.PrepareSource:output_type -> podmotion.agent.v1.PrepareSourceResponse
+	4,  // 13: podmotion.agent.v1.MigrationAgentService.PreDumpRound:output_type -> podmotion.agent.v1.PreDumpRoundResponse
+	6,  // 14: podmotion.agent.v1.MigrationAgentService.Checkpoint:output_type -> podmotion.agent.v1.CheckpointResponse
+	8,  // 15: podmotion.agent.v1.MigrationAgentService.PrepareDestination:output_type -> podmotion.agent.v1.PrepareDestinationResponse
+	10, // 16: podmotion.agent.v1.MigrationAgentService.Restore:output_type -> podmotion.agent.v1.RestoreResponse
+	12, // 17: podmotion.agent.v1.MigrationAgentService.Verify:output_type -> podmotion.agent.v1.VerifyResponse
+	14, // 18: podmotion.agent.v1.MigrationAgentService.Abort:output_type -> podmotion.agent.v1.AbortResponse
+	16, // 19: podmotion.agent.v1.MigrationAgentService.EstimateCheckpoint:output_type -> podmotion.agent.v1.EstimateCheckpointResponse
+	18, // 20: podmotion.agent.v1.MigrationAgentService.PutCheckpointTar:output_type -> podmotion.agent.v1.PutCheckpointTarResponse
+	20, // 21: podmotion.agent.v1.MigrationAgentService.GetCheckpointTar:output_type -> podmotion.agent.v1.GetCheckpointTarResponse
+	22, // 22: podmotion.agent.v1.MigrationAgentService.ReleaseCheckpoint:output_type -> podmotion.agent.v1.ReleaseCheckpointResponse
+	12, // [12:23] is the sub-list for method output_type
+	1,  // [1:12] is the sub-list for method input_type
 	1,  // [1:1] is the sub-list for extension type_name
 	1,  // [1:1] is the sub-list for extension extendee
 	0,  // [0:1] is the sub-list for field type_name
@@ -1381,7 +1630,7 @@ func file_migration_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_migration_agent_proto_rawDesc), len(file_migration_agent_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   18,
+			NumMessages:   22,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

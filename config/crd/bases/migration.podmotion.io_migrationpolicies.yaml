@@ -54,6 +54,16 @@ spec:
           spec:
             description: MigrationPolicySpec defines the desired state of MigrationPolicy.
             properties:
+              affinityMode:
+                default: strict
+                description: |-
+                  AffinityMode sets the default affinityMode for all PodMigrations triggered by this policy.
+                  Individual PodMigration CRs may override this. Defaults to strict.
+                enum:
+                - strict
+                - patch
+                - ignore
+                type: string
               blockedNamespaces:
                 description: BlockedNamespaces lists namespaces this policy will never
                   target, regardless of selector.
@@ -101,6 +111,19 @@ spec:
                 description: MigrationDefaults provides default PodMigrationSpec values
                   for migrations created by this policy.
                 properties:
+                  affinityMode:
+                    default: strict
+                    description: |-
+                      AffinityMode controls how PodMotion handles hard nodeAffinity / nodeSelector rules
+                      on the owning workload controller that pin pods to the source node.
+                      strict: reject at admission (default, safe for GitOps environments).
+                      patch: patch the Deployment/StatefulSet affinity at phase=Complete (requires M19 Part B).
+                      ignore: proceed without patching (standalone pods, no GitOps).
+                    enum:
+                    - strict
+                    - patch
+                    - ignore
+                    type: string
                   bandwidthLimitMbps:
                     default: 0
                     description: BandwidthLimitMbps caps per-migration transfer bandwidth.
@@ -182,11 +205,6 @@ spec:
                     maximum: 20
                     minimum: 1
                     type: integer
-                  replacementPodName:
-                    description: |-
-                      ReplacementPodName is the name of the replacement pod created by the workload
-                      controller after source pod deletion. Tracked by the PodMotion controller.
-                    type: string
                   rollbackOnFailure:
                     default: true
                     description: RollbackOnFailure unfreezes and restarts the source

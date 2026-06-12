@@ -67,6 +67,14 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 	}
 }
 
+// JoinNsRestore is the exported entry point for the NRI StartContainer hook.
+// It invokes the CRIU restore path that enters the container's existing namespaces
+// (created by runc) and restores the checkpointed process tree.
+// migrationName is used for log tagging; checkpointDir is the tmpfs images path.
+func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir string) (int, error) {
+	return joinNsRestore(migrationName, checkpointDir)
+}
+
 // ListenAndServe starts the gRPC server on addr (default ":9090").
 // tlsCfg may be nil for insecure mode (dev/test only).
 // Blocks until ctx is cancelled.
@@ -718,17 +726,40 @@ func buildMinimalOCIConfig(src map[string]interface{}, rootfsDir string) map[str
 
 func (s *AgentServer) PreDumpRound(_ context.Context, req *agentpb.PreDumpRoundRequest) (*agentpb.PreDumpRoundResponse, error) {
 	log.Info("PreDumpRound called", "migration", req.MigrationName, "round", req.RoundNumber)
+
+	// Resolve the container root PID so CRIU dumps the right process tree,
+	// not the agent's own cgroup. Without this, CRIU detects itself in the
+	// dump tree and fails with "The criu itself is within dumped tree."
+	var containerPID int32
+	if req.PodUid != "" {
+		pid, pidErr := FindContainerPID(req.PodUid)
+		if pidErr != nil {
+			log.Error(pidErr, "PreDumpRound: failed to resolve container PID", "podUID", req.PodUid)
+		} else {
+			containerPID = pid
+			log.Info("PreDumpRound: resolved container PID", "pid", containerPID, "podUID", req.PodUid)
+		}
+	}
+
+	imagesDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/round-%d", req.MigrationName, req.RoundNumber)
+	if err := os.MkdirAll(imagesDir, 0o700); err != nil {
+		return nil, fmt.Errorf("PreDumpRound: mkdir %s: %w", imagesDir, err)
+	}
+	var prevImagesDir string
+	if req.RoundNumber > 0 {
+		prevImagesDir = fmt.Sprintf("/run/podmotion/checkpoints/%s/round-%d", req.MigrationName, req.RoundNumber-1)
+	}
 	result, err := s.checkpointer.PreDump(context.Background(), criu.PreDumpOptions{
-		ImagesDir: fmt.Sprintf("/run/podmotion/checkpoints/%s/round-%d", req.MigrationName, req.RoundNumber),
-		TrackMem:  true,
+		ImagesDir:     imagesDir,
+		PrevImagesDir: prevImagesDir,
+		Pid:           containerPID,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("PreDumpRound %d: %w", req.RoundNumber, err)
 	}
 	return &agentpb.PreDumpRoundResponse{
-		DirtyPagesMb:    result.DirtyPagesMB,
-		RoundDurationMs: result.FreezeDurationMs,
-		// Convergence threshold: < 64 MB dirty qualifies as "good enough to freeze" (ADR-0011).
+		DirtyPagesMb:     result.DirtyPagesMB,
+		RoundDurationMs:  result.FreezeDurationMs,
 		ThresholdReached: result.DirtyPagesMB < 64,
 	}, nil
 }
@@ -761,18 +792,37 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 			sizeBytes, ctrErr := ctrCheckpoint(taskID, imagesDir)
 			freezeDurationMs := time.Since(freezeStart).Milliseconds()
 			if ctrErr != nil {
-				return nil, fmt.Errorf("checkpoint failed: ctr checkpoint: %w", ctrErr)
+				// Fall through to raw CRIU only for in-flight TCP socket failures — ctr invokes
+				// CRIU without --skip-in-flight, so containers with active TCP connections fail.
+				// Raw go-criu uses TcpSkipInFlight=true + TcpClose=true (established connections
+				// will be closed on restore — this is a deliberate behavior change, logged below).
+				// Any other ctr error (OOM, permission, corrupt task) is fatal and returned directly
+				// to avoid a double-freeze and to surface the real cause.
+				errStr := ctrErr.Error()
+				isInFlightTCP := strings.Contains(errStr, "In-flight") ||
+					strings.Contains(errStr, "in-flight") ||
+					strings.Contains(errStr, "inet")
+				if !isInFlightTCP {
+					return nil, fmt.Errorf("checkpoint failed (ctr): %w", ctrErr)
+				}
+				log.Info("Checkpoint: ctr failed due to in-flight TCP — falling back to raw CRIU (TcpClose=true: established connections will be dropped on restore)",
+					"taskID", taskID, "err", ctrErr)
+				// Clear any partial ctr images before raw CRIU writes to the same dir.
+				if rmErr := os.RemoveAll(imagesDir); rmErr != nil {
+					return nil, fmt.Errorf("checkpoint: clearing partial ctr images before raw CRIU: %w", rmErr)
+				}
+			} else {
+				sha := sha256OfDir(imagesDir)
+				log.Info("Checkpoint complete (ctr)", "migration", req.MigrationName,
+					"sizeBytes", sizeBytes, "sha256", sha, "freezeMs", freezeDurationMs)
+				return &agentpb.CheckpointResponse{
+					FreezeDurationMs:    freezeDurationMs,
+					CheckpointSha256:    sha,
+					CheckpointSizeBytes: sizeBytes,
+				}, nil
 			}
-			sha := sha256OfDir(imagesDir)
-			log.Info("Checkpoint complete (ctr)", "migration", req.MigrationName,
-				"sizeBytes", sizeBytes, "sha256", sha, "freezeMs", freezeDurationMs)
-			return &agentpb.CheckpointResponse{
-				FreezeDurationMs:    freezeDurationMs,
-				CheckpointSha256:    sha,
-				CheckpointSizeBytes: sizeBytes,
-			}, nil
 		}
-		log.Info("Checkpoint: ctr task lookup failed, falling back to raw CRIU", "err", taskErr)
+		log.Info("Checkpoint: ctr task lookup failed, using raw CRIU", "err", taskErr)
 	}
 
 	var containerPID int32
@@ -1053,7 +1103,6 @@ func (s *AgentServer) EstimateCheckpoint(ctx context.Context, req *agentpb.Estim
 		Namespace:     "k8s.io",
 		ImagesDir:     sampleDir,
 		PrevImagesDir: "",
-		TrackMem:      true,
 	})
 	if err != nil {
 		log.Error(err, "EstimateCheckpoint pre-dump failed — falling back to stub values")
@@ -1163,6 +1212,121 @@ func (s *AgentServer) PutCheckpointTar(_ context.Context, req *agentpb.PutCheckp
 		"bytesWritten", bytesWritten,
 		"tarSize", len(req.TarData))
 	return &agentpb.PutCheckpointTarResponse{Success: true, BytesWritten: bytesWritten}, nil
+}
+
+// GetCheckpointTar reads the checkpoint image directory on this (source) node and
+// returns a gzip-compressed tar. This is a pure read — it does NOT zeroize the source.
+// The controller calls GetCheckpointTar → PutCheckpointTar (dest) → persists
+// CheckpointTransferred=true → ReleaseCheckpoint (source). This sequence ensures the
+// source copy survives a controller crash between Put and the status write.
+func (s *AgentServer) GetCheckpointTar(_ context.Context, req *agentpb.GetCheckpointTarRequest) (*agentpb.GetCheckpointTarResponse, error) {
+	if req.MigrationName == "" {
+		return &agentpb.GetCheckpointTarResponse{Success: false, Error: "migration_name required"}, nil
+	}
+
+	srcDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", req.MigrationName)
+	entries, err := os.ReadDir(srcDir)
+	if err != nil || len(entries) == 0 {
+		return &agentpb.GetCheckpointTarResponse{
+			Success: false,
+			Error:   fmt.Sprintf("checkpoint dir not ready: %v", err),
+		}, nil
+	}
+
+	tarData, err := tarGzServerDir(srcDir)
+	if err != nil {
+		return &agentpb.GetCheckpointTarResponse{
+			Success: false,
+			Error:   fmt.Sprintf("tar checkpoint: %v", err),
+		}, nil
+	}
+
+	log.Info("GetCheckpointTar: checkpoint packaged (source intact until ReleaseCheckpoint)",
+		"migration", req.MigrationName,
+		"srcDir", srcDir,
+		"tarSizeBytes", len(tarData))
+
+	return &agentpb.GetCheckpointTarResponse{
+		Success:   true,
+		TarData:   tarData,
+		BytesRead: int64(len(tarData)),
+	}, nil
+}
+
+// ReleaseCheckpoint zeroizes and removes the checkpoint directory on this (source) node.
+// Called by the controller only after PutCheckpointTar has succeeded AND
+// pm.Status.CheckpointTransferred has been durably persisted. Idempotent: returns success
+// if the directory is already absent (handles controller-restart replay after release).
+func (s *AgentServer) ReleaseCheckpoint(_ context.Context, req *agentpb.ReleaseCheckpointRequest) (*agentpb.ReleaseCheckpointResponse, error) {
+	if req.MigrationName == "" {
+		return &agentpb.ReleaseCheckpointResponse{Success: false, Error: "migration_name required"}, nil
+	}
+
+	srcDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", req.MigrationName)
+	if _, err := os.Stat(srcDir); os.IsNotExist(err) {
+		// Already released (or never existed) — idempotent success.
+		log.Info("ReleaseCheckpoint: source dir already absent (idempotent)",
+			"migration", req.MigrationName, "dir", srcDir)
+		return &agentpb.ReleaseCheckpointResponse{Success: true}, nil
+	}
+
+	if err := zeroizeDir(srcDir); err != nil {
+		log.Error(err, "ReleaseCheckpoint: zeroize failed — images remain on tmpfs until node reboot",
+			"migration", req.MigrationName, "dir", srcDir)
+		// Non-fatal: tmpfs is volatile; images are gone on node reboot.
+		// Return success so the controller doesn't retry in a loop.
+	}
+
+	log.Info("ReleaseCheckpoint: source checkpoint zeroized and removed",
+		"migration", req.MigrationName, "dir", srcDir)
+	return &agentpb.ReleaseCheckpointResponse{Success: true}, nil
+}
+
+// tarGzServerDir creates a gzip-compressed tar of all regular files in dir.
+// Mirrors tarGzDir in the controller package; duplicated here to avoid cross-package deps.
+func tarGzServerDir(dir string) ([]byte, error) {
+	var buf bytes.Buffer
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		hdr := &tar.Header{
+			Name:    rel,
+			Size:    info.Size(),
+			Mode:    int64(info.Mode()),
+			ModTime: info.ModTime(),
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(tw, f)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+	if err := gzw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

@@ -1,0 +1,97 @@
+# PgBouncer connection pool proxy — sits between the load generator and the
+# migrating PostgreSQL pod. Pinned to pm-control so it never migrates.
+#
+# Uses transaction pooling mode: connections are held at the pool level, not
+# per-client, so PgBouncer can reconnect to the new pod IP transparently after
+# the migration freeze window. The error counter (cl_active vs cl_waiting + sv_login)
+# is the measurement point — any failed reconnect shows up here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgbouncer-cfg
+  namespace: pm-db-test
+data:
+  pgbouncer.ini: |
+    [databases]
+    pmtest = host=postgres-live-svc.pm-db-test.svc.cluster.local port=5432 dbname=pmtest
+
+    [pgbouncer]
+    listen_port = 5432
+    listen_addr = 0.0.0.0
+    auth_type = md5
+    auth_file = /etc/pgbouncer/userlist.txt
+    pool_mode = transaction
+    max_client_conn = 50
+    default_pool_size = 10
+    reserve_pool_size = 5
+    reserve_pool_timeout = 2
+    # Reconnect quickly after backend disappears (migration freeze)
+    server_connect_timeout = 5
+    server_login_retry = 1
+    query_timeout = 30
+    # Stats
+    stats_period = 5
+    admin_users = pgbadmin
+    logfile = /tmp/pgbouncer.log
+    pidfile = /tmp/pgbouncer.pid
+
+  userlist.txt: |
+    "pmuser" "pmpass"
+    "pgbadmin" "adminpass"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbouncer
+  namespace: pm-db-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pgbouncer
+  template:
+    metadata:
+      labels:
+        app: pgbouncer
+    spec:
+      nodeName: pm-control
+      containers:
+      - name: pgbouncer
+        image: bitnami/pgbouncer:1.22.1
+        env:
+        - name: PGBOUNCER_DATABASE
+          value: pmtest
+        - name: POSTGRESQL_HOST
+          value: postgres-live-svc.pm-db-test.svc.cluster.local
+        - name: POSTGRESQL_USERNAME
+          value: pmuser
+        - name: POSTGRESQL_PASSWORD
+          value: pmpass
+        - name: PGBOUNCER_POOL_MODE
+          value: transaction
+        - name: PGBOUNCER_MAX_CLIENT_CONN
+          value: "50"
+        - name: PGBOUNCER_DEFAULT_POOL_SIZE
+          value: "10"
+        ports:
+        - containerPort: 5432
+          name: pgbouncer
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "50m"
+          limits:
+            memory: "64Mi"
+            cpu: "200m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgbouncer-svc
+  namespace: pm-db-test
+spec:
+  selector:
+    app: pgbouncer
+  ports:
+  - port: 5432
+    targetPort: 5432

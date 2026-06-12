@@ -1,0 +1,91 @@
+# PostgreSQL source pod for live DB migration testing.
+# Pinned to pm-worker; migrated to pm-control.
+# Uses emptyDir so there are no PVC complications in Phase 1.
+# Phase 2 will use a PVC with Longhorn RWO to exercise the storage migration path.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pm-db-test
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: pm-db-test
+data:
+  init.sql: |
+    CREATE TABLE IF NOT EXISTS counters (
+      id      SERIAL PRIMARY KEY,
+      name    TEXT NOT NULL UNIQUE,
+      value   BIGINT NOT NULL DEFAULT 0,
+      updated TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    INSERT INTO counters (name, value) VALUES ('writes', 0) ON CONFLICT DO NOTHING;
+    INSERT INTO counters (name, value) VALUES ('reads',  0) ON CONFLICT DO NOTHING;
+
+    -- Function incremented by load generator on each write transaction
+    CREATE OR REPLACE FUNCTION bump_counter(cname TEXT) RETURNS BIGINT AS $$
+      UPDATE counters SET value = value + 1, updated = now()
+      WHERE name = cname
+      RETURNING value;
+    $$ LANGUAGE sql;
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-src
+  namespace: pm-db-test
+  labels:
+    app: postgres-live
+spec:
+  nodeName: pm-worker
+  containers:
+  - name: postgres
+    image: postgres:16-alpine
+    env:
+    - name: POSTGRES_DB
+      value: pmtest
+    - name: POSTGRES_USER
+      value: pmuser
+    - name: POSTGRES_PASSWORD
+      value: pmpass
+    - name: PGDATA
+      value: /var/lib/postgresql/data/pgdata
+    ports:
+    - containerPort: 5432
+    volumeMounts:
+    - name: data
+      mountPath: /var/lib/postgresql/data
+    - name: init
+      mountPath: /docker-entrypoint-initdb.d/init.sql
+      subPath: init.sql
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "100m"
+      limits:
+        memory: "256Mi"
+        cpu: "500m"
+    readinessProbe:
+      exec:
+        command: ["pg_isready", "-U", "pmuser", "-d", "pmtest"]
+      initialDelaySeconds: 5
+      periodSeconds: 2
+  volumes:
+  - name: data
+    emptyDir: {}
+  - name: init
+    configMap:
+      name: postgres-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-live-svc
+  namespace: pm-db-test
+spec:
+  selector:
+    app: postgres-live
+  ports:
+  - port: 5432
+    targetPort: 5432

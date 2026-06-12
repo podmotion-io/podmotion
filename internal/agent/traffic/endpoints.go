@@ -111,6 +111,16 @@ func (m *EndpointSliceManager) MarkDestinationReady(ctx context.Context, namespa
 	return nil
 }
 
+// HasEndpointForIP reports whether any EndpointSlice in namespace contains ip.
+// Used by the controller for post-flight verification that RemoveSource actually cleaned up.
+func (m *EndpointSliceManager) HasEndpointForIP(ctx context.Context, namespace, ip string) (bool, error) {
+	slices, err := m.findSlicesWithIP(ctx, namespace, ip)
+	if err != nil {
+		return false, err
+	}
+	return len(slices) > 0, nil
+}
+
 func (m *EndpointSliceManager) findSlicesWithIP(ctx context.Context, namespace, ip string) ([]discoveryv1.EndpointSlice, error) {
 	list := &discoveryv1.EndpointSliceList{}
 	if err := m.client.List(ctx, list,

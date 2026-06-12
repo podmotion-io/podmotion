@@ -26,6 +26,16 @@ service MigrationAgentService {
   // Used for same-cluster (LAN) cold migration where the operator can read source
   // checkpoint files directly and push them to the destination agent.
   rpc PutCheckpointTar(PutCheckpointTarRequest) returns (PutCheckpointTarResponse);
+  // GetCheckpointTar reads the checkpoint image directory on the source agent and
+  // returns a gzip-compressed tar of all files. This is a pure read — it does NOT
+  // zeroize the source. The controller calls this, then PutCheckpointTar, then persists
+  // CheckpointTransferred=true, then calls ReleaseCheckpoint to destroy the source copy.
+  rpc GetCheckpointTar(GetCheckpointTarRequest) returns (GetCheckpointTarResponse);
+  // ReleaseCheckpoint zeroizes and removes the checkpoint directory on this (source) node.
+  // Called by the controller only after PutCheckpointTar has succeeded AND
+  // pm.Status.CheckpointTransferred has been durably persisted. Idempotent: returns
+  // success if the directory is already absent (handles controller-restart replay).
+  rpc ReleaseCheckpoint(ReleaseCheckpointRequest) returns (ReleaseCheckpointResponse);
 }
 
 message PrepareSourceRequest {
@@ -46,6 +56,7 @@ message PrepareSourceResponse {
 message PreDumpRoundRequest {
   string migration_name = 1;
   int32  round_number   = 2;
+  string pod_uid        = 3; // used to resolve the container root PID via cgroup walk
 }
 message PreDumpRoundResponse {
   int64 dirty_pages_mb       = 1;
@@ -131,6 +142,25 @@ message PutCheckpointTarResponse {
   bool   success      = 1;
   string error        = 2;
   int64  bytes_written = 3;
+}
+
+message GetCheckpointTarRequest {
+  string migration_name = 1; // identifies the checkpoint directory on the source node
+}
+message GetCheckpointTarResponse {
+  bool   success      = 1;
+  string error        = 2;
+  bytes  tar_data     = 3; // gzip-compressed tar of the checkpoint final/ directory
+  int64  bytes_read   = 4;
+}
+
+message ReleaseCheckpointRequest {
+  string migration_name      = 1;
+  string migration_namespace = 2;
+}
+message ReleaseCheckpointResponse {
+  bool   success = 1;
+  string error   = 2;
 }
 
 enum MigrationMode {

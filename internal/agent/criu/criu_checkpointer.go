@@ -8,12 +8,15 @@ you may not use this file except in compliance with the License.
 package criu
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -49,8 +52,10 @@ func darwinError() error {
 }
 
 // PreDump performs one iterative pre-dump round without freezing the container.
-// Writes images to opts.ImagesDir. Sets track-mem so the next round captures
-// only dirty pages.
+// Uses `criu pre-dump` directly (not go-criu swrk) because CRIU's swrk PRE_DUMP
+// handler runs a loop waiting for follow-up requests; closing the socket mid-loop
+// causes CRIU to exit with code 255 even on success. Direct exec avoids the loop.
+// VM_READ mode (process_vm_readv) is used — no CONFIG_MEM_SOFT_DIRTY required.
 func (c *CRIUCheckpointer) PreDump(ctx context.Context, opts PreDumpOptions) (CheckpointResult, error) {
 	if runtime.GOOS == "darwin" {
 		return CheckpointResult{}, darwinError()
@@ -60,67 +65,54 @@ func (c *CRIUCheckpointer) PreDump(ctx context.Context, opts PreDumpOptions) (Ch
 		return CheckpointResult{}, fmt.Errorf("context cancelled before PreDump: %w", err)
 	}
 
-	if err := os.MkdirAll(opts.ImagesDir, 0o755); err != nil {
+	if err := os.MkdirAll(opts.ImagesDir, 0o700); err != nil {
 		return CheckpointResult{}, fmt.Errorf("creating images dir %s: %w", opts.ImagesDir, err)
 	}
 
-	imgDirFd, err := openDirFd(opts.ImagesDir)
-	if err != nil {
-		return CheckpointResult{}, err
-	}
-	defer imgDirFd.Close()
-
-	criuOpts := &rpc.CriuOpts{
-		ImagesDirFd: proto.Int32(int32(imgDirFd.Fd())),
-		LogFile:     proto.String("predump.log"),
-		LogLevel:    proto.Int32(4),
-		TrackMem:    proto.Bool(opts.TrackMem),
+	// CRIU uses -t for pid (short form) — --pid is not recognized for pre-dump.
+	args := []string{
+		"pre-dump",
+		"-t", strconv.Itoa(int(opts.Pid)),
+		"--images-dir", opts.ImagesDir,
+		"--log-file", "predump.log",
+		"-v4",
+		"--pre-dump-mode", "read",
 	}
 
 	if opts.PrevImagesDir != "" {
-		// CRIU expects a path relative to ImagesDir or absolute for --prev-images-dir.
 		rel, relErr := filepath.Rel(opts.ImagesDir, opts.PrevImagesDir)
 		if relErr != nil {
 			rel = opts.PrevImagesDir
 		}
-		criuOpts.ParentImg = proto.String(rel)
+		args = append(args, "--prev-images-dir", rel)
 	}
 
-	c.mu.Lock()
-	cr := gocriu.MakeCriu()
-	cr.SetCriuPath(c.criuBinaryPath)
-	c.activeCriu = cr
-	c.mu.Unlock()
+	//nolint:gosec // binary path is a trusted constant, args are controlled internally
+	cmd := exec.CommandContext(ctx, c.criuBinaryPath, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
-	defer func() {
-		c.mu.Lock()
-		c.activeCriu = nil
-		c.mu.Unlock()
-	}()
-
-	// Run CRIU in a goroutine so we can honour ctx cancellation.
-	type result struct {
-		err error
-	}
+	type result struct{ err error }
 	done := make(chan result, 1)
 	go func() {
-		done <- result{err: cr.PreDump(criuOpts, nil)}
+		done <- result{err: cmd.Run()}
 	}()
 
 	select {
 	case <-ctx.Done():
-		// Best-effort abort: close the swrk socket to unblock CRIU.
-		c.Abort(context.Background(), opts.ContainerID, opts.Namespace) //nolint:errcheck
+		_ = cmd.Process.Kill()
 		return CheckpointResult{}, fmt.Errorf("PreDump aborted: %w", ctx.Err())
 	case res := <-done:
 		if res.err != nil {
-			return CheckpointResult{}, fmt.Errorf("criu pre-dump: %w", res.err)
+			predumpLog, _ := os.ReadFile(filepath.Join(opts.ImagesDir, "predump.log"))
+			return CheckpointResult{}, fmt.Errorf("criu pre-dump: %w\nstderr: %s\nlog: %s",
+				res.err, stderr.String(), string(predumpLog))
 		}
 	}
 
 	return CheckpointResult{
 		ImagesDir:        opts.ImagesDir,
-		DirtyPagesMB:     0, // CRIU stats file parsing not yet implemented
+		DirtyPagesMB:     0, // stats file parsing not yet implemented
 		FreezeDurationMs: 0, // pre-dump does not freeze
 		RoundNumber:      0,
 		CheckpointedAt:   time.Now(),
@@ -173,9 +165,8 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	//   - ExtSharing=true       — overlay rootfs shares mount subtrees externally
 	//   - ExtMasters=true       — overlay upper/work dirs are external mount masters
 	//   - Root                  — container rootfs visible from the host via /proc/<pid>/root
-	//   - TrackMem=false        — soft-dirty tracking requires CONFIG_MEM_SOFT_DIRTY
-	//                            (x86-only; not available on ARM64 / Ubuntu 24.04 aarch64)
-	//                            Safe to omit for cold migration — no pre-copy rounds needed
+	//   - TrackMem omitted      — pre-dump uses VM_READ (process_vm_readv); cold dump
+	//                            never needs dirty tracking
 	//   - TcpClose=true         — close TCP sockets instead of erroring on multi-thread tasks
 	criuOpts := &rpc.CriuOpts{
 		ImagesDirFd:    proto.Int32(int32(imgDirFd.Fd())),
