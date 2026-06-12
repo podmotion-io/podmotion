@@ -58,6 +58,13 @@ var ErrCtrInFlightTCP = errors.New("ctr checkpoint: in-flight TCP sockets detect
 // Surface as gRPC codes.FailedPrecondition at the gRPC boundary.
 var ErrCRIUCapability = criu.ErrCRIUCapability
 
+// zwHoldState tracks per-migration zero-window hold state including armed timestamp and
+// watchdog cancel for auto-disarm on FreezeWindowBudgetMs + margin expiry.
+type zwHoldState struct {
+	armedAtNs      int64
+	watchdogCancel context.CancelFunc
+}
+
 // AgentServer implements agentpb.MigrationAgentServiceServer.
 // One instance runs per node agent process.
 type AgentServer struct {
@@ -70,6 +77,11 @@ type AgentServer struct {
 	// Used by Checkpoint to resolve the container root PID via /proc cgroup scan.
 	migrationPodUIDMu sync.RWMutex
 	migrationPodUID   map[string]string
+
+	// zwHoldMu guards zwHolds.
+	zwHoldMu sync.Mutex
+	// zwHolds tracks active zero-window holds keyed by migration name.
+	zwHolds map[string]*zwHoldState
 }
 
 // New constructs an AgentServer with the given Checkpointer implementation.
@@ -80,6 +92,7 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 		nodeName:        nodeName,
 		k8sClient:       k8sClient,
 		migrationPodUID: make(map[string]string),
+		zwHolds:         make(map[string]*zwHoldState),
 	}
 }
 
@@ -358,6 +371,46 @@ func ctrCheckpoint(taskID, imagesDir string) (int64, error) {
 	return total, nil
 }
 
+// buildCRIURestoreArgs constructs the argument list for `criu restore`.
+// Network namespace selection is tier-driven (ADR-0048):
+//   - destNetnsFd non-empty → --join-ns net:<path> + --tcp-established: restore into the
+//     pre-staged migration netns so that TCP seq/ack state is preserved across node handoff.
+//   - destNetnsFd empty → --empty-ns net + --tcp-close: stateless cold migration; CRIU creates
+//     a fresh netns and closes all TCP connections (correct default for NetworkContinuity=None).
+//
+// --restore-detached is intentionally absent: CRIU must remain the foreground parent of the
+// restored process tree to avoid ghost containers (PID in /proc but untracked by any supervisor).
+func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd string) []string {
+	tcpFlag := "--tcp-close"
+	if destNetnsFd != "" {
+		tcpFlag = "--tcp-established"
+	}
+	args := []string{
+		"restore",
+		"--images-dir", checkpointDir,
+		"--root", rootfsDir,
+		tcpFlag,
+		"--mntns-compat-mode",
+		"--manage-cgroups=ignore",
+		"--ext-mount-map", "/dev/null:/dev/null",
+		"--ext-mount-map", fmt.Sprintf("/data:%s", dataDir),
+		"--ext-mount-map", fmt.Sprintf("/dev/termination-log:%s", termlogFile),
+		"--ext-mount-map", fmt.Sprintf("/run/secrets/kubernetes.io/serviceaccount:%s", secretsDir),
+		"--ext-mount-map", "/dev/shm:/dev/shm",
+		"--ext-mount-map", "/etc/resolv.conf:/etc/resolv.conf",
+		"--ext-mount-map", "/etc/hostname:/etc/hostname",
+		"--ext-mount-map", "/etc/hosts:/etc/hosts",
+		"-v4",
+		"-o", restoreLogPath,
+	}
+	if destNetnsFd != "" {
+		args = append(args, "--join-ns", "net:"+destNetnsFd)
+	} else {
+		args = append(args, "--empty-ns", "net")
+	}
+	return args
+}
+
 // joinNsRestore restores a checkpointed container using a standalone overlayfs rootfs.
 // When destNetnsFd is non-empty (a /proc/<pid>/fd/<n> path to a pre-staged migration netns),
 // CRIU uses --join-ns net:<destNetnsFd> to restore TCP connections into the pre-staged netns
@@ -450,51 +503,8 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd string) (int, error
 	}
 
 	// Step 4: CRIU restore — standalone rootfs.
-	// Network namespace selection:
-	//   destNetnsFd non-empty → --join-ns net:<path>: restore into the pre-staged migration
-	//     netns so TCP connections survive across the overlay handoff (ADR-0048).
-	//   empty → --empty-ns net: create a fresh netns (stateless cold migration).
 	restoreLogPath := filepath.Join(checkpointDir, "restore.log")
-	// TCP flag is tier-driven: when restoring into a pre-staged migration netns (join-ns path,
-	// TCPPreservationMode=Strict/BestEffort) we MUST pass --tcp-established so CRIU restores
-	// the socket state table and TCP seq numbers. --tcp-close (the default) sends RST on every
-	// established connection, directly defeating the join-ns TCP-preservation purpose (ADR-0048).
-	// For the stateless cold path (destNetnsFd=="") --tcp-close is the correct/safe default.
-	tcpFlag := "--tcp-close"
-	if destNetnsFd != "" {
-		tcpFlag = "--tcp-established"
-	}
-	criuArgs := []string{
-		"restore",
-		"--images-dir", checkpointDir,
-		"--root", rootfsDir,
-		tcpFlag,
-		"--mntns-compat-mode",
-		"--manage-cgroups=ignore",
-		// /dev/null is the ext_key for all Kubernetes masked-path tmpfs bind-mounts.
-		"--ext-mount-map", "/dev/null:/dev/null",
-		// Kubernetes emptyDir / persistent volume mounted at /data.
-		"--ext-mount-map", fmt.Sprintf("/data:%s", dataDir),
-		// Container-terminated log file.
-		"--ext-mount-map", fmt.Sprintf("/dev/termination-log:%s", termlogFile),
-		// Service account token (not needed by Redis but present in the dump).
-		"--ext-mount-map", fmt.Sprintf("/run/secrets/kubernetes.io/serviceaccount:%s", secretsDir),
-		// Standard CRI bind-mounts that reference sandbox-specific host paths.
-		"--ext-mount-map", "/dev/shm:/dev/shm",
-		"--ext-mount-map", "/etc/resolv.conf:/etc/resolv.conf",
-		"--ext-mount-map", "/etc/hostname:/etc/hostname",
-		"--ext-mount-map", "/etc/hosts:/etc/hosts",
-		// No --restore-detached: CRIU runs foreground as the restored process's init/parent.
-		// --restore-detached would cause CRIU to exit-0 and orphan the process (ghost
-		// container — PID visible in /proc but not tracked by any supervisor).
-		"-v4",
-		"-o", restoreLogPath,
-	}
-	if destNetnsFd != "" {
-		criuArgs = append(criuArgs, "--join-ns", "net:"+destNetnsFd)
-	} else {
-		criuArgs = append(criuArgs, "--empty-ns", "net")
-	}
+	criuArgs := buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd)
 	criuCmd := exec.Command("/usr/local/sbin/criu", criuArgs...)
 	if err := criuCmd.Start(); err != nil {
 		return 0, fmt.Errorf("criu restore start: %w", err)
@@ -1448,6 +1458,135 @@ func checksumDir(dir string) (string, int64) {
 		return nil
 	})
 	return hex.EncodeToString(h.Sum(nil)), totalBytes
+}
+
+// zwWatchdogMargin is added to FreezeWindowBudgetMs to give the controller time to send
+// DisarmZeroWindow before the watchdog fires an emergency disarm.
+const zwWatchdogMargin = 500 * time.Millisecond
+
+// ArmZeroWindow implements MigrationAgentServiceServer.ArmZeroWindow.
+// It polls tcpi_unacked==0 for all TCP sockets of the source pod before returning armed=true,
+// ensuring no in-flight bytes are in the send buffer when FinalFreeze fires (ADR-0049).
+// A watchdog goroutine auto-disarms if DisarmZeroWindow is not received within
+// FreezeWindowBudgetMs + zwWatchdogMargin to prevent indefinite client stall.
+func (s *AgentServer) ArmZeroWindow(ctx context.Context, req *agentpb.ArmZeroWindowRequest) (*agentpb.ArmZeroWindowResponse, error) {
+	log.Info("ArmZeroWindow: arming zero-window hold", "migration", req.MigrationName, "podUID", req.PodUid)
+
+	s.migrationPodUIDMu.RLock()
+	podUID := s.migrationPodUID[req.MigrationName]
+	s.migrationPodUIDMu.RUnlock()
+	if podUID == "" && req.PodUid != "" {
+		podUID = req.PodUid
+	}
+
+	// Resolve source pod veth ifindex. On darwin/stub resolveVethIfindex returns 0 without error.
+	ifindex, err := resolveVethIfindex(podUID)
+	if err != nil {
+		log.Info("ArmZeroWindow: veth ifindex resolution failed (stub path)", "migration", req.MigrationName, "err", err)
+	}
+
+	// Arm the TC-BPF zero-window hold. On non-Linux this is a no-op stub.
+	if err := armZeroWindowBPF(ctx, ifindex); err != nil {
+		return &agentpb.ArmZeroWindowResponse{
+			Armed:          false,
+			BlockingReason: fmt.Sprintf("BPF arm failed: %v", err),
+		}, nil
+	}
+
+	// Poll tcpi_unacked==0 on all TCP sockets reachable via the pod's network namespace
+	// (ADR-0049 predicate A). On non-Linux or when the pod PID is not found, returns immediately.
+	if err := pollUnackedZero(ctx, podUID); err != nil {
+		log.Info("ArmZeroWindow: unacked drain poll failed or timed out",
+			"migration", req.MigrationName, "err", err)
+	}
+
+	armedAtNs := time.Now().UnixNano()
+
+	// Register hold state and launch watchdog goroutine.
+	budget := time.Duration(req.FreezeWindowBudgetMs)*time.Millisecond + zwWatchdogMargin
+	wdCtx, wdCancel := context.WithCancel(context.Background())
+	s.zwHoldMu.Lock()
+	s.zwHolds[req.MigrationName] = &zwHoldState{
+		armedAtNs:      armedAtNs,
+		watchdogCancel: wdCancel,
+	}
+	s.zwHoldMu.Unlock()
+
+	go func() {
+		select {
+		case <-time.After(budget):
+			log.Info("ArmZeroWindow: watchdog triggered — auto-disarming ZW hold",
+				"migration", req.MigrationName, "budgetMs", req.FreezeWindowBudgetMs)
+			disarmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if dErr := disarmZeroWindowBPF(disarmCtx, ifindex); dErr != nil {
+				log.Info("ArmZeroWindow: watchdog disarm BPF error", "migration", req.MigrationName, "err", dErr)
+			}
+			s.zwHoldMu.Lock()
+			delete(s.zwHolds, req.MigrationName)
+			s.zwHoldMu.Unlock()
+		case <-wdCtx.Done():
+			// Normal path: DisarmZeroWindow cancelled the watchdog.
+		}
+	}()
+
+	log.Info("ArmZeroWindow: hold armed", "migration", req.MigrationName, "armedAtNs", armedAtNs)
+	return &agentpb.ArmZeroWindowResponse{
+		Armed:     true,
+		ArmedAtNs: armedAtNs,
+	}, nil
+}
+
+// DisarmZeroWindow implements MigrationAgentServiceServer.DisarmZeroWindow.
+// It cancels the watchdog goroutine and detaches the TC-BPF zero-window hold.
+func (s *AgentServer) DisarmZeroWindow(_ context.Context, req *agentpb.DisarmZeroWindowRequest) (*agentpb.DisarmZeroWindowResponse, error) {
+	log.Info("DisarmZeroWindow: disarming zero-window hold", "migration", req.MigrationName)
+
+	s.zwHoldMu.Lock()
+	state, ok := s.zwHolds[req.MigrationName]
+	if ok {
+		state.watchdogCancel()
+		delete(s.zwHolds, req.MigrationName)
+	}
+	s.zwHoldMu.Unlock()
+
+	if !ok {
+		return &agentpb.DisarmZeroWindowResponse{
+			Disarmed:       false,
+			BlockingReason: "no active zero-window hold for migration",
+		}, nil
+	}
+
+	s.migrationPodUIDMu.RLock()
+	podUID := s.migrationPodUID[req.MigrationName]
+	s.migrationPodUIDMu.RUnlock()
+	if podUID == "" {
+		podUID = req.PodUid
+	}
+
+	ifindex, err := resolveVethIfindex(podUID)
+	if err != nil {
+		log.Info("DisarmZeroWindow: veth ifindex resolution failed (stub path)", "migration", req.MigrationName, "err", err)
+	}
+
+	disarmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := disarmZeroWindowBPF(disarmCtx, ifindex); err != nil {
+		log.Info("DisarmZeroWindow: BPF disarm error", "migration", req.MigrationName, "err", err)
+	}
+
+	disarmedAtNs := time.Now().UnixNano()
+	holdMs := int64(0)
+	if state.armedAtNs > 0 {
+		holdMs = (disarmedAtNs - state.armedAtNs) / int64(time.Millisecond)
+	}
+	log.Info("DisarmZeroWindow: hold disarmed", "migration", req.MigrationName,
+		"holdDurationMs", holdMs, "disarmedAtNs", disarmedAtNs)
+	return &agentpb.DisarmZeroWindowResponse{
+		Disarmed:       true,
+		DisarmedAtNs:   disarmedAtNs,
+		HoldDurationMs: holdMs,
+	}, nil
 }
 
 // zeroizeDir overwrites all regular files in dir with zeros then removes the directory.
