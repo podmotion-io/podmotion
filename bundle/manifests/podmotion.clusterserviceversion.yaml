@@ -36,7 +36,7 @@ metadata:
     categories: Storage,Networking
     containerImage: ghcr.io/podmotion/podmotion-operator:v0.1.0
     createdAt: "2026-06-09T00:00:00Z"
-    description: Live pod migration for Kubernetes — the live VM migration equivalent for containers.
+    description: Live pod migration for Kubernetes — stateful pods migrate live between nodes, zero downtime, zero connection loss.
     repository: https://github.com/podmotion-io/podmotion
     support: PodMotion Authors
 spec:
@@ -76,7 +76,7 @@ spec:
     - migration
     - live-migration
     - criu
-    - live VM migration
+    - 
     - checkpoint
     - restore
 

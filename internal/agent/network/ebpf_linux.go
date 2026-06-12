@@ -180,8 +180,10 @@ const (
 	bpfFAllowOverride = 1
 )
 
-// nlAttr builds a packed netlink attribute (type + len header + padded data).
-func nlAttr(typ int, data []byte) []byte {
+// tcAttr builds a packed netlink attribute for TC/qdisc messages
+// (type + len header + padded data).  Named tcAttr (not nlAttr) to avoid
+// collision with the shared nlAttr helper in fdb.go which uses uint16 keys.
+func tcAttr(typ int, data []byte) []byte {
 	hdrLen := 4
 	totalLen := hdrLen + len(data)
 	padded := (totalLen + 3) &^ 3
@@ -192,16 +194,16 @@ func nlAttr(typ int, data []byte) []byte {
 	return buf
 }
 
-// nlAttrStr builds a null-terminated string netlink attribute.
-func nlAttrStr(typ int, s string) []byte {
-	return nlAttr(typ, append([]byte(s), 0))
+// tcAttrStr builds a null-terminated string TC netlink attribute.
+func tcAttrStr(typ int, s string) []byte {
+	return tcAttr(typ, append([]byte(s), 0))
 }
 
-// nlAttrU32 builds a uint32 netlink attribute.
-func nlAttrU32(typ int, v uint32) []byte {
+// tcAttrU32 builds a uint32 TC netlink attribute.
+func tcAttrU32(typ int, v uint32) []byte {
 	var b [4]byte
 	binary.LittleEndian.PutUint32(b[:], v)
-	return nlAttr(typ, b[:])
+	return tcAttr(typ, b[:])
 }
 
 // ensureClsactQdisc creates the clsact qdisc on ifindex if it does not exist.
@@ -234,7 +236,7 @@ func ensureClsactQdisc(ifindex int) error {
 		Parent:  tcHandleRoot,
 	}
 	tcBytes := (*[unsafe.Sizeof(tc)]byte)(unsafe.Pointer(&tc))[:]
-	kind := nlAttrStr(tcaKind, "clsact")
+	kind := tcAttrStr(tcaKind, "clsact")
 	payload := append(tcBytes, kind...)
 
 	hdr := unix.NlMsghdr{
@@ -312,15 +314,15 @@ func attachTCEgress(ifindex int, prog *ebpf.Program) (uint32, error) {
 
 	progFD := uint32(prog.FD())
 	bpfOpts := append(
-		nlAttrU32(tcaBpfFd, progFD),
+		tcAttrU32(tcaBpfFd, progFD),
 		append(
-			nlAttrStr(tcaBpfName, "pm_zero_window_hold"),
-			nlAttrU32(tcaBpfFlags, tcBpfFlagActDirect)...,
+			tcAttrStr(tcaBpfName, "pm_zero_window_hold"),
+			tcAttrU32(tcaBpfFlags, tcBpfFlagActDirect)...,
 		)...,
 	)
 	attrs := append(
-		nlAttrStr(tcaKind, "bpf"),
-		nlAttr(tcaOptions, bpfOpts)...,
+		tcAttrStr(tcaKind, "bpf"),
+		tcAttr(tcaOptions, bpfOpts)...,
 	)
 	payload := append(tcBytes, attrs...)
 
@@ -392,7 +394,7 @@ func detachTCEgress(ifindex int, handle uint32) error {
 		Parent:  tcParentEgress,
 	}
 	tcBytes := (*[unsafe.Sizeof(tc)]byte)(unsafe.Pointer(&tc))[:]
-	kind := nlAttrStr(tcaKind, "bpf")
+	kind := tcAttrStr(tcaKind, "bpf")
 	payload := append(tcBytes, kind...)
 
 	hdr := unix.NlMsghdr{

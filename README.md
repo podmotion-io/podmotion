@@ -1,6 +1,6 @@
 # PodMotion
 
-Live pod migration for Kubernetes — live VM migration (OpenStack/live VM migration) at the pod layer.
+Live pod migration for Kubernetes — live VM migration for containers — stateful pods migrate between nodes with zero downtime and zero connection loss.
 
 ## Description
 
