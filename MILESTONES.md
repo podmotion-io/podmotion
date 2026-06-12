@@ -129,7 +129,7 @@ This is expected behavior and is NOT a PodMotion bug.
 | ARM64 linuxkit = hard wall | tun/veth/ns_last_pid/dirty-tracking all blocked at kernel level; no workaround |
 | Mock fallback correctly gated | Agent falls back to mock-restore only when real CRIU restore fails; no silent failures |
 | ADR-0043 written | Deployment/RS/StatefulSet workload-aware migration design locked |
-| ADR-0044 written | Cold migration with full storage for beta; live VM migration v1.2 storage scope locked |
+| ADR-0044 written | Cold migration with full storage for beta; live storage migration v1.2 scope locked |
 
 ### Sprint 9 Target — EC2 Pivot
 

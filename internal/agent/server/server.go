@@ -40,6 +40,7 @@ import (
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
+	"github.com/podmotion-io/podmotion/internal/agent/network"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 )
 
@@ -73,6 +74,11 @@ type AgentServer struct {
 	nodeName     string
 	k8sClient    client.Client // may be nil in pure-stub mode
 
+	// ebpfMgr is the eBPF manager used for zero-window hold arm/disarm.
+	// Initialised by New via network.NewEBPFManager; uses real cilium/ebpf
+	// on kernel ≥5.9 and the no-op stub otherwise.
+	ebpfMgr network.EBPFManager
+
 	// migrationPodUID stores pod UID keyed by migration name, populated by PrepareSource.
 	// Used by Checkpoint to resolve the container root PID via /proc cgroup scan.
 	migrationPodUIDMu sync.RWMutex
@@ -91,6 +97,7 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 		checkpointer:    cp,
 		nodeName:        nodeName,
 		k8sClient:       k8sClient,
+		ebpfMgr:         network.NewEBPFManager(context.Background()),
 		migrationPodUID: make(map[string]string),
 		zwHolds:         make(map[string]*zwHoldState),
 	}

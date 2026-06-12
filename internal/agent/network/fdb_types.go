@@ -7,7 +7,6 @@ package network
 
 import (
 	"context"
-	"fmt"
 	"net"
 )
 
@@ -55,19 +54,4 @@ type VTEPMACDiscoverer interface {
 	DiscoverVTEPMAC(ctx context.Context, flannelAnnotationJSON, ifName string) (net.HardwareAddr, error)
 }
 
-// validateFDBEntry returns an error if any required field is missing or invalid.
-func validateFDBEntry(e FDBEntry) error {
-	if e.IfName == "" {
-		return fmt.Errorf("IfName must not be empty")
-	}
-	if e.PodIP == nil {
-		return fmt.Errorf("PodIP must not be nil")
-	}
-	if len(e.PodMAC) == 0 {
-		return fmt.Errorf("PodMAC must not be empty")
-	}
-	if e.VTEPIP == nil {
-		return fmt.Errorf("VTEPIP must not be nil")
-	}
-	return nil
-}
+// validateFDBEntry is defined in fdb.go.

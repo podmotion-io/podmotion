@@ -553,7 +553,7 @@ living content model so they stay in sync as the product evolves:
 
 | Deck | Audience | Length | Focus |
 |------|----------|--------|-------|
-| **Executive** | CEO / board / investors | 8–10 slides | Problem ($B TCO waste from overprovisioning/spot loss), solution headline, differentiation vs live VM migration, adoption path, ask |
+| **Executive** | CEO / board / investors | 8–10 slides | Problem ($B TCO waste from overprovisioning/spot loss), solution headline, differentiation vs hypervisor live VM migration, adoption path, ask |
 | **Product / Engineering Lead** | VP Eng, platform team leads | 15–20 slides | Architecture overview, migration sequence, CNI/CSI/OS support matrix, SLA targets, operational model, beta scope and GA roadmap |
 | **Deep Technical** | SRE, platform engineer, contributor | Full reference | CRIU internals, ADR index, state machine, eBPF bridge design, GitOps constraint, NRI hook, security model, API reference, known limits |
 

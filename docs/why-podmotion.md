@@ -9,7 +9,7 @@ Every client with an open connection continues unaware. No RST. No reconnect. No
 Not "the connection survives through reconnect logic." Not "the main container survives."
 Every container. Every client. Zero awareness. That is the bar.
 
-This is what live VM migration (OpenStack Nova live migration, live VM migration) achieves at the
+This is what live VM migration (as implemented by OpenStack Nova, KVM/libvirt, and Xen) achieves at the
 VM layer. PodMotion achieves it at the pod layer, on stock Kubernetes, on stock kernels, with
 no changes to the application and no changes to the client.
 
@@ -47,18 +47,18 @@ was a virtue, and the mental model calcified around it. Kubernetes inherited tha
 model. The result is a platform that can run any workload but cannot move the stateful
 ones without a service interruption.
 
-## What live VM migration proved — and what it left unsolved
+## What live VM migration proved — and what it left unsolved for containers
 
-VMware solved this at the VM layer twenty years ago. live VM migration is production-hardened,
+Hypervisor live migration — pioneered by Xen, refined by KVM, and productized broadly — solved this at the VM layer. It is production-hardened,
 battle-tested, and runs in every large enterprise datacenter on earth. The insight it
 proved is simple: **live migration is not just possible, it is operationally necessary.**
 
 Node maintenance, cost optimization, failure remediation, workload rebalancing — all of
-these require moving running workloads between hosts. At the VM layer, you do this with
+these require moving running workloads between hosts. At the VM layer, you do this with live migration.
 live VM migration. At the container layer, you drain the node and accept the downtime. That
 asymmetry is not a design choice. It is a gap.
 
-live VM migration operates at Layer 2. A gratuitous ARP updates the switch MAC table and all
+Live VM migration at the hypervisor layer operates at Layer 2. A gratuitous ARP updates the switch MAC table and all
 traffic follows. It does not solve the Layer 7 problem: if your VM hosts a Kubernetes
 cluster and your Kubernetes cluster hosts a pod, live VM migration moves the VM but Kubernetes
 still thinks the pod is on the original node. You get VM mobility at the cost of
@@ -195,5 +195,3 @@ SIG presentations, and the podmotion.io marketing site.*
 
 ---
 
-*live VM migration is a registered trademark of VMware, Inc., a subsidiary of Broadcom Inc.
-PodMotion is not affiliated with or endorsed by VMware or Broadcom.*

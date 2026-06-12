@@ -1,6 +1,6 @@
 apiVersion: v2
 name: podmotion
-description: Live pod migration for Kubernetes — the live VM migration equivalent for containers
+description: Live pod migration for Kubernetes — stateful pods migrate live between nodes, zero downtime, zero connection loss
 type: application
 version: 0.1.0
 appVersion: 0.1.0
@@ -9,7 +9,7 @@ keywords:
   - migration
   - live-migration
   - criu
-  - live VM migration
+  - 
 home: https://podmotion.io
 sources:
   - https://github.com/podmotion-io/podmotion

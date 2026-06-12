@@ -29,6 +29,17 @@ import (
 // required for BTF-enabled CO-RE programs used by the cilium/ebpf loader.
 const kernelVersion59 = (5 << 16) | (9 << 8) | 0
 
+// EBPFManager is the exported interface for callers outside the network package
+// (e.g. internal/agent/server) that need to arm/disarm eBPF programs.
+// It is identical to the unexported eBPFManager.
+type EBPFManager interface {
+	ArmZeroWindowHold(ctx context.Context, ifindex uint32) error
+	DisarmZeroWindowHold(ctx context.Context, ifindex uint32) error
+	ArmXDPBridge(ctx context.Context, srcIP, dstIP net.IP, genevePort uint16) error
+	DisarmXDPBridge(ctx context.Context, srcIP net.IP) error
+	CheckXDPHookConflict(ctx context.Context, ifindex uint32) (bool, error)
+}
+
 // eBPFManager is the interface consumed by NetworkBridgeAgent.
 // Production implementation loads real BPF objects; stub logs only.
 type eBPFManager interface {
@@ -55,6 +66,13 @@ type eBPFManager interface {
 	// identified by ifindex. Used by NetworkBridgeAgent to detect Cilium XDP
 	// conflicts and fall back to TC ingress mode.
 	CheckXDPHookConflict(ctx context.Context, ifindex uint32) (bool, error)
+}
+
+// NewEBPFManager is the exported constructor for callers outside the network
+// package.  It selects the real cilium/ebpf manager on kernel ≥5.9; otherwise
+// returns the no-op stub.
+func NewEBPFManager(ctx context.Context) EBPFManager {
+	return newEBPFManager(ctx)
 }
 
 // newEBPFManager selects the production cilium/ebpf manager when the running
