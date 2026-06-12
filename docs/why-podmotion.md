@@ -138,20 +138,19 @@ PodMotion owns the in-flight connection story completely. CRIU + eBPF preserves 
 already-open TCP socket with seq_delta=0 — every client that had a connection before the
 migration still has that exact connection after.
 
-There is one thing PodMotion cannot own silently: **where new connections go after the
-pod has moved.**
+New connections after the migration are a different matter. Where they land depends on
+load balancer configuration, DNS TTLs, service mesh routing, BGP advertisements, or
+whatever the operator has in front of their nodes. **PodMotion does not know and does
+not assume.** The operator may already have another LB targeting both nodes. They may be
+cutting over manually. They may be running a routing layer we have never seen. That is
+their infrastructure and their call.
 
-A new connection arrives at a load balancer. The load balancer decides which node to
-route it to. If it still sends to the source node — where the pod no longer runs — the
-new connection fails. This is not a PodMotion failure. It is a load balancer
-configuration problem. But PodMotion is responsible for not letting a migration proceed
-until that configuration problem is known to be solved.
+**PodMotion migrates the pod. Traffic routing belongs to the operator.**
 
-**PodMotion's answer is a hard stop, not a silent failure.**
-
-If you try to migrate a pod and the destination node is not registered in your AWS ALB
-Target Group, PodMotion blocks the migration before the first CRIU pre-dump with a clear
-status condition:
+By default, PodMotion proceeds with the migration and surfaces routing observations as
+warnings in the status conditions — not as blockers. If a validator detects that the
+destination node is not registered in an AWS ALB Target Group, the migration still
+runs; the operator sees:
 
 ```
 TrafficRoutingPreflightPassed = False
@@ -161,27 +160,17 @@ Reason: AWSALBNodeNotRegistered
  Register the destination node or set autoRegister=true in MigrationPolicy."
 ```
 
-No partial attempt. No optimistic "migrate and hope the LB follows." Hard stop, clear
-diagnosis, actionable message. This is documented in ADR-0054.
+Clear diagnosis, actionable message — and the migration proceeds. Operators who want
+the preflight to be a hard block instead can opt in: set `onValidationFailure: Block`
+in `MigrationPolicy`. The beta release ships validators for AWS ALB and NLB; additional
+validators (Nginx Ingress, Istio, MetalLB, GCP, Azure) are tracked in the M22 milestone.
+The validator interface is open — operators can register any LB type. This is documented
+in ADR-0054.
 
-The same logic applies to every external LB type. The beta release ships validators for
-AWS ALB and NLB; the validator interface is open and documented so operators can register
-any LB type. Additional validators (Nginx Ingress, Istio, MetalLB, GCP, Azure) are tracked
-in the M22 milestone.
-
-Operators who want to migrate and handle traffic routing themselves — pointing a new LB at
-the destination manually, cutting over DNS, or running an unsupported LB type — can bypass
-the preflight entirely. All LB-related checks (`LBRouteReachable`, `UnknownLoadBalancerType`,
-`EndpointSliceReady`) are in the `allowForce` category: set `onValidationFailure: Skip` in
-`MigrationPolicy` or pass `--bypass-preflight --reason "manual cutover"` on the CLI. The
-pod migrates; traffic routing is the operator's responsibility.
-
-What cannot be bypassed are the checks that protect migration correctness itself:
-destination node readiness, source pod liveness, checkpoint directory permissions, and
-concurrent migration exclusion. Those are hard gates with no override.
-
-This is the only limitation. And it is not a defect — it is the correct behavior for
-a system that would rather refuse than silently corrupt.
+What PodMotion does block unconditionally are the checks that protect migration
+correctness itself: destination node readiness, source pod liveness, checkpoint directory
+permissions, and concurrent migration exclusion. Those are hard gates. Everything else
+is the operator's domain.
 
 ---
 
