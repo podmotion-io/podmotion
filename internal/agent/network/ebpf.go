@@ -10,7 +10,7 @@ you may not use this file except in compliance with the License.
 // eBPF programs are compiled from bpf/ and loaded on the SOURCE NODE only,
 // not inside any container.  The cilium/ebpf library is used as the Go-side
 // loader/map interface; the actual .o objects are embedded at build time via
-// bpf2go-generated files (bpf/ Makefile target "generate").
+// bpf2go-generated files in internal/agent/network/bpfloader/.
 //
 // ADR-0048/ADR-0049: cilium/ebpf is the production loader for kernel ≥5.9.
 // Below that threshold (or in unit tests) the eBPFManagerStub is used.
@@ -76,43 +76,7 @@ func newEBPFManager(ctx context.Context) eBPFManager {
 		return &eBPFManagerStub{}
 	}
 	log.Info("ebpf loader=cilium-ebpf", "kernel", kernelStr)
-	return &ciliumEBPFManager{}
-}
-
-// ciliumEBPFManager is the production eBPFManager backed by the cilium/ebpf
-// library.  BPF program objects are loaded from bpf2go-generated embedded
-// bytes (bpf/ Makefile "generate" target) at arm time.  Zero-copy map ops
-// use the cilium/ebpf Map API.
-//
-// M19 wires the loader selection and logging path.  ArmZeroWindowHold and
-// ArmXDPBridge call into the real kernel via this type; the actual .o object
-// load and TC/XDP attach are implemented in M20 alongside zero_window.c.
-type ciliumEBPFManager struct{}
-
-func (m *ciliumEBPFManager) ArmZeroWindowHold(ctx context.Context, ifindex uint32) error {
-	logf.FromContext(ctx).Info("ebpf cilium: ArmZeroWindowHold", "ifindex", ifindex)
-	return nil
-}
-
-func (m *ciliumEBPFManager) DisarmZeroWindowHold(ctx context.Context, ifindex uint32) error {
-	logf.FromContext(ctx).Info("ebpf cilium: DisarmZeroWindowHold", "ifindex", ifindex)
-	return nil
-}
-
-func (m *ciliumEBPFManager) ArmXDPBridge(ctx context.Context, srcIP, dstIP net.IP, genevePort uint16) error {
-	logf.FromContext(ctx).Info("ebpf cilium: ArmXDPBridge",
-		"srcIP", srcIP, "dstIP", dstIP, "genevePort", genevePort)
-	return nil
-}
-
-func (m *ciliumEBPFManager) DisarmXDPBridge(ctx context.Context, srcIP net.IP) error {
-	logf.FromContext(ctx).Info("ebpf cilium: DisarmXDPBridge", "srcIP", srcIP)
-	return nil
-}
-
-func (m *ciliumEBPFManager) CheckXDPHookConflict(ctx context.Context, ifindex uint32) (bool, error) {
-	logf.FromContext(ctx).Info("ebpf cilium: CheckXDPHookConflict", "ifindex", ifindex)
-	return false, nil
+	return newCiliumEBPFManager()
 }
 
 // eBPFManagerStub satisfies eBPFManager by logging intended operations only.

@@ -67,6 +67,35 @@ type MigrationCheckpointStatus struct {
 	// ConsumedAt is when the checkpoint was used for a successful restore.
 	// +optional
 	ConsumedAt *metav1.Time `json:"consumedAt,omitempty"`
+
+	// DestinationNetnsReady is True when the migration netns has been created on
+	// the destination node with the source pod IP as a /32 secondary address (M21).
+	// +optional
+	DestinationNetnsReady bool `json:"destinationNetnsReady,omitempty"`
+
+	// DestinationNetnsPath is the bind-mount path of the migration netns on the
+	// destination node (e.g. /run/podmotion/netns/pm-mig-<uid>).
+	// +optional
+	DestinationNetnsPath string `json:"destinationNetnsPath,omitempty"`
+
+	// VXLANFDBUpdated is True when the two-sided AF_BRIDGE + AF_INET FDB entries
+	// have been confirmed via RTM_GETNEIGH read-back on both nodes (M21).
+	// +optional
+	VXLANFDBUpdated bool `json:"vxlanFDBUpdated,omitempty"`
+
+	// ConntrackNotrackArmed is True when iptables raw NOTRACK rules are active on
+	// both source and destination nodes for the migrated pod IP (M21).
+	// +optional
+	ConntrackNotrackArmed bool `json:"conntrackNotrackArmed,omitempty"`
+
+	// ConntrackNotrackArmedAt is when the NOTRACK rules were installed.
+	// +optional
+	ConntrackNotrackArmedAt *metav1.Time `json:"conntrackNotrackArmedAt,omitempty"`
+
+	// ConntrackNotrackDisarmedAt is when the NOTRACK rules were removed.
+	// Populated after MigrationComplete so the cleanup path is auditable.
+	// +optional
+	ConntrackNotrackDisarmedAt *metav1.Time `json:"conntrackNotrackDisarmedAt,omitempty"`
 }
 
 // +kubebuilder:object:root=true

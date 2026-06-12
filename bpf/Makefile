@@ -25,11 +25,19 @@ all: $(BPF_OBJECTS)
 %.bpf.o: %.c
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
-# generate: produce Go bpf2go bindings for each program.
+# generate: produce Go bpf2go bindings for each program and copy .o to bpfloader.
 # bpf2go reads the .o, introspects maps/programs via BTF, and emits
 # typed Go structs with Load/Close methods — no unsafe casts at runtime.
-generate:
-	go generate ./bpf/...
+# Must run on Linux with clang ≥14 and bpf2go installed:
+#   go install github.com/cilium/ebpf/cmd/bpf2go@latest
+generate: $(BPF_OBJECTS)
+	go run github.com/cilium/ebpf/cmd/bpf2go \
+		-cc $(CLANG) \
+		-cflags "$(CFLAGS)" \
+		-output-dir ../internal/agent/network/bpfloader \
+		ZeroWindow ./zero_window.c
+	cp zero_window_bpfel.o ../internal/agent/network/bpfloader/zero_window_bpfel.o
+	cp zero_window_bpfeb.o ../internal/agent/network/bpfloader/zero_window_bpfeb.o
 
 clean:
 	rm -f $(BPF_OBJECTS)
