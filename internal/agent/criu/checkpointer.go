@@ -83,6 +83,10 @@ type DumpOptions struct {
 	// Pid to identify which process tree to dump. Callers must resolve this via
 	// FindContainerPID before calling Dump. A zero value causes Dump to fail fast.
 	Pid int32
+	// TcpEstablished instructs CRIU to checkpoint active TCP connections via TCP_REPAIR.
+	// Set true when TCPPreservationMode is Strict or BestEffort; false (default) for None
+	// (stateless cold migration — connections will be dropped at cutover).
+	TcpEstablished bool
 }
 
 // RestoreOptions configures CRIU restore on the destination node.
@@ -103,6 +107,9 @@ type RestoreOptions struct {
 	// is passed and CRIU attempts to reconstruct the veth from checkpoint metadata (which
 	// fails when the peer netns is absent on the destination node).
 	HostVethName string
+	// TcpEstablished instructs CRIU to restore active TCP connections via TCP_REPAIR.
+	// Must match the value used during the corresponding Dump call.
+	TcpEstablished bool
 }
 
 // Checkpointer is the interface Agent 1 exposes to the orchestration layer.
