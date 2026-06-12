@@ -26,6 +26,8 @@ const (
 	MigrationAgentService_Restore_FullMethodName                 = "/podmotion.agent.v1.MigrationAgentService/Restore"
 	MigrationAgentService_Verify_FullMethodName                  = "/podmotion.agent.v1.MigrationAgentService/Verify"
 	MigrationAgentService_PrepareDestinationNetns_FullMethodName = "/podmotion.agent.v1.MigrationAgentService/PrepareDestinationNetns"
+	MigrationAgentService_ArmZeroWindow_FullMethodName           = "/podmotion.agent.v1.MigrationAgentService/ArmZeroWindow"
+	MigrationAgentService_DisarmZeroWindow_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/DisarmZeroWindow"
 	MigrationAgentService_Abort_FullMethodName                   = "/podmotion.agent.v1.MigrationAgentService/Abort"
 	MigrationAgentService_EstimateCheckpoint_FullMethodName      = "/podmotion.agent.v1.MigrationAgentService/EstimateCheckpoint"
 	MigrationAgentService_PutCheckpointTar_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/PutCheckpointTar"
@@ -54,6 +56,15 @@ type MigrationAgentServiceClient interface {
 	// PrepareDestinationNetns pre-stages the migration network namespace on the destination
 	// node and returns the file descriptor path and VTEP MAC for overlay FDB injection.
 	PrepareDestinationNetns(ctx context.Context, in *PrepareDestinationNetnsRequest, opts ...grpc.CallOption) (*PrepareDestinationNetnsResponse, error)
+	// ArmZeroWindow attaches the zero_window eBPF program to the source pod veth TC egress,
+	// causing the kernel to advertise win=0 on all outgoing ACKs, stalling the peer sender.
+	// Must be called before FinalFreeze. The agent arms a watchdog that auto-disarms after
+	// FreezeWindowBudgetMs + margin if DisarmZeroWindow is not received in time.
+	ArmZeroWindow(ctx context.Context, in *ArmZeroWindowRequest, opts ...grpc.CallOption) (*ArmZeroWindowResponse, error)
+	// DisarmZeroWindow detaches the zero_window eBPF program from the source pod veth,
+	// allowing the peer sender to resume. Must be called after CRIU restore is confirmed
+	// complete and all 6 ADR-0049 barrier predicates are satisfied.
+	DisarmZeroWindow(ctx context.Context, in *DisarmZeroWindowRequest, opts ...grpc.CallOption) (*DisarmZeroWindowResponse, error)
 	// Abort cancels an in-progress migration and triggers rollback.
 	Abort(ctx context.Context, in *AbortRequest, opts ...grpc.CallOption) (*AbortResponse, error)
 	// EstimateCheckpoint performs a 10-second dirty page sampling without checkpointing.
@@ -153,6 +164,26 @@ func (c *migrationAgentServiceClient) PrepareDestinationNetns(ctx context.Contex
 	return out, nil
 }
 
+func (c *migrationAgentServiceClient) ArmZeroWindow(ctx context.Context, in *ArmZeroWindowRequest, opts ...grpc.CallOption) (*ArmZeroWindowResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ArmZeroWindowResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_ArmZeroWindow_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *migrationAgentServiceClient) DisarmZeroWindow(ctx context.Context, in *DisarmZeroWindowRequest, opts ...grpc.CallOption) (*DisarmZeroWindowResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DisarmZeroWindowResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_DisarmZeroWindow_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *migrationAgentServiceClient) Abort(ctx context.Context, in *AbortRequest, opts ...grpc.CallOption) (*AbortResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(AbortResponse)
@@ -224,6 +255,15 @@ type MigrationAgentServiceServer interface {
 	// PrepareDestinationNetns pre-stages the migration network namespace on the destination
 	// node and returns the file descriptor path and VTEP MAC for overlay FDB injection.
 	PrepareDestinationNetns(context.Context, *PrepareDestinationNetnsRequest) (*PrepareDestinationNetnsResponse, error)
+	// ArmZeroWindow attaches the zero_window eBPF program to the source pod veth TC egress,
+	// causing the kernel to advertise win=0 on all outgoing ACKs, stalling the peer sender.
+	// Must be called before FinalFreeze. The agent arms a watchdog that auto-disarms after
+	// FreezeWindowBudgetMs + margin if DisarmZeroWindow is not received in time.
+	ArmZeroWindow(context.Context, *ArmZeroWindowRequest) (*ArmZeroWindowResponse, error)
+	// DisarmZeroWindow detaches the zero_window eBPF program from the source pod veth,
+	// allowing the peer sender to resume. Must be called after CRIU restore is confirmed
+	// complete and all 6 ADR-0049 barrier predicates are satisfied.
+	DisarmZeroWindow(context.Context, *DisarmZeroWindowRequest) (*DisarmZeroWindowResponse, error)
 	// Abort cancels an in-progress migration and triggers rollback.
 	Abort(context.Context, *AbortRequest) (*AbortResponse, error)
 	// EstimateCheckpoint performs a 10-second dirty page sampling without checkpointing.
@@ -273,6 +313,12 @@ func (UnimplementedMigrationAgentServiceServer) Verify(context.Context, *VerifyR
 }
 func (UnimplementedMigrationAgentServiceServer) PrepareDestinationNetns(context.Context, *PrepareDestinationNetnsRequest) (*PrepareDestinationNetnsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PrepareDestinationNetns not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) ArmZeroWindow(context.Context, *ArmZeroWindowRequest) (*ArmZeroWindowResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ArmZeroWindow not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) DisarmZeroWindow(context.Context, *DisarmZeroWindowRequest) (*DisarmZeroWindowResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DisarmZeroWindow not implemented")
 }
 func (UnimplementedMigrationAgentServiceServer) Abort(context.Context, *AbortRequest) (*AbortResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Abort not implemented")
@@ -436,6 +482,42 @@ func _MigrationAgentService_PrepareDestinationNetns_Handler(srv interface{}, ctx
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MigrationAgentService_ArmZeroWindow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ArmZeroWindowRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).ArmZeroWindow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_ArmZeroWindow_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).ArmZeroWindow(ctx, req.(*ArmZeroWindowRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MigrationAgentService_DisarmZeroWindow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DisarmZeroWindowRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).DisarmZeroWindow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_DisarmZeroWindow_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).DisarmZeroWindow(ctx, req.(*DisarmZeroWindowRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MigrationAgentService_Abort_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(AbortRequest)
 	if err := dec(in); err != nil {
@@ -560,6 +642,14 @@ var MigrationAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PrepareDestinationNetns",
 			Handler:    _MigrationAgentService_PrepareDestinationNetns_Handler,
+		},
+		{
+			MethodName: "ArmZeroWindow",
+			Handler:    _MigrationAgentService_ArmZeroWindow_Handler,
+		},
+		{
+			MethodName: "DisarmZeroWindow",
+			Handler:    _MigrationAgentService_DisarmZeroWindow_Handler,
 		},
 		{
 			MethodName: "Abort",
