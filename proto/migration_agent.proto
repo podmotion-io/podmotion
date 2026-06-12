@@ -17,6 +17,9 @@ service MigrationAgentService {
   rpc Restore(RestoreRequest) returns (RestoreResponse);
   // Verify confirms the restored pod is healthy and accepting traffic.
   rpc Verify(VerifyRequest) returns (VerifyResponse);
+  // PrepareDestinationNetns pre-stages the migration network namespace on the destination
+  // node and returns the file descriptor path and VTEP MAC for overlay FDB injection.
+  rpc PrepareDestinationNetns(PrepareDestinationNetnsRequest) returns (PrepareDestinationNetnsResponse);
   // Abort cancels an in-progress migration and triggers rollback.
   rpc Abort(AbortRequest) returns (AbortResponse);
   // EstimateCheckpoint performs a 10-second dirty page sampling without checkpointing.
@@ -66,13 +69,25 @@ message PreDumpRoundResponse {
 
 message CheckpointRequest {
   string migration_name        = 1;
-  bool   tcp_established       = 2;
+  // field 2 reserved: tcp_established removed in M19 (ADR-0047)
   bool   apply_zero_window     = 3; // engage eBPF zero-window hold before freeze
 }
 message CheckpointResponse {
   int64  freeze_duration_ms   = 1;
   string checkpoint_sha256    = 2;
   int64  checkpoint_size_bytes = 3;
+}
+
+// SeqSnapshot captures TCP sequence state for a single connection at freeze time.
+// Used to verify sequence continuity after restore (ADR-0049).
+message SeqSnapshot {
+  string src_ip   = 1; // source IP of the 4-tuple
+  uint32 src_port = 2;
+  string dst_ip   = 3; // destination IP of the 4-tuple
+  uint32 dst_port = 4;
+  uint32 snd_nxt  = 5; // TCP SND.NXT at freeze
+  uint32 rcv_nxt  = 6; // TCP RCV.NXT at freeze
+  uint32 ts_recent = 7; // TSecr / ts_recent for PAWS
 }
 
 message PrepareDestinationRequest {
@@ -89,11 +104,25 @@ message PrepareDestinationResponse {
   bool   storage_ready       = 4;
 }
 
+message PrepareDestinationNetnsRequest {
+  string migration_name = 1;
+  string pod_ip         = 2; // IP to assign in the pre-staged netns
+  string pod_namespace  = 3;
+}
+message PrepareDestinationNetnsResponse {
+  bool   ready          = 1;
+  string blocking_reason = 2;
+  string dest_netns_fd  = 3; // /proc/<pid>/fd/<n> path to the pre-staged netns
+  string dest_vtep_mac  = 4; // VTEP MAC for overlay FDB injection (ADR-0048)
+}
+
 message RestoreRequest {
-  string migration_name    = 1;
-  string checkpoint_ref    = 2; // OCI image ref or direct P2P staging path
-  string source_node_addr  = 3; // for DirectP2P mode
-  bool   network_continuity = 4;
+  string migration_name              = 1;
+  string checkpoint_ref              = 2; // OCI image ref or direct P2P staging path
+  string source_node_addr            = 3; // for DirectP2P mode
+  // field 4 reserved: network_continuity bool removed; use TCPPreservationMode on the CR
+  string dest_netns_fd               = 5; // pre-staged netns path from PrepareDestinationNetns
+  int64  source_freeze_timestamp_ns  = 6; // CLOCK_REALTIME ns at source freeze for seq-xlat
 }
 message RestoreResponse {
   bool   success           = 1;

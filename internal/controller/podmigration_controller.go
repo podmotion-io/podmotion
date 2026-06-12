@@ -617,7 +617,6 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 	// Step 2b: Checkpoint — freeze and dump via real CRIU gRPC call.
 	checkpointResp, err := agentClient.Checkpoint(ctx, &agentpb.CheckpointRequest{
 		MigrationName:   pm.Name,
-		TcpEstablished:  pm.Spec.TCPPreservationMode != pmv1.TCPPreservationModeNone,
 		ApplyZeroWindow: pm.Spec.TCPPreservationMode != pmv1.TCPPreservationModeNone,
 	})
 	if err != nil {
