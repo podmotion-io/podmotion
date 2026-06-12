@@ -1348,6 +1348,7 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 	// the source node AND the caller did not opt into patching it, warn the user.
 	r.maybeSetGitOpsDriftWarning(ctx, pm)
 
+	r.releaseDestinationCapacity(ctx, pm)
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseComplete)
 }
 
@@ -1365,6 +1366,7 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 
 	pm.Status.Phase = pmv1.MigrationPhaseFailed
 	setCondition(pm, "RolledBack", metav1.ConditionTrue, "RollbackComplete", "Source pod restored to live state")
+	r.releaseDestinationCapacity(ctx, pm)
 	return ctrl.Result{}, r.Status().Update(ctx, pm)
 }
 
@@ -1394,6 +1396,7 @@ func (r *PodMigrationReconciler) failMigration(ctx context.Context, pm *pmv1.Pod
 	// Clean up the replacement pod on hard failure (not rollback — rollback handles its own).
 	// Prevents a gated orphan pod from lingering when the migration is permanently failed.
 	r.deleteReplacementPod(ctx, pm)
+	r.releaseDestinationCapacity(ctx, pm)
 
 	key := client.ObjectKeyFromObject(pm)
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -1653,6 +1656,31 @@ func (r *PodMigrationReconciler) validateNoEmptyDir(ctx context.Context, pm *pmv
 		}
 	}
 	return nil
+}
+
+// releaseDestinationCapacity decrements ActiveDestinationMigrations on the destination NMC.
+// Called on Complete, Failed, and RollingBack so capacity is never leaked.
+// Non-fatal: logs on error but does not fail the caller — migration state is already terminal.
+func (r *PodMigrationReconciler) releaseDestinationCapacity(ctx context.Context, pm *pmv1.PodMigration) {
+	destNode := pm.Status.DestinationNodeName
+	if destNode == "" {
+		return
+	}
+	log := logf.FromContext(ctx)
+	key := types.NamespacedName{Name: destNode}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		nmc := &pmv1.NodeMigrationCapacity{}
+		if err := r.Get(ctx, key, nmc); err != nil {
+			return err
+		}
+		if nmc.Status.ActiveDestinationMigrations > 0 {
+			nmc.Status.ActiveDestinationMigrations--
+		}
+		return r.Status().Update(ctx, nmc)
+	}); err != nil {
+		log.Error(err, "releaseDestinationCapacity: failed to decrement NMC counter",
+			"migration", pm.Name, "destNode", destNode)
+	}
 }
 
 // reserveDestinationCapacity increments ActiveDestinationMigrations on the destination
