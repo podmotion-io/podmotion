@@ -164,11 +164,12 @@ Reason: AWSALBNodeNotRegistered
 No partial attempt. No optimistic "migrate and hope the LB follows." Hard stop, clear
 diagnosis, actionable message. This is documented in ADR-0054.
 
-The same logic applies to every external LB type: NLB, Nginx Ingress, Istio, MetalLB,
-GCP Cloud Load Balancer, Azure Load Balancer. PodMotion ships a validator for each. If
-no validator is registered for a given LB type, the migration is blocked with
-`UnknownLoadBalancerType` — requiring the operator to explicitly acknowledge the risk
-via `onValidationFailure: Skip` rather than discovering it in production.
+The same logic applies to every external LB type. The beta release ships validators for
+AWS ALB and NLB; the validator interface is open and documented so operators can register
+any LB type. If no validator is registered for a given LB type, the migration is blocked
+with `UnknownLoadBalancerType` — requiring the operator to explicitly acknowledge the risk
+via `onValidationFailure: Skip` rather than discovering it in production. Additional
+validators (Nginx Ingress, Istio, MetalLB, GCP, Azure) are tracked in the M22 milestone.
 
 This is the only limitation. And it is not a defect — it is the correct behavior for
 a system that would rather refuse than silently corrupt.
