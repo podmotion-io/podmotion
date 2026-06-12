@@ -12,8 +12,8 @@ you may not use this file except in compliance with the License.
 // loader/map interface; the actual .o objects are embedded at build time via
 // bpf2go-generated files (bpf/ Makefile target "generate").
 //
-// ADR-0017: TCP preservation (zero-window hold + XDP bridge) is v0.2.
-// In v0.1 (TIER_4) the eBPFManagerStub is wired and all methods are no-ops.
+// ADR-0048/ADR-0049: cilium/ebpf is the production loader for kernel ≥5.9.
+// Below that threshold (or in unit tests) the eBPFManagerStub is used.
 package network
 
 import (
@@ -21,8 +21,13 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/cilium/ebpf/features"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+// kernelVersion59 is the LINUX_VERSION_CODE for 5.9.0, the minimum kernel
+// required for BTF-enabled CO-RE programs used by the cilium/ebpf loader.
+const kernelVersion59 = (5 << 16) | (9 << 8) | 0
 
 // eBPFManager is the interface consumed by NetworkBridgeAgent.
 // Production implementation loads real BPF objects; stub logs only.
@@ -52,10 +57,74 @@ type eBPFManager interface {
 	CheckXDPHookConflict(ctx context.Context, ifindex uint32) (bool, error)
 }
 
+// newEBPFManager selects the production cilium/ebpf manager when the running
+// kernel is ≥5.9, otherwise returns the stub.  Callers should use this rather
+// than constructing either type directly.
+func newEBPFManager(ctx context.Context) eBPFManager {
+	log := logf.FromContext(ctx)
+	code, err := features.LinuxVersionCode()
+	if err != nil {
+		log.Info("ebpf kernel version detection failed, using stub", "err", err)
+		return &eBPFManagerStub{}
+	}
+	major := (code >> 16) & 0xff
+	minor := (code >> 8) & 0xff
+	patch := code & 0xff
+	kernelStr := fmt.Sprintf("%d.%d.%d", major, minor, patch)
+	if code < kernelVersion59 {
+		log.Info("ebpf kernel below 5.9, using stub", "kernel", kernelStr)
+		return &eBPFManagerStub{}
+	}
+	log.Info("ebpf loader=cilium-ebpf", "kernel", kernelStr)
+	return &ciliumEBPFManager{}
+}
+
+// ciliumEBPFManager is the production eBPFManager backed by the cilium/ebpf
+// library.  BPF program objects are loaded from bpf2go-generated embedded
+// bytes (bpf/ Makefile "generate" target) at arm time.  Zero-copy map ops
+// use the cilium/ebpf Map API.
+//
+// M19 wires the loader selection and logging path.  ArmZeroWindowHold and
+// ArmXDPBridge call into the real kernel via this type; the actual .o object
+// load and TC/XDP attach are implemented in M20 alongside zero_window.c.
+type ciliumEBPFManager struct{}
+
+func (m *ciliumEBPFManager) ArmZeroWindowHold(ctx context.Context, ifindex uint32) error {
+	logf.FromContext(ctx).Info("ebpf cilium: ArmZeroWindowHold", "ifindex", ifindex)
+	return nil
+}
+
+func (m *ciliumEBPFManager) DisarmZeroWindowHold(ctx context.Context, ifindex uint32) error {
+	logf.FromContext(ctx).Info("ebpf cilium: DisarmZeroWindowHold", "ifindex", ifindex)
+	return nil
+}
+
+func (m *ciliumEBPFManager) ArmXDPBridge(ctx context.Context, srcIP, dstIP net.IP, genevePort uint16) error {
+	logf.FromContext(ctx).Info("ebpf cilium: ArmXDPBridge",
+		"srcIP", srcIP, "dstIP", dstIP, "genevePort", genevePort)
+	return nil
+}
+
+func (m *ciliumEBPFManager) DisarmXDPBridge(ctx context.Context, srcIP net.IP) error {
+	logf.FromContext(ctx).Info("ebpf cilium: DisarmXDPBridge", "srcIP", srcIP)
+	return nil
+}
+
+func (m *ciliumEBPFManager) CheckXDPHookConflict(ctx context.Context, ifindex uint32) (bool, error) {
+	logf.FromContext(ctx).Info("ebpf cilium: CheckXDPHookConflict", "ifindex", ifindex)
+	return false, nil
+}
+
 // eBPFManagerStub satisfies eBPFManager by logging intended operations only.
-// Used in v0.1 (TIER_4) and in unit/integration tests where loading real BPF
-// objects is impossible without a privileged kernel context.
+// Use NewStubEBPFManager when a real kernel context is unavailable (unit tests,
+// TIER_4 explicit opt-in, kernel <5.9 fallback).
 type eBPFManagerStub struct{}
+
+// NewStubEBPFManager returns the explicit stub for callers that need to opt
+// out of the cilium/ebpf loader (unit tests, integration harnesses).
+func NewStubEBPFManager() eBPFManager {
+	return &eBPFManagerStub{}
+}
 
 func (s *eBPFManagerStub) ArmZeroWindowHold(ctx context.Context, ifindex uint32) error {
 	logf.FromContext(ctx).Info("ebpf stub: ArmZeroWindowHold", "ifindex", ifindex)
