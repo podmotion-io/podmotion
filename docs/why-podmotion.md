@@ -192,3 +192,8 @@ All claims below are backed by reproducible test artifacts in `test/spike/m18.5/
 
 *This document is the canonical philosophy statement for PodMotion beta materials,
 SIG presentations, and the podmotion.io marketing site.*
+
+---
+
+*live VM migration is a registered trademark of VMware, Inc., a subsidiary of Broadcom Inc.
+PodMotion is not affiliated with or endorsed by VMware or Broadcom.*
