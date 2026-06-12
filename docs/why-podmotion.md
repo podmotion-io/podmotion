@@ -1,5 +1,20 @@
 # Why PodMotion: The Case for Live Pod Migration
 
+## The goal, stated plainly
+
+Every container in the pod continues running. Unaware it moved.
+
+Every client with an open connection continues unaware. No RST. No reconnect. No retry.
+
+Not "the connection survives through reconnect logic." Not "the main container survives."
+Every container. Every client. Zero awareness. That is the bar.
+
+This is what live VM migration achieves at the VM layer. PodMotion achieves it at the pod layer,
+on stock Kubernetes, on stock kernels, with no changes to the application and no changes to
+the client.
+
+---
+
 ## The community was half right
 
 For years the Kubernetes community maintained that live pod migration is unnecessary.
@@ -73,6 +88,14 @@ It requires the peer to handle a new TCP handshake. It requires the load balance
 proxy to re-establish state. Every layer in the stack must cooperate. `seq_delta=0`
 means none of that is required — the connection is not interrupted at all. The peer
 does not know the pod moved.
+
+And it is not enough for one container to survive. A pod is not a container — it is a
+group of containers sharing a network namespace, a lifecycle, and often shared memory.
+Every sidecar, every init container that is still running, every service mesh proxy —
+all of them must be checkpointed atomically and restored atomically. A migration that
+moves the application container but restarts Envoy is not transparent: Envoy's
+connection state is gone, the drain sequence was skipped, and the client *does* notice.
+PodMotion checkpoints the entire pod or it does not checkpoint at all.
 
 ## Why now
 
