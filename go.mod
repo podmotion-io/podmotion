@@ -5,6 +5,8 @@ go 1.25.7
 require (
 	github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2 v1.55.4
 	github.com/checkpoint-restore/go-criu/v7 v7.2.0
+	github.com/cilium/ebpf v0.21.0
+	github.com/containerd/nri v0.12.0
 	github.com/onsi/ginkgo/v2 v2.27.2
 	github.com/onsi/gomega v1.38.2
 	k8s.io/apimachinery v0.35.0
@@ -13,9 +15,7 @@ require (
 )
 
 require (
-	github.com/cilium/ebpf v0.21.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
-	github.com/containerd/nri v0.12.0 // indirect
 	github.com/containerd/ttrpc v1.2.7 // indirect
 	github.com/knqyf263/go-plugin v0.9.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
@@ -90,7 +90,7 @@ require (
 	golang.org/x/net v0.48.0 // indirect
 	golang.org/x/oauth2 v0.30.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/sys v0.39.0 // indirect
+	golang.org/x/sys v0.39.0
 	golang.org/x/term v0.38.0 // indirect
 	golang.org/x/text v0.32.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
