@@ -410,8 +410,10 @@ type CheckpointResponse struct {
 	FreezeDurationMs    int64                  `protobuf:"varint,1,opt,name=freeze_duration_ms,json=freezeDurationMs,proto3" json:"freeze_duration_ms,omitempty"`
 	CheckpointSha256    string                 `protobuf:"bytes,2,opt,name=checkpoint_sha256,json=checkpointSha256,proto3" json:"checkpoint_sha256,omitempty"`
 	CheckpointSizeBytes int64                  `protobuf:"varint,3,opt,name=checkpoint_size_bytes,json=checkpointSizeBytes,proto3" json:"checkpoint_size_bytes,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// SeqSnapshots holds TCP sequence state for every ESTABLISHED socket at freeze instant (ADR-0049).
+	SeqSnapshots  []*SeqSnapshot         `protobuf:"bytes,4,rep,name=seq_snapshots,json=seqSnapshots,proto3" json:"seq_snapshots,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CheckpointResponse) Reset() {
@@ -463,6 +465,13 @@ func (x *CheckpointResponse) GetCheckpointSizeBytes() int64 {
 		return x.CheckpointSizeBytes
 	}
 	return 0
+}
+
+func (x *CheckpointResponse) GetSeqSnapshots() []*SeqSnapshot {
+	if x != nil {
+		return x.SeqSnapshots
+	}
+	return nil
 }
 
 // SeqSnapshot captures TCP sequence state for a single connection at freeze time.

@@ -841,6 +841,28 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 	podUID := s.migrationPodUID[req.MigrationName]
 	s.migrationPodUIDMu.RUnlock()
 
+	// Resolve TCPPreservationMode from the PodMigration CR so TcpEstablished is tier-driven.
+	// Done early so both the ctr and raw-CRIU paths can use the same value.
+	tcpEstablished := false
+	if s.k8sClient != nil {
+		workloadNs := req.WorkloadNamespace
+		if workloadNs == "" {
+			return nil, fmt.Errorf("checkpoint: WorkloadNamespace is empty in CheckpointRequest; cannot resolve TCPPreservationMode — refusing to dump to avoid silent stateless downgrade")
+		}
+		pm := &pmv1.PodMigration{}
+		lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer lookupCancel()
+		if lookupErr := s.k8sClient.Get(lookupCtx, types.NamespacedName{
+			Name:      req.MigrationName,
+			Namespace: workloadNs,
+		}, pm); lookupErr != nil {
+			return nil, fmt.Errorf("checkpoint: failed to look up PodMigration CR %s/%s: %w — cannot determine TCPPreservationMode; refusing to dump to avoid silent stateless downgrade",
+				workloadNs, req.MigrationName, lookupErr)
+		}
+		mode := pm.Spec.TCPPreservationMode
+		tcpEstablished = mode == pmv1.TCPPreservationModeStrict || mode == pmv1.TCPPreservationModeBestEffort
+	}
+
 	// Try containerd-native checkpoint first (ctr tasks checkpoint).
 	// This handles all container namespaces correctly (network, mount, etc.) and produces
 	// CRIU images that runc can restore on the destination. Falls back to raw CRIU (go-criu)
@@ -872,10 +894,33 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 				sha := sha256OfDir(imagesDir)
 				log.Info("Checkpoint complete (ctr)", "migration", req.MigrationName,
 					"sizeBytes", sizeBytes, "sha256", sha, "freezeMs", freezeDurationMs)
+				// Capture socket inventory from the (now frozen) container via its PID.
+				// Non-fatal: ctr checkpoint already succeeded; SeqSnapshot is best-effort here.
+				var ctrSeqSnapshots []*agentpb.SeqSnapshot
+				if tcpEstablished {
+					if ctrPID, pidErr := FindContainerPID(podUID); pidErr == nil {
+						if sockEntries, invErr := network.SocketInventory(ctrPID); invErr == nil {
+							for _, e := range sockEntries {
+								ctrSeqSnapshots = append(ctrSeqSnapshots, &agentpb.SeqSnapshot{
+									SrcIp:    e.SrcIP.String(),
+									SrcPort:  uint32(e.SrcPort),
+									DstIp:    e.DstIP.String(),
+									DstPort:  uint32(e.DstPort),
+									SndNxt:   e.SndNxt,
+									RcvNxt:   e.RcvNxt,
+									TsRecent: e.TsRecent,
+								})
+							}
+							log.Info("Checkpoint: socket inventory (ctr path)", "migration", req.MigrationName,
+								"connections", len(ctrSeqSnapshots))
+						}
+					}
+				}
 				return &agentpb.CheckpointResponse{
 					FreezeDurationMs:    freezeDurationMs,
 					CheckpointSha256:    sha,
 					CheckpointSizeBytes: sizeBytes,
+					SeqSnapshots:        ctrSeqSnapshots,
 				}, nil
 			}
 		}
@@ -901,36 +946,28 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		return nil, fmt.Errorf("checkpoint: cannot create images dir %s: %w", imagesDir, mkErr)
 	}
 
-	// Resolve TCPPreservationMode from the PodMigration CR so TcpEstablished is tier-driven.
-	// The CR lives in the WORKLOAD namespace (not the operator namespace). The caller MUST
-	// populate req.WorkloadNamespace; if it is empty and the k8s client is available we
-	// fail the checkpoint rather than silently degrading to stateless (ADR-0047 §safety).
-	tcpEstablished := false
-	if s.k8sClient != nil {
-		// WorkloadNamespace is the namespace of the migrating pod's PodMigration CR.
-		// It is set by the controller in CheckpointRequest.WorkloadNamespace.
-		// Falling back to POD_NAMESPACE (operator namespace) is WRONG for cross-namespace pods
-		// and is the source of the silent-stateless-downgrade bug fixed here.
-		workloadNs := req.WorkloadNamespace
-		if workloadNs == "" {
-			// WorkloadNamespace not provided: fail closed — we cannot determine the mode.
-			// Return an error rather than silently dumping stateless for an unknown mode.
-			return nil, fmt.Errorf("checkpoint: WorkloadNamespace is empty in CheckpointRequest; cannot resolve TCPPreservationMode — refusing to dump to avoid silent stateless downgrade")
-		}
-		pm := &pmv1.PodMigration{}
-		lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer lookupCancel()
-		if lookupErr := s.k8sClient.Get(lookupCtx, types.NamespacedName{
-			Name:      req.MigrationName,
-			Namespace: workloadNs,
-		}, pm); lookupErr != nil {
-			// Lookup failed: for a migration in Strict/BestEffort mode we must not silently
-			// downgrade to stateless — fail the checkpoint so the controller can retry or rollback.
-			return nil, fmt.Errorf("checkpoint: failed to look up PodMigration CR %s/%s: %w — cannot determine TCPPreservationMode; refusing to dump to avoid silent stateless downgrade",
-				workloadNs, req.MigrationName, lookupErr)
+	// Capture socket inventory immediately before freeze so snd_nxt/rcv_nxt reflect
+	// the exact pre-freeze sequence numbers (ADR-0049 seq_delta=0 invariant).
+	// Only populated when TCPPreservationMode is Strict or BestEffort.
+	var seqSnapshots []*agentpb.SeqSnapshot
+	if tcpEstablished && containerPID != 0 {
+		sockEntries, invErr := network.SocketInventory(containerPID)
+		if invErr != nil {
+			log.Error(invErr, "Checkpoint: socket inventory failed — continuing without SeqSnapshot", "pid", containerPID)
 		} else {
-			mode := pm.Spec.TCPPreservationMode
-			tcpEstablished = mode == pmv1.TCPPreservationModeStrict || mode == pmv1.TCPPreservationModeBestEffort
+			for _, e := range sockEntries {
+				seqSnapshots = append(seqSnapshots, &agentpb.SeqSnapshot{
+					SrcIp:    e.SrcIP.String(),
+					SrcPort:  uint32(e.SrcPort),
+					DstIp:    e.DstIP.String(),
+					DstPort:  uint32(e.DstPort),
+					SndNxt:   e.SndNxt,
+					RcvNxt:   e.RcvNxt,
+					TsRecent: e.TsRecent,
+				})
+			}
+			log.Info("Checkpoint: socket inventory complete", "migration", req.MigrationName,
+				"pid", containerPID, "connections", len(seqSnapshots))
 		}
 	}
 
@@ -1012,6 +1049,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		FreezeDurationMs:    freezeDurationMs,
 		CheckpointSha256:    sha256sum,
 		CheckpointSizeBytes: sizeBytes,
+		SeqSnapshots:        seqSnapshots,
 	}, nil
 }
 
