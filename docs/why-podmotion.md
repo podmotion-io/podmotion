@@ -147,10 +147,10 @@ their infrastructure and their call.
 
 **PodMotion migrates the pod. Traffic routing belongs to the operator.**
 
-By default, PodMotion proceeds with the migration and surfaces routing observations as
-warnings in the status conditions — not as blockers. If a validator detects that the
-destination node is not registered in an AWS ALB Target Group, the migration still
-runs; the operator sees:
+By default, PodMotion blocks the migration if a validator detects a routing problem —
+because most operators want to know before the pod moves, not after. If the destination
+node is not registered in an AWS ALB Target Group, the migration stops before the first
+CRIU pre-dump with a clear status condition:
 
 ```
 TrafficRoutingPreflightPassed = False
@@ -160,12 +160,20 @@ Reason: AWSALBNodeNotRegistered
  Register the destination node or set autoRegister=true in MigrationPolicy."
 ```
 
-Clear diagnosis, actionable message — and the migration proceeds. Operators who want
-the preflight to be a hard block instead can opt in: set `onValidationFailure: Block`
-in `MigrationPolicy`. The beta release ships validators for AWS ALB and NLB; additional
-validators (Nginx Ingress, Istio, MetalLB, GCP, Azure) are tracked in the M22 milestone.
-The validator interface is open — operators can register any LB type. This is documented
-in ADR-0054.
+Operators who already have routing covered — another LB targeting both nodes, BGP,
+DNS, a service mesh, or a routing layer PodMotion doesn't know about — set their
+preference once in `MigrationPolicy` and it applies to every migration that policy
+covers:
+
+```yaml
+spec:
+  onValidationFailure: Warn   # proceed, surface as status condition only
+  # or: Skip                  # proceed, no condition emitted
+```
+
+The beta release ships validators for AWS ALB and NLB; additional validators (Nginx
+Ingress, Istio, MetalLB, GCP, Azure) are tracked in the M22 milestone. The validator
+interface is open — operators can register any LB type. This is documented in ADR-0054.
 
 What PodMotion does block unconditionally are the checks that protect migration
 correctness itself: destination node readiness, source pod liveness, checkpoint directory
