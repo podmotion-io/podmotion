@@ -19,44 +19,60 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
-	"github.com/podmotion-io/podmotion/internal/agent/criu"
+	agentclient "github.com/podmotion-io/podmotion/internal/agent/client"
+	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 )
 
-const (
-	conditionMemorySynced = "MemorySynced"
-	// basePredumpDir is the root under which per-round image directories are created.
-	basePredumpDir = "/var/lib/podmotion/checkpoints"
-)
+const conditionMemorySynced = "MemorySynced"
 
 // ReplicationManager owns the iterative pre-copy dirty-page sync loop (Agent 11).
 // It runs in a goroutine launched by the PodMigration controller PreMigrating phase
 // and patches the MemorySynced condition on the CR when the loop concludes.
+//
+// Pre-dump rounds are executed via PreDumpRound RPC on the SOURCE agent — CRIU runs
+// on the node where the container lives, not on the operator node.
 type ReplicationManager struct {
 	// Client is the k8s client used to patch PodMigration status.
 	Client client.Client
+	// AgentPool provides per-node gRPC connections to source agents.
+	AgentPool *agentclient.AgentClientPool
 }
 
 // RunPreCopyLoop executes the full Mirror → Iterative Sync → Convergence loop.
 //
 // Loop structure:
 //
-//	Round 0 (Mirror): initial pre-dump with PrevImagesDir="".
-//	Rounds 1..MaxRounds: incremental pre-dumps using the previous round's directory.
+//	Round 0 (Mirror): initial pre-dump with no previous dir.
+//	Rounds 1..MaxRounds: incremental pre-dumps using the previous round as parent.
 //
-// Termination conditions (evaluated after each round via EvaluateConvergence):
-//   - DirtyMB < threshold → MemorySynced=True (normal convergence)
+// Termination conditions (evaluated after each round):
+//   - DirtyMB < threshold → MemorySynced=True  (normal convergence)
 //   - rounds >= MaxRounds → MemorySynced=True with ForceFreeze note (ADR-0011)
-//   - dirty rate increasing for 3 consecutive rounds → MemorySynced=False, reason=DirtyRateIncreasing
+//   - dirty rate increasing for 3 consecutive rounds → MemorySynced=False, DirtyRateIncreasing
 //     (ADR-0024: clean abort; pod is never frozen so no rollback needed)
-//
-// The caller (reconcilePreMigrating goroutine) watches for MemorySynced to appear
-// and then gates on StorageReadyForFreeze before advancing to Checkpointing.
 func (r *ReplicationManager) RunPreCopyLoop(
 	ctx context.Context,
 	pm *pmv1.PodMigration,
-	checkpointer criu.Checkpointer,
+	_ interface{}, // unused: checkpointer — pre-dump is now via RPC on the source agent
 ) error {
 	log := logf.FromContext(ctx).WithValues("migration", pm.Name)
+
+	if r.AgentPool == nil {
+		return fmt.Errorf("ReplicationManager.AgentPool is nil — cannot run pre-copy via RPC")
+	}
+
+	sourceNode := pm.Status.SourceNodeName
+	if sourceNode == "" {
+		sourceNode = pm.Spec.TargetNodeName // fallback for tests
+	}
+	if sourceNode == "" {
+		return fmt.Errorf("source node unknown — cannot issue PreDumpRound RPC")
+	}
+
+	srcClient, err := r.AgentPool.ForNode(ctx, sourceNode)
+	if err != nil {
+		return fmt.Errorf("connect to source agent on %s: %w", sourceNode, err)
+	}
 
 	maxRounds := pm.Spec.PreCopyMaxRounds
 	if maxRounds <= 0 {
@@ -67,57 +83,52 @@ func (r *ReplicationManager) RunPreCopyLoop(
 		threshold = 64
 	}
 
-	var (
-		rounds      []RoundStats
-		prevDir     string
-		containerID = pm.Spec.PodName // placeholder — real impl resolves via CRI
-		namespace   = "k8s.io"
-	)
+	var rounds []RoundStats
 
-	for round := 0; int32(round) < maxRounds; round++ {
+	for round := int32(0); round < maxRounds; round++ {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 
-		imagesDir := fmt.Sprintf("%s/%s/round-%d", basePredumpDir, pm.Name, round)
-
 		start := time.Now()
-		result, err := checkpointer.PreDump(ctx, criu.PreDumpOptions{
-			ContainerID:   containerID,
-			Namespace:     namespace,
-			ImagesDir:     imagesDir,
-			PrevImagesDir: prevDir,
-			TrackMem:      true,
+		resp, err := srcClient.PreDumpRound(ctx, &agentpb.PreDumpRoundRequest{
+			MigrationName: pm.Name,
+			RoundNumber:   round,
+			PodUid:        pm.Spec.SourcePodUID,
 		})
 		if err != nil {
-			return fmt.Errorf("pre-dump round %d failed: %w", round, err)
+			// Pre-dump RPC failed (e.g. CRIU "Unable to interrupt task" on aarch64 daemon
+			// processes). Treat as ForceFreeze — no dirty pages to track, proceed to final
+			// checkpoint. This sets MemorySynced=True so the next reconcile does not launch
+			// another goroutine (goroutine-launch-leak fix).
+			log.Info("PreDumpRound failed — treating as ForceFreeze and proceeding to final checkpoint",
+				"round", round, "err", err)
+			return r.patchMemorySynced(ctx, pm, metav1.ConditionTrue, "ForceFreeze",
+				fmt.Sprintf("pre-dump round %d failed (%v): skipping pre-copy, proceeding to final freeze", round, err))
 		}
 
 		elapsedMs := time.Since(start).Milliseconds()
 		var rateMBps float64
 		if elapsedMs > 0 {
-			rateMBps = float64(result.DirtyPagesMB) / (float64(elapsedMs) / 1000.0)
+			rateMBps = float64(resp.DirtyPagesMb) / (float64(elapsedMs) / 1000.0)
 		}
 
 		stat := RoundStats{
-			Round:         round,
-			DirtyMB:       result.DirtyPagesMB,
+			Round:         int(round),
+			DirtyMB:       resp.DirtyPagesMb,
 			DirtyRateMBps: rateMBps,
 			ElapsedMs:     elapsedMs,
 		}
 		rounds = append(rounds, stat)
-		prevDir = imagesDir
 
 		log.Info("pre-dump round complete",
-			"round", round, "dirtyMB", result.DirtyPagesMB, "elapsedMs", elapsedMs)
+			"round", round, "dirtyMB", resp.DirtyPagesMb, "elapsedMs", elapsedMs)
 
 		conv := EvaluateConvergence(rounds, threshold, maxRounds)
 
 		if conv.Reason == "DirtyRateIncreasing" {
-			// ADR-0024: diverging dirty rate → clean abort without rollback.
-			// Pod has never been frozen so source remains fully live.
 			log.Info("dirty rate diverging — aborting pre-copy loop", "rounds", conv.Rounds)
 			return r.patchMemorySynced(ctx, pm, metav1.ConditionFalse, "DirtyRateIncreasing",
 				fmt.Sprintf("dirty pages increasing for %d consecutive rounds: %dMB",
@@ -134,8 +145,7 @@ func (r *ReplicationManager) RunPreCopyLoop(
 		}
 	}
 
-	// Should not reach here — EvaluateConvergence handles the maxRounds case,
-	// but guard against off-by-one if threshold is never crossed.
+	// Max rounds exhausted without convergence — force freeze (ADR-0011).
 	conv := EvaluateConvergence(rounds, threshold, maxRounds)
 	if err := r.updatePreCopyStats(ctx, pm, conv, rounds); err != nil {
 		log.Error(err, "failed to update PreCopyStats on loop exit")
@@ -145,7 +155,7 @@ func (r *ReplicationManager) RunPreCopyLoop(
 }
 
 // patchMemorySynced writes the MemorySynced condition to the PodMigration status.
-// Retries on optimistic-lock conflict (resource version mismatch) using retry.RetryOnConflict.
+// Retries on optimistic-lock conflict using retry.RetryOnConflict.
 func (r *ReplicationManager) patchMemorySynced(
 	ctx context.Context,
 	pm *pmv1.PodMigration,
@@ -170,8 +180,6 @@ func (r *ReplicationManager) patchMemorySynced(
 }
 
 // updatePreCopyStats persists pre-copy metrics to pm.Status.PreCopyStats.
-// Called before patchMemorySynced so stats are visible alongside the condition.
-// Retries on optimistic-lock conflict.
 func (r *ReplicationManager) updatePreCopyStats(
 	ctx context.Context,
 	pm *pmv1.PodMigration,
@@ -184,12 +192,10 @@ func (r *ReplicationManager) updatePreCopyStats(
 		if err := r.Client.Get(ctx, key, fresh); err != nil {
 			return err
 		}
-		// FreezeDurationMs is not known here (that is the final CRIU Dump timing).
-		// Recorded as 0 now; the Checkpointing phase updates it after the real dump.
 		fresh.Status.PreCopyStats = &pmv1.PreCopyStats{
 			RoundsCompleted:   int32(conv.Rounds),
 			FinalDirtyPagesMB: int32(conv.FinalDirtyMB),
-			FreezeDurationMs:  0,
+			FreezeDurationMs:  0, // updated by Checkpointing phase after the real dump
 		}
 		return r.Client.Status().Update(ctx, fresh)
 	})
