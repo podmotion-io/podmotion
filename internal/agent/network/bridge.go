@@ -76,10 +76,12 @@ type NetworkBridgeAgent struct {
 }
 
 // NewNetworkBridgeAgent constructs a NetworkBridgeAgent.
-// In production the caller passes nil for mgr and it defaults to eBPFManagerStub.
+// When mgr is nil the real cilium/ebpf loader is selected for kernel ≥5.9;
+// kernels below that threshold fall back to the stub automatically.
+// Pass NewStubEBPFManager() explicitly to force the stub (unit tests, TIER_4).
 func NewNetworkBridgeAgent(c client.Client, pm *pmv1.PodMigration, cfg BridgeConfig, mgr eBPFManager) *NetworkBridgeAgent {
 	if mgr == nil {
-		mgr = &eBPFManagerStub{}
+		mgr = newEBPFManager(context.Background())
 	}
 	return &NetworkBridgeAgent{
 		Client:    c,
