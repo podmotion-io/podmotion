@@ -24,9 +24,11 @@ you may not use this file except in compliance with the License.
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -86,28 +88,46 @@ var podMigrationGVR = schema.GroupVersionResource{
 	Resource: "podmigrations",
 }
 
-// terminalPhases are phases where migration is no longer active and FDB cleanup
+// terminalPhases are phases where migration is no longer active and FDB/ARP cleanup
 // should proceed normally.
+//
+// IMPORTANT: RollingBack and CutoverComplete are NOT terminal.
+//   - RollingBack: the controller is actively restoring the source pod to live state
+//     (reconcileRollingBack). The source pod's FDB/ARP entries must remain intact so
+//     migrated TCP flows continue to route correctly during the rollback window.
+//   - CutoverComplete: the source pod has not yet been deleted; overlay state is still live.
+//
+// FDB/ARP cleanup is only safe when the migration has fully committed (Complete) or
+// hard-failed with no source-restore intent remaining (Failed). RollingBack/CutoverComplete
+// must suppress DEL so the source-node dataplane stays intact until the controller drives
+// final teardown.
 var terminalPhases = map[string]bool{
 	"Complete":       true,
 	"Failed":         true,
-	"RollingBack":    true,
 	"DryRunComplete": true,
-	"CutoverComplete": true,
+	// RollingBack and CutoverComplete are intentionally absent — see comment above.
 }
 
 func main() {
+	// Read stdin exactly once into a buffer so it can be decoded for the migration
+	// check AND forwarded verbatim to the delegate plugin.  os.Stdin is a
+	// non-seekable pipe; re-reading it after json.Decode returns empty bytes.
+	stdinBytes, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		fatal(1, "read stdin", err.Error())
+	}
+
 	cmd := cniCommand(os.Getenv("CNI_COMMAND"))
 	switch cmd {
 	case cmdVERSION:
 		handleVersion()
 	case cmdADD, cmdCHECK:
 		// Pass-through: pm-cni does not modify ADD or CHECK behaviour.
-		if err := delegateToNext(); err != nil {
+		if err := delegateToNext(stdinBytes); err != nil {
 			fatal(1, "delegate failed", err.Error())
 		}
 	case cmdDEL:
-		if err := handleDEL(); err != nil {
+		if err := handleDEL(stdinBytes); err != nil {
 			fatal(1, "DEL failed", err.Error())
 		}
 	default:
@@ -128,14 +148,18 @@ func handleVersion() {
 //
 // CNI_ARGS carries K8S_POD_NAME and K8S_POD_NAMESPACE as semicolon-separated
 // key=value pairs.  If a PodMigration CR exists for this pod in a non-terminal
-// phase, the DEL is suppressed — the FDB entry is left intact so the overlay
-// continues to route traffic to the migration netns on the destination node.
+// phase, the FDB/ARP entries are preserved — the DEL is still forwarded to the
+// delegate so that veth and IPAM resources are released by the primary plugin.
 // The controller is responsible for removing the FDB entry after MigrationComplete.
-func handleDEL() error {
+//
+// NOTE: suppression means the delegate's DEL is invoked normally EXCEPT that
+// any FDB/ARP-specific cleanup performed by the migration overlay is deferred to
+// the controller.  We do NOT swallow the entire delegate chain.
+func handleDEL(stdinBytes []byte) error {
 	podName, podNamespace := parseCNIArgs(os.Getenv("CNI_ARGS"))
 	if podName == "" || podNamespace == "" {
 		// CNI_ARGS absent or malformed — cannot perform lookup; pass through.
-		return delegateToNext()
+		return delegateToNext(stdinBytes)
 	}
 
 	suppressed, err := isMigrationActive(podName, podNamespace)
@@ -143,18 +167,19 @@ func handleDEL() error {
 		// Lookup failed — log to stderr (kubelet captures CNI stderr) and pass
 		// through to avoid blocking pod deletion on API unavailability.
 		fmt.Fprintf(os.Stderr, "pm-cni: MigrationCheckpoint lookup failed for %s/%s: %v; passing through DEL\n", podNamespace, podName, err)
-		return delegateToNext()
+		return delegateToNext(stdinBytes)
 	}
 
 	if suppressed {
-		// Active migration: suppress FDB/ARP cleanup.  The DEL succeeds (exit 0)
-		// without invoking the next plugin, preserving the source node FDB entry
-		// until the controller removes it post-MigrationComplete.
-		fmt.Fprintf(os.Stderr, "pm-cni: suppressing FDB/ARP DEL cleanup for migrating pod %s/%s\n", podNamespace, podName)
-		return nil
+		// Active migration window: the overlay FDB/ARP state must be preserved so
+		// the source pod IP stays routed correctly during migration or rollback.
+		// We still invoke the delegate so veth teardown and IPAM release happen
+		// (they are safe to run; only the FDB/ARP removal is deferred to the
+		// controller via RemoveFDBEntry after MigrationComplete/Failed).
+		fmt.Fprintf(os.Stderr, "pm-cni: active migration for %s/%s — forwarding DEL to delegate (FDB/ARP deferred to controller)\n", podNamespace, podName)
 	}
 
-	return delegateToNext()
+	return delegateToNext(stdinBytes)
 }
 
 // isMigrationActive returns true when a PodMigration CR exists for podName/podNamespace
@@ -236,15 +261,15 @@ func buildDynamicClient() (dynamic.Interface, error) {
 }
 
 // delegateToNext re-execs the next plugin in the CNI chain by looking up the
-// plugin binary on CNI_PATH and re-passing stdin + environment unchanged.
+// plugin binary on CNI_PATH and forwarding the original stdin bytes unchanged.
 //
-// CNI chaining convention: the runtime passes the full netconf on stdin; the
-// chained plugin finds the next type from the "plugins" array or from the
-// "delegate" field.  For M19 we read the type from the netconf and exec the
-// binary of the same name from CNI_PATH.  M21 will switch to reading
-// conflist["plugins"][nextIndex] for proper chain ordering.
-func delegateToNext() error {
-	conf, err := readNetConf()
+// stdinBytes must be the raw bytes read from os.Stdin before any decoding, so
+// the delegate receives the complete netconf (including prevResult and any
+// fields pm-cni does not know about).  The "type" field is read from stdinBytes
+// to locate the delegate binary; the bytes are forwarded verbatim so the
+// delegate's own JSON decoder sees a fully-populated netconf.
+func delegateToNext(stdinBytes []byte) error {
+	conf, err := parseNetConf(stdinBytes)
 	if err != nil {
 		return fmt.Errorf("read netconf: %w", err)
 	}
@@ -258,26 +283,23 @@ func delegateToNext() error {
 		return fmt.Errorf("find plugin %q: %w", conf.Type, err)
 	}
 
-	stdin, err := json.Marshal(conf)
-	if err != nil {
-		return fmt.Errorf("marshal netconf: %w", err)
-	}
-
 	c := exec.Command(path) //nolint:gosec
-	c.Stdin = os.Stdin      // re-pass original stdin (full netconf with prevResult)
+	// Forward the original, unmodified stdin bytes so the delegate receives the
+	// full netconf exactly as the runtime supplied it.
+	c.Stdin = bytes.NewReader(stdinBytes)
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	c.Env = os.Environ()
-	// Override stdin with the re-serialised conf only if we need to strip our own type.
-	_ = stdin // used when stripping pm-cni from the chain config
 
 	return c.Run()
 }
 
-// readNetConf decodes the CNI netconf from stdin.
-func readNetConf() (*netConf, error) {
+// parseNetConf decodes the CNI netconf from a byte slice.
+// Using a byte slice (rather than os.Stdin directly) allows the caller to
+// forward the same bytes to the delegate without re-reading stdin.
+func parseNetConf(b []byte) (*netConf, error) {
 	var conf netConf
-	if err := json.NewDecoder(os.Stdin).Decode(&conf); err != nil {
+	if err := json.NewDecoder(bytes.NewReader(b)).Decode(&conf); err != nil {
 		return nil, fmt.Errorf("decode netconf: %w", err)
 	}
 	return &conf, nil
