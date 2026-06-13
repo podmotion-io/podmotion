@@ -253,10 +253,16 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 			oldSeen = true
 			continue
 		}
-		// This is the new Flannel IP (or any other non-OLD address). Its subnet's .1 is the
-		// destination cni0 bridge gateway the pod must use for its return path.
-		if gw := gatewayForIP(ipOnly); gw != "" {
-			cni0Gateway = gw
+		// This is the new Flannel IP (or any other non-OLD address). The DESTINATION cni0
+		// gateway must be derived from the address whose /24 is the destination node's pod
+		// CIDR — i.e. an address NOT in the OLD IP's /24. A stale address in the OLD IP's own
+		// /24 (e.g. a leftover from a prior restore) would otherwise yield the dead SOURCE
+		// gateway (10.244.0.1) and break the pod's return path (probe/AC1 fail). Only adopt a
+		// gateway from an out-of-OLD-/24 address; keep the OLD-/24 fallback otherwise.
+		if cidr24ForIP(ipOnly) != cidr24ForIP(oldIP) {
+			if gw := gatewayForIP(ipOnly); gw != "" {
+				cni0Gateway = gw
+			}
 		}
 		// Strip it so the pod is single-homed on the OLD IP.
 		delOut, delErr := exec.Command("nsenter", "--net="+netnsPath,
