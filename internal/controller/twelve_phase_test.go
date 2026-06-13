@@ -362,7 +362,7 @@ func TestTCPPreservationModeGating(t *testing.T) {
 //
 //   - TCPPreservationMode=None: fast-path, DestinationNetnsReady set True immediately (no RPC needed).
 //   - TCPPreservationMode=Strict: blocked — PrepareDestinationNetns RPC not yet wired (M22).
-//     DestinationNetnsReady is set to False with reason "RPCNotWired". Setting it True without
+//     DestinationNetnsReady is set to False (RPC not yet wired at M22). Setting it True without
 //     a real RPC would advance the state machine past OverlayHandoff and delete the source pod
 //     without any actual netns/FDB state being created, black-holing the source IP and RST-ing
 //     every in-flight TCP connection (M19.5 CRITICAL bar). This test guards against regression.
@@ -434,7 +434,7 @@ func TestDestinationNetnsReadyCondition(t *testing.T) {
 //
 //   - TCPPreservationMode=None: fast-path, VXLANFDBUpdated set True immediately (no RPC needed).
 //   - TCPPreservationMode=Strict: blocked — AddFDBEntry/ConfirmOverlayReady RPCs not yet wired (M22).
-//     VXLANFDBUpdated is set to False with reason "RPCNotWired". Setting it True without a real
+//     VXLANFDBUpdated is set to False (RPC not yet wired at M22). Setting it True without a real
 //     RPC would advance the state machine to RestoreSocketReattach and delete the source pod
 //     against a dataplane that was never configured — RST-ing every in-flight TCP connection
 //     (M19.5 CRITICAL bar). This test guards against regression.
