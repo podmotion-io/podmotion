@@ -182,16 +182,24 @@ func (p *Plugin) verifyPodMigration(ctx context.Context, namespace, checkpointRe
 		return fmt.Errorf("list PodMigrations: %w", err)
 	}
 	for _, pm := range pmList.Items {
-		if pm.Status.CheckpointRef == nil || pm.Status.CheckpointRef.Name != checkpointRef {
+		// The annotation value is pm.Name (DNS-label safe identifier). Match on that
+		// rather than the full filesystem path stored in pm.Status.CheckpointRef.Name.
+		if pm.Name != checkpointRef {
 			continue
 		}
 		if pm.Status.Phase != pmv1.MigrationPhaseRestoring {
 			return fmt.Errorf("PodMigration %s/%s phase is %s, expected Restoring",
 				namespace, pm.Name, pm.Status.Phase)
 		}
-		if p.nodeName != "" && pm.Spec.DestinationNode != p.nodeName {
+		// Prefer status.DestinationNodeName (set by controller after scheduling);
+		// fall back to spec.TargetNodeName for early-phase races.
+		destNode := pm.Status.DestinationNodeName
+		if destNode == "" {
+			destNode = pm.Spec.TargetNodeName
+		}
+		if p.nodeName != "" && destNode != p.nodeName {
 			return fmt.Errorf("PodMigration %s/%s destinationNode %s != this node %s",
-				namespace, pm.Name, pm.Spec.DestinationNode, p.nodeName)
+				namespace, pm.Name, destNode, p.nodeName)
 		}
 		return nil // found and verified
 	}
