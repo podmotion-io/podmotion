@@ -159,7 +159,9 @@ func main() {
 				"checkpointRef", checkpointRef,
 				"checkpointDir", checkpointDir,
 			)
-			pid, err := agentSrv.JoinNsRestore(checkpointRef, checkpointDir)
+			// ADR-0122: pass the replacement pod's sandbox UID so JoinNsRestore can resolve
+			// its pause container netns and hand the open fd to CRIU via --net-fd.
+			pid, err := agentSrv.JoinNsRestore(checkpointRef, checkpointDir, event.PodUID)
 			if err != nil {
 				log.Error(err, "NRI CRIU restore failed", "container", event.ID)
 				return err

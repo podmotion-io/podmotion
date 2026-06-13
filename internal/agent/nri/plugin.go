@@ -51,6 +51,9 @@ type ContainerEvent struct {
 	Name        string            `json:"name"`
 	Namespace   string            `json:"namespace"`
 	Pod         string            `json:"pod"`
+	// PodUID is the replacement pod's sandbox UID, used to resolve the pause container
+	// netns for ADR-0122 --net-fd CRIU restore.
+	PodUID      string            `json:"podUID,omitempty"`
 	Labels      map[string]string `json:"labels,omitempty"`
 	// Annotations carries pod annotations forwarded by the NRI runtime. In real NRI v2,
 	// pod annotations appear here. The JSON stub must include them to test the restore path.
@@ -250,6 +253,7 @@ func (a *nriAdapter) StartContainer(ctx context.Context, pod *nriapi.PodSandbox,
 		Name:        container.GetName(),
 		Namespace:   pod.GetNamespace(),
 		Pod:         pod.GetName(),
+		PodUID:      pod.GetUid(),
 		Labels:      container.GetLabels(),
 		Annotations: pod.GetAnnotations(),
 	}
