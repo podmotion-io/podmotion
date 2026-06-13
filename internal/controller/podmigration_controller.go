@@ -620,7 +620,8 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 		FdbIfname:            fdbIfname,
 		PodIp:                pm.Spec.SourcePodIP,
 		PodMac:               pm.Status.SourcePodMac,
-		VtepIp:               pm.Status.DestVtepMac, // destination VTEP IP stored in DestVtepMac
+		// VtepIp intentionally omitted: the destination agent resolves its local
+		// VTEP IP from FdbIfname at call time (avoids conflating MAC with IP).
 		SourceConntrackArmed: pm.Status.SourceConntrackArmed,
 		RestoreComplete:      false, // restore has not yet run at this phase
 		SourceClockNs:        pm.Status.SourceFreezeTimestampNs,
@@ -739,7 +740,8 @@ func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm 
 			FdbIfname:            fdbIfname,
 			PodIp:                pm.Spec.SourcePodIP,
 			PodMac:               pm.Status.SourcePodMac,
-			VtepIp:               pm.Status.DestVtepMac,
+			// VtepIp intentionally omitted: the destination agent resolves its local
+			// VTEP IP from FdbIfname at call time (avoids conflating MAC with IP).
 			SourceConntrackArmed: pm.Status.SourceConntrackArmed,
 			RestoreComplete:      true, // CRIU restore succeeded before this phase
 			SourceClockNs:        pm.Status.SourceFreezeTimestampNs,
