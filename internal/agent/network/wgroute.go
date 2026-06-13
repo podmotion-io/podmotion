@@ -564,10 +564,14 @@ func InjectMigrationHostRoute(podIP net.IP, wgInterface string) error {
 // via NLM_F_REPLACE.
 func SetPodIPHostRoute(ctx context.Context, ifName string, podIP net.IP) error {
 	log := logf.FromContext(ctx)
-	ifindex, err := linkIndexByName(ifName)
+	// Use the Go stdlib (getifaddrs/RTM_GETLINK via the runtime) for the ifindex — the
+	// raw linkIndexByName RTM_GETLINK reply is unreliable under the agent's concurrent
+	// netlink sockets (ADR-0135 observed EAGAIN). net.InterfaceByName is robust.
+	iface, err := net.InterfaceByName(ifName)
 	if err != nil {
 		return fmt.Errorf("SetPodIPHostRoute: interface %q not found: %w", ifName, err)
 	}
+	ifindex := iface.Index
 	bits := 32
 	if podIP.To4() == nil {
 		bits = 128
@@ -583,11 +587,12 @@ func SetPodIPHostRoute(ctx context.Context, ifName string, podIP net.IP) error {
 // DeletePodIPHostRoute removes the /32 host route installed by SetPodIPHostRoute. Idempotent.
 func DeletePodIPHostRoute(ctx context.Context, ifName string, podIP net.IP) error {
 	log := logf.FromContext(ctx)
-	ifindex, err := linkIndexByName(ifName)
+	iface, err := net.InterfaceByName(ifName)
 	if err != nil {
 		// Interface gone is not an error for cleanup.
 		return nil
 	}
+	ifindex := iface.Index
 	bits := 32
 	if podIP.To4() == nil {
 		bits = 128
