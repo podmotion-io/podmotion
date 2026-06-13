@@ -10,9 +10,32 @@ package network
 import (
 	"context"
 	"fmt"
+	"net"
 
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+// SetPodIPNeigh is a no-op on non-Linux builds (ADR-0133 destination handoff stub).
+func SetPodIPNeigh(ctx context.Context, ifName string, podIP net.IP, lladdr net.HardwareAddr) error {
+	logf.FromContext(ctx).Info("neigh stub: SetPodIPNeigh (ADR-0133)", "ifName", ifName, "podIP", podIP, "lladdr", lladdr)
+	return nil
+}
+
+// DeletePodIPNeigh is a no-op on non-Linux builds (ADR-0133 source cleanup stub).
+func DeletePodIPNeigh(ctx context.Context, ifName string, podIP net.IP) error {
+	logf.FromContext(ctx).Info("neigh stub: DeletePodIPNeigh (ADR-0133)", "ifName", ifName, "podIP", podIP)
+	return nil
+}
+
+// DiscoverVTEPMAC returns the VTEP MAC via net.InterfaceByName on non-Linux builds.
+// The flannel annotation path is unavailable here; falls back to the interface MAC.
+func DiscoverVTEPMAC(_ context.Context, _ string, ifName string) (net.HardwareAddr, error) {
+	iface, err := net.InterfaceByName(ifName)
+	if err != nil {
+		return nil, fmt.Errorf("DiscoverVTEPMAC stub: %w", err)
+	}
+	return iface.HardwareAddr, nil
+}
 
 // fdbManagerStub satisfies FDBManager for non-Linux builds (macOS dev, unit tests).
 type fdbManagerStub struct{}

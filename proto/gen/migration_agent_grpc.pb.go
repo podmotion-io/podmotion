@@ -34,6 +34,8 @@ const (
 	MigrationAgentService_PutCheckpointTar_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/PutCheckpointTar"
 	MigrationAgentService_GetCheckpointTar_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/GetCheckpointTar"
 	MigrationAgentService_ReleaseCheckpoint_FullMethodName       = "/podmotion.agent.v1.MigrationAgentService/ReleaseCheckpoint"
+	MigrationAgentService_InjectIPHandoff_FullMethodName         = "/podmotion.agent.v1.MigrationAgentService/InjectIPHandoff"
+	MigrationAgentService_CleanupSourceIPHandoff_FullMethodName  = "/podmotion.agent.v1.MigrationAgentService/CleanupSourceIPHandoff"
 	MigrationAgentService_VerifyTCP_FullMethodName               = "/podmotion.agent.v1.MigrationAgentService/VerifyTCP"
 )
 
@@ -91,6 +93,17 @@ type MigrationAgentServiceClient interface {
 	// pm.Status.CheckpointTransferred has been durably persisted. Idempotent: returns
 	// success if the directory is already absent (handles controller-restart replay).
 	ReleaseCheckpoint(ctx context.Context, in *ReleaseCheckpointRequest, opts ...grpc.CallOption) (*ReleaseCheckpointResponse, error)
+	// InjectIPHandoff installs neighbor/FDB entries on the DESTINATION node so the OLD
+	// pod IP becomes reachable at the replacement pod's veth MAC (ADR-0133 Decision 2).
+	// Called by the controller in reconcileVerifying after criuRestoreConfirmed=true and
+	// before DisarmZeroWindow. Idempotent (RTM_NEWNEIGH NLM_F_REPLACE). The response
+	// returns the destination node's VTEP MAC and an in-node reachability probe result.
+	InjectIPHandoff(ctx context.Context, in *InjectIPHandoffRequest, opts ...grpc.CallOption) (*InjectIPHandoffResponse, error)
+	// CleanupSourceIPHandoff removes the stale ARP/neighbor and FDB entries for the OLD
+	// pod IP on the SOURCE node after traffic has moved to the replacement (ADR-0133
+	// Decision 4). Deferred until after TrafficVerified=True and DisarmZeroWindow.
+	// Idempotent: ENOENT is treated as success.
+	CleanupSourceIPHandoff(ctx context.Context, in *CleanupSourceIPHandoffRequest, opts ...grpc.CallOption) (*CleanupSourceIPHandoffResponse, error)
 	// VerifyTCP reads /proc/<pid>/net/tcp[6] on the destination node post-restore and
 	// compares each ESTABLISHED 4-tuple's snd_nxt/rcv_nxt against the source SeqSnapshots
 	// captured at freeze. Returns verified=true only when all connections match within
@@ -257,6 +270,26 @@ func (c *migrationAgentServiceClient) ReleaseCheckpoint(ctx context.Context, in 
 	return out, nil
 }
 
+func (c *migrationAgentServiceClient) InjectIPHandoff(ctx context.Context, in *InjectIPHandoffRequest, opts ...grpc.CallOption) (*InjectIPHandoffResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(InjectIPHandoffResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_InjectIPHandoff_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *migrationAgentServiceClient) CleanupSourceIPHandoff(ctx context.Context, in *CleanupSourceIPHandoffRequest, opts ...grpc.CallOption) (*CleanupSourceIPHandoffResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CleanupSourceIPHandoffResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_CleanupSourceIPHandoff_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *migrationAgentServiceClient) VerifyTCP(ctx context.Context, in *VerifyTCPRequest, opts ...grpc.CallOption) (*VerifyTCPResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VerifyTCPResponse)
@@ -321,6 +354,17 @@ type MigrationAgentServiceServer interface {
 	// pm.Status.CheckpointTransferred has been durably persisted. Idempotent: returns
 	// success if the directory is already absent (handles controller-restart replay).
 	ReleaseCheckpoint(context.Context, *ReleaseCheckpointRequest) (*ReleaseCheckpointResponse, error)
+	// InjectIPHandoff installs neighbor/FDB entries on the DESTINATION node so the OLD
+	// pod IP becomes reachable at the replacement pod's veth MAC (ADR-0133 Decision 2).
+	// Called by the controller in reconcileVerifying after criuRestoreConfirmed=true and
+	// before DisarmZeroWindow. Idempotent (RTM_NEWNEIGH NLM_F_REPLACE). The response
+	// returns the destination node's VTEP MAC and an in-node reachability probe result.
+	InjectIPHandoff(context.Context, *InjectIPHandoffRequest) (*InjectIPHandoffResponse, error)
+	// CleanupSourceIPHandoff removes the stale ARP/neighbor and FDB entries for the OLD
+	// pod IP on the SOURCE node after traffic has moved to the replacement (ADR-0133
+	// Decision 4). Deferred until after TrafficVerified=True and DisarmZeroWindow.
+	// Idempotent: ENOENT is treated as success.
+	CleanupSourceIPHandoff(context.Context, *CleanupSourceIPHandoffRequest) (*CleanupSourceIPHandoffResponse, error)
 	// VerifyTCP reads /proc/<pid>/net/tcp[6] on the destination node post-restore and
 	// compares each ESTABLISHED 4-tuple's snd_nxt/rcv_nxt against the source SeqSnapshots
 	// captured at freeze. Returns verified=true only when all connections match within
@@ -381,6 +425,12 @@ func (UnimplementedMigrationAgentServiceServer) GetCheckpointTar(context.Context
 }
 func (UnimplementedMigrationAgentServiceServer) ReleaseCheckpoint(context.Context, *ReleaseCheckpointRequest) (*ReleaseCheckpointResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReleaseCheckpoint not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) InjectIPHandoff(context.Context, *InjectIPHandoffRequest) (*InjectIPHandoffResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method InjectIPHandoff not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) CleanupSourceIPHandoff(context.Context, *CleanupSourceIPHandoffRequest) (*CleanupSourceIPHandoffResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CleanupSourceIPHandoff not implemented")
 }
 func (UnimplementedMigrationAgentServiceServer) VerifyTCP(context.Context, *VerifyTCPRequest) (*VerifyTCPResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method VerifyTCP not implemented")
@@ -676,6 +726,42 @@ func _MigrationAgentService_ReleaseCheckpoint_Handler(srv interface{}, ctx conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MigrationAgentService_InjectIPHandoff_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InjectIPHandoffRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).InjectIPHandoff(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_InjectIPHandoff_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).InjectIPHandoff(ctx, req.(*InjectIPHandoffRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MigrationAgentService_CleanupSourceIPHandoff_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CleanupSourceIPHandoffRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).CleanupSourceIPHandoff(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_CleanupSourceIPHandoff_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).CleanupSourceIPHandoff(ctx, req.(*CleanupSourceIPHandoffRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MigrationAgentService_VerifyTCP_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(VerifyTCPRequest)
 	if err := dec(in); err != nil {
@@ -760,6 +846,14 @@ var MigrationAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReleaseCheckpoint",
 			Handler:    _MigrationAgentService_ReleaseCheckpoint_Handler,
+		},
+		{
+			MethodName: "InjectIPHandoff",
+			Handler:    _MigrationAgentService_InjectIPHandoff_Handler,
+		},
+		{
+			MethodName: "CleanupSourceIPHandoff",
+			Handler:    _MigrationAgentService_CleanupSourceIPHandoff_Handler,
 		},
 		{
 			MethodName: "VerifyTCP",

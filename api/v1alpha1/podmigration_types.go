@@ -415,6 +415,13 @@ type PodMigrationStatus struct {
 	// +optional
 	RestoredPID int32 `json:"restoredPID,omitempty"`
 
+	// ReplVethMAC is the replacement pod's eth0 MAC address inside the pod netns,
+	// collected by the NRI plugin at restore time and threaded through
+	// ReportRestoreConfirmed. The controller passes it to InjectIPHandoff on the
+	// destination agent so the OLD pod IP resolves to the replacement veth (ADR-0133 D3).
+	// +optional
+	ReplVethMAC string `json:"replVethMAC,omitempty"`
+
 	// StorageTier is the detected storage migration tier (0=RWX, 1=Longhorn, 2=CephRBD, 3=SnapshotRsync, 4=Blocked).
 	// +optional
 	StorageTier *int32 `json:"storageTier,omitempty"`

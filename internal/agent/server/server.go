@@ -148,7 +148,11 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, sandboxID stri
 // restore completed successfully (ADR-0120 D3). It sets criuRestoreConfirmed=true
 // and restoredPID on the named migration's status subresource. migrationName is the
 // PodMigration object name (equal to the checkpoint-ref); namespace is the CR namespace.
-func (s *AgentServer) ReportRestoreConfirmed(ctx context.Context, migrationName, namespace string, pid int32) error {
+// replVethMAC (ADR-0133 D3) is the replacement pod's eth0 MAC inside the pod netns,
+// collected by the NRI plugin at restore time so the operator can install the destination
+// neighbor/FDB handoff for the OLD pod IP. May be empty if MAC collection failed; the
+// operator falls back to a diagnostic exec in that case.
+func (s *AgentServer) ReportRestoreConfirmed(ctx context.Context, migrationName, namespace string, pid int32, replVethMAC string) error {
 	if s.k8sClient == nil {
 		return fmt.Errorf("ReportRestoreConfirmed: no k8s client available on agent server")
 	}
@@ -165,13 +169,140 @@ func (s *AgentServer) ReportRestoreConfirmed(ctx context.Context, migrationName,
 	confirmed := true
 	pm.Status.CRIURestoreConfirmed = &confirmed
 	pm.Status.RestoredPID = pid
+	if replVethMAC != "" {
+		pm.Status.ReplVethMAC = replVethMAC
+	}
 
 	if err := s.k8sClient.Status().Patch(ctx, pm, client.MergeFrom(base)); err != nil {
 		return fmt.Errorf("ReportRestoreConfirmed: patch status %s/%s: %w", namespace, migrationName, err)
 	}
 	log.Info("ReportRestoreConfirmed: criuRestoreConfirmed set true",
-		"migration", migrationName, "namespace", namespace, "restoredPID", pid)
+		"migration", migrationName, "namespace", namespace, "restoredPID", pid, "replVethMAC", replVethMAC)
 	return nil
+}
+
+// ReadReplVethMAC reads the replacement pod's eth0 MAC inside the netns of the restored
+// process (host PID). It uses `nsenter --net --target <pid> cat /sys/class/net/eth0/address`
+// per ADR-0133 D3. Returns "" and a non-nil error on failure; the caller treats MAC
+// collection as best-effort (the operator has a diagnostic exec fallback).
+func ReadReplVethMAC(pid int) (string, error) {
+	if pid <= 0 {
+		return "", fmt.Errorf("ReadReplVethMAC: invalid pid %d", pid)
+	}
+	out, err := exec.Command("nsenter", "--net=/proc/"+strconv.Itoa(pid)+"/ns/net",
+		"cat", "/sys/class/net/eth0/address").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("ReadReplVethMAC: nsenter pid %d: %w (%s)", pid, err, strings.TrimSpace(string(out)))
+	}
+	mac := strings.TrimSpace(string(out))
+	if mac == "" {
+		return "", fmt.Errorf("ReadReplVethMAC: empty MAC for pid %d", pid)
+	}
+	return mac, nil
+}
+
+// InjectIPHandoff installs the ADR-0133 Decision 2 destination-side neighbor entries so
+// the OLD pod IP becomes reachable at the replacement pod's veth MAC, then optionally runs
+// an in-node reachability probe (Decision 5). Idempotent: uses RTM_NEWNEIGH NLM_F_REPLACE.
+func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIPHandoffRequest) (*agentpb.InjectIPHandoffResponse, error) {
+	log.Info("InjectIPHandoff called", "migration", req.MigrationName,
+		"oldPodIP", req.OldPodIp, "replVethMAC", req.ReplVethMac, "srcNodeVTEPMAC", req.SrcNodeVtepMac)
+
+	if req.OldPodIp == "" || req.ReplVethMac == "" {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"InjectIPHandoff: old_pod_ip and repl_veth_mac are required (got %q/%q)", req.OldPodIp, req.ReplVethMac)
+	}
+	oldIP := net.ParseIP(req.OldPodIp)
+	if oldIP == nil || oldIP.To4() == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "InjectIPHandoff: old_pod_ip %q is not a valid IPv4", req.OldPodIp)
+	}
+	mac, err := net.ParseMAC(req.ReplVethMac)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "InjectIPHandoff: repl_veth_mac %q invalid: %v", req.ReplVethMac, err)
+	}
+
+	bridgeIf := req.BridgeIfname
+	if bridgeIf == "" {
+		bridgeIf = "cni0"
+	}
+	fdbIf := req.FdbIfname
+	if fdbIf == "" {
+		fdbIf = "flannel.1"
+	}
+
+	// D2.1: ip neigh replace <oldPodIP> lladdr <replVethMAC> dev cni0 nud permanent
+	if err := network.SetPodIPNeigh(ctx, bridgeIf, oldIP, mac); err != nil {
+		return &agentpb.InjectIPHandoffResponse{Injected: false,
+			BlockingReason: fmt.Sprintf("cni0 neigh: %v", err)}, nil
+	}
+	// D2.2: ip neigh replace <oldPodIP> lladdr <replVethMAC> dev flannel.1 nud permanent
+	if err := network.SetPodIPNeigh(ctx, fdbIf, oldIP, mac); err != nil {
+		return &agentpb.InjectIPHandoffResponse{Injected: false,
+			BlockingReason: fmt.Sprintf("flannel.1 neigh: %v", err)}, nil
+	}
+
+	resp := &agentpb.InjectIPHandoffResponse{Injected: true}
+
+	// Decision 3: return this node's VTEP MAC for the operator to thread to source cleanup.
+	if vtepMAC, derr := network.DiscoverVTEPMAC(ctx, "", fdbIf); derr == nil {
+		resp.DestVtepMac = vtepMAC.String()
+	} else {
+		log.Error(derr, "InjectIPHandoff: DiscoverVTEPMAC failed (non-fatal)", "ifName", fdbIf)
+	}
+
+	// Decision 5: in-node reachability probe — ping the OLD pod IP from this node.
+	if req.Probe {
+		out, perr := exec.CommandContext(ctx, "ping", "-c", "1", "-W", "2", req.OldPodIp).CombinedOutput()
+		resp.ProbeOutput = strings.TrimSpace(string(out))
+		resp.ProbeOk = perr == nil
+		if perr != nil {
+			log.Info("InjectIPHandoff: reachability probe failed", "oldPodIP", req.OldPodIp, "err", perr, "output", resp.ProbeOutput)
+		} else {
+			log.Info("InjectIPHandoff: reachability probe OK", "oldPodIP", req.OldPodIp)
+		}
+	}
+
+	log.Info("InjectIPHandoff: handoff injected (ADR-0133 D2)", "migration", req.MigrationName,
+		"oldPodIP", req.OldPodIp, "destVTEPMAC", resp.DestVtepMac, "probeOk", resp.ProbeOk)
+	return resp, nil
+}
+
+// CleanupSourceIPHandoff removes the stale ARP/neighbor entries for the OLD pod IP on the
+// SOURCE node after traffic has moved to the replacement (ADR-0133 Decision 4). Idempotent.
+func (s *AgentServer) CleanupSourceIPHandoff(ctx context.Context, req *agentpb.CleanupSourceIPHandoffRequest) (*agentpb.CleanupSourceIPHandoffResponse, error) {
+	log.Info("CleanupSourceIPHandoff called", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+
+	if req.OldPodIp == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "CleanupSourceIPHandoff: old_pod_ip is required")
+	}
+	oldIP := net.ParseIP(req.OldPodIp)
+	if oldIP == nil || oldIP.To4() == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "CleanupSourceIPHandoff: old_pod_ip %q is not a valid IPv4", req.OldPodIp)
+	}
+
+	bridgeIf := req.BridgeIfname
+	if bridgeIf == "" {
+		bridgeIf = "cni0"
+	}
+	fdbIf := req.FdbIfname
+	if fdbIf == "" {
+		fdbIf = "flannel.1"
+	}
+
+	var firstErr error
+	if err := network.DeletePodIPNeigh(ctx, bridgeIf, oldIP); err != nil {
+		firstErr = err
+	}
+	if err := network.DeletePodIPNeigh(ctx, fdbIf, oldIP); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if firstErr != nil {
+		return &agentpb.CleanupSourceIPHandoffResponse{Cleaned: false,
+			BlockingReason: firstErr.Error()}, nil
+	}
+
+	log.Info("CleanupSourceIPHandoff: stale neigh removed (ADR-0133 D4)", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+	return &agentpb.CleanupSourceIPHandoffResponse{Cleaned: true}, nil
 }
 
 // ListenAndServe starts the gRPC server on addr (default ":9090").
