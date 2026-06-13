@@ -2411,6 +2411,36 @@ func (r *PodMigrationReconciler) nodeInternalIP(ctx context.Context, nodeName st
 	return "", fmt.Errorf("node %q has no InternalIP", nodeName)
 }
 
+// disarmTCRedirect retires the ADR-0139 destination tc-ingress redirect for the relocated OLD
+// IP. Per Decision 3 this is the IPAM-reclaim hook, NOT part of steady-state cutover: the
+// redirect must persist for the life of the replacement pod to keep the OLD IP reachable from
+// source-CIDR clients (AC2/AC3). Invoked when the OLD IP is reclaimed. Idempotent / best-effort.
+func (r *PodMigrationReconciler) disarmTCRedirect(ctx context.Context, pm *pmv1.PodMigration) error {
+	if r.AgentPool == nil {
+		return nil
+	}
+	destNode := pm.Status.DestinationNodeName
+	if destNode == "" {
+		destNode = pm.Spec.TargetNodeName
+	}
+	if destNode == "" {
+		return nil
+	}
+	destAgent, err := r.AgentPool.ForNode(ctx, destNode)
+	if err != nil {
+		return err
+	}
+	fdbIfname := pm.Status.OverlayFdbIfname
+	if fdbIfname == "" {
+		fdbIfname = "flannel.1"
+	}
+	_, err = destAgent.DisarmTCRedirect(ctx, &agentpb.DisarmTCRedirectRequest{
+		MigrationName: pm.Name,
+		FdbIfname:     fdbIfname,
+	})
+	return err
+}
+
 // injectIPHandoff calls InjectIPHandoff on the DESTINATION agent (ADR-0133 D1/D2) to make
 // the OLD pod IP reachable at the replacement pod, then gates on the in-node reachability
 // probe (D5). On success it sets conditionIPHandoffInjected=True (and TrafficVerified=True
@@ -2728,6 +2758,15 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 			}
 		}
 	}
+
+	// ADR-0139 Decision 3 (disarm): the tc-ingress redirect on the DESTINATION flannel.1 is
+	// the forward-path delivery mechanism for the relocated OLD IP — exactly symmetric to the
+	// ADR-0136 source flannel.1 redirect that CleanupSourceIPHandoff deliberately PRESERVES.
+	// Disarming it here would re-blackhole the OLD IP for source-CIDR clients (AC2/AC3) the
+	// instant the migration completes. So, like the source redirect, it persists for the life
+	// of the replacement pod and is retired only when the OLD IP is reclaimed by IPAM via the
+	// DisarmTCRedirect RPC (r.disarmTCRedirect). It is intentionally NOT called in the
+	// steady-state cutover completion. (Quorum R1/Lead: keep reachability.)
 
 	// ADR-0015 overlap-then-delete: now that TrafficVerified=True and source is deleted,
 	// remove the source pod IP from EndpointSlices. The destination IP was added in

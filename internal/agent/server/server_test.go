@@ -286,3 +286,42 @@ func TestHoldDuration_WithinFreezeWindowBudget(t *testing.T) {
 			disarmResp.DisarmedAtNs, armResp.ArmedAtNs)
 	}
 }
+
+// TestParseVethPeerIndex_ADR0139 asserts eth0@if<N> peer index extraction.
+func TestParseVethPeerIndex_ADR0139(t *testing.T) {
+	cases := map[string]int{
+		`2: eth0@if12: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 ... link/ether aa:bb`: 12,
+		`2: eth0@if7: <UP> link/ether 0a:1b`:                                            7,
+		`2: eth0: <UP> link/ether 0a:1b`:                                                0,
+		``:                                                                              0,
+	}
+	for in, want := range cases {
+		if got := parseVethPeerIndex(in); got != want {
+			t.Errorf("parseVethPeerIndex(%q) = %d, want %d", in, got, want)
+		}
+	}
+}
+
+// TestHostLinkNameByIndex_ADR0139 asserts veth-peer name lookup by ifindex.
+func TestHostLinkNameByIndex_ADR0139(t *testing.T) {
+	out := "1: lo: <LOOPBACK,UP> mtu 65536\n12: veth1a2b3c4d@if2: <UP> mtu 1450 link/ether aa:bb master cni0\n13: flannel.1: <UP> mtu 1450\n"
+	if got := hostLinkNameByIndex(out, 12); got != "veth1a2b3c4d" {
+		t.Errorf("hostLinkNameByIndex(12) = %q, want veth1a2b3c4d", got)
+	}
+	if got := hostLinkNameByIndex(out, 13); got != "flannel.1" {
+		t.Errorf("hostLinkNameByIndex(13) = %q, want flannel.1", got)
+	}
+	if got := hostLinkNameByIndex(out, 99); got != "" {
+		t.Errorf("hostLinkNameByIndex(99) = %q, want empty", got)
+	}
+}
+
+// TestCidr24ForIP_ADR0139 asserts source-CIDR derivation for the reverse-path route.
+func TestCidr24ForIP_ADR0139(t *testing.T) {
+	if got := cidr24ForIP("10.244.0.97"); got != "10.244.0.0/24" {
+		t.Errorf("cidr24ForIP = %q, want 10.244.0.0/24", got)
+	}
+	if got := cidr24ForIP("not-an-ip"); got != "" {
+		t.Errorf("cidr24ForIP(bad) = %q, want empty", got)
+	}
+}

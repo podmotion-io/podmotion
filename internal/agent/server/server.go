@@ -316,6 +316,24 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 			log.Info("SingleHomeRestoredPod: installed cni0-gateway routes (ADR-0138)",
 				"migration", migrationName, "restoredPID", pid, "gateway", cni0Gateway)
 		}
+
+		// ADR-0139 Decision 2 (reverse path, blocker B8): the OLD IP's connected /24
+		// (10.244.0.0/24) makes the pod treat the SOURCE node's pod CIDR — including the
+		// source VTEP IP 10.244.0.0 — as on-link, so replies ARP `who-has 10.244.0.0` and
+		// never egress. Force replies to the source CIDR via the destination cni0 gateway
+		// (which routes them over VXLAN back to pm-control) instead of on-link ARP. The
+		// source CIDR is the /24 of the OLD IP. `ip route replace` is inherently idempotent.
+		srcNodeCIDR := cidr24ForIP(oldIP)
+		if srcNodeCIDR != "" {
+			if rOut, rErr := exec.Command("nsenter", "--net="+netnsPath,
+				"ip", "route", "replace", srcNodeCIDR, "via", cni0Gateway, "dev", "eth0").CombinedOutput(); rErr != nil {
+				log.Info("SingleHomeRestoredPod: warning — set reverse-path route (ADR-0139 D2)",
+					"srcNodeCIDR", srcNodeCIDR, "gw", cni0Gateway, "err", rErr, "output", strings.TrimSpace(string(rOut)))
+			} else {
+				log.Info("SingleHomeRestoredPod: installed reverse-path route to source CIDR via cni0 gateway (ADR-0139 D2)",
+					"migration", migrationName, "restoredPID", pid, "srcNodeCIDR", srcNodeCIDR, "gateway", cni0Gateway)
+			}
+		}
 	}
 
 	// Verify: only the OLD IP should remain on eth0.
@@ -365,6 +383,21 @@ func gatewayForIP(ip string) string {
 		return ""
 	}
 	return fmt.Sprintf("%d.%d.%d.1", v4[0], v4[1], v4[2])
+}
+
+// cidr24ForIP returns the /24 network CIDR containing ip (e.g. "10.244.0.97" ->
+// "10.244.0.0/24"). Returns "" if ip is not a valid IPv4. Used by ADR-0139 to derive the
+// SOURCE node's pod CIDR for the pod-netns reverse-path route.
+func cidr24ForIP(ip string) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return ""
+	}
+	v4 := parsed.To4()
+	if v4 == nil {
+		return ""
+	}
+	return fmt.Sprintf("%d.%d.%d.0/24", v4[0], v4[1], v4[2])
 }
 
 // parseEth0IPv4Addrs extracts the "A.B.C.D/N" tokens from `ip -o -4 addr show eth0` output.
@@ -522,6 +555,32 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 			BlockingReason: fmt.Sprintf("flannel.1 neigh: %v", err)}, nil
 	}
 
+	// ADR-0139 Decision 1 (forward path, blocker B8): the ADR-0135 /32 cni0 host route makes
+	// the kernel local-input-classify the VXLAN-decapped inner packet for the OLD IP (FORWARD
+	// never traversed → never reaches the pod veth). Install a tc-ingress redirect on flannel.1
+	// that moves decapped frames for the OLD IP straight to the replacement pod's host-side veth
+	// peer, bypassing L3 local-input classification (proven live Sprint 27). Best-effort: a
+	// resolution/setup failure is non-fatal (logged loud) so an otherwise-good handoff is not
+	// blocked; the source is held until TrafficVerified so a requeue re-asserts it (idempotent).
+	if replPID := s.restoredPIDForMigration(ctx, req.MigrationName); replPID > 0 {
+		if vethPeer, vErr := resolveReplVethPeer(replPID); vErr != nil {
+			log.Error(vErr, "InjectIPHandoff: ADR-0139 could not resolve repl veth peer — tc redirect NOT installed (non-fatal)",
+				"migration", req.MigrationName, "replPID", replPID)
+		} else if vethPeer == "" {
+			log.Info("InjectIPHandoff: ADR-0139 repl veth peer empty — tc redirect NOT installed (non-fatal)",
+				"migration", req.MigrationName, "replPID", replPID)
+		} else if tcErr := installTCRedirect(ctx, fdbIf, oldIP, vethPeer); tcErr != nil {
+			log.Error(tcErr, "InjectIPHandoff: ADR-0139 tc redirect install failed (non-fatal)",
+				"migration", req.MigrationName, "fdbIf", fdbIf, "oldPodIP", req.OldPodIp, "vethPeer", vethPeer)
+		} else {
+			log.Info("InjectIPHandoff: ADR-0139 tc-ingress redirect installed (forward path B8)",
+				"migration", req.MigrationName, "fdbIf", fdbIf, "oldPodIP", req.OldPodIp, "vethPeer", vethPeer)
+		}
+	} else {
+		log.Info("InjectIPHandoff: ADR-0139 RestoredPID not yet in CR status — tc redirect deferred to requeue (non-fatal)",
+			"migration", req.MigrationName)
+	}
+
 	resp := &agentpb.InjectIPHandoffResponse{Injected: true}
 
 	// Decision 3: return this node's VTEP MAC for the operator to thread to source cleanup.
@@ -596,6 +655,156 @@ func (s *AgentServer) CleanupSourceIPHandoff(ctx context.Context, req *agentpb.C
 
 	log.Info("CleanupSourceIPHandoff: stale cni0 entry removed; flannel.1 redirect preserved (ADR-0133 D4 + ADR-0136)", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 	return &agentpb.CleanupSourceIPHandoffResponse{Cleaned: true}, nil
+}
+
+// restoredPIDForMigration fetches the PodMigration CR and returns Status.RestoredPID (the root
+// PID of the restored container, set by this agent at ReportRestoreConfirmed). Returns 0 if the
+// CR/PID is unavailable. Used by ADR-0139 to resolve the replacement pod's veth peer without a
+// proto change (the agent already holds the k8s client and the migration name).
+func (s *AgentServer) restoredPIDForMigration(ctx context.Context, migrationName string) int {
+	if s.k8sClient == nil || migrationName == "" {
+		return 0
+	}
+	// Namespace is not carried on the InjectIPHandoff request; PodMigrations are namespaced.
+	// The PoC runs in "default". List across namespaces by name as a robust fallback so this
+	// is not hard-wired to one namespace if the operator is reconfigured.
+	pm := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: migrationName}, pm); err == nil {
+		return int(pm.Status.RestoredPID)
+	}
+	pmList := &pmv1.PodMigrationList{}
+	if err := s.k8sClient.List(ctx, pmList); err != nil {
+		log.Info("restoredPIDForMigration: list PodMigrations failed (non-fatal)",
+			"migration", migrationName, "err", err)
+		return 0
+	}
+	for i := range pmList.Items {
+		if pmList.Items[i].Name == migrationName {
+			return int(pmList.Items[i].Status.RestoredPID)
+		}
+	}
+	return 0
+}
+
+// resolveReplVethPeer returns the HOST-side veth peer name for the replacement pod's eth0,
+// given the restored PID. Inside the pod netns `ip -o link show eth0` reports the peer's host
+// ifindex as `eth0@if<N>`; the host link with ifindex <N> (`ip -o link show`) is the veth peer.
+// No netlink dependency (ADR-0045): reuses the in-tree nsenter+ip exec idiom.
+func resolveReplVethPeer(replPID int) (string, error) {
+	netnsPath := fmt.Sprintf("/proc/%d/ns/net", replPID)
+	out, err := exec.Command("nsenter", "--net="+netnsPath,
+		"ip", "-o", "link", "show", "eth0").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("resolveReplVethPeer: ip link show eth0 in netns %s: %w (%s)",
+			netnsPath, err, strings.TrimSpace(string(out)))
+	}
+	peerIdx := parseVethPeerIndex(string(out))
+	if peerIdx <= 0 {
+		return "", fmt.Errorf("resolveReplVethPeer: no eth0@if<N> peer index in: %s", strings.TrimSpace(string(out)))
+	}
+	hostOut, hErr := exec.Command("ip", "-o", "link", "show").CombinedOutput()
+	if hErr != nil {
+		return "", fmt.Errorf("resolveReplVethPeer: host ip link show: %w (%s)", hErr, strings.TrimSpace(string(hostOut)))
+	}
+	name := hostLinkNameByIndex(string(hostOut), peerIdx)
+	if name == "" {
+		return "", fmt.Errorf("resolveReplVethPeer: host link with ifindex %d not found", peerIdx)
+	}
+	return name, nil
+}
+
+// parseVethPeerIndex extracts <N> from an `ip -o link show eth0` line containing `eth0@if<N>`.
+// Returns 0 if not present.
+func parseVethPeerIndex(out string) int {
+	for _, line := range strings.Split(out, "\n") {
+		i := strings.Index(line, "eth0@if")
+		if i < 0 {
+			continue
+		}
+		rest := line[i+len("eth0@if"):]
+		j := 0
+		for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+			j++
+		}
+		if j == 0 {
+			continue
+		}
+		if n, err := strconv.Atoi(rest[:j]); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// hostLinkNameByIndex extracts the interface name for ifindex idx from `ip -o link show` output.
+// Each line begins "<idx>: <name>@... :" or "<idx>: <name>:". Returns "" if not found.
+func hostLinkNameByIndex(out string, idx int) string {
+	prefix := strconv.Itoa(idx) + ":"
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, prefix) {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) < 2 {
+			continue
+		}
+		name := strings.TrimSuffix(fields[1], ":")
+		if at := strings.IndexByte(name, '@'); at >= 0 {
+			name = name[:at]
+		}
+		return name
+	}
+	return ""
+}
+
+// installTCRedirect installs the ADR-0139 Decision 1 tc-ingress redirect on the overlay
+// interface (flannel.1): decapped frames with dst == oldPodIP/32 are redirected to the
+// replacement pod's host-side veth peer, bypassing the L3 local-input misclassification.
+// Idempotent: the ingress qdisc add tolerates "exists"; the filter is re-added on requeue.
+func installTCRedirect(ctx context.Context, fdbIf string, oldIP net.IP, vethPeer string) error {
+	// Ensure the ingress qdisc exists (idempotent: tolerate "exists"/"File exists").
+	if qOut, qErr := exec.CommandContext(ctx, "tc", "qdisc", "add", "dev", fdbIf, "ingress").CombinedOutput(); qErr != nil {
+		msg := strings.ToLower(strings.TrimSpace(string(qOut)))
+		if !strings.Contains(msg, "exists") {
+			return fmt.Errorf("tc qdisc add ingress on %s: %w (%s)", fdbIf, qErr, strings.TrimSpace(string(qOut)))
+		}
+	}
+	// Clear any stale filter for idempotency, then add the redirect (ignore del errors).
+	_, _ = exec.CommandContext(ctx, "tc", "filter", "del", "dev", fdbIf, "ingress").CombinedOutput()
+	fOut, fErr := exec.CommandContext(ctx, "tc", "filter", "add", "dev", fdbIf, "ingress",
+		"protocol", "ip", "u32",
+		"match", "ip", "dst", oldIP.String()+"/32",
+		"action", "mirred", "egress", "redirect", "dev", vethPeer).CombinedOutput()
+	if fErr != nil {
+		return fmt.Errorf("tc filter add redirect on %s -> %s: %w (%s)", fdbIf, vethPeer, fErr, strings.TrimSpace(string(fOut)))
+	}
+	return nil
+}
+
+// DisarmTCRedirect removes the ADR-0139 tc-ingress filter + qdisc from the overlay interface
+// after TrafficVerified=True (Decision 3 disarm order). Idempotent: tolerates ENOENT.
+func (s *AgentServer) DisarmTCRedirect(ctx context.Context, req *agentpb.DisarmTCRedirectRequest) (*agentpb.DisarmTCRedirectResponse, error) {
+	fdbIf := req.FdbIfname
+	if fdbIf == "" {
+		fdbIf = "flannel.1"
+	}
+	log.Info("DisarmTCRedirect called (ADR-0139 D3)", "migration", req.MigrationName, "fdbIf", fdbIf)
+	// Remove the filter, then the ingress qdisc. Both tolerate "does not exist"/ENOENT.
+	if fOut, fErr := exec.CommandContext(ctx, "tc", "filter", "del", "dev", fdbIf, "ingress").CombinedOutput(); fErr != nil {
+		msg := strings.ToLower(strings.TrimSpace(string(fOut)))
+		if !strings.Contains(msg, "does not exist") && !strings.Contains(msg, "no such") && !strings.Contains(msg, "cannot") {
+			log.Info("DisarmTCRedirect: tc filter del warning (non-fatal)", "fdbIf", fdbIf, "output", strings.TrimSpace(string(fOut)))
+		}
+	}
+	if qOut, qErr := exec.CommandContext(ctx, "tc", "qdisc", "del", "dev", fdbIf, "ingress").CombinedOutput(); qErr != nil {
+		msg := strings.ToLower(strings.TrimSpace(string(qOut)))
+		if !strings.Contains(msg, "does not exist") && !strings.Contains(msg, "no such") && !strings.Contains(msg, "cannot") {
+			log.Info("DisarmTCRedirect: tc qdisc del warning (non-fatal)", "fdbIf", fdbIf, "output", strings.TrimSpace(string(qOut)))
+		}
+	}
+	log.Info("DisarmTCRedirect: tc-ingress redirect disarmed (ADR-0139 D3)", "migration", req.MigrationName, "fdbIf", fdbIf)
+	return &agentpb.DisarmTCRedirectResponse{Disarmed: true}, nil
 }
 
 // InjectSourceRedirect installs the SOURCE-node VXLAN redirect for the relocated OLD pod IP
