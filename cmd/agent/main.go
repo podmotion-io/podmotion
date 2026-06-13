@@ -215,6 +215,20 @@ func main() {
 				log.Info("NRI CRIU restore: collected replacement pod eth0 MAC (ADR-0133)",
 					"migration", checkpointRef, "replVethMAC", replVethMAC)
 			}
+			// ADR-0137 (single-home variant): strip the CNI-assigned NEW Flannel IP from the
+			// replacement pod's eth0, leaving only the CRIU-restored OLD pod IP. This removes the
+			// dual-homed conflict (Sprint 26 B6) so the destination kernel delivers VXLAN-decapped
+			// transit traffic for the OLD IP to the pod veth instead of local-input-dropping it.
+			// Non-fatal on the live path: log loud on failure, AC5 catches a missed strip; the
+			// source pod is preserved until TrafficVerified=True regardless (ADR-0012).
+			if shErr := agentSrv.SingleHomeRestoredPod(reportCtx, checkpointRef, migrationNamespace, pid); shErr != nil {
+				log.Error(shErr, "NRI CRIU restore: SingleHomeRestoredPod failed (ADR-0137) — pod may remain dual-homed; OLD-IP transit delivery may fail",
+					"migration", checkpointRef, "restoredPID", pid)
+			} else {
+				log.Info("NRI CRIU restore: replacement pod single-homed on OLD IP (ADR-0137)",
+					"migration", checkpointRef, "restoredPID", pid)
+			}
+
 			if err := agentSrv.ReportRestoreConfirmed(reportCtx, checkpointRef, migrationNamespace, int32(pid), replVethMAC); err != nil {
 				log.Error(err, "NRI CRIU restore: failed to report confirmation to CR — controller poll will time out",
 					"migration", checkpointRef, "namespace", migrationNamespace)
