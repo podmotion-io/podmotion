@@ -10,9 +10,16 @@ you may not use this file except in compliance with the License.
 package network
 
 import (
+	"context"
 	"fmt"
 	"net"
 )
+
+// SetPodIPHostRoute is a no-op on non-Linux builds (ADR-0135 handoff route stub).
+func SetPodIPHostRoute(_ context.Context, _ string, _ net.IP) error { return nil }
+
+// DeletePodIPHostRoute is a no-op on non-Linux builds (ADR-0135 source cleanup stub).
+func DeletePodIPHostRoute(_ context.Context, _ string, _ net.IP) error { return nil }
 
 func InjectMigrationHostRoute(_ net.IP, _ string) error {
 	return fmt.Errorf("WireGuard host route injection not supported on non-Linux")
