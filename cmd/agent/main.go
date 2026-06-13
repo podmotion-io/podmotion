@@ -189,13 +189,20 @@ func main() {
 			// `ctr containers info` lookup can race the post-restore settle. Retry both briefly.
 			var replVethMAC string
 			var macErr error
-			for attempt := 0; attempt < 5; attempt++ {
-				sbNetnsPath, nsErr := agentSrv.SandboxNetnsPath(reportCtx, event.SandboxID)
-				if nsErr != nil {
-					log.Info("NRI CRIU restore: SandboxNetnsPath lookup retrying (ADR-0133)",
-						"attempt", attempt, "err", nsErr.Error())
+			for attempt := 0; attempt < 6; attempt++ {
+				// Prefer the exact netns path CRIU joined (stashed by joinNsRestore); fall back
+				// to resolving it from the sandbox spec. Both can lag the post-restore settle,
+				// so retry briefly.
+				netnsPath := agentSrv.ResolvedNetnsPath(checkpointRef)
+				if netnsPath == "" {
+					if p, nsErr := agentSrv.SandboxNetnsPath(reportCtx, event.SandboxID); nsErr == nil {
+						netnsPath = p
+					} else {
+						log.Info("NRI CRIU restore: SandboxNetnsPath lookup retrying (ADR-0133)",
+							"attempt", attempt, "err", nsErr.Error())
+					}
 				}
-				replVethMAC, macErr = server.ReadReplVethMAC(pid, sbNetnsPath)
+				replVethMAC, macErr = server.ReadReplVethMAC(pid, netnsPath)
 				if macErr == nil && replVethMAC != "" {
 					break
 				}
