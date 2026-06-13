@@ -2437,6 +2437,7 @@ func (r *PodMigrationReconciler) disarmTCRedirect(ctx context.Context, pm *pmv1.
 	_, err = destAgent.DisarmTCRedirect(ctx, &agentpb.DisarmTCRedirectRequest{
 		MigrationName: pm.Name,
 		FdbIfname:     fdbIfname,
+		OldPodIp:      pm.Spec.SourcePodIP,
 	})
 	return err
 }
