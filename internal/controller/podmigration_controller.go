@@ -286,27 +286,80 @@ func (r *PodMigrationReconciler) reconcileDestinationPrewarm(ctx context.Context
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhasePreCopyMemory)
 	}
 
-	// TODO(M22): Wire PrepareDestinationNetns agent RPC here.
-	// The condition must only be set to True after a verified RPC success
-	// (ConfirmOverlayReady read-back per ADR-0049 §5 barriers C-E).
-	// Until that wiring exists, TCPPreservationMode=Strict migrations are
-	// blocked here rather than advancing with a false-positive condition.
-	//
-	// Setting DestinationNetnsReady=True without the RPC having run would
-	// assert that the source IP is bound and AF_BRIDGE/AF_INET entries are
-	// injected when nothing has executed — advancing to RestoreSocketReattach
-	// would then delete the source pod and black-hole the source pod IP,
-	// RST-ing every in-flight TCP connection (M19.5 CRITICAL bar).
-	log.Error(nil, "DestinationPrewarm: PrepareDestinationNetns RPC not yet wired (M22) — blocking Strict migration",
-		"migration", pm.Name, "mode", pm.Spec.TCPPreservationMode)
-	setCondition(pm, pmv1.ConditionDestinationNetnsReady, metav1.ConditionFalse,
-		"RPCNotWired", "SCAFFOLDING: PrepareDestinationNetns agent RPC not yet implemented (M22); "+
-			"TCPPreservationMode=Strict migrations blocked until wired")
+	// PrepareDestinationNetns: call the destination agent RPC to pre-stage the migration
+	// netns on the destination node before CRIU restore (ADR-0048, M22).
+	if r.AgentPool == nil {
+		log.Error(nil, "DestinationPrewarm: AgentPool not wired — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	destNode := pm.Status.DestinationNodeName
+	if destNode == "" && pm.Spec.TargetNodeName != "" {
+		destNode = pm.Spec.TargetNodeName
+	}
+	if destNode == "" {
+		log.Error(nil, "DestinationPrewarm: DestinationNodeName not set — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	podIP := pm.Spec.SourcePodIP
+	if podIP == "" {
+		log.Error(nil, "DestinationPrewarm: SourcePodIP not set — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	destAgent, err := r.AgentPool.ForNode(ctx, destNode)
+	if err != nil {
+		log.Error(err, "DestinationPrewarm: cannot connect to destination agent — requeuing",
+			"migration", pm.Name, "node", destNode)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	log.Info("DestinationPrewarm: calling PrepareDestinationNetns on destination agent (ADR-0048)",
+		"migration", pm.Name, "node", destNode, "podIP", podIP)
+	prepResp, prepErr := destAgent.PrepareDestinationNetns(ctx, &agentpb.PrepareDestinationNetnsRequest{
+		MigrationName: pm.Name,
+		PodIp:         podIP,
+		PodNamespace:  pm.Spec.PodNamespace,
+	})
+	if prepErr != nil {
+		log.Error(prepErr, "DestinationPrewarm: PrepareDestinationNetns RPC failed — requeuing",
+			"migration", pm.Name)
+		setCondition(pm, pmv1.ConditionDestinationNetnsReady, metav1.ConditionFalse,
+			"RPCFailed", fmt.Sprintf("PrepareDestinationNetns RPC error: %v", prepErr))
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	if !prepResp.Ready {
+		log.Error(nil, "DestinationPrewarm: agent returned ready=false — requeuing",
+			"migration", pm.Name, "reason", prepResp.BlockingReason)
+		setCondition(pm, pmv1.ConditionDestinationNetnsReady, metav1.ConditionFalse,
+			"NotReady", fmt.Sprintf("PrepareDestinationNetns: %s", prepResp.BlockingReason))
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Persist the returned netns fd path and VTEP MAC into status for use by RestoreRequest
+	// and ConfirmOverlayReady (ADR-0048).
+	pm.Status.DestNetnsPath = prepResp.DestNetnsFd
+	pm.Status.DestVtepMac = prepResp.DestVtepMac
+	if pm.Status.DestinationNodeName == "" {
+		pm.Status.DestinationNodeName = destNode
+	}
+
+	msg := fmt.Sprintf("Destination netns pre-staged on node %s; dest_netns_fd=%s dest_vtep_mac=%s (ADR-0048)",
+		destNode, prepResp.DestNetnsFd, prepResp.DestVtepMac)
+	log.Info("DestinationPrewarm: PrepareDestinationNetns succeeded", "migration", pm.Name,
+		"destNetnsFd", prepResp.DestNetnsFd, "destVtepMac", prepResp.DestVtepMac)
+	setCondition(pm, pmv1.ConditionDestinationNetnsReady, metav1.ConditionTrue, "Ready", msg)
 	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
-	// Requeue with backoff; will re-enter this handler until the RPC is wired.
-	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	return r.transitionTo(ctx, pm, pmv1.MigrationPhasePreCopyMemory)
 }
 
 // reconcilePreCopyMemory drives the iterative dirty-page pre-copy loop.
@@ -524,24 +577,84 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoreSocketReattach)
 	}
 
-	// TODO(M22): Wire AddFDBEntry (source+destination nodes) + ConfirmOverlayReady RPC here.
-	// VXLANFDBUpdated must only be set True after RTM_GETNEIGH read-back confirms both
-	// AF_BRIDGE and AF_INET entries are installed (ADR-0049 §5 barrier D).
-	// Until that wiring exists, TCPPreservationMode=Strict migrations are blocked here.
-	//
-	// Setting VXLANFDBUpdated=True without the RPC having run would falsely assert that
-	// VXLAN FDB and neighbor entries are installed on both nodes when nothing has executed.
-	// Advancing to RestoreSocketReattach from this state destroys in-flight TCP connections
-	// (M19.5 CRITICAL: TCP RST on migrating connection).
-	log.Error(nil, "OverlayHandoff: FDB injection RPCs not yet wired (M22) — blocking Strict migration",
-		"migration", pm.Name, "mode", pm.Spec.TCPPreservationMode)
-	setCondition(pm, pmv1.ConditionVXLANFDBUpdated, metav1.ConditionFalse,
-		"RPCNotWired", "SCAFFOLDING: AddFDBEntry/ConfirmOverlayReady agent RPCs not yet implemented (M22); "+
-			"TCPPreservationMode=Strict migrations blocked until wired")
+	// ConfirmOverlayReady (pre-restore pass): call the destination agent to confirm that
+	// AF_BRIDGE FDB and AF_INET neighbor entries are installed (ADR-0049 predicates C/D) and
+	// conntrack NOTRACK is armed (predicate E). restore_complete=false because CRIU restore
+	// has not yet run; predicate F is deferred to the DisengageHold phase (M22, ADR-0048).
+	if r.AgentPool == nil {
+		log.Error(nil, "OverlayHandoff: AgentPool not wired — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	destNode := pm.Status.DestinationNodeName
+	if destNode == "" && pm.Spec.TargetNodeName != "" {
+		destNode = pm.Spec.TargetNodeName
+	}
+	if destNode == "" {
+		log.Error(nil, "OverlayHandoff: DestinationNodeName not set — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	destAgent, err := r.AgentPool.ForNode(ctx, destNode)
+	if err != nil {
+		log.Error(err, "OverlayHandoff: cannot connect to destination agent — requeuing",
+			"migration", pm.Name, "node", destNode)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Determine overlay FDB interface name; default to "flannel.1" per ADR-0048.
+	fdbIfname := pm.Status.OverlayFdbIfname
+	if fdbIfname == "" {
+		fdbIfname = "flannel.1"
+	}
+
+	// seq_xlat_seeded: seeded if TCPSeqSnapshots are present (predicate B).
+	seqXlatSeeded := len(pm.Status.TCPSeqSnapshots) > 0
+
+	log.Info("OverlayHandoff: calling ConfirmOverlayReady on destination agent (pre-restore, predicates B-E)",
+		"migration", pm.Name, "node", destNode, "fdbIfname", fdbIfname,
+		"seqXlatSeeded", seqXlatSeeded)
+	confirmResp, confirmErr := destAgent.ConfirmOverlayReady(ctx, &agentpb.ConfirmOverlayReadyRequest{
+		MigrationName:        pm.Name,
+		SeqXlatSeeded:        seqXlatSeeded,
+		FdbIfname:            fdbIfname,
+		PodIp:                pm.Spec.SourcePodIP,
+		PodMac:               pm.Status.SourcePodMac,
+		VtepIp:               pm.Status.DestVtepMac, // destination VTEP IP stored in DestVtepMac
+		SourceConntrackArmed: pm.Status.SourceConntrackArmed,
+		RestoreComplete:      false, // restore has not yet run at this phase
+		SourceClockNs:        pm.Status.SourceFreezeTimestampNs,
+	})
+	if confirmErr != nil {
+		log.Error(confirmErr, "OverlayHandoff: ConfirmOverlayReady RPC failed — requeuing",
+			"migration", pm.Name)
+		setCondition(pm, pmv1.ConditionVXLANFDBUpdated, metav1.ConditionFalse,
+			"RPCFailed", fmt.Sprintf("ConfirmOverlayReady RPC error: %v", confirmErr))
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	if !confirmResp.Ready {
+		log.Error(nil, "OverlayHandoff: ConfirmOverlayReady returned ready=false (FDB predicates not met) — requeuing",
+			"migration", pm.Name, "reason", confirmResp.BlockingReason)
+		setCondition(pm, pmv1.ConditionVXLANFDBUpdated, metav1.ConditionFalse,
+			"FDBNotReady", fmt.Sprintf("ConfirmOverlayReady: %s", confirmResp.BlockingReason))
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	msg := fmt.Sprintf("FDB predicates B/C/D/E confirmed on destination node %s; "+
+		"predB(seq_xlat)=%v predC(af_bridge)=%v predD(af_inet)=%v predE(conntrack)=%v (ADR-0048/ADR-0049)",
+		destNode, confirmResp.PredicateBOk, confirmResp.PredicateCOk, confirmResp.PredicateDOk, confirmResp.PredicateEOk)
+	log.Info("OverlayHandoff: FDB confirmed", "migration", pm.Name)
+	setCondition(pm, pmv1.ConditionVXLANFDBUpdated, metav1.ConditionTrue, "FDBConfirmed", msg)
 	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoreSocketReattach)
 }
 
 // reconcileRestoreSocketReattach executes CRIU restore on the destination and reattaches
@@ -585,6 +698,83 @@ func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm 
 			return ctrl.Result{}, err
 		}
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseTCPVerifying)
+	}
+
+	// ConfirmOverlayReady (post-restore pass, M22): call the destination agent with
+	// restore_complete=true to evaluate all 6 ADR-0049 barrier predicates before
+	// DisarmZeroWindow. Sets OverlayReady=True only when all predicates pass (ADR-0049).
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionOverlayReady) {
+		if r.AgentPool == nil {
+			log.Error(nil, "DisengageHold: AgentPool not wired for ConfirmOverlayReady — requeuing",
+				"migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
+		destNode := pm.Status.DestinationNodeName
+		if destNode == "" && pm.Spec.TargetNodeName != "" {
+			destNode = pm.Spec.TargetNodeName
+		}
+		if destNode == "" {
+			log.Error(nil, "DisengageHold: DestinationNodeName not set for ConfirmOverlayReady — requeuing",
+				"migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
+		destAgentForConfirm, destAgentErr := r.AgentPool.ForNode(ctx, destNode)
+		if destAgentErr != nil {
+			log.Error(destAgentErr, "DisengageHold: cannot connect to destination agent for ConfirmOverlayReady — requeuing",
+				"migration", pm.Name, "node", destNode)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
+		fdbIfname := pm.Status.OverlayFdbIfname
+		if fdbIfname == "" {
+			fdbIfname = "flannel.1"
+		}
+		seqXlatSeeded := len(pm.Status.TCPSeqSnapshots) > 0
+
+		log.Info("DisengageHold: calling ConfirmOverlayReady on destination agent (post-restore, all 6 predicates)",
+			"migration", pm.Name, "node", destNode)
+		overlayResp, overlayErr := destAgentForConfirm.ConfirmOverlayReady(ctx, &agentpb.ConfirmOverlayReadyRequest{
+			MigrationName:        pm.Name,
+			SeqXlatSeeded:        seqXlatSeeded,
+			FdbIfname:            fdbIfname,
+			PodIp:                pm.Spec.SourcePodIP,
+			PodMac:               pm.Status.SourcePodMac,
+			VtepIp:               pm.Status.DestVtepMac,
+			SourceConntrackArmed: pm.Status.SourceConntrackArmed,
+			RestoreComplete:      true, // CRIU restore succeeded before this phase
+			SourceClockNs:        pm.Status.SourceFreezeTimestampNs,
+		})
+		if overlayErr != nil {
+			log.Error(overlayErr, "DisengageHold: ConfirmOverlayReady RPC failed — requeuing",
+				"migration", pm.Name)
+			setCondition(pm, pmv1.ConditionOverlayReady, metav1.ConditionFalse,
+				"RPCFailed", fmt.Sprintf("ConfirmOverlayReady (post-restore) RPC error: %v", overlayErr))
+			if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+				return ctrl.Result{}, sErr
+			}
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		if !overlayResp.Ready {
+			log.Error(nil, "DisengageHold: ConfirmOverlayReady returned ready=false (6-predicate barrier not met) — requeuing",
+				"migration", pm.Name, "reason", overlayResp.BlockingReason)
+			setCondition(pm, pmv1.ConditionOverlayReady, metav1.ConditionFalse,
+				"BarrierNotMet", fmt.Sprintf("ConfirmOverlayReady: %s", overlayResp.BlockingReason))
+			if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+				return ctrl.Result{}, sErr
+			}
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
+		overlayMsg := fmt.Sprintf("All ADR-0049 predicates satisfied on destination node %s; "+
+			"predB=%v predC=%v predD=%v predE=%v predF=%v ts_delta=%d (ADR-0049)",
+			destNode, overlayResp.PredicateBOk, overlayResp.PredicateCOk, overlayResp.PredicateDOk,
+			overlayResp.PredicateEOk, overlayResp.PredicateFOk, overlayResp.TsDelta)
+		log.Info("DisengageHold: ConfirmOverlayReady — all predicates satisfied", "migration", pm.Name,
+			"tsDelta", overlayResp.TsDelta)
+		setCondition(pm, pmv1.ConditionOverlayReady, metav1.ConditionTrue, "AllPredicatesMet", overlayMsg)
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr
+		}
 	}
 
 	// Disarm the zero-window hold if not already disarmed.

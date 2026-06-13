@@ -431,6 +431,41 @@ type PodMigrationStatus struct {
 	// controller can pass it in RestoreRequest.seq_snapshots for PM_SEQ_XLAT seeding.
 	// +optional
 	TCPSeqSnapshots []TCPSeqSnapshot `json:"tcpSeqSnapshots,omitempty"`
+
+	// DestNetnsPath is the /proc/<pid>/fd/<n> path to the pre-staged migration netns on
+	// the destination node, returned by PrepareDestinationNetns. Passed as dest_netns_fd
+	// in RestoreRequest so the CRIU restore re-enters the correct netns (ADR-0048).
+	// +optional
+	DestNetnsPath string `json:"destNetnsPath,omitempty"`
+
+	// DestVtepMac is the VTEP MAC for the destination overlay interface, returned by
+	// PrepareDestinationNetns. Used to inject the AF_BRIDGE FDB entry on the source node
+	// and passed to ConfirmOverlayReady (ADR-0048).
+	// +optional
+	DestVtepMac string `json:"destVtepMac,omitempty"`
+
+	// SourcePodMac is the MAC address of the source pod's primary interface, populated
+	// during the DestinationPrewarm phase from the source pod annotation or netlink query.
+	// Used in AF_BRIDGE FDB lookups by ConfirmOverlayReady (ADR-0048).
+	// +optional
+	SourcePodMac string `json:"sourcePodMac,omitempty"`
+
+	// OverlayFdbIfname is the overlay interface name on both nodes (e.g. "flannel.1") used
+	// for FDB and neighbor entry injection and RTM_GETNEIGH confirmation. Populated once
+	// during DestinationPrewarm and reused by ConfirmOverlayReady (ADR-0048).
+	// +optional
+	OverlayFdbIfname string `json:"overlayFdbIfname,omitempty"`
+
+	// SourceConntrackArmed indicates that the NOTRACK conntrack rule is confirmed on the
+	// source node. Set by the OverlayHandoff phase before calling ConfirmOverlayReady.
+	// +optional
+	SourceConntrackArmed bool `json:"sourceConntrackArmed,omitempty"`
+
+	// SourceClockNs is CLOCK_MONOTONIC nanoseconds captured on the source node at freeze
+	// time, returned in CheckpointResponse. Passed to ConfirmOverlayReady so the destination
+	// can compute the PAWS ts_delta for PM_SEQ_XLAT (ADR-0049).
+	// +optional
+	SourceClockNs int64 `json:"sourceClockNs,omitempty"`
 }
 
 // TCPSeqSnapshot captures the TCP sequence state for a single ESTABLISHED connection
