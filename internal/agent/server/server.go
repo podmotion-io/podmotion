@@ -62,7 +62,7 @@ var ErrCRIUCapability = criu.ErrCRIUCapability
 
 // ErrRestoredPIDNotFound is returned by the cgroup-anchored restored-PID scan (ADR-0123 D2)
 // when, after CRIU exits 0, no process resident in the replacement pod's cgroup can be found
-// within the scan timeout. On the cold (--net-fd) path the caller MUST fail loud on this error
+// within the scan timeout. On the cold (--join-ns net:<path>) path the caller MUST fail loud on this error
 // and MUST NOT fall back to the name-based findRestoredProcessPID scan, and MUST NOT set
 // criuRestoreConfirmed (ADR-0123 D2 step 5 / AC5).
 var ErrRestoredPIDNotFound = errors.New("restored process PID not found in replacement pod cgroup")
@@ -134,11 +134,12 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 // network namespace the restored process must join (ADR-0122). It comes from the NRI pod
 // sandbox object (pod.GetId()).
 //
-// ADR-0122: rather than minting an empty netns (--empty-ns net), JoinNsRestore resolves
-// the replacement pod's sandbox netns via the containerd sandbox API (B1), opens the netns
-// path with an fstat/stat inode cross-check (B2), and hands the open fd to CRIU via
-// --net-fd. The restored process then comes up inside the pod netns, inheriting the pod IP,
-// veth pair, and CNI routing — reachable at the pod IP with no post-restore namespace surgery.
+// ADR-0122 + ADR-0125: rather than minting an empty netns (--empty-ns net), JoinNsRestore
+// resolves the replacement pod's sandbox netns via the containerd sandbox API (B1), opens the
+// netns path with an fstat/stat inode cross-check (B2), then closes the fd and hands the netns
+// PATH to CRIU via --join-ns net:<path> (ADR-0125 — CRIU 4.2 has no --net-fd flag). The restored
+// process then comes up inside the pod netns, inheriting the pod IP, veth pair, and CNI routing —
+// reachable at the pod IP with no post-restore namespace surgery.
 func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, sandboxID string) (int, error) {
 	return joinNsRestore(migrationName, checkpointDir, "", sandboxID)
 }
@@ -364,8 +365,12 @@ func FindContainerPID(podUID string) (int32, error) {
 }
 
 // ResolveNetnsFromSandbox returns an open *os.File for the network namespace of the
-// containerd sandbox (pause container) identified by sandboxID. The caller must Close
-// the returned file.
+// containerd sandbox (pause container) identified by sandboxID, along with the resolved
+// netns filesystem path. The caller must Close the returned file.
+//
+// ADR-0125 (Sprint 20): the open fd exists only to run the B2 TOCTOU inode cross-check
+// (open path, fstat fd vs stat path). It is no longer handed to CRIU — the caller closes
+// it and passes the returned path string to CRIU via --join-ns net:<path>.
 //
 // ADR-0122 B1 (post-quorum): this replaces the previous /proc/*/comm "pause" scan, which
 // was ambiguous on multi-pod nodes (every pod's pause process matches, so the scan could
@@ -385,17 +390,17 @@ func FindContainerPID(podUID string) (int32, error) {
 // `ctr` CLI (no containerd Go module in the build — see go.mod; consistent with
 // ctrCheckpoint / FindContainerTaskID), so the sandbox spec is resolved via
 // `ctr --namespace k8s.io containers info <sandboxID>`.
-func ResolveNetnsFromSandbox(ctx context.Context, containerdClient interface{}, sandboxID string) (*os.File, error) {
+func ResolveNetnsFromSandbox(ctx context.Context, containerdClient interface{}, sandboxID string) (*os.File, string, error) {
 	if sandboxID == "" {
-		return nil, fmt.Errorf("ResolveNetnsFromSandbox: empty sandboxID")
+		return nil, "", fmt.Errorf("ResolveNetnsFromSandbox: empty sandboxID")
 	}
 
 	netnsPath, err := sandboxNetnsPath(ctx, sandboxID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if netnsPath == "" {
-		return nil, fmt.Errorf("ResolveNetnsFromSandbox: sandbox %s spec has no network namespace path "+
+		return nil, "", fmt.Errorf("ResolveNetnsFromSandbox: sandbox %s spec has no network namespace path "+
 			"(host-network sandbox cannot be joined)", sandboxID)
 	}
 
@@ -403,28 +408,28 @@ func ResolveNetnsFromSandbox(ctx context.Context, containerdClient interface{}, 
 	// that was recycled between resolution and open.
 	f, err := os.Open(netnsPath)
 	if err != nil {
-		return nil, fmt.Errorf("ResolveNetnsFromSandbox: open netns path %s for sandbox %s: %w", netnsPath, sandboxID, err)
+		return nil, "", fmt.Errorf("ResolveNetnsFromSandbox: open netns path %s for sandbox %s: %w", netnsPath, sandboxID, err)
 	}
 
 	var pathStat, fdStat syscall.Stat_t
 	if serr := syscall.Stat(netnsPath, &pathStat); serr != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("ResolveNetnsFromSandbox: stat netns path %s: %w", netnsPath, serr)
+		return nil, "", fmt.Errorf("ResolveNetnsFromSandbox: stat netns path %s: %w", netnsPath, serr)
 	}
 	if serr := syscall.Fstat(int(f.Fd()), &fdStat); serr != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("ResolveNetnsFromSandbox: fstat netns fd for %s: %w", netnsPath, serr)
+		return nil, "", fmt.Errorf("ResolveNetnsFromSandbox: fstat netns fd for %s: %w", netnsPath, serr)
 	}
 	if pathStat.Ino != fdStat.Ino || pathStat.Dev != fdStat.Dev {
 		_ = f.Close()
-		return nil, fmt.Errorf("ResolveNetnsFromSandbox: netns inode mismatch — sandbox may have been recycled "+
+		return nil, "", fmt.Errorf("ResolveNetnsFromSandbox: netns inode mismatch — sandbox may have been recycled "+
 			"(sandbox %s path %s: path inode %d/dev %d, fd inode %d/dev %d)",
 			sandboxID, netnsPath, pathStat.Ino, pathStat.Dev, fdStat.Ino, fdStat.Dev)
 	}
 
-	log.Info("ResolveNetnsFromSandbox: resolved sandbox netns (ADR-0122 B1/B2)",
+	log.Info("ResolveNetnsFromSandbox: resolved sandbox netns (ADR-0122 B1/B2, ADR-0125)",
 		"sandboxID", sandboxID, "netnsPath", netnsPath, "inode", fdStat.Ino)
-	return f, nil
+	return f, netnsPath, nil
 }
 
 // sandboxNetnsPath reads the OCI spec of the containerd sandbox identified by sandboxID
@@ -552,6 +557,22 @@ var containerdMaskedPaths = []string{
 	"/sys/firmware", "/sys/fs/pstore", "/sys/fs/bpf",
 }
 
+// standardPodMounts is the canonical set of external mounts that every Kubernetes
+// pod container carries and that buildCRIURestoreArgs maps explicitly by PATH (not to
+// /dev/null) via --ext-mount-map <mountpoint>:<host-target>. The pre-scan must recognise
+// these as covered — they are legitimately restorable external mounts, not unmapped ones.
+// This list MUST stay in lockstep with the path-form --ext-mount-map entries in
+// buildCRIURestoreArgs (ADR-0124 R2 / AC6 — single source of truth, no divergent copy).
+var standardPodMounts = []string{
+	"/data",
+	"/dev/termination-log",
+	"/run/secrets/kubernetes.io/serviceaccount",
+	"/dev/shm",
+	"/etc/resolv.conf",
+	"/etc/hostname",
+	"/etc/hosts",
+}
+
 // buildMaskedPathExtMountArgs pre-scans the checkpoint's mountpoints-*.img (ADR-0124)
 // and generates the --ext-mount-map args CRIU needs to re-bind containerd's masked-path
 // external mounts. It MUST run AFTER patchCheckpointImages so it sees exactly the mount
@@ -609,6 +630,10 @@ print(json.dumps(results))
 	for _, p := range containerdMaskedPaths {
 		masked[p] = true
 	}
+	stdPod := make(map[string]bool, len(standardPodMounts))
+	for _, p := range standardPodMounts {
+		stdPod[p] = true
+	}
 
 	var args []string
 	var unmapped []string
@@ -619,8 +644,14 @@ print(json.dumps(results))
 			args = append(args, "--ext-mount-map", fmt.Sprintf("%d:/dev/null", e.MntID))
 			continue
 		}
-		// An external mount (root is external / ext_key set) that is neither a null bind nor a
-		// known masked path is unsafe to map to /dev/null — fail loud (D4).
+		// Standard pod mounts are mapped by PATH in buildCRIURestoreArgs (mountpoint:host-target),
+		// not by numeric mnt_id here — emitting a numeric /dev/null map would clobber them. They are
+		// covered, so skip without flagging as unmapped (ADR-0124 R2 / AC6).
+		if stdPod[e.Mountpoint] {
+			continue
+		}
+		// An external mount (root is external / ext_key set) that is neither a null bind, a known
+		// masked path, nor a standard pod mount is unsafe to restore — fail loud (D4).
 		unmapped = append(unmapped, fmt.Sprintf("mnt_id=%d mountpoint=%q root=%q", e.MntID, e.Mountpoint, e.Root))
 	}
 	if len(unmapped) > 0 {
@@ -634,13 +665,18 @@ print(json.dumps(results))
 // Network namespace selection is tier-driven (ADR-0048):
 //   - destNetnsFd non-empty → --join-ns net:<path> + --tcp-established: restore into the
 //     pre-staged migration netns so that TCP seq/ack state is preserved across node handoff.
-//   - destNetnsFd empty → --tcp-close + --net-fd <petnsFdNum>: stateless cold migration; the
-//     restored process joins the replacement pod's pause container netns passed as an inherited
-//     fd (ADR-0122), inheriting the pod IP / veth / CNI routing so it answers at the pod IP.
+//   - destNetnsFd empty → --tcp-close + --join-ns net:<petnsPath>: stateless cold migration; the
+//     restored process joins the replacement pod's pause container netns by PATH (ADR-0125),
+//     inheriting the pod IP / veth / CNI routing so it answers at the pod IP.
 //
-// petnsFdNum is the child-process fd number (3+) of the open replacement-pod pause netns, as
-// placed in exec.Cmd.ExtraFiles by the caller. It is used only on the destNetnsFd-empty path;
-// the caller must guarantee a valid fd there (>=3). On the --join-ns path it is ignored.
+// petnsPath is the filesystem path of the replacement-pod pause netns (e.g.
+// /var/run/netns/<id>), resolved by the caller via ResolveNetnsFromSandbox. It is used only on
+// the destNetnsFd-empty path; the caller must guarantee a non-empty path there. On the
+// destNetnsFd-non-empty (--join-ns Restore) path it is ignored.
+//
+// ADR-0125 (Sprint 20, supersedes ADR-0122 §3): CRIU 4.2 has no --net-fd flag. The documented
+// way to join an existing network namespace at restore is --join-ns net:<path>. We pass the
+// netns path string directly; no fd is handed to CRIU via ExtraFiles.
 //
 // --restore-detached is intentionally absent: CRIU must remain the foreground parent of the
 // restored process tree to avoid ghost containers (PID in /proc but untracked by any supervisor).
@@ -648,7 +684,7 @@ print(json.dumps(results))
 // --leave-stopped is added when destNetnsFd is non-empty (TCP-stateful path): the restored
 // process tree stays in SIGSTOP until the caller sends SIGCONT, which must happen only AFTER
 // SocketsLive=True is confirmed (M23 ordering invariant).
-func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd string, petnsFdNum int) []string {
+func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath string) []string {
 	tcpFlag := "--tcp-close"
 	if destNetnsFd != "" {
 		tcpFlag = "--tcp-established"
@@ -677,10 +713,11 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		// SIGCONT is sent only after SocketsLive=True is confirmed (M23 ordering invariant).
 		args = append(args, "--leave-stopped")
 	} else {
-		// ADR-0122: join the replacement pod's pause container netns via the inherited fd
-		// instead of minting an empty one. --net-fd <N> references ExtraFiles[N-3] in the
-		// CRIU child process; the restored process inherits the pod IP, veth, and CNI routes.
-		args = append(args, "--net-fd", strconv.Itoa(petnsFdNum))
+		// ADR-0125 (supersedes ADR-0122 §3): join the replacement pod's pause container netns
+		// by PATH instead of minting an empty one. CRIU 4.2 has no --net-fd flag; the documented
+		// flag is --join-ns net:<path>. The restored process inherits the pod IP, veth, and CNI
+		// routes. No fd is passed via ExtraFiles.
+		args = append(args, "--join-ns", "net:"+petnsPath)
 	}
 	return args
 }
@@ -690,11 +727,12 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 // CRIU uses --join-ns net:<destNetnsFd> to restore TCP connections into the pre-staged netns
 // (required for TCPPreservationMode=Strict/BestEffort per ADR-0048).
 // When destNetnsFd is empty, CRIU joins the replacement pod's sandbox netns via
-// --net-fd (ADR-0122): sandboxID is resolved through the containerd sandbox API
-// (ResolveNetnsFromSandbox), whose netns path is opened (with an inode cross-check) and
-// passed to the CRIU child as an inherited fd. The restored process then comes up inside
-// the pod netns (pod IP, veth, CNI routes) and is reachable at the pod IP with no
-// post-restore namespace surgery.
+// --join-ns net:<path> (ADR-0125, supersedes ADR-0122 §3): sandboxID is resolved through the
+// containerd sandbox API (ResolveNetnsFromSandbox), which opens the netns path and runs the B2
+// inode cross-check (TOCTOU guard). The fd is then closed and only the path STRING is handed to
+// CRIU — CRIU 4.2 has no --net-fd flag. The restored process then comes up inside the pod netns
+// (pod IP, veth, CNI routes) and is reachable at the pod IP with no post-restore namespace
+// surgery.
 //
 // Approach:
 //  1. Patch checkpoint images: remove null-ext_key masked mounts, strip extRootNetNS from
@@ -785,31 +823,33 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) 
 
 	// Step 4: CRIU restore — standalone rootfs.
 	//
-	// ADR-0122: on the stateless (destNetnsFd-empty) path, resolve the replacement pod's
-	// sandbox netns via the containerd sandbox API and hand its open fd to CRIU via --net-fd
-	// so the restored process joins the pod netns (pod IP, veth, CNI routes) instead of getting
-	// an empty one. The fd is placed in criuCmd.ExtraFiles, which makes it fd 3 in the CRIU
-	// child (0/1/2 = std streams).
+	// ADR-0125 (supersedes ADR-0122 §3): on the stateless (destNetnsFd-empty) path, resolve the
+	// replacement pod's sandbox netns via the containerd sandbox API and hand its PATH to CRIU via
+	// --join-ns net:<path> so the restored process joins the pod netns (pod IP, veth, CNI routes)
+	// instead of getting an empty one. CRIU 4.2 has no --net-fd flag; no fd is passed via
+	// ExtraFiles. ResolveNetnsFromSandbox still opens the path briefly to run the B2 inode
+	// cross-check (TOCTOU guard), then we close the fd and pass only the path string.
 	restoreLogPath := filepath.Join(checkpointDir, "restore.log")
-	const petnsChildFd = 3 // ExtraFiles[0] → fd 3 in the child process
-	var extraFiles []*os.File
+	var petnsPath string
 	if destNetnsFd == "" {
 		if sandboxID == "" {
-			return 0, fmt.Errorf("ADR-0122: replacement pod sandbox ID required to resolve netns for --net-fd restore")
+			return 0, fmt.Errorf("ADR-0125: replacement pod sandbox ID required to resolve netns for --join-ns net:<path> restore")
 		}
 		// B1: resolve via the containerd sandbox API (unambiguous per pod, no /proc comm scan).
 		// B2: ResolveNetnsFromSandbox opens the netns path and cross-checks fd/path inodes.
-		netnsFd, rerr := ResolveNetnsFromSandbox(context.Background(), nil, sandboxID)
+		netnsFd, resolvedPath, rerr := ResolveNetnsFromSandbox(context.Background(), nil, sandboxID)
 		if rerr != nil {
 			return 0, fmt.Errorf("resolve replacement pod sandbox netns: %w", rerr)
 		}
-		defer netnsFd.Close()
-		extraFiles = []*os.File{netnsFd}
-		log.Info("joinNsRestore: joining replacement pod netns via --net-fd (ADR-0122)",
-			"sandboxID", sandboxID, "childFd", petnsChildFd)
+		// ADR-0125: the fd existed only for the B2 inode cross-check. Close it now; CRIU joins by
+		// path, not by inherited fd.
+		_ = netnsFd.Close()
+		petnsPath = resolvedPath
+		log.Info("joinNsRestore: joining replacement pod netns via --join-ns net:<path> (ADR-0125)",
+			"sandboxID", sandboxID, "netnsPath", petnsPath)
 	}
 
-	criuArgs := buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsChildFd)
+	criuArgs := buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath)
 	// ADR-0124: dynamically scan the (post-patch) mountpoints-*.img for containerd masked-path
 	// external mounts and append their --ext-mount-map <mnt_id>:/dev/null args. Fail loud before
 	// invoking CRIU if any external mount is not safely mappable (D4).
@@ -819,12 +859,17 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) 
 	}
 	criuArgs = append(criuArgs, maskedArgs...)
 	criuCmd := exec.Command("/usr/local/sbin/criu", criuArgs...)
-	criuCmd.ExtraFiles = extraFiles
+	// ADR-0125: no ExtraFiles — CRIU joins the netns by path (--join-ns net:<path>), not by an
+	// inherited fd. The previous --net-fd fd-passing was removed (CRIU 4.2 has no --net-fd flag).
+	// Capture CRIU's stderr: when CRIU fails before opening its -o logfile (e.g. arg/ext-mount
+	// resolution errors), the only diagnostic is on stderr. A bounded buffer keeps it cheap.
+	var criuStderr bytes.Buffer
+	criuCmd.Stderr = &criuStderr
 	if err := criuCmd.Start(); err != nil {
 		return 0, fmt.Errorf("criu restore start: %w", err)
 	}
 
-	// ADR-0123 D1: reap CRIU and gate on its exit code. CRIU on the cold (--net-fd) path is
+	// ADR-0123 D1: reap CRIU and gate on its exit code. CRIU on the cold (--join-ns net:<path>) path is
 	// NOT --leave-stopped (that flag is only on the --join-ns path), so it self-exits once the
 	// process tree is restored and Wait() returns promptly. Wait() is called exactly once here;
 	// no deferred cleanup also waits on this command (Arch-A double-Wait guard).
@@ -838,8 +883,12 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) 
 		if criuCmd.ProcessState != nil {
 			exitCode = criuCmd.ProcessState.ExitCode()
 		}
-		return 0, fmt.Errorf("criu restore failed (exit code %d): %w\nrestore.log tail:\n%s",
-			exitCode, waitErr, readLogTail(restoreLogPath, 4096))
+		stderrTail := strings.TrimSpace(criuStderr.String())
+		if len(stderrTail) > 4096 {
+			stderrTail = stderrTail[len(stderrTail)-4096:]
+		}
+		return 0, fmt.Errorf("criu restore failed (exit code %d): %w\ncriu stderr:\n%s\nrestore.log tail:\n%s",
+			exitCode, waitErr, stderrTail, readLogTail(restoreLogPath, 4096))
 	}
 
 	// ADR-0123 D3: verify restore.log was produced and is non-empty on the cold path. CRIU has
@@ -852,9 +901,9 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) 
 
 	// Step 5: ADR-0123 D2 — locate the restored application PID via the replacement pod's
 	// cgroup, NOT by process name. CRIU has exited (D1), so its PID can no longer be confused
-	// with the application and there is no zombie to match. On the cold (--net-fd) path the
+	// with the application and there is no zombie to match. On the cold (--join-ns net:<path>) path the
 	// sandboxID anchors the pod cgroup; the comm-based findRestoredProcessPID is never used as a
-	// fallback (D2 step 5). The --join-ns Restore path (no sandboxID) is out of Sprint-18 scope
+	// fallback (D2 step 5). The --join-ns Restore (TCP-stateful) path (no sandboxID) is out of Sprint-18 scope
 	// and retains the legacy name/cgroup scan.
 	var pid int
 	if sandboxID != "" {
@@ -872,8 +921,8 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) 
 	log.Info("joinNsRestore: found restored process", "pid", pid)
 
 	// Step 6: ADR-0123 D4 — bring loopback up in the RESTORED application's net namespace,
-	// using the PID resolved from the pod cgroup (never the CRIU PID). On the --net-fd path this
-	// is the CNI-wired pod netns (lo is normally already up); on the --join-ns path it is the
+	// using the PID resolved from the pod cgroup (never the CRIU PID). On the cold path this
+	// is the CNI-wired pod netns (lo is normally already up); on the TCP-stateful path it is the
 	// pre-staged migration netns. Idempotent either way.
 	if out, err := exec.Command("nsenter",
 		fmt.Sprintf("--net=/proc/%d/ns/net", pid), "--",
