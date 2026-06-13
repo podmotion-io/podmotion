@@ -68,22 +68,20 @@ func SocketInventoryFromNetns(rootPID int32, _ string) ([]SocketEntry, error) {
 // parseProcNetTCP parses /proc/net/tcp or /proc/net/tcp6 at path.
 // isIPv6 toggles the address decoding width (16 bytes vs 4 bytes).
 // Only ESTABLISHED sockets (state field == "01") are returned.
-// Fields we capture per row (0-indexed after the sl: prefix):
+// Fields captured per row (0-indexed after the sl: prefix):
 //
 //	col 1  local_address  hex encoded ip:port (little-endian)
 //	col 2  rem_address    hex encoded ip:port
 //	col 3  st            socket state (01 = ESTABLISHED)
-//	col 7  snd_nxt       (tx_queue field in newer kernels holds it)
 //
 // /proc/net/tcp format (space-separated):
 //
 //	sl  local_address rem_address st tx_queue:rx_queue tr:tm->when retrnsmt uid timeout inode
 //
-// snd_nxt / rcv_nxt are NOT in the standard /proc/net/tcp columns; they live
-// in the detailed per-socket file at /proc/net/tcp (unnamed columns after inode).
-// For kernel ≥ 3.0 the format has extra columns: snd_nxt rcv_nxt ts_recent wscale.
-// We parse those if present; otherwise we leave them zero so callers can choose
-// to fall back to CRIU image parsing at restore time.
+// NOTE: snd_nxt and rcv_nxt are NOT present in /proc/net/tcp[6] in any kernel
+// version. The kernel's tcp4_seq_show / tcp6_seq_show never emit them.
+// SndNxt / RcvNxt in SocketEntry are left zero; callers must source real
+// sequence numbers from TCP_REPAIR getsockopt or the CRIU inetsk image.
 func parseProcNetTCP(path string, isIPv6 bool) ([]SocketEntry, error) {
 	f, err := os.Open(filepath.Clean(path))
 	if err != nil {
@@ -140,29 +138,25 @@ func parseProcNetTCPLine(line string, isIPv6 bool) (SocketEntry, bool, error) {
 		SrcPort: srcPort,
 		DstIP:   dstIP,
 		DstPort: dstPort,
+		// SndNxt, RcvNxt, TsRecent are intentionally left zero.
+		//
+		// IMPORTANT: /proc/net/tcp[6] does NOT contain snd_nxt or rcv_nxt in any
+		// column. The kernel's tcp4_seq_show / tcp6_seq_show emit (after inode):
+		//   retransmits, predicted_ack, rto, ato, snd_cwnd, ssthresh
+		// — none of which are sequence numbers.
+		//
+		// snd_nxt / rcv_nxt are only obtainable via:
+		//   getsockopt(TCP_REPAIR_QUEUE) + TCP_QUEUE_SEQ   (CRIU mechanism), or
+		//   inet_diag (INET_DIAG_INFO / TCP_INFO)
+		//
+		// Parsing positional columns from /proc/net/tcp and treating them as sequence
+		// numbers drives PM_SEQ_XLAT with garbage offsets, injecting wrong sequence
+		// numbers into the migrated flow and triggering peer RST. Leaving them zero
+		// forces callers to obtain real values from the CRIU inetsk image or TCP_REPAIR.
+		//
+		// See: ADR-0049 Gap 1, M23 critical finding "TCP sequence fidelity".
 	}
 
-	// /proc/net/tcp standard columns (0-indexed after stripping leading space):
-	//  0:sl 1:local 2:remote 3:st 4:tx:rx 5:tr:tm 6:retransmt 7:uid 8:timeout 9:inode
-	//  10:ref 11:ptr 12:drops [optional extra columns...]
-	//
-	// Extended columns appended by the kernel for detailed TCP state (kernel ≥ 3.12 with
-	// CONFIG_TCP_ESTATS or similar; layout: ... 13:snd_nxt 14:rcv_nxt 15:ts_recent 16:wscale).
-	// Real kernels use slightly different layouts; we parse defensively starting at col 13.
-	if len(fields) > 13 {
-		entry.SndNxt, _ = parseHex32(fields[13])
-	}
-	if len(fields) > 14 {
-		entry.RcvNxt, _ = parseHex32(fields[14])
-	}
-	if len(fields) > 15 {
-		entry.TsRecent, _ = parseHex32(fields[15])
-	}
-	if len(fields) > 16 {
-		// wscale field encodes snd_wscale in the high nibble, rcv_wscale in the low nibble.
-		wscaleRaw, _ := parseHex32(fields[16])
-		entry.WScale = uint8(wscaleRaw & 0xFF)
-	}
 	// SACK is enabled when the kernel advertised SACK in the SYN exchange; it is not
 	// directly readable from /proc/net/tcp. We conservatively assume enabled for
 	// ESTABLISHED sockets (the kernel only keeps a socket in ESTABLISHED if the

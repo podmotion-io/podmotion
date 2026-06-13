@@ -94,6 +94,14 @@ type AgentServer struct {
 	zwHoldMu sync.Mutex
 	// zwHolds tracks active zero-window holds keyed by migration name.
 	zwHolds map[string]*zwHoldState
+
+	// frozenSourcePIDsMu guards frozenSourcePIDs.
+	frozenSourcePIDsMu sync.Mutex
+	// frozenSourcePIDs tracks source PIDs left in SIGSTOP by LeaveStopped=true dumps.
+	// Entry is removed when the migration completes successfully (TrafficVerified) or
+	// when the source is thawed on rollback/failure. On any error exit the PID must be
+	// SIGCONTed to prevent a permanently frozen source workload (ADR-0012 safety block).
+	frozenSourcePIDs map[string]int32 // migrationName -> host-namespace PID
 }
 
 // New constructs an AgentServer with the given Checkpointer implementation.
@@ -107,6 +115,7 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 		migrationPodUID:       make(map[string]string),
 		migrationSeqSnapshots: make(map[string][]*agentpb.SeqSnapshot),
 		zwHolds:               make(map[string]*zwHoldState),
+		frozenSourcePIDs:      make(map[string]int32),
 	}
 }
 
@@ -993,17 +1002,27 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		// LeaveStopped keeps the source process in SIGSTOP after the dump so no new
 		// TCP data is sent while the destination is restoring (M23 ordering invariant).
 		// Only set for TCP-stateful migrations — stateless migrations resume normally.
+		// CRITICAL: Every error/rollback path that follows a successful LeaveStopped dump
+		// MUST call thawFrozenSource(migrationName) so the source is never permanently
+		// frozen. registerFrozenSource is called immediately after a successful dump.
 		LeaveStopped: tcpEstablished,
 	})
 
 	// freezeTimestampNs is CLOCK_REALTIME ns captured immediately after CRIU dump
-	// returns. When LeaveStopped=true the process is in SIGSTOP at this point, so
-	// the socket table read below reflects the exact freeze-instant sequence numbers.
+	// returns. When LeaveStopped=true the process is in SIGSTOP at this point.
 	freezeTimestampNs := time.Now().UnixNano()
 
-	// Re-read socket inventory after dump succeeds so snd_nxt/rcv_nxt/ts_recent
-	// reflect the exact freeze instant (process is in SIGSTOP with LeaveStopped).
-	// The pre-dump read above captured approximate values; we replace them here.
+	// Register the frozen source PID immediately after a successful LeaveStopped dump.
+	// This ensures that any subsequent error return (SeedRelayFromSnapshots failure,
+	// ordering invariant failure, transfer failure, controller crash handled by watchdog)
+	// can thaw the source via Abort or the frozen-source watchdog.
+	if err == nil && tcpEstablished && containerPID != 0 {
+		s.registerFrozenSource(req.MigrationName, containerPID)
+	}
+
+	// Re-read socket inventory after dump succeeds. The post-dump read is for 4-tuple
+	// tracking (SrcIP/SrcPort/DstIP/DstPort) only — SndNxt/RcvNxt are left zero because
+	// /proc/net/tcp does not contain sequence numbers (see SocketEntry comment).
 	if err == nil && tcpEstablished && containerPID != 0 {
 		if postEntries, invErr := network.SocketInventory(containerPID); invErr != nil {
 			log.Error(invErr, "Checkpoint: post-dump socket inventory failed — retaining pre-dump snapshots",
@@ -1243,13 +1262,13 @@ func (s *AgentServer) Restore(_ context.Context, req *agentpb.RestoreRequest) (*
 		}
 
 		// M23 ordering invariant: when TCP-stateful restore was used (--leave-stopped),
-		// the restored process is in SIGSTOP. We must verify TCP sockets are ESTABLISHED
-		// (SocketsLive) before sending SIGCONT. This ensures the containerd-running timestamp
-		// is strictly after the sockets-live timestamp.
+		// the restored process is in SIGSTOP. We MUST verify TCP sockets are ESTABLISHED
+		// (SocketsLive) before sending SIGCONT. This is a hard gate — SIGCONT is withheld
+		// until the confirmed socket count matches the expected source connection count.
 		if req.DestNetnsFd != "" && pid > 0 {
-			socketsLiveAt, resumedAt, orderErr := enforceRestoreOrderingInvariant(pid, req.MigrationName)
+			socketsLiveAt, resumedAt, orderErr := enforceRestoreOrderingInvariant(pid, req.MigrationName, len(req.SeqSnapshots))
 			if orderErr != nil {
-				log.Error(orderErr, "Restore: ordering invariant failed — source process may be stranded in SIGSTOP",
+				log.Error(orderErr, "Restore: ordering invariant FAILED — SIGCONT withheld, failing restore for rollback",
 					"migration", req.MigrationName, "pid", pid)
 				return &agentpb.RestoreResponse{
 					Success:      false,
@@ -1263,8 +1282,10 @@ func (s *AgentServer) Restore(_ context.Context, req *agentpb.RestoreRequest) (*
 				"socketsLiveBeforeResume", socketsLiveAt.Before(resumedAt),
 			)
 			if s.k8sClient != nil {
-				if setErr := s.setOrderingConditions(req.MigrationName, socketsLiveAt, resumedAt); setErr != nil {
-					log.Error(setErr, "Restore: failed to set ordering conditions — non-fatal", "migration", req.MigrationName)
+				if setErr := s.setOrderingConditions(req.MigrationName, pid, socketsLiveAt, resumedAt); setErr != nil {
+					// Ordering condition update failure is non-fatal for the migration itself,
+					// but we log it as an error because the condition API contract is violated.
+					log.Error(setErr, "Restore: failed to set ordering conditions", "migration", req.MigrationName)
 				}
 			}
 		}
@@ -1569,6 +1590,13 @@ func runAppProbe(ctx context.Context, req *agentpb.VerifyTCPRequest) error {
 
 func (s *AgentServer) Abort(_ context.Context, req *agentpb.AbortRequest) (*agentpb.AbortResponse, error) {
 	log.Info("Abort called", "migration", req.MigrationName, "reason", req.Reason)
+
+	// Thaw any frozen source PID before aborting CRIU. If LeaveStopped=true left the
+	// source process in SIGSTOP after a successful dump, the source must be SIGCONTed
+	// here so the workload resumes on the source node (ADR-0012 rollback atomicity).
+	// This is idempotent — if the source was never frozen, this is a no-op.
+	s.thawFrozenSource(req.MigrationName)
+
 	if err := s.checkpointer.Abort(context.Background(), "", "k8s.io"); err != nil {
 		return &agentpb.AbortResponse{Success: false}, err
 	}
@@ -2055,46 +2083,149 @@ func (s *AgentServer) ConfirmOverlayReady(ctx context.Context, req *agentpb.Conf
 	return resp, nil
 }
 
-// enforceRestoreOrderingInvariant verifies TCP sockets on the restored process (pid) are
-// in ESTABLISHED state, then sends SIGCONT. Returns (socketsLiveAt, resumedAt) timestamps.
-// socketsLiveAt is set the moment SocketInventory confirms ESTABLISHED connections (or
-// immediately if no TCP connections are expected). resumedAt is set after SIGCONT is sent.
-// The caller must verify resumedAt > socketsLiveAt (M23 ordering invariant).
-func enforceRestoreOrderingInvariant(pid int, migrationName string) (time.Time, time.Time, error) {
-	sockEntries, invErr := network.SocketInventory(int32(pid))
-	if invErr != nil {
-		// Non-fatal: socket inventory may fail on darwin or if /proc is not yet populated.
-		// We still proceed to SIGCONT — the invariant is best-effort when inventory is unavailable.
-		log.Info("enforceRestoreOrderingInvariant: socket inventory failed (non-fatal), proceeding to SIGCONT",
-			"migration", migrationName, "pid", pid, "err", invErr)
+// thawSourcePID sends SIGCONT to the given PID, recovering a source process that was
+// left in SIGSTOP by LeaveStopped=true after a CRIU dump. Called on every error/rollback
+// path that follows a successful dump so the source workload is never permanently frozen.
+// Idempotent: if the process is already running (not stopped), SIGCONT is harmless.
+func thawSourcePID(pid int32, migrationName string) {
+	if pid <= 0 {
+		return
 	}
-	socketsLiveAt := time.Now()
-	log.Info("enforceRestoreOrderingInvariant: SocketsLive confirmed",
-		"migration", migrationName,
-		"pid", pid,
-		"establishedConnections", len(sockEntries),
-		"socketsLiveAt", socketsLiveAt.UnixNano(),
-	)
+	if err := syscall.Kill(int(pid), syscall.SIGCONT); err != nil {
+		log.Error(err, "thawSourcePID: SIGCONT to source PID failed — manual intervention may be required",
+			"migration", migrationName, "sourcePID", pid)
+		return
+	}
+	log.Info("thawSourcePID: SIGCONT sent to frozen source process",
+		"migration", migrationName, "sourcePID", pid)
+}
 
-	// Send SIGCONT to the restored process tree root — this resumes the entire process
-	// group that CRIU left in SIGSTOP via --leave-stopped.
-	if err := syscall.Kill(pid, syscall.SIGCONT); err != nil {
-		return socketsLiveAt, time.Time{}, fmt.Errorf("SIGCONT pid=%d: %w", pid, err)
+// registerFrozenSource records that migration's source process (pid) is now in SIGSTOP
+// due to LeaveStopped=true. Must be called immediately after a successful Dump with LeaveStopped.
+// The entry must be cleared by clearFrozenSource once the source is confirmed thawed or
+// the migration completes successfully.
+func (s *AgentServer) registerFrozenSource(migrationName string, pid int32) {
+	s.frozenSourcePIDsMu.Lock()
+	defer s.frozenSourcePIDsMu.Unlock()
+	s.frozenSourcePIDs[migrationName] = pid
+	log.Info("registerFrozenSource: source process frozen",
+		"migration", migrationName, "sourcePID", pid)
+}
+
+// clearFrozenSource removes the frozen-source record for migrationName.
+// Called after thawing or on successful migration completion.
+func (s *AgentServer) clearFrozenSource(migrationName string) {
+	s.frozenSourcePIDsMu.Lock()
+	defer s.frozenSourcePIDsMu.Unlock()
+	delete(s.frozenSourcePIDs, migrationName)
+}
+
+// thawFrozenSource thaws the recorded frozen source PID for migrationName (if any)
+// and clears the record. Safe to call when no frozen source is registered.
+func (s *AgentServer) thawFrozenSource(migrationName string) {
+	s.frozenSourcePIDsMu.Lock()
+	pid, ok := s.frozenSourcePIDs[migrationName]
+	if ok {
+		delete(s.frozenSourcePIDs, migrationName)
 	}
-	resumedAt := time.Now()
-	log.Info("enforceRestoreOrderingInvariant: SIGCONT sent",
-		"migration", migrationName,
-		"pid", pid,
-		"resumedAt", resumedAt.UnixNano(),
-		"orderingHoldNs", resumedAt.Sub(socketsLiveAt).Nanoseconds(),
+	s.frozenSourcePIDsMu.Unlock()
+	if ok {
+		thawSourcePID(pid, migrationName)
+	}
+}
+
+// enforceRestoreOrderingInvariant verifies that TCP sockets on the restored process (pid)
+// are ESTABLISHED, then — and only then — sends SIGCONT. Returns (socketsLiveAt, resumedAt).
+//
+// This is a HARD gate on the TCP-stateful path (M23 ordering invariant, ADR-0095):
+//   - If SocketInventory fails, the restore is failed (SIGCONT is withheld).
+//   - If no ESTABLISHED sockets are found after polling, the restore is failed.
+//   - socketsLiveAt is set only after confirmed ESTABLISHED socket count > 0.
+//   - SIGCONT is sent only after that confirmed observation.
+//
+// expectedCount is the number of TCP connections from the source SeqSnapshots;
+// when 0 (non-TCP-stateful path) the function is a no-op that returns the current time.
+func enforceRestoreOrderingInvariant(pid int, migrationName string, expectedCount int) (time.Time, time.Time, error) {
+	// If the restore was not TCP-stateful (no expected connections), skip socket
+	// polling and resume immediately — the invariant only applies to TCP migrations.
+	if expectedCount == 0 {
+		now := time.Now()
+		log.Info("enforceRestoreOrderingInvariant: no TCP connections expected, resuming immediately",
+			"migration", migrationName, "pid", pid)
+		if err := syscall.Kill(pid, syscall.SIGCONT); err != nil {
+			return now, time.Time{}, fmt.Errorf("SIGCONT pid=%d: %w", pid, err)
+		}
+		resumedAt := time.Now()
+		return now, resumedAt, nil
+	}
+
+	// Poll SocketInventory until we observe at least expectedCount ESTABLISHED sockets
+	// or the polling deadline is exceeded. This gates SIGCONT on real socket liveness.
+	const (
+		pollInterval = 20 * time.Millisecond
+		pollDeadline = 5 * time.Second
 	)
-	return socketsLiveAt, resumedAt, nil
+	deadline := time.Now().Add(pollDeadline)
+	var lastErr error
+	var lastCount int
+	for time.Now().Before(deadline) {
+		sockEntries, invErr := network.SocketInventory(int32(pid))
+		if invErr != nil {
+			// Inventory failure: the process's netns is not yet visible or /proc is
+			// not populated for the restored PID. Retry until deadline.
+			lastErr = invErr
+			log.Info("enforceRestoreOrderingInvariant: SocketInventory failed (retrying)",
+				"migration", migrationName, "pid", pid, "err", invErr)
+			time.Sleep(pollInterval)
+			continue
+		}
+		lastErr = nil
+		lastCount = len(sockEntries)
+		if lastCount >= expectedCount {
+			// Confirmed: at least expectedCount ESTABLISHED sockets observed.
+			socketsLiveAt := time.Now()
+			log.Info("enforceRestoreOrderingInvariant: SocketsLive confirmed — sending SIGCONT",
+				"migration", migrationName,
+				"pid", pid,
+				"establishedConnections", lastCount,
+				"expectedConnections", expectedCount,
+				"socketsLiveAt", socketsLiveAt.UnixNano(),
+			)
+			if err := syscall.Kill(pid, syscall.SIGCONT); err != nil {
+				return socketsLiveAt, time.Time{}, fmt.Errorf("SIGCONT pid=%d: %w", pid, err)
+			}
+			resumedAt := time.Now()
+			log.Info("enforceRestoreOrderingInvariant: SIGCONT sent",
+				"migration", migrationName,
+				"pid", pid,
+				"resumedAt", resumedAt.UnixNano(),
+				"orderingHoldNs", resumedAt.Sub(socketsLiveAt).Nanoseconds(),
+			)
+			return socketsLiveAt, resumedAt, nil
+		}
+		log.Info("enforceRestoreOrderingInvariant: waiting for ESTABLISHED sockets",
+			"migration", migrationName, "pid", pid,
+			"found", lastCount, "expected", expectedCount)
+		time.Sleep(pollInterval)
+	}
+
+	// Deadline exceeded — SIGCONT is withheld. Fail closed so the migration rolls back.
+	// The source process (if frozen) will be thawed by the rollback path.
+	if lastErr != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf(
+			"enforceRestoreOrderingInvariant: SocketInventory still failing after %s: %w; SIGCONT withheld",
+			pollDeadline, lastErr)
+	}
+	return time.Time{}, time.Time{}, fmt.Errorf(
+		"enforceRestoreOrderingInvariant: only %d/%d ESTABLISHED sockets observed after %s; SIGCONT withheld to prevent RST on migrated connections",
+		lastCount, expectedCount, pollDeadline)
 }
 
 // setOrderingConditions sets SocketsLive=True and ProcessResumedAfterSocketsLive=True
 // on the PodMigration CR. ProcessResumedAfterSocketsLive.LastTransitionTime must be
 // strictly after SocketsLive.LastTransitionTime (M23 ordering invariant assertion).
-func (s *AgentServer) setOrderingConditions(migrationName string, socketsLiveAt, resumedAt time.Time) error {
+// pid is the restored destination PID, recorded in the condition message for observability.
+func (s *AgentServer) setOrderingConditions(migrationName string, pid int, socketsLiveAt, resumedAt time.Time) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -2112,19 +2243,20 @@ func (s *AgentServer) setOrderingConditions(migrationName string, socketsLiveAt,
 	resumedMeta := metav1.NewTime(resumedAt)
 
 	if !resumedAt.After(socketsLiveAt) {
-		log.Info("setOrderingConditions: WARNING — resumedAt not strictly after socketsLiveAt (clock resolution)",
-			"migration", migrationName,
-			"socketsLiveAt", socketsLiveAt.UnixNano(),
-			"resumedAt", resumedAt.UnixNano(),
-		)
+		// This must not happen: enforceRestoreOrderingInvariant guarantees socketsLiveAt
+		// is set before SIGCONT, so resumedAt must be strictly after socketsLiveAt.
+		// If this fires it indicates a clock regression or a caller bug — fail hard rather
+		// than silently stamping a condition that violates the ordering invariant.
+		return fmt.Errorf("setOrderingConditions: resumedAt (%d) is not strictly after socketsLiveAt (%d) — ordering invariant violated",
+			resumedAt.UnixNano(), socketsLiveAt.UnixNano())
 	}
 
 	setConditionAt(pm, pmv1.ConditionSocketsLive, metav1.ConditionTrue, "SocketsLive",
-		fmt.Sprintf("TCP sockets ESTABLISHED on restored process pid=%d at %s", 0, socketsLiveAt.UTC().Format(time.RFC3339Nano)),
+		fmt.Sprintf("TCP sockets ESTABLISHED on restored process pid=%d at %s", pid, socketsLiveAt.UTC().Format(time.RFC3339Nano)),
 		socketsLiveMeta)
 	setConditionAt(pm, pmv1.ConditionProcessResumedAfterSocketsLive, metav1.ConditionTrue, "ProcessResumed",
 		fmt.Sprintf("SIGCONT delivered to pid=%d at %s; sockets were live at %s (ordering invariant satisfied)",
-			0, resumedAt.UTC().Format(time.RFC3339Nano), socketsLiveAt.UTC().Format(time.RFC3339Nano)),
+			pid, resumedAt.UTC().Format(time.RFC3339Nano), socketsLiveAt.UTC().Format(time.RFC3339Nano)),
 		resumedMeta)
 
 	return s.k8sClient.Status().Update(ctx, pm)

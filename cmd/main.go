@@ -236,7 +236,9 @@ func main() {
 		Estimator: &estimation.DefaultEstimator{
 			Prober: &estimation.StubProber{},
 		},
-		Rollbacker:      rollback.NewStubRollbacker(),
+		// Pass nil source agent client — in M2/M3 the frozen-source watchdog on the
+		// agent handles thawing. Wire a real Abort-capable client in M4+.
+		Rollbacker: rollback.NewStubRollbacker(nil),
 		AgentPool:       agentPool,
 		TrafficVerifier: compositeVerifier,
 		ReplicationMgr:  replicationMgr,
