@@ -21,6 +21,7 @@ import (
 
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -159,10 +160,33 @@ func main() {
 				"checkpointRef", checkpointRef,
 				"checkpointDir", checkpointDir,
 			)
+			// ADR-0144 Decision Point 1 / NB-3: fetch tcpPreservationMode from the
+			// PodMigration CR BEFORE invoking CRIU so that --leave-stopped is emitted
+			// correctly. CR fetch failure defaults to Strict (fail-closed, NB-4): if the
+			// mode is unknown it is safer to hold the restored tree than to risk a write
+			// into an unwired datapath, which breaks seq_delta=0.
+			migrationNamespace := event.Annotations["podmotion.io/migration-namespace"]
+			if migrationNamespace == "" {
+				migrationNamespace = event.Namespace
+			}
+			tcpPreservationMode := string(pmv1.TCPPreservationModeStrict) // fail-closed default
+			if k8sClient != nil {
+				fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				pmCR := &pmv1.PodMigration{}
+				if fetchErr := k8sClient.Get(fetchCtx, types.NamespacedName{Namespace: migrationNamespace, Name: checkpointRef}, pmCR); fetchErr != nil {
+					log.Error(fetchErr, "NRI StartContainer: could not fetch PodMigration CR for tcpPreservationMode — defaulting to Strict (fail-closed, ADR-0144 NB-4)",
+						"migration", checkpointRef, "namespace", migrationNamespace)
+				} else {
+					tcpPreservationMode = string(pmCR.Spec.TCPPreservationMode)
+					log.Info("NRI StartContainer: fetched tcpPreservationMode from CR (ADR-0144)",
+						"migration", checkpointRef, "mode", tcpPreservationMode)
+				}
+				fetchCancel()
+			}
 			// ADR-0122: pass the replacement pod's containerd sandbox ID (pod.GetId()) so
-			// JoinNsRestore can resolve its netns via the containerd sandbox API and hand the
-			// open fd to CRIU via --net-fd.
-			pid, err := agentSrv.JoinNsRestore(checkpointRef, checkpointDir, event.SandboxID)
+			// JoinNsRestore can resolve its netns via the containerd sandbox API. Also pass
+			// tcpPreservationMode so JoinNsRestore can gate --leave-stopped on the Strict path.
+			pid, err := agentSrv.JoinNsRestore(checkpointRef, checkpointDir, event.SandboxID, tcpPreservationMode)
 			if err != nil {
 				log.Error(err, "NRI CRIU restore failed", "container", event.ID)
 				return err
@@ -171,11 +195,7 @@ func main() {
 
 			// ADR-0120 D3: propagate authoritative restore confirmation back to the
 			// PodMigration CR. The migration name equals the checkpoint-ref; the CR
-			// namespace is carried on the replacement pod via podmotion.io/migration-namespace.
-			migrationNamespace := event.Annotations["podmotion.io/migration-namespace"]
-			if migrationNamespace == "" {
-				migrationNamespace = event.Namespace // fall back to the pod's namespace
-			}
+			// namespace was already resolved above (before JoinNsRestore) for tcpPreservationMode.
 			// Use a fresh context: the NRI handler context (ctx) is cancelled
 			// when the NRI socket disconnects during CRIU restore, which would
 			// cause the k8s patch to hit "context deadline exceeded".

@@ -30,6 +30,7 @@ func TestBuildCRIURestoreArgs_JoinNs(t *testing.T) {
 		"/run/podmotion/checkpoints/test/final/restore.log",
 		"/proc/12345/fd/7",
 		"",
+		false,
 	)
 	joined := strings.Join(args, " ")
 
@@ -67,6 +68,7 @@ func TestBuildCRIURestoreArgs_ColdJoinNsPath(t *testing.T) {
 		"/run/podmotion/checkpoints/test/final/restore.log",
 		"",
 		"/var/run/netns/cni-abc123",
+		false,
 	)
 	joined := strings.Join(args, " ")
 
@@ -87,6 +89,34 @@ func TestBuildCRIURestoreArgs_ColdJoinNsPath(t *testing.T) {
 	}
 	if strings.Contains(joined, "--restore-detached") {
 		t.Errorf("--restore-detached must never appear (ghost container risk); got: %s", joined)
+	}
+}
+
+// TestBuildCRIURestoreArgs_StrictModeNRIPath verifies that when strictMode=true and
+// destNetnsFd="" (the NRI path), --leave-stopped is emitted (ADR-0144 Decision Point 1).
+// This is the gate that prevents a write into an unwired datapath on an actively-writing client.
+func TestBuildCRIURestoreArgs_StrictModeNRIPath(t *testing.T) {
+	args := buildCRIURestoreArgs(
+		"/run/podmotion/checkpoints/test/final",
+		"/var/lib/podmotion/restore/test/bundle/rootfs",
+		"/var/lib/podmotion/restore/test/data",
+		"/var/lib/podmotion/restore/test/termination-log",
+		"/var/lib/podmotion/restore/test/secrets",
+		"/run/podmotion/checkpoints/test/final/restore.log",
+		"", // NRI path: destNetnsFd is always empty
+		"/var/run/netns/cni-abc123",
+		true, // strictMode=true → must emit --leave-stopped (ADR-0144 D1)
+	)
+	joined := strings.Join(args, " ")
+
+	if !strings.Contains(joined, "--leave-stopped") {
+		t.Errorf("ADR-0144 D1: expected --leave-stopped when strictMode=true and destNetnsFd=''; got: %s", joined)
+	}
+	if !strings.Contains(joined, "--join-ns net:/var/run/netns/cni-abc123") {
+		t.Errorf("expected --join-ns net:<path> on NRI path; got: %s", joined)
+	}
+	if strings.Contains(joined, "--restore-detached") {
+		t.Errorf("--restore-detached must never appear (ADR-0142 D4); got: %s", joined)
 	}
 }
 

@@ -146,6 +146,10 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 // sandboxID is the containerd sandbox (pause container) ID of the replacement pod whose
 // network namespace the restored process must join (ADR-0122). It comes from the NRI pod
 // sandbox object (pod.GetId()).
+// tcpPreservationMode is the value from spec.tcpPreservationMode on the PodMigration CR
+// (ADR-0144): the caller MUST fetch it from the CR BEFORE invoking JoinNsRestore so that
+// --leave-stopped is emitted when mode=Strict. Failure to fetch the CR must default to
+// Strict (fail-closed) to preserve the seq_delta=0 invariant.
 //
 // ADR-0122 + ADR-0125: rather than minting an empty netns (--empty-ns net), JoinNsRestore
 // resolves the replacement pod's sandbox netns via the containerd sandbox API (B1), opens the
@@ -153,8 +157,53 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 // PATH to CRIU via --join-ns net:<path> (ADR-0125 — CRIU 4.2 has no --net-fd flag). The restored
 // process then comes up inside the pod netns, inheriting the pod IP, veth pair, and CNI routing —
 // reachable at the pod IP with no post-restore namespace surgery.
-func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, sandboxID string) (int, error) {
-	return joinNsRestore(migrationName, checkpointDir, "", sandboxID)
+//
+// ADR-0144 Decision Points 1–3: on tcpPreservationMode=Strict, JoinNsRestore passes
+// --leave-stopped to CRIU (via strictMode=true in buildCRIURestoreArgs), calls
+// enforceRestoreOrderingInvariant with deferResume=true after the subprocess returns, and
+// records the restored PID in pendingResumePIDs. SIGCONT fires exclusively from
+// InjectIPHandoff after the OLD-IP datapath is confirmed live. No SIGCONT is sent inline here.
+// ADR-0012 invariant: the source pod is not released until TrafficVerified=True, which only
+// follows InjectIPHandoff returning success — the source is still frozen at the moment the
+// restored tree resumes (ADR-0012).
+func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, sandboxID, tcpPreservationMode string) (int, error) {
+	strictMode := tcpPreservationMode == string(pmv1.TCPPreservationModeStrict)
+	pid, err := joinNsRestore(migrationName, checkpointDir, "", sandboxID, strictMode)
+	if err != nil {
+		return 0, err
+	}
+
+	// ADR-0144 Decision Points 2–3: on the Strict path, enforce the gated-resume invariant.
+	// expectedSocketCount is derived from the number of tcp-stream-*.img files in the checkpoint
+	// directory (ADR-0144 NB-1): on the NRI path req.SeqSnapshots is always 0, so we must count
+	// the tcp-stream image files directly. Using 0 would cause enforceRestoreOrderingInvariant to
+	// return immediately without waiting for SocketsLive, bypassing the invariant entirely.
+	if strictMode {
+		tcpImgs, globErr := filepath.Glob(filepath.Join(checkpointDir, "tcp-stream-*.img"))
+		expectedSocketCount := 0
+		if globErr == nil {
+			expectedSocketCount = len(tcpImgs)
+		}
+		// enforceRestoreOrderingInvariant with deferResume=true: confirms SocketsLive but does
+		// NOT send SIGCONT. The restored tree stays in SIGSTOP; PID is recorded in
+		// pendingResumePIDs for InjectIPHandoff to fire SIGCONT after datapath confirmation.
+		_, resumedAt, orderErr := enforceRestoreOrderingInvariant(pid, migrationName, expectedSocketCount, true)
+		if orderErr != nil {
+			log.Error(orderErr, "JoinNsRestore: ordering invariant FAILED — SIGCONT withheld; "+
+				"NRI callback will return error → containerd marks container failed → operator requeues (ADR-0144 NB-2)",
+				"migration", migrationName, "pid", pid)
+			return 0, fmt.Errorf("JoinNsRestore: ordering invariant: %w", orderErr)
+		}
+		if resumedAt.IsZero() {
+			// SocketsLive confirmed; SIGCONT deferred — record PID for InjectIPHandoff.
+			s.pendingResumePIDsMu.Lock()
+			s.pendingResumePIDs[migrationName] = pid
+			s.pendingResumePIDsMu.Unlock()
+			log.Info("JoinNsRestore: --leave-stopped active, SIGCONT deferred to InjectIPHandoff (ADR-0144)",
+				"migration", migrationName, "pid", pid, "expectedSocketCount", expectedSocketCount)
+		}
+	}
+	return pid, nil
 }
 
 // ReportRestoreConfirmed patches the PodMigration CR status to record that CRIU
@@ -1581,6 +1630,8 @@ print(json.dumps(results))
 }
 
 // buildCRIURestoreArgs constructs the argument list for `criu restore`.
+// strictMode is true when tcpPreservationMode=Strict on the NRI restore path; it causes
+// --leave-stopped to be emitted even when destNetnsFd is empty (ADR-0144 Decision Point 1).
 // Network namespace selection is tier-driven (ADR-0048):
 //   - destNetnsFd non-empty → --join-ns net:<path> + --tcp-established: restore into the
 //     pre-staged migration netns so that TCP seq/ack state is preserved across node handoff.
@@ -1616,7 +1667,7 @@ func checkpointHasEstablishedTCP(checkpointDir string) bool {
 	return len(matches) > 0
 }
 
-func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath string) []string {
+func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath string, strictMode bool) []string {
 	// Choose --tcp-established whenever the checkpoint actually captured an established
 	// TCP connection (presence of a tcp-stream-*.img), NOT merely when a pre-staged
 	// migration netns fd was supplied. The NRI StartContainer restore path joins the
@@ -1673,6 +1724,14 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		// flag is --join-ns net:<path>. The restored process inherits the pod IP, veth, and CNI
 		// routes. No fd is passed via ExtraFiles.
 		args = append(args, "--join-ns", "net:"+petnsPath)
+		if strictMode {
+			// ADR-0144 Decision Point 1: on the NRI path (destNetnsFd==""), strictMode=true means
+			// tcpPreservationMode=Strict. Emit --leave-stopped so the restored process tree stays
+			// in SIGSTOP until InjectIPHandoff fires SIGCONT via pendingResumePIDs. Without this,
+			// the NRI path resumed immediately and could write into an unwired datapath, breaking
+			// seq_delta=0 for actively-writing clients.
+			args = append(args, "--leave-stopped")
+		}
 	}
 	return args
 }
@@ -1698,7 +1757,7 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 //  4. Bring up loopback in the restored process's network namespace.
 //
 // Returns the host PID of the restored process.
-func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) (int, error) {
+func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string, strictMode bool) (int, error) {
 	cfgPath := filepath.Join(checkpointDir, "config.json")
 	cfgData, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -1815,7 +1874,7 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) 
 			"sandboxID", sandboxID, "netnsPath", petnsPath)
 	}
 
-	criuArgs := buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath)
+	criuArgs := buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath, strictMode)
 	// ADR-0124: dynamically scan the (post-patch) mountpoints-*.img for containerd masked-path
 	// external mounts and append their --ext-mount-map <mnt_id>:/dev/null args. Fail loud before
 	// invoking CRIU if any external mount is not safely mappable (D4).
@@ -3063,7 +3122,10 @@ func (s *AgentServer) Restore(_ context.Context, req *agentpb.RestoreRequest) (*
 		// stateless path, joinNsRestore now requires the sandbox netns and will fail loudly —
 		// the live North Star restore flows through the NRI hook (cmd/agent/main.go), which
 		// supplies the sandbox ID from pod.GetId().
-		pid, joinErr := joinNsRestore(req.MigrationName, imagesDir, req.DestNetnsFd, "")
+		// Operator Restore RPC: strictMode=false here because --leave-stopped is already gated
+		// on destNetnsFd != "" inside buildCRIURestoreArgs (the M23 ordering invariant path).
+		// ADR-0144: the NRI path uses strictMode=true when tcpPreservationMode=Strict.
+		pid, joinErr := joinNsRestore(req.MigrationName, imagesDir, req.DestNetnsFd, "", false)
 		restoreDurationMs := time.Since(restoreStart).Milliseconds()
 		if joinErr != nil {
 			return nil, fmt.Errorf("runc restore failed: %w", joinErr)
