@@ -60,6 +60,13 @@ var ErrCtrInFlightTCP = errors.New("ctr checkpoint: in-flight TCP sockets detect
 // Surface as gRPC codes.FailedPrecondition at the gRPC boundary.
 var ErrCRIUCapability = criu.ErrCRIUCapability
 
+// ErrRestoredPIDNotFound is returned by the cgroup-anchored restored-PID scan (ADR-0123 D2)
+// when, after CRIU exits 0, no process resident in the replacement pod's cgroup can be found
+// within the scan timeout. On the cold (--net-fd) path the caller MUST fail loud on this error
+// and MUST NOT fall back to the name-based findRestoredProcessPID scan, and MUST NOT set
+// criuRestoreConfirmed (ADR-0123 D2 step 5 / AC5).
+var ErrRestoredPIDNotFound = errors.New("restored process PID not found in replacement pod cgroup")
+
 // zwHoldState tracks per-migration zero-window hold state including armed timestamp and
 // watchdog cancel for auto-disarm on FreezeWindowBudgetMs + margin expiry.
 type zwHoldState struct {
@@ -716,25 +723,58 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) 
 	if err := criuCmd.Start(); err != nil {
 		return 0, fmt.Errorf("criu restore start: %w", err)
 	}
-	// Give CRIU time to fork and restore the process tree before we scan /proc.
-	time.Sleep(500 * time.Millisecond)
-	// Check for early exit — if CRIU failed it will have exited already.
-	if criuCmd.ProcessState != nil && criuCmd.ProcessState.Exited() {
-		logContent, _ := os.ReadFile(restoreLogPath)
-		return 0, fmt.Errorf("criu restore exited prematurely\nlog:\n%s", logContent)
+
+	// ADR-0123 D1: reap CRIU and gate on its exit code. CRIU on the cold (--net-fd) path is
+	// NOT --leave-stopped (that flag is only on the --join-ns path), so it self-exits once the
+	// process tree is restored and Wait() returns promptly. Wait() is called exactly once here;
+	// no deferred cleanup also waits on this command (Arch-A double-Wait guard).
+	//
+	// A non-nil Wait() error (including any non-zero exit code, which Wait surfaces as
+	// *exec.ExitError) means the restore failed: return immediately, do NOT scan for a PID, do
+	// NOT set criuRestoreConfirmed. The error carries the CRIU exit code and a bounded tail of
+	// restore.log for diagnosis (Decision 1 / AC5; Security note: tail capped at 4 KiB).
+	if waitErr := criuCmd.Wait(); waitErr != nil {
+		exitCode := -1
+		if criuCmd.ProcessState != nil {
+			exitCode = criuCmd.ProcessState.ExitCode()
+		}
+		return 0, fmt.Errorf("criu restore failed (exit code %d): %w\nrestore.log tail:\n%s",
+			exitCode, waitErr, readLogTail(restoreLogPath, 4096))
 	}
 
-	// Step 5: Find the restored process by scanning /proc for the process name.
-	time.Sleep(200 * time.Millisecond)
-	pid, err := findRestoredProcessPID(checkpointDir)
-	if err != nil {
-		return 0, err
+	// ADR-0123 D3: verify restore.log was produced and is non-empty on the cold path. CRIU has
+	// exited 0 at this point, so the log must exist; an empty/missing log indicates the log
+	// target was dropped or CRIU never wrote it (the present-but-unverified Bug-2 gap).
+	if fi, statErr := os.Stat(restoreLogPath); statErr != nil || fi.Size() == 0 {
+		return 0, fmt.Errorf("criu restore reported exit 0 but restore.log is missing or empty at %s "+
+			"(ADR-0123 D3 verification failed): %v", restoreLogPath, statErr)
+	}
+
+	// Step 5: ADR-0123 D2 — locate the restored application PID via the replacement pod's
+	// cgroup, NOT by process name. CRIU has exited (D1), so its PID can no longer be confused
+	// with the application and there is no zombie to match. On the cold (--net-fd) path the
+	// sandboxID anchors the pod cgroup; the comm-based findRestoredProcessPID is never used as a
+	// fallback (D2 step 5). The --join-ns Restore path (no sandboxID) is out of Sprint-18 scope
+	// and retains the legacy name/cgroup scan.
+	var pid int
+	if sandboxID != "" {
+		pid, err = findRestoredPIDByCgroup(sandboxID)
+		if err != nil {
+			// Fail loud — never fall back to comm-scan on the cold path (D2 step 5 / AC5).
+			return 0, err
+		}
+	} else {
+		pid, err = findRestoredProcessPID(checkpointDir)
+		if err != nil {
+			return 0, err
+		}
 	}
 	log.Info("joinNsRestore: found restored process", "pid", pid)
 
-	// Step 6: Ensure loopback is up in the restored process's net namespace.
-	// On the ADR-0122 --net-fd path this is the CNI-wired pod netns (lo is normally already
-	// up); on the --join-ns path it is the pre-staged migration netns. Idempotent either way.
+	// Step 6: ADR-0123 D4 — bring loopback up in the RESTORED application's net namespace,
+	// using the PID resolved from the pod cgroup (never the CRIU PID). On the --net-fd path this
+	// is the CNI-wired pod netns (lo is normally already up); on the --join-ns path it is the
+	// pre-staged migration netns. Idempotent either way.
 	if out, err := exec.Command("nsenter",
 		fmt.Sprintf("--net=/proc/%d/ns/net", pid), "--",
 		"ip", "link", "set", "lo", "up",
@@ -744,6 +784,205 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) 
 
 	success = true
 	return pid, nil
+}
+
+// readLogTail returns at most maxBytes of the tail of the file at path, prefixed with a marker
+// when truncated. Best-effort: returns a short diagnostic string on read error rather than
+// failing, so it is safe to embed in an error message. The bound (Security note 2) prevents a
+// hostile/huge restore.log from blowing up the error string.
+func readLogTail(path string, maxBytes int64) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Sprintf("(restore.log unavailable: %v)", err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return fmt.Sprintf("(restore.log stat failed: %v)", err)
+	}
+	size := fi.Size()
+	if size == 0 {
+		return "(restore.log empty)"
+	}
+	start := int64(0)
+	truncated := false
+	if size > maxBytes {
+		start = size - maxBytes
+		truncated = true
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return fmt.Sprintf("(restore.log seek failed: %v)", err)
+	}
+	buf, err := io.ReadAll(f)
+	if err != nil {
+		return fmt.Sprintf("(restore.log read failed: %v)", err)
+	}
+	if truncated {
+		return "...(truncated to last 4 KiB)...\n" + string(buf)
+	}
+	return string(buf)
+}
+
+// findRestoredPIDByCgroup implements ADR-0123 Decision 2: resolve the restored application PID
+// by cgroup membership in the replacement pod, anchored on the pod's pause/sandbox container.
+//
+//  1. Resolve the pause PID for sandboxID (the ADR-0122 sandbox anchor) via `ctr tasks list`,
+//     then read /proc/<pausePID>/cgroup to obtain the pod cgroup path. If the pause PID has
+//     exited (TOCTOU), fail loud rather than scanning an empty cgroup (Security/Runtime note 3).
+//  2. Scan /proc/*/cgroup for processes whose cgroup path matches the pod-UID subtree exactly
+//     (not a prefix that could match a sibling pod), excluding the CRIU binary and the pause PID.
+//  3. Among survivors, select the restored tree's root/leader: a cgroup-resident process whose
+//     PPid is NOT itself in the pod cgroup (CRIU exited, so the tree was reparented to the agent
+//     subreaper / PID 1). Tie-break by LOWEST PID — the leader starts first; higher PIDs are its
+//     children. "Highest PID" is explicitly wrong (can pick a transient child).
+//  4. Retry for up to 10s at 200ms intervals to allow reparenting to become observable.
+//  5. On zero candidates after timeout, return ErrRestoredPIDNotFound (no comm-scan fallback).
+func findRestoredPIDByCgroup(sandboxID string) (int, error) {
+	pausePID, err := sandboxPausePID(sandboxID)
+	if err != nil {
+		return 0, fmt.Errorf("ADR-0123 D2: resolve pause PID for sandbox %s: %w", sandboxID, err)
+	}
+	// Read the pod cgroup path from the pause container. TOCTOU: if the pause PID has exited,
+	// /proc/<pid>/cgroup is gone — fail loud, never scan an empty cgroup (Security note 3).
+	podCgroup, err := cgroupV2Path(pausePID)
+	if err != nil {
+		return 0, fmt.Errorf("ADR-0123 D2: read pod cgroup from pause PID %d (sandbox %s): %w",
+			pausePID, sandboxID, err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		pid, found := scanCgroupForRestoredRoot(podCgroup, pausePID)
+		if found {
+			log.Info("findRestoredPIDByCgroup: resolved restored PID via pod cgroup (ADR-0123 D2)",
+				"pid", pid, "sandboxID", sandboxID, "pausePID", pausePID, "podCgroup", podCgroup)
+			return pid, nil
+		}
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("%w (sandbox %s, podCgroup %s, pausePID %d, 10s timeout)",
+				ErrRestoredPIDNotFound, sandboxID, podCgroup, pausePID)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// scanCgroupForRestoredRoot performs one pass of the ADR-0123 D2 scan over /proc. It returns the
+// lowest-PID cgroup-resident process whose parent is NOT in the pod cgroup (the reparented tree
+// root), excluding the pause PID and the CRIU binary. found is false when no candidate exists.
+func scanCgroupForRestoredRoot(podCgroup string, pausePID int) (int, bool) {
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, false
+	}
+
+	// First collect the set of cgroup-resident PIDs so we can test parentage against it.
+	resident := make(map[int]bool)
+	for _, p := range procs {
+		if !p.IsDir() {
+			continue
+		}
+		pid, convErr := strconv.Atoi(p.Name())
+		if convErr != nil || pid == pausePID {
+			continue
+		}
+		if procInPodCgroup(pid, podCgroup) {
+			resident[pid] = true
+		}
+	}
+
+	bestPID := 0
+	for pid := range resident {
+		// Exclude the CRIU binary (it has exited on the cold path, but guard defensively).
+		comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+		if strings.TrimSpace(string(comm)) == "criu" {
+			continue
+		}
+		// Root/leader = a cgroup-resident process whose parent is NOT in the pod cgroup.
+		ppid := procPPid(pid)
+		if resident[ppid] {
+			continue // this is a child of another in-cgroup process, not the tree root
+		}
+		// Tie-break by LOWEST PID (the leader starts first).
+		if bestPID == 0 || pid < bestPID {
+			bestPID = pid
+		}
+	}
+	if bestPID == 0 {
+		return 0, false
+	}
+	return bestPID, true
+}
+
+// procInPodCgroup reports whether the cgroup v2 path of pid is within the podCgroup subtree
+// (exact subtree match, not a sibling-pod-matching prefix). A process is in the subtree when its
+// path equals podCgroup or is a descendant (podCgroup + "/...").
+func procInPodCgroup(pid int, podCgroup string) bool {
+	path, err := cgroupV2Path(pid)
+	if err != nil {
+		return false
+	}
+	return path == podCgroup || strings.HasPrefix(path, podCgroup+"/")
+}
+
+// cgroupV2Path returns the unified cgroup v2 path (the "0::<path>" entry) for pid from
+// /proc/<pid>/cgroup. Returns an error if the file cannot be read (e.g. the PID has exited) or
+// has no unified entry.
+func cgroupV2Path(pid int) (string, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "0::") {
+			return strings.TrimPrefix(line, "0::"), nil
+		}
+	}
+	return "", fmt.Errorf("no cgroup v2 (0::) entry in /proc/%d/cgroup", pid)
+}
+
+// procPPid returns the parent PID of pid by reading field 4 (PPid) of /proc/<pid>/status.
+// Returns 0 on any read/parse error.
+func procPPid(pid int) int {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "PPid:") {
+			fields := strings.Fields(line)
+			if len(fields) == 2 {
+				ppid, _ := strconv.Atoi(fields[1])
+				return ppid
+			}
+		}
+	}
+	return 0
+}
+
+// sandboxPausePID resolves the host PID of the pause/sandbox container identified by sandboxID
+// via `ctr --namespace k8s.io tasks list`. The sandbox ID is the pause container's containerd
+// task ID (from the NRI pod sandbox object, pod.GetId()), so its PID is the task's PID.
+func sandboxPausePID(sandboxID string) (int, error) {
+	out, err := exec.Command("ctr", "--namespace", "k8s.io", "tasks", "list").Output()
+	if err != nil {
+		return 0, fmt.Errorf("ctr tasks list: %w", err)
+	}
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines[1:] { // skip header
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if fields[0] != sandboxID {
+			continue
+		}
+		pid, convErr := strconv.Atoi(fields[1])
+		if convErr != nil || pid == 0 {
+			return 0, fmt.Errorf("sandbox %s task has invalid PID %q", sandboxID, fields[1])
+		}
+		return pid, nil
+	}
+	return 0, fmt.Errorf("sandbox %s not found in ctr tasks list (pause container may have exited)", sandboxID)
 }
 
 // patchCheckpointImages modifies the CRIU image files in checkpointDir to remove entries
