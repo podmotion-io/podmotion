@@ -405,6 +405,16 @@ type PodMigrationStatus struct {
 	// +optional
 	DataIntact *bool `json:"dataIntact,omitempty"`
 
+	// CRIURestoreConfirmed is set to true by the NRI plugin after JoinNsRestore
+	// completes successfully, confirming memory images were replayed.
+	// +optional
+	CRIURestoreConfirmed *bool `json:"criuRestoreConfirmed,omitempty"`
+
+	// RestoredPID is the root PID of the restored container process tree,
+	// set by the NRI plugin after successful CRIU restore.
+	// +optional
+	RestoredPID int32 `json:"restoredPID,omitempty"`
+
 	// StorageTier is the detected storage migration tier (0=RWX, 1=Longhorn, 2=CephRBD, 3=SnapshotRsync, 4=Blocked).
 	// +optional
 	StorageTier *int32 `json:"storageTier,omitempty"`

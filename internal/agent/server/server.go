@@ -127,6 +127,36 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir string) (int, e
 	return joinNsRestore(migrationName, checkpointDir, "")
 }
 
+// ReportRestoreConfirmed patches the PodMigration CR status to record that CRIU
+// restore completed successfully (ADR-0120 D3). It sets criuRestoreConfirmed=true
+// and restoredPID on the named migration's status subresource. migrationName is the
+// PodMigration object name (equal to the checkpoint-ref); namespace is the CR namespace.
+func (s *AgentServer) ReportRestoreConfirmed(ctx context.Context, migrationName, namespace string, pid int32) error {
+	if s.k8sClient == nil {
+		return fmt.Errorf("ReportRestoreConfirmed: no k8s client available on agent server")
+	}
+	if migrationName == "" || namespace == "" {
+		return fmt.Errorf("ReportRestoreConfirmed: migrationName and namespace are required (got %q/%q)", namespace, migrationName)
+	}
+
+	pm := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: migrationName}, pm); err != nil {
+		return fmt.Errorf("ReportRestoreConfirmed: get PodMigration %s/%s: %w", namespace, migrationName, err)
+	}
+
+	base := pm.DeepCopy()
+	confirmed := true
+	pm.Status.CRIURestoreConfirmed = &confirmed
+	pm.Status.RestoredPID = pid
+
+	if err := s.k8sClient.Status().Patch(ctx, pm, client.MergeFrom(base)); err != nil {
+		return fmt.Errorf("ReportRestoreConfirmed: patch status %s/%s: %w", namespace, migrationName, err)
+	}
+	log.Info("ReportRestoreConfirmed: criuRestoreConfirmed set true",
+		"migration", migrationName, "namespace", namespace, "restoredPID", pid)
+	return nil
+}
+
 // ListenAndServe starts the gRPC server on addr (default ":9090").
 // tlsCfg may be nil for insecure mode (dev/test only).
 // Blocks until ctx is cancelled.

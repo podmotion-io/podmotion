@@ -1515,11 +1515,25 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 
 	// If a concurrent reconcile already claimed the checkpoint slot (Unknown/InProgress),
 	// requeue and wait — never run two CRIU dumps on the same process.
+	// ADR-0118: if the claim is stale (older than 30 s) the agent that set it has likely
+	// restarted; clear the claim so the operator can re-issue the RPC to the fresh agent.
+	const checkpointClaimStaleness = 30 * time.Second
 	condCP := meta.FindStatusCondition(pm.Status.Conditions, conditionCheckpointed)
 	if condCP != nil && condCP.Status == metav1.ConditionUnknown && condCP.Reason == "InProgress" {
-		log.Info("checkpoint already in progress (claimed by concurrent reconcile) — requeuing",
-			"migration", pm.Name)
-		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+		age := time.Since(condCP.LastTransitionTime.Time)
+		if age < checkpointClaimStaleness {
+			log.Info("checkpoint already in progress (claimed by concurrent reconcile) — requeuing",
+				"migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+		}
+		// Stale claim — agent likely restarted mid-checkpoint; clear and retry.
+		log.Info("checkpoint claim is stale (agent restart suspected) — clearing claim and retrying",
+			"migration", pm.Name, "claimAge", age.Round(time.Second).String())
+		meta.RemoveStatusCondition(&pm.Status.Conditions, conditionCheckpointed)
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return ctrl.Result{}, fmt.Errorf("clearing stale checkpoint claim: %w", err)
+		}
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Check for a prior CheckpointFailed signal before issuing a fresh call.
@@ -2257,13 +2271,71 @@ func (r *PodMigrationReconciler) reconcileRestoringNRI(ctx context.Context, pm *
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
-	log.Info("replacement pod Running and Ready — NRI CRIU restore complete",
+	log.Info("replacement pod Running and Ready — precondition met, awaiting CRIU restore confirmation",
 		"migration", pm.Name, "replacementPod", pm.Status.ReplacementPodName,
 		"destNode", replacement.Spec.NodeName)
 
+	// ADR-0120 D1/D4: pod readiness is only a precondition, NOT restore evidence.
+	// A freshly-scheduled container reaches Running/Ready with no CRIU restore at all
+	// (Redis boots empty). The authoritative signal is status.criuRestoreConfirmed,
+	// written by the NRI plugin after JoinNsRestore succeeds (D2/D3). Poll for it with a
+	// bounded timeout; on timeout set conditionRestored=False (never default to true).
+	const criuConfirmTimeout = 60 * time.Second
+	const criuConfirmAnnotation = "podmotion.io/restore-confirm-wait-start"
+
+	// Re-fetch the CR so we observe the latest criuRestoreConfirmed written by the agent.
+	fresh := &pmv1.PodMigration{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(pm), fresh); err == nil {
+		pm.Status.CRIURestoreConfirmed = fresh.Status.CRIURestoreConfirmed
+		pm.Status.RestoredPID = fresh.Status.RestoredPID
+	}
+
+	if pm.Status.CRIURestoreConfirmed == nil || !*pm.Status.CRIURestoreConfirmed {
+		// Stamp the wait-start time on first entry so the 60s budget is measured from when
+		// the pod first became Ready, surviving across requeues.
+		waitStart := time.Now()
+		if pm.Annotations == nil {
+			pm.Annotations = make(map[string]string)
+		}
+		if v, ok := pm.Annotations[criuConfirmAnnotation]; ok {
+			if t, perr := time.Parse(time.RFC3339, v); perr == nil {
+				waitStart = t
+			}
+		} else {
+			pm.Annotations[criuConfirmAnnotation] = waitStart.Format(time.RFC3339)
+			if err := r.Update(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
+		if time.Since(waitStart) >= criuConfirmTimeout {
+			msg := fmt.Sprintf("CRIU restore was not confirmed within %s — replacement pod %s reached Ready "+
+				"but the NRI plugin never set criuRestoreConfirmed (memory state not restored)",
+				criuConfirmTimeout, pm.Status.ReplacementPodName)
+			log.Error(fmt.Errorf("restore not confirmed"), msg, "migration", pm.Name)
+			setCondition(pm, conditionRestored, metav1.ConditionFalse, "RestoreNotConfirmed", msg)
+			if err := r.statusUpdate(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+			// Do NOT mark Complete. Requeue so a late confirmation (or operator action)
+			// can still be observed; the timeout condition stands until then.
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+
+		log.Info("CRIU restore not yet confirmed — polling criuRestoreConfirmed",
+			"migration", pm.Name, "replacementPod", pm.Status.ReplacementPodName,
+			"elapsed", time.Since(waitStart).Truncate(time.Second).String(),
+			"timeout", criuConfirmTimeout.String())
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	log.Info("CRIU restore confirmed by NRI plugin — restore authoritative",
+		"migration", pm.Name, "replacementPod", pm.Status.ReplacementPodName,
+		"restoredPID", pm.Status.RestoredPID, "destNode", replacement.Spec.NodeName)
+
 	setCondition(pm, conditionRestored, metav1.ConditionTrue, "Restored",
-		fmt.Sprintf("NRI StartContainer hook restored process into replacement pod %s",
-			pm.Status.ReplacementPodName))
+		fmt.Sprintf("NRI JoinNsRestore confirmed CRIU restore into replacement pod %s (restoredPID=%d)",
+			pm.Status.ReplacementPodName, pm.Status.RestoredPID))
 
 	// ADR-0015 overlap-then-delete: add destination IP to EndpointSlices.
 	if pm.Spec.SourcePodIP != "" && replacement.Status.PodIP != "" {
@@ -2896,6 +2968,14 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 		newAnnotations[k] = v
 	}
 	delete(newAnnotations, "kubectl.kubernetes.io/last-applied-configuration")
+
+	// ADR-0120 D3: stamp the checkpoint-ref so the NRI StartContainer hook fires CRIU
+	// restore, and the migration namespace so the NRI plugin can patch the correct
+	// PodMigration CR with criuRestoreConfirmed after JoinNsRestore succeeds.
+	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
+		newAnnotations["podmotion.io/checkpoint-ref"] = pm.Status.CheckpointRef.Name
+		newAnnotations["podmotion.io/migration-namespace"] = pm.Namespace
+	}
 
 	// Deep-copy spec; clear scheduler-assigned and mutable fields.
 	spec := *sourcePod.Spec.DeepCopy()

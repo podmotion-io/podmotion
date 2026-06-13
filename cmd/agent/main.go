@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -43,6 +44,10 @@ func init() {
 
 func main() {
 	log := zap.New().WithName("podmotion-agent")
+	// Wire the controller-runtime global logger so packages that use ctrl.Log / logf.Log
+	// (e.g. internal/agent/server, internal/agent/nri) produce structured output instead
+	// of panicking with "log.SetLogger(...) was never called".
+	ctrl.SetLogger(log)
 
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
@@ -160,6 +165,19 @@ func main() {
 				return err
 			}
 			log.Info("NRI CRIU restore complete", "container", event.ID, "restoredPID", pid)
+
+			// ADR-0120 D3: propagate authoritative restore confirmation back to the
+			// PodMigration CR. The migration name equals the checkpoint-ref; the CR
+			// namespace is carried on the replacement pod via podmotion.io/migration-namespace.
+			migrationNamespace := event.Annotations["podmotion.io/migration-namespace"]
+			if migrationNamespace == "" {
+				migrationNamespace = event.Namespace // fall back to the pod's namespace
+			}
+			if err := agentSrv.ReportRestoreConfirmed(ctx, checkpointRef, migrationNamespace, int32(pid)); err != nil {
+				log.Error(err, "NRI CRIU restore: failed to report confirmation to CR — controller poll will time out",
+					"migration", checkpointRef, "namespace", migrationNamespace)
+				return err
+			}
 			return nil
 		},
 	).WithK8sVerification(k8sClient, nodeName)
