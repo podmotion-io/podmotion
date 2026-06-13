@@ -1738,6 +1738,50 @@ func (x *ConfirmOverlayReadyResponse) GetPredicateFOk() bool       { return x.Pr
 func (x *ConfirmOverlayReadyResponse) GetTsDelta() int32           { return x.TsDelta }
 func (x *ConfirmOverlayReadyResponse) GetDestClockNs() int64       { return x.DestClockNs }
 
+// VerifyTCPRequest is the hand-patched Go struct for the VerifyTCP RPC (M22).
+type VerifyTCPRequest struct {
+	MigrationName      string         `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`
+	PodUid             string         `protobuf:"bytes,2,opt,name=pod_uid,json=podUid,proto3" json:"pod_uid,omitempty"`
+	SourceSeqSnapshots []*SeqSnapshot `protobuf:"bytes,3,rep,name=source_seq_snapshots,json=sourceSeqSnapshots,proto3" json:"source_seq_snapshots,omitempty"`
+	AppProbeProtocol   string         `protobuf:"bytes,4,opt,name=app_probe_protocol,json=appProbeProtocol,proto3" json:"app_probe_protocol,omitempty"`
+	AppProbeAddress    string         `protobuf:"bytes,5,opt,name=app_probe_address,json=appProbeAddress,proto3" json:"app_probe_address,omitempty"`
+	AppProbeQuery      string         `protobuf:"bytes,6,opt,name=app_probe_query,json=appProbeQuery,proto3" json:"app_probe_query,omitempty"`
+	AppProbeTimeoutS   int32          `protobuf:"varint,7,opt,name=app_probe_timeout_s,json=appProbeTimeoutS,proto3" json:"app_probe_timeout_s,omitempty"`
+}
+
+func (x *VerifyTCPRequest) Reset()         {}
+func (x *VerifyTCPRequest) String() string  { return x.MigrationName }
+func (x *VerifyTCPRequest) ProtoMessage()   {}
+
+func (x *VerifyTCPRequest) GetMigrationName() string              { return x.MigrationName }
+func (x *VerifyTCPRequest) GetPodUid() string                     { return x.PodUid }
+func (x *VerifyTCPRequest) GetSourceSeqSnapshots() []*SeqSnapshot { return x.SourceSeqSnapshots }
+func (x *VerifyTCPRequest) GetAppProbeProtocol() string           { return x.AppProbeProtocol }
+func (x *VerifyTCPRequest) GetAppProbeAddress() string            { return x.AppProbeAddress }
+func (x *VerifyTCPRequest) GetAppProbeQuery() string              { return x.AppProbeQuery }
+func (x *VerifyTCPRequest) GetAppProbeTimeoutS() int32            { return x.AppProbeTimeoutS }
+
+// VerifyTCPResponse is the hand-patched Go struct for the VerifyTCP RPC (M22).
+type VerifyTCPResponse struct {
+	Verified             bool   `protobuf:"varint,1,opt,name=verified,proto3" json:"verified,omitempty"`
+	FailureReason        string `protobuf:"bytes,2,opt,name=failure_reason,json=failureReason,proto3" json:"failure_reason,omitempty"`
+	ConnectionsVerified  int32  `protobuf:"varint,3,opt,name=connections_verified,json=connectionsVerified,proto3" json:"connections_verified,omitempty"`
+	ConnectionsExpected  int32  `protobuf:"varint,4,opt,name=connections_expected,json=connectionsExpected,proto3" json:"connections_expected,omitempty"`
+	AppProbeOk           bool   `protobuf:"varint,5,opt,name=app_probe_ok,json=appProbeOk,proto3" json:"app_probe_ok,omitempty"`
+	AppProbeError        string `protobuf:"bytes,6,opt,name=app_probe_error,json=appProbeError,proto3" json:"app_probe_error,omitempty"`
+}
+
+func (x *VerifyTCPResponse) Reset()         {}
+func (x *VerifyTCPResponse) String() string  { return "" }
+func (x *VerifyTCPResponse) ProtoMessage()   {}
+
+func (x *VerifyTCPResponse) GetVerified() bool              { return x.Verified }
+func (x *VerifyTCPResponse) GetFailureReason() string       { return x.FailureReason }
+func (x *VerifyTCPResponse) GetConnectionsVerified() int32  { return x.ConnectionsVerified }
+func (x *VerifyTCPResponse) GetConnectionsExpected() int32  { return x.ConnectionsExpected }
+func (x *VerifyTCPResponse) GetAppProbeOk() bool            { return x.AppProbeOk }
+func (x *VerifyTCPResponse) GetAppProbeError() string       { return x.AppProbeError }
+
 type ArmZeroWindowRequest struct {
 	state                protoimpl.MessageState `protogen:"open.v1"`
 	MigrationName        string                 `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`

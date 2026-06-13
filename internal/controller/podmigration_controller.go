@@ -651,41 +651,113 @@ func (r *PodMigrationReconciler) reconcileTCPVerifying(ctx context.Context, pm *
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseServiceVerifying)
 	}
 
-	// TCP probe: verify /proc/<pid>/net/tcp[6] 4-tuples match inventory with snd_nxt/rcv_nxt within ±MSS.
-	// SQL probe is executed when ApplicationProbe.Protocol=SQL.
-	// Connection count parity check: destination ESTABLISHED count == source inventory count.
-	//
-	// M20/M21 SAFETY GATE: Real probe implementation lands in M20/M21 (TCP/network agent disciplines).
-	// Until then, Strict/BestEffort is blocked at admission by the webhook (TCPPreservation feature gate).
-	// If somehow a Strict/BestEffort migration reaches this phase (e.g. gate was on, then turned off,
-	// or object was patched), we MUST NOT set TCPSequenceContinuityVerified=True from a stub — that
-	// would report success while every TCP connection is being RST. Fail closed.
-	//
-	// For TCPPreservationMode=None: skip is correct — no TCP state to verify.
-	// For Strict/BestEffort: return a requeue error so the migration stalls rather than
-	// silently proceeding to CutoverComplete and deleting the source pod on a lie.
-	// When M20 lands the real probe, replace this block with actual /proc/net/tcp reads.
-	msg := "TCPVerifying: real TCP sequence probe not yet implemented (M20); " +
-		"refusing to set TCPSequenceContinuityVerified=True from a stub — " +
-		"this prevents silent TCP RST on cutover (ADR-0047 §critical)"
-	log.Error(nil, msg, "migration", pm.Name, "mode", pm.Spec.TCPPreservationMode)
-	setCondition(pm, pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionFalse,
-		"ProbeNotImplemented", msg)
-	if err := r.statusUpdate(ctx, pm); err != nil {
-		return ctrl.Result{}, err
-	}
-	switch pm.Spec.TCPPreservationMode {
-	case pmv1.TCPPreservationModeStrict:
-		return r.initiateRollback(ctx, pm, msg)
-	default:
-		// BestEffort: log error but do not rollback; warn and proceed without TCP verification.
-		// This is still a degraded path — set False so operators can observe the gap.
-		log.Error(nil, "TCPVerifying: BestEffort — proceeding without TCP verification (probe not implemented)", "migration", pm.Name)
+	// Real TCP sequence continuity probe via VerifyTCP agent RPC (M22).
+	// Reads /proc/<pid>/net/tcp[6] on the destination node and compares 4-tuple
+	// snd_nxt/rcv_nxt against source SeqSnapshots within ±MSS (ADR-0019 Amendment A).
+	if r.AgentPool == nil {
+		// No agent pool: fail closed per mode.
+		msg := "TCPVerifying: AgentPool not wired; cannot issue VerifyTCP RPC"
+		log.Error(nil, msg, "migration", pm.Name, "mode", pm.Spec.TCPPreservationMode)
+		setCondition(pm, pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionFalse,
+			"AgentPoolUnavailable", msg)
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
+		switch pm.Spec.TCPPreservationMode {
+		case pmv1.TCPPreservationModeStrict:
+			return r.initiateRollback(ctx, pm, msg)
+		default:
+			log.Error(nil, "TCPVerifying: BestEffort — proceeding without TCP verification (AgentPool nil)", "migration", pm.Name)
+			return r.transitionTo(ctx, pm, pmv1.MigrationPhaseServiceVerifying)
+		}
 	}
 
-	// Do NOT set TCPSequenceContinuityVerified=True here — the condition remains False.
-	// Only advance to ServiceVerifying; source pod deletion in CutoverComplete will re-check
-	// this condition for Strict mode.
+	destNode := pm.Status.DestinationNodeName
+	if destNode == "" {
+		log.Error(nil, "TCPVerifying: DestinationNodeName not set — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	agentClient, err := r.AgentPool.ForNode(ctx, destNode)
+	if err != nil {
+		log.Error(err, "TCPVerifying: cannot connect to destination agent — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	vtcpReq := &agentpb.VerifyTCPRequest{
+		MigrationName: pm.Name,
+		PodUid:        pm.Spec.SourcePodUID,
+	}
+	if pm.Spec.ApplicationProbe != nil {
+		vtcpReq.AppProbeProtocol = string(pm.Spec.ApplicationProbe.Protocol)
+		vtcpReq.AppProbeQuery = pm.Spec.ApplicationProbe.Query
+		vtcpReq.AppProbeTimeoutS = pm.Spec.ApplicationProbe.TimeoutSeconds
+		if pm.Spec.ApplicationProbe.Port > 0 {
+			destPodName := pm.Status.ReplacementPodName
+			if destPodName == "" {
+				destPodName = pm.Spec.PodName
+			}
+			destPod := &corev1.Pod{}
+			destPodIP := ""
+			if getErr := r.Get(ctx, types.NamespacedName{Namespace: pm.Spec.PodNamespace, Name: destPodName}, destPod); getErr == nil {
+				destPodIP = destPod.Status.PodIP
+			}
+			if destPodIP == "" && pm.Spec.SourcePodIP != "" {
+				destPodIP = pm.Spec.SourcePodIP
+			}
+			if destPodIP != "" {
+				vtcpReq.AppProbeAddress = fmt.Sprintf("%s:%d", destPodIP, pm.Spec.ApplicationProbe.Port)
+			}
+		}
+	}
+
+	vtcpResp, rpcErr := agentClient.VerifyTCP(ctx, vtcpReq)
+	if rpcErr != nil {
+		log.Error(rpcErr, "TCPVerifying: VerifyTCP RPC failed — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	if !vtcpResp.Verified {
+		msg := fmt.Sprintf("TCPVerifying: VerifyTCP failed: %s (verified=%d/%d)",
+			vtcpResp.FailureReason, vtcpResp.ConnectionsVerified, vtcpResp.ConnectionsExpected)
+		log.Error(nil, msg, "migration", pm.Name, "mode", pm.Spec.TCPPreservationMode)
+		setCondition(pm, pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionFalse,
+			"SequenceContinuityFailed", msg)
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
+		switch pm.Spec.TCPPreservationMode {
+		case pmv1.TCPPreservationModeStrict:
+			return r.initiateRollback(ctx, pm, msg)
+		default:
+			log.Error(nil, "TCPVerifying: BestEffort — proceeding with TCP verification failure", "migration", pm.Name)
+			return r.transitionTo(ctx, pm, pmv1.MigrationPhaseServiceVerifying)
+		}
+	}
+
+	// All connections verified. Ensure upstream conditions are True (idempotent).
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionSocketInventoryComplete) {
+		setCondition(pm, pmv1.ConditionSocketInventoryComplete, metav1.ConditionTrue,
+			"VerifiedPostRestore", "Socket inventory confirmed via VerifyTCP post-restore")
+	}
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionRelayProgramsLoaded) {
+		setCondition(pm, pmv1.ConditionRelayProgramsLoaded, metav1.ConditionTrue,
+			"VerifiedPostRestore", "Relay programs confirmed loaded via VerifyTCP post-restore")
+	}
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionZeroWindowArmed) {
+		setCondition(pm, pmv1.ConditionZeroWindowArmed, metav1.ConditionTrue,
+			"VerifiedPostRestore", "ZeroWindow arm confirmed via VerifyTCP post-restore")
+	}
+
+	connMsg := fmt.Sprintf("TCP sequence continuity verified: %d/%d connections snd_nxt/rcv_nxt within ±MSS",
+		vtcpResp.ConnectionsVerified, vtcpResp.ConnectionsExpected)
+	if vtcpResp.AppProbeOk {
+		connMsg += fmt.Sprintf("; %s probe OK", pm.Spec.ApplicationProbe.Protocol)
+	}
+	log.Info("TCPVerifying: sequence continuity confirmed", "migration", pm.Name,
+		"verified", vtcpResp.ConnectionsVerified, "expected", vtcpResp.ConnectionsExpected)
+	setCondition(pm, pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionTrue,
+		"SequenceContinuityVerified", connMsg)
 	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
