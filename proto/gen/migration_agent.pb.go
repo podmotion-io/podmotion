@@ -413,9 +413,14 @@ type CheckpointResponse struct {
 	// seq_snapshots holds the TCP sequence state for every ESTABLISHED socket
 	// in the container netns at the exact freeze instant (ADR-0049).
 	// Populated when TCPPreservationMode is Strict or BestEffort.
-	SeqSnapshots  []*SeqSnapshot `protobuf:"bytes,4,rep,name=seq_snapshots,json=seqSnapshots,proto3" json:"seq_snapshots,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SeqSnapshots []*SeqSnapshot `protobuf:"bytes,4,rep,name=seq_snapshots,json=seqSnapshots,proto3" json:"seq_snapshots,omitempty"`
+	// freeze_timestamp_ns is CLOCK_REALTIME nanoseconds captured at the exact
+	// moment the CRIU dump completes and the process enters SIGSTOP.
+	// The controller passes this as source_freeze_timestamp_ns in RestoreRequest
+	// so the destination agent can compute the PAWS ts_delta.
+	FreezeTimestampNs int64 `protobuf:"varint,5,opt,name=freeze_timestamp_ns,json=freezeTimestampNs,proto3" json:"freeze_timestamp_ns,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *CheckpointResponse) Reset() {
@@ -474,6 +479,13 @@ func (x *CheckpointResponse) GetSeqSnapshots() []*SeqSnapshot {
 		return x.SeqSnapshots
 	}
 	return nil
+}
+
+func (x *CheckpointResponse) GetFreezeTimestampNs() int64 {
+	if x != nil {
+		return x.FreezeTimestampNs
+	}
+	return 0
 }
 
 // SeqSnapshot captures TCP sequence state for a single connection at freeze time.
@@ -2374,12 +2386,13 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\x11CheckpointRequest\x12%\n" +
 	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12*\n" +
 	"\x11apply_zero_window\x18\x03 \x01(\bR\x0fapplyZeroWindow\x12-\n" +
-	"\x12workload_namespace\x18\x04 \x01(\tR\x11workloadNamespaceJ\x04\b\x02\x10\x03R\x0ftcp_established\"\xe9\x01\n" +
+	"\x12workload_namespace\x18\x04 \x01(\tR\x11workloadNamespaceJ\x04\b\x02\x10\x03R\x0ftcp_established\"\x99\x02\n" +
 	"\x12CheckpointResponse\x12,\n" +
 	"\x12freeze_duration_ms\x18\x01 \x01(\x03R\x10freezeDurationMs\x12+\n" +
 	"\x11checkpoint_sha256\x18\x02 \x01(\tR\x10checkpointSha256\x122\n" +
 	"\x15checkpoint_size_bytes\x18\x03 \x01(\x03R\x13checkpointSizeBytes\x12D\n" +
-	"\rseq_snapshots\x18\x04 \x03(\v2\x1f.podmotion.agent.v1.SeqSnapshotR\fseqSnapshots\"\xc0\x01\n" +
+	"\rseq_snapshots\x18\x04 \x03(\v2\x1f.podmotion.agent.v1.SeqSnapshotR\fseqSnapshots\x12.\n" +
+	"\x13freeze_timestamp_ns\x18\x05 \x01(\x03R\x11freezeTimestampNs\"\xc0\x01\n" +
 	"\vSeqSnapshot\x12\x15\n" +
 	"\x06src_ip\x18\x01 \x01(\tR\x05srcIp\x12\x19\n" +
 	"\bsrc_port\x18\x02 \x01(\rR\asrcPort\x12\x15\n" +

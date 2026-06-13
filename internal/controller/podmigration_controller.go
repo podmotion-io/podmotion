@@ -1455,12 +1455,31 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 	}
 	pm.Status.PreCopyStats.FreezeDurationMs = checkpointResp.FreezeDurationMs
 
+	// Persist freeze timestamp and TCP seq snapshots for the Restore phase.
+	// These cross the Checkpoint→Restore phase boundary via pm.Status so the
+	// controller can wire them into RestoreRequest after a controller restart.
+	pm.Status.SourceFreezeTimestampNs = checkpointResp.FreezeTimestampNs
+	pm.Status.TCPSeqSnapshots = nil
+	for _, snap := range checkpointResp.SeqSnapshots {
+		pm.Status.TCPSeqSnapshots = append(pm.Status.TCPSeqSnapshots, pmv1.TCPSeqSnapshot{
+			SrcIP:    snap.SrcIp,
+			SrcPort:  snap.SrcPort,
+			DstIP:    snap.DstIp,
+			DstPort:  snap.DstPort,
+			SndNxt:   snap.SndNxt,
+			RcvNxt:   snap.RcvNxt,
+			TsRecent: snap.TsRecent,
+		})
+	}
+
 	checkpointMsg := fmt.Sprintf("Checkpoint captured: size=%d bytes sha256=%s freeze=%dms",
 		checkpointResp.CheckpointSizeBytes, checkpointResp.CheckpointSha256, checkpointResp.FreezeDurationMs)
 	log.Info("CRIU checkpoint complete", "migration", pm.Name,
 		"sizeBytes", checkpointResp.CheckpointSizeBytes,
 		"sha256", checkpointResp.CheckpointSha256,
-		"freezeDurationMs", checkpointResp.FreezeDurationMs)
+		"freezeDurationMs", checkpointResp.FreezeDurationMs,
+		"freezeTimestampNs", checkpointResp.FreezeTimestampNs,
+		"tcpConnections", len(pm.Status.TCPSeqSnapshots))
 
 	setCondition(pm, conditionCheckpointed, metav1.ConditionTrue, "Checkpointed", checkpointMsg)
 
@@ -1784,10 +1803,25 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 	// CRIU recreates the process directly without a scheduler round-trip, so no pod object
 	// with NodeName needs to be created here — the process is pinned by executing the restore
 	// RPC on the target node's agent.
+	var restoreSeqSnapshots []*agentpb.SeqSnapshot
+	for _, snap := range pm.Status.TCPSeqSnapshots {
+		restoreSeqSnapshots = append(restoreSeqSnapshots, &agentpb.SeqSnapshot{
+			SrcIp:    snap.SrcIP,
+			SrcPort:  snap.SrcPort,
+			DstIp:    snap.DstIP,
+			DstPort:  snap.DstPort,
+			SndNxt:   snap.SndNxt,
+			RcvNxt:   snap.RcvNxt,
+			TsRecent: snap.TsRecent,
+		})
+	}
+
 	restoreResp, err := agentClient.Restore(ctx, &agentpb.RestoreRequest{
-		MigrationName:  pm.Name,
-		CheckpointRef:  checkpointRef,
-		SourceNodeAddr: pm.Status.SourceNodeName,
+		MigrationName:           pm.Name,
+		CheckpointRef:           checkpointRef,
+		SourceNodeAddr:          pm.Status.SourceNodeName,
+		SourceFreezeTimestampNs: pm.Status.SourceFreezeTimestampNs,
+		SeqSnapshots:            restoreSeqSnapshots,
 	})
 	if err != nil || (restoreResp != nil && !restoreResp.Success) {
 		msg := "restore RPC failed"

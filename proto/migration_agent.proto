@@ -102,6 +102,11 @@ message CheckpointResponse {
   // in the container netns at the exact freeze instant (ADR-0049).
   // Populated when TCPPreservationMode is Strict or BestEffort.
   repeated SeqSnapshot seq_snapshots = 4;
+  // freeze_timestamp_ns is CLOCK_REALTIME nanoseconds captured at the exact
+  // moment the CRIU dump completes and the process enters SIGSTOP.
+  // The controller passes this as source_freeze_timestamp_ns in RestoreRequest
+  // so the destination agent can compute the PAWS ts_delta.
+  int64  freeze_timestamp_ns   = 5;
 }
 
 // SeqSnapshot captures TCP sequence state for a single connection at freeze time.
