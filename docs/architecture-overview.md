@@ -122,7 +122,7 @@ Goroutine packages called by the node agent, each owning a single concern:
 |-----------|-------------|---------|
 | Core data model | 0001, 0003, 0018 | Module path (github.com/podmotion-io); five-CRD model; crash-safe phase persistence via CR conditions |
 | CRIU / checkpoint | 0002, 0006, 0013, 0024, 0031, 0042 | Subprocess firewall (GPLv2); dual transfer modes (P2P gRPC vs OCI registry); out-of-kubelet restore; convergence abort policy; post-copy lazy-pages server lifetime; CRIU opts for containerized workloads |
-| Network / eBPF | 0011, 0012, 0014, 0017, 0021, 0028, 0036, 0041, 0047, 0048, 0049 | Two-pipeline model; TrafficVerified gate; immutable rollback order; TCP preservation deferred v0.2 (superseded by 0047); service mesh option; NetworkBridgeArmed condition; VPC CNI EKS gap; networkContinuity default false (superseded by 0047); TCP-first architecture; overlay-native L3 IP identity; zero-window hold ARM/DISARM atomicity |
+| Network / eBPF | 0011, 0012, 0014, 0017, 0021, 0028, 0036, 0041, 0047, 0048, 0049, **0093** | Two-pipeline model; TrafficVerified gate; immutable rollback order; TCP preservation deferred v0.2 (superseded by 0047); service mesh option; NetworkBridgeArmed condition; VPC CNI EKS gap; networkContinuity default false (superseded by 0047); TCP-first architecture; overlay-native L3 IP identity; zero-window hold ARM/DISARM atomicity; **M22 relay program architecture (PM_SEQ_XLAT, TC relay, SK_LOOKUP, VTEP programs)** |
 | Storage | 0007, 0011, 0026, 0034, 0044 | Four-tier classification + webhook enforcement; two-pipeline handoff gate; Ceph RBD Squid requirement; OCI registry WAN medium for multi-cluster; cold migration beta scope / live storage migration v1.2 |
 | Security | 0009, 0029 | Security agent veto power; checkpoint encryption opt-in |
 | Scheduler | 0025 | Scheduler plugin creates `PodMigration` CR; operator never binds pods directly |
@@ -130,6 +130,29 @@ Goroutine packages called by the node agent, each owning a single concern:
 | OSS hygiene | 0004, 0020, 0038 | Own public repos over long-lived upstream branches; WG Checkpoint/Restore engagement + KEP-2008; ecosystem delta model |
 
 ADRs marked **superseded**: 0017 (TCP deferred, replaced by 0047), 0041 (networkContinuity default false, replaced by 0047's TCP-first model).
+
+---
+
+## M22 Status Conditions — TCP Socket Preservation
+
+M22 added four `metav1.Condition` entries to `PodMigration` status. These conditions track
+the relay lifecycle and are evaluated by the `TCPVerifying` controller phase before the
+source pod deletion gate fires.
+
+| Condition | Type | Meaning when True |
+|-----------|------|--------------------|
+| `SocketInventoryComplete` | `metav1.Condition` | `SocketInventory()` parsed `/proc/<pid>/net/tcp[6]` for all ESTABLISHED connections in the container netns and populated `SeqSnapshots` on `CheckpointResponse`. Set immediately before `FinalFreeze`. Must be True before relay arm proceeds. |
+| `RelayProgramsLoaded` | `metav1.Condition` | All six eBPF programs are attached: `PM_RELAY_TC_EGRESS`, `PM_RELAY_TC_INGRESS`, `PM_SK_LOOKUP`, `PM_XDP_VTEP`, `PM_XDP_SRC_GUARD`. Verified via `bpftool prog show` output and BPF map lookup. Set after `ArmRelay` + `ArmVTEP` return without error. |
+| `ZeroWindowArmed` | `metav1.Condition` | The TC egress zero-window hold program is attached on the source veth. The peer's TCP send window is 0; no new data is entering the connection. This condition gates `FinalFreeze`: CRIU dump does not start until this is True (ADR-0049 §1). |
+| `TCPSequenceContinuityVerified` | `metav1.Condition` | Post-restore `VerifyTCP` RPC confirmed that the destination socket's 4-tuple and seq/ack state match the source `SeqSnapshots` within ±MSS (1448 bytes) using 32-bit modular arithmetic. SQL/TCP application probes passed if configured. In `Strict` mode, False causes rollback. In `BestEffort` mode, False logs a warning and continues. |
+
+**Source pod deletion gate** (ADR-0012 + ADR-0049):
+The source pod is NOT deleted until BOTH of the following conditions are True:
+- `TrafficVerified=True` (HTTP/endpoint readiness check)
+- `TCPSequenceContinuityVerified=True` (for `Strict` and `BestEffort` modes)
+
+For `NetworkContinuityMode=None`, TCP conditions are not required — the standard
+`TrafficVerified` gate applies.
 
 ---
 
