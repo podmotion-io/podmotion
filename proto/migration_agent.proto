@@ -72,6 +72,10 @@ service MigrationAgentService {
   // destination VTEP instead. Called from injectIPHandoff after the destination probe
   // passes; torn down by CleanupSourceIPHandoff after TrafficVerified=True. Idempotent.
   rpc InjectSourceRedirect(InjectSourceRedirectRequest) returns (InjectSourceRedirectResponse);
+  // DisarmTCRedirect removes the ADR-0139 tc-ingress redirect (filter + ingress qdisc) from
+  // the destination overlay interface (flannel.1) after TrafficVerified=True (Decision 3
+  // disarm order). Idempotent: ENOENT is treated as success.
+  rpc DisarmTCRedirect(DisarmTCRedirectRequest) returns (DisarmTCRedirectResponse);
   // VerifyTCP reads /proc/<pid>/net/tcp[6] on the destination node post-restore and
   // compares each ESTABLISHED 4-tuple's snd_nxt/rcv_nxt against the source SeqSnapshots
   // captured at freeze. Returns verified=true only when all connections match within
@@ -361,6 +365,17 @@ message CleanupSourceIPHandoffRequest {
 }
 message CleanupSourceIPHandoffResponse {
   bool   cleaned          = 1;
+  string blocking_reason  = 2;
+}
+
+// DisarmTCRedirectRequest carries the inputs for ADR-0139 Decision 3 tc-redirect teardown.
+message DisarmTCRedirectRequest {
+  string migration_name   = 1;
+  // fdb_ifname is the overlay interface the redirect was installed on (default "flannel.1").
+  string fdb_ifname       = 2;
+}
+message DisarmTCRedirectResponse {
+  bool   disarmed         = 1;
   string blocking_reason  = 2;
 }
 

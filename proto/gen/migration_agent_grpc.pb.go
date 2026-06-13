@@ -37,6 +37,7 @@ const (
 	MigrationAgentService_InjectIPHandoff_FullMethodName         = "/podmotion.agent.v1.MigrationAgentService/InjectIPHandoff"
 	MigrationAgentService_CleanupSourceIPHandoff_FullMethodName  = "/podmotion.agent.v1.MigrationAgentService/CleanupSourceIPHandoff"
 	MigrationAgentService_InjectSourceRedirect_FullMethodName    = "/podmotion.agent.v1.MigrationAgentService/InjectSourceRedirect"
+	MigrationAgentService_DisarmTCRedirect_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/DisarmTCRedirect"
 	MigrationAgentService_VerifyTCP_FullMethodName               = "/podmotion.agent.v1.MigrationAgentService/VerifyTCP"
 )
 
@@ -113,6 +114,10 @@ type MigrationAgentServiceClient interface {
 	// destination VTEP instead. Called from injectIPHandoff after the destination probe
 	// passes; torn down by CleanupSourceIPHandoff after TrafficVerified=True. Idempotent.
 	InjectSourceRedirect(ctx context.Context, in *InjectSourceRedirectRequest, opts ...grpc.CallOption) (*InjectSourceRedirectResponse, error)
+	// DisarmTCRedirect removes the ADR-0139 tc-ingress redirect (filter + ingress qdisc) from
+	// the destination overlay interface (flannel.1) after TrafficVerified=True (Decision 3
+	// disarm order). Idempotent: ENOENT is treated as success.
+	DisarmTCRedirect(ctx context.Context, in *DisarmTCRedirectRequest, opts ...grpc.CallOption) (*DisarmTCRedirectResponse, error)
 	// VerifyTCP reads /proc/<pid>/net/tcp[6] on the destination node post-restore and
 	// compares each ESTABLISHED 4-tuple's snd_nxt/rcv_nxt against the source SeqSnapshots
 	// captured at freeze. Returns verified=true only when all connections match within
@@ -309,6 +314,16 @@ func (c *migrationAgentServiceClient) InjectSourceRedirect(ctx context.Context, 
 	return out, nil
 }
 
+func (c *migrationAgentServiceClient) DisarmTCRedirect(ctx context.Context, in *DisarmTCRedirectRequest, opts ...grpc.CallOption) (*DisarmTCRedirectResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DisarmTCRedirectResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_DisarmTCRedirect_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *migrationAgentServiceClient) VerifyTCP(ctx context.Context, in *VerifyTCPRequest, opts ...grpc.CallOption) (*VerifyTCPResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VerifyTCPResponse)
@@ -392,6 +407,10 @@ type MigrationAgentServiceServer interface {
 	// destination VTEP instead. Called from injectIPHandoff after the destination probe
 	// passes; torn down by CleanupSourceIPHandoff after TrafficVerified=True. Idempotent.
 	InjectSourceRedirect(context.Context, *InjectSourceRedirectRequest) (*InjectSourceRedirectResponse, error)
+	// DisarmTCRedirect removes the ADR-0139 tc-ingress redirect (filter + ingress qdisc) from
+	// the destination overlay interface (flannel.1) after TrafficVerified=True (Decision 3
+	// disarm order). Idempotent: ENOENT is treated as success.
+	DisarmTCRedirect(context.Context, *DisarmTCRedirectRequest) (*DisarmTCRedirectResponse, error)
 	// VerifyTCP reads /proc/<pid>/net/tcp[6] on the destination node post-restore and
 	// compares each ESTABLISHED 4-tuple's snd_nxt/rcv_nxt against the source SeqSnapshots
 	// captured at freeze. Returns verified=true only when all connections match within
@@ -461,6 +480,9 @@ func (UnimplementedMigrationAgentServiceServer) CleanupSourceIPHandoff(context.C
 }
 func (UnimplementedMigrationAgentServiceServer) InjectSourceRedirect(context.Context, *InjectSourceRedirectRequest) (*InjectSourceRedirectResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method InjectSourceRedirect not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) DisarmTCRedirect(context.Context, *DisarmTCRedirectRequest) (*DisarmTCRedirectResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DisarmTCRedirect not implemented")
 }
 func (UnimplementedMigrationAgentServiceServer) VerifyTCP(context.Context, *VerifyTCPRequest) (*VerifyTCPResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method VerifyTCP not implemented")
@@ -810,6 +832,24 @@ func _MigrationAgentService_InjectSourceRedirect_Handler(srv interface{}, ctx co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MigrationAgentService_DisarmTCRedirect_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DisarmTCRedirectRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).DisarmTCRedirect(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_DisarmTCRedirect_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).DisarmTCRedirect(ctx, req.(*DisarmTCRedirectRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MigrationAgentService_VerifyTCP_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(VerifyTCPRequest)
 	if err := dec(in); err != nil {
@@ -906,6 +946,10 @@ var MigrationAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "InjectSourceRedirect",
 			Handler:    _MigrationAgentService_InjectSourceRedirect_Handler,
+		},
+		{
+			MethodName: "DisarmTCRedirect",
+			Handler:    _MigrationAgentService_DisarmTCRedirect_Handler,
 		},
 		{
 			MethodName: "VerifyTCP",
