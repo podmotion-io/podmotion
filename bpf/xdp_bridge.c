@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
 /*
  * xdp_bridge.c — XDP program that bridges packets from the source pod IP to
  * the destination via a GENEVE tunnel during the cutover window.
@@ -99,4 +99,4 @@ int pm_xdp_bridge(struct xdp_md *ctx)
     return XDP_PASS;
 }
 
-char _license[] SEC("license") = "GPL";
+char _license[] SEC("license") = "Dual BSD/GPL";

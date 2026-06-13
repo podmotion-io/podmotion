@@ -58,7 +58,10 @@ type MigrationAgentServiceClient interface {
 	// PrepareDestinationNetns pre-stages the migration network namespace on the destination
 	// node and returns the file descriptor path and VTEP MAC for overlay FDB injection.
 	PrepareDestinationNetns(ctx context.Context, in *PrepareDestinationNetnsRequest, opts ...grpc.CallOption) (*PrepareDestinationNetnsResponse, error)
-	// ConfirmOverlayReady evaluates the ADR-0049 atomicity barrier predicates B–F.
+	// ConfirmOverlayReady evaluates the ADR-0049 atomicity barrier predicates B–F on the
+	// destination node and returns the result. The controller calls this RPC after Restore
+	// succeeds and before calling DisarmZeroWindow on the source node.
+	// Predicate A (tcpi_unacked==0) is checked by ArmZeroWindow on the source node.
 	ConfirmOverlayReady(ctx context.Context, in *ConfirmOverlayReadyRequest, opts ...grpc.CallOption) (*ConfirmOverlayReadyResponse, error)
 	// ArmZeroWindow attaches the zero_window eBPF program to the source pod veth TC egress,
 	// causing the kernel to advertise win=0 on all outgoing ACKs, stalling the peer sender.
@@ -88,8 +91,11 @@ type MigrationAgentServiceClient interface {
 	// pm.Status.CheckpointTransferred has been durably persisted. Idempotent: returns
 	// success if the directory is already absent (handles controller-restart replay).
 	ReleaseCheckpoint(ctx context.Context, in *ReleaseCheckpointRequest, opts ...grpc.CallOption) (*ReleaseCheckpointResponse, error)
-	// VerifyTCP reads /proc/<pid>/net/tcp[6] post-restore and compares snd_nxt/rcv_nxt
-	// against source SeqSnapshots. Issues SQL/TCP application probe when configured.
+	// VerifyTCP reads /proc/<pid>/net/tcp[6] on the destination node post-restore and
+	// compares each ESTABLISHED 4-tuple's snd_nxt/rcv_nxt against the source SeqSnapshots
+	// captured at freeze. Returns verified=true only when all connections match within
+	// ±MSS (1448 bytes). Also issues the ApplicationProbe (SQL/TCP) when configured.
+	// Called by the controller during TCPVerifying phase per ADR-0019 Amendment A.
 	VerifyTCP(ctx context.Context, in *VerifyTCPRequest, opts ...grpc.CallOption) (*VerifyTCPResponse, error)
 }
 
@@ -282,7 +288,10 @@ type MigrationAgentServiceServer interface {
 	// PrepareDestinationNetns pre-stages the migration network namespace on the destination
 	// node and returns the file descriptor path and VTEP MAC for overlay FDB injection.
 	PrepareDestinationNetns(context.Context, *PrepareDestinationNetnsRequest) (*PrepareDestinationNetnsResponse, error)
-	// ConfirmOverlayReady evaluates the ADR-0049 atomicity barrier predicates B–F.
+	// ConfirmOverlayReady evaluates the ADR-0049 atomicity barrier predicates B–F on the
+	// destination node and returns the result. The controller calls this RPC after Restore
+	// succeeds and before calling DisarmZeroWindow on the source node.
+	// Predicate A (tcpi_unacked==0) is checked by ArmZeroWindow on the source node.
 	ConfirmOverlayReady(context.Context, *ConfirmOverlayReadyRequest) (*ConfirmOverlayReadyResponse, error)
 	// ArmZeroWindow attaches the zero_window eBPF program to the source pod veth TC egress,
 	// causing the kernel to advertise win=0 on all outgoing ACKs, stalling the peer sender.
@@ -312,8 +321,11 @@ type MigrationAgentServiceServer interface {
 	// pm.Status.CheckpointTransferred has been durably persisted. Idempotent: returns
 	// success if the directory is already absent (handles controller-restart replay).
 	ReleaseCheckpoint(context.Context, *ReleaseCheckpointRequest) (*ReleaseCheckpointResponse, error)
-	// VerifyTCP reads /proc/<pid>/net/tcp[6] post-restore and compares snd_nxt/rcv_nxt
-	// against source SeqSnapshots. Issues SQL/TCP application probe when configured.
+	// VerifyTCP reads /proc/<pid>/net/tcp[6] on the destination node post-restore and
+	// compares each ESTABLISHED 4-tuple's snd_nxt/rcv_nxt against the source SeqSnapshots
+	// captured at freeze. Returns verified=true only when all connections match within
+	// ±MSS (1448 bytes). Also issues the ApplicationProbe (SQL/TCP) when configured.
+	// Called by the controller during TCPVerifying phase per ADR-0019 Amendment A.
 	VerifyTCP(context.Context, *VerifyTCPRequest) (*VerifyTCPResponse, error)
 	mustEmbedUnimplementedMigrationAgentServiceServer()
 }

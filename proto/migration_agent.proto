@@ -150,6 +150,13 @@ message RestoreRequest {
   reserved "network_continuity";
   string dest_netns_fd               = 5; // pre-staged netns path from PrepareDestinationNetns
   int64  source_freeze_timestamp_ns  = 6; // CLOCK_REALTIME ns at source freeze for seq-xlat
+  // seq_snapshots carries per-connection TCP sequence state from the source freeze instant
+  // so the destination can seed PM_SEQ_XLAT before ZeroWindowDisarm (ADR-0049 predicate B).
+  // Populated by the controller from CheckpointResponse.seq_snapshots.
+  repeated SeqSnapshot seq_snapshots = 7;
+  // relay_ifname is the overlay interface name on the destination where PM_RELAY_TC programs
+  // are attached (typically "flannel.1"). Empty means use the default "flannel.1".
+  string relay_ifname                = 8;
 }
 message RestoreResponse {
   bool   success           = 1;

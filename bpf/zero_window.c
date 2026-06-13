@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
 /*
  * zero_window.c — TC egress program that rewrites TCP window=0 to hold senders.
  *
@@ -94,4 +94,4 @@ int pm_zero_window_hold(struct __sk_buff *skb)
     return TC_ACT_OK;
 }
 
-char _license[] SEC("license") = "GPL";
+char _license[] SEC("license") = "Dual BSD/GPL";

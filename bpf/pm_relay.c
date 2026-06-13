@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
 /*
  * pm_relay.c — TC-BPF relay programs for TCP sequence/ack translation.
  *
@@ -10,14 +10,14 @@
  *       seq  += seq_delta
  *       ack  += ack_delta
  *       TSval += ts_delta
- *       SACK block left/right edges += ack_delta
+ *       SACK block left/right edges += seq_delta  (edges are in OUR send-seq space)
  *
  *   pm_relay_tc_ingress — attached to flannel.1 TC ingress (incoming direction).
  *     Incoming means: peer → pod.  We apply the NEGATIVE delta:
  *       seq  -= seq_delta   (peer thinks it is talking to old socket)
  *       ack  -= ack_delta
  *       TSecr += ts_delta   (peer's echo of our TSval; must be shifted the same way)
- *       SACK edges += ack_delta
+ *       SACK edges -= seq_delta  (same sequence space; undo the egress shift)
  *
  * The asymmetry on TSecr is intentional: the peer echoes what we sent them
  * (TSval), so TSecr seen on ingress must be un-shifted by the same ts_delta
@@ -80,6 +80,13 @@ struct {
  * csum_diff32: incremental checksum update for a 32-bit field change.
  * RFC 1624: new_csum = ~(~old_csum - old_val + new_val)
  * Returns the updated checksum in network byte order.
+ *
+ * The running sum is carried as a __u32 to accommodate the range
+ * [0, 3*0xffff] during accumulation.  Two fold passes are required to
+ * handle the case where the first fold still leaves a carry in bit 16
+ * (e.g. when the subtracted old_val produces an underflow that the single
+ * (sum>>16)+(sum&0xffff) pass does not fully absorb).  The second pass
+ * guarantees the result fits in 16 bits (RFC 1624 §3).
  */
 static __always_inline __sum16 csum_diff32(__sum16 old_csum, __be32 old_val, __be32 new_val)
 {
@@ -88,8 +95,9 @@ static __always_inline __sum16 csum_diff32(__sum16 old_csum, __be32 old_val, __b
     csum -= (bpf_ntohl(old_val) & 0xffff);
     csum += (bpf_ntohl(new_val) >> 16);
     csum += (bpf_ntohl(new_val) & 0xffff);
+    /* Two fold passes: the first may still leave a carry in bit 16. */
     csum = (csum >> 16) + (csum & 0xffff);
-    csum += (csum >> 16);
+    csum = (csum >> 16) + (csum & 0xffff);
     return bpf_htons((__u16)~csum);
 }
 
@@ -185,23 +193,59 @@ static __always_inline int parse_vxlan_inner_tcp(
 #define TCPOPT_TS    8
 
 /*
+ * opt_csum_add32: accumulate the one's-complement checksum difference for a
+ * 32-bit field change.  A 32-bit value covers two 16-bit checksum words;
+ * they must each contribute independently so that a carry out of the low
+ * half is not silently lost.  Using a plain arithmetic delta (new32-old32)
+ * on a 32-bit accumulator is WRONG when the low 16 bits carry into the high
+ * half (e.g. old=0x0000FFFF, new=0x00010001: delta=2 but the high-half word
+ * changed by +1 and the low-half word changed by +2, giving an independent
+ * sum of 3, not 2).
+ *
+ * The running sum is __u32 to hold up to 4*0xffff without wrapping.
+ */
+static __always_inline __u32 opt_csum_add32(__u32 csum_acc, __be32 old_val, __be32 new_val)
+{
+    __u32 old_h = bpf_ntohl(old_val) >> 16;
+    __u32 old_l = bpf_ntohl(old_val) & 0xffff;
+    __u32 new_h = bpf_ntohl(new_val) >> 16;
+    __u32 new_l = bpf_ntohl(new_val) & 0xffff;
+    /* Subtract old halves, add new halves.  Carry is accumulated in the upper
+     * bits and folded by the caller. */
+    csum_acc += new_h - old_h + new_l - old_l;
+    return csum_acc;
+}
+
+/*
  * rewrite_tcp_options: scan TCP options and patch TSval (egress) or TSecr
  * (ingress) and SACK block edges.
  *
- * is_egress==1  → patch TSval field (+ts_delta) + SACK left/right (+ack_delta)
- * is_egress==0  → patch TSecr field (+ts_delta) + SACK left/right (+ack_delta)
+ * is_egress==1  → patch TSval field (+ts_delta) + SACK edges (+seq_delta)
+ * is_egress==0  → patch TSecr field (+ts_delta) + SACK edges (-seq_delta)
  *
- * Returns the net checksum change as a 32-bit accumulator (host byte order,
- * one's complement partial sum).  Caller folds and applies to tcp->check.
+ * SACK edge correction:
+ *   Egress (pod→peer): SACK blocks contain sequence numbers in OUR send
+ *   space, which has been shifted by seq_delta.  Edges must be shifted by
+ *   +seq_delta (same sign as the seq rewrite).
+ *
+ *   Ingress (peer→pod): SACK blocks in a packet from the peer acknowledge
+ *   segments in OUR send space.  The peer saw seq numbers that already had
+ *   +seq_delta applied; to undo that for the local socket we apply -seq_delta.
+ *   Using ack_delta here was WRONG (different sequence space, possibly
+ *   different magnitude and sign).
+ *
+ * Returns the accumulated one's-complement checksum delta for all rewritten
+ * option fields (running __u32 partial sum, caller must fold and apply to
+ * tcp->check using the same csum_diff32 approach).
  *
  * We scan at most 40 bytes of options (TCP max header is 60B, fixed hdr 20B).
  * The BPF verifier requires bounded loops; we unroll manually up to 10 options.
  */
-static __always_inline __s32 rewrite_tcp_options(
+static __always_inline __u32 rewrite_tcp_options(
     struct tcphdr *tcp,
     void          *data_end,
     __s32          ts_delta,
-    __s32          ack_delta,
+    __s32          seq_delta,
     int            is_egress)
 {
     __u8 *opts = (__u8 *)tcp + 20; /* option bytes start after fixed 20B header */
@@ -212,7 +256,12 @@ static __always_inline __s32 rewrite_tcp_options(
     if (opts_len > 40)
         opts_len = 40;
 
-    __s32 csum_delta = 0;
+    /* sack_edge_delta: +seq_delta on egress, -seq_delta on ingress.
+     * This correctly adjusts SACK block edges relative to OUR send-sequence
+     * space in both directions (see function comment above). */
+    __s32 sack_edge_delta = is_egress ? seq_delta : -seq_delta;
+
+    __u32 csum_acc = 0; /* accumulated one's-complement partial sum */
     __u32 i = 0;
 
 #pragma unroll
@@ -244,13 +293,13 @@ static __always_inline __s32 rewrite_tcp_options(
                 __be32 *tsval = (__be32 *)(opts + i + 2);
                 __be32 old = *tsval;
                 *tsval = bpf_htonl(bpf_ntohl(old) + ts_delta);
-                csum_delta += (bpf_ntohl(*tsval) - bpf_ntohl(old));
+                csum_acc = opt_csum_add32(csum_acc, old, *tsval);
             } else {
                 /* TSecr is at offset +6 within the option. */
                 __be32 *tsecr = (__be32 *)(opts + i + 6);
                 __be32 old = *tsecr;
                 *tsecr = bpf_htonl(bpf_ntohl(old) + ts_delta);
-                csum_delta += (bpf_ntohl(*tsecr) - bpf_ntohl(old));
+                csum_acc = opt_csum_add32(csum_acc, old, *tsecr);
             }
         } else if (kind == TCPOPT_SACK && len >= 10) {
             /* SACK blocks: each block is 8 bytes (left_edge + right_edge).
@@ -269,17 +318,17 @@ static __always_inline __s32 rewrite_tcp_options(
                 __be32 *right = (__be32 *)(opts + off + 4);
                 __be32 old_l = *left;
                 __be32 old_r = *right;
-                *left  = bpf_htonl(bpf_ntohl(old_l) + ack_delta);
-                *right = bpf_htonl(bpf_ntohl(old_r) + ack_delta);
-                csum_delta += (bpf_ntohl(*left)  - bpf_ntohl(old_l));
-                csum_delta += (bpf_ntohl(*right) - bpf_ntohl(old_r));
+                *left  = bpf_htonl(bpf_ntohl(old_l) + sack_edge_delta);
+                *right = bpf_htonl(bpf_ntohl(old_r) + sack_edge_delta);
+                csum_acc = opt_csum_add32(csum_acc, old_l, *left);
+                csum_acc = opt_csum_add32(csum_acc, old_r, *right);
             }
         }
 
         i += len;
     }
 
-    return csum_delta;
+    return csum_acc;
 }
 
 /* ── Egress relay ─────────────────────────────────────────────────────────── */
@@ -325,16 +374,15 @@ int pm_relay_tc_egress(struct __sk_buff *skb)
 
     /* Rewrite TSval + SACK edges in TCP options. */
     if (e->ts_delta != 0 || e->sack_present) {
-        __s32 opt_csum = rewrite_tcp_options(tcp, data_end, e->ts_delta, e->ack_delta, 1);
+        __u32 opt_csum = rewrite_tcp_options(tcp, data_end, e->ts_delta, e->seq_delta, 1);
         if (opt_csum != 0) {
-            /* Fold opt_csum into tcp->check incrementally. */
+            /* Fold opt_csum (one's-complement partial sum) into tcp->check.
+             * Start from the one's complement of the existing checksum, add
+             * the accumulated delta, then two-fold to absorb any carry.      */
             __u32 c = (~bpf_ntohs(tcp->check)) & 0xffff;
-            if (opt_csum > 0)
-                c += (__u32)opt_csum;
-            else
-                c -= (__u32)(-opt_csum);
+            c += opt_csum;
             c = (c >> 16) + (c & 0xffff);
-            c += (c >> 16);
+            c = (c >> 16) + (c & 0xffff);
             tcp->check = bpf_htons((__u16)~c);
         }
     }
@@ -393,17 +441,16 @@ int pm_relay_tc_ingress(struct __sk_buff *skb)
     }
 
     /* TSecr must track what we sent them (TSval already shifted by +ts_delta),
-     * so we un-apply the same ts_delta on the echo. */
+     * so we un-apply the same ts_delta on the echo.
+     * SACK edges on ingress reference OUR send-sequence space; rewrite_tcp_options
+     * with is_egress=0 applies -seq_delta to each edge (correct sign). */
     if (e->ts_delta != 0 || e->sack_present) {
-        __s32 opt_csum = rewrite_tcp_options(tcp, data_end, e->ts_delta, e->ack_delta, 0);
+        __u32 opt_csum = rewrite_tcp_options(tcp, data_end, e->ts_delta, e->seq_delta, 0);
         if (opt_csum != 0) {
             __u32 c = (~bpf_ntohs(tcp->check)) & 0xffff;
-            if (opt_csum > 0)
-                c += (__u32)opt_csum;
-            else
-                c -= (__u32)(-opt_csum);
+            c += opt_csum;
             c = (c >> 16) + (c & 0xffff);
-            c += (c >> 16);
+            c = (c >> 16) + (c & 0xffff);
             tcp->check = bpf_htons((__u16)~c);
         }
     }
@@ -420,4 +467,4 @@ int pm_relay_tc_ingress(struct __sk_buff *skb)
     return TC_ACT_OK;
 }
 
-char _license[] SEC("license") = "GPL";
+char _license[] SEC("license") = "Dual BSD/GPL";

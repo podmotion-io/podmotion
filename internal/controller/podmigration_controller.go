@@ -735,18 +735,20 @@ func (r *PodMigrationReconciler) reconcileTCPVerifying(ctx context.Context, pm *
 		}
 	}
 
-	// All connections verified. Ensure upstream conditions are True (idempotent).
+	// All connections verified.
+	// NOTE: We do NOT retroactively set RelayProgramsLoaded or ZeroWindowArmed here.
+	// VerifyTCP only reads /proc/<pid>/net/tcp[6] and compares snd_nxt/rcv_nxt — it does NOT
+	// inspect BPF map state, TC filter presence, or XDP link state. Setting those conditions
+	// True based on VerifyTCP would fabricate BPF-layer facts that were never observed,
+	// violating ADR-0012's requirement that status.conditions reflect observed reality.
+	// RelayProgramsLoaded must be driven by ArmRelay returning success; ZeroWindowArmed by
+	// ArmZeroWindow returning armed=true. See ADR-0049 §condition-integrity.
+	//
+	// SocketInventoryComplete is set here because VerifyTCP performs a socket inventory
+	// comparison and its success does constitute observed evidence of socket continuity.
 	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionSocketInventoryComplete) {
 		setCondition(pm, pmv1.ConditionSocketInventoryComplete, metav1.ConditionTrue,
-			"VerifiedPostRestore", "Socket inventory confirmed via VerifyTCP post-restore")
-	}
-	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionRelayProgramsLoaded) {
-		setCondition(pm, pmv1.ConditionRelayProgramsLoaded, metav1.ConditionTrue,
-			"VerifiedPostRestore", "Relay programs confirmed loaded via VerifyTCP post-restore")
-	}
-	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionZeroWindowArmed) {
-		setCondition(pm, pmv1.ConditionZeroWindowArmed, metav1.ConditionTrue,
-			"VerifiedPostRestore", "ZeroWindow arm confirmed via VerifyTCP post-restore")
+			"VerifiedPostRestore", "Socket inventory confirmed via VerifyTCP post-restore snd_nxt/rcv_nxt comparison")
 	}
 
 	connMsg := fmt.Sprintf("TCP sequence continuity verified: %d/%d connections snd_nxt/rcv_nxt within ±MSS",

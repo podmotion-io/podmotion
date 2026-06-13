@@ -93,8 +93,37 @@ Attribution: Copyright 2019 The logr Authors.
 
 --------------------------------------------------------------------------------
 
+--------------------------------------------------------------------------------
+PodMotion eBPF Programs (bpf/)
+License: GPL-2.0 OR BSD-2-Clause (pm_relay.c, pm_xdp_vtep.c, zero_window.c, xdp_bridge.c)
+         GPL-2.0-only              (pm_sk_lookup.c — uses bpf_sk_assign, a GPL-only kernel helper)
+
+The following compiled eBPF object files are embedded into the pm-agent binary at
+build time via //go:embed directives in internal/agent/network/bpfloader/:
+
+  pm_relay_bpfel.o       — GPL-2.0 OR BSD-2-Clause
+  pm_xdp_vtep_bpfel.o    — GPL-2.0 OR BSD-2-Clause
+  pm_sk_lookup_bpfel.o   — GPL-2.0-only (bpf_sk_assign kernel helper is GPL-only)
+  zero_window_bpfel.o    — GPL-2.0 OR BSD-2-Clause
+  zero_window_bpfeb.o    — GPL-2.0 OR BSD-2-Clause
+
+These objects are BPF bytecode that runs in the Linux kernel context, not in
+userspace.  The GPL-2.0-only object (pm_sk_lookup_bpfel.o) is isolated in a
+separate ELF section and its GPL license obligation applies to the eBPF bytecode
+itself and any kernel modules that link it, not to the Apache-2.0 userspace Go
+binary that loads and manages it via the bpf(2) syscall (BPF program loading via
+syscall does not constitute static linking for GPL copyleft purposes).
+
+Downstream redistributors who modify the eBPF C sources must satisfy the
+GPL-2.0 obligations for any modified pm_sk_lookup.c-derived objects, and
+BSD-2-Clause or GPL-2.0 obligations for objects derived from the other files.
+
+--------------------------------------------------------------------------------
+
 NOTE TO MAINTAINERS: This file must be updated whenever a new Go dependency is added
 that carries its own NOTICE obligations (any dependency whose license requires
 attribution text to be preserved in derivative works). Run `go mod tidy` and inspect
 new entries in go.sum. For GPL/LGPL-licensed packages, verify the subprocess firewall
 is maintained and document the isolation here.
+Also update the eBPF section above when any BPF source file is added or its license
+changes. Run `grep -r "SPDX-License" bpf/` to verify licenses before release.
