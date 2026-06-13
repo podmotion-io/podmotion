@@ -1,0 +1,66 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: podmotion-gate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: w6-workload
+  namespace: podmotion-gate
+  labels:
+    app: w6
+    podmotion.io/workload-type: w6
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: w6
+  template:
+    metadata:
+      labels:
+        app: w6
+        podmotion.io/workload-type: w6
+    spec:
+      nodeSelector:
+        podmotion.io/role: worker
+      tolerations:
+        - key: podmotion.io/role
+          operator: Equal
+          value: worker
+          effect: NoSchedule
+      containers:
+        - name: ws-server
+          # FILL_IN_DIGEST — custom WebSocket frame-counter server
+          # Replace with: image: <registry>/ws-server@sha256:<digest>
+          image: FILL_IN_DIGEST
+          ports:
+            - name: websocket
+              containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: w6-svc
+  namespace: podmotion-gate
+  labels:
+    app: w6
+    podmotion.io/workload-type: w6
+spec:
+  type: ClusterIP
+  selector:
+    app: w6
+  ports:
+    - name: websocket
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
