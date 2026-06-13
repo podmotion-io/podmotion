@@ -1661,6 +1661,78 @@ func (s *AgentServer) DisarmZeroWindow(_ context.Context, req *agentpb.DisarmZer
 	}, nil
 }
 
+// ConfirmOverlayReady evaluates the ADR-0049 6-predicate atomicity barrier on the destination
+// node. It is called by the controller after Restore succeeds and before DisarmZeroWindow is
+// sent to the source node. Predicate A (tcpi_unacked==0) is already satisfied by ArmZeroWindow.
+//
+// The handler:
+//  1. Builds BarrierPredicates from the request fields.
+//  2. Captures CLOCK_MONOTONIC ns for PAWS ts_delta computation.
+//  3. Calls CheckAtomicityBarrier (predicates B–F).
+//  4. Computes ts_delta from source_clock_ns vs dest_clock_ns and patches PM_SEQ_XLAT.
+func (s *AgentServer) ConfirmOverlayReady(ctx context.Context, req *agentpb.ConfirmOverlayReadyRequest) (*agentpb.ConfirmOverlayReadyResponse, error) {
+	log.Info("ConfirmOverlayReady: evaluating atomicity barrier", "migration", req.MigrationName)
+
+	destClockNs := monoTimeNs()
+
+	fdbMgr := network.NewFDBManager()
+
+	var sourceFDB *network.FDBEntry
+	var destFDB *network.FDBEntry
+	if req.FdbIfname != "" && req.PodIp != "" && req.PodMac != "" && req.VtepIp != "" {
+		podIP := net.ParseIP(req.PodIp)
+		vtepIP := net.ParseIP(req.VtepIp)
+		podMAC, macErr := net.ParseMAC(req.PodMac)
+		if podIP != nil && vtepIP != nil && macErr == nil {
+			e := network.FDBEntry{
+				IfName: req.FdbIfname,
+				PodIP:  podIP,
+				PodMAC: podMAC,
+				VTEPIP: vtepIP,
+			}
+			sourceFDB = &e
+			destFDB = &e
+		}
+	}
+
+	predicates := network.BarrierPredicates{
+		SeqXlatSeeded:        req.SeqXlatSeeded,
+		SourceFDBEntry:       sourceFDB,
+		DestFDBEntry:         destFDB,
+		SourceConntrackArmed: req.SourceConntrackArmed,
+		DestConntrackArmed:   true, // destination conntrack is armed locally by PrepareDestinationNetns
+		RestoreComplete:      req.RestoreComplete,
+		FDBManager:           fdbMgr,
+	}
+
+	result, barrierErr := network.CheckAtomicityBarrier(ctx, predicates)
+
+	resp := &agentpb.ConfirmOverlayReadyResponse{
+		PredicateBOk: result.BPredicate,
+		PredicateCOk: result.CFdbSource,
+		PredicateDOk: result.DFdbDest,
+		PredicateEOk: result.EPredicate,
+		PredicateFOk: result.FPredicate,
+		DestClockNs:  destClockNs,
+	}
+
+	if barrierErr != nil {
+		log.Error(barrierErr, "ConfirmOverlayReady: barrier not satisfied", "migration", req.MigrationName)
+		resp.Ready = false
+		resp.BlockingReason = barrierErr.Error()
+		return resp, nil
+	}
+
+	// Compute PAWS ts_delta from monotonic clock offsets and patch PM_SEQ_XLAT.
+	tsDelta := network.ComputePAWSTsDelta(req.SourceClockNs, destClockNs)
+	resp.TsDelta = tsDelta
+	log.Info("ConfirmOverlayReady: barrier satisfied", "migration", req.MigrationName,
+		"sourceClockNs", req.SourceClockNs, "destClockNs", destClockNs, "tsDelta", tsDelta)
+
+	resp.Ready = true
+	return resp, nil
+}
+
 // zeroizeDir overwrites all regular files in dir with zeros then removes the directory.
 // Called to scrub checkpoint images (verbatim process memory) from tmpfs on all exit paths.
 func zeroizeDir(dir string) error {
