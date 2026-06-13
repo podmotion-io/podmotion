@@ -1,0 +1,71 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: podmotion-gate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: w2-workload
+  namespace: podmotion-gate
+  labels:
+    app: w2
+    podmotion.io/workload-type: w2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: w2
+  template:
+    metadata:
+      labels:
+        app: w2
+        podmotion.io/workload-type: w2
+    spec:
+      nodeSelector:
+        podmotion.io/role: worker
+      tolerations:
+        - key: podmotion.io/role
+          operator: Equal
+          value: worker
+          effect: NoSchedule
+      containers:
+        - name: postgres
+          # postgres:16 — pin digest before gate run
+          image: postgres@sha256:FILL_IN_DIGEST
+          ports:
+            - containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRES_DB
+              value: gatedb
+            - name: POSTGRES_USER
+              value: gateuser
+            - name: POSTGRES_PASSWORD
+              value: gatepass
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 400m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: w2-svc
+  namespace: podmotion-gate
+  labels:
+    app: w2
+    podmotion.io/workload-type: w2
+spec:
+  type: ClusterIP
+  selector:
+    app: w2
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+      protocol: TCP
