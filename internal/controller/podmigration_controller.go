@@ -2973,7 +2973,10 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	// restore, and the migration namespace so the NRI plugin can patch the correct
 	// PodMigration CR with criuRestoreConfirmed after JoinNsRestore succeeds.
 	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
-		newAnnotations["podmotion.io/checkpoint-ref"] = pm.Status.CheckpointRef.Name
+		// Use pm.Name (DNS-label safe) as the annotation value so the NRI plugin's
+		// validCheckpointRef regex accepts it. The plugin reconstructs the full
+		// checkpoint path as /run/podmotion/checkpoints/<ref>/final in main.go.
+		newAnnotations["podmotion.io/checkpoint-ref"] = pm.Name
 		newAnnotations["podmotion.io/migration-namespace"] = pm.Namespace
 	}
 
