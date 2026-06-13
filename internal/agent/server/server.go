@@ -538,6 +538,98 @@ func ctrCheckpoint(taskID, imagesDir string) (int64, error) {
 	return total, nil
 }
 
+// containerdMaskedPaths is the canonical, single source of truth for the set of
+// host-sensitive paths the containerd/runc OCI runtime masks by default (OCI
+// runtime-spec linux.maskedPaths). containerd binds /dev/null or an empty
+// read-only tmpfs over each, so CRIU dumps them as external mounts that require
+// an --ext-mount-map on restore (ADR-0124). Both the restore-time pre-scan
+// (buildMaskedPathExtMountArgs) and the patch step (patchCheckpointImages)
+// consult this list — do not fork a divergent copy (AC6).
+var containerdMaskedPaths = []string{
+	"/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys",
+	"/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats",
+	"/proc/sched_debug", "/proc/scsi",
+	"/sys/firmware", "/sys/fs/pstore", "/sys/fs/bpf",
+}
+
+// buildMaskedPathExtMountArgs pre-scans the checkpoint's mountpoints-*.img (ADR-0124)
+// and generates the --ext-mount-map args CRIU needs to re-bind containerd's masked-path
+// external mounts. It MUST run AFTER patchCheckpointImages so it sees exactly the mount
+// set CRIU will be asked to restore (ordered, disjoint-by-construction with the patch's
+// delete set).
+//
+// For each mount entry it flags a masked-path external mount when EITHER the pycriu-reported
+// root (normalized by trimming a single leading '/') equals "null", OR the mountpoint is in
+// containerdMaskedPaths. Each qualifying entry yields "--ext-mount-map <mnt_id>:/dev/null"
+// (numeric mnt_id form — the form CRIU failed to resolve in "No mapping for 2288:...").
+//
+// Fail loud (ADR-0124 D4 / AC5): any external mount that is neither in containerdMaskedPaths
+// nor mappable to /dev/null returns an error naming each unmapped mnt_id and mountpoint, and
+// the caller must NOT invoke CRIU restore.
+//
+// pycriu is invoked as a python3 subprocess with PYTHONPATH set (ADR-0121); imagesDir is passed
+// as argv (never string-formatted into the script body — Security note).
+func buildMaskedPathExtMountArgs(imagesDir string) ([]string, error) {
+	const scanScript = `
+import pycriu, glob, json, sys
+imgs = glob.glob(sys.argv[1] + '/mountpoints-*.img')
+results = []
+for img in imgs:
+    with open(img, 'rb') as f:
+        data = pycriu.images.load(f)
+    for e in data.get('entries', []):
+        if e.get('ext_key') or e.get('root') in ('null', '/null', None):
+            results.append({'mnt_id': e.get('mnt_id'), 'mountpoint': e.get('mountpoint', ''), 'root': e.get('root', ''), 'ext_key': e.get('ext_key', '')})
+print(json.dumps(results))
+`
+	scriptPath := "/dev/shm/pm-scan-mounts.py"
+	if err := os.WriteFile(scriptPath, []byte(scanScript), 0o600); err != nil {
+		return nil, fmt.Errorf("write mount-scan script: %w", err)
+	}
+	defer os.Remove(scriptPath)
+
+	cmd := exec.Command("python3", scriptPath, imagesDir)
+	cmd.Env = append(os.Environ(), "PYTHONPATH=/usr/lib/python3/dist-packages")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("mount-scan script failed: %w\n%s", err, out)
+	}
+
+	var entries []struct {
+		MntID      int    `json:"mnt_id"`
+		Mountpoint string `json:"mountpoint"`
+		Root       string `json:"root"`
+		ExtKey     string `json:"ext_key"`
+	}
+	if err := json.Unmarshal(out, &entries); err != nil {
+		return nil, fmt.Errorf("parse mount-scan output: %w\n%s", err, out)
+	}
+
+	masked := make(map[string]bool, len(containerdMaskedPaths))
+	for _, p := range containerdMaskedPaths {
+		masked[p] = true
+	}
+
+	var args []string
+	var unmapped []string
+	for _, e := range entries {
+		// Normalize root by trimming a single leading '/' so both "null" and "/null" match (ADR-0124 R3).
+		normRoot := strings.TrimPrefix(e.Root, "/")
+		if normRoot == "null" || masked[e.Mountpoint] {
+			args = append(args, "--ext-mount-map", fmt.Sprintf("%d:/dev/null", e.MntID))
+			continue
+		}
+		// An external mount (root is external / ext_key set) that is neither a null bind nor a
+		// known masked path is unsafe to map to /dev/null — fail loud (D4).
+		unmapped = append(unmapped, fmt.Sprintf("mnt_id=%d mountpoint=%q root=%q", e.MntID, e.Mountpoint, e.Root))
+	}
+	if len(unmapped) > 0 {
+		return nil, fmt.Errorf("buildMaskedPathExtMountArgs: %d external mount(s) not in containerdMaskedPaths and not a /dev/null bind — refusing to restore (ADR-0124 D4): %s",
+			len(unmapped), strings.Join(unmapped, "; "))
+	}
+	return args, nil
+}
+
 // buildCRIURestoreArgs constructs the argument list for `criu restore`.
 // Network namespace selection is tier-driven (ADR-0048):
 //   - destNetnsFd non-empty → --join-ns net:<path> + --tcp-established: restore into the
@@ -718,6 +810,14 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) 
 	}
 
 	criuArgs := buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsChildFd)
+	// ADR-0124: dynamically scan the (post-patch) mountpoints-*.img for containerd masked-path
+	// external mounts and append their --ext-mount-map <mnt_id>:/dev/null args. Fail loud before
+	// invoking CRIU if any external mount is not safely mappable (D4).
+	maskedArgs, err := buildMaskedPathExtMountArgs(checkpointDir)
+	if err != nil {
+		return 0, err
+	}
+	criuArgs = append(criuArgs, maskedArgs...)
 	criuCmd := exec.Command("/usr/local/sbin/criu", criuArgs...)
 	criuCmd.ExtraFiles = extraFiles
 	if err := criuCmd.Start(); err != nil {
@@ -995,11 +1095,20 @@ func sandboxPausePID(sandboxID string) (int, error) {
 // Idempotent: backs up originals as *.orig on first call; subsequent calls are no-ops.
 func patchCheckpointImages(checkpointDir string) error {
 	// Write the patch script to a temp file and run it with the system python3 + pycriu.
+	// containerdMaskedPaths is injected as a JSON argv so the patch step consumes the same
+	// single source of truth as buildMaskedPathExtMountArgs (ADR-0124 R2 / AC6) — no divergent
+	// hardcoded copy. The delete set (masked path AND no ext_key) and the restore-time map set
+	// are disjoint by construction: entries deleted here are never presented to CRIU.
+	maskedJSON, err := json.Marshal(containerdMaskedPaths)
+	if err != nil {
+		return fmt.Errorf("marshal masked paths: %w", err)
+	}
 	patchScript := `
-import sys, os, shutil
+import sys, os, shutil, glob, json
 import pycriu
 
 ckpt = sys.argv[1]
+null_ext_key_masked = set(json.loads(sys.argv[2]))
 
 def backup(path):
     orig = path + '.orig'
@@ -1008,23 +1117,18 @@ def backup(path):
     return orig
 
 # ---- mountpoints: keep only mounts with valid (non-null) ext_key or standard in-container mounts ----
-mp_path = os.path.join(ckpt, 'mountpoints-13.img')
-if os.path.exists(mp_path):
+for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     src = backup(mp_path)
     with open(src, 'rb') as f:
         img = pycriu.images.load(f)
     # Remove entries that have no ext_key AND are masked paths (proc/* or sys/firmware, sys/fs/pstore)
     # that cannot be recreated cross-node. Entries with a valid ext_key are handled via --ext-mount-map.
-    null_ext_key_masked = {
-        '/proc/acpi', '/proc/scsi', '/sys/firmware', '/sys/fs/pstore',
-        '/proc/timer_stats', '/proc/sched_debug',
-    }
     kept = [e for e in img['entries']
             if not (e.get('mountpoint') in null_ext_key_masked and not e.get('ext_key'))]
     img['entries'] = kept
     with open(mp_path, 'wb') as f:
         pycriu.images.dump(img, f)
-    print('mountpoints: kept', len(kept), 'entries')
+    print('mountpoints:', os.path.basename(mp_path), 'kept', len(kept), 'entries')
 
 # ---- netns: remove extRootNetNS dependency (references source host net ns) ----
 netns_path = os.path.join(ckpt, 'netns-10.img')
@@ -1063,7 +1167,7 @@ if os.path.exists(netdev_path):
 		return fmt.Errorf("write patch script: %w", err)
 	}
 	defer os.Remove(scriptPath)
-	cmd := exec.Command("python3", scriptPath, checkpointDir)
+	cmd := exec.Command("python3", scriptPath, checkpointDir, string(maskedJSON))
 	cmd.Env = append(os.Environ(), "PYTHONPATH=/usr/lib/python3/dist-packages")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
