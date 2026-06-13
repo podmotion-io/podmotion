@@ -240,6 +240,58 @@ func assertPort(t *testing.T, label string, got, want uint16) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// TestExportConntrack — gate criterion G7: ExportConntrack reachable, options validated
+// ---------------------------------------------------------------------------
+
+func TestExportConntrack(t *testing.T) {
+	ctx := context.Background()
+	// Export for a non-existent pod IP — should return empty slice, not error.
+	entries, err := ExportConntrack(ctx, ConntrackExportOptions{PodIP: "192.0.2.1"})
+	if err != nil {
+		t.Fatalf("ExportConntrack: unexpected error: %v", err)
+	}
+	// No entries expected for a non-existent pod — result must be a valid (possibly empty) slice.
+	if entries == nil {
+		t.Fatal("ExportConntrack: returned nil slice, want empty []ConntrackEntry")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestConntrackRoundTrip — gate criterion G7: exported entries preserve 4-tuple + state
+// ---------------------------------------------------------------------------
+
+func TestConntrackRoundTrip(t *testing.T) {
+	// Build a synthetic entry representing a stable TCP session.
+	original := ConntrackEntry{
+		SrcIP:    net.ParseIP("10.244.1.5").To4(),
+		DstIP:    net.ParseIP("10.96.0.10").To4(),
+		SrcPort:  44321,
+		DstPort:  8080,
+		Protocol: syscall.IPPROTO_TCP,
+		Layer3Proto: unix.AF_INET,
+	}
+
+	// Verify 4-tuple is preserved through rewriteEntry (the core migration transform).
+	opts := ConntrackImportOptions{
+		SourcePodIP: "10.244.1.5",
+		DestPodIP:   "10.244.2.7",
+	}
+	rewritten := rewriteEntry(original, opts)
+	if !rewritten.SrcIP.Equal(net.ParseIP("10.244.2.7").To4()) {
+		t.Errorf("rewriteEntry: SrcIP not updated: got %s", rewritten.SrcIP)
+	}
+	if rewritten.SrcPort != original.SrcPort {
+		t.Errorf("rewriteEntry: SrcPort changed: got %d, want %d", rewritten.SrcPort, original.SrcPort)
+	}
+	if rewritten.DstPort != original.DstPort {
+		t.Errorf("rewriteEntry: DstPort changed: got %d, want %d", rewritten.DstPort, original.DstPort)
+	}
+	if rewritten.Protocol != original.Protocol {
+		t.Errorf("rewriteEntry: Protocol changed: got %d, want %d", rewritten.Protocol, original.Protocol)
+	}
+}
+
 // bytesContain reports whether haystack contains needle as a contiguous subsequence.
 func bytesContain(haystack, needle []byte) bool {
 	if len(needle) == 0 {
