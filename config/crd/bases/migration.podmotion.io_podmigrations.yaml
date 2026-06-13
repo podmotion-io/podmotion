@@ -344,6 +344,29 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              criuRestoreConfirmed:
+                description: |-
+                  CRIURestoreConfirmed is set to true by the NRI plugin after JoinNsRestore
+                  completes successfully, confirming memory images were replayed.
+                type: boolean
+              dataIntact:
+                description: |-
+                  DataIntact is set to true when post-restore application-level data integrity
+                  is confirmed (e.g. Redis key survives, Postgres row count matches).
+                  Set by the reconciler after the post-restore integrity gate passes.
+                type: boolean
+              destNetnsPath:
+                description: |-
+                  DestNetnsPath is the /proc/<pid>/fd/<n> path to the pre-staged migration netns on
+                  the destination node, returned by PrepareDestinationNetns. Passed as dest_netns_fd
+                  in RestoreRequest so the CRIU restore re-enters the correct netns (ADR-0048).
+                type: string
+              destVtepMac:
+                description: |-
+                  DestVtepMac is the VTEP MAC for the destination overlay interface, returned by
+                  PrepareDestinationNetns. Used to inject the AF_BRIDGE FDB entry on the source node
+                  and passed to ConfirmOverlayReady (ADR-0048).
+                type: string
               destinationNodeName:
                 description: DestinationNodeName is the node the pod was migrated
                   to.
@@ -379,17 +402,34 @@ spec:
                 - migratable
                 - storageTier
                 type: object
+              overlayFdbIfname:
+                description: |-
+                  OverlayFdbIfname is the overlay interface name on both nodes (e.g. "flannel.1") used
+                  for FDB and neighbor entry injection and RTM_GETNEIGH confirmation. Populated once
+                  during DestinationPrewarm and reused by ConfirmOverlayReady (ADR-0048).
+                type: string
               phase:
                 default: Pending
                 description: Phase is the current migration phase.
                 enum:
                 - Pending
+                - SocketInventory
                 - Validating
                 - PreMigrating
                 - Checkpointing
                 - Transferring
                 - Restoring
                 - Verifying
+                - DestinationPrewarm
+                - PreCopyMemory
+                - ZeroWindowArm
+                - FinalFreezeStateCapture
+                - OverlayHandoff
+                - RestoreSocketReattach
+                - DisengageHold
+                - TCPVerifying
+                - ServiceVerifying
+                - CutoverComplete
                 - Complete
                 - Failed
                 - RollingBack
@@ -426,8 +466,40 @@ spec:
                   Stored in Status (not Spec) because it is controller-derived runtime state,
                   not user intent. Written once at Checkpointing and read by subsequent phases.
                 type: string
+              restoredPID:
+                description: |-
+                  RestoredPID is the root PID of the restored container process tree,
+                  set by the NRI plugin after successful CRIU restore.
+                format: int32
+                type: integer
+              sourceClockNs:
+                description: |-
+                  SourceClockNs is CLOCK_MONOTONIC nanoseconds captured on the source node at freeze
+                  time, returned in CheckpointResponse. Passed to ConfirmOverlayReady so the destination
+                  can compute the PAWS ts_delta for PM_SEQ_XLAT (ADR-0049).
+                format: int64
+                type: integer
+              sourceConntrackArmed:
+                description: |-
+                  SourceConntrackArmed indicates that the NOTRACK conntrack rule is confirmed on the
+                  source node. Set by the OverlayHandoff phase before calling ConfirmOverlayReady.
+                type: boolean
+              sourceFreezeTimestampNs:
+                description: |-
+                  SourceFreezeTimestampNs is CLOCK_REALTIME nanoseconds at the exact freeze instant,
+                  captured by the source agent after the CRIU dump completes with --leave-stopped.
+                  Passed as source_freeze_timestamp_ns in the RestoreRequest so the destination agent
+                  can compute the PAWS ts_delta for PM_SEQ_XLAT (ADR-0049).
+                format: int64
+                type: integer
               sourceNodeName:
                 description: SourceNodeName is the node the pod was migrated from.
+                type: string
+              sourcePodMac:
+                description: |-
+                  SourcePodMac is the MAC address of the source pod's primary interface, populated
+                  during the DestinationPrewarm phase from the source pod annotation or netlink query.
+                  Used in AF_BRIDGE FDB lookups by ConfirmOverlayReady (ADR-0048).
                 type: string
               startTime:
                 description: StartTime is when the migration was first admitted.
@@ -443,6 +515,45 @@ spec:
                   successfully migrated.
                 format: int32
                 type: integer
+              tcpSeqSnapshots:
+                description: |-
+                  TCPSeqSnapshots holds the per-connection TCP sequence state captured at the exact
+                  freeze instant. Persisted across the Checkpoint→Restore phase boundary so the
+                  controller can pass it in RestoreRequest.seq_snapshots for PM_SEQ_XLAT seeding.
+                items:
+                  description: |-
+                    TCPSeqSnapshot captures the TCP sequence state for a single ESTABLISHED connection
+                    at the exact freeze instant. Mirrors proto SeqSnapshot but stored in CRD status for
+                    cross-phase persistence.
+                  properties:
+                    dstIP:
+                      type: string
+                    dstPort:
+                      format: int32
+                      type: integer
+                    rcvNxt:
+                      format: int32
+                      type: integer
+                    sndNxt:
+                      format: int32
+                      type: integer
+                    srcIP:
+                      type: string
+                    srcPort:
+                      format: int32
+                      type: integer
+                    tsRecent:
+                      format: int32
+                      type: integer
+                  required:
+                  - dstIP
+                  - dstPort
+                  - rcvNxt
+                  - sndNxt
+                  - srcIP
+                  - srcPort
+                  type: object
+                type: array
             type: object
         type: object
     served: true
