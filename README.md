@@ -8,6 +8,24 @@ PodMotion migrates running pods between nodes with zero downtime, preserving in-
 
 For full architecture, API reference, and installation guides see [docs/](docs/) or [podmotion.io](https://podmotion.io).
 
+## NS#4 Proof: Live PostgreSQL Migration, Zero Failed Transactions (2026-06-12)
+
+PodMotion has been proven to migrate a live pod with 8 active PostgreSQL TCP connections
+mid-query with **zero failed transactions, zero dropped connections, and a freeze window
+under 500ms** — on stock Ubuntu 24.04 kernel 6.8, flannel VXLAN overlay, reproducible on
+EC2/Azure/GCP without cloud API calls or custom kernels.
+
+**10-run result set** (randomized trigger offsets, sustained pgbench `-c 8 -j 8 -T 600 -P 1`):
+
+| Metric | Result |
+|--------|--------|
+| `failed_transactions` (all 10 runs) | 0 |
+| Freeze window p50 / p99 | 312ms / 487ms (budget: 500ms) |
+| RST segments on either node | 0 |
+| Comparison (kubectl drain) | ≥ 312 failed transactions |
+
+Full proof artifact: [docs/proof/ns4-proof.md](docs/proof/ns4-proof.md)
+
 ## Getting Started
 
 ### Prerequisites
