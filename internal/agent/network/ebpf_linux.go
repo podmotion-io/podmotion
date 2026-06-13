@@ -837,6 +837,47 @@ func attachXDP(ifindex int, prog *ebpf.Program) error {
 	return nil
 }
 
+// PatchRelayTsDelta performs a read-modify-write on PM_SEQ_XLAT for the given key,
+// updating only the ts_delta field while preserving seq_delta and ack_delta.
+// ADR-0049: ts_delta is patched separately from seq/ack because the PAWS clock
+// offset is not known until the destination captures its monotonic clock at restore
+// time, which is after SeedRelayFromSnapshots has already seeded seq_delta/ack_delta.
+// This method must never be replaced by a plain ArmRelay call, which would overwrite
+// the entire map value and zero seq_delta/ack_delta.
+func (m *ciliumEBPFManager) PatchRelayTsDelta(ctx context.Context, key SeqXlatKey, tsDelta int32) error {
+	log := logf.FromContext(ctx)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.relayObjs == nil {
+		// relay collection not loaded; entry doesn't exist.
+		log.Info("ebpf cilium: PatchRelayTsDelta skipped — relay not loaded", "srcPort", key.SrcPort, "dstPort", key.DstPort)
+		return nil
+	}
+
+	bpfKey := pmRelayBpfKey(key)
+	// Read existing value.
+	var existing [16]byte
+	if err := m.relayObjs.PmSeqXlat.Lookup(bpfKey, &existing); err != nil {
+		// Entry not found — not an error (stateless migration or entry already removed).
+		log.Info("ebpf cilium: PatchRelayTsDelta: entry not found, skipping",
+			"srcPort", key.SrcPort, "dstPort", key.DstPort)
+		return nil
+	}
+
+	// Overwrite only the ts_delta word (bytes 8–11, little-endian), leaving seq_delta
+	// (bytes 0–3) and ack_delta (bytes 4–7) untouched.
+	binary.LittleEndian.PutUint32(existing[8:12], uint32(tsDelta))
+
+	if err := m.relayObjs.PmSeqXlat.Update(bpfKey, existing[:], ebpf.UpdateExist); err != nil {
+		return fmt.Errorf("PM_SEQ_XLAT PatchRelayTsDelta update: %w", err)
+	}
+
+	log.Info("ebpf cilium: PatchRelayTsDelta: ts_delta patched",
+		"srcPort", key.SrcPort, "dstPort", key.DstPort, "tsDelta", tsDelta)
+	return nil
+}
+
 // ── Lazy loaders ─────────────────────────────────────────────────────────────
 
 func (m *ciliumEBPFManager) ensureRelayLoaded(ctx context.Context) error {

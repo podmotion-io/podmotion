@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
 /*
  * pm_xdp_vtep.c — XDP programs for VXLAN VTEP handling during migration.
  *
@@ -171,4 +171,4 @@ int pm_xdp_src_guard(struct xdp_md *ctx)
     return bpf_redirect(ve->dst_ifindex, 0);
 }
 
-char _license[] SEC("license") = "GPL";
+char _license[] SEC("license") = "Dual BSD/GPL";

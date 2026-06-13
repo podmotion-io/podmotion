@@ -76,6 +76,11 @@ type EBPFManager interface {
 	ArmVTEP(ctx context.Context, podIP net.IP, ve VtepEntry, dstIfname, srcIfname string) error
 	// DisarmVTEP removes the PM_VTEP_MAP entry for podIP.
 	DisarmVTEP(ctx context.Context, podIP net.IP) error
+	// PatchRelayTsDelta performs a read-modify-write on PM_SEQ_XLAT for the given key,
+	// updating only the ts_delta field while preserving the existing seq_delta/ack_delta.
+	// If the entry does not exist it is a no-op (returns nil).
+	// This must be called INSTEAD of ArmRelay when only ts_delta needs to be updated.
+	PatchRelayTsDelta(ctx context.Context, key SeqXlatKey, tsDelta int32) error
 }
 
 // eBPFManager is the interface consumed by NetworkBridgeAgent.
@@ -116,6 +121,10 @@ type eBPFManager interface {
 
 	// DisarmVTEP removes the PM_VTEP_MAP entry for podIP.
 	DisarmVTEP(ctx context.Context, podIP net.IP) error
+
+	// PatchRelayTsDelta performs a read-modify-write on PM_SEQ_XLAT for the given key,
+	// updating only the ts_delta field while preserving the existing seq_delta/ack_delta.
+	PatchRelayTsDelta(ctx context.Context, key SeqXlatKey, tsDelta int32) error
 }
 
 // NewEBPFManager is the exported constructor for callers outside the network
@@ -201,6 +210,11 @@ func (s *eBPFManagerStub) ArmVTEP(ctx context.Context, podIP net.IP, ve VtepEntr
 
 func (s *eBPFManagerStub) DisarmVTEP(ctx context.Context, podIP net.IP) error {
 	logf.FromContext(ctx).Info("ebpf stub: DisarmVTEP", "podIP", podIP)
+	return nil
+}
+
+func (s *eBPFManagerStub) PatchRelayTsDelta(ctx context.Context, key SeqXlatKey, tsDelta int32) error {
+	logf.FromContext(ctx).Info("ebpf stub: PatchRelayTsDelta", "srcPort", key.SrcPort, "dstPort", key.DstPort, "tsDelta", tsDelta)
 	return nil
 }
 

@@ -1184,8 +1184,17 @@ func (s *AgentServer) Restore(_ context.Context, req *agentpb.RestoreRequest) (*
 			seedCtx, seedCancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer seedCancel()
 			if _, seedErr := network.SeedRelayFromSnapshots(seedCtx, int32(pid), snaps, relayIfname, s.ebpfMgr); seedErr != nil {
-				log.Error(seedErr, "Restore: SeedRelayFromSnapshots failed — relay deltas not seeded; migration may see seq corruption",
+				// CRITICAL: SeqSnapshots were provided but PM_SEQ_XLAT seeding failed.
+				// Returning success here would allow the controller to advance to
+				// CutoverComplete and delete the source pod while sequence translation
+				// is absent — causing TCP RST on all migrated connections (ADR-0049).
+				// Fail closed so the controller rolls back and the source pod is preserved.
+				log.Error(seedErr, "Restore: SeedRelayFromSnapshots FAILED — returning failure to prevent premature source deletion",
 					"migration", req.MigrationName)
+				return &agentpb.RestoreResponse{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("SeedRelayFromSnapshots: %v — relay seq translation not seeded; migration cannot safely proceed", seedErr),
+				}, nil
 			}
 		}
 
@@ -1306,14 +1315,37 @@ func (s *AgentServer) VerifyTCP(ctx context.Context, req *agentpb.VerifyTCPReque
 		}, nil
 	}
 
-	// If no source snapshots are available, verify only connection count (best-effort).
+	// If no source snapshots are available and there are ESTABLISHED connections on the
+	// destination, fail CLOSED. An empty snapshot set means either:
+	//   (a) the proto wire bug dropped the field — verified=true with no evidence is
+	//       catastrophic because it authorises source-pod deletion without proof, or
+	//   (b) there were genuinely zero ESTABLISHED sockets at freeze time — in which
+	//       case len(destEntries) should also be 0 (no connections to verify).
+	// We never treat absence-of-evidence as proof of continuity (ADR-0049 fail-closed).
+	//
+	// Exception: if both source snapshots AND destination connections are zero, the
+	// migration had no TCP state to preserve — that is genuinely verified.
 	if len(sourceSnaps) == 0 {
-		log.Info("VerifyTCP: no source SeqSnapshots available — count-only verification",
-			"migration", req.MigrationName, "destConnections", len(destEntries))
+		if len(destEntries) == 0 {
+			// No ESTABLISHED connections at either end — stateless migration, trivially verified.
+			log.Info("VerifyTCP: no source SeqSnapshots and no destination ESTABLISHED sockets — stateless migration verified",
+				"migration", req.MigrationName)
+			return &agentpb.VerifyTCPResponse{
+				Verified:            true,
+				ConnectionsVerified: 0,
+				ConnectionsExpected: 0,
+			}, nil
+		}
+		// Source snapshots missing but destination has live ESTABLISHED connections.
+		// This is a verification failure — absence of evidence is not success.
+		msg := fmt.Sprintf("VerifyTCP: source SeqSnapshots absent but destination has %d ESTABLISHED connection(s) — cannot verify TCP continuity (ADR-0049 fail-closed); regenerate proto/gen if proto wire bug suspected",
+			len(destEntries))
+		log.Error(nil, msg, "migration", req.MigrationName)
 		return &agentpb.VerifyTCPResponse{
-			Verified:            true,
-			ConnectionsVerified: int32(len(destEntries)),
-			ConnectionsExpected: 0,
+			Verified:            false,
+			ConnectionsVerified: 0,
+			ConnectionsExpected: -1, // sentinel: snapshots missing, not zero
+			FailureReason:       msg,
 		}, nil
 	}
 

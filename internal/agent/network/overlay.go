@@ -153,13 +153,20 @@ func ComputePAWSTsDelta(sourceClockNs, destClockNs int64) int32 {
 	return int32(offsetMs)
 }
 
-// PatchSeqXlatTsDelta updates the ts_delta field of a SeqXlatEntry already loaded into
-// PM_SEQ_XLAT via ArmRelay. This is a separate step because the clock offset is not
-// available until the destination agent captures its monotonic clock at restore time,
-// which is after SeedRelayFromSnapshots has already run.
+// PatchSeqXlatTsDelta updates the ts_delta field of a SeqXlatEntry already seeded into
+// PM_SEQ_XLAT by SeedRelayFromSnapshots. This is a separate step because the PAWS clock
+// offset is not available until the destination agent captures its monotonic clock at
+// restore time, which is after SeedRelayFromSnapshots has already run.
 //
-// If ebpfMgr is nil or the entry does not exist in the map, the function logs and returns nil.
-func PatchSeqXlatTsDelta(ctx context.Context, snapshots []SeqSnapshot, tsDelta int32, relayIfname string, ebpfMgr EBPFManager) error {
+// CRITICAL: This function MUST use EBPFManager.PatchRelayTsDelta (read-modify-write) and
+// MUST NOT call ArmRelay. ArmRelay does a full-value OVERWRITE of the BPF map entry, which
+// would clobber the seq_delta/ack_delta previously seeded by SeedRelayFromSnapshots with
+// zeros, causing the relay to emit un-translated sequence numbers → peer TCP RST.
+//
+// If ebpfMgr is nil, tsDelta is 0, or the entry does not exist in the map, the function
+// logs and returns nil (no-op is safe: ts_delta=0 means no PAWS adjustment, acceptable
+// when source and destination clocks are synchronised).
+func PatchSeqXlatTsDelta(ctx context.Context, snapshots []SeqSnapshot, tsDelta int32, _ string, ebpfMgr EBPFManager) error {
 	log := logf.FromContext(ctx)
 	if ebpfMgr == nil || len(snapshots) == 0 || tsDelta == 0 {
 		return nil
@@ -171,19 +178,14 @@ func PatchSeqXlatTsDelta(ctx context.Context, snapshots []SeqSnapshot, tsDelta i
 			continue
 		}
 		key := ipPortToSeqXlatKey(localIP.To4(), uint16(snap.SrcPort), peerIP.To4(), uint16(snap.DstPort))
-		entry := SeqXlatEntry{
-			SeqDelta:    0,    // will be overwritten in ArmRelay; zero is safe as additive no-op
-			AckDelta:    0,
-			TsDelta:     tsDelta,
-			Wscale:      0,
-			SackPresent: 1,
-			State:       1,
+		// Use PatchRelayTsDelta (read-modify-write) to preserve the seq_delta/ack_delta
+		// that SeedRelayFromSnapshots has already written to the BPF map entry.
+		if err := ebpfMgr.PatchRelayTsDelta(ctx, key, tsDelta); err != nil {
+			log.Error(err, "PatchSeqXlatTsDelta: PatchRelayTsDelta failed", "src", snap.SrcIP, "dst", snap.DstIP)
+			return fmt.Errorf("PatchSeqXlatTsDelta: PatchRelayTsDelta: %w", err)
 		}
-		if err := ebpfMgr.ArmRelay(ctx, relayIfname, key, entry); err != nil {
-			log.Error(err, "PatchSeqXlatTsDelta: ArmRelay failed", "src", snap.SrcIP, "dst", snap.DstIP)
-			return fmt.Errorf("PatchSeqXlatTsDelta: ArmRelay: %w", err)
-		}
-		log.Info("PatchSeqXlatTsDelta: ts_delta patched", "srcPort", snap.SrcPort, "dstPort", snap.DstPort, "tsDelta", tsDelta)
+		log.Info("PatchSeqXlatTsDelta: ts_delta patched via read-modify-write",
+			"srcPort", snap.SrcPort, "dstPort", snap.DstPort, "tsDelta", tsDelta)
 	}
 	return nil
 }
