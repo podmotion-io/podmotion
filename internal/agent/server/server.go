@@ -1911,6 +1911,10 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		tcpEstablished = mode == pmv1.TCPPreservationModeStrict || mode == pmv1.TCPPreservationModeBestEffort
 	}
 
+	// resolvedTaskID caches the containerd task ID resolved during the ctr attempt so the
+	// raw-CRIU config.json staging step can reuse it without a second (racy) lookup (ADR-0134).
+	var resolvedTaskID string
+
 	// Try containerd-native checkpoint first (ctr tasks checkpoint).
 	// This handles all container namespaces correctly (network, mount, etc.) and produces
 	// CRIU images that runc can restore on the destination. Falls back to raw CRIU (go-criu)
@@ -1918,6 +1922,13 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 	if podUID != "" {
 		taskID, taskErr := FindContainerTaskID(podUID)
 		if taskErr == nil {
+			// ADR-0134: cache the resolved task ID so the raw-CRIU config.json staging step
+			// below can reuse it. After the raw CRIU dump runs with --tcp-established, the
+			// task may no longer be enumerable by FindContainerTaskID (the frozen/dumped
+			// process drops off the running-task scan), so re-resolving there returns
+			// "task not found" and config.json is never staged → destination restore fails
+			// with "read config.json: no such file or directory".
+			resolvedTaskID = taskID
 			log.Info("Checkpoint: using containerd-native ctr checkpoint", "taskID", taskID)
 			freezeStart := time.Now()
 			sizeBytes, ctrErr := ctrCheckpoint(taskID, imagesDir)
@@ -2134,14 +2145,21 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		// <checkpointDir>/config.json to build the OCI bundle. Without it restore fails
 		// with "read config.json: no such file or directory" (ADR-0131 restore path).
 		if podUID != "" {
-			if taskID, taskErr := FindContainerTaskID(podUID); taskErr == nil {
-				srcCfg := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s/config.json", taskID)
+			// ADR-0134: prefer the task ID cached during the ctr attempt. Re-resolving here
+			// fails after the raw CRIU dump (frozen task drops off FindContainerTaskID's scan).
+			stageTaskID := resolvedTaskID
+			var taskErr error
+			if stageTaskID == "" {
+				stageTaskID, taskErr = FindContainerTaskID(podUID)
+			}
+			if taskErr == nil && stageTaskID != "" {
+				srcCfg := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s/config.json", stageTaskID)
 				dstCfg := filepath.Join(checkpointPath, "config.json")
 				if data, readErr := os.ReadFile(srcCfg); readErr == nil {
 					if wErr := os.WriteFile(dstCfg, data, 0o644); wErr != nil {
 						log.Error(wErr, "Checkpoint: failed to stage config.json into checkpoint dir (raw CRIU path) — restore will fail", "dst", dstCfg)
 					} else {
-						log.Info("Checkpoint: staged config.json into checkpoint dir (raw CRIU path)", "dst", dstCfg)
+						log.Info("Checkpoint: staged config.json into checkpoint dir (raw CRIU path)", "dst", dstCfg, "taskID", stageTaskID)
 					}
 				} else {
 					log.Error(readErr, "Checkpoint: could not read bundle config.json (raw CRIU path)", "src", srcCfg)
