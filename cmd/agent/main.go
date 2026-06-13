@@ -184,7 +184,10 @@ func main() {
 			// ADR-0133 D3: collect the replacement pod's eth0 MAC inside the restored
 			// process's netns so the operator can install the destination IP handoff for
 			// the OLD pod IP. Best-effort: log on failure, the operator has a fallback.
-			replVethMAC, macErr := server.ReadReplVethMAC(pid)
+			// Resolve the sandbox netns path (the join-ns restore target) as the authoritative
+			// source for eth0's MAC; the restored PID's netns can transiently lack eth0.
+			sbNetnsPath, _ := agentSrv.SandboxNetnsPath(reportCtx, event.SandboxID)
+			replVethMAC, macErr := server.ReadReplVethMAC(pid, sbNetnsPath)
 			if macErr != nil {
 				log.Error(macErr, "NRI CRIU restore: could not read replacement pod eth0 MAC (ADR-0133) — operator will fall back to diagnostic exec",
 					"migration", checkpointRef, "restoredPID", pid)

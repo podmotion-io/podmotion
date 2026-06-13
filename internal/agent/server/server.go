@@ -181,24 +181,52 @@ func (s *AgentServer) ReportRestoreConfirmed(ctx context.Context, migrationName,
 	return nil
 }
 
-// ReadReplVethMAC reads the replacement pod's eth0 MAC inside the netns of the restored
-// process (host PID). It uses `nsenter --net --target <pid> cat /sys/class/net/eth0/address`
-// per ADR-0133 D3. Returns "" and a non-nil error on failure; the caller treats MAC
-// collection as best-effort (the operator has a diagnostic exec fallback).
-func ReadReplVethMAC(pid int) (string, error) {
-	if pid <= 0 {
-		return "", fmt.Errorf("ReadReplVethMAC: invalid pid %d", pid)
+// ReadReplVethMAC reads the replacement pod's eth0 MAC for ADR-0133 D3. It prefers the
+// sandbox network namespace path (the same netns the join-ns restore targeted, where eth0
+// is reliably present), falling back to the restored process's own netns. The restored
+// PID's /proc/<pid>/ns/net can transiently resolve to a netns without eth0 right after CRIU
+// exits, so the sandbox-netns read is the authoritative source. Returns "" and a non-nil
+// error if both fail; the caller treats MAC collection as best-effort.
+//
+// sandboxNetnsPath may be empty (host-network or unresolved), in which case only the PID
+// path is attempted.
+func ReadReplVethMAC(pid int, sandboxNetnsPath string) (string, error) {
+	var attempts []string
+	if sandboxNetnsPath != "" {
+		attempts = append(attempts, sandboxNetnsPath)
 	}
-	out, err := exec.Command("nsenter", "--net=/proc/"+strconv.Itoa(pid)+"/ns/net",
-		"cat", "/sys/class/net/eth0/address").CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("ReadReplVethMAC: nsenter pid %d: %w (%s)", pid, err, strings.TrimSpace(string(out)))
+	if pid > 0 {
+		attempts = append(attempts, "/proc/"+strconv.Itoa(pid)+"/ns/net")
 	}
-	mac := strings.TrimSpace(string(out))
-	if mac == "" {
-		return "", fmt.Errorf("ReadReplVethMAC: empty MAC for pid %d", pid)
+	if len(attempts) == 0 {
+		return "", fmt.Errorf("ReadReplVethMAC: no netns source (pid=%d, sandboxNetnsPath=%q)", pid, sandboxNetnsPath)
 	}
-	return mac, nil
+	var lastErr error
+	for _, netnsArg := range attempts {
+		out, err := exec.Command("nsenter", "--net="+netnsArg,
+			"cat", "/sys/class/net/eth0/address").CombinedOutput()
+		if err != nil {
+			lastErr = fmt.Errorf("ReadReplVethMAC: nsenter %s: %w (%s)", netnsArg, err, strings.TrimSpace(string(out)))
+			continue
+		}
+		mac := strings.TrimSpace(string(out))
+		if mac == "" {
+			lastErr = fmt.Errorf("ReadReplVethMAC: empty MAC via %s", netnsArg)
+			continue
+		}
+		return mac, nil
+	}
+	return "", lastErr
+}
+
+// SandboxNetnsPath resolves the network namespace path for a containerd sandbox ID, for use
+// by the NRI restore callback to collect the replacement pod's eth0 MAC (ADR-0133 D3).
+// Returns "" with a nil error for host-network sandboxes (no netns to read).
+func (s *AgentServer) SandboxNetnsPath(ctx context.Context, sandboxID string) (string, error) {
+	if sandboxID == "" {
+		return "", fmt.Errorf("SandboxNetnsPath: empty sandboxID")
+	}
+	return sandboxNetnsPath(ctx, sandboxID)
 }
 
 // InjectIPHandoff installs the ADR-0133 Decision 2 destination-side neighbor entries so
