@@ -357,6 +357,16 @@ kind-create:
 	kind get clusters | grep -q $(KIND_CLUSTER) || \
 	  kind create cluster --config images/kind/kind-config.yaml
 
+## watch: Live dashboard — pods, PodMigrations, events (auto-picks active PodMotion cluster)
+.PHONY: watch
+watch:
+	./hack/watch-cluster.sh
+
+## clusters: List all available kubectl contexts and kind clusters
+.PHONY: clusters
+clusters:
+	./hack/watch-cluster.sh --list
+
 ## kind-delete: Tear down the local development kind cluster
 .PHONY: kind-delete
 kind-delete:
