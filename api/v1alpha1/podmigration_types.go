@@ -111,7 +111,7 @@ const (
 
 // MigrationPhase represents the current phase of a PodMigration.
 // The 12-phase pipeline replaces the earlier 8-phase pipeline per ADR-0047.
-// +kubebuilder:validation:Enum=Pending;SocketInventory;Validating;DestinationPrewarm;PreCopyMemory;ZeroWindowArm;FinalFreezeStateCapture;OverlayHandoff;RestoreSocketReattach;DisengageHold;TCPVerifying;ServiceVerifying;CutoverComplete;Complete;Failed;RollingBack;DryRunComplete
+// +kubebuilder:validation:Enum=Pending;SocketInventory;Validating;PreMigrating;Checkpointing;Transferring;Restoring;Verifying;DestinationPrewarm;PreCopyMemory;ZeroWindowArm;FinalFreezeStateCapture;OverlayHandoff;RestoreSocketReattach;DisengageHold;TCPVerifying;ServiceVerifying;CutoverComplete;Complete;Failed;RollingBack;DryRunComplete
 type MigrationPhase string
 
 const (
@@ -398,6 +398,12 @@ type PodMigrationStatus struct {
 	// CompletionTime is when the migration reached Complete, Failed, or DryRunComplete.
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+
+	// DataIntact is set to true when post-restore application-level data integrity
+	// is confirmed (e.g. Redis key survives, Postgres row count matches).
+	// Set by the reconciler after the post-restore integrity gate passes.
+	// +optional
+	DataIntact *bool `json:"dataIntact,omitempty"`
 
 	// StorageTier is the detected storage migration tier (0=RWX, 1=Longhorn, 2=CephRBD, 3=SnapshotRsync, 4=Blocked).
 	// +optional
