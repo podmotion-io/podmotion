@@ -315,6 +315,16 @@ const (
 	// ConditionServiceVerified is True when the application-level probe configured in
 	// spec.applicationProbe returns healthy from the destination pod post-restore.
 	ConditionServiceVerified = "ServiceVerified"
+	// ConditionSocketsLive is True when the restore driver has confirmed that the
+	// restored TCP sockets are accepting data on the destination (CRIU --tcp-established
+	// restore completed and the sockets are in ESTABLISHED state). Set before SIGCONT
+	// is delivered to the restored process tree (M23 ordering invariant).
+	ConditionSocketsLive = "SocketsLive"
+	// ConditionProcessResumedAfterSocketsLive is True when the restored process tree
+	// received SIGCONT only after SocketsLive=True was confirmed. The condition
+	// LastTransitionTime must be strictly after the SocketsLive LastTransitionTime
+	// (M23 ordering invariant: no process resumption before sockets are live).
+	ConditionProcessResumedAfterSocketsLive = "ProcessResumedAfterSocketsLive"
 )
 
 // PreCopyStats records metrics from the iterative pre-copy phase.
