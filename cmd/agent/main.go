@@ -215,8 +215,9 @@ func main() {
 				log.Info("NRI CRIU restore: collected replacement pod eth0 MAC (ADR-0133)",
 					"migration", checkpointRef, "replVethMAC", replVethMAC)
 			}
-			// ADR-0137 (single-home variant): strip the CNI-assigned NEW Flannel IP from the
-			// replacement pod's eth0, leaving only the CRIU-restored OLD pod IP. This removes the
+			// ADR-0138 (single-home, assign-not-assume): strip the CNI-assigned NEW Flannel IP,
+			// assign the OLD pod IP, and add the destination cni0-gateway routes on the
+			// replacement pod's eth0, leaving it single-homed on the OLD IP. This removes the
 			// dual-homed conflict (Sprint 26 B6) so the destination kernel delivers VXLAN-decapped
 			// transit traffic for the OLD IP to the pod veth instead of local-input-dropping it.
 			// Non-fatal on the live path: log loud on failure, AC5 catches a missed strip; the

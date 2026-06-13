@@ -235,8 +235,15 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 	log.Info("SingleHomeRestoredPod: eth0 addresses before single-home (ADR-0137)",
 		"migration", migrationName, "restoredPID", pid, "oldIP", oldIP, "addrs", addrs)
 
+	// ADR-0138: the join-ns CRIU restore does NOT replay the checkpoint's inet addr/route
+	// config into the pod netns — at this point eth0 carries ONLY the new Flannel IP and no
+	// OLD-CIDR route. So we must ASSIGN the OLD IP and the destination cni0-gateway routes,
+	// not assume CRIU restored them (ADR-0137's disproven premise). Derive the destination
+	// cni0 gateway from the on-eth0 Flannel IP (host octet -> 1, e.g. 10.244.1.95 -> 10.244.1.1);
+	// fall back to the OLD-IP gateway if no Flannel IP is present.
 	oldSeen := false
 	var delErrs []string
+	cni0Gateway := gatewayForIP(oldIP) // fallback
 	for _, cidr := range addrs {
 		ipOnly := cidr
 		if i := strings.IndexByte(cidr, '/'); i >= 0 {
@@ -246,7 +253,12 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 			oldSeen = true
 			continue
 		}
-		// This is the new Flannel IP (or any other non-OLD address) — strip it.
+		// This is the new Flannel IP (or any other non-OLD address). Its subnet's .1 is the
+		// destination cni0 bridge gateway the pod must use for its return path.
+		if gw := gatewayForIP(ipOnly); gw != "" {
+			cni0Gateway = gw
+		}
+		// Strip it so the pod is single-homed on the OLD IP.
 		delOut, delErr := exec.Command("nsenter", "--net="+netnsPath,
 			"ip", "addr", "del", cidr, "dev", "eth0").CombinedOutput()
 		if delErr != nil {
@@ -261,8 +273,49 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 			delErrs = append(delErrs, fmt.Sprintf("del %s: %v (%s)", cidr, delErr, msg))
 			continue
 		}
-		log.Info("SingleHomeRestoredPod: removed non-OLD eth0 address (ADR-0137 single-home)",
+		log.Info("SingleHomeRestoredPod: removed non-OLD eth0 address (ADR-0138 single-home)",
 			"migration", migrationName, "restoredPID", pid, "removed", cidr, "reason", "not OLD IP")
+	}
+
+	// ADR-0138 step 2: ASSIGN the OLD IP to eth0 if not already present (idempotent: tolerate
+	// EEXIST). This replaces ADR-0137's invalid assumption that CRIU restored it.
+	if !oldSeen {
+		addOut, addErr := exec.Command("nsenter", "--net="+netnsPath,
+			"ip", "addr", "add", oldIP+"/24", "dev", "eth0").CombinedOutput()
+		if addErr != nil {
+			msg := strings.TrimSpace(string(addOut))
+			if strings.Contains(strings.ToLower(msg), "exists") {
+				log.Info("SingleHomeRestoredPod: OLD IP already present (idempotent)", "oldIP", oldIP)
+			} else {
+				return fmt.Errorf("SingleHomeRestoredPod: assign OLD IP %s/24 to eth0: %w (%s)", oldIP, addErr, msg)
+			}
+		} else {
+			log.Info("SingleHomeRestoredPod: assigned OLD IP to eth0 (ADR-0138)",
+				"migration", migrationName, "restoredPID", pid, "oldIP", oldIP)
+		}
+	}
+
+	// ADR-0138 step 3: add a link route to the destination cni0 gateway and an onlink default
+	// via it, so the pod can reply to host-originated (AC1) and cross-node (AC4) traffic that
+	// arrives via cni0. The OLD /24 is foreign to the destination cni0 subnet, so without this
+	// the pod has no return path off its own /24 ("Network is unreachable").
+	if cni0Gateway != "" {
+		// link route to the gateway (idempotent)
+		if rOut, rErr := exec.Command("nsenter", "--net="+netnsPath,
+			"ip", "route", "add", cni0Gateway, "dev", "eth0").CombinedOutput(); rErr != nil {
+			msg := strings.TrimSpace(string(rOut))
+			if !strings.Contains(strings.ToLower(msg), "exists") {
+				log.Info("SingleHomeRestoredPod: warning — add gateway link route", "gw", cni0Gateway, "err", rErr, "output", msg)
+			}
+		}
+		// onlink default via the gateway (replace if present)
+		if rOut, rErr := exec.Command("nsenter", "--net="+netnsPath,
+			"ip", "route", "replace", "default", "via", cni0Gateway, "dev", "eth0", "onlink").CombinedOutput(); rErr != nil {
+			log.Info("SingleHomeRestoredPod: warning — set onlink default route", "gw", cni0Gateway, "err", rErr, "output", strings.TrimSpace(string(rOut)))
+		} else {
+			log.Info("SingleHomeRestoredPod: installed cni0-gateway routes (ADR-0138)",
+				"migration", migrationName, "restoredPID", pid, "gateway", cni0Gateway)
+		}
 	}
 
 	// Verify: only the OLD IP should remain on eth0.
@@ -273,20 +326,45 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 			netnsPath, verifyErr, strings.TrimSpace(string(verifyOut)))
 	}
 	remaining := parseEth0IPv4Addrs(string(verifyOut))
-	log.Info("SingleHomeRestoredPod: eth0 addresses after single-home (ADR-0137 AC5)",
-		"migration", migrationName, "restoredPID", pid, "oldIP", oldIP, "remaining", remaining)
+	log.Info("SingleHomeRestoredPod: eth0 addresses after single-home (ADR-0138 AC5)",
+		"migration", migrationName, "restoredPID", pid, "oldIP", oldIP, "remaining", remaining, "gateway", cni0Gateway)
 
 	if len(delErrs) > 0 {
 		return fmt.Errorf("SingleHomeRestoredPod: failed to remove %d address(es): %s",
 			len(delErrs), strings.Join(delErrs, "; "))
 	}
-	if !oldSeen {
-		// The OLD IP was not present on eth0 at all — CRIU did not restore it, or it lives
-		// elsewhere. Surface loud: single-homing on a missing OLD IP would leave eth0 bare.
-		return fmt.Errorf("SingleHomeRestoredPod: OLD IP %s not present on eth0 (addrs were %v); refusing to leave eth0 without it",
-			oldIP, addrs)
+	// AC5: eth0 must carry the OLD IP and only the OLD IP.
+	oldPresent := false
+	for _, cidr := range remaining {
+		ipOnly := cidr
+		if i := strings.IndexByte(cidr, '/'); i >= 0 {
+			ipOnly = cidr[:i]
+		}
+		if ipOnly == oldIP {
+			oldPresent = true
+		} else {
+			return fmt.Errorf("SingleHomeRestoredPod: eth0 still has non-OLD address %s after single-home (remaining %v)", cidr, remaining)
+		}
+	}
+	if !oldPresent {
+		return fmt.Errorf("SingleHomeRestoredPod: OLD IP %s not present on eth0 after single-home (remaining %v)", oldIP, remaining)
 	}
 	return nil
+}
+
+// gatewayForIP returns the ".1" gateway address of the /24 containing ip (e.g. "10.244.1.95"
+// -> "10.244.1.1"). Returns "" if ip is not a valid IPv4. Used to derive the destination cni0
+// bridge gateway from the new Flannel IP (ADR-0138).
+func gatewayForIP(ip string) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return ""
+	}
+	v4 := parsed.To4()
+	if v4 == nil {
+		return ""
+	}
+	return fmt.Sprintf("%d.%d.%d.1", v4[0], v4[1], v4[2])
 }
 
 // parseEth0IPv4Addrs extracts the "A.B.C.D/N" tokens from `ip -o -4 addr show eth0` output.
