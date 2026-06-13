@@ -29,6 +29,7 @@ func TestBuildCRIURestoreArgs_JoinNs(t *testing.T) {
 		"/var/lib/podmotion/restore/test/secrets",
 		"/run/podmotion/checkpoints/test/final/restore.log",
 		"/proc/12345/fd/7",
+		3,
 	)
 	joined := strings.Join(args, " ")
 
@@ -41,6 +42,9 @@ func TestBuildCRIURestoreArgs_JoinNs(t *testing.T) {
 	if strings.Contains(joined, "--empty-ns") {
 		t.Errorf("--empty-ns must not appear when destNetnsFd is set; got: %s", joined)
 	}
+	if strings.Contains(joined, "--net-fd") {
+		t.Errorf("--net-fd must not appear on the --join-ns path; got: %s", joined)
+	}
 	if strings.Contains(joined, "--tcp-close") {
 		t.Errorf("--tcp-close must not appear when destNetnsFd is set; got: %s", joined)
 	}
@@ -49,10 +53,11 @@ func TestBuildCRIURestoreArgs_JoinNs(t *testing.T) {
 	}
 }
 
-// TestBuildCRIURestoreArgs_EmptyNs asserts that when destNetnsFd is empty (stateless
-// cold migration), buildCRIURestoreArgs produces --empty-ns net and --tcp-close, and
-// that --join-ns and --tcp-established are absent.
-func TestBuildCRIURestoreArgs_EmptyNs(t *testing.T) {
+// TestBuildCRIURestoreArgs_NetFd asserts that when destNetnsFd is empty (stateless
+// cold migration), buildCRIURestoreArgs joins the replacement pod's pause container
+// netns via --net-fd <childFd> + --tcp-close (ADR-0122), and that --empty-ns, --join-ns,
+// and --tcp-established are absent.
+func TestBuildCRIURestoreArgs_NetFd(t *testing.T) {
 	args := buildCRIURestoreArgs(
 		"/run/podmotion/checkpoints/test/final",
 		"/var/lib/podmotion/restore/test/bundle/rootfs",
@@ -61,11 +66,15 @@ func TestBuildCRIURestoreArgs_EmptyNs(t *testing.T) {
 		"/var/lib/podmotion/restore/test/secrets",
 		"/run/podmotion/checkpoints/test/final/restore.log",
 		"",
+		3,
 	)
 	joined := strings.Join(args, " ")
 
-	if !strings.Contains(joined, "--empty-ns net") {
-		t.Errorf("expected --empty-ns net in args; got: %s", joined)
+	if !strings.Contains(joined, "--net-fd 3") {
+		t.Errorf("expected --net-fd 3 in args (ADR-0122); got: %s", joined)
+	}
+	if strings.Contains(joined, "--empty-ns") {
+		t.Errorf("--empty-ns must not appear (ADR-0122 removed it); got: %s", joined)
 	}
 	if !strings.Contains(joined, "--tcp-close") {
 		t.Errorf("expected --tcp-close in args; got: %s", joined)
