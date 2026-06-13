@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -246,14 +247,73 @@ func (r *Registrar) Register(ctx context.Context) error {
 		return fmt.Errorf("applying NodeMigrationCapacity: %w", err)
 	}
 
-	// Update status
+	// Update status — include M25 network encryption probes (ADR-0081, ADR-0102).
 	now := metav1.Now()
 	nmc.Status.Ready = true
 	nmc.Status.LastHeartbeat = &now
+	nmc.Status.ClusterIPFamily = detectIPFamilySupport()
+	// WireGuard and IPSec detection uses the network package (Linux-only; no-op stub on other OS).
+	// Pod CIDR is read from the node spec; fall back to nil (detection skips CIDR-scoped checks).
+	var podCIDR *net.IPNet
+	nodeObj := &corev1.Node{}
+	if r.client.Get(ctx, client.ObjectKey{Name: r.nodeName}, nodeObj) == nil {
+		for _, cidr := range nodeObj.Spec.PodCIDRs {
+			if _, ipnet, err := net.ParseCIDR(cidr); err == nil {
+				podCIDR = ipnet
+				break
+			}
+		}
+	}
+	if wgIface, err := detectWireGuardInterface(podCIDR); err == nil {
+		nmc.Spec.NetworkCapability.WireGuardInterface = wgIface
+	}
+	if ipsec, err := detectIPSecModeCNI(podCIDR); err == nil {
+		nmc.Status.IPSecEncryption = ipsec
+	}
 	if err := r.client.Status().Update(ctx, nmc); err != nil {
 		return fmt.Errorf("updating NodeMigrationCapacity status: %w", err)
 	}
 	return nil
+}
+
+// detectIPFamilySupport inspects the node's non-loopback, non-link-local addresses
+// to determine IP family support (ADR-0081).
+func detectIPFamilySupport() pmv1.IPFamilySupport {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return pmv1.IPFamilySupportUnknown
+	}
+	var hasV4, hasV6 bool
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ip, _, err := net.ParseCIDR(addr.String())
+			if err != nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+				continue
+			}
+			if ip.To4() != nil {
+				hasV4 = true
+			} else {
+				hasV6 = true
+			}
+		}
+	}
+	switch {
+	case hasV4 && hasV6:
+		return pmv1.IPFamilySupportDualStack
+	case hasV4:
+		return pmv1.IPFamilySupportIPv4Only
+	case hasV6:
+		return pmv1.IPFamilySupportIPv6Only
+	default:
+		return pmv1.IPFamilySupportUnknown
+	}
 }
 
 // detectCNI tries to identify the CNI plugin from known directories.

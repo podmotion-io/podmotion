@@ -57,6 +57,11 @@ type NetworkCapability struct {
 	// WireGuard, BGP). Used for MSS clamping calculations when GENEVE bridge is active.
 	// +optional
 	CNIUnderlayType string `json:"cniUnderlayType,omitempty"`
+	// WireGuardInterface is the name of the WireGuard tunnel interface on this node's
+	// primary CNI encryption path (e.g. "wireguard.cali", "cilium_wg0", "wg0").
+	// Empty string if WireGuard is not in use (ADR-0102).
+	// +optional
+	WireGuardInterface string `json:"wireGuardInterface,omitempty"`
 }
 
 // NodeMigrationCapacitySpec is set by the node agent at startup and updated periodically.
@@ -104,6 +109,18 @@ type NodeMigrationCapacitySpec struct {
 }
 
 // NodeMigrationCapacityStatus reflects real-time node state.
+// IPFamilySupport describes the IP address families detected on the node's primary
+// network interface (ADR-0081).
+// +kubebuilder:validation:Enum=IPv4Only;IPv6Only;DualStack;Unknown
+type IPFamilySupport string
+
+const (
+	IPFamilySupportIPv4Only  IPFamilySupport = "IPv4Only"
+	IPFamilySupportIPv6Only  IPFamilySupport = "IPv6Only"
+	IPFamilySupportDualStack IPFamilySupport = "DualStack"
+	IPFamilySupportUnknown   IPFamilySupport = "Unknown"
+)
+
 type NodeMigrationCapacityStatus struct {
 	// ActiveSourceMigrations is the number of migrations currently sourced from this node.
 	ActiveSourceMigrations int32 `json:"activeSourceMigrations"`
@@ -117,6 +134,16 @@ type NodeMigrationCapacityStatus struct {
 	LastHeartbeat *metav1.Time `json:"lastHeartbeat,omitempty"`
 	// Ready indicates the agent is running and all required features are available.
 	Ready bool `json:"ready"`
+	// ClusterIPFamily reports the IP address family support detected on this node's
+	// primary interface. Used by the admission webhook to reject IPv6-primary migrations
+	// (ADR-0081). Populated by the NMC probe on startup and on each resync.
+	// +optional
+	ClusterIPFamily IPFamilySupport `json:"clusterIPFamily,omitempty"`
+	// IPSecEncryption is true when CNI-managed IPSec (XFRM pod-CIDR policies) is
+	// detected on this node. Migrations are rejected at admission for IPSec clusters
+	// (ADR-0102).
+	// +optional
+	IPSecEncryption bool `json:"ipSecEncryption,omitempty"`
 }
 
 // +kubebuilder:object:root=true
