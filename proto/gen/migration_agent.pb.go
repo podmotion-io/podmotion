@@ -2488,7 +2488,9 @@ type DisarmTCRedirectRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	MigrationName string                 `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`
 	// fdb_ifname is the overlay interface the redirect was installed on (default "flannel.1").
-	FdbIfname     string `protobuf:"bytes,2,opt,name=fdb_ifname,json=fdbIfname,proto3" json:"fdb_ifname,omitempty"`
+	FdbIfname string `protobuf:"bytes,2,opt,name=fdb_ifname,json=fdbIfname,proto3" json:"fdb_ifname,omitempty"`
+	// old_pod_ip is the relocated OLD pod IP whose ADR-0140 FORWARD ACCEPT pair is also removed.
+	OldPodIp      string `protobuf:"bytes,3,opt,name=old_pod_ip,json=oldPodIp,proto3" json:"old_pod_ip,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2533,6 +2535,13 @@ func (x *DisarmTCRedirectRequest) GetMigrationName() string {
 func (x *DisarmTCRedirectRequest) GetFdbIfname() string {
 	if x != nil {
 		return x.FdbIfname
+	}
+	return ""
+}
+
+func (x *DisarmTCRedirectRequest) GetOldPodIp() string {
+	if x != nil {
+		return x.OldPodIp
 	}
 	return ""
 }
@@ -3093,11 +3102,13 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\rbridge_ifname\x18\x04 \x01(\tR\fbridgeIfname\"c\n" +
 	"\x1eCleanupSourceIPHandoffResponse\x12\x18\n" +
 	"\acleaned\x18\x01 \x01(\bR\acleaned\x12'\n" +
-	"\x0fblocking_reason\x18\x02 \x01(\tR\x0eblockingReason\"_\n" +
+	"\x0fblocking_reason\x18\x02 \x01(\tR\x0eblockingReason\"}\n" +
 	"\x17DisarmTCRedirectRequest\x12%\n" +
 	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12\x1d\n" +
 	"\n" +
-	"fdb_ifname\x18\x02 \x01(\tR\tfdbIfname\"_\n" +
+	"fdb_ifname\x18\x02 \x01(\tR\tfdbIfname\x12\x1c\n" +
+	"\n" +
+	"old_pod_ip\x18\x03 \x01(\tR\boldPodIp\"_\n" +
 	"\x18DisarmTCRedirectResponse\x12\x1a\n" +
 	"\bdisarmed\x18\x01 \x01(\bR\bdisarmed\x12'\n" +
 	"\x0fblocking_reason\x18\x02 \x01(\tR\x0eblockingReason\"\xc5\x01\n" +

@@ -575,6 +575,18 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 		} else {
 			log.Info("InjectIPHandoff: ADR-0139 tc-ingress redirect installed (forward path B8)",
 				"migration", req.MigrationName, "fdbIf", fdbIf, "oldPodIP", req.OldPodIp, "vethPeer", vethPeer)
+			// ADR-0140 (blocker B9): the tc `mirred` redirect steals the forward frame before
+			// conntrack's ingress hook, so the pod's reply is conntrack-INVALID and kube-proxy's
+			// KUBE-FORWARD `ctstate INVALID -j DROP` rule drops it (reply reaches `cni0 In` but
+			// never `flannel.1 Out`). Insert a narrow OLD-IP/32 FORWARD ACCEPT pair at the head
+			// of FORWARD (before KUBE-FORWARD) so the reply is forwarded back over VXLAN. Non-fatal.
+			if fwErr := installOldIPForwardAccept(ctx, oldIP); fwErr != nil {
+				log.Error(fwErr, "InjectIPHandoff: ADR-0140 FORWARD ACCEPT install failed (non-fatal)",
+					"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+			} else {
+				log.Info("InjectIPHandoff: ADR-0140 OLD-IP FORWARD ACCEPT installed (reverse path B9)",
+					"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+			}
 		}
 	} else {
 		log.Info("InjectIPHandoff: ADR-0139 RestoredPID not yet in CR status — tc redirect deferred to requeue (non-fatal)",
@@ -782,6 +794,50 @@ func installTCRedirect(ctx context.Context, fdbIf string, oldIP net.IP, vethPeer
 	return nil
 }
 
+// installOldIPForwardAccept inserts the ADR-0140 (blocker B9) narrow OLD-IP/32 FORWARD ACCEPT
+// pair at the head of the FORWARD chain so the relocated pod's replies — conntrack-INVALID
+// because the ADR-0139 tc `mirred` redirect stole the forward leg before conntrack — are not
+// dropped by kube-proxy's KUBE-FORWARD `ctstate INVALID -j DROP` rule. Idempotent: each rule is
+// deleted first (tolerate ENOENT) then inserted, so requeues do not stack duplicates.
+func installOldIPForwardAccept(ctx context.Context, oldIP net.IP) error {
+	cidr := oldIP.String() + "/32"
+	for _, spec := range [][]string{
+		{"-d", cidr},
+		{"-s", cidr},
+	} {
+		// Delete any existing copy first (idempotent; ignore "does not exist").
+		delArgs := append([]string{"-D", "FORWARD"}, spec...)
+		delArgs = append(delArgs, "-j", "ACCEPT", "-m", "comment", "--comment", "podmotion ADR-0140 oldIP fwd")
+		_, _ = exec.CommandContext(ctx, "iptables", delArgs...).CombinedOutput()
+		// Insert at the head, before KUBE-FORWARD.
+		insArgs := append([]string{"-I", "FORWARD", "1"}, spec...)
+		insArgs = append(insArgs, "-j", "ACCEPT", "-m", "comment", "--comment", "podmotion ADR-0140 oldIP fwd")
+		if out, err := exec.CommandContext(ctx, "iptables", insArgs...).CombinedOutput(); err != nil {
+			return fmt.Errorf("iptables -I FORWARD %v: %w (%s)", spec, err, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
+}
+
+// removeOldIPForwardAccept removes the ADR-0140 OLD-IP/32 FORWARD ACCEPT pair (IPAM-reclaim /
+// disarm). Idempotent: tolerates ENOENT. Removes all copies (loop until -D fails).
+func removeOldIPForwardAccept(ctx context.Context, oldIP net.IP) {
+	cidr := oldIP.String() + "/32"
+	for _, spec := range [][]string{
+		{"-d", cidr},
+		{"-s", cidr},
+	} {
+		args := append([]string{"-D", "FORWARD"}, spec...)
+		args = append(args, "-j", "ACCEPT", "-m", "comment", "--comment", "podmotion ADR-0140 oldIP fwd")
+		// Remove up to a few duplicates defensively.
+		for i := 0; i < 4; i++ {
+			if _, err := exec.CommandContext(ctx, "iptables", args...).CombinedOutput(); err != nil {
+				break
+			}
+		}
+	}
+}
+
 // DisarmTCRedirect removes the ADR-0139 tc-ingress filter + qdisc from the overlay interface
 // after TrafficVerified=True (Decision 3 disarm order). Idempotent: tolerates ENOENT.
 func (s *AgentServer) DisarmTCRedirect(ctx context.Context, req *agentpb.DisarmTCRedirectRequest) (*agentpb.DisarmTCRedirectResponse, error) {
@@ -801,6 +857,13 @@ func (s *AgentServer) DisarmTCRedirect(ctx context.Context, req *agentpb.DisarmT
 		msg := strings.ToLower(strings.TrimSpace(string(qOut)))
 		if !strings.Contains(msg, "does not exist") && !strings.Contains(msg, "no such") && !strings.Contains(msg, "cannot") {
 			log.Info("DisarmTCRedirect: tc qdisc del warning (non-fatal)", "fdbIf", fdbIf, "output", strings.TrimSpace(string(qOut)))
+		}
+	}
+	// ADR-0140: remove the OLD-IP FORWARD ACCEPT pair alongside the tc redirect (same lifecycle).
+	if req.OldPodIp != "" {
+		if oldIP := net.ParseIP(req.OldPodIp); oldIP != nil && oldIP.To4() != nil {
+			removeOldIPForwardAccept(ctx, oldIP)
+			log.Info("DisarmTCRedirect: removed ADR-0140 OLD-IP FORWARD ACCEPT", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 		}
 	}
 	log.Info("DisarmTCRedirect: tc-ingress redirect disarmed (ADR-0139 D3)", "migration", req.MigrationName, "fdbIf", fdbIf)

@@ -373,6 +373,8 @@ message DisarmTCRedirectRequest {
   string migration_name   = 1;
   // fdb_ifname is the overlay interface the redirect was installed on (default "flannel.1").
   string fdb_ifname       = 2;
+  // old_pod_ip is the relocated OLD pod IP whose ADR-0140 FORWARD ACCEPT pair is also removed.
+  string old_pod_ip       = 3;
 }
 message DisarmTCRedirectResponse {
   bool   disarmed         = 1;
