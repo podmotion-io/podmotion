@@ -212,7 +212,7 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 			return rpc.CriuNetworkLockMethod_SKIP.Enum()
 		}(),
 		ShellJob:    proto.Bool(false),
-		TrackMem:    proto.Bool(false), // ARM64 lacks CONFIG_MEM_SOFT_DIRTY; not needed for cold migration
+		TrackMem:    proto.Bool(true), // ADR-0042 §Decision table mandates TrackMem=true; any change requires an ADR amendment
 		AutoDedup:   proto.Bool(true),
 		ExtSharing:  proto.Bool(true),
 		ExtMasters:  proto.Bool(true),
