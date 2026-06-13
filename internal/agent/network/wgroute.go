@@ -35,6 +35,15 @@ func openNLSocket(proto int) (int, error) {
 		unix.Close(fd)
 		return -1, err
 	}
+	// Set a receive timeout so a lost/unmatched ACK can never block the cutover path
+	// indefinitely (ADR-0135): nlRecvAll's unix.Read returns EAGAIN on timeout, which the
+	// caller surfaces as an error and the controller requeues. Without this a missing ACK
+	// hangs InjectIPHandoff and the whole gRPC call.
+	tv := unix.Timeval{Sec: 5}
+	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
+		unix.Close(fd)
+		return -1, err
+	}
 	return fd, nil
 }
 
