@@ -380,13 +380,90 @@ func (s *AgentServer) CleanupSourceIPHandoff(ctx context.Context, req *agentpb.C
 	if err := network.DeletePodIPHostRoute(ctx, bridgeIf, oldIP); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	// ADR-0136: remove the SOURCE-node VXLAN redirect installed by InjectSourceRedirect —
+	// the /32 route on flannel.1 (so oldPodIP no longer blackholes over a dead overlay path
+	// after the IP is reclaimed by IPAM). The AF_BRIDGE FDB / AF_INET neigh on flannel.1 are
+	// removed by the DeletePodIPNeigh(fdbIf) above; the FDB (keyed on the replacement MAC)
+	// ages out with the overlay. Idempotent: no such route on a node that never redirected.
+	if err := network.DeletePodIPHostRoute(ctx, fdbIf, oldIP); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if firstErr != nil {
 		return &agentpb.CleanupSourceIPHandoffResponse{Cleaned: false,
 			BlockingReason: firstErr.Error()}, nil
 	}
 
-	log.Info("CleanupSourceIPHandoff: stale neigh removed (ADR-0133 D4)", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+	log.Info("CleanupSourceIPHandoff: stale neigh removed (ADR-0133 D4 + ADR-0136 redirect)", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 	return &agentpb.CleanupSourceIPHandoffResponse{Cleaned: true}, nil
+}
+
+// InjectSourceRedirect installs the SOURCE-node VXLAN redirect for the relocated OLD pod IP
+// (ADR-0136). The OLD IP lives in the source node's own pod CIDR, so the kernel would route
+// it to the local cni0 bridge — where the source pod no longer exists, blackholing it. This
+// installs three consistent entries on flannel.1 so traffic to the OLD IP is instead
+// VXLAN-encapsulated to the destination node's VTEP and delivered at the replacement pod:
+//
+//  1. /32 link-scope route for oldPodIP via flannel.1 (overrides the local cni0 /24 by LPM).
+//  2. AF_INET neigh oldPodIP -> replVethMAC on flannel.1 (L3 resolves the overlay neighbor).
+//  3. AF_BRIDGE FDB replVethMAC -> dstNodeIP on flannel.1 (VXLAN encap to the dest VTEP).
+//
+// The FDB MUST be keyed on the replacement veth MAC — the MAC the L3 neigh resolves to —
+// NOT the destination VTEP MAC; keying it on the VTEP MAC was the Sprint 25 0-packet failure.
+// Idempotent (RTM_NEWNEIGH/NEWROUTE NLM_F_REPLACE). Torn down by CleanupSourceIPHandoff.
+func (s *AgentServer) InjectSourceRedirect(ctx context.Context, req *agentpb.InjectSourceRedirectRequest) (*agentpb.InjectSourceRedirectResponse, error) {
+	log.Info("InjectSourceRedirect called", "migration", req.MigrationName,
+		"oldPodIP", req.OldPodIp, "replVethMAC", req.ReplVethMac, "dstNodeIP", req.DstNodeIp)
+
+	if req.OldPodIp == "" || req.ReplVethMac == "" || req.DstNodeIp == "" {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"InjectSourceRedirect: old_pod_ip, repl_veth_mac and dst_node_ip are required (got %q/%q/%q)",
+			req.OldPodIp, req.ReplVethMac, req.DstNodeIp)
+	}
+	oldIP := net.ParseIP(req.OldPodIp)
+	if oldIP == nil || oldIP.To4() == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "InjectSourceRedirect: old_pod_ip %q is not a valid IPv4", req.OldPodIp)
+	}
+	mac, err := net.ParseMAC(req.ReplVethMac)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "InjectSourceRedirect: repl_veth_mac %q invalid: %v", req.ReplVethMac, err)
+	}
+	dstNodeIP := net.ParseIP(req.DstNodeIp)
+	if dstNodeIP == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "InjectSourceRedirect: dst_node_ip %q is not a valid IP", req.DstNodeIp)
+	}
+
+	fdbIf := req.FdbIfname
+	if fdbIf == "" {
+		fdbIf = "flannel.1"
+	}
+
+	// (1) /32 link-scope route for oldPodIP via flannel.1. Wins LPM over the cni0 /24, so the
+	// kernel selects the overlay and consults the AF_INET neigh below instead of cni0 ARP.
+	if err := network.SetPodIPHostRoute(ctx, fdbIf, oldIP); err != nil {
+		return &agentpb.InjectSourceRedirectResponse{Injected: false,
+			BlockingReason: fmt.Sprintf("flannel.1 /32 route: %v", err)}, nil
+	}
+	// (2) AF_INET neigh oldPodIP -> replVethMAC on flannel.1.
+	if err := network.SetPodIPNeigh(ctx, fdbIf, oldIP, mac); err != nil {
+		return &agentpb.InjectSourceRedirectResponse{Injected: false,
+			BlockingReason: fmt.Sprintf("flannel.1 neigh: %v", err)}, nil
+	}
+	// (3) AF_BRIDGE FDB replVethMAC -> dstNodeIP on flannel.1 (the missing encap link from
+	// Sprint 25). AddFDBEntry also re-asserts the AF_INET neigh for the same MAC — harmless.
+	if err := network.NewFDBManager().AddFDBEntry(ctx, network.FDBEntry{
+		IfName: fdbIf,
+		PodIP:  oldIP,
+		PodMAC: mac,
+		VTEPIP: dstNodeIP,
+	}); err != nil {
+		return &agentpb.InjectSourceRedirectResponse{Injected: false,
+			BlockingReason: fmt.Sprintf("flannel.1 AF_BRIDGE FDB: %v", err)}, nil
+	}
+
+	log.Info("InjectSourceRedirect: source VXLAN redirect installed (ADR-0136)",
+		"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "replVethMAC", req.ReplVethMac,
+		"dstNodeIP", req.DstNodeIp, "ifName", fdbIf)
+	return &agentpb.InjectSourceRedirectResponse{Injected: true}, nil
 }
 
 // ListenAndServe starts the gRPC server on addr (default ":9090").

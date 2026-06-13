@@ -36,6 +36,7 @@ const (
 	MigrationAgentService_ReleaseCheckpoint_FullMethodName       = "/podmotion.agent.v1.MigrationAgentService/ReleaseCheckpoint"
 	MigrationAgentService_InjectIPHandoff_FullMethodName         = "/podmotion.agent.v1.MigrationAgentService/InjectIPHandoff"
 	MigrationAgentService_CleanupSourceIPHandoff_FullMethodName  = "/podmotion.agent.v1.MigrationAgentService/CleanupSourceIPHandoff"
+	MigrationAgentService_InjectSourceRedirect_FullMethodName    = "/podmotion.agent.v1.MigrationAgentService/InjectSourceRedirect"
 	MigrationAgentService_VerifyTCP_FullMethodName               = "/podmotion.agent.v1.MigrationAgentService/VerifyTCP"
 )
 
@@ -104,6 +105,14 @@ type MigrationAgentServiceClient interface {
 	// Decision 4). Deferred until after TrafficVerified=True and DisarmZeroWindow.
 	// Idempotent: ENOENT is treated as success.
 	CleanupSourceIPHandoff(ctx context.Context, in *CleanupSourceIPHandoffRequest, opts ...grpc.CallOption) (*CleanupSourceIPHandoffResponse, error)
+	// InjectSourceRedirect installs the SOURCE-node VXLAN redirect for the OLD pod IP
+	// (ADR-0136). Because the OLD IP is in the source node's own pod CIDR, the kernel
+	// otherwise routes it to the dead local cni0 bridge. This installs three consistent
+	// entries on flannel.1 — a /32 route, an AF_INET neigh (oldIP->replVethMAC) and an
+	// AF_BRIDGE FDB (replVethMAC->destNodeIP) — so traffic is VXLAN-encapsulated to the
+	// destination VTEP instead. Called from injectIPHandoff after the destination probe
+	// passes; torn down by CleanupSourceIPHandoff after TrafficVerified=True. Idempotent.
+	InjectSourceRedirect(ctx context.Context, in *InjectSourceRedirectRequest, opts ...grpc.CallOption) (*InjectSourceRedirectResponse, error)
 	// VerifyTCP reads /proc/<pid>/net/tcp[6] on the destination node post-restore and
 	// compares each ESTABLISHED 4-tuple's snd_nxt/rcv_nxt against the source SeqSnapshots
 	// captured at freeze. Returns verified=true only when all connections match within
@@ -290,6 +299,16 @@ func (c *migrationAgentServiceClient) CleanupSourceIPHandoff(ctx context.Context
 	return out, nil
 }
 
+func (c *migrationAgentServiceClient) InjectSourceRedirect(ctx context.Context, in *InjectSourceRedirectRequest, opts ...grpc.CallOption) (*InjectSourceRedirectResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(InjectSourceRedirectResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_InjectSourceRedirect_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *migrationAgentServiceClient) VerifyTCP(ctx context.Context, in *VerifyTCPRequest, opts ...grpc.CallOption) (*VerifyTCPResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VerifyTCPResponse)
@@ -365,6 +384,14 @@ type MigrationAgentServiceServer interface {
 	// Decision 4). Deferred until after TrafficVerified=True and DisarmZeroWindow.
 	// Idempotent: ENOENT is treated as success.
 	CleanupSourceIPHandoff(context.Context, *CleanupSourceIPHandoffRequest) (*CleanupSourceIPHandoffResponse, error)
+	// InjectSourceRedirect installs the SOURCE-node VXLAN redirect for the OLD pod IP
+	// (ADR-0136). Because the OLD IP is in the source node's own pod CIDR, the kernel
+	// otherwise routes it to the dead local cni0 bridge. This installs three consistent
+	// entries on flannel.1 — a /32 route, an AF_INET neigh (oldIP->replVethMAC) and an
+	// AF_BRIDGE FDB (replVethMAC->destNodeIP) — so traffic is VXLAN-encapsulated to the
+	// destination VTEP instead. Called from injectIPHandoff after the destination probe
+	// passes; torn down by CleanupSourceIPHandoff after TrafficVerified=True. Idempotent.
+	InjectSourceRedirect(context.Context, *InjectSourceRedirectRequest) (*InjectSourceRedirectResponse, error)
 	// VerifyTCP reads /proc/<pid>/net/tcp[6] on the destination node post-restore and
 	// compares each ESTABLISHED 4-tuple's snd_nxt/rcv_nxt against the source SeqSnapshots
 	// captured at freeze. Returns verified=true only when all connections match within
@@ -431,6 +458,9 @@ func (UnimplementedMigrationAgentServiceServer) InjectIPHandoff(context.Context,
 }
 func (UnimplementedMigrationAgentServiceServer) CleanupSourceIPHandoff(context.Context, *CleanupSourceIPHandoffRequest) (*CleanupSourceIPHandoffResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CleanupSourceIPHandoff not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) InjectSourceRedirect(context.Context, *InjectSourceRedirectRequest) (*InjectSourceRedirectResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method InjectSourceRedirect not implemented")
 }
 func (UnimplementedMigrationAgentServiceServer) VerifyTCP(context.Context, *VerifyTCPRequest) (*VerifyTCPResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method VerifyTCP not implemented")
@@ -762,6 +792,24 @@ func _MigrationAgentService_CleanupSourceIPHandoff_Handler(srv interface{}, ctx 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MigrationAgentService_InjectSourceRedirect_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InjectSourceRedirectRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).InjectSourceRedirect(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_InjectSourceRedirect_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).InjectSourceRedirect(ctx, req.(*InjectSourceRedirectRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MigrationAgentService_VerifyTCP_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(VerifyTCPRequest)
 	if err := dec(in); err != nil {
@@ -854,6 +902,10 @@ var MigrationAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CleanupSourceIPHandoff",
 			Handler:    _MigrationAgentService_CleanupSourceIPHandoff_Handler,
+		},
+		{
+			MethodName: "InjectSourceRedirect",
+			Handler:    _MigrationAgentService_InjectSourceRedirect_Handler,
 		},
 		{
 			MethodName: "VerifyTCP",
