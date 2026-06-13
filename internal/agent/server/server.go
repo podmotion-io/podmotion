@@ -779,29 +779,83 @@ func findRestoredProcessPID(checkpointDir string) (int, error) {
 	}
 
 	procs, _ := os.ReadDir("/proc")
+
+	// First pass: look for an exact comm match.
+	if expectedComm != "" {
+		for _, p := range procs {
+			if !p.IsDir() {
+				continue
+			}
+			comm, _ := os.ReadFile(fmt.Sprintf("/proc/%s/comm", p.Name()))
+			commStr := strings.TrimSpace(string(comm))
+			if commStr != expectedComm {
+				continue
+			}
+			pid, err := strconv.Atoi(p.Name())
+			if err != nil {
+				continue
+			}
+			return pid, nil
+		}
+		// Exact match not found — the entrypoint may have exec'd into the real
+		// process (e.g. docker-entrypoint.sh → redis-server).  Fall through to
+		// the generic non-pause scan below rather than failing immediately.
+	}
+
+	// Second pass (fallback): find a process in the agent's own cgroup that is NOT
+	// the agent binary itself.  CRIU-restored processes inherit the cgroup of the
+	// CRIU subprocess (which runs under podmotion-agent-ctl.service), so filtering
+	// by cgroup reliably excludes kubepods containers and host system processes.
+	agentCgroup, _ := os.ReadFile("/proc/self/cgroup")
+	agentCgroupStr := strings.TrimSpace(string(agentCgroup))
+	// Extract the last path component from "0::<path>" to get the service unit name.
+	agentCgroupPath := ""
+	for _, line := range strings.Split(agentCgroupStr, "\n") {
+		if strings.HasPrefix(line, "0::") {
+			agentCgroupPath = strings.TrimPrefix(line, "0::")
+			break
+		}
+	}
+
+	agentPID := os.Getpid()
+	bestPID := 0
+	bestStartTicks := uint64(0)
 	for _, p := range procs {
 		if !p.IsDir() {
 			continue
 		}
+		pid, err := strconv.Atoi(p.Name())
+		if err != nil || pid == agentPID {
+			continue
+		}
 		comm, _ := os.ReadFile(fmt.Sprintf("/proc/%s/comm", p.Name()))
 		commStr := strings.TrimSpace(string(comm))
-		if commStr == "" || commStr == "pause" {
+		if commStr == "" || commStr == "pause" || commStr == "podmotion-agent" {
 			continue
 		}
-		pid, err := strconv.Atoi(p.Name())
-		if err != nil {
-			continue
-		}
-		if expectedComm != "" {
-			if commStr == expectedComm {
-				return pid, nil
+		if agentCgroupPath != "" {
+			procCgroup, _ := os.ReadFile(fmt.Sprintf("/proc/%s/cgroup", p.Name()))
+			if !strings.Contains(string(procCgroup), agentCgroupPath) {
+				continue
 			}
 		}
+		// Among matching processes, prefer the one with the highest start time
+		// (most recently created = the CRIU-restored process from this run).
+		statData, _ := os.ReadFile(fmt.Sprintf("/proc/%s/stat", p.Name()))
+		fields := strings.Fields(string(statData))
+		var startTicks uint64
+		if len(fields) >= 22 {
+			startTicks, _ = strconv.ParseUint(fields[21], 10, 64)
+		}
+		if startTicks > bestStartTicks {
+			bestStartTicks = startTicks
+			bestPID = pid
+		}
 	}
-	if expectedComm != "" {
-		return 0, fmt.Errorf("restored process %q not found in /proc after CRIU restore", expectedComm)
+	if bestPID != 0 {
+		return bestPID, nil
 	}
-	return 0, fmt.Errorf("findRestoredProcessPID: config.json absent and no non-pause process found")
+	return 0, fmt.Errorf("findRestoredProcessPID: no CRIU-restored process found in agent cgroup after restore (expectedComm=%q)", expectedComm)
 }
 
 // buildMinimalOCIConfig strips pod-specific paths from config.json, leaving only

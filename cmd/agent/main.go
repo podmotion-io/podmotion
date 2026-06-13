@@ -173,7 +173,12 @@ func main() {
 			if migrationNamespace == "" {
 				migrationNamespace = event.Namespace // fall back to the pod's namespace
 			}
-			if err := agentSrv.ReportRestoreConfirmed(ctx, checkpointRef, migrationNamespace, int32(pid)); err != nil {
+			// Use a fresh context: the NRI handler context (ctx) is cancelled
+			// when the NRI socket disconnects during CRIU restore, which would
+			// cause the k8s patch to hit "context deadline exceeded".
+			reportCtx, reportCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer reportCancel()
+			if err := agentSrv.ReportRestoreConfirmed(reportCtx, checkpointRef, migrationNamespace, int32(pid)); err != nil {
 				log.Error(err, "NRI CRIU restore: failed to report confirmation to CR — controller poll will time out",
 					"migration", checkpointRef, "namespace", migrationNamespace)
 				return err
