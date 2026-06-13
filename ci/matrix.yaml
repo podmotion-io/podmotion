@@ -1,0 +1,193 @@
+# ci/matrix.yaml — canonical CI matrix
+# Regenerated at release branch cut. Do not edit manually during CI.
+# schema version: 1
+schema_version: 1
+
+# M26 required-tier cells: 2 kernel × 2 CNI × 2 storage × 2 K8s = 16 required cells
+# Per ADR-0093 (formerly ADR-0079) / ADR-0098
+
+kernels:
+  - id: kernel-5-15
+    version: "5.15"
+    ubuntu: "22.04"
+    tier: required
+  - id: kernel-6-8
+    version: "6.8"
+    ubuntu: "24.04"
+    tier: required
+  - id: kernel-6-1
+    version: "6.1"
+    debian: "12"
+    tier: extended
+
+cnis:
+  - id: flannel
+    version: "v0.24"
+    tier: required
+  - id: calico
+    version: "v3.27"
+    tier: required
+  - id: cilium
+    version: "v1.15"
+    tier: extended
+  - id: weave
+    version: "v2.8"
+    tier: extended
+
+storage:
+  - id: hostpath
+    tier: required
+  - id: longhorn
+    version: "v1.6"
+    tier: required
+  - id: ceph-rbd
+    version: "v1.13"
+    tier: extended
+  - id: nfs
+    tier: extended
+
+k8s_versions:
+  - id: n
+    version: "1.31"
+    ref: latest-stable
+    tier: required
+  - id: n-1
+    version: "1.29"
+    ref: n-minus-1
+    tier: required
+  - id: n-2
+    version: "1.28"
+    ref: n-minus-2
+    tier: extended
+
+# Required-tier cells (16 total): cross-product of all required dimensions above.
+# kernel-5-15 × {flannel,calico} × {hostpath,longhorn} × {n,n-1}
+# kernel-6-8  × {flannel,calico} × {hostpath,longhorn} × {n,n-1}
+cells:
+  - id: "kernel-5-15/flannel/hostpath/n"
+    kernel: kernel-5-15
+    cni: flannel
+    storage: hostpath
+    k8s_version: n
+    tier: required
+    status: untested
+
+  - id: "kernel-5-15/flannel/hostpath/n-1"
+    kernel: kernel-5-15
+    cni: flannel
+    storage: hostpath
+    k8s_version: n-1
+    tier: required
+    status: untested
+
+  - id: "kernel-5-15/flannel/longhorn/n"
+    kernel: kernel-5-15
+    cni: flannel
+    storage: longhorn
+    k8s_version: n
+    tier: required
+    status: untested
+
+  - id: "kernel-5-15/flannel/longhorn/n-1"
+    kernel: kernel-5-15
+    cni: flannel
+    storage: longhorn
+    k8s_version: n-1
+    tier: required
+    status: untested
+
+  - id: "kernel-5-15/calico/hostpath/n"
+    kernel: kernel-5-15
+    cni: calico
+    storage: hostpath
+    k8s_version: n
+    tier: required
+    status: untested
+
+  - id: "kernel-5-15/calico/hostpath/n-1"
+    kernel: kernel-5-15
+    cni: calico
+    storage: hostpath
+    k8s_version: n-1
+    tier: required
+    status: untested
+
+  - id: "kernel-5-15/calico/longhorn/n"
+    kernel: kernel-5-15
+    cni: calico
+    storage: longhorn
+    k8s_version: n
+    tier: required
+    status: untested
+
+  - id: "kernel-5-15/calico/longhorn/n-1"
+    kernel: kernel-5-15
+    cni: calico
+    storage: longhorn
+    k8s_version: n-1
+    tier: required
+    status: untested
+
+  - id: "kernel-6-8/flannel/hostpath/n"
+    kernel: kernel-6-8
+    cni: flannel
+    storage: hostpath
+    k8s_version: n
+    tier: required
+    status: untested
+
+  - id: "kernel-6-8/flannel/hostpath/n-1"
+    kernel: kernel-6-8
+    cni: flannel
+    storage: hostpath
+    k8s_version: n-1
+    tier: required
+    status: untested
+
+  - id: "kernel-6-8/flannel/longhorn/n"
+    kernel: kernel-6-8
+    cni: flannel
+    storage: longhorn
+    k8s_version: n
+    tier: required
+    status: untested
+
+  - id: "kernel-6-8/flannel/longhorn/n-1"
+    kernel: kernel-6-8
+    cni: flannel
+    storage: longhorn
+    k8s_version: n-1
+    tier: required
+    status: untested
+
+  - id: "kernel-6-8/calico/hostpath/n"
+    kernel: kernel-6-8
+    cni: calico
+    storage: hostpath
+    k8s_version: n
+    tier: required
+    status: untested
+
+  - id: "kernel-6-8/calico/hostpath/n-1"
+    kernel: kernel-6-8
+    cni: calico
+    storage: hostpath
+    k8s_version: n-1
+    tier: required
+    status: untested
+
+  - id: "kernel-6-8/calico/longhorn/n"
+    kernel: kernel-6-8
+    cni: calico
+    storage: longhorn
+    k8s_version: n
+    tier: required
+    status: untested
+
+  - id: "kernel-6-8/calico/longhorn/n-1"
+    kernel: kernel-6-8
+    cni: calico
+    storage: longhorn
+    k8s_version: n-1
+    tier: required
+    status: untested
