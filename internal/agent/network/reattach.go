@@ -123,9 +123,15 @@ func SeedRelayFromFreshSocket(
 // SeedRelayFromFreshSocket for each one. All entries must be populated before returning
 // so that PM_SEQ_XLAT is fully seeded before ZeroWindowDisarm (ADR-0049 predicate B).
 //
+// PM_SEQ_XLAT relay programs are loaded on BOTH flannel.1 (relayIfname) AND the migration
+// veth (migrationVethIfname) when both are provided. Loading on both ensures that VXLAN-
+// encapped traffic arriving at the destination VTEP and traffic entering via the migration
+// veth are both subject to seq/ack translation (M24 requirement).
+//
 // snapshots: SeqSnapshot entries from CheckpointResponse (source final seq numbers).
 // freshPID: host-namespace PID of the restored container process.
-// relayIfname: interface name for the TC relay programs (typically "flannel.1").
+// relayIfname: overlay interface name for TC relay programs (typically "flannel.1").
+// migrationVethIfname: host-side veth of the migration netns (e.g. "pmh-<uid>"); empty skips.
 // ebpfMgr: may be stub on non-Linux; ArmRelay is a no-op in that case.
 func SeedRelayFromSnapshots(
 	ctx context.Context,
@@ -133,9 +139,16 @@ func SeedRelayFromSnapshots(
 	snapshots []SeqSnapshot,
 	relayIfname string,
 	ebpfMgr EBPFManager,
+	migrationVethIfname ...string,
 ) ([]ReattachResult, error) {
+	log := logf.FromContext(ctx)
 	if len(snapshots) == 0 {
 		return nil, nil
+	}
+
+	var vethIfname string
+	if len(migrationVethIfname) > 0 {
+		vethIfname = migrationVethIfname[0]
 	}
 
 	results := make([]ReattachResult, 0, len(snapshots))
@@ -163,6 +176,28 @@ func SeedRelayFromSnapshots(
 				snap.SrcIP, snap.SrcPort, snap.DstIP, snap.DstPort, err)
 		}
 		results = append(results, r)
+
+		// Load relay on the migration veth in addition to flannel.1 so that traffic
+		// entering the destination via the host-side veth (pmdst0 peer) also undergoes
+		// seq/ack translation before reaching the restored container (M24 requirement).
+		if vethIfname != "" {
+			key := ipPortToSeqXlatKey(localIP.To4(), uint16(snap.SrcPort), peerIP.To4(), uint16(snap.DstPort))
+			entry := SeqXlatEntry{
+				SeqDelta:    r.SeqDelta,
+				AckDelta:    r.AckDelta,
+				TsDelta:     0,
+				Wscale:      0,
+				SackPresent: 1,
+				State:       1,
+			}
+			if armErr := ebpfMgr.ArmRelay(ctx, vethIfname, key, entry); armErr != nil {
+				log.Error(armErr, "reattach: ArmRelay on migration veth failed (non-fatal — flannel.1 armed)",
+					"veth", vethIfname, "srcPort", snap.SrcPort, "dstPort", snap.DstPort)
+			} else {
+				log.Info("reattach: PM_SEQ_XLAT seeded on migration veth",
+					"veth", vethIfname, "srcPort", snap.SrcPort, "dstPort", snap.DstPort)
+			}
+		}
 	}
 	return results, nil
 }
