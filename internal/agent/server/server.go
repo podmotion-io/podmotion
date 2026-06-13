@@ -123,16 +123,17 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 // It invokes the CRIU restore path that enters the container's existing namespaces
 // (created by runc) and restores the checkpointed process tree.
 // migrationName is used for log tagging; checkpointDir is the tmpfs images path;
-// replacementPodUID is the UID of the replacement pod whose pause container netns
-// the restored process must join (ADR-0122).
+// sandboxID is the containerd sandbox (pause container) ID of the replacement pod whose
+// network namespace the restored process must join (ADR-0122). It comes from the NRI pod
+// sandbox object (pod.GetId()).
 //
 // ADR-0122: rather than minting an empty netns (--empty-ns net), JoinNsRestore resolves
-// the replacement pod's pause container PID, opens its /proc/<pid>/ns/net, and hands the
-// open fd to CRIU via --net-fd. The restored process then comes up inside the pod netns,
-// inheriting the pod IP, veth pair, and CNI routing — reachable at the pod IP with no
-// post-restore namespace surgery.
-func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, replacementPodUID string) (int, error) {
-	return joinNsRestore(migrationName, checkpointDir, "", replacementPodUID)
+// the replacement pod's sandbox netns via the containerd sandbox API (B1), opens the netns
+// path with an fstat/stat inode cross-check (B2), and hands the open fd to CRIU via
+// --net-fd. The restored process then comes up inside the pod netns, inheriting the pod IP,
+// veth pair, and CNI routing — reachable at the pod IP with no post-restore namespace surgery.
+func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, sandboxID string) (int, error) {
+	return joinNsRestore(migrationName, checkpointDir, "", sandboxID)
 }
 
 // ReportRestoreConfirmed patches the PodMigration CR status to record that CRIU
@@ -355,48 +356,102 @@ func FindContainerPID(podUID string) (int32, error) {
 	return lowest, nil
 }
 
-// FindPauseContainerPID scans /proc/*/cgroup for a line containing podUID and returns
-// the host PID of the pod's pause/infra container — the inverse selection of
-// FindContainerPID, which skips it. The pause container is the only container whose
-// network namespace IS the pod netns (every app container shares it), so its
-// /proc/<pid>/ns/net is the stable anchor for joining the pod's CNI-wired network
-// namespace at CRIU restore time (ADR-0122).
+// ResolveNetnsFromSandbox returns an open *os.File for the network namespace of the
+// containerd sandbox (pause container) identified by sandboxID. The caller must Close
+// the returned file.
 //
-// The agent must have hostPID:true so all host PIDs are visible under /proc. Handles
-// both hyphenated UIDs and the underscore-encoded form used by cgroup v2 systemd slices.
-func FindPauseContainerPID(podUID string) (int32, error) {
-	entries, err := os.ReadDir("/proc")
+// ADR-0122 B1 (post-quorum): this replaces the previous /proc/*/comm "pause" scan, which
+// was ambiguous on multi-pod nodes (every pod's pause process matches, so the scan could
+// not reliably pick the correct sandbox). The sandbox ID comes from the NRI pod sandbox
+// object (pod.GetId()) and is unambiguous per pod. We read the sandbox's OCI spec under
+// the containerd "k8s.io" namespace, locate the spec.Linux.Namespaces entry with
+// Type == "network", and open its Path directly.
+//
+// ADR-0122 B2 (post-quorum): TOCTOU close-out. We open the netns *path* (e.g.
+// /var/run/netns/<id> or a bind-mounted handle), then fstat the resulting fd and stat the
+// path and compare inodes. If they differ the sandbox netns was torn down and its inode
+// recycled between resolution and open; we return a "netns inode mismatch" error and abort
+// rather than silently joining a recycled namespace.
+//
+// containerdClient is accepted as interface{} for forward compatibility with a typed
+// containerd Go client (per the ADR signature). This agent talks to containerd via the
+// `ctr` CLI (no containerd Go module in the build — see go.mod; consistent with
+// ctrCheckpoint / FindContainerTaskID), so the sandbox spec is resolved via
+// `ctr --namespace k8s.io containers info <sandboxID>`.
+func ResolveNetnsFromSandbox(ctx context.Context, containerdClient interface{}, sandboxID string) (*os.File, error) {
+	if sandboxID == "" {
+		return nil, fmt.Errorf("ResolveNetnsFromSandbox: empty sandboxID")
+	}
+
+	netnsPath, err := sandboxNetnsPath(ctx, sandboxID)
 	if err != nil {
-		return 0, fmt.Errorf("reading /proc: %w", err)
+		return nil, err
 	}
-	var lowest int32
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
-		cgroupData, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
-		if err != nil {
-			continue
-		}
-		if !cgroupContainsPodUID(string(cgroupData), podUID) {
-			continue
-		}
-		// Select ONLY the pause/infra container — the holder of the pod netns.
-		if !isPauseContainer(pid) {
-			continue
-		}
-		if lowest == 0 || int32(pid) < lowest {
-			lowest = int32(pid)
+	if netnsPath == "" {
+		return nil, fmt.Errorf("ResolveNetnsFromSandbox: sandbox %s spec has no network namespace path "+
+			"(host-network sandbox cannot be joined)", sandboxID)
+	}
+
+	// B2: open the path, then cross-check inodes (path stat vs fd fstat) to detect a netns
+	// that was recycled between resolution and open.
+	f, err := os.Open(netnsPath)
+	if err != nil {
+		return nil, fmt.Errorf("ResolveNetnsFromSandbox: open netns path %s for sandbox %s: %w", netnsPath, sandboxID, err)
+	}
+
+	var pathStat, fdStat syscall.Stat_t
+	if serr := syscall.Stat(netnsPath, &pathStat); serr != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("ResolveNetnsFromSandbox: stat netns path %s: %w", netnsPath, serr)
+	}
+	if serr := syscall.Fstat(int(f.Fd()), &fdStat); serr != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("ResolveNetnsFromSandbox: fstat netns fd for %s: %w", netnsPath, serr)
+	}
+	if pathStat.Ino != fdStat.Ino || pathStat.Dev != fdStat.Dev {
+		_ = f.Close()
+		return nil, fmt.Errorf("ResolveNetnsFromSandbox: netns inode mismatch — sandbox may have been recycled "+
+			"(sandbox %s path %s: path inode %d/dev %d, fd inode %d/dev %d)",
+			sandboxID, netnsPath, pathStat.Ino, pathStat.Dev, fdStat.Ino, fdStat.Dev)
+	}
+
+	log.Info("ResolveNetnsFromSandbox: resolved sandbox netns (ADR-0122 B1/B2)",
+		"sandboxID", sandboxID, "netnsPath", netnsPath, "inode", fdStat.Ino)
+	return f, nil
+}
+
+// sandboxNetnsPath reads the OCI spec of the containerd sandbox identified by sandboxID
+// (under the k8s.io namespace) and returns the path of its network namespace — the
+// spec.Linux.Namespaces entry whose Type == "network". Returns "" (no error) when the
+// sandbox shares the host network namespace (no path).
+func sandboxNetnsPath(_ context.Context, sandboxID string) (string, error) {
+	// `ctr containers info` prints the container record including the OCI runtime Spec.
+	out, err := exec.Command("ctr", "--namespace", "k8s.io", "containers", "info", sandboxID).Output()
+	if err != nil {
+		return "", fmt.Errorf("ctr containers info %s: %w", sandboxID, err)
+	}
+
+	// The record is JSON: { ..., "Spec": { "linux": { "namespaces": [ {type,path}, ... ] } } }.
+	// We only need linux.namespaces, so decode loosely.
+	var rec struct {
+		Spec struct {
+			Linux struct {
+				Namespaces []struct {
+					Type string `json:"type"`
+					Path string `json:"path"`
+				} `json:"namespaces"`
+			} `json:"linux"`
+		} `json:"Spec"`
+	}
+	if err := json.Unmarshal(out, &rec); err != nil {
+		return "", fmt.Errorf("parse ctr containers info for sandbox %s: %w", sandboxID, err)
+	}
+	for _, ns := range rec.Spec.Linux.Namespaces {
+		if ns.Type == "network" {
+			return ns.Path, nil
 		}
 	}
-	if lowest == 0 {
-		return 0, fmt.Errorf("pause container PID not found for pod UID %s (tried hyphenated and underscore forms)", podUID)
-	}
-	return lowest, nil
+	return "", nil
 }
 
 // FindContainerTaskID finds the containerd task ID (container ID) for a pod by scanning
@@ -535,11 +590,12 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 // When destNetnsFd is non-empty (a /proc/<pid>/fd/<n> path to a pre-staged migration netns),
 // CRIU uses --join-ns net:<destNetnsFd> to restore TCP connections into the pre-staged netns
 // (required for TCPPreservationMode=Strict/BestEffort per ADR-0048).
-// When destNetnsFd is empty, CRIU joins the replacement pod's pause container netns via
-// --net-fd (ADR-0122): replacementPodUID is used to resolve the pause container PID, whose
-// /proc/<pid>/ns/net is opened and passed to the CRIU child as an inherited fd. The restored
-// process then comes up inside the pod netns (pod IP, veth, CNI routes) and is reachable at
-// the pod IP with no post-restore namespace surgery.
+// When destNetnsFd is empty, CRIU joins the replacement pod's sandbox netns via
+// --net-fd (ADR-0122): sandboxID is resolved through the containerd sandbox API
+// (ResolveNetnsFromSandbox), whose netns path is opened (with an inode cross-check) and
+// passed to the CRIU child as an inherited fd. The restored process then comes up inside
+// the pod netns (pod IP, veth, CNI routes) and is reachable at the pod IP with no
+// post-restore namespace surgery.
 //
 // Approach:
 //  1. Patch checkpoint images: remove null-ext_key masked mounts, strip extRootNetNS from
@@ -550,7 +606,7 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 //  4. Bring up loopback in the restored process's network namespace.
 //
 // Returns the host PID of the restored process.
-func joinNsRestore(migrationName, checkpointDir, destNetnsFd, replacementPodUID string) (int, error) {
+func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) (int, error) {
 	cfgPath := filepath.Join(checkpointDir, "config.json")
 	cfgData, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -631,29 +687,27 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd, replacementPodUID 
 	// Step 4: CRIU restore — standalone rootfs.
 	//
 	// ADR-0122: on the stateless (destNetnsFd-empty) path, resolve the replacement pod's
-	// pause container netns and hand its open fd to CRIU via --net-fd so the restored process
-	// joins the pod netns (pod IP, veth, CNI routes) instead of getting an empty one. The fd is
-	// placed in criuCmd.ExtraFiles, which makes it fd 3 in the CRIU child (0/1/2 = std streams).
+	// sandbox netns via the containerd sandbox API and hand its open fd to CRIU via --net-fd
+	// so the restored process joins the pod netns (pod IP, veth, CNI routes) instead of getting
+	// an empty one. The fd is placed in criuCmd.ExtraFiles, which makes it fd 3 in the CRIU
+	// child (0/1/2 = std streams).
 	restoreLogPath := filepath.Join(checkpointDir, "restore.log")
 	const petnsChildFd = 3 // ExtraFiles[0] → fd 3 in the child process
 	var extraFiles []*os.File
 	if destNetnsFd == "" {
-		if replacementPodUID == "" {
-			return 0, fmt.Errorf("ADR-0122: replacement pod UID required to resolve pause netns for --net-fd restore")
+		if sandboxID == "" {
+			return 0, fmt.Errorf("ADR-0122: replacement pod sandbox ID required to resolve netns for --net-fd restore")
 		}
-		pausePID, perr := FindPauseContainerPID(replacementPodUID)
-		if perr != nil {
-			return 0, fmt.Errorf("resolve replacement pod pause container PID: %w", perr)
-		}
-		netnsPath := fmt.Sprintf("/proc/%d/ns/net", pausePID)
-		netnsFd, oerr := os.Open(netnsPath)
-		if oerr != nil {
-			return 0, fmt.Errorf("open replacement pod netns: %w", oerr)
+		// B1: resolve via the containerd sandbox API (unambiguous per pod, no /proc comm scan).
+		// B2: ResolveNetnsFromSandbox opens the netns path and cross-checks fd/path inodes.
+		netnsFd, rerr := ResolveNetnsFromSandbox(context.Background(), nil, sandboxID)
+		if rerr != nil {
+			return 0, fmt.Errorf("resolve replacement pod sandbox netns: %w", rerr)
 		}
 		defer netnsFd.Close()
 		extraFiles = []*os.File{netnsFd}
 		log.Info("joinNsRestore: joining replacement pod netns via --net-fd (ADR-0122)",
-			"replacementPodUID", replacementPodUID, "pausePID", pausePID, "netnsPath", netnsPath, "childFd", petnsChildFd)
+			"sandboxID", sandboxID, "childFd", petnsChildFd)
 	}
 
 	criuArgs := buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsChildFd)
@@ -1412,10 +1466,11 @@ func (s *AgentServer) Restore(_ context.Context, req *agentpb.RestoreRequest) (*
 		log.Info("Restore: config.json found — using join-ns restore (ctr placeholder + CRIU)",
 			"destNetnsFd", req.DestNetnsFd)
 		restoreStart := time.Now()
-		// ADR-0122: the Restore gRPC path does not carry a replacement pod UID (no proto
-		// field). On the --join-ns (DestNetnsFd set) path the UID is unused. On the stateless
-		// path, joinNsRestore now requires the pause netns and will fail loudly — the live
-		// North Star restore flows through the NRI hook (cmd/agent/main.go), which supplies it.
+		// ADR-0122: the Restore gRPC path does not carry a replacement pod sandbox ID (no proto
+		// field). On the --join-ns (DestNetnsFd set) path the sandbox ID is unused. On the
+		// stateless path, joinNsRestore now requires the sandbox netns and will fail loudly —
+		// the live North Star restore flows through the NRI hook (cmd/agent/main.go), which
+		// supplies the sandbox ID from pod.GetId().
 		pid, joinErr := joinNsRestore(req.MigrationName, imagesDir, req.DestNetnsFd, "")
 		restoreDurationMs := time.Since(restoreStart).Milliseconds()
 		if joinErr != nil {
