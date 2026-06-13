@@ -1,0 +1,12 @@
+# CODEOWNERS — PodMotion repository ownership rules.
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Format: <pattern> <owner> [<owner> ...]
+# Last matching rule wins.
+
+# Default: all maintainers must review every change.
+* @podmotion-io/maintainers
+
+# Release scripts and workflow require release-manager sign-off in addition.
+scripts/promote-staging.sh @podmotion-io/release-managers
+.github/workflows/release.yml @podmotion-io/release-managers

@@ -1,0 +1,110 @@
+# ci/green-streaks.yaml — per-cell consecutive green run counters
+# Written by the CI aggregation job after each run.
+# Read by scripts/check-release-gate.sh to enforce the 10-consecutive-green-run gate.
+# All cells start as data-pending (no runs recorded yet).
+# Per ADR-0093 §3.2 and bootstrap gap policy in internal/ci/flakedb.go.
+#
+# Status values:
+#   data-pending  — fewer than 10 recorded runs; blocks ReadyForPromotion
+#   active        — at least one run recorded; current_streak may be < 10
+#
+# schema_version: 1
+
+schema_version: 1
+
+streaks:
+  - cell_id: "kernel-5-15/flannel/hostpath/n"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
+
+  - cell_id: "kernel-5-15/flannel/hostpath/n-1"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
+
+  - cell_id: "kernel-5-15/flannel/longhorn/n"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
+
+  - cell_id: "kernel-5-15/flannel/longhorn/n-1"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
+
+  - cell_id: "kernel-5-15/calico/hostpath/n"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
+
+  - cell_id: "kernel-5-15/calico/hostpath/n-1"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
+
+  - cell_id: "kernel-5-15/calico/longhorn/n"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
+
+  - cell_id: "kernel-5-15/calico/longhorn/n-1"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
+
+  - cell_id: "kernel-6-8/flannel/hostpath/n"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
+
+  - cell_id: "kernel-6-8/flannel/hostpath/n-1"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
+
+  - cell_id: "kernel-6-8/flannel/longhorn/n"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
+
+  - cell_id: "kernel-6-8/flannel/longhorn/n-1"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
+
+  - cell_id: "kernel-6-8/calico/hostpath/n"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
+
+  - cell_id: "kernel-6-8/calico/hostpath/n-1"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
+
+  - cell_id: "kernel-6-8/calico/longhorn/n"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
+
+  - cell_id: "kernel-6-8/calico/longhorn/n-1"
+    status: data-pending
+    current_streak: 0
+    last_run_id: ""
+    last_updated: ""
