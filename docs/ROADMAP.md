@@ -93,17 +93,25 @@ roadmap.
 
 | ID | Title | Theme | Status | Size | North star after |
 |----|-------|-------|--------|------|------------------|
-| M22 | Multi-Container Consistent Checkpoint Correctness | Checkpoint correctness — the "every container" half | NEW | L | ~45% |
-| M23 | Conntrack/NAT State Migration + N-Flow Transparency | Network transparency — the "every client" half (kernel path) | NEW | L | ~65% |
+| M22 | Multi-Container Consistent Checkpoint Correctness + Scope Matrix + Security Baseline | Checkpoint correctness + admission enforcement + security hardening (Gap 1, Gap 4) | NEW | L | ~45% |
+| M23 | Conntrack/NAT State Migration + N-Flow Transparency + Controller Test Gate | Network transparency — "every client" half + behavior test coverage (Gap 2) | NEW | L | ~65% |
 | M24 | CNI Matrix to Production + LB Connection Tracking | Per-CNI transparency parity | IN_PLAN | XL | ~80% |
 | M25 | IPv6 + Encrypted Overlay Transparency | Network transparency across IP families / encryption | NEW | XL | ~88% |
-| M26 | Observability Completeness + Scheduler/Descheduler E2E | Provability and orchestration | IN_PLAN | M | ~90% |
-| M27 | First True-North-Star AWS Gate Run | Pre-beta validation against real definition | NEW | M | ~92% |
+| M26 | Observability + Scheduler/Descheduler E2E + **CI Matrix Gate + Release Hygiene** | Provability, orchestration, deterministic CI (Gap 3, Gap 6) | IN_PLAN | L | ~90% |
+| M27 | First True-North-Star AWS Gate Run + **Chaos Gate** | Pre-beta validation + fault injection empirical verification (Gap 5) | NEW | M | ~92% |
 | M28 | Beta Gate — 80 Runs, Zero Errors/Warnings | Production hardening gate | IN_PLAN | L | ~95% |
 | M29 | CNCF Sandbox + External Security Audit + Public Launch | Community launch | IN_PLAN | M | ~95% |
 | M30 | API Stabilization + v1.0 Matrix Freeze | API maturity and v1.0 | NEW | L | 100% (amd64 scope) |
 
 Tier-0 prerequisites: **M22 and M23 must both land before any north-star gate run.**
+
+**Pre-production hardening note (2026-06-12 CNCF quorum):** 6 pre-production gap ADRs
+reviewed. 1 accepted (ADR-0079 — E2E CI Matrix). 5 rejected and require revision.
+Hardening tasks have been folded into M22 (scope matrix, security baseline), M23
+(controller test gate), M26 (CI matrix implementation, release hygiene), and M27
+(chaos gate). All 5 rejected ADRs must be revised, re-reviewed, and accepted before
+their respective milestone gates can be declared passed. See
+`docs/PRE_PROD_CHECKLIST.md` and `docs/adr/CNCF_AUDIT_REJECTED.md`.
 
 **Milestone-count realism:** this synthesized plan is 9 net milestones (M22–M30) vs.
 the 4 originally planned (M22–M25). If M22 reveals deep CRIU shared-namespace ordering
