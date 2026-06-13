@@ -859,29 +859,50 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 	// process memory and secrets are never written to persistent disk (ADR-0046).
 	imagesDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", req.MigrationName)
 
-	// Resolve the container root PID from the pod UID stored during PrepareSource.
-	s.migrationPodUIDMu.RLock()
-	podUID := s.migrationPodUID[req.MigrationName]
-	s.migrationPodUIDMu.RUnlock()
-
-	// Resolve TCPPreservationMode from the PodMigration CR so TcpEstablished is tier-driven.
-	// Done early so both the ctr and raw-CRIU paths can use the same value.
-	tcpEstablished := false
+	// Fetch the PodMigration CR up front (ADR-0118). The CR is the canonical source of
+	// migration identity: it provides both the TCPPreservationMode and the SourcePodUID
+	// fallback used when the in-memory map has been lost across an agent restart.
+	pm := &pmv1.PodMigration{}
 	if s.k8sClient != nil {
 		workloadNs := req.WorkloadNamespace
 		if workloadNs == "" {
 			return nil, fmt.Errorf("checkpoint: WorkloadNamespace is empty in CheckpointRequest; cannot resolve TCPPreservationMode — refusing to dump to avoid silent stateless downgrade")
 		}
-		pm := &pmv1.PodMigration{}
 		lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer lookupCancel()
-		if lookupErr := s.k8sClient.Get(lookupCtx, types.NamespacedName{
+		if err := s.k8sClient.Get(lookupCtx, types.NamespacedName{
 			Name:      req.MigrationName,
 			Namespace: workloadNs,
-		}, pm); lookupErr != nil {
-			return nil, fmt.Errorf("checkpoint: failed to look up PodMigration CR %s/%s: %w — cannot determine TCPPreservationMode; refusing to dump to avoid silent stateless downgrade",
-				workloadNs, req.MigrationName, lookupErr)
+		}, pm); err != nil {
+			return nil, fmt.Errorf("checkpoint: CR lookup failed: %w", err)
 		}
+	}
+
+	// Resolve the container root PID from the pod UID stored during PrepareSource.
+	s.migrationPodUIDMu.RLock()
+	podUID := s.migrationPodUID[req.MigrationName]
+	s.migrationPodUIDMu.RUnlock()
+
+	// ADR-0118: if the in-memory map missed (e.g. the agent restarted between PrepareSource
+	// and Checkpoint), recover the pod UID from the CR's spec.sourcePodUID.
+	if podUID == "" && s.k8sClient != nil {
+		if pm.Spec.SourcePodUID == "" {
+			return nil, fmt.Errorf("checkpoint: SourcePodUID is empty in CR — " +
+				"controller has not completed Validating yet")
+		}
+		log.Info("Checkpoint: podUID not in memory map — recovering from CR spec.sourcePodUID",
+			"migration", req.MigrationName, "uid", pm.Spec.SourcePodUID)
+		podUID = pm.Spec.SourcePodUID
+		// Repopulate the map so subsequent calls in this agent session skip the CR fallback.
+		s.migrationPodUIDMu.Lock()
+		s.migrationPodUID[req.MigrationName] = podUID
+		s.migrationPodUIDMu.Unlock()
+	}
+
+	// Resolve TCPPreservationMode from the already-fetched PodMigration CR so TcpEstablished
+	// is tier-driven. Done early so both the ctr and raw-CRIU paths can use the same value.
+	tcpEstablished := false
+	if s.k8sClient != nil {
 		mode := pm.Spec.TCPPreservationMode
 		tcpEstablished = mode == pmv1.TCPPreservationModeStrict || mode == pmv1.TCPPreservationModeBestEffort
 	}
