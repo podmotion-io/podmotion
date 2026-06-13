@@ -696,7 +696,6 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		tcpFlag,
 		"--mntns-compat-mode",
 		"--manage-cgroups=ignore",
-		"--network-lock", "skip", // ADR-0126: netns is CNI-managed (ADR-0125); do not replay source iptables
 		"--ext-mount-map", "/dev/null:/dev/null",
 		"--ext-mount-map", fmt.Sprintf("/data:%s", dataDir),
 		"--ext-mount-map", fmt.Sprintf("/dev/termination-log:%s", termlogFile),
@@ -879,25 +878,44 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) 
 	// *exec.ExitError) means the restore failed: return immediately, do NOT scan for a PID, do
 	// NOT set criuRestoreConfirmed. The error carries the CRIU exit code and a bounded tail of
 	// restore.log for diagnosis (Decision 1 / AC5; Security note: tail capped at 4 KiB).
-	if waitErr := criuCmd.Wait(); waitErr != nil {
-		exitCode := -1
-		if criuCmd.ProcessState != nil {
-			exitCode = criuCmd.ProcessState.ExitCode()
+	// ADR-0127: restore.log content is the PRIMARY success signal, not the CRIU exit code.
+	// CRIU exits non-zero due to post-restore iptables network-unlock failures in the joined
+	// CNI-managed netns (Sprint 20). That iptables-restore error occurs AFTER "Tasks resumed" —
+	// the process tree is already live. For a --join-ns net:<path> restore (ADR-0125) the netns is
+	// externally managed by CNI; iptables state belongs to CNI, not CRIU. We therefore read
+	// restore.log after Wait() returns (whether nil or non-nil) and gate on its content first.
+	waitErr := criuCmd.Wait()
+	exitCode := -1
+	if criuCmd.ProcessState != nil {
+		exitCode = criuCmd.ProcessState.ExitCode()
+	}
+	logBytes, _ := os.ReadFile(restoreLogPath)
+	restoreSucceeded := strings.Contains(string(logBytes), "Restore finished successfully")
+
+	if restoreSucceeded {
+		// PRIMARY signal: process tree was restored regardless of CRIU exit code. Proceed to PID scan.
+		if waitErr != nil {
+			log.Info("joinNsRestore: CRIU exited non-zero but restore.log confirms success (ADR-0127); "+
+				"treating as success — post-restore network-unlock failure is non-fatal",
+				"exitCode", exitCode, "waitErr", waitErr)
 		}
+	} else if waitErr == nil && exitCode == 0 {
+		// CRIU said ok but wrote no success marker — shouldn't happen on the cold path, but the
+		// process tree exited cleanly so honor it (ADR-0127). Keep the ADR-0123 D3 non-empty check.
+		if fi, statErr := os.Stat(restoreLogPath); statErr != nil || fi.Size() == 0 {
+			return 0, fmt.Errorf("criu restore reported exit 0 but restore.log is missing or empty at %s "+
+				"(ADR-0123 D3 verification failed): %v", restoreLogPath, statErr)
+		}
+		log.Info("joinNsRestore: CRIU exited 0 without 'Restore finished successfully' marker (ADR-0127); "+
+			"proceeding on exit code", "restoreLogPath", restoreLogPath)
+	} else {
+		// FAIL: no success marker AND non-zero exit. Combine exit code + stderr + log tail.
 		stderrTail := strings.TrimSpace(criuStderr.String())
 		if len(stderrTail) > 4096 {
 			stderrTail = stderrTail[len(stderrTail)-4096:]
 		}
 		return 0, fmt.Errorf("criu restore failed (exit code %d): %w\ncriu stderr:\n%s\nrestore.log tail:\n%s",
 			exitCode, waitErr, stderrTail, readLogTail(restoreLogPath, 4096))
-	}
-
-	// ADR-0123 D3: verify restore.log was produced and is non-empty on the cold path. CRIU has
-	// exited 0 at this point, so the log must exist; an empty/missing log indicates the log
-	// target was dropped or CRIU never wrote it (the present-but-unverified Bug-2 gap).
-	if fi, statErr := os.Stat(restoreLogPath); statErr != nil || fi.Size() == 0 {
-		return 0, fmt.Errorf("criu restore reported exit 0 but restore.log is missing or empty at %s "+
-			"(ADR-0123 D3 verification failed): %v", restoreLogPath, statErr)
 	}
 
 	// Step 5: ADR-0123 D2 — locate the restored application PID via the replacement pod's
