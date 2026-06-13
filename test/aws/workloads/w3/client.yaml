@@ -1,0 +1,32 @@
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: w3-client
+  namespace: podmotion-gate
+  labels:
+    app: w3-client
+    podmotion.io/workload-type: w3
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    podmotion.io/role: client
+  tolerations:
+    - key: podmotion.io/role
+      operator: Equal
+      value: client
+      effect: NoSchedule
+  containers:
+    - name: client
+      # w3 client binary — digest must be pinned before gate run
+      image: FILL_IN_DIGEST
+      env:
+        - name: TARGET_SVC
+          value: w3-svc.podmotion-gate.svc.cluster.local:6379
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi
