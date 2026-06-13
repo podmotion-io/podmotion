@@ -27,6 +27,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 
 	corev1 "k8s.io/api/core/v1"
@@ -121,6 +122,53 @@ func (v *PodMigrationValidator) validate(ctx context.Context, pm *pmv1.PodMigrat
 			if nmcErr == nil && !nmc.Spec.KernelFeatures.Userfaultfd {
 				allErrs = append(allErrs, field.Forbidden(spec.Child("mode"),
 					fmt.Sprintf("PostCopy requires CONFIG_USERFAULTFD on source node %q; node reports userfaultfd=false", sourceNode)))
+			}
+		}
+	}
+
+	// Rule M25-A: Reject IPv6-primary source pod addresses (ADR-0081).
+	// IPv6 and dual-stack pod migration is not supported in v0.1/v0.2.
+	if errs := validateIPv6PrimaryAddress(pod); len(errs) > 0 {
+		allErrs = append(allErrs, errs...)
+	}
+
+	// Rule M25-B: Reject IPSec-encrypted source nodes; enforce encryption-mode consistency (ADR-0102).
+	if pod.Spec.NodeName != "" {
+		srcNMC, nmcErr := v.getNMC(ctx, pod.Spec.NodeName)
+		if nmcErr == nil {
+			if srcNMC.Status.IPSecEncryption {
+				allErrs = append(allErrs, field.Forbidden(spec.Child("podName"),
+					fmt.Sprintf(
+						"source node %q uses CNI-managed IPSec encryption (XFRM pod-CIDR policies detected). "+
+							"IPSec migration is not supported in PodMotion v0.1/v0.2 (ADR-0102). "+
+							"WireGuard-encrypted overlays are supported. "+
+							"Track IPSec support at https://github.com/podmotion-io/podmotion/issues/IPSec",
+						pod.Spec.NodeName)))
+			}
+			// Cross-encryption-mode check (requires targetNodeName to be set).
+			if pm.Spec.TargetNodeName != "" {
+				dstNMC, dstErr := v.getNMC(ctx, pm.Spec.TargetNodeName)
+				if dstErr == nil {
+					srcHasWG := srcNMC.Spec.NetworkCapability.WireGuardInterface != ""
+					dstHasWG := dstNMC.Spec.NetworkCapability.WireGuardInterface != ""
+					if srcHasWG != dstHasWG {
+						allErrs = append(allErrs, field.Invalid(spec.Child("targetNodeName"), pm.Spec.TargetNodeName,
+							fmt.Sprintf(
+								"source node %q WireGuard=%v but destination node %q WireGuard=%v: "+
+									"cross-encryption-mode migration is not supported (ADR-0102). "+
+									"Ensure both nodes are part of the same encrypted overlay.",
+								pod.Spec.NodeName, srcHasWG, pm.Spec.TargetNodeName, dstHasWG)))
+					}
+					// Reject if destination node is IPv6-only (ADR-0081 §3).
+					if dstNMC.Status.ClusterIPFamily == pmv1.IPFamilySupportIPv6Only {
+						allErrs = append(allErrs, field.Invalid(spec.Child("targetNodeName"), pm.Spec.TargetNodeName,
+							fmt.Sprintf(
+								"destination node %q has IPv6-only primary interface (clusterIPFamily=IPv6Only). "+
+									"IPv6 migration is not supported in v0.1/v0.2 (ADR-0081). "+
+									"Track support at https://github.com/podmotion-io/podmotion/issues/IPv6",
+								pm.Spec.TargetNodeName)))
+					}
+				}
 			}
 		}
 	}
@@ -238,6 +286,39 @@ func (v *PodMigrationValidator) validate(ctx context.Context, pm *pmv1.PodMigrat
 	}
 
 	return allErrs
+}
+
+// validateIPv6PrimaryAddress rejects a PodMigration whose source pod has an IPv6 primary
+// address. IPv6 and dual-stack pod migration are not supported in v0.1/v0.2 (ADR-0081).
+// Admission-time rejection prevents silent eBPF map truncation and ARP handoff failure.
+func validateIPv6PrimaryAddress(pod *corev1.Pod) field.ErrorList {
+	var errs field.ErrorList
+	if len(pod.Status.PodIPs) == 0 {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "podName"),
+			pod.Name,
+			"source pod has no assigned IP address; migration cannot proceed until the pod has a running IP"))
+		return errs
+	}
+	primaryIP := net.ParseIP(pod.Status.PodIPs[0].IP)
+	if primaryIP == nil {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "podName"),
+			pod.Name,
+			fmt.Sprintf("source pod primary IP %q could not be parsed", pod.Status.PodIPs[0].IP)))
+		return errs
+	}
+	if primaryIP.To4() == nil {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "podName"),
+			pod.Name,
+			fmt.Sprintf(
+				"source pod %q has IPv6 primary address %s: IPv6 and dual-stack pod migration "+
+					"is not supported in PodMotion v0.1/v0.2 (ADR-0081). "+
+					"Track support at https://github.com/podmotion-io/podmotion/issues/IPv6",
+				pod.Name, pod.Status.PodIPs[0].IP)))
+	}
+	return errs
 }
 
 // detectTier4Volume returns a non-empty reason string if any pod volume is in the Tier 4 (blocked) category.

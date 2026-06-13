@@ -42,11 +42,32 @@
 
 /* ── PM_SEQ_XLAT map ──────────────────────────────────────────────────────── */
 
-/* FourTuple — network-byte-order 4-tuple used as map key.
- * src/dst are from the inner TCP segment's perspective. */
+/*
+ * FourTuple — network-byte-order 4-tuple used as PM_SEQ_XLAT map key.
+ * src/dst are from the inner TCP segment's perspective.
+ *
+ * IPv4 ONLY (ADR-0081): src_ip and dst_ip are 32-bit IPv4 addresses (__be32).
+ * An IPv6 address is 128 bits; IPv6 source addresses cause silent truncation or
+ * mismatch on this key. IPv6 extension point (for M25/ADR-0081 implementor):
+ *
+ *   Replace __be32 src_ip/__be32 dst_ip with:
+ *     union { __be32 v4; __be32 v6[4]; } src_ip;
+ *     union { __be32 v4; __be32 v6[4]; } dst_ip;
+ *     __u8 family;   // AF_INET or AF_INET6
+ *     __u8 _pad[3];
+ *
+ *   Also add parse_ipv6_hdr() XDP parsing path and explicit XDP_PASS for
+ *   ICMPv6 types 133-137 (NDP Neighbor Solicitation/Advertisement) so NDP
+ *   frames are not dropped when the XDP program is attached.
+ *
+ *   The PM_SEQ_XLAT map max_entries and map_flags do not change; only
+ *   sizeof(struct four_tuple) changes, which __type(key, ...) picks up.
+ *
+ * Track IPv6 support: https://github.com/podmotion-io/podmotion/issues/IPv6
+ */
 struct four_tuple {
-    __be32 src_ip;
-    __be32 dst_ip;
+    __be32 src_ip;   /* IPv4 source address — ADR-0081: IPv4-only in v0.1/v0.2 */
+    __be32 dst_ip;   /* IPv4 destination address — ADR-0081: IPv4-only in v0.1/v0.2 */
     __be16 src_port;
     __be16 dst_port;
 };
