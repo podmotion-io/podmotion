@@ -1,0 +1,70 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: podmotion-gate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: w5-workload
+  namespace: podmotion-gate
+  labels:
+    app: w5
+    podmotion.io/workload-type: w5
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: w5
+  template:
+    metadata:
+      labels:
+        app: w5
+        podmotion.io/workload-type: w5
+    spec:
+      nodeSelector:
+        podmotion.io/role: worker
+      tolerations:
+        - key: podmotion.io/role
+          operator: Equal
+          value: worker
+          effect: NoSchedule
+      containers:
+        - name: grpc-server
+          # image: <registry>/grpc-streaming-server:latest  # human-readable tag
+          image: FILL_IN_DIGEST  # pin to sha256 digest before gate run; see docs/sprints/m27-image-pins.md
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          readinessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 5
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: w5-svc
+  namespace: podmotion-gate
+  labels:
+    app: w5
+    podmotion.io/workload-type: w5
+spec:
+  type: ClusterIP
+  selector:
+    app: w5
+  ports:
+    - name: grpc
+      port: 8080
+      targetPort: 50051
+      protocol: TCP
