@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
@@ -104,18 +105,36 @@ func main() {
 		}
 	}
 
-	// Build a k8s client so the agent can upsert MigrationCheckpoint CRs.
+	// Build a controller-runtime cluster so the agent has a cached, informer-backed k8s client.
+	// The cache is required for the ADR-0118 podUID-from-CR fallback: Checkpoint reads the
+	// PodMigration CR, and a cold (un-synced) cache would return spurious not-found errors.
 	var k8sClient client.Client
-	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme})
-	if err != nil {
-		log.Error(err, "Failed to build k8s client — MigrationCheckpoint CR updates will be skipped")
+	cl, clErr := cluster.New(cfg, func(o *cluster.Options) { o.Scheme = scheme })
+	if clErr != nil {
+		log.Error(clErr, "Failed to build k8s cluster client — MigrationCheckpoint CR updates will be skipped")
 		k8sClient = nil
+	} else {
+		k8sClient = cl.GetClient()
+		// Run the cluster (starts the informer cache) for the agent's lifetime.
+		go func() {
+			if err := cl.Start(ctx); err != nil {
+				log.Error(err, "cluster cache runtime exited with error")
+			}
+		}()
 	}
 
 	agentSrv := server.New(nodeName, checkpointer, k8sClient)
 
 	// Start gRPC server on :9090.
 	go func() {
+		// ADR-0118 Blocking Item 1: do not accept Checkpoint RPCs until the informer cache
+		// has completed its initial sync, otherwise CR lookups race against cache warm-up.
+		if cl != nil {
+			if ok := cl.GetCache().WaitForCacheSync(ctx); !ok {
+				log.Error(nil, "informer cache failed to sync — refusing to start gRPC server")
+				os.Exit(1)
+			}
+		}
 		if err := agentSrv.ListenAndServe(ctx, ":9090", tlsCfg); err != nil {
 			log.Error(err, "gRPC server exited with error")
 		}
