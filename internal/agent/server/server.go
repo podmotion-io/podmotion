@@ -587,6 +587,17 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 				log.Info("InjectIPHandoff: ADR-0140 OLD-IP FORWARD ACCEPT installed (reverse path B9)",
 					"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 			}
+			// ADR-0140's filter ACCEPT fixes control/ICMP forwarding but the stateful-TCP DATA
+			// segment is still conntrack-INVALID (the tc mirred redirect made the forward leg
+			// conntrack-invisible), so the kernel RSTs it (B10). NOTRACK the OLD-IP flow in the
+			// raw table (pre-conntrack) on this destination node, both directions. Non-fatal.
+			if ntErr := installOldIPNotrack(ctx, oldIP, "both"); ntErr != nil {
+				log.Error(ntErr, "InjectIPHandoff: ADR-0141 NOTRACK install failed (non-fatal)",
+					"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+			} else {
+				log.Info("InjectIPHandoff: ADR-0141 OLD-IP NOTRACK installed (reverse data path B10)",
+					"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+			}
 		}
 	} else {
 		log.Info("InjectIPHandoff: ADR-0139 RestoredPID not yet in CR status — tc redirect deferred to requeue (non-fatal)",
@@ -664,6 +675,9 @@ func (s *AgentServer) CleanupSourceIPHandoff(ctx context.Context, req *agentpb.C
 		return &agentpb.CleanupSourceIPHandoffResponse{Cleaned: false,
 			BlockingReason: firstErr.Error()}, nil
 	}
+
+	// ADR-0141: the source-node NOTRACK rules persist for the life of the relocated IP (like the
+	// flannel.1 redirect above); they are removed only on IPAM reclaim. Not torn down here.
 
 	log.Info("CleanupSourceIPHandoff: stale cni0 entry removed; flannel.1 redirect preserved (ADR-0133 D4 + ADR-0136)", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 	return &agentpb.CleanupSourceIPHandoffResponse{Cleaned: true}, nil
@@ -819,6 +833,61 @@ func installOldIPForwardAccept(ctx context.Context, oldIP net.IP) error {
 	return nil
 }
 
+// installOldIPNotrack installs the ADR-0141 (blocker B10) raw-table NOTRACK rules for the
+// relocated OLD IP so the flow is never conntrack-tracked and can never be classified INVALID
+// (which otherwise triggers a data-segment RST / KUBE-FORWARD INVALID DROP, because the
+// ADR-0139 tc `mirred` redirect made the forward leg conntrack-invisible). The `raw` table runs
+// in PREROUTING/OUTPUT before conntrack. dst-side controls the locally-bound src octet differs
+// per node, so callers pass the directions relevant to their node:
+//   - "both": PREROUTING -d and -s, plus OUTPUT -d (destination node, ADR-0139)
+//   - "source": PREROUTING -s, plus OUTPUT -d (source node, ADR-0136)
+// Idempotent: delete-then-insert. Best-effort: returns the first insert error.
+func installOldIPNotrack(ctx context.Context, oldIP net.IP, mode string) error {
+	cidr := oldIP.String() + "/32"
+	type rule struct {
+		chain string
+		dir   string // "-d" or "-s"
+	}
+	var rules []rule
+	switch mode {
+	case "both": // destination node
+		rules = []rule{
+			{"PREROUTING", "-d"}, {"PREROUTING", "-s"}, {"OUTPUT", "-d"},
+		}
+	default: // "source"
+		rules = []rule{
+			{"PREROUTING", "-s"}, {"OUTPUT", "-d"},
+		}
+	}
+	comment := "podmotion ADR-0141 oldIP notrack"
+	for _, r := range rules {
+		del := []string{"-t", "raw", "-D", r.chain, r.dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
+		_, _ = exec.CommandContext(ctx, "iptables", del...).CombinedOutput()
+		ins := []string{"-t", "raw", "-I", r.chain, "1", r.dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
+		if out, err := exec.CommandContext(ctx, "iptables", ins...).CombinedOutput(); err != nil {
+			return fmt.Errorf("iptables -t raw -I %s %s %s NOTRACK: %w (%s)", r.chain, r.dir, cidr, err, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
+}
+
+// removeOldIPNotrack removes all ADR-0141 raw-table NOTRACK rules for the OLD IP (both chains,
+// both directions) on the calling node. Idempotent: tolerates ENOENT.
+func removeOldIPNotrack(ctx context.Context, oldIP net.IP) {
+	cidr := oldIP.String() + "/32"
+	comment := "podmotion ADR-0141 oldIP notrack"
+	for _, chain := range []string{"PREROUTING", "OUTPUT"} {
+		for _, dir := range []string{"-d", "-s"} {
+			args := []string{"-t", "raw", "-D", chain, dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
+			for i := 0; i < 4; i++ {
+				if _, err := exec.CommandContext(ctx, "iptables", args...).CombinedOutput(); err != nil {
+					break
+				}
+			}
+		}
+	}
+}
+
 // removeOldIPForwardAccept removes the ADR-0140 OLD-IP/32 FORWARD ACCEPT pair (IPAM-reclaim /
 // disarm). Idempotent: tolerates ENOENT. Removes all copies (loop until -D fails).
 func removeOldIPForwardAccept(ctx context.Context, oldIP net.IP) {
@@ -863,7 +932,8 @@ func (s *AgentServer) DisarmTCRedirect(ctx context.Context, req *agentpb.DisarmT
 	if req.OldPodIp != "" {
 		if oldIP := net.ParseIP(req.OldPodIp); oldIP != nil && oldIP.To4() != nil {
 			removeOldIPForwardAccept(ctx, oldIP)
-			log.Info("DisarmTCRedirect: removed ADR-0140 OLD-IP FORWARD ACCEPT", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+			removeOldIPNotrack(ctx, oldIP)
+			log.Info("DisarmTCRedirect: removed ADR-0140 FORWARD ACCEPT + ADR-0141 NOTRACK", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 		}
 	}
 	log.Info("DisarmTCRedirect: tc-ingress redirect disarmed (ADR-0139 D3)", "migration", req.MigrationName, "fdbIf", fdbIf)
@@ -931,6 +1001,17 @@ func (s *AgentServer) InjectSourceRedirect(ctx context.Context, req *agentpb.Inj
 	}); err != nil {
 		return &agentpb.InjectSourceRedirectResponse{Injected: false,
 			BlockingReason: fmt.Sprintf("flannel.1 AF_BRIDGE FDB: %v", err)}, nil
+	}
+
+	// ADR-0141 (blocker B10): NOTRACK the OLD-IP flow on the SOURCE node too, so the reply
+	// arriving from the relocated pod (and the client SYN/GET egressing) is never conntrack-
+	// tracked → never INVALID → no RST on the source side. Symmetric to the destination NOTRACK.
+	if ntErr := installOldIPNotrack(ctx, oldIP, "source"); ntErr != nil {
+		log.Error(ntErr, "InjectSourceRedirect: ADR-0141 source NOTRACK install failed (non-fatal)",
+			"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+	} else {
+		log.Info("InjectSourceRedirect: ADR-0141 source NOTRACK installed (B10)",
+			"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 	}
 
 	log.Info("InjectSourceRedirect: source VXLAN redirect installed (ADR-0136)",
