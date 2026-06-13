@@ -441,6 +441,59 @@ bundle-build:
 bundle-push:
 	$(CONTAINER_TOOL) push $(BUNDLE_IMG)
 
+##@ Release Hygiene
+
+.PHONY: deploy-crds
+deploy-crds: manifests ## Apply CRD manifests directly from config/crd/bases/ (bypasses kustomize).
+	kubectl apply -f config/crd/bases/
+
+.PHONY: crd-upgrade-check
+crd-upgrade-check: manifests ## Diff live CRDs against generated manifests; exit 1 on breaking changes.
+	@echo "==> Checking CRD upgrade safety..."
+	@fail=0; \
+	for f in config/crd/bases/*.yaml; do \
+	  name=$$(grep '^  name:' "$$f" | head -1 | awk '{print $$2}'); \
+	  if ! kubectl get crd "$$name" >/dev/null 2>&1; then \
+	    echo "  [SKIP] $$name not installed — skipping diff"; \
+	    continue; \
+	  fi; \
+	  diff_out=$$(kubectl diff -f "$$f" 2>/dev/null || true); \
+	  if echo "$$diff_out" | grep -qE '^\-.*required|^\-.*x-kubernetes-validations'; then \
+	    echo "  [FAIL] $$name: detected required-field removal or CEL rule removal"; \
+	    echo "$$diff_out"; \
+	    fail=1; \
+	  fi; \
+	  if echo "$$diff_out" | grep -qE '^\-  [a-zA-Z]'; then \
+	    echo "  [WARN] $$name: potential field removal detected — review carefully:"; \
+	    echo "$$diff_out" | grep -E '^\-' | head -20; \
+	  fi; \
+	done; \
+	if [ $$fail -eq 1 ]; then \
+	  echo ""; \
+	  echo "ERROR: crd-upgrade-check FAILED — breaking CRD changes detected."; \
+	  echo "       CRD fields and CEL rules must not be removed in a patch/minor release."; \
+	  exit 1; \
+	fi; \
+	echo "==> crd-upgrade-check PASSED."
+
+.PHONY: release-gate
+release-gate: crd-upgrade-check ## Run all release gate checks (scripts + CRD check + release-tagged tests).
+	@echo "==> Running release gate..."
+	@if [ -f scripts/check-release-gate.sh ]; then \
+	  bash scripts/check-release-gate.sh || { echo "ERROR: check-release-gate.sh FAILED"; exit 1; }; \
+	else \
+	  echo "  [SKIP] scripts/check-release-gate.sh not found"; \
+	fi
+	@if [ -f scripts/check-kernel-config.sh ]; then \
+	  bash scripts/check-kernel-config.sh || { echo "ERROR: check-kernel-config.sh FAILED"; exit 1; }; \
+	else \
+	  echo "  [SKIP] scripts/check-kernel-config.sh not found"; \
+	fi
+	@echo "==> Running go test ./... -tags release..."
+	@go test -tags release ./... || { echo "ERROR: go test -tags release FAILED"; exit 1; }
+	@echo ""
+	@echo "==> release-gate PASSED — safe to tag and publish."
+
 ## release-manifests: Generate single-file install.yaml for quick cluster install
 .PHONY: release-manifests
 release-manifests: manifests generate kustomize
