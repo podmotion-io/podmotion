@@ -1,0 +1,108 @@
+# eksctl cluster config — PodMotion M27 gate run
+# K8s version is substituted by the harness at runtime: {{K8S_VERSION}}
+# VPC references are substituted from Terraform VPC module outputs:
+#   {{VPC_ID}}      — VPC ID output from test/aws/vpc/
+#   {{SUBNET_IDS}}  — comma-separated list of private subnet IDs (one per AZ)
+#
+# Region: us-east-1
+# See ADR-0111 for full provisioning rationale.
+
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: podmotion-gate
+  region: us-east-1
+  version: "{{K8S_VERSION}}"
+  tags:
+    podmotion:gate: m27
+    podmotion:managed: "true"
+    # podmotion:run-id is injected by the harness via --tags at eksctl invocation time
+
+vpc:
+  id: "{{VPC_ID}}"
+  subnets:
+    private:
+      us-east-1a:
+        id: "{{SUBNET_IDS_AZ_A}}"
+      us-east-1b:
+        id: "{{SUBNET_IDS_AZ_B}}"
+      us-east-1c:
+        id: "{{SUBNET_IDS_AZ_C}}"
+  clusterEndpoints:
+    publicAccess: true
+    privateAccess: true
+
+iam:
+  withOIDC: true
+  serviceAccounts: []
+
+managedNodeGroups:
+  # arm64 (Graviton) worker nodes — m7g.large
+  - name: workers-arm64
+    instanceType: m7g.large
+    amiFamily: AmazonLinux2023
+    # AMI is pinned via ami-pins.json; harness validates actual AMI ID post-launch.
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 2
+    privateNetworking: true
+    availabilityZones:
+      - us-east-1a
+      - us-east-1b
+    labels:
+      podmotion.io/role: worker
+      podmotion.io/arch: arm64
+    tags:
+      podmotion:gate: m27
+      podmotion:managed: "true"
+    iam:
+      attachPolicyARNs:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  # x86-64 worker nodes — m7i.large
+  - name: workers-x86-64
+    instanceType: m7i.large
+    amiFamily: AmazonLinux2023
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 2
+    privateNetworking: true
+    availabilityZones:
+      - us-east-1b
+      - us-east-1c
+    labels:
+      podmotion.io/role: worker
+      podmotion.io/arch: x86-64
+    tags:
+      podmotion:gate: m27
+      podmotion:managed: "true"
+    iam:
+      attachPolicyARNs:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  # Client node — single node group for workload client pods
+  - name: clients
+    instanceType: m7i.large
+    amiFamily: AmazonLinux2023
+    desiredCapacity: 1
+    minSize: 1
+    maxSize: 1
+    privateNetworking: true
+    availabilityZones:
+      - us-east-1a
+    labels:
+      podmotion.io/role: client
+      podmotion.io/arch: x86-64
+    tags:
+      podmotion:gate: m27
+      podmotion:managed: "true"
+    iam:
+      attachPolicyARNs:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
