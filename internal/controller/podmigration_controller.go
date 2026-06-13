@@ -2336,17 +2336,28 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 				Mode:           traffic.VerificationModeEndpointSlice,
 			}
 			if err := r.TrafficVerifier.Verify(ctx, req); err != nil {
-				// ADR-0019: warn only — do not rollback after handoff.
-				log.Info("traffic verification failed (warn-only, ADR-0019)", "migration", pm.Name, "err", err)
+				// ADR-0012: verification failure → set TrafficVerified=False, do NOT delete source pod.
+				log.Error(err, "traffic verification failed — setting TrafficVerified=False, requeuing (ADR-0012)", "migration", pm.Name)
+				setCondition(pm, conditionTrafficVerified, metav1.ConditionFalse, "VerificationFailed",
+					fmt.Sprintf("TrafficVerifier returned error: %v", err))
+				if statusErr := r.statusUpdate(ctx, pm); statusErr != nil {
+					return ctrl.Result{}, statusErr
+				}
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 			}
-			// Set TrafficVerified=True regardless — StubVerifier always passes; real verifier
-			// failures are warn-only per ADR-0019.
+			// Verifier returned nil — traffic is genuinely confirmed.
 			setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "TrafficVerified",
-				"Traffic verified (or warn-only override per ADR-0019)")
+				"Traffic verified by TrafficVerifier")
 		} else {
-			// No verifier wired — skip and advance immediately.
-			log.Info("TrafficVerifier not wired; skipping verification", "migration", pm.Name)
-			setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "TrafficVerified", "Skipped: no verifier wired")
+			// ADR-0012: no verifier wired — cannot confirm traffic; do NOT promote to True.
+			// Requeue and wait for a verifier to be wired, or for an operator to intervene.
+			log.Error(nil, "TrafficVerifier not wired — cannot verify traffic; requeuing without setting TrafficVerified=True (ADR-0012)", "migration", pm.Name)
+			setCondition(pm, conditionTrafficVerified, metav1.ConditionFalse, "NoVerifier",
+				"TrafficVerifier not wired; cannot confirm traffic (ADR-0012)")
+			if statusErr := r.statusUpdate(ctx, pm); statusErr != nil {
+				return ctrl.Result{}, statusErr
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
 		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
@@ -2383,6 +2394,20 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
+	// ADR-0012 defensive re-fetch: re-read TrafficVerified from API before any source pod deletion.
+	// In-memory pm.Status may be stale; the authoritative state is in etcd.
+	{
+		freshPM := &pmv1.PodMigration{}
+		if fetchErr := r.Get(ctx, client.ObjectKeyFromObject(pm), freshPM); fetchErr != nil {
+			log.Error(fetchErr, "Verifying: failed to re-fetch PodMigration before source pod deletion — requeuing for safety (ADR-0012)", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		if !meta.IsStatusConditionTrue(freshPM.Status.Conditions, conditionTrafficVerified) {
+			log.Error(nil, "Verifying: SAFETY BLOCK — TrafficVerified is not True on re-fetch; refusing to delete source pod (ADR-0012)", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+	}
+
 	sourcePod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
 	if err == nil {
 		// Only delete if pod is still on the source node (not already gone or rescheduled).
@@ -2392,8 +2417,8 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 				"node", pm.Status.SourceNodeName,
 				"migration", pm.Name)
 			if deleteErr := r.Delete(ctx, sourcePod); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
-				log.Error(deleteErr, "failed to delete source pod — proceeding to Complete anyway (ADR-0019)")
-				// ADR-0019: warn only, do not fail the migration.
+				log.Error(deleteErr, "failed to delete source pod — requeuing (ADR-0012)", "migration", pm.Name)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
 		}
 	} else if !apierrors.IsNotFound(err) {
