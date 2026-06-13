@@ -73,6 +73,9 @@ const (
 	conditionDataplaneReconciled     = "DataplaneReconciled"
 	conditionGitOpsSuspended              = "GitOpsSuspended"
 	conditionEndpointSliceCleanVerified   = "EndpointSliceCleanupVerified"
+	// conditionIPHandoffInjected records that the ADR-0133 destination-side neighbor/FDB
+	// handoff for the OLD pod IP has been installed and the reachability probe passed.
+	conditionIPHandoffInjected            = "IPHandoffInjected"
 )
 
 // PodMigrationReconciler reconciles a PodMigration object.
@@ -2392,6 +2395,116 @@ func (r *PodMigrationReconciler) reconcileRestoringNRI(ctx context.Context, pm *
 }
 
 
+// injectIPHandoff calls InjectIPHandoff on the DESTINATION agent (ADR-0133 D1/D2) to make
+// the OLD pod IP reachable at the replacement pod, then gates on the in-node reachability
+// probe (D5). On success it sets conditionIPHandoffInjected=True (and TrafficVerified=True
+// for the directly-pinned pod-IP path) and returns done=true so the caller continues. On a
+// transient failure it returns done=false with a requeue Result. The held source connection
+// is never torn down on failure (source thawed path, ADR-0132 R7), so retries are safe.
+func (r *PodMigrationReconciler) injectIPHandoff(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error, bool) {
+	log := logf.FromContext(ctx)
+
+	if pm.Spec.SourcePodIP == "" {
+		log.Info("injectIPHandoff: SourcePodIP empty — skipping IP handoff (service-path verification only)", "migration", pm.Name)
+		setCondition(pm, conditionIPHandoffInjected, metav1.ConditionFalse, "NoSourcePodIP",
+			"SourcePodIP not set; relying on Service/EndpointSlice path (ADR-0015)")
+		return ctrl.Result{}, nil, true
+	}
+
+	// Re-fetch the latest replVethMAC written by the NRI plugin via ReportRestoreConfirmed.
+	fresh := &pmv1.PodMigration{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(pm), fresh); err == nil {
+		pm.Status.ReplVethMAC = fresh.Status.ReplVethMAC
+	}
+	if pm.Status.ReplVethMAC == "" {
+		log.Info("injectIPHandoff: replVethMAC not yet present in status — requeuing (NRI plugin writeback pending)", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil, false
+	}
+
+	if r.AgentPool == nil {
+		log.Error(nil, "injectIPHandoff: AgentPool not wired — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil, false
+	}
+	destNode := pm.Status.DestinationNodeName
+	if destNode == "" {
+		destNode = pm.Spec.TargetNodeName
+	}
+	if destNode == "" {
+		log.Error(nil, "injectIPHandoff: DestinationNodeName not set — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil, false
+	}
+	destAgent, err := r.AgentPool.ForNode(ctx, destNode)
+	if err != nil {
+		log.Error(err, "injectIPHandoff: cannot connect to destination agent — requeuing", "migration", pm.Name, "node", destNode)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
+	}
+
+	fdbIfname := pm.Status.OverlayFdbIfname
+	if fdbIfname == "" {
+		fdbIfname = "flannel.1"
+	}
+
+	log.Info("injectIPHandoff: calling InjectIPHandoff on destination agent (ADR-0133 D2)",
+		"migration", pm.Name, "node", destNode, "oldPodIP", pm.Spec.SourcePodIP, "replVethMAC", pm.Status.ReplVethMAC)
+	resp, err := destAgent.InjectIPHandoff(ctx, &agentpb.InjectIPHandoffRequest{
+		MigrationName:  pm.Name,
+		OldPodIp:       pm.Spec.SourcePodIP,
+		ReplVethMac:    pm.Status.ReplVethMAC,
+		SrcNodeVtepMac: pm.Status.SourcePodMac, // diagnostic; source VTEP MAC cached if available
+		FdbIfname:      fdbIfname,
+		BridgeIfname:   "cni0",
+		Probe:          true,
+	})
+	if err != nil {
+		log.Error(err, "injectIPHandoff: InjectIPHandoff RPC failed — requeuing", "migration", pm.Name)
+		setCondition(pm, conditionIPHandoffInjected, metav1.ConditionFalse, "RPCFailed",
+			fmt.Sprintf("InjectIPHandoff RPC error: %v", err))
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr, false
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
+	}
+	if !resp.Injected {
+		log.Error(nil, "injectIPHandoff: InjectIPHandoff returned injected=false — requeuing",
+			"migration", pm.Name, "reason", resp.BlockingReason)
+		setCondition(pm, conditionIPHandoffInjected, metav1.ConditionFalse, "NotInjected",
+			fmt.Sprintf("InjectIPHandoff: %s", resp.BlockingReason))
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr, false
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
+	}
+
+	// Cache the destination VTEP MAC for diagnostics / forensic replay (ADR-0133 R8 nit).
+	if resp.DestVtepMac != "" {
+		log.Info("injectIPHandoff: destination VTEP MAC", "migration", pm.Name, "destVTEPMAC", resp.DestVtepMac)
+	}
+
+	// Decision 5: reachability probe gates TrafficVerified for the pinned pod-IP path.
+	if !resp.ProbeOk {
+		log.Info("injectIPHandoff: reachability probe to oldPodIP failed — requeuing (do not disarm, source held)",
+			"migration", pm.Name, "oldPodIP", pm.Spec.SourcePodIP, "probeOutput", resp.ProbeOutput)
+		setCondition(pm, conditionIPHandoffInjected, metav1.ConditionFalse, "ProbeFailed",
+			fmt.Sprintf("ping %s from destination node failed: %s", pm.Spec.SourcePodIP, resp.ProbeOutput))
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr, false
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
+	}
+
+	log.Info("injectIPHandoff: handoff injected and reachability probe passed (ADR-0133 AC1)",
+		"migration", pm.Name, "oldPodIP", pm.Spec.SourcePodIP)
+	setCondition(pm, conditionIPHandoffInjected, metav1.ConditionTrue, "Injected",
+		fmt.Sprintf("OLD pod IP %s reachable at replacement veth %s on %s; ping probe passed (ADR-0133 D2/D5)",
+			pm.Spec.SourcePodIP, pm.Status.ReplVethMAC, destNode))
+	// The L3 reachability of the OLD pod IP is proven — set TrafficVerified=True for the
+	// pinned-IP client. The Service-path verifier below remains a backstop but is now
+	// short-circuited because trafficVerified will read True on the next reconcile.
+	setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "TrafficVerified",
+		fmt.Sprintf("OLD pod IP %s reachable at replacement pod (ADR-0133 reachability probe)", pm.Spec.SourcePodIP))
+	return ctrl.Result{}, nil, true
+}
+
 func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -2399,8 +2512,27 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 	// ADR-0019: if verification fails AFTER handoff, warn only — do not rollback.
 	trafficVerified := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionTrafficVerified)
 	if !trafficVerified {
+		// ADR-0133 Decision 1: inject the OLD-pod-IP handoff on the DESTINATION node
+		// AFTER criuRestoreConfirmed (precondition of the Restoring→Verifying transition)
+		// and BEFORE TrafficVerified is set / source is disarmed/cleaned. The reachability
+		// probe (Decision 5) gates TrafficVerified for the directly-pinned pod-IP client;
+		// the service-path TrafficVerifier remains as the L4/Service backstop below.
+		if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
+			if res, err, done := r.injectIPHandoff(ctx, pm); !done {
+				return res, err
+			}
+			if err := r.statusUpdate(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
 		// Drive verification: call the TrafficVerifier and set the condition.
-		if r.TrafficVerifier != nil {
+		// Skip if the ADR-0133 reachability probe already set TrafficVerified=True
+		// (the OLD pod IP is reachable at the replacement — the strongest proof).
+		if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionTrafficVerified) {
+			log.Info("Verifying: TrafficVerified already set by ADR-0133 IP handoff probe — skipping service-path verifier",
+				"migration", pm.Name)
+		} else if r.TrafficVerifier != nil {
 			// Build verify request with correct pod names and IPs.
 			destPodName := pm.Status.ReplacementPodName
 			if destPodName == "" {
@@ -2516,6 +2648,40 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 	// If IsNotFound — already deleted, that is fine.
 
 	setCondition(pm, conditionSourcePodDeleted, metav1.ConditionTrue, "Deleted", "Source pod deleted post-TrafficVerified")
+
+	// ADR-0133 Decision 4: source-side cleanup. Now that TrafficVerified=True and the
+	// zero-window hold has been disarmed (reconcileDisengageHold), remove the stale
+	// ARP/neighbor entries for the OLD pod IP on the SOURCE node so it does not split-route
+	// or blackhole. Deferred to here (never before TrafficVerified) so the in-flight held
+	// connection survives the convergence window. Best-effort: warn-only on failure.
+	if pm.Spec.SourcePodIP != "" && r.AgentPool != nil {
+		srcNode := pm.Status.SourceNodeName
+		if srcNode != "" {
+			if srcAgent, agErr := r.AgentPool.ForNode(ctx, srcNode); agErr != nil {
+				log.Error(agErr, "ADR-0133 D4: cannot connect to source agent for IP handoff cleanup (warn-only)",
+					"migration", pm.Name, "node", srcNode)
+			} else {
+				fdbIfname := pm.Status.OverlayFdbIfname
+				if fdbIfname == "" {
+					fdbIfname = "flannel.1"
+				}
+				if cleanResp, cErr := srcAgent.CleanupSourceIPHandoff(ctx, &agentpb.CleanupSourceIPHandoffRequest{
+					MigrationName: pm.Name,
+					OldPodIp:      pm.Spec.SourcePodIP,
+					FdbIfname:     fdbIfname,
+					BridgeIfname:  "cni0",
+				}); cErr != nil {
+					log.Error(cErr, "ADR-0133 D4: CleanupSourceIPHandoff RPC failed (warn-only)", "migration", pm.Name)
+				} else if !cleanResp.Cleaned {
+					log.Info("ADR-0133 D4: CleanupSourceIPHandoff returned cleaned=false (warn-only)",
+						"migration", pm.Name, "reason", cleanResp.BlockingReason)
+				} else {
+					log.Info("ADR-0133 D4: source IP handoff cleaned on source node",
+						"migration", pm.Name, "node", srcNode, "oldPodIP", pm.Spec.SourcePodIP)
+				}
+			}
+		}
+	}
 
 	// ADR-0015 overlap-then-delete: now that TrafficVerified=True and source is deleted,
 	// remove the source pod IP from EndpointSlices. The destination IP was added in

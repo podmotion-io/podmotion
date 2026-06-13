@@ -133,6 +133,55 @@ func DiscoverVTEPMAC(ctx context.Context, flannelAnnotationJSON, ifName string) 
 	return iface.HardwareAddr, nil
 }
 
+// SetPodIPNeigh installs (RTM_NEWNEIGH, NLM_F_CREATE|NLM_F_REPLACE) an AF_INET
+// permanent neighbor entry mapping podIP -> lladdr on the named device (e.g. "cni0"
+// or "flannel.1"). This is the ADR-0133 Decision 2 destination-side handoff: it tells
+// the destination node's kernel that the OLD pod IP is reachable at the replacement
+// pod's veth MAC. Idempotent via NLM_F_REPLACE (ADR-0133 — `ip neigh replace`).
+func SetPodIPNeigh(ctx context.Context, ifName string, podIP net.IP, lladdr net.HardwareAddr) error {
+	log := logf.FromContext(ctx)
+	if podIP == nil || podIP.To4() == nil {
+		return fmt.Errorf("SetPodIPNeigh: podIP must be a valid IPv4 (got %v)", podIP)
+	}
+	if len(lladdr) == 0 {
+		return fmt.Errorf("SetPodIPNeigh: lladdr must not be empty")
+	}
+	ifindex, err := ifaceIndex(ifName)
+	if err != nil {
+		return fmt.Errorf("SetPodIPNeigh: %w", err)
+	}
+	if err := netlinkNeighSet(unix.AF_INET, ifindex, podIP.To4(), lladdr, nil,
+		unix.RTM_NEWNEIGH, unix.NLM_F_CREATE|unix.NLM_F_REPLACE); err != nil {
+		return fmt.Errorf("SetPodIPNeigh %s on %s: %w", podIP, ifName, err)
+	}
+	log.Info("neigh: RTM_NEWNEIGH AF_INET permanent (ADR-0133 handoff)", "ifName", ifName, "podIP", podIP, "lladdr", lladdr)
+	return nil
+}
+
+// DeletePodIPNeigh removes the AF_INET neighbor entry for podIP on the named device.
+// ENOENT is treated as success (idempotent — ADR-0133 Decision 4 source cleanup).
+func DeletePodIPNeigh(ctx context.Context, ifName string, podIP net.IP) error {
+	log := logf.FromContext(ctx)
+	if podIP == nil || podIP.To4() == nil {
+		return fmt.Errorf("DeletePodIPNeigh: podIP must be a valid IPv4 (got %v)", podIP)
+	}
+	ifindex, err := ifaceIndex(ifName)
+	if err != nil {
+		// Interface gone is not an error for cleanup.
+		if isEnoent(err) {
+			return nil
+		}
+		return fmt.Errorf("DeletePodIPNeigh: %w", err)
+	}
+	// lladdr is not required for delete; pass a zero MAC (NDA_DST is the key).
+	if err := netlinkNeighSet(unix.AF_INET, ifindex, podIP.To4(), net.HardwareAddr{0, 0, 0, 0, 0, 0}, nil,
+		unix.RTM_DELNEIGH, 0); err != nil && !isEnoent(err) {
+		return fmt.Errorf("DeletePodIPNeigh %s on %s: %w", podIP, ifName, err)
+	}
+	log.Info("neigh: RTM_DELNEIGH AF_INET (ADR-0133 source cleanup)", "ifName", ifName, "podIP", podIP)
+	return nil
+}
+
 // validateFDBEntry is defined in fdb_types.go (no build tag) so it is available
 // on all platforms including the fdb_stub.go (!linux) path.
 

@@ -2177,6 +2177,312 @@ func (x *DisarmZeroWindowResponse) GetHoldDurationMs() int64 {
 	return 0
 }
 
+// InjectIPHandoffRequest carries the inputs for the ADR-0133 D2 destination-side
+// neighbor/FDB injection. All inputs are node-internal (no attacker-supplied data).
+type InjectIPHandoffRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MigrationName string                 `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`
+	// old_pod_ip is the source pod's original IP (pm.Spec.SourcePodIP) that must become
+	// reachable at the replacement pod on this (destination) node.
+	OldPodIp string `protobuf:"bytes,2,opt,name=old_pod_ip,json=oldPodIp,proto3" json:"old_pod_ip,omitempty"`
+	// repl_veth_mac is the replacement pod's eth0 MAC inside the pod netns, collected by
+	// the NRI plugin at restore time and threaded through ReportRestoreConfirmed → CR status.
+	ReplVethMac string `protobuf:"bytes,3,opt,name=repl_veth_mac,json=replVethMac,proto3" json:"repl_veth_mac,omitempty"`
+	// src_node_vtep_mac is the source node's flannel.1 VTEP MAC (for diagnostics / FDB).
+	SrcNodeVtepMac string `protobuf:"bytes,4,opt,name=src_node_vtep_mac,json=srcNodeVtepMac,proto3" json:"src_node_vtep_mac,omitempty"`
+	// fdb_ifname is the overlay interface name (default "flannel.1").
+	FdbIfname string `protobuf:"bytes,5,opt,name=fdb_ifname,json=fdbIfname,proto3" json:"fdb_ifname,omitempty"`
+	// bridge_ifname is the local CNI bridge name (default "cni0").
+	BridgeIfname string `protobuf:"bytes,6,opt,name=bridge_ifname,json=bridgeIfname,proto3" json:"bridge_ifname,omitempty"`
+	// probe indicates the agent should run an in-node ICMP reachability probe to old_pod_ip
+	// after installing the entries (ADR-0133 Decision 5).
+	Probe         bool `protobuf:"varint,7,opt,name=probe,proto3" json:"probe,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InjectIPHandoffRequest) Reset() {
+	*x = InjectIPHandoffRequest{}
+	mi := &file_migration_agent_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InjectIPHandoffRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InjectIPHandoffRequest) ProtoMessage() {}
+
+func (x *InjectIPHandoffRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_migration_agent_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InjectIPHandoffRequest.ProtoReflect.Descriptor instead.
+func (*InjectIPHandoffRequest) Descriptor() ([]byte, []int) {
+	return file_migration_agent_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *InjectIPHandoffRequest) GetMigrationName() string {
+	if x != nil {
+		return x.MigrationName
+	}
+	return ""
+}
+
+func (x *InjectIPHandoffRequest) GetOldPodIp() string {
+	if x != nil {
+		return x.OldPodIp
+	}
+	return ""
+}
+
+func (x *InjectIPHandoffRequest) GetReplVethMac() string {
+	if x != nil {
+		return x.ReplVethMac
+	}
+	return ""
+}
+
+func (x *InjectIPHandoffRequest) GetSrcNodeVtepMac() string {
+	if x != nil {
+		return x.SrcNodeVtepMac
+	}
+	return ""
+}
+
+func (x *InjectIPHandoffRequest) GetFdbIfname() string {
+	if x != nil {
+		return x.FdbIfname
+	}
+	return ""
+}
+
+func (x *InjectIPHandoffRequest) GetBridgeIfname() string {
+	if x != nil {
+		return x.BridgeIfname
+	}
+	return ""
+}
+
+func (x *InjectIPHandoffRequest) GetProbe() bool {
+	if x != nil {
+		return x.Probe
+	}
+	return false
+}
+
+type InjectIPHandoffResponse struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Injected       bool                   `protobuf:"varint,1,opt,name=injected,proto3" json:"injected,omitempty"`
+	BlockingReason string                 `protobuf:"bytes,2,opt,name=blocking_reason,json=blockingReason,proto3" json:"blocking_reason,omitempty"`
+	// dest_vtep_mac is this node's flannel.1 VTEP MAC, returned so the operator can pass it
+	// to the source agent for FDB cleanup (ADR-0133 Decision 3/4).
+	DestVtepMac string `protobuf:"bytes,3,opt,name=dest_vtep_mac,json=destVtepMac,proto3" json:"dest_vtep_mac,omitempty"`
+	// probe_ok is the result of the in-node `ping -c1 -W2 old_pod_ip` reachability probe.
+	ProbeOk       bool   `protobuf:"varint,4,opt,name=probe_ok,json=probeOk,proto3" json:"probe_ok,omitempty"`
+	ProbeOutput   string `protobuf:"bytes,5,opt,name=probe_output,json=probeOutput,proto3" json:"probe_output,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InjectIPHandoffResponse) Reset() {
+	*x = InjectIPHandoffResponse{}
+	mi := &file_migration_agent_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InjectIPHandoffResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InjectIPHandoffResponse) ProtoMessage() {}
+
+func (x *InjectIPHandoffResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_migration_agent_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InjectIPHandoffResponse.ProtoReflect.Descriptor instead.
+func (*InjectIPHandoffResponse) Descriptor() ([]byte, []int) {
+	return file_migration_agent_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *InjectIPHandoffResponse) GetInjected() bool {
+	if x != nil {
+		return x.Injected
+	}
+	return false
+}
+
+func (x *InjectIPHandoffResponse) GetBlockingReason() string {
+	if x != nil {
+		return x.BlockingReason
+	}
+	return ""
+}
+
+func (x *InjectIPHandoffResponse) GetDestVtepMac() string {
+	if x != nil {
+		return x.DestVtepMac
+	}
+	return ""
+}
+
+func (x *InjectIPHandoffResponse) GetProbeOk() bool {
+	if x != nil {
+		return x.ProbeOk
+	}
+	return false
+}
+
+func (x *InjectIPHandoffResponse) GetProbeOutput() string {
+	if x != nil {
+		return x.ProbeOutput
+	}
+	return ""
+}
+
+// CleanupSourceIPHandoffRequest carries the inputs for ADR-0133 D4 source-side cleanup.
+type CleanupSourceIPHandoffRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MigrationName string                 `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`
+	// old_pod_ip is the source pod IP whose stale neighbor/FDB entries are to be removed.
+	OldPodIp string `protobuf:"bytes,2,opt,name=old_pod_ip,json=oldPodIp,proto3" json:"old_pod_ip,omitempty"`
+	// fdb_ifname is the overlay interface name (default "flannel.1").
+	FdbIfname string `protobuf:"bytes,3,opt,name=fdb_ifname,json=fdbIfname,proto3" json:"fdb_ifname,omitempty"`
+	// bridge_ifname is the local CNI bridge name (default "cni0").
+	BridgeIfname  string `protobuf:"bytes,4,opt,name=bridge_ifname,json=bridgeIfname,proto3" json:"bridge_ifname,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CleanupSourceIPHandoffRequest) Reset() {
+	*x = CleanupSourceIPHandoffRequest{}
+	mi := &file_migration_agent_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CleanupSourceIPHandoffRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CleanupSourceIPHandoffRequest) ProtoMessage() {}
+
+func (x *CleanupSourceIPHandoffRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_migration_agent_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CleanupSourceIPHandoffRequest.ProtoReflect.Descriptor instead.
+func (*CleanupSourceIPHandoffRequest) Descriptor() ([]byte, []int) {
+	return file_migration_agent_proto_rawDescGZIP(), []int{33}
+}
+
+func (x *CleanupSourceIPHandoffRequest) GetMigrationName() string {
+	if x != nil {
+		return x.MigrationName
+	}
+	return ""
+}
+
+func (x *CleanupSourceIPHandoffRequest) GetOldPodIp() string {
+	if x != nil {
+		return x.OldPodIp
+	}
+	return ""
+}
+
+func (x *CleanupSourceIPHandoffRequest) GetFdbIfname() string {
+	if x != nil {
+		return x.FdbIfname
+	}
+	return ""
+}
+
+func (x *CleanupSourceIPHandoffRequest) GetBridgeIfname() string {
+	if x != nil {
+		return x.BridgeIfname
+	}
+	return ""
+}
+
+type CleanupSourceIPHandoffResponse struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Cleaned        bool                   `protobuf:"varint,1,opt,name=cleaned,proto3" json:"cleaned,omitempty"`
+	BlockingReason string                 `protobuf:"bytes,2,opt,name=blocking_reason,json=blockingReason,proto3" json:"blocking_reason,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *CleanupSourceIPHandoffResponse) Reset() {
+	*x = CleanupSourceIPHandoffResponse{}
+	mi := &file_migration_agent_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CleanupSourceIPHandoffResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CleanupSourceIPHandoffResponse) ProtoMessage() {}
+
+func (x *CleanupSourceIPHandoffResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_migration_agent_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CleanupSourceIPHandoffResponse.ProtoReflect.Descriptor instead.
+func (*CleanupSourceIPHandoffResponse) Descriptor() ([]byte, []int) {
+	return file_migration_agent_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *CleanupSourceIPHandoffResponse) GetCleaned() bool {
+	if x != nil {
+		return x.Cleaned
+	}
+	return false
+}
+
+func (x *CleanupSourceIPHandoffResponse) GetBlockingReason() string {
+	if x != nil {
+		return x.BlockingReason
+	}
+	return ""
+}
+
 // VerifyTCPRequest asks the destination agent to read /proc/<pid>/net/tcp[6]
 // and compare 4-tuples + snd_nxt/rcv_nxt against source_seq_snapshots.
 type VerifyTCPRequest struct {
@@ -2195,7 +2501,7 @@ type VerifyTCPRequest struct {
 
 func (x *VerifyTCPRequest) Reset() {
 	*x = VerifyTCPRequest{}
-	mi := &file_migration_agent_proto_msgTypes[31]
+	mi := &file_migration_agent_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2207,7 +2513,7 @@ func (x *VerifyTCPRequest) String() string {
 func (*VerifyTCPRequest) ProtoMessage() {}
 
 func (x *VerifyTCPRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_migration_agent_proto_msgTypes[31]
+	mi := &file_migration_agent_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2220,7 +2526,7 @@ func (x *VerifyTCPRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyTCPRequest.ProtoReflect.Descriptor instead.
 func (*VerifyTCPRequest) Descriptor() ([]byte, []int) {
-	return file_migration_agent_proto_rawDescGZIP(), []int{31}
+	return file_migration_agent_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *VerifyTCPRequest) GetMigrationName() string {
@@ -2286,7 +2592,7 @@ type VerifyTCPResponse struct {
 
 func (x *VerifyTCPResponse) Reset() {
 	*x = VerifyTCPResponse{}
-	mi := &file_migration_agent_proto_msgTypes[32]
+	mi := &file_migration_agent_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2298,7 +2604,7 @@ func (x *VerifyTCPResponse) String() string {
 func (*VerifyTCPResponse) ProtoMessage() {}
 
 func (x *VerifyTCPResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_migration_agent_proto_msgTypes[32]
+	mi := &file_migration_agent_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2311,7 +2617,7 @@ func (x *VerifyTCPResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyTCPResponse.ProtoReflect.Descriptor instead.
 func (*VerifyTCPResponse) Descriptor() ([]byte, []int) {
-	return file_migration_agent_proto_rawDescGZIP(), []int{32}
+	return file_migration_agent_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *VerifyTCPResponse) GetVerified() bool {
@@ -2519,7 +2825,33 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\bdisarmed\x18\x01 \x01(\bR\bdisarmed\x12'\n" +
 	"\x0fblocking_reason\x18\x02 \x01(\tR\x0eblockingReason\x12$\n" +
 	"\x0edisarmed_at_ns\x18\x03 \x01(\x03R\fdisarmedAtNs\x12(\n" +
-	"\x10hold_duration_ms\x18\x04 \x01(\x03R\x0eholdDurationMs\"\xd6\x02\n" +
+	"\x10hold_duration_ms\x18\x04 \x01(\x03R\x0eholdDurationMs\"\x86\x02\n" +
+	"\x16InjectIPHandoffRequest\x12%\n" +
+	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12\x1c\n" +
+	"\n" +
+	"old_pod_ip\x18\x02 \x01(\tR\boldPodIp\x12\"\n" +
+	"\rrepl_veth_mac\x18\x03 \x01(\tR\vreplVethMac\x12)\n" +
+	"\x11src_node_vtep_mac\x18\x04 \x01(\tR\x0esrcNodeVtepMac\x12\x1d\n" +
+	"\n" +
+	"fdb_ifname\x18\x05 \x01(\tR\tfdbIfname\x12#\n" +
+	"\rbridge_ifname\x18\x06 \x01(\tR\fbridgeIfname\x12\x14\n" +
+	"\x05probe\x18\a \x01(\bR\x05probe\"\xc0\x01\n" +
+	"\x17InjectIPHandoffResponse\x12\x1a\n" +
+	"\binjected\x18\x01 \x01(\bR\binjected\x12'\n" +
+	"\x0fblocking_reason\x18\x02 \x01(\tR\x0eblockingReason\x12\"\n" +
+	"\rdest_vtep_mac\x18\x03 \x01(\tR\vdestVtepMac\x12\x19\n" +
+	"\bprobe_ok\x18\x04 \x01(\bR\aprobeOk\x12!\n" +
+	"\fprobe_output\x18\x05 \x01(\tR\vprobeOutput\"\xa8\x01\n" +
+	"\x1dCleanupSourceIPHandoffRequest\x12%\n" +
+	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12\x1c\n" +
+	"\n" +
+	"old_pod_ip\x18\x02 \x01(\tR\boldPodIp\x12\x1d\n" +
+	"\n" +
+	"fdb_ifname\x18\x03 \x01(\tR\tfdbIfname\x12#\n" +
+	"\rbridge_ifname\x18\x04 \x01(\tR\fbridgeIfname\"c\n" +
+	"\x1eCleanupSourceIPHandoffResponse\x12\x18\n" +
+	"\acleaned\x18\x01 \x01(\bR\acleaned\x12'\n" +
+	"\x0fblocking_reason\x18\x02 \x01(\tR\x0eblockingReason\"\xd6\x02\n" +
 	"\x10VerifyTCPRequest\x12%\n" +
 	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12\x17\n" +
 	"\apod_uid\x18\x02 \x01(\tR\x06podUid\x12Q\n" +
@@ -2540,7 +2872,7 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\x1aMIGRATION_MODE_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17MIGRATION_MODE_PRE_COPY\x10\x01\x12\x1c\n" +
 	"\x18MIGRATION_MODE_POST_COPY\x10\x02\x12\x17\n" +
-	"\x13MIGRATION_MODE_COLD\x10\x032\x96\r\n" +
+	"\x13MIGRATION_MODE_COLD\x10\x032\x83\x0f\n" +
 	"\x15MigrationAgentService\x12d\n" +
 	"\rPrepareSource\x12(.podmotion.agent.v1.PrepareSourceRequest\x1a).podmotion.agent.v1.PrepareSourceResponse\x12a\n" +
 	"\fPreDumpRound\x12'.podmotion.agent.v1.PreDumpRoundRequest\x1a(.podmotion.agent.v1.PreDumpRoundResponse\x12[\n" +
@@ -2557,7 +2889,9 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\x12EstimateCheckpoint\x12-.podmotion.agent.v1.EstimateCheckpointRequest\x1a..podmotion.agent.v1.EstimateCheckpointResponse\x12m\n" +
 	"\x10PutCheckpointTar\x12+.podmotion.agent.v1.PutCheckpointTarRequest\x1a,.podmotion.agent.v1.PutCheckpointTarResponse\x12m\n" +
 	"\x10GetCheckpointTar\x12+.podmotion.agent.v1.GetCheckpointTarRequest\x1a,.podmotion.agent.v1.GetCheckpointTarResponse\x12p\n" +
-	"\x11ReleaseCheckpoint\x12,.podmotion.agent.v1.ReleaseCheckpointRequest\x1a-.podmotion.agent.v1.ReleaseCheckpointResponse\x12X\n" +
+	"\x11ReleaseCheckpoint\x12,.podmotion.agent.v1.ReleaseCheckpointRequest\x1a-.podmotion.agent.v1.ReleaseCheckpointResponse\x12j\n" +
+	"\x0fInjectIPHandoff\x12*.podmotion.agent.v1.InjectIPHandoffRequest\x1a+.podmotion.agent.v1.InjectIPHandoffResponse\x12\x7f\n" +
+	"\x16CleanupSourceIPHandoff\x121.podmotion.agent.v1.CleanupSourceIPHandoffRequest\x1a2.podmotion.agent.v1.CleanupSourceIPHandoffResponse\x12X\n" +
 	"\tVerifyTCP\x12$.podmotion.agent.v1.VerifyTCPRequest\x1a%.podmotion.agent.v1.VerifyTCPResponseB5Z3github.com/podmotion-io/podmotion/proto/gen;agentpbb\x06proto3"
 
 var (
@@ -2573,7 +2907,7 @@ func file_migration_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_migration_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_migration_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 33)
+var file_migration_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 37)
 var file_migration_agent_proto_goTypes = []any{
 	(MigrationMode)(0),                      // 0: podmotion.agent.v1.MigrationMode
 	(*PrepareSourceRequest)(nil),            // 1: podmotion.agent.v1.PrepareSourceRequest
@@ -2607,8 +2941,12 @@ var file_migration_agent_proto_goTypes = []any{
 	(*ArmZeroWindowResponse)(nil),           // 29: podmotion.agent.v1.ArmZeroWindowResponse
 	(*DisarmZeroWindowRequest)(nil),         // 30: podmotion.agent.v1.DisarmZeroWindowRequest
 	(*DisarmZeroWindowResponse)(nil),        // 31: podmotion.agent.v1.DisarmZeroWindowResponse
-	(*VerifyTCPRequest)(nil),                // 32: podmotion.agent.v1.VerifyTCPRequest
-	(*VerifyTCPResponse)(nil),               // 33: podmotion.agent.v1.VerifyTCPResponse
+	(*InjectIPHandoffRequest)(nil),          // 32: podmotion.agent.v1.InjectIPHandoffRequest
+	(*InjectIPHandoffResponse)(nil),         // 33: podmotion.agent.v1.InjectIPHandoffResponse
+	(*CleanupSourceIPHandoffRequest)(nil),   // 34: podmotion.agent.v1.CleanupSourceIPHandoffRequest
+	(*CleanupSourceIPHandoffResponse)(nil),  // 35: podmotion.agent.v1.CleanupSourceIPHandoffResponse
+	(*VerifyTCPRequest)(nil),                // 36: podmotion.agent.v1.VerifyTCPRequest
+	(*VerifyTCPResponse)(nil),               // 37: podmotion.agent.v1.VerifyTCPResponse
 }
 var file_migration_agent_proto_depIdxs = []int32{
 	0,  // 0: podmotion.agent.v1.PrepareSourceRequest.mode:type_name -> podmotion.agent.v1.MigrationMode
@@ -2630,25 +2968,29 @@ var file_migration_agent_proto_depIdxs = []int32{
 	20, // 16: podmotion.agent.v1.MigrationAgentService.PutCheckpointTar:input_type -> podmotion.agent.v1.PutCheckpointTarRequest
 	22, // 17: podmotion.agent.v1.MigrationAgentService.GetCheckpointTar:input_type -> podmotion.agent.v1.GetCheckpointTarRequest
 	24, // 18: podmotion.agent.v1.MigrationAgentService.ReleaseCheckpoint:input_type -> podmotion.agent.v1.ReleaseCheckpointRequest
-	32, // 19: podmotion.agent.v1.MigrationAgentService.VerifyTCP:input_type -> podmotion.agent.v1.VerifyTCPRequest
-	2,  // 20: podmotion.agent.v1.MigrationAgentService.PrepareSource:output_type -> podmotion.agent.v1.PrepareSourceResponse
-	4,  // 21: podmotion.agent.v1.MigrationAgentService.PreDumpRound:output_type -> podmotion.agent.v1.PreDumpRoundResponse
-	6,  // 22: podmotion.agent.v1.MigrationAgentService.Checkpoint:output_type -> podmotion.agent.v1.CheckpointResponse
-	9,  // 23: podmotion.agent.v1.MigrationAgentService.PrepareDestination:output_type -> podmotion.agent.v1.PrepareDestinationResponse
-	13, // 24: podmotion.agent.v1.MigrationAgentService.Restore:output_type -> podmotion.agent.v1.RestoreResponse
-	15, // 25: podmotion.agent.v1.MigrationAgentService.Verify:output_type -> podmotion.agent.v1.VerifyResponse
-	11, // 26: podmotion.agent.v1.MigrationAgentService.PrepareDestinationNetns:output_type -> podmotion.agent.v1.PrepareDestinationNetnsResponse
-	27, // 27: podmotion.agent.v1.MigrationAgentService.ConfirmOverlayReady:output_type -> podmotion.agent.v1.ConfirmOverlayReadyResponse
-	29, // 28: podmotion.agent.v1.MigrationAgentService.ArmZeroWindow:output_type -> podmotion.agent.v1.ArmZeroWindowResponse
-	31, // 29: podmotion.agent.v1.MigrationAgentService.DisarmZeroWindow:output_type -> podmotion.agent.v1.DisarmZeroWindowResponse
-	17, // 30: podmotion.agent.v1.MigrationAgentService.Abort:output_type -> podmotion.agent.v1.AbortResponse
-	19, // 31: podmotion.agent.v1.MigrationAgentService.EstimateCheckpoint:output_type -> podmotion.agent.v1.EstimateCheckpointResponse
-	21, // 32: podmotion.agent.v1.MigrationAgentService.PutCheckpointTar:output_type -> podmotion.agent.v1.PutCheckpointTarResponse
-	23, // 33: podmotion.agent.v1.MigrationAgentService.GetCheckpointTar:output_type -> podmotion.agent.v1.GetCheckpointTarResponse
-	25, // 34: podmotion.agent.v1.MigrationAgentService.ReleaseCheckpoint:output_type -> podmotion.agent.v1.ReleaseCheckpointResponse
-	33, // 35: podmotion.agent.v1.MigrationAgentService.VerifyTCP:output_type -> podmotion.agent.v1.VerifyTCPResponse
-	20, // [20:36] is the sub-list for method output_type
-	4,  // [4:20] is the sub-list for method input_type
+	32, // 19: podmotion.agent.v1.MigrationAgentService.InjectIPHandoff:input_type -> podmotion.agent.v1.InjectIPHandoffRequest
+	34, // 20: podmotion.agent.v1.MigrationAgentService.CleanupSourceIPHandoff:input_type -> podmotion.agent.v1.CleanupSourceIPHandoffRequest
+	36, // 21: podmotion.agent.v1.MigrationAgentService.VerifyTCP:input_type -> podmotion.agent.v1.VerifyTCPRequest
+	2,  // 22: podmotion.agent.v1.MigrationAgentService.PrepareSource:output_type -> podmotion.agent.v1.PrepareSourceResponse
+	4,  // 23: podmotion.agent.v1.MigrationAgentService.PreDumpRound:output_type -> podmotion.agent.v1.PreDumpRoundResponse
+	6,  // 24: podmotion.agent.v1.MigrationAgentService.Checkpoint:output_type -> podmotion.agent.v1.CheckpointResponse
+	9,  // 25: podmotion.agent.v1.MigrationAgentService.PrepareDestination:output_type -> podmotion.agent.v1.PrepareDestinationResponse
+	13, // 26: podmotion.agent.v1.MigrationAgentService.Restore:output_type -> podmotion.agent.v1.RestoreResponse
+	15, // 27: podmotion.agent.v1.MigrationAgentService.Verify:output_type -> podmotion.agent.v1.VerifyResponse
+	11, // 28: podmotion.agent.v1.MigrationAgentService.PrepareDestinationNetns:output_type -> podmotion.agent.v1.PrepareDestinationNetnsResponse
+	27, // 29: podmotion.agent.v1.MigrationAgentService.ConfirmOverlayReady:output_type -> podmotion.agent.v1.ConfirmOverlayReadyResponse
+	29, // 30: podmotion.agent.v1.MigrationAgentService.ArmZeroWindow:output_type -> podmotion.agent.v1.ArmZeroWindowResponse
+	31, // 31: podmotion.agent.v1.MigrationAgentService.DisarmZeroWindow:output_type -> podmotion.agent.v1.DisarmZeroWindowResponse
+	17, // 32: podmotion.agent.v1.MigrationAgentService.Abort:output_type -> podmotion.agent.v1.AbortResponse
+	19, // 33: podmotion.agent.v1.MigrationAgentService.EstimateCheckpoint:output_type -> podmotion.agent.v1.EstimateCheckpointResponse
+	21, // 34: podmotion.agent.v1.MigrationAgentService.PutCheckpointTar:output_type -> podmotion.agent.v1.PutCheckpointTarResponse
+	23, // 35: podmotion.agent.v1.MigrationAgentService.GetCheckpointTar:output_type -> podmotion.agent.v1.GetCheckpointTarResponse
+	25, // 36: podmotion.agent.v1.MigrationAgentService.ReleaseCheckpoint:output_type -> podmotion.agent.v1.ReleaseCheckpointResponse
+	33, // 37: podmotion.agent.v1.MigrationAgentService.InjectIPHandoff:output_type -> podmotion.agent.v1.InjectIPHandoffResponse
+	35, // 38: podmotion.agent.v1.MigrationAgentService.CleanupSourceIPHandoff:output_type -> podmotion.agent.v1.CleanupSourceIPHandoffResponse
+	37, // 39: podmotion.agent.v1.MigrationAgentService.VerifyTCP:output_type -> podmotion.agent.v1.VerifyTCPResponse
+	22, // [22:40] is the sub-list for method output_type
+	4,  // [4:22] is the sub-list for method input_type
 	4,  // [4:4] is the sub-list for extension type_name
 	4,  // [4:4] is the sub-list for extension extendee
 	0,  // [0:4] is the sub-list for field type_name
@@ -2665,7 +3007,7 @@ func file_migration_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_migration_agent_proto_rawDesc), len(file_migration_agent_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   33,
+			NumMessages:   37,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

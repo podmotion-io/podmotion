@@ -459,6 +459,13 @@ spec:
                 - freezeDurationMs
                 - roundsCompleted
                 type: object
+              replVethMAC:
+                description: |-
+                  ReplVethMAC is the replacement pod's eth0 MAC address inside the pod netns,
+                  collected by the NRI plugin at restore time and threaded through
+                  ReportRestoreConfirmed. The controller passes it to InjectIPHandoff on the
+                  destination agent so the OLD pod IP resolves to the replacement veth (ADR-0133 D3).
+                type: string
               replacementPodName:
                 description: |-
                   ReplacementPodName is the name of the replacement pod created by the operator

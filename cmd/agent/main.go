@@ -181,7 +181,18 @@ func main() {
 			// cause the k8s patch to hit "context deadline exceeded".
 			reportCtx, reportCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer reportCancel()
-			if err := agentSrv.ReportRestoreConfirmed(reportCtx, checkpointRef, migrationNamespace, int32(pid)); err != nil {
+			// ADR-0133 D3: collect the replacement pod's eth0 MAC inside the restored
+			// process's netns so the operator can install the destination IP handoff for
+			// the OLD pod IP. Best-effort: log on failure, the operator has a fallback.
+			replVethMAC, macErr := server.ReadReplVethMAC(pid)
+			if macErr != nil {
+				log.Error(macErr, "NRI CRIU restore: could not read replacement pod eth0 MAC (ADR-0133) — operator will fall back to diagnostic exec",
+					"migration", checkpointRef, "restoredPID", pid)
+			} else {
+				log.Info("NRI CRIU restore: collected replacement pod eth0 MAC (ADR-0133)",
+					"migration", checkpointRef, "replVethMAC", replVethMAC)
+			}
+			if err := agentSrv.ReportRestoreConfirmed(reportCtx, checkpointRef, migrationNamespace, int32(pid), replVethMAC); err != nil {
 				log.Error(err, "NRI CRIU restore: failed to report confirmation to CR — controller poll will time out",
 					"migration", checkpointRef, "namespace", migrationNamespace)
 				return err

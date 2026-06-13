@@ -53,6 +53,17 @@ service MigrationAgentService {
   // pm.Status.CheckpointTransferred has been durably persisted. Idempotent: returns
   // success if the directory is already absent (handles controller-restart replay).
   rpc ReleaseCheckpoint(ReleaseCheckpointRequest) returns (ReleaseCheckpointResponse);
+  // InjectIPHandoff installs neighbor/FDB entries on the DESTINATION node so the OLD
+  // pod IP becomes reachable at the replacement pod's veth MAC (ADR-0133 Decision 2).
+  // Called by the controller in reconcileVerifying after criuRestoreConfirmed=true and
+  // before DisarmZeroWindow. Idempotent (RTM_NEWNEIGH NLM_F_REPLACE). The response
+  // returns the destination node's VTEP MAC and an in-node reachability probe result.
+  rpc InjectIPHandoff(InjectIPHandoffRequest) returns (InjectIPHandoffResponse);
+  // CleanupSourceIPHandoff removes the stale ARP/neighbor and FDB entries for the OLD
+  // pod IP on the SOURCE node after traffic has moved to the replacement (ADR-0133
+  // Decision 4). Deferred until after TrafficVerified=True and DisarmZeroWindow.
+  // Idempotent: ENOENT is treated as success.
+  rpc CleanupSourceIPHandoff(CleanupSourceIPHandoffRequest) returns (CleanupSourceIPHandoffResponse);
   // VerifyTCP reads /proc/<pid>/net/tcp[6] on the destination node post-restore and
   // compares each ESTABLISHED 4-tuple's snd_nxt/rcv_nxt against the source SeqSnapshots
   // captured at freeze. Returns verified=true only when all connections match within
@@ -297,6 +308,52 @@ message DisarmZeroWindowResponse {
   string blocking_reason = 2; // set if disarmed=false
   int64  disarmed_at_ns  = 3; // CLOCK_REALTIME ns when TC filter was detached
   int64  hold_duration_ms = 4; // wall time from arm to disarm
+}
+
+// InjectIPHandoffRequest carries the inputs for the ADR-0133 D2 destination-side
+// neighbor/FDB injection. All inputs are node-internal (no attacker-supplied data).
+message InjectIPHandoffRequest {
+  string migration_name   = 1;
+  // old_pod_ip is the source pod's original IP (pm.Spec.SourcePodIP) that must become
+  // reachable at the replacement pod on this (destination) node.
+  string old_pod_ip       = 2;
+  // repl_veth_mac is the replacement pod's eth0 MAC inside the pod netns, collected by
+  // the NRI plugin at restore time and threaded through ReportRestoreConfirmed → CR status.
+  string repl_veth_mac    = 3;
+  // src_node_vtep_mac is the source node's flannel.1 VTEP MAC (for diagnostics / FDB).
+  string src_node_vtep_mac = 4;
+  // fdb_ifname is the overlay interface name (default "flannel.1").
+  string fdb_ifname       = 5;
+  // bridge_ifname is the local CNI bridge name (default "cni0").
+  string bridge_ifname    = 6;
+  // probe indicates the agent should run an in-node ICMP reachability probe to old_pod_ip
+  // after installing the entries (ADR-0133 Decision 5).
+  bool   probe            = 7;
+}
+message InjectIPHandoffResponse {
+  bool   injected         = 1;
+  string blocking_reason  = 2;
+  // dest_vtep_mac is this node's flannel.1 VTEP MAC, returned so the operator can pass it
+  // to the source agent for FDB cleanup (ADR-0133 Decision 3/4).
+  string dest_vtep_mac    = 3;
+  // probe_ok is the result of the in-node `ping -c1 -W2 old_pod_ip` reachability probe.
+  bool   probe_ok         = 4;
+  string probe_output     = 5;
+}
+
+// CleanupSourceIPHandoffRequest carries the inputs for ADR-0133 D4 source-side cleanup.
+message CleanupSourceIPHandoffRequest {
+  string migration_name   = 1;
+  // old_pod_ip is the source pod IP whose stale neighbor/FDB entries are to be removed.
+  string old_pod_ip       = 2;
+  // fdb_ifname is the overlay interface name (default "flannel.1").
+  string fdb_ifname       = 3;
+  // bridge_ifname is the local CNI bridge name (default "cni0").
+  string bridge_ifname    = 4;
+}
+message CleanupSourceIPHandoffResponse {
+  bool   cleaned          = 1;
+  string blocking_reason  = 2;
 }
 
 enum MigrationMode {
