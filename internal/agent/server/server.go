@@ -368,24 +368,23 @@ func (s *AgentServer) CleanupSourceIPHandoff(ctx context.Context, req *agentpb.C
 		fdbIf = "flannel.1"
 	}
 
+	// ADR-0136 correction: D4 cleanup must remove ONLY the stale LOCAL-bridge (cni0) entry
+	// for the OLD pod IP. It must NOT touch the flannel.1 entries, because on the source node
+	// those flannel.1 entries (/32 route + AF_INET neigh oldIP->replVethMAC + AF_BRIDGE FDB
+	// replVethMAC->destNodeIP) are the live VXLAN redirect installed by InjectSourceRedirect —
+	// they are what keeps the relocated OLD IP reachable from a source-co-resident client.
+	// Deleting the flannel.1 neigh here (as the original ADR-0133 D4 did) tore down the
+	// redirect in the same reconcile pass and re-blackholed the IP (Sprint 26 AC2 first run).
+	// The flannel.1 redirect is retired separately when the IP is reclaimed by IPAM; for the
+	// PoC it persists for the life of the replacement pod. cni0 cleanup remains idempotent.
+	_ = fdbIf
 	var firstErr error
 	if err := network.DeletePodIPNeigh(ctx, bridgeIf, oldIP); err != nil {
 		firstErr = err
 	}
-	if err := network.DeletePodIPNeigh(ctx, fdbIf, oldIP); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	// ADR-0135: remove the /32 host route installed on the destination handoff. On the
-	// SOURCE node this is a no-op (no such route), which is fine — idempotent cleanup.
+	// ADR-0135: remove any /32 host route on the LOCAL bridge (cni0). On the source node this
+	// is a no-op (the redirect route is on flannel.1, deliberately left intact). Idempotent.
 	if err := network.DeletePodIPHostRoute(ctx, bridgeIf, oldIP); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	// ADR-0136: remove the SOURCE-node VXLAN redirect installed by InjectSourceRedirect —
-	// the /32 route on flannel.1 (so oldPodIP no longer blackholes over a dead overlay path
-	// after the IP is reclaimed by IPAM). The AF_BRIDGE FDB / AF_INET neigh on flannel.1 are
-	// removed by the DeletePodIPNeigh(fdbIf) above; the FDB (keyed on the replacement MAC)
-	// ages out with the overlay. Idempotent: no such route on a node that never redirected.
-	if err := network.DeletePodIPHostRoute(ctx, fdbIf, oldIP); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if firstErr != nil {
@@ -393,7 +392,7 @@ func (s *AgentServer) CleanupSourceIPHandoff(ctx context.Context, req *agentpb.C
 			BlockingReason: firstErr.Error()}, nil
 	}
 
-	log.Info("CleanupSourceIPHandoff: stale neigh removed (ADR-0133 D4 + ADR-0136 redirect)", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+	log.Info("CleanupSourceIPHandoff: stale cni0 entry removed; flannel.1 redirect preserved (ADR-0133 D4 + ADR-0136)", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 	return &agentpb.CleanupSourceIPHandoffResponse{Cleaned: true}, nil
 }
 
