@@ -5,17 +5,19 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 */
 
+//go:build linux
+
 package network
 
 import (
-	"bufio"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
-	"os/exec"
-	"strconv"
-	"strings"
+	"syscall"
+	"unsafe"
 
+	"golang.org/x/sys/unix"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -27,10 +29,10 @@ import (
 // expects. Without import the first response packet from the restored pod triggers
 // an RST because the kernel has no matching conntrack entry.
 type ConntrackEntry struct {
-	// Protocol is the L4 protocol name as returned by conntrack: "tcp", "udp", "icmp".
-	Protocol string
-	// Layer3Proto is the network layer protocol: "ipv4" or "ipv6".
-	Layer3Proto string
+	// Protocol is the L4 protocol number (e.g. syscall.IPPROTO_TCP).
+	Protocol uint8
+	// Layer3Proto is the AF family: unix.AF_INET or unix.AF_INET6.
+	Layer3Proto uint8
 
 	// SrcIP / DstIP are the original direction tuple.
 	SrcIP  net.IP
@@ -38,8 +40,8 @@ type ConntrackEntry struct {
 	SrcPort uint16
 	DstPort uint16
 
-	// State is the conntrack state string (e.g. "ESTABLISHED", "SYN_SENT").
-	State string
+	// State is the conntrack TCP state (CTA_PROTO_INFO TCP_CONNTRACK_*).
+	State uint8
 
 	// TCPSeqAdj and TCPAckAdj are the sequence adjustment values maintained by
 	// conntrack for NAT. Zero for non-NATed flows.
@@ -70,7 +72,7 @@ type ConntrackExportOptions struct {
 	// recommended in production; useful for tests).
 	PodIP string
 
-	// IncludeIPVS also queries the IPVS connection table when kube-proxy runs in
+	// IncludeIPVS also reads the IPVS connection table when kube-proxy runs in
 	// IPVS mode. Entries are tagged with IsIPVS=true.
 	IncludeIPVS bool
 
@@ -78,11 +80,50 @@ type ConntrackExportOptions struct {
 	MaxEntries int
 }
 
+// Netlink / nfnetlink constants (NFNL_SUBSYS_CTNETLINK).
+const (
+	nfnlSubsysCtnetlink = 1
+	ipctnlMsgCtGet      = 1
+
+	// Attribute type numbers used in the nfnetlink conntrack protocol.
+	ctaTupleOrig  = 1
+	ctaTupleReply = 2
+	ctaStatus     = 3
+	ctaProtoinfo  = 4
+	ctaTimeout    = 7
+	ctaMark       = 8
+	ctaZone       = 18
+
+	ctaTupleIP    = 1
+	ctaTupleProto = 2
+
+	ctaIPv4Src = 1
+	ctaIPv4Dst = 2
+	ctaIPv6Src = 3
+	ctaIPv6Dst = 4
+
+	ctaProtoNum     = 1
+	ctaProtoSrcPort = 2
+	ctaProtoDstPort = 3
+
+	ctaProtoinfoTCP      = 1
+	ctaProtoinfoTCPState = 1
+
+	nlaHdrLen = 4 // sizeof(nlattr): type(2) + len(2)
+)
+
+// nfnlHdr is the fixed header that follows the netlink header in nfnetlink messages.
+// Layout: family(1) version(1) res_id(2).
+type nfnlHdr struct {
+	Family  uint8
+	Version uint8
+	ResID   uint16
+}
+
 // ExportConntrack captures the conntrack table entries at freeze time for a pod.
 //
-// It reads the kernel conntrack table via `conntrack -L` and, when IncludeIPVS is
-// true, also reads the IPVS connection table via `ipvsadm -Lnc`. Both tools are
-// invoked as subprocesses — custom parsing, no external conntrack packages.
+// Export uses pure netlink via NFNL_SUBSYS_CTNETLINK (IPCTNL_MSG_CT_GET dump),
+// as required by ADR-0108 §2. No external tool dependency.
 //
 // Call this immediately after CRIU freeze while the pod's network namespace is
 // still active. The returned entries must be passed to ImportConntrack on the
@@ -90,298 +131,490 @@ type ConntrackExportOptions struct {
 func ExportConntrack(ctx context.Context, opts ConntrackExportOptions) ([]ConntrackEntry, error) {
 	log := logf.FromContext(ctx)
 
-	entries, err := readConntrackTable(ctx, opts.PodIP)
+	entries4, err := dumpConntrackFamily(ctx, unix.AF_INET)
 	if err != nil {
-		return nil, fmt.Errorf("ExportConntrack: conntrack table: %w", err)
+		return nil, fmt.Errorf("ExportConntrack: IPv4 dump: %w", err)
+	}
+	entries6, err := dumpConntrackFamily(ctx, unix.AF_INET6)
+	if err != nil {
+		// IPv6 may not be configured; non-fatal.
+		log.Info("ExportConntrack: IPv6 dump unavailable (non-fatal)", "err", err)
 	}
 
+	all := append(entries4, entries6...)
+
 	if opts.IncludeIPVS {
-		ipvsEntries, err := readIPVSTable(ctx, opts.PodIP)
+		ipvsEntries, err := readIPVSConnections(ctx, opts.PodIP)
 		if err != nil {
-			// IPVS may not be loaded; log and continue rather than hard-fail.
-			log.Info("ExportConntrack: IPVS table unavailable (non-fatal)", "err", err)
+			log.Info("ExportConntrack: IPVS read unavailable (non-fatal)", "err", err)
 		} else {
-			entries = append(entries, ipvsEntries...)
+			all = append(all, ipvsEntries...)
 		}
 	}
 
-	if opts.MaxEntries > 0 && len(entries) > opts.MaxEntries {
-		entries = entries[:opts.MaxEntries]
+	// Filter by pod IP if specified.
+	var filtered []ConntrackEntry
+	for _, e := range all {
+		if opts.PodIP != "" && !entryMatchesPodIP(e, opts.PodIP) {
+			continue
+		}
+		filtered = append(filtered, e)
 	}
 
-	log.Info("ExportConntrack: captured entries", "count", len(entries), "podIP", opts.PodIP)
+	if opts.MaxEntries > 0 && len(filtered) > opts.MaxEntries {
+		filtered = filtered[:opts.MaxEntries]
+	}
+
+	log.Info("ExportConntrack: captured entries", "count", len(filtered), "podIP", opts.PodIP)
+	return filtered, nil
+}
+
+// dumpConntrackFamily sends a NFNL_SUBSYS_CTNETLINK IPCTNL_MSG_CT_GET dump
+// request for the given address family and parses all returned entries.
+func dumpConntrackFamily(ctx context.Context, family uint8) ([]ConntrackEntry, error) {
+	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_NETFILTER)
+	if err != nil {
+		return nil, fmt.Errorf("netlink socket: %w", err)
+	}
+	defer unix.Close(fd)
+
+	addr := &unix.SockaddrNetlink{Family: unix.AF_NETLINK, Pid: 0, Groups: 0}
+	if err := unix.Bind(fd, addr); err != nil {
+		return nil, fmt.Errorf("netlink bind: %w", err)
+	}
+
+	// Build the NFNL dump request.
+	// nlmsghdr(16) + nfnlHdr(4) = 20 bytes minimum.
+	msgType := uint16(nfnlSubsysCtnetlink<<8) | ipctnlMsgCtGet
+	nlh := unix.NlMsghdr{
+		Len:   uint32(unix.SizeofNlMsghdr + 4),
+		Type:  msgType,
+		Flags: unix.NLM_F_REQUEST | unix.NLM_F_DUMP,
+		Seq:   1,
+		Pid:   0,
+	}
+	nfh := nfnlHdr{Family: family, Version: 0, ResID: 0}
+
+	buf := make([]byte, unix.SizeofNlMsghdr+4)
+	nlhBytes := (*[unix.SizeofNlMsghdr]byte)(unsafe.Pointer(&nlh))[:]
+	copy(buf, nlhBytes)
+	buf[unix.SizeofNlMsghdr+0] = nfh.Family
+	buf[unix.SizeofNlMsghdr+1] = nfh.Version
+	binary.BigEndian.PutUint16(buf[unix.SizeofNlMsghdr+2:], nfh.ResID)
+
+	_, err = unix.Write(fd, buf)
+	if err != nil {
+		return nil, fmt.Errorf("netlink write: %w", err)
+	}
+
+	var entries []ConntrackEntry
+	recvBuf := make([]byte, 1<<20) // 1 MiB receive buffer
+
+	for {
+		// Check context cancellation before each receive.
+		select {
+		case <-ctx.Done():
+			return entries, ctx.Err()
+		default:
+		}
+
+		n, err := unix.Read(fd, recvBuf)
+		if err != nil {
+			return nil, fmt.Errorf("netlink read: %w", err)
+		}
+
+		msgs, err := syscall.ParseNetlinkMessage(recvBuf[:n])
+		if err != nil {
+			return nil, fmt.Errorf("netlink parse: %w", err)
+		}
+
+		done := false
+		for _, msg := range msgs {
+			if msg.Header.Type == unix.NLMSG_DONE || msg.Header.Type == unix.NLMSG_ERROR {
+				done = true
+				break
+			}
+			entry, ok, parseErr := parseCtNetlinkMsg(msg.Data, family)
+			if parseErr != nil || !ok {
+				continue
+			}
+			entries = append(entries, entry)
+		}
+		if done {
+			break
+		}
+	}
+
 	return entries, nil
 }
 
-// readConntrackTable runs `conntrack -L` and parses its output.
-// When podIP is non-empty, only entries matching that IP are returned.
-func readConntrackTable(ctx context.Context, podIP string) ([]ConntrackEntry, error) {
-	args := []string{"-L", "--output", "extended"}
-	if podIP != "" {
-		args = append(args, "--orig-src", podIP)
+// parseCtNetlinkMsg decodes a single nfnetlink conntrack message into a ConntrackEntry.
+// The message Data starts with the nfnlHdr (4 bytes) followed by nested NLATTRs.
+func parseCtNetlinkMsg(data []byte, family uint8) (ConntrackEntry, bool, error) {
+	if len(data) < 4 {
+		return ConntrackEntry{}, false, nil
 	}
+	// Skip nfnlHdr (4 bytes).
+	data = data[4:]
 
-	cmd := exec.CommandContext(ctx, "conntrack", args...)
-	out, err := cmd.Output()
-	if err != nil {
-		// conntrack exits non-zero when the table is empty; treat that as empty.
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			stderr := string(exitErr.Stderr)
-			if strings.Contains(stderr, "0 flow entries") ||
-				strings.Contains(stderr, "Can't open") {
-				return nil, fmt.Errorf("conntrack: %s", stderr)
-			}
-			// Non-zero exit with output = possible "0 entries" case; parse what we got.
-			if len(out) == 0 {
-				return nil, nil
-			}
-		} else {
-			return nil, fmt.Errorf("conntrack -L: %w", err)
+	var e ConntrackEntry
+	e.Layer3Proto = family
+
+	for len(data) >= nlaHdrLen {
+		nlaLen := int(binary.LittleEndian.Uint16(data[0:2]))
+		nlaType := int(binary.LittleEndian.Uint16(data[2:4])) & 0x1FFF // mask nested flag
+		if nlaLen < nlaHdrLen || nlaLen > len(data) {
+			break
 		}
+		payload := data[nlaHdrLen:nlaLen]
+
+		switch nlaType {
+		case ctaTupleOrig:
+			parseTuple(payload, &e.SrcIP, &e.DstIP, &e.SrcPort, &e.DstPort, &e.Protocol, family)
+		case ctaTupleReply:
+			parseTuple(payload, &e.ReplySrcIP, &e.ReplyDstIP, &e.ReplySrcPort, &e.ReplyDstPort, nil, family)
+		case ctaMark:
+			if len(payload) == 4 {
+				e.Mark = binary.BigEndian.Uint32(payload)
+			}
+		case ctaZone:
+			if len(payload) == 2 {
+				e.Zone = binary.BigEndian.Uint16(payload)
+			}
+		case ctaProtoinfo:
+			parseProtoinfo(payload, &e.State)
+		}
+
+		// Advance with 4-byte alignment.
+		aligned := (nlaLen + 3) & ^3
+		if aligned > len(data) {
+			break
+		}
+		data = data[aligned:]
 	}
 
-	return parseConntrackOutput(string(out), podIP)
+	if e.SrcIP == nil || e.DstIP == nil {
+		return ConntrackEntry{}, false, nil
+	}
+	return e, true, nil
 }
 
-// parseConntrackOutput parses the text output of `conntrack -L --output extended`.
-// Each line represents one flow entry. The extended output format is:
-//
-//	<proto> <proto_num> <timeout> [state] src=X dst=Y sport=P dport=Q \
-//	    packets=N bytes=M src=X' dst=Y' sport=P' dport=Q' ... [mark=M] [zone=Z]
-//
-// podIP is used for secondary filtering in case --orig-src is not supported.
-func parseConntrackOutput(output, podIP string) ([]ConntrackEntry, error) {
+// parseTuple decodes a CTA_TUPLE_* nested attribute into IP/port fields.
+func parseTuple(data []byte, srcIP, dstIP *net.IP, srcPort, dstPort *uint16, proto *uint8, family uint8) {
+	for len(data) >= nlaHdrLen {
+		nlaLen := int(binary.LittleEndian.Uint16(data[0:2]))
+		nlaType := int(binary.LittleEndian.Uint16(data[2:4])) & 0x1FFF
+		if nlaLen < nlaHdrLen || nlaLen > len(data) {
+			break
+		}
+		payload := data[nlaHdrLen:nlaLen]
+
+		switch nlaType {
+		case ctaTupleIP:
+			parseIPTuple(payload, srcIP, dstIP, family)
+		case ctaTupleProto:
+			parseProtoTuple(payload, srcPort, dstPort, proto)
+		}
+		aligned := (nlaLen + 3) & ^3
+		if aligned > len(data) {
+			break
+		}
+		data = data[aligned:]
+	}
+}
+
+// parseIPTuple decodes a CTA_TUPLE_IP nested attribute.
+func parseIPTuple(data []byte, srcIP, dstIP *net.IP, family uint8) {
+	for len(data) >= nlaHdrLen {
+		nlaLen := int(binary.LittleEndian.Uint16(data[0:2]))
+		nlaType := int(binary.LittleEndian.Uint16(data[2:4])) & 0x1FFF
+		if nlaLen < nlaHdrLen || nlaLen > len(data) {
+			break
+		}
+		payload := data[nlaHdrLen:nlaLen]
+
+		switch {
+		case (nlaType == ctaIPv4Src) && family == unix.AF_INET && len(payload) == 4:
+			ip := make(net.IP, 4)
+			copy(ip, payload)
+			*srcIP = ip
+		case (nlaType == ctaIPv4Dst) && family == unix.AF_INET && len(payload) == 4:
+			ip := make(net.IP, 4)
+			copy(ip, payload)
+			*dstIP = ip
+		case (nlaType == ctaIPv6Src) && family == unix.AF_INET6 && len(payload) == 16:
+			ip := make(net.IP, 16)
+			copy(ip, payload)
+			*srcIP = ip
+		case (nlaType == ctaIPv6Dst) && family == unix.AF_INET6 && len(payload) == 16:
+			ip := make(net.IP, 16)
+			copy(ip, payload)
+			*dstIP = ip
+		}
+		aligned := (nlaLen + 3) & ^3
+		if aligned > len(data) {
+			break
+		}
+		data = data[aligned:]
+	}
+}
+
+// parseProtoTuple decodes a CTA_TUPLE_PROTO nested attribute.
+func parseProtoTuple(data []byte, srcPort, dstPort *uint16, proto *uint8) {
+	for len(data) >= nlaHdrLen {
+		nlaLen := int(binary.LittleEndian.Uint16(data[0:2]))
+		nlaType := int(binary.LittleEndian.Uint16(data[2:4])) & 0x1FFF
+		if nlaLen < nlaHdrLen || nlaLen > len(data) {
+			break
+		}
+		payload := data[nlaHdrLen:nlaLen]
+
+		switch nlaType {
+		case ctaProtoNum:
+			if len(payload) == 1 && proto != nil {
+				*proto = payload[0]
+			}
+		case ctaProtoSrcPort:
+			if len(payload) == 2 {
+				*srcPort = binary.BigEndian.Uint16(payload)
+			}
+		case ctaProtoDstPort:
+			if len(payload) == 2 {
+				*dstPort = binary.BigEndian.Uint16(payload)
+			}
+		}
+		aligned := (nlaLen + 3) & ^3
+		if aligned > len(data) {
+			break
+		}
+		data = data[aligned:]
+	}
+}
+
+// parseProtoinfo decodes the CTA_PROTOINFO nested attribute to extract TCP state.
+func parseProtoinfo(data []byte, state *uint8) {
+	// CTA_PROTOINFO → CTA_PROTOINFO_TCP → CTA_PROTOINFO_TCP_STATE (1 byte).
+	for len(data) >= nlaHdrLen {
+		nlaLen := int(binary.LittleEndian.Uint16(data[0:2]))
+		nlaType := int(binary.LittleEndian.Uint16(data[2:4])) & 0x1FFF
+		if nlaLen < nlaHdrLen || nlaLen > len(data) {
+			break
+		}
+		payload := data[nlaHdrLen:nlaLen]
+		if nlaType == ctaProtoinfoTCP {
+			// Nested: look for TCP_STATE.
+			for len(payload) >= nlaHdrLen {
+				innerLen := int(binary.LittleEndian.Uint16(payload[0:2]))
+				innerType := int(binary.LittleEndian.Uint16(payload[2:4])) & 0x1FFF
+				if innerLen < nlaHdrLen || innerLen > len(payload) {
+					break
+				}
+				innerPayload := payload[nlaHdrLen:innerLen]
+				if innerType == ctaProtoinfoTCPState && len(innerPayload) == 1 {
+					*state = innerPayload[0]
+				}
+				innerAligned := (innerLen + 3) & ^3
+				if innerAligned > len(payload) {
+					break
+				}
+				payload = payload[innerAligned:]
+			}
+		}
+		aligned := (nlaLen + 3) & ^3
+		if aligned > len(data) {
+			break
+		}
+		data = data[aligned:]
+	}
+}
+
+// readIPVSConnections reads the IPVS connection table from /proc/net/ip_vs_conn.
+// This file is a standard Linux kernel procfs interface requiring no external tools.
+// Entries are tagged with IsIPVS=true.
+func readIPVSConnections(ctx context.Context, podIP string) ([]ConntrackEntry, error) {
+	const procPath = "/proc/net/ip_vs_conn"
+	data, err := unix.Open(procPath, unix.O_RDONLY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("readIPVSConnections: open %s: %w", procPath, err)
+	}
+	defer unix.Close(data)
+
+	var buf [1 << 16]byte
+	var content []byte
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		n, err := unix.Read(data, buf[:])
+		if n > 0 {
+			content = append(content, buf[:n]...)
+		}
+		if err != nil || n == 0 {
+			break
+		}
+	}
+	return parseIPVSProcOutput(string(content), podIP), nil
+}
+
+// parseIPVSProcOutput parses /proc/net/ip_vs_conn.
+// Format (after header): Pro FromIP FPrt ToIP TPrt DestIP DPrt State
+// All IPs are hex-encoded big-endian 32-bit values.
+func parseIPVSProcOutput(content, podIP string) []ConntrackEntry {
 	var entries []ConntrackEntry
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
+	lines := splitLines(content)
+	for i, line := range lines {
+		if i == 0 || line == "" {
+			continue // skip header
 		}
-		entry, ok, err := parseConntrackLine(line)
-		if err != nil {
-			// Malformed lines are skipped; migration must not block on a single bad line.
-			continue
-		}
+		e, ok := parseIPVSProcLine(line)
 		if !ok {
 			continue
 		}
-		if podIP != "" && !entryMatchesPodIP(entry, podIP) {
+		if podIP != "" && !entryMatchesPodIP(e, podIP) {
 			continue
 		}
-		entries = append(entries, entry)
+		entries = append(entries, e)
 	}
-	return entries, scanner.Err()
+	return entries
 }
 
-// parseConntrackLine parses a single conntrack output line.
-// Returns (entry, true, nil) on success, (zero, false, nil) for skipped lines.
-func parseConntrackLine(line string) (ConntrackEntry, bool, error) {
-	fields := strings.Fields(line)
-	if len(fields) < 4 {
-		return ConntrackEntry{}, false, nil
+// parseIPVSProcLine parses one line from /proc/net/ip_vs_conn.
+func parseIPVSProcLine(line string) (ConntrackEntry, bool) {
+	// Fields: Pro  FromIP  FPrt  ToIP  TPrt  DestIP  DPrt  State
+	fields := splitFields(line)
+	if len(fields) < 8 {
+		return ConntrackEntry{}, false
+	}
+	var e ConntrackEntry
+	e.IsIPVS = true
+
+	// Protocol
+	switch fields[0] {
+	case "TCP":
+		e.Protocol = syscall.IPPROTO_TCP
+	case "UDP":
+		e.Protocol = syscall.IPPROTO_UDP
+	default:
+		return ConntrackEntry{}, false
 	}
 
-	var entry ConntrackEntry
-
-	// Field 0: proto (tcp, udp, icmp, ipv6-icmp, …)
-	entry.Protocol = fields[0]
-
-	// Determine L3 proto from presence of IPv6 addresses later; default ipv4.
-	entry.Layer3Proto = "ipv4"
-
-	// Parse key=value tokens; conntrack -L --output extended emits:
-	// src= dst= sport= dport= packets= bytes= [mark=] [zone=] [use=]
-	// The original tuple comes first, reply tuple comes after a second src= token.
-	origSeen := false
-	replySeen := false
-
-	for i := 0; i < len(fields); i++ {
-		f := fields[i]
-		switch {
-		case f == "ESTABLISHED", f == "SYN_SENT", f == "SYN_RECV",
-			f == "FIN_WAIT", f == "CLOSE_WAIT", f == "LAST_ACK",
-			f == "TIME_WAIT", f == "CLOSE", f == "LISTEN",
-			f == "UNREPLIED", f == "ASSURED", f == "SEEN_REPLY":
-			entry.State = f
-
-		case strings.HasPrefix(f, "src="):
-			ip := net.ParseIP(strings.TrimPrefix(f, "src="))
-			if ip == nil {
-				continue
-			}
-			if ip.To4() == nil {
-				entry.Layer3Proto = "ipv6"
-			}
-			if !origSeen {
-				entry.SrcIP = normalizeIP(ip)
-				origSeen = true
-			} else if !replySeen {
-				entry.ReplySrcIP = normalizeIP(ip)
-				replySeen = true
-			}
-
-		case strings.HasPrefix(f, "dst="):
-			ip := net.ParseIP(strings.TrimPrefix(f, "dst="))
-			if ip == nil {
-				continue
-			}
-			if !origSeen {
-				// dst before src shouldn't happen, skip
-			} else if entry.DstIP == nil && !replySeen {
-				entry.DstIP = normalizeIP(ip)
-			} else if replySeen && entry.ReplyDstIP == nil {
-				entry.ReplyDstIP = normalizeIP(ip)
-			}
-
-		case strings.HasPrefix(f, "sport="):
-			p, err := strconv.ParseUint(strings.TrimPrefix(f, "sport="), 10, 16)
-			if err != nil {
-				continue
-			}
-			if entry.SrcPort == 0 && !replySeen {
-				entry.SrcPort = uint16(p)
-			} else if entry.ReplySrcPort == 0 {
-				entry.ReplySrcPort = uint16(p)
-			}
-
-		case strings.HasPrefix(f, "dport="):
-			p, err := strconv.ParseUint(strings.TrimPrefix(f, "dport="), 10, 16)
-			if err != nil {
-				continue
-			}
-			if entry.DstPort == 0 && !replySeen {
-				entry.DstPort = uint16(p)
-			} else if entry.ReplyDstPort == 0 {
-				entry.ReplyDstPort = uint16(p)
-			}
-
-		case strings.HasPrefix(f, "mark="):
-			v, err := strconv.ParseUint(strings.TrimPrefix(f, "mark="), 10, 32)
-			if err == nil {
-				entry.Mark = uint32(v)
-			}
-
-		case strings.HasPrefix(f, "zone="):
-			v, err := strconv.ParseUint(strings.TrimPrefix(f, "zone="), 10, 16)
-			if err == nil {
-				entry.Zone = uint16(v)
-			}
-
-		case strings.HasPrefix(f, "delta-seq-orig="):
-			v, err := strconv.ParseInt(strings.TrimPrefix(f, "delta-seq-orig="), 10, 32)
-			if err == nil {
-				entry.TCPSeqAdj = int32(v)
-			}
-
-		case strings.HasPrefix(f, "delta-seq-reply="):
-			v, err := strconv.ParseInt(strings.TrimPrefix(f, "delta-seq-reply="), 10, 32)
-			if err == nil {
-				entry.TCPAckAdj = int32(v)
-			}
-		}
+	srcIP := parseHexIP(fields[1])
+	if srcIP == nil {
+		return ConntrackEntry{}, false
 	}
+	e.SrcIP = srcIP
 
-	// Require at least src/dst for a valid entry.
-	if entry.SrcIP == nil || entry.DstIP == nil {
-		return ConntrackEntry{}, false, nil
+	srcPort, err := parseHexPort(fields[2])
+	if err != nil {
+		return ConntrackEntry{}, false
 	}
+	e.SrcPort = srcPort
 
-	return entry, true, nil
+	dstIP := parseHexIP(fields[3])
+	if dstIP == nil {
+		return ConntrackEntry{}, false
+	}
+	e.DstIP = dstIP
+
+	dstPort, err := parseHexPort(fields[4])
+	if err != nil {
+		return ConntrackEntry{}, false
+	}
+	e.DstPort = dstPort
+
+	e.State = 0 // IPVS state not mapped to TCP conntrack state
+	if srcIP.To4() != nil {
+		e.Layer3Proto = unix.AF_INET
+	} else {
+		e.Layer3Proto = unix.AF_INET6
+	}
+	return e, true
 }
 
-// readIPVSTable reads the IPVS connection table via `ipvsadm -Lnc`.
-// IPVS is used by kube-proxy in IPVS mode; it maintains its own connection
-// state independent of netfilter conntrack for load-balanced service IPs.
-func readIPVSTable(ctx context.Context, podIP string) ([]ConntrackEntry, error) {
-	cmd := exec.CommandContext(ctx, "ipvsadm", "-Lnc")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("ipvsadm -Lnc: %w", err)
+// parseHexIP parses a 8-character big-endian hex IPv4 address from /proc/net/ip_vs_conn.
+func parseHexIP(s string) net.IP {
+	if len(s) != 8 {
+		return nil
 	}
-	return parseIPVSOutput(string(out), podIP)
+	var b [4]byte
+	for i := 0; i < 4; i++ {
+		nibbleHi := hexVal(s[i*2])
+		nibbleLo := hexVal(s[i*2+1])
+		if nibbleHi < 0 || nibbleLo < 0 {
+			return nil
+		}
+		b[i] = byte(nibbleHi<<4 | nibbleLo)
+	}
+	// /proc/net/ip_vs_conn stores in network byte order (big-endian).
+	return net.IP(b[:])
 }
 
-// parseIPVSOutput parses `ipvsadm -Lnc` output.
-// Output format (after header lines):
-//
-//	TCP  src_ip:src_port  dest_ip:dest_port  state    expires
-func parseIPVSOutput(output, podIP string) ([]ConntrackEntry, error) {
-	var entries []ConntrackEntry
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	headerSkip := 3 // skip "IPVS connection entries", blank line, column header
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if headerSkip > 0 {
-			headerSkip--
-			continue
-		}
-		if line == "" {
-			continue
-		}
-		entry, ok, err := parseIPVSLine(line)
-		if err != nil || !ok {
-			continue
-		}
-		if podIP != "" && !entryMatchesPodIP(entry, podIP) {
-			continue
-		}
-		entries = append(entries, entry)
+// parseHexPort parses a 4-character hex port from /proc/net/ip_vs_conn.
+func parseHexPort(s string) (uint16, error) {
+	if len(s) != 4 {
+		return 0, fmt.Errorf("invalid port hex %q", s)
 	}
-	return entries, scanner.Err()
+	var v uint16
+	for _, c := range s {
+		hv := hexVal(byte(c))
+		if hv < 0 {
+			return 0, fmt.Errorf("invalid hex char %c in port %q", c, s)
+		}
+		v = v<<4 | uint16(hv)
+	}
+	return v, nil
 }
 
-// parseIPVSLine parses one data row from ipvsadm -Lnc output.
-// Format: PROTO  laddr:lport  faddr:fport  state  expires
-func parseIPVSLine(line string) (ConntrackEntry, bool, error) {
-	fields := strings.Fields(line)
-	if len(fields) < 4 {
-		return ConntrackEntry{}, false, nil
+func hexVal(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10
 	}
-
-	var entry ConntrackEntry
-	entry.Protocol = strings.ToLower(fields[0])
-	entry.Layer3Proto = "ipv4"
-	entry.IsIPVS = true
-
-	srcIP, srcPort, err := parseIPPort(fields[1])
-	if err != nil {
-		return ConntrackEntry{}, false, err
-	}
-	dstIP, dstPort, err := parseIPPort(fields[2])
-	if err != nil {
-		return ConntrackEntry{}, false, err
-	}
-
-	entry.SrcIP = srcIP
-	entry.SrcPort = srcPort
-	entry.DstIP = dstIP
-	entry.DstPort = dstPort
-	entry.State = fields[3]
-
-	if srcIP.To4() == nil {
-		entry.Layer3Proto = "ipv6"
-	}
-
-	return entry, true, nil
+	return -1
 }
 
-// parseIPPort splits "1.2.3.4:5678" or "[::1]:5678" into IP and port.
-func parseIPPort(s string) (net.IP, uint16, error) {
-	// Use net.SplitHostPort which handles IPv6 brackets.
-	host, portStr, err := net.SplitHostPort(s)
-	if err != nil {
-		return nil, 0, fmt.Errorf("parseIPPort %q: %w", s, err)
+// splitLines splits a string into lines without using strings package to keep imports minimal.
+func splitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			lines = append(lines, s[start:i])
+			start = i + 1
+		}
 	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return nil, 0, fmt.Errorf("parseIPPort %q: invalid IP %q", s, host)
+	if start < len(s) {
+		lines = append(lines, s[start:])
 	}
-	port, err := strconv.ParseUint(portStr, 10, 16)
-	if err != nil {
-		return nil, 0, fmt.Errorf("parseIPPort %q: invalid port %q", s, portStr)
+	return lines
+}
+
+// splitFields splits a line on whitespace (ASCII spaces/tabs).
+func splitFields(s string) []string {
+	var fields []string
+	inField := false
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isSpace := c == ' ' || c == '\t'
+		if !isSpace && !inField {
+			start = i
+			inField = true
+		} else if isSpace && inField {
+			fields = append(fields, s[start:i])
+			inField = false
+		}
 	}
-	return normalizeIP(ip), uint16(port), nil
+	if inField {
+		fields = append(fields, s[start:])
+	}
+	return fields
 }
 
 // entryMatchesPodIP reports whether the entry's original-direction source or
@@ -391,7 +624,9 @@ func entryMatchesPodIP(e ConntrackEntry, podIP string) bool {
 	if target == nil {
 		return false
 	}
-	target = normalizeIP(target)
+	if t4 := target.To4(); t4 != nil {
+		target = t4
+	}
 	return e.SrcIP.Equal(target) || e.DstIP.Equal(target)
 }
 
