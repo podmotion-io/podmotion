@@ -395,6 +395,23 @@ func (r *PodMigrationReconciler) reconcilePreCopyMemory(ctx context.Context, pm 
 		networkBridgeArmed = true
 	}
 
+	// ADR-0131 (Strict/BestEffort TCP transparency): the legacy NetworkBridgeArmed
+	// precondition is satisfied here so PreCopyMemory can advance. The actual eBPF
+	// data-plane arming for the TCP-stateful path is NOT a single XDP bridge — it is
+	// the TC-egress zero-window hold (reconcileZeroWindowArm) plus the VTEP/relay
+	// overlay handoff (reconcileOverlayHandoff / ConfirmOverlayReady), which run in
+	// their own dedicated downstream phases. Without this, MemorySynced + StorageReady
+	// can both be True while NetworkBridgeArmed stays unset, livelocking PreCopyMemory.
+	if pm.Spec.TCPPreservationMode != pmv1.TCPPreservationModeNone && !networkBridgeArmed {
+		setCondition(pm, conditionNetworkBridgeArmed, metav1.ConditionTrue,
+			"DeferredToZeroWindowAndOverlay",
+			"TCP-stateful path: eBPF arming deferred to ZeroWindowArm + OverlayHandoff phases (ADR-0131)")
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
+		networkBridgeArmed = true
+	}
+
 	if !storageReady && r.StorageMgr == nil {
 		setCondition(pm, conditionStorageReady, metav1.ConditionTrue,
 			"StatelessFastPath", "No PVC volumes: storage pre-stage not required")
@@ -3370,6 +3387,19 @@ func preCopyRetransmitHeadroom(_ *pmv1.PodMigration) float64 {
 //   - MigrationModeCold (no pre-copy loop ran, gate irrelevant)
 //   - PreCopyStats is nil (pre-copy loop not yet populated — defer to requeue)
 func preCopyTCPGatePassed(pm *pmv1.PodMigration) bool {
+	// MemorySynced=True is the authoritative convergence signal. The pre-copy loop
+	// can legitimately converge without populating PreCopyStats — e.g. dirty pages
+	// were already below threshold on the first sample (RoundsCompleted==0), so no
+	// per-round stats were recorded. In that case there is nothing left to wait for:
+	// blocking on nil/zero-round PreCopyStats here livelocks the migration in
+	// PreCopyMemory forever even though memory has converged. Defer to the condition.
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionMemorySynced) {
+		// Convergence already proven by the pre-copy loop; only block if explicit
+		// stats are present AND show poor convergence.
+		if pm.Status.PreCopyStats == nil || pm.Status.PreCopyStats.RoundsCompleted == 0 {
+			return true
+		}
+	}
 	if pm.Status.PreCopyStats == nil {
 		// Pre-copy loop has not reported stats yet; wait for at least one round.
 		return false

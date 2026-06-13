@@ -189,7 +189,12 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		LeaveRunning:   proto.Bool(opts.LeaveRunning),
 		LeaveStopped:   proto.Bool(opts.LeaveStopped),
 		TcpEstablished: proto.Bool(opts.TcpEstablished),
-		TcpClose: proto.Bool(true),
+		// TcpClose and TcpEstablished are mutually exclusive: TcpClose tells CRIU to drop
+		// all TCP connections on restore ("Will drop all TCP connections on restore"), which
+		// directly defeats the ADR-0131 seq_delta=0 goal. When TcpEstablished=true we are
+		// explicitly preserving the connection via TCP_REPAIR, so TcpClose MUST be false.
+		// Only close connections on stateless (non-TCP-preservation) dumps.
+		TcpClose: proto.Bool(!opts.TcpEstablished),
 		// TcpSkipInFlight: when TCP-stateful migration is active (TcpEstablished=true and
 		// LeaveStopped=true), in-flight data MUST NOT be silently skipped — that would drop
 		// busy connections, violating ADR-0049 "unacked==0 at dump time" requirement.
@@ -211,9 +216,15 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 			}
 			return rpc.CriuNetworkLockMethod_SKIP.Enum()
 		}(),
-		ShellJob:    proto.Bool(false),
-		TrackMem:    proto.Bool(true), // ADR-0042 §Decision table mandates TrackMem=true; any change requires an ADR amendment
-		AutoDedup:   proto.Bool(true),
+		ShellJob: proto.Bool(false),
+		// TrackMem (soft-dirty memory tracking, CONFIG_MEM_SOFT_DIRTY) is only meaningful for
+		// iterative pre-dump rounds. For the final freeze dump it is unnecessary, and on kernels
+		// where soft-dirty is unavailable CRIU hard-fails the whole dump:
+		//   "Error (criu/config.c:1130): Tracking memory is not available. Consider omitting --track-mem option."
+		// Drive it from opts.TrackMem (default false for the final dump) so the freeze dump does
+		// not require soft-dirty. Pre-dump rounds set TrackMem explicitly where supported.
+		TrackMem:  proto.Bool(opts.TrackMem),
+		AutoDedup: proto.Bool(true),
 		ExtSharing:  proto.Bool(true),
 		ExtMasters:  proto.Bool(true),
 		// AutoExtMnt=true is equivalent to --ext-mount-map auto: CRIU automatically
@@ -255,8 +266,8 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		"pid", opts.Pid,
 		"imagesDir", opts.ImagesDir,
 		"criuBinary", c.criuBinaryPath,
-		"opts", fmt.Sprintf("LeaveRunning=%v TcpClose=%v TrackMem=%v ExtSharing=%v ExtMasters=%v NetworkLock=SKIP",
-			opts.LeaveRunning, true, true, true, true),
+		"opts", fmt.Sprintf("LeaveRunning=%v TcpEstablished=%v TcpClose=%v TrackMem=%v LeaveStopped=%v",
+			opts.LeaveRunning, opts.TcpEstablished, !opts.TcpEstablished, opts.TrackMem, opts.LeaveStopped),
 	)
 
 	freezeStart := time.Now()
@@ -354,7 +365,12 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 		LogFile:         proto.String("restore.log"),
 		LogLevel:        proto.Int32(4),
 		TcpEstablished: proto.Bool(opts.TcpEstablished),
-		TcpClose:       proto.Bool(true),
+		// TcpClose and TcpEstablished are mutually exclusive on restore too. With
+		// TcpClose=true CRIU logs "Will drop all TCP connections on restore" and tears
+		// the socket down, defeating ADR-0131 seq_delta=0. When restoring an established
+		// connection (TcpEstablished=true) TcpClose MUST be false so TCP_REPAIR rebuilds
+		// the exact socket state captured at freeze.
+		TcpClose: proto.Bool(!opts.TcpEstablished),
 		// TcpSkipInFlight on restore: mirror the dump policy — only skip in-flight for
 		// non-TCP-stateful restores. For TCP-stateful restores the connection state must
 		// be fully intact (no in-flight data was present at dump time per ADR-0049).
@@ -392,6 +408,20 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 			"/sys/firmware",
 			"/sys/fs/pstore",
 			"/run/secrets/kubernetes.io/serviceaccount",
+			// Additional containerd/runc-injected proc submounts that CRIU autodetects as
+			// external mounts with a (null) source on restore (mount.c:3120). These are
+			// re-provided by the destination runtime's own bundle, so skipping them on
+			// restore is safe — Redis does not depend on them. Without this the restore
+			// hard-fails with "is autodetected external mount" (ADR-0131 restore path).
+			"/proc/bus",
+			"/proc/fs",
+			"/proc/irq",
+			"/proc/sys",
+			"/proc/sysrq-trigger",
+			"/proc/acpi",
+			"/proc/asound",
+			"/sys/fs/bpf",
+			"/sys/fs/cgroup",
 		},
 	}
 

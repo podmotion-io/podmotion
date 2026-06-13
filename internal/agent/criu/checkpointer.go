@@ -93,6 +93,12 @@ type DumpOptions struct {
 	// migration: prevents the source from sending new data while the destination
 	// is restoring (M23 ordering invariant).
 	LeaveStopped bool
+	// TrackMem enables --track-mem (soft-dirty memory tracking, CONFIG_MEM_SOFT_DIRTY)
+	// on the final freeze dump. Defaults false: the final dump is a one-shot freeze and
+	// does not need iterative dirty tracking, and on kernels without soft-dirty support
+	// forcing --track-mem makes CRIU hard-fail the whole dump (config.c:1130). Only set
+	// true on hosts known to support soft-dirty when iterative final-dump dedup is desired.
+	TrackMem bool
 }
 
 // RestoreOptions configures CRIU restore on the destination node.

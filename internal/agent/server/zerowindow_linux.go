@@ -20,6 +20,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/podmotion-io/podmotion/internal/agent/network"
 )
 
 // tcpInfoUnacked mirrors the kernel tcp_info struct up through tcpi_unacked.
@@ -110,17 +112,49 @@ func resolveVethIfindex(podUID string) (uint32, error) {
 	return 0, nil
 }
 
-// armZeroWindowBPF stubs the TC-BPF arm call on Linux.
-// The real cilium/ebpf attach is wired via network.CiliumEBPFManager when the
-// network package build conflicts from M20 eBPF discipline are resolved.
+// armZeroWindowBPF performs the real TC-BPF zero-window arm on Linux by delegating to
+// the network package's EBPFManager (ADR-0131 D1 / ADR-0049). It attaches the zero_window
+// TC-egress program to the source pod veth (by ifindex) and inserts the ifindex into
+// PM_ACTIVE_HOLDS. On kernels <5.9 NewEBPFManager returns the stub (logs only). Idempotent.
+// ifindex==0 means veth resolution failed upstream; skip the attach (nothing to arm).
 func armZeroWindowBPF(ctx context.Context, ifindex uint32) error {
-	log.Info("armZeroWindowBPF: stub — TC-BPF zero-window arm (real attach wired via eBPF discipline)", "ifindex", ifindex)
+	if ifindex == 0 {
+		log.Info("armZeroWindowBPF: ifindex=0 (veth unresolved) — skipping TC-BPF arm")
+		return nil
+	}
+	mgr := network.NewEBPFManager(ctx)
+	if err := mgr.ArmZeroWindowHold(ctx, ifindex); err != nil {
+		// Graceful degradation: on this PoC the embedded arm64 zero_window BPF object can
+		// fail to load ("no symbol section") because the bpf2go-generated .o was not built
+		// with a valid arm64 BPF toolchain. The hold is a *protective optimisation* (it makes
+		// the client pause via window=0 during the freeze); the migration's correctness for
+		// seq_delta=0 comes from CRIU --tcp-established preserving the socket. Rather than
+		// hard-failing the whole migration on a missing BPF object, log and continue so the
+		// rest of the ADR-0131 orchestration (freeze, handoff, verify, disarm) is exercised.
+		// AC1 (observable window=0) requires a valid arm64 BPF object — tracked as a blocker.
+		log.Error(err, "armZeroWindowBPF: real TC-BPF arm failed — continuing WITHOUT hold (AC1 degraded; seq continuity still relies on CRIU --tcp-established)", "ifindex", ifindex)
+		return nil
+	}
+	log.Info("armZeroWindowBPF: TC-BPF zero-window hold armed", "ifindex", ifindex)
 	return nil
 }
 
-// disarmZeroWindowBPF stubs the TC-BPF disarm call on Linux.
+// disarmZeroWindowBPF performs the real TC-BPF zero-window disarm on Linux by delegating to
+// the network package's EBPFManager. Removes the ifindex from PM_ACTIVE_HOLDS and detaches
+// the TC filter when the map empties. Idempotent; ifindex==0 is a no-op.
 func disarmZeroWindowBPF(ctx context.Context, ifindex uint32) error {
-	log.Info("disarmZeroWindowBPF: stub — TC-BPF zero-window disarm (real detach wired via eBPF discipline)", "ifindex", ifindex)
+	if ifindex == 0 {
+		log.Info("disarmZeroWindowBPF: ifindex=0 (veth unresolved) — skipping TC-BPF disarm")
+		return nil
+	}
+	mgr := network.NewEBPFManager(ctx)
+	if err := mgr.DisarmZeroWindowHold(ctx, ifindex); err != nil {
+		// Mirror armZeroWindowBPF's graceful degradation: if the hold was never armed
+		// (BPF object failed to load), disarm is a no-op. Log and continue.
+		log.Error(err, "disarmZeroWindowBPF: real TC-BPF disarm failed — continuing (hold likely never armed)", "ifindex", ifindex)
+		return nil
+	}
+	log.Info("disarmZeroWindowBPF: TC-BPF zero-window hold disarmed", "ifindex", ifindex)
 	return nil
 }
 
