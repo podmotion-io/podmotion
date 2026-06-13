@@ -181,6 +181,130 @@ func (s *AgentServer) ReportRestoreConfirmed(ctx context.Context, migrationName,
 	return nil
 }
 
+// SingleHomeRestoredPod implements ADR-0137 (single-home variant): after CRIU restore and the
+// ADR-0128 cgroup move, before ReportRestoreConfirmed, it removes the CNI-assigned NEW Flannel IP
+// from the replacement pod's eth0, leaving only the CRIU-restored OLD pod IP (pm.Spec.SourcePodIP).
+//
+// Background (Sprint 26 blocker B6): the replacement pod is dual-homed — eth0 carries both the new
+// Flannel IP (e.g. 10.244.1.94) and the CRIU-restored OLD IP (e.g. 10.244.0.94). The competing
+// connected subnet makes the destination kernel classify VXLAN-decapped transit traffic for the OLD
+// IP as local-input (RTN_LOCAL) and drop it. Removing the new Flannel IP eliminates the conflict so
+// the kernel delivers transit traffic for the OLD IP at L2 to the pod veth via the ADR-0133 D2 neigh.
+//
+// No netlink dependency (vishvananda/netlink is not in go.mod; ADR-0045 forbids adding it): we reuse
+// the in-tree nsenter+ip idiom already used by ReadReplVethMAC and the joinNsRestore lo-up. We only
+// ever DELETE eth0 IPv4 addresses that are not the (validated) OLD IP — never add. Idempotent; an
+// already-absent address is tolerated. Empty SourcePodIP → no-op (legacy/cold path unaffected).
+func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, namespace string, pid int) error {
+	if s.k8sClient == nil {
+		return fmt.Errorf("SingleHomeRestoredPod: no k8s client available on agent server")
+	}
+	if migrationName == "" || namespace == "" {
+		return fmt.Errorf("SingleHomeRestoredPod: migrationName and namespace are required (got %q/%q)", namespace, migrationName)
+	}
+	if pid <= 0 {
+		return fmt.Errorf("SingleHomeRestoredPod: invalid restored PID %d", pid)
+	}
+
+	pm := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: migrationName}, pm); err != nil {
+		return fmt.Errorf("SingleHomeRestoredPod: get PodMigration %s/%s: %w", namespace, migrationName, err)
+	}
+
+	oldIP := strings.TrimSpace(pm.Spec.SourcePodIP)
+	if oldIP == "" {
+		log.Info("SingleHomeRestoredPod: pm.Spec.SourcePodIP is empty — no-op (legacy/cold path)",
+			"migration", migrationName, "restoredPID", pid)
+		return nil
+	}
+	if parsed := net.ParseIP(oldIP); parsed == nil || parsed.To4() == nil {
+		return fmt.Errorf("SingleHomeRestoredPod: SourcePodIP %q is not a valid IPv4", oldIP)
+	}
+
+	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+
+	// List eth0 IPv4 addresses inside the pod netns. `ip -o -4 addr show eth0` is netns-scoped
+	// via nsenter --net (sysfs/`cat` would read the HOST's interfaces — see ReadReplVethMAC).
+	out, err := exec.Command("nsenter", "--net="+netnsPath,
+		"ip", "-o", "-4", "addr", "show", "eth0").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("SingleHomeRestoredPod: list eth0 addrs in netns %s: %w (%s)",
+			netnsPath, err, strings.TrimSpace(string(out)))
+	}
+	addrs := parseEth0IPv4Addrs(string(out))
+	log.Info("SingleHomeRestoredPod: eth0 addresses before single-home (ADR-0137)",
+		"migration", migrationName, "restoredPID", pid, "oldIP", oldIP, "addrs", addrs)
+
+	oldSeen := false
+	var delErrs []string
+	for _, cidr := range addrs {
+		ipOnly := cidr
+		if i := strings.IndexByte(cidr, '/'); i >= 0 {
+			ipOnly = cidr[:i]
+		}
+		if ipOnly == oldIP {
+			oldSeen = true
+			continue
+		}
+		// This is the new Flannel IP (or any other non-OLD address) — strip it.
+		delOut, delErr := exec.Command("nsenter", "--net="+netnsPath,
+			"ip", "addr", "del", cidr, "dev", "eth0").CombinedOutput()
+		if delErr != nil {
+			msg := strings.TrimSpace(string(delOut))
+			// Idempotent: tolerate an already-absent address.
+			if strings.Contains(strings.ToLower(msg), "cannot assign") ||
+				strings.Contains(strings.ToLower(msg), "not found") ||
+				strings.Contains(strings.ToLower(msg), "no such") {
+				log.Info("SingleHomeRestoredPod: address already absent (idempotent)", "addr", cidr)
+				continue
+			}
+			delErrs = append(delErrs, fmt.Sprintf("del %s: %v (%s)", cidr, delErr, msg))
+			continue
+		}
+		log.Info("SingleHomeRestoredPod: removed non-OLD eth0 address (ADR-0137 single-home)",
+			"migration", migrationName, "restoredPID", pid, "removed", cidr, "reason", "not OLD IP")
+	}
+
+	// Verify: only the OLD IP should remain on eth0.
+	verifyOut, verifyErr := exec.Command("nsenter", "--net="+netnsPath,
+		"ip", "-o", "-4", "addr", "show", "eth0").CombinedOutput()
+	if verifyErr != nil {
+		return fmt.Errorf("SingleHomeRestoredPod: verify eth0 addrs in netns %s: %w (%s)",
+			netnsPath, verifyErr, strings.TrimSpace(string(verifyOut)))
+	}
+	remaining := parseEth0IPv4Addrs(string(verifyOut))
+	log.Info("SingleHomeRestoredPod: eth0 addresses after single-home (ADR-0137 AC5)",
+		"migration", migrationName, "restoredPID", pid, "oldIP", oldIP, "remaining", remaining)
+
+	if len(delErrs) > 0 {
+		return fmt.Errorf("SingleHomeRestoredPod: failed to remove %d address(es): %s",
+			len(delErrs), strings.Join(delErrs, "; "))
+	}
+	if !oldSeen {
+		// The OLD IP was not present on eth0 at all — CRIU did not restore it, or it lives
+		// elsewhere. Surface loud: single-homing on a missing OLD IP would leave eth0 bare.
+		return fmt.Errorf("SingleHomeRestoredPod: OLD IP %s not present on eth0 (addrs were %v); refusing to leave eth0 without it",
+			oldIP, addrs)
+	}
+	return nil
+}
+
+// parseEth0IPv4Addrs extracts the "A.B.C.D/N" tokens from `ip -o -4 addr show eth0` output.
+// Each line looks like: "2: eth0    inet 10.244.0.94/24 brd ... scope global eth0\\ ...".
+// Returns the addresses in CIDR form (suitable to pass straight back to `ip addr del`).
+func parseEth0IPv4Addrs(out string) []string {
+	var addrs []string
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		for i := 0; i < len(fields)-1; i++ {
+			if fields[i] == "inet" {
+				addrs = append(addrs, fields[i+1])
+			}
+		}
+	}
+	return addrs
+}
+
 // ReadReplVethMAC reads the replacement pod's eth0 MAC for ADR-0133 D3. It prefers the
 // sandbox network namespace path (the same netns the join-ns restore targeted, where eth0
 // is reliably present), falling back to the restored process's own netns. The restored
