@@ -165,10 +165,10 @@ green runs required per required-tier cell, North Star invariant (`errsDuringMig
 **Gap analysis exit criterion**: Threat-model-driven secure-default baseline; RBAC
 least-privilege verified; cert rotation tested; SBOM/signing/vuln-scan gate in CI.
 
-### Pre-conditions (must pass before ADR-0080 can be re-reviewed)
+### Pre-conditions (must pass before ADR-0106 can be re-reviewed)
 
-- [ ] Renumber `0080-security-hardening-baseline.md` (away from collision with
-      `0080-pm-cni-chained-plugin`) · Owner: [TBD] · M22
+- [x] Renumbered `0080-security-hardening-baseline.md` → `0106-security-hardening-baseline.md`
+      (resolved collision with `0080-pm-cni-chained-plugin`) · Done 2026-06-12
 - [ ] Redesign `SeccompGuard`: patch the *agent container's* seccomp profile or use
       a node-level mechanism — not the target pod's immutable `securityContext` ·
       Owner: Security Agent · M22
