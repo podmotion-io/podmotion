@@ -87,6 +87,12 @@ type DumpOptions struct {
 	// Set true when TCPPreservationMode is Strict or BestEffort; false (default) for None
 	// (stateless cold migration — connections will be dropped at cutover).
 	TcpEstablished bool
+	// LeaveStopped instructs CRIU to leave the source process in SIGSTOP state after
+	// the dump completes (--leave-stopped). The process is NOT resumed on the source
+	// node — it stays frozen until explicitly signalled. Required for TCP-stateful
+	// migration: prevents the source from sending new data while the destination
+	// is restoring (M23 ordering invariant).
+	LeaveStopped bool
 }
 
 // RestoreOptions configures CRIU restore on the destination node.

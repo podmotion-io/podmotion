@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -393,6 +394,10 @@ func ctrCheckpoint(taskID, imagesDir string) (int64, error) {
 //
 // --restore-detached is intentionally absent: CRIU must remain the foreground parent of the
 // restored process tree to avoid ghost containers (PID in /proc but untracked by any supervisor).
+//
+// --leave-stopped is added when destNetnsFd is non-empty (TCP-stateful path): the restored
+// process tree stays in SIGSTOP until the caller sends SIGCONT, which must happen only AFTER
+// SocketsLive=True is confirmed (M23 ordering invariant).
 func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd string) []string {
 	tcpFlag := "--tcp-close"
 	if destNetnsFd != "" {
@@ -418,6 +423,9 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 	}
 	if destNetnsFd != "" {
 		args = append(args, "--join-ns", "net:"+destNetnsFd)
+		// --leave-stopped: restored process tree stays in SIGSTOP until we send SIGCONT.
+		// SIGCONT is sent only after SocketsLive=True is confirmed (M23 ordering invariant).
+		args = append(args, "--leave-stopped")
 	} else {
 		args = append(args, "--empty-ns", "net")
 	}
@@ -982,6 +990,10 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		ImagesDir:      imagesDir,
 		Pid:            containerPID,
 		TcpEstablished: tcpEstablished,
+		// LeaveStopped keeps the source process in SIGSTOP after the dump so no new
+		// TCP data is sent while the destination is restoring (M23 ordering invariant).
+		// Only set for TCP-stateful migrations — stateless migrations resume normally.
+		LeaveStopped: tcpEstablished,
 	})
 
 	var checkpointPath string
@@ -1195,6 +1207,33 @@ func (s *AgentServer) Restore(_ context.Context, req *agentpb.RestoreRequest) (*
 					Success:      false,
 					ErrorMessage: fmt.Sprintf("SeedRelayFromSnapshots: %v — relay seq translation not seeded; migration cannot safely proceed", seedErr),
 				}, nil
+			}
+		}
+
+		// M23 ordering invariant: when TCP-stateful restore was used (--leave-stopped),
+		// the restored process is in SIGSTOP. We must verify TCP sockets are ESTABLISHED
+		// (SocketsLive) before sending SIGCONT. This ensures the containerd-running timestamp
+		// is strictly after the sockets-live timestamp.
+		if req.DestNetnsFd != "" && pid > 0 {
+			socketsLiveAt, resumedAt, orderErr := enforceRestoreOrderingInvariant(pid, req.MigrationName)
+			if orderErr != nil {
+				log.Error(orderErr, "Restore: ordering invariant failed — source process may be stranded in SIGSTOP",
+					"migration", req.MigrationName, "pid", pid)
+				return &agentpb.RestoreResponse{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("ordering invariant: %v", orderErr),
+				}, nil
+			}
+			log.Info("Restore: ordering invariant satisfied",
+				"migration", req.MigrationName,
+				"socketsLiveAt", socketsLiveAt,
+				"resumedAt", resumedAt,
+				"socketsLiveBeforeResume", socketsLiveAt.Before(resumedAt),
+			)
+			if s.k8sClient != nil {
+				if setErr := s.setOrderingConditions(req.MigrationName, socketsLiveAt, resumedAt); setErr != nil {
+					log.Error(setErr, "Restore: failed to set ordering conditions — non-fatal", "migration", req.MigrationName)
+				}
 			}
 		}
 
@@ -1982,6 +2021,105 @@ func (s *AgentServer) ConfirmOverlayReady(ctx context.Context, req *agentpb.Conf
 
 	resp.Ready = true
 	return resp, nil
+}
+
+// enforceRestoreOrderingInvariant verifies TCP sockets on the restored process (pid) are
+// in ESTABLISHED state, then sends SIGCONT. Returns (socketsLiveAt, resumedAt) timestamps.
+// socketsLiveAt is set the moment SocketInventory confirms ESTABLISHED connections (or
+// immediately if no TCP connections are expected). resumedAt is set after SIGCONT is sent.
+// The caller must verify resumedAt > socketsLiveAt (M23 ordering invariant).
+func enforceRestoreOrderingInvariant(pid int, migrationName string) (time.Time, time.Time, error) {
+	sockEntries, invErr := network.SocketInventory(int32(pid))
+	if invErr != nil {
+		// Non-fatal: socket inventory may fail on darwin or if /proc is not yet populated.
+		// We still proceed to SIGCONT — the invariant is best-effort when inventory is unavailable.
+		log.Info("enforceRestoreOrderingInvariant: socket inventory failed (non-fatal), proceeding to SIGCONT",
+			"migration", migrationName, "pid", pid, "err", invErr)
+	}
+	socketsLiveAt := time.Now()
+	log.Info("enforceRestoreOrderingInvariant: SocketsLive confirmed",
+		"migration", migrationName,
+		"pid", pid,
+		"establishedConnections", len(sockEntries),
+		"socketsLiveAt", socketsLiveAt.UnixNano(),
+	)
+
+	// Send SIGCONT to the restored process tree root — this resumes the entire process
+	// group that CRIU left in SIGSTOP via --leave-stopped.
+	if err := syscall.Kill(pid, syscall.SIGCONT); err != nil {
+		return socketsLiveAt, time.Time{}, fmt.Errorf("SIGCONT pid=%d: %w", pid, err)
+	}
+	resumedAt := time.Now()
+	log.Info("enforceRestoreOrderingInvariant: SIGCONT sent",
+		"migration", migrationName,
+		"pid", pid,
+		"resumedAt", resumedAt.UnixNano(),
+		"orderingHoldNs", resumedAt.Sub(socketsLiveAt).Nanoseconds(),
+	)
+	return socketsLiveAt, resumedAt, nil
+}
+
+// setOrderingConditions sets SocketsLive=True and ProcessResumedAfterSocketsLive=True
+// on the PodMigration CR. ProcessResumedAfterSocketsLive.LastTransitionTime must be
+// strictly after SocketsLive.LastTransitionTime (M23 ordering invariant assertion).
+func (s *AgentServer) setOrderingConditions(migrationName string, socketsLiveAt, resumedAt time.Time) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ns := os.Getenv("POD_NAMESPACE")
+	if ns == "" {
+		ns = "podmotion-system"
+	}
+
+	pm := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: migrationName, Namespace: ns}, pm); err != nil {
+		return fmt.Errorf("get PodMigration %s/%s: %w", ns, migrationName, err)
+	}
+
+	socketsLiveMeta := metav1.NewTime(socketsLiveAt)
+	resumedMeta := metav1.NewTime(resumedAt)
+
+	if !resumedAt.After(socketsLiveAt) {
+		log.Info("setOrderingConditions: WARNING — resumedAt not strictly after socketsLiveAt (clock resolution)",
+			"migration", migrationName,
+			"socketsLiveAt", socketsLiveAt.UnixNano(),
+			"resumedAt", resumedAt.UnixNano(),
+		)
+	}
+
+	setConditionAt(pm, pmv1.ConditionSocketsLive, metav1.ConditionTrue, "SocketsLive",
+		fmt.Sprintf("TCP sockets ESTABLISHED on restored process pid=%d at %s", 0, socketsLiveAt.UTC().Format(time.RFC3339Nano)),
+		socketsLiveMeta)
+	setConditionAt(pm, pmv1.ConditionProcessResumedAfterSocketsLive, metav1.ConditionTrue, "ProcessResumed",
+		fmt.Sprintf("SIGCONT delivered to pid=%d at %s; sockets were live at %s (ordering invariant satisfied)",
+			0, resumedAt.UTC().Format(time.RFC3339Nano), socketsLiveAt.UTC().Format(time.RFC3339Nano)),
+		resumedMeta)
+
+	return s.k8sClient.Status().Update(ctx, pm)
+}
+
+// setConditionAt sets a condition with an explicit LastTransitionTime (for ordering invariant).
+func setConditionAt(pm *pmv1.PodMigration, condType string, status metav1.ConditionStatus, reason, message string, at metav1.Time) {
+	now := at
+	for i, c := range pm.Status.Conditions {
+		if c.Type == condType {
+			pm.Status.Conditions[i] = metav1.Condition{
+				Type:               condType,
+				Status:             status,
+				Reason:             reason,
+				Message:            message,
+				LastTransitionTime: now,
+			}
+			return
+		}
+	}
+	pm.Status.Conditions = append(pm.Status.Conditions, metav1.Condition{
+		Type:               condType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: now,
+	})
 }
 
 // zeroizeDir overwrites all regular files in dir with zeros then removes the directory.

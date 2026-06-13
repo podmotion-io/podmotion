@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -177,12 +178,16 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	//   - TrackMem omitted      — pre-dump uses VM_READ (process_vm_readv); cold dump
 	//                            never needs dirty tracking
 	//   - TcpClose=true         — close TCP sockets instead of erroring on multi-thread tasks
+	//   - LeaveStopped          — when TcpEstablished: source stays in SIGSTOP after dump
+	//                            so no new data is sent while the destination is restoring
+	//                            (M23 ordering invariant: --leave-stopped)
 	criuOpts := &rpc.CriuOpts{
 		ImagesDirFd:    proto.Int32(int32(imgDirFd.Fd())),
 		LogFile:        proto.String("dump.log"),
 		LogLevel:       proto.Int32(4),
 		Pid:            proto.Int32(opts.Pid),
 		LeaveRunning:   proto.Bool(opts.LeaveRunning),
+		LeaveStopped:   proto.Bool(opts.LeaveStopped),
 		TcpEstablished: proto.Bool(opts.TcpEstablished),
 		TcpClose:       proto.Bool(true),
 		// TcpSkipInFlight skips TCP sockets with in-flight data — avoids iptables
@@ -259,7 +264,15 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	// Always surface the CRIU dump log — invaluable for diagnosing failures on kind.
 	dumpLogBytes, _ := os.ReadFile(filepath.Join(opts.ImagesDir, "dump.log"))
 	if len(dumpLogBytes) > 0 {
-		logger.Info("CRIU dump log", "pid", opts.Pid, "imagesDir", opts.ImagesDir, "content", string(dumpLogBytes))
+		logContent := string(dumpLogBytes)
+		tcpEntries, unsupported := parseTCPImageEntries(logContent)
+		logger.Info("CRIU dump log",
+			"pid", opts.Pid,
+			"imagesDir", opts.ImagesDir,
+			"tcpImageEntries", tcpEntries,
+			"unsupportedSocketErrors", unsupported,
+			"content", logContent,
+		)
 	}
 
 	if dumpErr != nil {
@@ -407,7 +420,14 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 
 	// Surface the CRIU restore log regardless of success/failure.
 	if restoreLogBytes, readErr := os.ReadFile(filepath.Join(opts.ImagesDir, "restore.log")); readErr == nil {
-		logger.Info("CRIU restore log", "imagesDir", opts.ImagesDir, "content", string(restoreLogBytes))
+		logContent := string(restoreLogBytes)
+		tcpEntries, unsupported := parseTCPImageEntries(logContent)
+		logger.Info("CRIU restore log",
+			"imagesDir", opts.ImagesDir,
+			"tcpImageEntries", tcpEntries,
+			"unsupportedSocketErrors", unsupported,
+			"content", logContent,
+		)
 	}
 
 	if restoreErr != nil {
@@ -447,4 +467,22 @@ func openDirFd(dirPath string) (*os.File, error) {
 		return nil, fmt.Errorf("opening images dir %s: %w", dirPath, err)
 	}
 	return f, nil
+}
+
+// parseTCPImageEntries scans a CRIU dump or restore log for TCP image entries
+// (inetsk/tcp lines) and "Unsupported socket" error lines.
+// Returns (tcpEntryCount, unsupportedCount) as structured log fields.
+// The presence of tcpEntryCount > 0 confirms TcpEstablished=true was honoured by CRIU
+// (M23 acceptance criterion: live CRIU log confirms inetsk/tcp image entries present).
+func parseTCPImageEntries(logContent string) (int, int) {
+	var tcpEntries, unsupported int
+	for _, line := range strings.Split(logContent, "\n") {
+		if strings.Contains(line, "inetsk") || strings.Contains(line, "tcp") {
+			tcpEntries++
+		}
+		if strings.Contains(line, "Unsupported socket") {
+			unsupported++
+		}
+	}
+	return tcpEntries, unsupported
 }
