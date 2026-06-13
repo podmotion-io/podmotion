@@ -547,9 +547,11 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd string) (int, error
 	dataDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/data", migrationName)
 	secretsDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/secrets", migrationName)
 	termlogFile := fmt.Sprintf("/var/lib/podmotion/restore/%s/termination-log", migrationName)
-	// 0o700: data dir may contain PV data; secrets dir holds service-account tokens.
-	// World-readable (0o755) is inappropriate for either (M19.5 criterion 10).
-	_ = os.MkdirAll(dataDir, 0o700)
+	// dataDir (0o755): CRIU re-enters the container's /data mount via --ext-mount-map;
+	// the directory must be world-executable so CRIU (running as root but entering the
+	// container's user ns) can traverse it (ADR-0121).
+	// secretsDir stays 0o700: holds service-account tokens — never world-readable.
+	_ = os.MkdirAll(dataDir, 0o755)
 	_ = os.MkdirAll(secretsDir, 0o700)
 	_ = os.WriteFile(termlogFile, nil, 0o644)
 	// Create missing mount target directories inside rootfs (CRIU bind-mounts into these).
@@ -610,7 +612,6 @@ func patchCheckpointImages(checkpointDir string) error {
 	// Write the patch script to a temp file and run it with the system python3 + pycriu.
 	patchScript := `
 import sys, os, shutil
-sys.path.insert(0, '/tmp/criu-4.2/lib')
 import pycriu
 
 ckpt = sys.argv[1]
@@ -677,7 +678,9 @@ if os.path.exists(netdev_path):
 		return fmt.Errorf("write patch script: %w", err)
 	}
 	defer os.Remove(scriptPath)
-	out, err := exec.Command("python3", scriptPath, checkpointDir).CombinedOutput()
+	cmd := exec.Command("python3", scriptPath, checkpointDir)
+	cmd.Env = append(os.Environ(), "PYTHONPATH=/usr/lib/python3/dist-packages")
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("patch script failed: %w\n%s", err, out)
 	}
