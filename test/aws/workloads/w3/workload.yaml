@@ -1,0 +1,64 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: podmotion-gate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: w3-workload
+  namespace: podmotion-gate
+  labels:
+    app: w3
+    podmotion.io/workload-type: w3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: w3
+  template:
+    metadata:
+      labels:
+        app: w3
+        podmotion.io/workload-type: w3
+    spec:
+      nodeSelector:
+        podmotion.io/role: worker
+      tolerations:
+        - key: podmotion.io/role
+          operator: Equal
+          value: worker
+          effect: NoSchedule
+      containers:
+        - name: redis
+          # redis:7.2-alpine — digest must be pinned before gate run
+          image: redis@sha256:FILL_IN_DIGEST
+          ports:
+            - containerPort: 6379
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: w3-svc
+  namespace: podmotion-gate
+  labels:
+    app: w3
+    podmotion.io/workload-type: w3
+spec:
+  type: ClusterIP
+  selector:
+    app: w3
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      protocol: TCP
