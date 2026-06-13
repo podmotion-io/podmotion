@@ -299,6 +299,16 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 		fdbIf = "flannel.1"
 	}
 
+	// ADR-0135: install a /32 link-scoped host route for the OLD pod IP via cni0 so the
+	// kernel's route lookup selects the LOCAL bridge instead of the default per-CIDR
+	// flannel.1 overlay route back to the source node. Without this the neighbor entries
+	// below are never consulted (the destination is routed out flannel.1 toward the source
+	// VTEP) and the reachability probe blackholes.
+	if err := network.SetPodIPHostRoute(ctx, bridgeIf, oldIP); err != nil {
+		return &agentpb.InjectIPHandoffResponse{Injected: false,
+			BlockingReason: fmt.Sprintf("cni0 /32 route: %v", err)}, nil
+	}
+
 	// D2.1: ip neigh replace <oldPodIP> lladdr <replVethMAC> dev cni0 nud permanent
 	if err := network.SetPodIPNeigh(ctx, bridgeIf, oldIP, mac); err != nil {
 		return &agentpb.InjectIPHandoffResponse{Injected: false,
@@ -363,6 +373,11 @@ func (s *AgentServer) CleanupSourceIPHandoff(ctx context.Context, req *agentpb.C
 		firstErr = err
 	}
 	if err := network.DeletePodIPNeigh(ctx, fdbIf, oldIP); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	// ADR-0135: remove the /32 host route installed on the destination handoff. On the
+	// SOURCE node this is a no-op (no such route), which is fine — idempotent cleanup.
+	if err := network.DeletePodIPHostRoute(ctx, bridgeIf, oldIP); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if firstErr != nil {

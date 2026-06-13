@@ -11,6 +11,7 @@ you may not use this file except in compliance with the License.
 package network
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // ─── netlink helpers ─────────────────────────────────────────────────────────
@@ -542,6 +544,50 @@ func InjectMigrationHostRoute(podIP net.IP, wgInterface string) error {
 	if err := injectRoute(ifindex, dst, unix.RT_SCOPE_LINK, unix.RTPROT_STATIC, unix.RTN_UNICAST, 50); err != nil {
 		return fmt.Errorf("inject WireGuard host route %s via %s: %w", podIP, wgInterface, err)
 	}
+	return nil
+}
+
+// SetPodIPHostRoute installs a /32 (or /128) link-scoped host route for podIP egressing the
+// named device (e.g. "cni0"), so the kernel's route lookup selects the LOCAL bridge for the
+// OLD pod IP instead of the default per-CIDR flannel.1 overlay route to the source node
+// (ADR-0135). Without this route the neighbor entry from ADR-0133 D2 is never consulted,
+// because the destination is routed out flannel.1 toward the source node's VTEP. Idempotent
+// via NLM_F_REPLACE.
+func SetPodIPHostRoute(ctx context.Context, ifName string, podIP net.IP) error {
+	log := logf.FromContext(ctx)
+	ifindex, err := linkIndexByName(ifName)
+	if err != nil {
+		return fmt.Errorf("SetPodIPHostRoute: interface %q not found: %w", ifName, err)
+	}
+	bits := 32
+	if podIP.To4() == nil {
+		bits = 128
+	}
+	dst := &net.IPNet{IP: podIP, Mask: net.CIDRMask(bits, bits*4)}
+	if err := injectRoute(ifindex, dst, unix.RT_SCOPE_LINK, unix.RTPROT_STATIC, unix.RTN_UNICAST, 0); err != nil {
+		return fmt.Errorf("SetPodIPHostRoute %s via %s: %w", podIP, ifName, err)
+	}
+	log.Info("route: RTM_NEWROUTE /32 link-scope (ADR-0135 handoff)", "ifName", ifName, "podIP", podIP)
+	return nil
+}
+
+// DeletePodIPHostRoute removes the /32 host route installed by SetPodIPHostRoute. Idempotent.
+func DeletePodIPHostRoute(ctx context.Context, ifName string, podIP net.IP) error {
+	log := logf.FromContext(ctx)
+	ifindex, err := linkIndexByName(ifName)
+	if err != nil {
+		// Interface gone is not an error for cleanup.
+		return nil
+	}
+	bits := 32
+	if podIP.To4() == nil {
+		bits = 128
+	}
+	dst := &net.IPNet{IP: podIP, Mask: net.CIDRMask(bits, bits*4)}
+	if err := deleteRoute(ifindex, dst); err != nil {
+		return fmt.Errorf("DeletePodIPHostRoute %s via %s: %w", podIP, ifName, err)
+	}
+	log.Info("route: RTM_DELROUTE /32 (ADR-0135 source cleanup)", "ifName", ifName, "podIP", podIP)
 	return nil
 }
 
