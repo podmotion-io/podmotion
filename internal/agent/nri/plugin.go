@@ -103,23 +103,46 @@ func (p *Plugin) WithK8sVerification(c client.Client, nodeName string) *Plugin {
 // command executes. If the container carries podmotion.io/checkpoint-ref, the
 // OnStartContainer callback is invoked to trigger CRIU restore into the live namespaces.
 func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent) error {
-	log.Info("NRI StartContainer hook called",
+	// ADR-0119 D2/D3: comma-ok map reads below are nil-safe in Go, so the unconditional
+	// log and annotation lookup cannot panic even when Annotations/Labels are nil.
+
+	// ADR-0119 D3: dual-path annotation read. Prefer the pod annotation (the Kubernetes
+	// pod spec annotation forwarded by the NRI runtime), then fall back to the
+	// container-level/Linux annotations (carried on event.Labels for broad compat with
+	// runtimes that surface them there).
+	const refKey = "podmotion.io/checkpoint-ref"
+	checkpointRef, matchPath := event.Annotations[refKey], "pod-annotation"
+	if checkpointRef == "" {
+		if v, ok := event.Labels[refKey]; ok {
+			checkpointRef, matchPath = v, "container-linux-annotation"
+		}
+	}
+	if checkpointRef == "" {
+		matchPath = "none"
+	}
+
+	// ADR-0119 D3: unconditional per-pod log for EVERY start event — matching or not —
+	// so a "hook never fired" failure is directly observable in the agent journal.
+	log.Info("NRI HandleStartContainer called",
 		"container", event.ID,
 		"name", event.Name,
 		"pod", event.Pod,
 		"namespace", event.Namespace,
+		"checkpointRefPresent", checkpointRef != "",
+		"matchPath", matchPath,
 	)
 
-	// Real NRI v2: pod annotations propagate into the sandbox annotations map.
-	// JSON stub: annotations field carries them explicitly.
-	// Also accept the label form as a fallback (set by pod_webhook.go for broad compat).
-	checkpointRef := event.Annotations["podmotion.io/checkpoint-ref"]
-	if checkpointRef == "" {
-		checkpointRef = event.Labels["podmotion.io/checkpoint-ref"]
-	}
 	if checkpointRef == "" {
 		return nil // not a restore target
 	}
+
+	// ADR-0119 D4: record the matched annotation value before invoking the restore path.
+	log.Info("NRI HandleStartContainer: checkpoint-ref found — invoking JoinNsRestore",
+		"pod", event.Pod,
+		"namespace", event.Namespace,
+		"checkpointRef", checkpointRef,
+		"matchPath", matchPath,
+	)
 
 	// Validate before the ref touches the filesystem — reject anything that isn't a
 	// plain identifier (no slashes, dots, or path traversal sequences).
@@ -208,6 +231,12 @@ type nriAdapter struct {
 // 30s >> 400ms — safe margin. If restore ever exceeds ~10s, containerd config must be
 // updated: [plugins."io.containerd.nri.v1.nri"] plugin_request_timeout = "60s".
 func (a *nriAdapter) StartContainer(ctx context.Context, pod *nriapi.PodSandbox, container *nriapi.Container) error {
+	// ADR-0119 D2: defensive nil guard. The NRI bridge can deliver a start event with a
+	// nil or incomplete sandbox/container (the source of the plugin.go panic). Treat it as
+	// a clean no-op rather than dereferencing nil.
+	if pod == nil || container == nil {
+		return nil
+	}
 	event := ContainerEvent{
 		ID:          container.GetId(),
 		Name:        container.GetName(),
