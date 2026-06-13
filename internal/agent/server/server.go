@@ -2029,10 +2029,15 @@ func (s *AgentServer) ConfirmOverlayReady(ctx context.Context, req *agentpb.Conf
 
 	var sourceFDB *network.FDBEntry
 	var destFDB *network.FDBEntry
-	if req.FdbIfname != "" && req.PodIp != "" && req.PodMac != "" && req.VtepIp != "" {
+	if req.FdbIfname != "" && req.PodIp != "" && req.PodMac != "" {
 		podIP := net.ParseIP(req.PodIp)
-		vtepIP := net.ParseIP(req.VtepIp)
 		podMAC, macErr := net.ParseMAC(req.PodMac)
+		// vtep_ip is optional: the caller may omit it because the destination agent is
+		// already on the destination node and can derive the VTEP IP from the interface.
+		vtepIP := net.ParseIP(req.VtepIp)
+		if vtepIP == nil && req.FdbIfname != "" {
+			vtepIP = localInterfaceIP(req.FdbIfname)
+		}
 		if podIP != nil && vtepIP != nil && macErr == nil {
 			e := network.FDBEntry{
 				IfName: req.FdbIfname,
@@ -2303,4 +2308,35 @@ func zeroizeDir(dir string) error {
 		return nil
 	})
 	return os.RemoveAll(dir)
+}
+
+// localInterfaceIP returns the first non-loopback, non-link-local unicast IPv4 address
+// assigned to the named interface. Used by ConfirmOverlayReady to derive the local VTEP IP
+// when the caller omits vtep_ip (the destination agent runs on the destination node and can
+// always resolve its own overlay interface address).
+func localInterfaceIP(ifname string) net.IP {
+	iface, err := net.InterfaceByName(ifname)
+	if err != nil {
+		return nil
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil
+	}
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			continue
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4
+		}
+	}
+	return nil
 }
