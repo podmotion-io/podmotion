@@ -696,6 +696,7 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		tcpFlag,
 		"--mntns-compat-mode",
 		"--manage-cgroups=ignore",
+		"--network-lock", "skip", // ADR-0126: netns is CNI-managed (ADR-0125); do not replay source iptables
 		"--ext-mount-map", "/dev/null:/dev/null",
 		"--ext-mount-map", fmt.Sprintf("/data:%s", dataDir),
 		"--ext-mount-map", fmt.Sprintf("/dev/termination-log:%s", termlogFile),
