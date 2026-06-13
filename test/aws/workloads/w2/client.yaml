@@ -1,0 +1,44 @@
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: w2-client
+  namespace: podmotion-gate
+  labels:
+    app: w2-client
+    podmotion.io/workload-type: w2
+spec:
+  nodeSelector:
+    podmotion.io/role: client
+  tolerations:
+    - key: podmotion.io/role
+      operator: Equal
+      value: client
+      effect: NoSchedule
+  restartPolicy: Always
+  containers:
+    - name: client
+      # w2 client binary — pin digest before gate run
+      image: podmotion-gate-client@sha256:FILL_IN_DIGEST
+      env:
+        - name: TARGET_SVC
+          value: w2-svc.podmotion-gate.svc.cluster.local:5432
+        - name: WORKLOAD_TYPE
+          value: postgresql
+        - name: PG_HOST
+          value: w2-svc.podmotion-gate.svc.cluster.local
+        - name: PG_PORT
+          value: "5432"
+        - name: PG_DB
+          value: gatedb
+        - name: PG_USER
+          value: gateuser
+        - name: PG_PASSWORD
+          value: gatepass
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi
