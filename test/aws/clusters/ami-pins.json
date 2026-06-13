@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0",
+  "note": "AMI IDs must be filled in by the operator before the gate run. See ADR-0117.",
+  "pinned_at": "FILL_IN",
+  "region": "us-east-1",
+  "arm64": {
+    "ami_id": "FILL_IN",
+    "kernel_version": "6.8+",
+    "base_os": "Ubuntu 24.04",
+    "image_builder_commit": "FILL_IN"
+  },
+  "x86_64": {
+    "ami_id": "FILL_IN",
+    "kernel_version": "6.8+",
+    "base_os": "Ubuntu 24.04",
+    "image_builder_commit": "FILL_IN"
+  }
+}
