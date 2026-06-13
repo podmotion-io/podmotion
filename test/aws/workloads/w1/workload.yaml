@@ -1,0 +1,70 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: podmotion-gate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: w1-workload
+  namespace: podmotion-gate
+  labels:
+    app: w1
+    podmotion.io/workload-type: w1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: w1
+  template:
+    metadata:
+      labels:
+        app: w1
+        podmotion.io/workload-type: w1
+    spec:
+      nodeSelector:
+        podmotion.io/role: worker
+      tolerations:
+        - key: podmotion.io/role
+          operator: Equal
+          value: worker
+          effect: NoSchedule
+      containers:
+        - name: nginx
+          # nginx:1.27-alpine — pin digest before run
+          image: nginx@sha256:FILL_IN_DIGEST
+          ports:
+            - containerPort: 80
+              name: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: w1-svc
+  namespace: podmotion-gate
+  labels:
+    app: w1
+    podmotion.io/workload-type: w1
+spec:
+  type: ClusterIP
+  selector:
+    app: w1
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 80
+      protocol: TCP
