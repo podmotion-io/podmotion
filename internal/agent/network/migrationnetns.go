@@ -63,6 +63,28 @@ func PrepareDestinationNetns(ctx context.Context, uid, podIP, podCIDR, bridgeNam
 		return nil, fmt.Errorf("PrepareDestinationNetns: invalid podIP %q", podIP)
 	}
 
+	// Idempotency (M22/M24 freeze-go): the controller calls this RPC on every
+	// DestinationPrewarm reconcile until DestinationNetnsReady=True. A prior
+	// reconcile may have already created the netns and its veth. If a live nsfs
+	// bind mount already exists at netnsPath, the netns is prepared — return it
+	// rather than failing with "already exists", which would livelock the phase.
+	// A leftover empty file with NO backing mount is stale; tear it down and recreate.
+	if _, statErr := os.Stat(netnsPath); statErr == nil {
+		if isNsfsMounted(netnsPath) {
+			log.Info("migration netns already prepared — reusing (idempotent)",
+				"netnsPath", netnsPath, "hostVeth", hostVeth, "podIP", podIP)
+			return &MigrationNetns{
+				NetnsPath:    netnsPath,
+				HostVethName: hostVeth,
+			}, nil
+		}
+		log.Info("stale migration netns file with no backing mount — cleaning up before recreate",
+			"netnsPath", netnsPath)
+		_ = removeVeth(hostVeth)
+		_ = unix.Unmount(netnsPath, unix.MNT_DETACH)
+		_ = os.Remove(netnsPath)
+	}
+
 	if err := createBindMountedNetns(netnsPath); err != nil {
 		return nil, fmt.Errorf("PrepareDestinationNetns: %w", err)
 	}
@@ -124,6 +146,39 @@ func TeardownMigrationNetns(ctx context.Context, ns *MigrationNetns) error {
 	return nil
 }
 
+// isNsfsMounted reports whether path is a live network-namespace bind mount
+// (filesystem type "nsfs"). Used to distinguish an already-prepared migration
+// netns (reuse, idempotent) from a stale empty backing file (recreate).
+// Reads /proc/self/mountinfo; returns false on any read error.
+func isNsfsMounted(path string) bool {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		// mountinfo format: ... <mount-point> ... - <fstype> <source> <opts>
+		// The mount point is field 5 (1-indexed); fstype follows the " - " separator.
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		if fields[4] != path {
+			continue
+		}
+		sep := -1
+		for i, f := range fields {
+			if f == "-" {
+				sep = i
+				break
+			}
+		}
+		if sep >= 0 && sep+1 < len(fields) && fields[sep+1] == "nsfs" {
+			return true
+		}
+	}
+	return false
+}
+
 // createBindMountedNetns creates a new network namespace and bind-mounts it
 // to path so it survives after the goroutine that created it exits.
 func createBindMountedNetns(path string) error {
@@ -178,6 +233,13 @@ func createBindMountedNetns(path string) error {
 // createVethPair creates a veth pair with hostVeth on the host and peerVeth
 // placed inside the netns at netnsPath.
 func createVethPair(hostVeth, peerVeth, netnsPath string) error {
+	// Idempotency: a prior aborted prepare can leak the host veth even after its
+	// netns mount is gone. RTM_NEWLINK then fails with EEXIST (errno 17). Remove any
+	// pre-existing host veth first so re-prepare succeeds. ENOENT is fine.
+	if _, lookErr := net.InterfaceByName(hostVeth); lookErr == nil {
+		_ = removeVeth(hostVeth)
+	}
+
 	// Open the target netns for the peer end.
 	nsFD, err := os.Open(netnsPath)
 	if err != nil {
