@@ -789,10 +789,13 @@ func hostLinkNameByIndex(out string, idx int) string {
 // replacement pod's host-side veth peer, bypassing the L3 local-input misclassification.
 // Idempotent: the ingress qdisc add tolerates "exists"; the filter is re-added on requeue.
 func installTCRedirect(ctx context.Context, fdbIf string, oldIP net.IP, vethPeer string) error {
-	// Ensure the ingress qdisc exists (idempotent: tolerate "exists"/"File exists").
+	// Ensure the ingress qdisc exists. `tc qdisc add ... ingress` fails with "Exclusivity flag
+	// on, cannot modify." (NOT "exists") when an ingress qdisc is already present — the ingress
+	// qdisc is a singleton. Tolerate both that and "exists"; only a genuinely different error
+	// is fatal. (`tc qdisc replace ingress` is rejected by some iproute2 builds, so we add+tolerate.)
 	if qOut, qErr := exec.CommandContext(ctx, "tc", "qdisc", "add", "dev", fdbIf, "ingress").CombinedOutput(); qErr != nil {
 		msg := strings.ToLower(strings.TrimSpace(string(qOut)))
-		if !strings.Contains(msg, "exists") {
+		if !strings.Contains(msg, "exists") && !strings.Contains(msg, "exclusivity") {
 			return fmt.Errorf("tc qdisc add ingress on %s: %w (%s)", fdbIf, qErr, strings.TrimSpace(string(qOut)))
 		}
 	}
