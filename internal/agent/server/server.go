@@ -869,54 +869,78 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) 
 		return 0, fmt.Errorf("criu restore start: %w", err)
 	}
 
-	// ADR-0123 D1: reap CRIU and gate on its exit code. CRIU on the cold (--join-ns net:<path>) path is
-	// NOT --leave-stopped (that flag is only on the --join-ns path), so it self-exits once the
-	// process tree is restored and Wait() returns promptly. Wait() is called exactly once here;
-	// no deferred cleanup also waits on this command (Arch-A double-Wait guard).
+	// ADR-0127 (revised Sprint 22): restore.log content is the PRIMARY success signal — and on the
+	// cold --join-ns net:<path> path CRIU does NOT self-exit. Without --restore-detached (forbidden
+	// by standing constraint) and without --leave-stopped (that flag is only on the TCP-stateful
+	// branch), CRIU restores the process tree, writes "Restore finished successfully. Tasks
+	// resumed." to restore.log, and then stays in the foreground as the parent of the restored
+	// workload, blocking in wait4() for the lifetime of the workload (confirmed Sprint 22: criu
+	// in do_wait, redis-server alive as its child, restore.log marker present, 57 KiB written).
 	//
-	// A non-nil Wait() error (including any non-zero exit code, which Wait surfaces as
-	// *exec.ExitError) means the restore failed: return immediately, do NOT scan for a PID, do
-	// NOT set criuRestoreConfirmed. The error carries the CRIU exit code and a bounded tail of
-	// restore.log for diagnosis (Decision 1 / AC5; Security note: tail capped at 4 KiB).
-	// ADR-0127: restore.log content is the PRIMARY success signal, not the CRIU exit code.
-	// CRIU exits non-zero due to post-restore iptables network-unlock failures in the joined
-	// CNI-managed netns (Sprint 20). That iptables-restore error occurs AFTER "Tasks resumed" —
-	// the process tree is already live. For a --join-ns net:<path> restore (ADR-0125) the netns is
-	// externally managed by CNI; iptables state belongs to CNI, not CRIU. We therefore read
-	// restore.log after Wait() returns (whether nil or non-nil) and gate on its content first.
-	waitErr := criuCmd.Wait()
-	exitCode := -1
-	if criuCmd.ProcessState != nil {
-		exitCode = criuCmd.ProcessState.ExitCode()
-	}
-	logBytes, _ := os.ReadFile(restoreLogPath)
-	restoreSucceeded := strings.Contains(string(logBytes), "Restore finished successfully")
+	// Therefore we must NOT call criuCmd.Wait() synchronously here — it would never return and the
+	// NRI StartContainer handler would hang until containerd kills the container (the Sprint 22
+	// failure: replacement pod entered Failed). Instead we poll restore.log for the success marker
+	// while CRIU keeps running; once the marker appears the process tree is live and we proceed.
+	// A background goroutine performs the single Wait() to reap CRIU if/when it eventually exits,
+	// so there is no zombie and Wait() is still called exactly once (Arch-A double-Wait guard).
+	criuReaped := make(chan error, 1)
+	go func() { criuReaped <- criuCmd.Wait() }()
 
-	if restoreSucceeded {
-		// PRIMARY signal: process tree was restored regardless of CRIU exit code. Proceed to PID scan.
-		if waitErr != nil {
-			log.Info("joinNsRestore: CRIU exited non-zero but restore.log confirms success (ADR-0127); "+
-				"treating as success — post-restore network-unlock failure is non-fatal",
-				"exitCode", exitCode, "waitErr", waitErr)
+	const (
+		markerPollInterval = 100 * time.Millisecond
+		markerPollTimeout  = 60 * time.Second
+	)
+	markerSeen := false
+	deadline := time.Now().Add(markerPollTimeout)
+	for time.Now().Before(deadline) {
+		if logBytes, rerr := os.ReadFile(restoreLogPath); rerr == nil &&
+			strings.Contains(string(logBytes), "Restore finished successfully") {
+			markerSeen = true
+			break
 		}
-	} else if waitErr == nil && exitCode == 0 {
-		// CRIU said ok but wrote no success marker — shouldn't happen on the cold path, but the
-		// process tree exited cleanly so honor it (ADR-0127). Keep the ADR-0123 D3 non-empty check.
-		if fi, statErr := os.Stat(restoreLogPath); statErr != nil || fi.Size() == 0 {
-			return 0, fmt.Errorf("criu restore reported exit 0 but restore.log is missing or empty at %s "+
-				"(ADR-0123 D3 verification failed): %v", restoreLogPath, statErr)
+		// If CRIU exited before writing the marker, stop polling and inspect the exit.
+		select {
+		case waitErr := <-criuReaped:
+			exitCode := -1
+			if criuCmd.ProcessState != nil {
+				exitCode = criuCmd.ProcessState.ExitCode()
+			}
+			// Re-read once: CRIU may have flushed the marker right before exiting.
+			if logBytes, rerr := os.ReadFile(restoreLogPath); rerr == nil &&
+				strings.Contains(string(logBytes), "Restore finished successfully") {
+				markerSeen = true
+			}
+			if !markerSeen {
+				stderrTail := strings.TrimSpace(criuStderr.String())
+				if len(stderrTail) > 4096 {
+					stderrTail = stderrTail[len(stderrTail)-4096:]
+				}
+				return 0, fmt.Errorf("criu restore exited (exit code %d) without 'Restore finished successfully' in restore.log: %w\ncriu stderr:\n%s\nrestore.log tail:\n%s",
+					exitCode, waitErr, stderrTail, readLogTail(restoreLogPath, 4096))
+			}
+		default:
 		}
-		log.Info("joinNsRestore: CRIU exited 0 without 'Restore finished successfully' marker (ADR-0127); "+
-			"proceeding on exit code", "restoreLogPath", restoreLogPath)
-	} else {
-		// FAIL: no success marker AND non-zero exit. Combine exit code + stderr + log tail.
+		if markerSeen {
+			break
+		}
+		time.Sleep(markerPollInterval)
+	}
+
+	if !markerSeen {
 		stderrTail := strings.TrimSpace(criuStderr.String())
 		if len(stderrTail) > 4096 {
 			stderrTail = stderrTail[len(stderrTail)-4096:]
 		}
-		return 0, fmt.Errorf("criu restore failed (exit code %d): %w\ncriu stderr:\n%s\nrestore.log tail:\n%s",
-			exitCode, waitErr, stderrTail, readLogTail(restoreLogPath, 4096))
+		return 0, fmt.Errorf("criu restore did not write 'Restore finished successfully' to restore.log within %s (ADR-0127): \ncriu stderr:\n%s\nrestore.log tail:\n%s",
+			markerPollTimeout, stderrTail, readLogTail(restoreLogPath, 4096))
 	}
+
+	// PRIMARY success: restore.log confirms the process tree was restored and resumed. CRIU remains
+	// running in the foreground as the workload parent; that is expected on this path and is NOT a
+	// zombie (the background goroutine above reaps it when the workload exits). Proceed to PID scan.
+	log.Info("joinNsRestore: restore.log confirms 'Restore finished successfully' (ADR-0127); "+
+		"CRIU remains as foreground workload parent — proceeding to PID resolution",
+		"restoreLogPath", restoreLogPath)
 
 	// Step 5: ADR-0123 D2 — locate the restored application PID via the replacement pod's
 	// cgroup, NOT by process name. CRIU has exited (D1), so its PID can no longer be confused
