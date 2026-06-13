@@ -996,6 +996,37 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		LeaveStopped: tcpEstablished,
 	})
 
+	// freezeTimestampNs is CLOCK_REALTIME ns captured immediately after CRIU dump
+	// returns. When LeaveStopped=true the process is in SIGSTOP at this point, so
+	// the socket table read below reflects the exact freeze-instant sequence numbers.
+	freezeTimestampNs := time.Now().UnixNano()
+
+	// Re-read socket inventory after dump succeeds so snd_nxt/rcv_nxt/ts_recent
+	// reflect the exact freeze instant (process is in SIGSTOP with LeaveStopped).
+	// The pre-dump read above captured approximate values; we replace them here.
+	if err == nil && tcpEstablished && containerPID != 0 {
+		if postEntries, invErr := network.SocketInventory(containerPID); invErr != nil {
+			log.Error(invErr, "Checkpoint: post-dump socket inventory failed — retaining pre-dump snapshots",
+				"pid", containerPID, "migration", req.MigrationName)
+		} else {
+			seqSnapshots = seqSnapshots[:0]
+			for _, e := range postEntries {
+				seqSnapshots = append(seqSnapshots, &agentpb.SeqSnapshot{
+					SrcIp:    e.SrcIP.String(),
+					SrcPort:  uint32(e.SrcPort),
+					DstIp:    e.DstIP.String(),
+					DstPort:  uint32(e.DstPort),
+					SndNxt:   e.SndNxt,
+					RcvNxt:   e.RcvNxt,
+					TsRecent: e.TsRecent,
+				})
+			}
+			log.Info("Checkpoint: post-dump socket inventory (exact freeze instant)",
+				"migration", req.MigrationName, "pid", containerPID,
+				"connections", len(seqSnapshots), "freezeTimestampNs", freezeTimestampNs)
+		}
+	}
+
 	var checkpointPath string
 	var sha256sum string
 	var sizeBytes int64
@@ -1068,6 +1099,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		CheckpointSha256:    sha256sum,
 		CheckpointSizeBytes: sizeBytes,
 		SeqSnapshots:        seqSnapshots,
+		FreezeTimestampNs:   freezeTimestampNs,
 	}, nil
 }
 

@@ -418,6 +418,32 @@ type PodMigrationStatus struct {
 	// the next reconcile skips the Get/Put and proceeds directly to gate removal + Restoring.
 	// +optional
 	CheckpointTransferred bool `json:"checkpointTransferred,omitempty"`
+
+	// SourceFreezeTimestampNs is CLOCK_REALTIME nanoseconds at the exact freeze instant,
+	// captured by the source agent after the CRIU dump completes with --leave-stopped.
+	// Passed as source_freeze_timestamp_ns in the RestoreRequest so the destination agent
+	// can compute the PAWS ts_delta for PM_SEQ_XLAT (ADR-0049).
+	// +optional
+	SourceFreezeTimestampNs int64 `json:"sourceFreezeTimestampNs,omitempty"`
+
+	// TCPSeqSnapshots holds the per-connection TCP sequence state captured at the exact
+	// freeze instant. Persisted across the Checkpoint→Restore phase boundary so the
+	// controller can pass it in RestoreRequest.seq_snapshots for PM_SEQ_XLAT seeding.
+	// +optional
+	TCPSeqSnapshots []TCPSeqSnapshot `json:"tcpSeqSnapshots,omitempty"`
+}
+
+// TCPSeqSnapshot captures the TCP sequence state for a single ESTABLISHED connection
+// at the exact freeze instant. Mirrors proto SeqSnapshot but stored in CRD status for
+// cross-phase persistence.
+type TCPSeqSnapshot struct {
+	SrcIP    string `json:"srcIP"`
+	SrcPort  uint32 `json:"srcPort"`
+	DstIP    string `json:"dstIP"`
+	DstPort  uint32 `json:"dstPort"`
+	SndNxt   uint32 `json:"sndNxt"`
+	RcvNxt   uint32 `json:"rcvNxt"`
+	TsRecent uint32 `json:"tsRecent,omitempty"`
 }
 
 // +kubebuilder:object:root=true
