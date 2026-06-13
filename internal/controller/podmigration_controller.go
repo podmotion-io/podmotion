@@ -2978,12 +2978,48 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 		// checkpoint path as /run/podmotion/checkpoints/<ref>/final in main.go.
 		newAnnotations["podmotion.io/checkpoint-ref"] = pm.Name
 		newAnnotations["podmotion.io/migration-namespace"] = pm.Namespace
+		// ADR-0130: mark that this pod's container command was replaced with a holder
+		// (the real workload is supplied by the CRIU-restored tree).
+		newAnnotations["podmotion.io/original-command-overridden"] = "true"
 	}
 
 	// Deep-copy spec; clear scheduler-assigned and mutable fields.
 	spec := *sourcePod.Spec.DeepCopy()
 	spec.SchedulerName = ""    // webhook injects podmotion-scheduler
 	spec.SchedulingGates = nil // webhook injects the gate
+
+	// ADR-0130: the replacement pod's container init must NOT run the real workload
+	// command. The NRI StartContainer hook fires CRIU restore as a side-effect AFTER
+	// containerd has already started the container's real init, so the CRIU-restored
+	// tree (ADR-0125 joins the pod netns; ADR-0128 places it in the pod cgroup) runs
+	// alongside containerd's init — not as it. If containerd's init runs the real
+	// command (e.g. redis-server), it collides with the restored process on the
+	// workload port in the shared pod netns, exits, and trips the operator's
+	// PodFailed rollback (reconcileRestoring). Override every container to a benign
+	// long-lived holder so containerd's init is a stable, never-exiting, no-contention
+	// process; the real workload is supplied solely by the CRIU-restored tree. Pod
+	// readiness is only a precondition here — the authoritative restore signal is
+	// status.criuRestoreConfirmed (ADR-0120 D1/D4).
+	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
+		// /bin/sh + sleep are present in standard base images (incl. redis:7).
+		// `exec sleep` makes sleep the container PID 1 so SIGTERM on pod delete
+		// terminates it cleanly. 2147483647 (~68y) is a portable "infinity" that
+		// works on BusyBox and GNU sleep alike.
+		holderCmd := []string{"/bin/sh", "-c"}
+		holderArgs := []string{"echo podmotion-holder ready; exec sleep 2147483647"}
+		for i := range spec.Containers {
+			spec.Containers[i].Command = holderCmd
+			spec.Containers[i].Args = holderArgs
+			// Strip probes: a probe against the holder (no real workload in that
+			// process tree) would fail, and a probe that hit the restored process on
+			// the pod IP would couple container readiness to a process containerd
+			// does not own. Readiness is gated by criuRestoreConfirmed + TrafficVerified.
+			spec.Containers[i].LivenessProbe = nil
+			spec.Containers[i].ReadinessProbe = nil
+			spec.Containers[i].StartupProbe = nil
+			spec.Containers[i].Lifecycle = nil
+		}
+	}
 
 	// Pin NodeName directly to the destination node if known.
 	// When the MutatingAdmissionWebhook is deployed it would enforce this via spec.destinationNode;
