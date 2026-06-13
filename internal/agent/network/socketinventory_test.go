@@ -17,8 +17,10 @@ import (
 func TestParseProcNetTCPLine_IPv4_Established(t *testing.T) {
 	// 0100007F:0050 is 127.0.0.1:80, 0200007F:C350 is 127.0.0.2:50000
 	// state 01 = ESTABLISHED
-	// Columns: sl local remote st tx:rx tr:tm retrnsmt uid timeout inode ref ptr drops snd_nxt rcv_nxt ts_recent wscale
-	// Indices:  0  1     2      3  4     5     6        7   8       9     10  11  12    13      14      15        16
+	// The /proc/net/tcp format does NOT contain snd_nxt or rcv_nxt; those columns
+	// are retransmits, predicted_ack, rto, ato, snd_cwnd, ssthresh.
+	// SndNxt and RcvNxt must always be zero from /proc/net/tcp parsing.
+	// (ADR-0049 Gap 1 / M23 critical finding "TCP sequence fidelity")
 	line := "  0: 0100007F:0050 0200007F:C350 01 00000000:00000000 00:00000000 00000000 0 0 1234 1 0000000000000000 100 AABBCCDD EEFF1122 DEADBEEF 00000105"
 	entry, ok, err := parseProcNetTCPLine(line, false)
 	if err != nil {
@@ -42,14 +44,17 @@ func TestParseProcNetTCPLine_IPv4_Established(t *testing.T) {
 	if entry.DstPort != 50000 {
 		t.Errorf("DstPort: got %d, want 50000", entry.DstPort)
 	}
-	if entry.SndNxt != 0xAABBCCDD {
-		t.Errorf("SndNxt: got %08X, want AABBCCDD", entry.SndNxt)
+	// SndNxt, RcvNxt, TsRecent must be zero: /proc/net/tcp does not contain sequence
+	// numbers. Any non-zero value would be from the wrong column (retransmits, rto, etc.)
+	// and would drive PM_SEQ_XLAT with garbage offsets, triggering TCP RST.
+	if entry.SndNxt != 0 {
+		t.Errorf("SndNxt must be 0 (not from /proc/net/tcp columns): got %08X", entry.SndNxt)
 	}
-	if entry.RcvNxt != 0xEEFF1122 {
-		t.Errorf("RcvNxt: got %08X, want EEFF1122", entry.RcvNxt)
+	if entry.RcvNxt != 0 {
+		t.Errorf("RcvNxt must be 0 (not from /proc/net/tcp columns): got %08X", entry.RcvNxt)
 	}
-	if entry.TsRecent != 0xDEADBEEF {
-		t.Errorf("TsRecent: got %08X, want DEADBEEF", entry.TsRecent)
+	if entry.TsRecent != 0 {
+		t.Errorf("TsRecent must be 0 (not from /proc/net/tcp columns): got %08X", entry.TsRecent)
 	}
 }
 
@@ -66,7 +71,9 @@ func TestParseProcNetTCPLine_NonEstablished(t *testing.T) {
 }
 
 func TestParseProcNetTCPFile(t *testing.T) {
-	// Columns: sl local remote st tx:rx tr:tm retrnsmt uid timeout inode ref ptr drops snd_nxt rcv_nxt ts_recent wscale
+	// /proc/net/tcp columns: sl local remote st tx:rx tr:tm retrnsmt uid timeout inode ...
+	// Extra columns after inode are NOT sequence numbers (see SocketEntry.SndNxt comment).
+	// The fixture has extra columns to confirm they are NOT parsed as sequence numbers.
 	content := `  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
    0: 0100007F:1F40 0200007F:0050 01 00000000:00000000 00:00000000 00000000 0 0 100 1 0000000000000000 0 DEADBEEF CAFEF00D 00001234 00000101
    1: 00000000:1F41 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 101 1 0
@@ -91,11 +98,14 @@ func TestParseProcNetTCPFile(t *testing.T) {
 	if e.DstPort != 80 { // 0x0050 = 80
 		t.Errorf("DstPort: got %d, want 80", e.DstPort)
 	}
-	if e.SndNxt != 0xDEADBEEF {
-		t.Errorf("SndNxt: got %08X, want DEADBEEF", e.SndNxt)
+	// SndNxt and RcvNxt must be zero: the columns after inode in /proc/net/tcp are
+	// NOT sequence numbers. They look like hex values (DEADBEEF, CAFEF00D) in the
+	// fixture but are retransmit counts / timing values on a real kernel.
+	if e.SndNxt != 0 {
+		t.Errorf("SndNxt must be 0 (not sourced from /proc/net/tcp): got %08X", e.SndNxt)
 	}
-	if e.RcvNxt != 0xCAFEF00D {
-		t.Errorf("RcvNxt: got %08X, want CAFEF00D", e.RcvNxt)
+	if e.RcvNxt != 0 {
+		t.Errorf("RcvNxt must be 0 (not sourced from /proc/net/tcp): got %08X", e.RcvNxt)
 	}
 }
 

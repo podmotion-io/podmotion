@@ -189,13 +189,28 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		LeaveRunning:   proto.Bool(opts.LeaveRunning),
 		LeaveStopped:   proto.Bool(opts.LeaveStopped),
 		TcpEstablished: proto.Bool(opts.TcpEstablished),
-		TcpClose:       proto.Bool(true),
-		// TcpSkipInFlight skips TCP sockets with in-flight data — avoids iptables
-		// network-lock scripts (iptables-restore) that are absent in kind agent images.
-		TcpSkipInFlight: proto.Bool(true),
-		// NetworkLock=SKIP bypasses iptables-based network namespace locking entirely.
-		// Safe for kind where network isolation is Docker-managed, not iptables per-ns.
-		NetworkLock: rpc.CriuNetworkLockMethod_SKIP.Enum(),
+		TcpClose: proto.Bool(true),
+		// TcpSkipInFlight: when TCP-stateful migration is active (TcpEstablished=true and
+		// LeaveStopped=true), in-flight data MUST NOT be silently skipped — that would drop
+		// busy connections, violating ADR-0049 "unacked==0 at dump time" requirement.
+		// TcpSkipInFlight is only safe for non-TCP-stateful dumps or when the zero-window
+		// hold has drained unacked data to zero beforehand.
+		// For TCP-stateful dumps: false (fail the dump if in-flight data is present, so the
+		// caller knows and can retry after the zero-window hold drains the send buffer).
+		// For non-TCP dumps: true (avoid iptables-restore failures in kind environments).
+		TcpSkipInFlight: proto.Bool(!opts.TcpEstablished),
+		// NetworkLock: for TCP-stateful migrations use IPTABLES (CRIU's default network lock)
+		// to prevent the peer from sending segments into a half-restored connection during the
+		// freeze→transfer→restore window. SKIP is only safe when an equivalent quiescence
+		// mechanism (e.g. zero-window hold + eBPF) is proven to fully substitute for it.
+		// For non-TCP dumps or kind-only dev environments, SKIP avoids iptables-restore
+		// failures when iptables is not available in the agent image.
+		NetworkLock: func() *rpc.CriuNetworkLockMethod {
+			if opts.TcpEstablished {
+				return rpc.CriuNetworkLockMethod_IPTABLES.Enum()
+			}
+			return rpc.CriuNetworkLockMethod_SKIP.Enum()
+		}(),
 		ShellJob:    proto.Bool(false),
 		TrackMem:    proto.Bool(false), // ARM64 lacks CONFIG_MEM_SOFT_DIRTY; not needed for cold migration
 		AutoDedup:   proto.Bool(true),
@@ -338,11 +353,20 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 		ImagesDirFd:     proto.Int32(int32(imgDirFd.Fd())),
 		LogFile:         proto.String("restore.log"),
 		LogLevel:        proto.Int32(4),
-		TcpEstablished:  proto.Bool(opts.TcpEstablished),
-		TcpClose:        proto.Bool(true),
-		TcpSkipInFlight: proto.Bool(true),
-		// NetworkLock=SKIP: no iptables-restore needed on destination either.
-		NetworkLock: rpc.CriuNetworkLockMethod_SKIP.Enum(),
+		TcpEstablished: proto.Bool(opts.TcpEstablished),
+		TcpClose:       proto.Bool(true),
+		// TcpSkipInFlight on restore: mirror the dump policy — only skip in-flight for
+		// non-TCP-stateful restores. For TCP-stateful restores the connection state must
+		// be fully intact (no in-flight data was present at dump time per ADR-0049).
+		TcpSkipInFlight: proto.Bool(!opts.TcpEstablished),
+		// NetworkLock on restore: CRIU uses this to prevent the peer from racing segments
+		// during the restore window. Mirror the dump policy — use IPTABLES for TCP-stateful.
+		NetworkLock: func() *rpc.CriuNetworkLockMethod {
+			if opts.TcpEstablished {
+				return rpc.CriuNetworkLockMethod_IPTABLES.Enum()
+			}
+			return rpc.CriuNetworkLockMethod_SKIP.Enum()
+		}(),
 		ShellJob:    proto.Bool(false),
 		ExtSharing:  proto.Bool(true),
 		ExtMasters:  proto.Bool(true),
