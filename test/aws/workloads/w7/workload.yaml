@@ -1,0 +1,161 @@
+---
+# W7 — multi-container-envoy
+# ADR-0112 §5: app listens 127.0.0.1:8080 only; Envoy listens 0.0.0.0:9090 and proxies to app.
+# Service targets Envoy port 9090. Envoy admin exposed on 9901 for ADR-0113 §5 assertion.
+# Images must be pinned by digest before gate run (see docs/sprints/m27-image-pins.md).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: podmotion-gate
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: w7-envoy-config
+  namespace: podmotion-gate
+  labels:
+    app: w7
+    podmotion.io/workload-type: w7
+data:
+  envoy.yaml: |
+    static_resources:
+      listeners:
+        - name: listener_0
+          address:
+            socket_address:
+              address: 0.0.0.0
+              port_value: 9090
+          filter_chains:
+            - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: ingress_http
+                    route_config:
+                      name: local_route
+                      virtual_hosts:
+                        - name: local_service
+                          domains: ["*"]
+                          routes:
+                            - match:
+                                prefix: "/"
+                              route:
+                                cluster: app_cluster
+                    http_filters:
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      clusters:
+        - name: app_cluster
+          connect_timeout: 5s
+          type: STATIC
+          load_assignment:
+            cluster_name: app_cluster
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: 127.0.0.1
+                          port_value: 8080
+    admin:
+      # ADR-0113 §5: admin port 9901 polled by gate harness for envoy_http_downstream_cx_active > 0
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 9901
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: w7-workload
+  namespace: podmotion-gate
+  labels:
+    app: w7
+    podmotion.io/workload-type: w7
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: w7
+  template:
+    metadata:
+      labels:
+        app: w7
+        podmotion.io/workload-type: w7
+    spec:
+      # ADR-0112 §4: workload pods must land on worker nodes, not client nodes
+      nodeSelector:
+        podmotion.io/role: worker
+      tolerations:
+        - key: podmotion.io/role
+          operator: Equal
+          value: worker
+          effect: NoSchedule
+      containers:
+        - name: app
+          # ADR-0112 §1: image pinned by digest; tag is a human-readable comment only
+          image: FILL_IN_DIGEST  # w7-app:latest — custom echo server, listens 127.0.0.1:8080
+          ports:
+            # ADR-0112 §5: app binds exclusively to loopback; direct external access is impossible
+            - containerPort: 8080
+              protocol: TCP
+              # Note: hostIP binding is enforced in the app binary, not here; this port is
+              # intentionally not exposed via the Service — only Envoy's 9090 is.
+          resources:
+            # ADR-0112 §3: W7 app container: 100m CPU / 128Mi memory; limit = 2x request
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+        - name: envoy
+          # ADR-0112 §1: image pinned by digest; tag is a human-readable comment only
+          image: FILL_IN_DIGEST  # envoy:v1.30 — static bootstrap, no xDS
+          args:
+            - -c
+            - /etc/envoy/envoy.yaml
+          ports:
+            # ADR-0112 §5: Envoy is the only ingress path from outside the pod
+            - containerPort: 9090
+              protocol: TCP
+            # ADR-0113 §5: admin port for gate harness Envoy resume assertion
+            - containerPort: 9901
+              protocol: TCP
+          resources:
+            # ADR-0112 §3: W7 Envoy sidecar: 100m CPU / 128Mi memory; limit = 2x request
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          volumeMounts:
+            - name: envoy-config
+              mountPath: /etc/envoy
+              readOnly: true
+      volumes:
+        - name: envoy-config
+          configMap:
+            name: w7-envoy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: w7-svc
+  namespace: podmotion-gate
+  labels:
+    app: w7
+    podmotion.io/workload-type: w7
+spec:
+  # ADR-0112 §2: ClusterIP only — NodePort/LoadBalancer prohibited in gate runs
+  type: ClusterIP
+  selector:
+    app: w7
+  ports:
+    # ADR-0112 §5: Service targets Envoy port 9090; app's 8080 is not exposed
+    - name: http
+      port: 8080
+      targetPort: 9090
+      protocol: TCP
