@@ -1684,6 +1684,60 @@ func (x *ReleaseCheckpointResponse) GetError() string {
 	return ""
 }
 
+// ConfirmOverlayReadyRequest is the hand-patched Go struct for the ConfirmOverlayReady RPC.
+type ConfirmOverlayReadyRequest struct {
+	MigrationName        string `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`
+	SeqXlatSeeded        bool   `protobuf:"varint,2,opt,name=seq_xlat_seeded,json=seqXlatSeeded,proto3" json:"seq_xlat_seeded,omitempty"`
+	FdbIfname            string `protobuf:"bytes,3,opt,name=fdb_ifname,json=fdbIfname,proto3" json:"fdb_ifname,omitempty"`
+	PodIp                string `protobuf:"bytes,4,opt,name=pod_ip,json=podIp,proto3" json:"pod_ip,omitempty"`
+	PodMac               string `protobuf:"bytes,5,opt,name=pod_mac,json=podMac,proto3" json:"pod_mac,omitempty"`
+	VtepIp               string `protobuf:"bytes,6,opt,name=vtep_ip,json=vtepIp,proto3" json:"vtep_ip,omitempty"`
+	SourceConntrackArmed bool   `protobuf:"varint,7,opt,name=source_conntrack_armed,json=sourceConntrackArmed,proto3" json:"source_conntrack_armed,omitempty"`
+	RestoreComplete      bool   `protobuf:"varint,8,opt,name=restore_complete,json=restoreComplete,proto3" json:"restore_complete,omitempty"`
+	SourceClockNs        int64  `protobuf:"varint,9,opt,name=source_clock_ns,json=sourceClockNs,proto3" json:"source_clock_ns,omitempty"`
+}
+
+func (x *ConfirmOverlayReadyRequest) Reset()         {}
+func (x *ConfirmOverlayReadyRequest) String() string  { return x.MigrationName }
+func (x *ConfirmOverlayReadyRequest) ProtoMessage()   {}
+
+func (x *ConfirmOverlayReadyRequest) GetMigrationName() string        { return x.MigrationName }
+func (x *ConfirmOverlayReadyRequest) GetSeqXlatSeeded() bool          { return x.SeqXlatSeeded }
+func (x *ConfirmOverlayReadyRequest) GetFdbIfname() string            { return x.FdbIfname }
+func (x *ConfirmOverlayReadyRequest) GetPodIp() string                { return x.PodIp }
+func (x *ConfirmOverlayReadyRequest) GetPodMac() string               { return x.PodMac }
+func (x *ConfirmOverlayReadyRequest) GetVtepIp() string               { return x.VtepIp }
+func (x *ConfirmOverlayReadyRequest) GetSourceConntrackArmed() bool   { return x.SourceConntrackArmed }
+func (x *ConfirmOverlayReadyRequest) GetRestoreComplete() bool        { return x.RestoreComplete }
+func (x *ConfirmOverlayReadyRequest) GetSourceClockNs() int64         { return x.SourceClockNs }
+
+// ConfirmOverlayReadyResponse is the hand-patched Go struct for the ConfirmOverlayReady RPC.
+type ConfirmOverlayReadyResponse struct {
+	Ready          bool   `protobuf:"varint,1,opt,name=ready,proto3" json:"ready,omitempty"`
+	BlockingReason string `protobuf:"bytes,2,opt,name=blocking_reason,json=blockingReason,proto3" json:"blocking_reason,omitempty"`
+	PredicateBOk   bool   `protobuf:"varint,3,opt,name=predicate_b_ok,json=predicateBOk,proto3" json:"predicate_b_ok,omitempty"`
+	PredicateCOk   bool   `protobuf:"varint,4,opt,name=predicate_c_ok,json=predicateCOk,proto3" json:"predicate_c_ok,omitempty"`
+	PredicateDOk   bool   `protobuf:"varint,5,opt,name=predicate_d_ok,json=predicateDOk,proto3" json:"predicate_d_ok,omitempty"`
+	PredicateEOk   bool   `protobuf:"varint,6,opt,name=predicate_e_ok,json=predicateEOk,proto3" json:"predicate_e_ok,omitempty"`
+	PredicateFOk   bool   `protobuf:"varint,7,opt,name=predicate_f_ok,json=predicateFOk,proto3" json:"predicate_f_ok,omitempty"`
+	TsDelta        int32  `protobuf:"varint,8,opt,name=ts_delta,json=tsDelta,proto3" json:"ts_delta,omitempty"`
+	DestClockNs    int64  `protobuf:"varint,9,opt,name=dest_clock_ns,json=destClockNs,proto3" json:"dest_clock_ns,omitempty"`
+}
+
+func (x *ConfirmOverlayReadyResponse) Reset()         {}
+func (x *ConfirmOverlayReadyResponse) String() string  { return "" }
+func (x *ConfirmOverlayReadyResponse) ProtoMessage()   {}
+
+func (x *ConfirmOverlayReadyResponse) GetReady() bool              { return x.Ready }
+func (x *ConfirmOverlayReadyResponse) GetBlockingReason() string   { return x.BlockingReason }
+func (x *ConfirmOverlayReadyResponse) GetPredicateBOk() bool       { return x.PredicateBOk }
+func (x *ConfirmOverlayReadyResponse) GetPredicateCOk() bool       { return x.PredicateCOk }
+func (x *ConfirmOverlayReadyResponse) GetPredicateDOk() bool       { return x.PredicateDOk }
+func (x *ConfirmOverlayReadyResponse) GetPredicateEOk() bool       { return x.PredicateEOk }
+func (x *ConfirmOverlayReadyResponse) GetPredicateFOk() bool       { return x.PredicateFOk }
+func (x *ConfirmOverlayReadyResponse) GetTsDelta() int32           { return x.TsDelta }
+func (x *ConfirmOverlayReadyResponse) GetDestClockNs() int64       { return x.DestClockNs }
+
 type ArmZeroWindowRequest struct {
 	state                protoimpl.MessageState `protogen:"open.v1"`
 	MigrationName        string                 `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`

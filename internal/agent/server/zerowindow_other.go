@@ -11,6 +11,7 @@ package server
 
 import (
 	"context"
+	"time"
 )
 
 // resolveVethIfindex is a no-op stub on non-Linux platforms.
@@ -31,4 +32,11 @@ func disarmZeroWindowBPF(_ context.Context, _ uint32) error {
 // pollUnackedZero is a no-op stub on non-Linux platforms.
 func pollUnackedZero(_ context.Context, _ string) error {
 	return nil
+}
+
+// monoTimeNs returns the current monotonic clock value in nanoseconds.
+// On non-Linux, returns wall-clock time as a fallback (acceptable for PAWS ts_delta
+// which only needs rough cross-node time ordering).
+func monoTimeNs() int64 {
+	return time.Now().UnixNano()
 }

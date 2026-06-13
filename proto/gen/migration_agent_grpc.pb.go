@@ -26,6 +26,7 @@ const (
 	MigrationAgentService_Restore_FullMethodName                 = "/podmotion.agent.v1.MigrationAgentService/Restore"
 	MigrationAgentService_Verify_FullMethodName                  = "/podmotion.agent.v1.MigrationAgentService/Verify"
 	MigrationAgentService_PrepareDestinationNetns_FullMethodName = "/podmotion.agent.v1.MigrationAgentService/PrepareDestinationNetns"
+	MigrationAgentService_ConfirmOverlayReady_FullMethodName     = "/podmotion.agent.v1.MigrationAgentService/ConfirmOverlayReady"
 	MigrationAgentService_ArmZeroWindow_FullMethodName           = "/podmotion.agent.v1.MigrationAgentService/ArmZeroWindow"
 	MigrationAgentService_DisarmZeroWindow_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/DisarmZeroWindow"
 	MigrationAgentService_Abort_FullMethodName                   = "/podmotion.agent.v1.MigrationAgentService/Abort"
@@ -56,6 +57,8 @@ type MigrationAgentServiceClient interface {
 	// PrepareDestinationNetns pre-stages the migration network namespace on the destination
 	// node and returns the file descriptor path and VTEP MAC for overlay FDB injection.
 	PrepareDestinationNetns(ctx context.Context, in *PrepareDestinationNetnsRequest, opts ...grpc.CallOption) (*PrepareDestinationNetnsResponse, error)
+	// ConfirmOverlayReady evaluates the ADR-0049 atomicity barrier predicates B–F.
+	ConfirmOverlayReady(ctx context.Context, in *ConfirmOverlayReadyRequest, opts ...grpc.CallOption) (*ConfirmOverlayReadyResponse, error)
 	// ArmZeroWindow attaches the zero_window eBPF program to the source pod veth TC egress,
 	// causing the kernel to advertise win=0 on all outgoing ACKs, stalling the peer sender.
 	// Must be called before FinalFreeze. The agent arms a watchdog that auto-disarms after
@@ -164,6 +167,16 @@ func (c *migrationAgentServiceClient) PrepareDestinationNetns(ctx context.Contex
 	return out, nil
 }
 
+func (c *migrationAgentServiceClient) ConfirmOverlayReady(ctx context.Context, in *ConfirmOverlayReadyRequest, opts ...grpc.CallOption) (*ConfirmOverlayReadyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ConfirmOverlayReadyResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_ConfirmOverlayReady_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *migrationAgentServiceClient) ArmZeroWindow(ctx context.Context, in *ArmZeroWindowRequest, opts ...grpc.CallOption) (*ArmZeroWindowResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ArmZeroWindowResponse)
@@ -255,6 +268,8 @@ type MigrationAgentServiceServer interface {
 	// PrepareDestinationNetns pre-stages the migration network namespace on the destination
 	// node and returns the file descriptor path and VTEP MAC for overlay FDB injection.
 	PrepareDestinationNetns(context.Context, *PrepareDestinationNetnsRequest) (*PrepareDestinationNetnsResponse, error)
+	// ConfirmOverlayReady evaluates the ADR-0049 atomicity barrier predicates B–F.
+	ConfirmOverlayReady(context.Context, *ConfirmOverlayReadyRequest) (*ConfirmOverlayReadyResponse, error)
 	// ArmZeroWindow attaches the zero_window eBPF program to the source pod veth TC egress,
 	// causing the kernel to advertise win=0 on all outgoing ACKs, stalling the peer sender.
 	// Must be called before FinalFreeze. The agent arms a watchdog that auto-disarms after
@@ -313,6 +328,9 @@ func (UnimplementedMigrationAgentServiceServer) Verify(context.Context, *VerifyR
 }
 func (UnimplementedMigrationAgentServiceServer) PrepareDestinationNetns(context.Context, *PrepareDestinationNetnsRequest) (*PrepareDestinationNetnsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PrepareDestinationNetns not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) ConfirmOverlayReady(context.Context, *ConfirmOverlayReadyRequest) (*ConfirmOverlayReadyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ConfirmOverlayReady not implemented")
 }
 func (UnimplementedMigrationAgentServiceServer) ArmZeroWindow(context.Context, *ArmZeroWindowRequest) (*ArmZeroWindowResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ArmZeroWindow not implemented")
@@ -482,6 +500,24 @@ func _MigrationAgentService_PrepareDestinationNetns_Handler(srv interface{}, ctx
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MigrationAgentService_ConfirmOverlayReady_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ConfirmOverlayReadyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).ConfirmOverlayReady(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_ConfirmOverlayReady_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).ConfirmOverlayReady(ctx, req.(*ConfirmOverlayReadyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MigrationAgentService_ArmZeroWindow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ArmZeroWindowRequest)
 	if err := dec(in); err != nil {
@@ -642,6 +678,10 @@ var MigrationAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PrepareDestinationNetns",
 			Handler:    _MigrationAgentService_PrepareDestinationNetns_Handler,
+		},
+		{
+			MethodName: "ConfirmOverlayReady",
+			Handler:    _MigrationAgentService_ConfirmOverlayReady_Handler,
 		},
 		{
 			MethodName: "ArmZeroWindow",

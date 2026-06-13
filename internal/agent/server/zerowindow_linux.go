@@ -197,6 +197,14 @@ func txQueueZero(pid int32) (bool, error) {
 	return true, nil
 }
 
+// monoTimeNs returns CLOCK_MONOTONIC in nanoseconds via clock_gettime(2).
+// Used for PAWS ts_delta computation across source and destination nodes.
+func monoTimeNs() int64 {
+	var ts syscall.Timespec
+	syscall.ClockGettime(syscall.CLOCK_MONOTONIC, &ts)
+	return ts.Nano()
+}
+
 // getsockoptTCPInfoUnacked calls getsockopt(TCP_INFO) on an open socket fd and returns
 // the tcpi_unacked counter. Exposed for callers that already hold an open fd inside
 // the pod's network namespace.

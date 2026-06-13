@@ -20,6 +20,11 @@ service MigrationAgentService {
   // PrepareDestinationNetns pre-stages the migration network namespace on the destination
   // node and returns the file descriptor path and VTEP MAC for overlay FDB injection.
   rpc PrepareDestinationNetns(PrepareDestinationNetnsRequest) returns (PrepareDestinationNetnsResponse);
+  // ConfirmOverlayReady evaluates the ADR-0049 atomicity barrier predicates B–F on the
+  // destination node and returns the result. The controller calls this RPC after Restore
+  // succeeds and before calling DisarmZeroWindow on the source node.
+  // Predicate A (tcpi_unacked==0) is checked by ArmZeroWindow on the source node.
+  rpc ConfirmOverlayReady(ConfirmOverlayReadyRequest) returns (ConfirmOverlayReadyResponse);
   // ArmZeroWindow attaches the zero_window eBPF program to the source pod veth TC egress,
   // causing the kernel to advertise win=0 on all outgoing ACKs, stalling the peer sender.
   // Must be called before FinalFreeze. The agent arms a watchdog that auto-disarms after
@@ -206,6 +211,52 @@ message ReleaseCheckpointRequest {
 message ReleaseCheckpointResponse {
   bool   success = 1;
   string error   = 2;
+}
+
+// ConfirmOverlayReadyRequest carries the barrier predicate inputs from the controller.
+// The destination agent evaluates predicates B–F locally and returns the result.
+message ConfirmOverlayReadyRequest {
+  string migration_name           = 1;
+  // seq_xlat_seeded must be set to true by the controller after SeedRelayFromSnapshots
+  // has populated PM_SEQ_XLAT (predicate B). Empty snapshot list → B is trivially satisfied.
+  bool   seq_xlat_seeded          = 2;
+  // fdb_ifname is the overlay interface name (e.g. "flannel.1") for RTM_GETNEIGH confirmation.
+  string fdb_ifname               = 3;
+  // pod_ip is the source pod IP used to look up AF_INET FDB entries.
+  string pod_ip                   = 4;
+  // pod_mac is the source pod MAC used to look up AF_BRIDGE FDB entries.
+  string pod_mac                  = 5;
+  // vtep_ip is the destination VTEP IP used in the AF_BRIDGE entry lookup.
+  string vtep_ip                  = 6;
+  // source_conntrack_armed indicates that the NOTRACK rule is confirmed on the source node.
+  bool   source_conntrack_armed   = 7;
+  // restore_complete indicates that CRIU restore has succeeded (predicate F).
+  bool   restore_complete         = 8;
+  // source_clock_ns is CLOCK_MONOTONIC ns captured on the source node at freeze time.
+  // Used with dest_clock_ns to compute PAWS ts_delta (RFC 7323 §5.3).
+  int64  source_clock_ns          = 9;
+}
+
+message ConfirmOverlayReadyResponse {
+  // ready is true when all evaluated predicates pass.
+  bool   ready             = 1;
+  // blocking_reason lists which predicates failed; empty when ready=true.
+  string blocking_reason   = 2;
+  // predicate_b_ok: PM_SEQ_XLAT seeded.
+  bool   predicate_b_ok    = 3;
+  // predicate_c_ok: AF_BRIDGE FDB confirmed.
+  bool   predicate_c_ok    = 4;
+  // predicate_d_ok: AF_INET FDB confirmed.
+  bool   predicate_d_ok    = 5;
+  // predicate_e_ok: conntrack NOTRACK armed on both nodes.
+  bool   predicate_e_ok    = 6;
+  // predicate_f_ok: CRIU restore complete.
+  bool   predicate_f_ok    = 7;
+  // ts_delta is the PAWS clock offset (ms) computed on the destination node.
+  // Seeded into PM_SEQ_XLAT ts_delta field before relay arms.
+  int32  ts_delta          = 8;
+  // dest_clock_ns is CLOCK_MONOTONIC ns captured on the destination at confirm time.
+  int64  dest_clock_ns     = 9;
 }
 
 message ArmZeroWindowRequest {
