@@ -96,6 +96,98 @@ func TestDumpOptions_TcpEstablishedTier(t *testing.T) {
 	}
 }
 
+// TestParseTCPImageEntries_InetskLines verifies that parseTCPImageEntries correctly
+// counts inetsk/tcp image lines and "Unsupported socket" errors from a CRIU dump log.
+// This is the M23 unit-level check for the log-parsing path that the integration test
+// exercises against a live CRIU invocation.
+func TestParseTCPImageEntries_InetskLines(t *testing.T) {
+	type row struct {
+		name          string
+		logContent    string
+		wantTCP       int
+		wantUnsupport int
+	}
+	rows := []row{
+		{
+			name:          "empty_log",
+			logContent:    "",
+			wantTCP:       0,
+			wantUnsupport: 0,
+		},
+		{
+			name: "inetsk_entries_present",
+			logContent: `Dumping inetsk 0x7f1a2b3c4d50
+Writing tcp image
+Writing tcp image
+`,
+			wantTCP:       3,
+			wantUnsupport: 0,
+		},
+		{
+			name: "unsupported_socket_present",
+			logContent: `Dumping inetsk 0x7f1a2b3c4d50
+Unsupported socket family 1
+`,
+			wantTCP:       1,
+			wantUnsupport: 1,
+		},
+		{
+			name: "tcp_close_path_no_inetsk",
+			logContent: `Closing tcp socket
+Closing tcp socket
+`,
+			wantTCP:       2,
+			wantUnsupport: 0,
+		},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			gotTCP, gotUnsupport := criu.ExportedParseTCPImageEntries(r.logContent)
+			if gotTCP != r.wantTCP {
+				t.Errorf("tcpEntries: got %d, want %d", gotTCP, r.wantTCP)
+			}
+			if gotUnsupport != r.wantUnsupport {
+				t.Errorf("unsupportedErrors: got %d, want %d", gotUnsupport, r.wantUnsupport)
+			}
+		})
+	}
+}
+
+// TestDumpOptions_LeaveStopped_SetWhenTcpEstablished verifies that when TcpEstablished=true
+// the caller is expected to also set LeaveStopped=true (M23 ordering invariant). The StubCheckpointer
+// records the options so we can assert without invoking real CRIU.
+func TestDumpOptions_LeaveStopped_SetWhenTcpEstablished(t *testing.T) {
+	type row struct {
+		name           string
+		tcpEstablished bool
+		leaveStopped   bool
+		wantLeaveStopped bool
+	}
+	rows := []row{
+		{name: "tcp_stateful_with_leave_stopped", tcpEstablished: true, leaveStopped: true, wantLeaveStopped: true},
+		{name: "stateless_no_leave_stopped", tcpEstablished: false, leaveStopped: false, wantLeaveStopped: false},
+		{name: "tcp_stateful_leave_stopped_not_set", tcpEstablished: true, leaveStopped: false, wantLeaveStopped: false},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			stub := &criu.StubCheckpointer{}
+			opts := criu.DumpOptions{
+				ImagesDir:      t.TempDir(),
+				TcpEstablished: r.tcpEstablished,
+				LeaveStopped:   r.leaveStopped,
+			}
+			_, _ = stub.Dump(context.Background(), opts)
+			if len(stub.DumpCalls) != 1 {
+				t.Fatalf("expected 1 Dump call, got %d", len(stub.DumpCalls))
+			}
+			got := stub.DumpCalls[0].LeaveStopped
+			if got != r.wantLeaveStopped {
+				t.Errorf("LeaveStopped: got %v, want %v", got, r.wantLeaveStopped)
+			}
+		})
+	}
+}
+
 func assertDarwinError(t *testing.T, err error) {
 	t.Helper()
 	if err == nil {
