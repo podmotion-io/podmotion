@@ -865,6 +865,14 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) 
 	// resolution errors), the only diagnostic is on stderr. A bounded buffer keeps it cheap.
 	var criuStderr bytes.Buffer
 	criuCmd.Stderr = &criuStderr
+
+	// ADR-0128: snapshot the agent's own cgroup PID set BEFORE launching CRIU. With
+	// --manage-cgroups=ignore the restored process tree inherits the launcher's (agent's)
+	// cgroup; we diff this snapshot after restore to find the new workload PID, then move
+	// it into the pod's sandbox cgroup. Best-effort: only used on the cold (sandboxID!="")
+	// path; a snapshot error there is fatal and surfaced at resolution time.
+	beforeAgentPIDs, agentPIDsErr := getAgentCgroupPIDs()
+
 	if err := criuCmd.Start(); err != nil {
 		return 0, fmt.Errorf("criu restore start: %w", err)
 	}
@@ -950,11 +958,34 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) 
 	// and retains the legacy name/cgroup scan.
 	var pid int
 	if sandboxID != "" {
-		pid, err = findRestoredPIDByCgroup(sandboxID)
+		// ADR-0128: --manage-cgroups=ignore leaves the restored tree in the AGENT's cgroup, not
+		// the pod cgroup, so the ADR-0123 D2 pod-cgroup scan finds nothing. Instead diff the agent
+		// cgroup against the pre-CRIU snapshot to find the new workload PID, then move it into the
+		// pod's sandbox cgroup so containerd/k8s can manage it.
+		if agentPIDsErr != nil {
+			return 0, fmt.Errorf("ADR-0128: snapshot agent cgroup PIDs before restore: %w", agentPIDsErr)
+		}
+		pid, err = findRestoredPIDInAgentCgroup(beforeAgentPIDs, criuCmd.Process.Pid)
 		if err != nil {
 			// Fail loud — never fall back to comm-scan on the cold path (D2 step 5 / AC5).
 			return 0, err
 		}
+		// Resolve the pod's sandbox cgroup path from the pause PID (same anchor as ADR-0123 D2).
+		pausePID, perr := sandboxPausePID(sandboxID)
+		if perr != nil {
+			return 0, fmt.Errorf("ADR-0128: resolve pause PID for sandbox %s: %w", sandboxID, perr)
+		}
+		podCgroup, cerr := cgroupV2Path(pausePID)
+		if cerr != nil {
+			return 0, fmt.Errorf("ADR-0128: read pod cgroup from pause PID %d (sandbox %s): %w",
+				pausePID, sandboxID, cerr)
+		}
+		// Move the restored tree root into the pod cgroup (single cgroup.procs write moves the group).
+		if merr := moveProcessToPodCgroup(pid, podCgroup); merr != nil {
+			return 0, fmt.Errorf("ADR-0128: move restored PID %d into pod cgroup %s: %w", pid, podCgroup, merr)
+		}
+		log.Info("joinNsRestore: moved restored process into pod cgroup (ADR-0128)",
+			"pid", pid, "podCgroup", podCgroup, "sandboxID", sandboxID)
 	} else {
 		pid, err = findRestoredProcessPID(checkpointDir)
 		if err != nil {
@@ -1056,6 +1087,82 @@ func findRestoredPIDByCgroup(sandboxID string) (int, error) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// getAgentCgroupPIDs implements ADR-0128: returns the set of PIDs currently resident in the
+// agent's OWN cgroup. It reads /proc/self/cgroup to get the agent's cgroup v2 path, then reads
+// cgroup.procs for that path. Used to snapshot the agent cgroup before CRIU starts so the
+// restored workload PID can be identified as the new entrant afterwards.
+func getAgentCgroupPIDs() (map[int]bool, error) {
+	selfPath, err := cgroupV2Path(os.Getpid())
+	if err != nil {
+		return nil, fmt.Errorf("read agent cgroup path from /proc/self/cgroup: %w", err)
+	}
+	procsPath := filepath.Join("/sys/fs/cgroup", selfPath, "cgroup.procs")
+	data, err := os.ReadFile(procsPath)
+	if err != nil {
+		return nil, fmt.Errorf("read agent cgroup.procs (%s): %w", procsPath, err)
+	}
+	pids := make(map[int]bool)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if pid, convErr := strconv.Atoi(line); convErr == nil {
+			pids[pid] = true
+		}
+	}
+	return pids, nil
+}
+
+// findRestoredPIDInAgentCgroup implements ADR-0128: with --manage-cgroups=ignore the CRIU-restored
+// process tree lands in the AGENT's cgroup (the launcher's). This scans the agent cgroup for PIDs
+// that were NOT present in beforePIDs (the pre-CRIU snapshot) and are NOT the CRIU process itself,
+// returning the LOWEST such PID — the restored tree root (the leader starts first; children get
+// higher PIDs). Retries for up to 10s at 200ms intervals to allow the restored tree to appear.
+func findRestoredPIDInAgentCgroup(beforePIDs map[int]bool, criuPID int) (int, error) {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		current, err := getAgentCgroupPIDs()
+		if err == nil {
+			bestPID := 0
+			for pid := range current {
+				if beforePIDs[pid] || pid == criuPID {
+					continue
+				}
+				// Defensive: never select the CRIU binary even if PID-reuse hides it.
+				comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+				if strings.TrimSpace(string(comm)) == "criu" {
+					continue
+				}
+				if bestPID == 0 || pid < bestPID {
+					bestPID = pid
+				}
+			}
+			if bestPID != 0 {
+				log.Info("findRestoredPIDInAgentCgroup: resolved restored PID via agent cgroup diff (ADR-0128)",
+					"pid", bestPID, "criuPID", criuPID)
+				return bestPID, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("%w (agent-cgroup diff, criuPID %d, 10s timeout)", ErrRestoredPIDNotFound, criuPID)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// moveProcessToPodCgroup implements ADR-0128: moves pid into the pod's sandbox cgroup by writing
+// it to <podCgroupPath>/cgroup.procs under /sys/fs/cgroup. A single cgroup.procs write moves the
+// whole thread group of the leader; the CRIU-restored tree shares one cgroup, so moving the root
+// migrates the group. podCgroupPath is the cgroup v2 path (e.g. "/kubepods.slice/.../...scope").
+func moveProcessToPodCgroup(pid int, podCgroupPath string) error {
+	procsPath := filepath.Join("/sys/fs/cgroup", podCgroupPath, "cgroup.procs")
+	if err := os.WriteFile(procsPath, []byte(strconv.Itoa(pid)), 0o644); err != nil {
+		return fmt.Errorf("write PID %d to %s: %w", pid, procsPath, err)
+	}
+	return nil
 }
 
 // scanCgroupForRestoredRoot performs one pass of the ADR-0123 D2 scan over /proc. It returns the
