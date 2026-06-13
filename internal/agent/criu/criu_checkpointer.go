@@ -469,6 +469,12 @@ func openDirFd(dirPath string) (*os.File, error) {
 	return f, nil
 }
 
+// ExportedParseTCPImageEntries is the exported wrapper around parseTCPImageEntries
+// for use in package-level tests (package criu_test).
+func ExportedParseTCPImageEntries(logContent string) (int, int) {
+	return parseTCPImageEntries(logContent)
+}
+
 // parseTCPImageEntries scans a CRIU dump or restore log for TCP image entries
 // (inetsk/tcp lines) and "Unsupported socket" error lines.
 // Returns (tcpEntryCount, unsupportedCount) as structured log fields.
