@@ -1,0 +1,108 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pm-ns4
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgres-ns4-pv
+spec:
+  capacity:
+    storage: 2Gi
+  accessModes:
+  - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-storage
+  local:
+    path: /var/lib/podmotion/ns4/postgres
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          - pm-control
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-ns4-pvc
+  namespace: pm-ns4
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: local-storage
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-ns4-init
+  namespace: pm-ns4
+data:
+  init.sql: |
+    CREATE TABLE IF NOT EXISTS pgbench_accounts (
+      aid    BIGINT PRIMARY KEY,
+      bid    INTEGER,
+      abalance INTEGER,
+      filler CHAR(84)
+    );
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-ns4
+  namespace: pm-ns4
+  labels:
+    app: postgres-ns4
+spec:
+  nodeName: pm-control
+  containers:
+  - name: postgres
+    image: postgres:16
+    env:
+    - name: POSTGRES_DB
+      value: pgbench
+    - name: POSTGRES_USER
+      value: pguser
+    - name: POSTGRES_PASSWORD
+      value: pgpass
+    - name: PGDATA
+      value: /var/lib/postgresql/data/pgdata
+    ports:
+    - containerPort: 5432
+    volumeMounts:
+    - name: data
+      mountPath: /var/lib/postgresql/data
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "250m"
+      limits:
+        memory: "512Mi"
+        cpu: "1000m"
+    readinessProbe:
+      exec:
+        command: ["pg_isready", "-U", "pguser", "-d", "pgbench"]
+      initialDelaySeconds: 5
+      periodSeconds: 2
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: postgres-ns4-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-ns4-svc
+  namespace: pm-ns4
+spec:
+  selector:
+    app: postgres-ns4
+  ports:
+  - port: 5432
+    targetPort: 5432
