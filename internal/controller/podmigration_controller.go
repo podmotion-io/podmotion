@@ -2395,6 +2395,22 @@ func (r *PodMigrationReconciler) reconcileRestoringNRI(ctx context.Context, pm *
 }
 
 
+// nodeInternalIP returns the InternalIP address of the named Node (the flannel VXLAN
+// underlay endpoint on this single-NIC PoC). Used by ADR-0136 to tell the source agent
+// which underlay IP to encapsulate the relocated OLD pod IP toward.
+func (r *PodMigrationReconciler) nodeInternalIP(ctx context.Context, nodeName string) (string, error) {
+	node := &corev1.Node{}
+	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+		return "", err
+	}
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == corev1.NodeInternalIP {
+			return addr.Address, nil
+		}
+	}
+	return "", fmt.Errorf("node %q has no InternalIP", nodeName)
+}
+
 // injectIPHandoff calls InjectIPHandoff on the DESTINATION agent (ADR-0133 D1/D2) to make
 // the OLD pod IP reachable at the replacement pod, then gates on the in-node reachability
 // probe (D5). On success it sets conditionIPHandoffInjected=True (and TrafficVerified=True
@@ -2490,6 +2506,36 @@ func (r *PodMigrationReconciler) injectIPHandoff(ctx context.Context, pm *pmv1.P
 			return ctrl.Result{}, sErr, false
 		}
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
+	}
+
+	// ADR-0136: now that the destination handoff is proven (probe passed), install the
+	// SOURCE-node VXLAN redirect so a client co-resident on the source node can reach the
+	// relocated OLD pod IP (Sprint 25 AC2). Best-effort — the destination-side reachability
+	// (AC1) is already proven; a source-redirect failure should not block the migration, it
+	// only degrades the co-resident-client case. It is requeue-safe (idempotent) and torn
+	// down by CleanupSourceIPHandoff after TrafficVerified=True.
+	if srcNode := pm.Status.SourceNodeName; srcNode != "" && srcNode != destNode {
+		if dstNodeIP, ipErr := r.nodeInternalIP(ctx, destNode); ipErr != nil || dstNodeIP == "" {
+			log.Error(ipErr, "injectIPHandoff: ADR-0136 could not resolve destination node IP — skipping source redirect (warn-only)",
+				"migration", pm.Name, "destNode", destNode)
+		} else if srcAgent, agErr := r.AgentPool.ForNode(ctx, srcNode); agErr != nil {
+			log.Error(agErr, "injectIPHandoff: ADR-0136 cannot connect to source agent — skipping source redirect (warn-only)",
+				"migration", pm.Name, "node", srcNode)
+		} else if redirResp, redirErr := srcAgent.InjectSourceRedirect(ctx, &agentpb.InjectSourceRedirectRequest{
+			MigrationName: pm.Name,
+			OldPodIp:      pm.Spec.SourcePodIP,
+			ReplVethMac:   pm.Status.ReplVethMAC,
+			DstNodeIp:     dstNodeIP,
+			FdbIfname:     fdbIfname,
+		}); redirErr != nil {
+			log.Error(redirErr, "injectIPHandoff: ADR-0136 InjectSourceRedirect RPC failed (warn-only)", "migration", pm.Name)
+		} else if !redirResp.Injected {
+			log.Info("injectIPHandoff: ADR-0136 InjectSourceRedirect returned injected=false (warn-only)",
+				"migration", pm.Name, "reason", redirResp.BlockingReason)
+		} else {
+			log.Info("injectIPHandoff: ADR-0136 source VXLAN redirect installed",
+				"migration", pm.Name, "srcNode", srcNode, "oldPodIP", pm.Spec.SourcePodIP, "dstNodeIP", dstNodeIP)
+		}
 	}
 
 	log.Info("injectIPHandoff: handoff injected and reachability probe passed (ADR-0133 AC1)",

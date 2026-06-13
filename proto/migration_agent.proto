@@ -64,6 +64,14 @@ service MigrationAgentService {
   // Decision 4). Deferred until after TrafficVerified=True and DisarmZeroWindow.
   // Idempotent: ENOENT is treated as success.
   rpc CleanupSourceIPHandoff(CleanupSourceIPHandoffRequest) returns (CleanupSourceIPHandoffResponse);
+  // InjectSourceRedirect installs the SOURCE-node VXLAN redirect for the OLD pod IP
+  // (ADR-0136). Because the OLD IP is in the source node's own pod CIDR, the kernel
+  // otherwise routes it to the dead local cni0 bridge. This installs three consistent
+  // entries on flannel.1 — a /32 route, an AF_INET neigh (oldIP->replVethMAC) and an
+  // AF_BRIDGE FDB (replVethMAC->destNodeIP) — so traffic is VXLAN-encapsulated to the
+  // destination VTEP instead. Called from injectIPHandoff after the destination probe
+  // passes; torn down by CleanupSourceIPHandoff after TrafficVerified=True. Idempotent.
+  rpc InjectSourceRedirect(InjectSourceRedirectRequest) returns (InjectSourceRedirectResponse);
   // VerifyTCP reads /proc/<pid>/net/tcp[6] on the destination node post-restore and
   // compares each ESTABLISHED 4-tuple's snd_nxt/rcv_nxt against the source SeqSnapshots
   // captured at freeze. Returns verified=true only when all connections match within
@@ -353,6 +361,26 @@ message CleanupSourceIPHandoffRequest {
 }
 message CleanupSourceIPHandoffResponse {
   bool   cleaned          = 1;
+  string blocking_reason  = 2;
+}
+
+// InjectSourceRedirectRequest carries the inputs for the ADR-0136 source-node VXLAN
+// redirect. All inputs are node-internal / control-plane sourced (no attacker data).
+message InjectSourceRedirectRequest {
+  string migration_name   = 1;
+  // old_pod_ip is the relocated source pod IP that must be redirected over the overlay.
+  string old_pod_ip       = 2;
+  // repl_veth_mac is the replacement pod's eth0 MAC (the MAC the L3 neigh resolves to;
+  // the AF_BRIDGE FDB is keyed on THIS MAC, not the destination VTEP MAC — ADR-0136).
+  string repl_veth_mac    = 3;
+  // dst_node_ip is the destination node's underlay (VTEP tunnel endpoint) IP, used as the
+  // AF_BRIDGE FDB destination so the VXLAN driver encapsulates frames to that node.
+  string dst_node_ip      = 4;
+  // fdb_ifname is the overlay interface name (default "flannel.1").
+  string fdb_ifname       = 5;
+}
+message InjectSourceRedirectResponse {
+  bool   injected         = 1;
   string blocking_reason  = 2;
 }
 

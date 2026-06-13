@@ -2483,6 +2483,142 @@ func (x *CleanupSourceIPHandoffResponse) GetBlockingReason() string {
 	return ""
 }
 
+// InjectSourceRedirectRequest carries the inputs for the ADR-0136 source-node VXLAN
+// redirect. All inputs are node-internal / control-plane sourced (no attacker data).
+type InjectSourceRedirectRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MigrationName string                 `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`
+	// old_pod_ip is the relocated source pod IP that must be redirected over the overlay.
+	OldPodIp string `protobuf:"bytes,2,opt,name=old_pod_ip,json=oldPodIp,proto3" json:"old_pod_ip,omitempty"`
+	// repl_veth_mac is the replacement pod's eth0 MAC (the MAC the L3 neigh resolves to;
+	// the AF_BRIDGE FDB is keyed on THIS MAC, not the destination VTEP MAC — ADR-0136).
+	ReplVethMac string `protobuf:"bytes,3,opt,name=repl_veth_mac,json=replVethMac,proto3" json:"repl_veth_mac,omitempty"`
+	// dst_node_ip is the destination node's underlay (VTEP tunnel endpoint) IP, used as the
+	// AF_BRIDGE FDB destination so the VXLAN driver encapsulates frames to that node.
+	DstNodeIp string `protobuf:"bytes,4,opt,name=dst_node_ip,json=dstNodeIp,proto3" json:"dst_node_ip,omitempty"`
+	// fdb_ifname is the overlay interface name (default "flannel.1").
+	FdbIfname     string `protobuf:"bytes,5,opt,name=fdb_ifname,json=fdbIfname,proto3" json:"fdb_ifname,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InjectSourceRedirectRequest) Reset() {
+	*x = InjectSourceRedirectRequest{}
+	mi := &file_migration_agent_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InjectSourceRedirectRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InjectSourceRedirectRequest) ProtoMessage() {}
+
+func (x *InjectSourceRedirectRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_migration_agent_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InjectSourceRedirectRequest.ProtoReflect.Descriptor instead.
+func (*InjectSourceRedirectRequest) Descriptor() ([]byte, []int) {
+	return file_migration_agent_proto_rawDescGZIP(), []int{35}
+}
+
+func (x *InjectSourceRedirectRequest) GetMigrationName() string {
+	if x != nil {
+		return x.MigrationName
+	}
+	return ""
+}
+
+func (x *InjectSourceRedirectRequest) GetOldPodIp() string {
+	if x != nil {
+		return x.OldPodIp
+	}
+	return ""
+}
+
+func (x *InjectSourceRedirectRequest) GetReplVethMac() string {
+	if x != nil {
+		return x.ReplVethMac
+	}
+	return ""
+}
+
+func (x *InjectSourceRedirectRequest) GetDstNodeIp() string {
+	if x != nil {
+		return x.DstNodeIp
+	}
+	return ""
+}
+
+func (x *InjectSourceRedirectRequest) GetFdbIfname() string {
+	if x != nil {
+		return x.FdbIfname
+	}
+	return ""
+}
+
+type InjectSourceRedirectResponse struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Injected       bool                   `protobuf:"varint,1,opt,name=injected,proto3" json:"injected,omitempty"`
+	BlockingReason string                 `protobuf:"bytes,2,opt,name=blocking_reason,json=blockingReason,proto3" json:"blocking_reason,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *InjectSourceRedirectResponse) Reset() {
+	*x = InjectSourceRedirectResponse{}
+	mi := &file_migration_agent_proto_msgTypes[36]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InjectSourceRedirectResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InjectSourceRedirectResponse) ProtoMessage() {}
+
+func (x *InjectSourceRedirectResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_migration_agent_proto_msgTypes[36]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InjectSourceRedirectResponse.ProtoReflect.Descriptor instead.
+func (*InjectSourceRedirectResponse) Descriptor() ([]byte, []int) {
+	return file_migration_agent_proto_rawDescGZIP(), []int{36}
+}
+
+func (x *InjectSourceRedirectResponse) GetInjected() bool {
+	if x != nil {
+		return x.Injected
+	}
+	return false
+}
+
+func (x *InjectSourceRedirectResponse) GetBlockingReason() string {
+	if x != nil {
+		return x.BlockingReason
+	}
+	return ""
+}
+
 // VerifyTCPRequest asks the destination agent to read /proc/<pid>/net/tcp[6]
 // and compare 4-tuples + snd_nxt/rcv_nxt against source_seq_snapshots.
 type VerifyTCPRequest struct {
@@ -2501,7 +2637,7 @@ type VerifyTCPRequest struct {
 
 func (x *VerifyTCPRequest) Reset() {
 	*x = VerifyTCPRequest{}
-	mi := &file_migration_agent_proto_msgTypes[35]
+	mi := &file_migration_agent_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2513,7 +2649,7 @@ func (x *VerifyTCPRequest) String() string {
 func (*VerifyTCPRequest) ProtoMessage() {}
 
 func (x *VerifyTCPRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_migration_agent_proto_msgTypes[35]
+	mi := &file_migration_agent_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2526,7 +2662,7 @@ func (x *VerifyTCPRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyTCPRequest.ProtoReflect.Descriptor instead.
 func (*VerifyTCPRequest) Descriptor() ([]byte, []int) {
-	return file_migration_agent_proto_rawDescGZIP(), []int{35}
+	return file_migration_agent_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *VerifyTCPRequest) GetMigrationName() string {
@@ -2592,7 +2728,7 @@ type VerifyTCPResponse struct {
 
 func (x *VerifyTCPResponse) Reset() {
 	*x = VerifyTCPResponse{}
-	mi := &file_migration_agent_proto_msgTypes[36]
+	mi := &file_migration_agent_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2604,7 +2740,7 @@ func (x *VerifyTCPResponse) String() string {
 func (*VerifyTCPResponse) ProtoMessage() {}
 
 func (x *VerifyTCPResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_migration_agent_proto_msgTypes[36]
+	mi := &file_migration_agent_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2617,7 +2753,7 @@ func (x *VerifyTCPResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyTCPResponse.ProtoReflect.Descriptor instead.
 func (*VerifyTCPResponse) Descriptor() ([]byte, []int) {
-	return file_migration_agent_proto_rawDescGZIP(), []int{36}
+	return file_migration_agent_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *VerifyTCPResponse) GetVerified() bool {
@@ -2851,6 +2987,17 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\rbridge_ifname\x18\x04 \x01(\tR\fbridgeIfname\"c\n" +
 	"\x1eCleanupSourceIPHandoffResponse\x12\x18\n" +
 	"\acleaned\x18\x01 \x01(\bR\acleaned\x12'\n" +
+	"\x0fblocking_reason\x18\x02 \x01(\tR\x0eblockingReason\"\xc5\x01\n" +
+	"\x1bInjectSourceRedirectRequest\x12%\n" +
+	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12\x1c\n" +
+	"\n" +
+	"old_pod_ip\x18\x02 \x01(\tR\boldPodIp\x12\"\n" +
+	"\rrepl_veth_mac\x18\x03 \x01(\tR\vreplVethMac\x12\x1e\n" +
+	"\vdst_node_ip\x18\x04 \x01(\tR\tdstNodeIp\x12\x1d\n" +
+	"\n" +
+	"fdb_ifname\x18\x05 \x01(\tR\tfdbIfname\"c\n" +
+	"\x1cInjectSourceRedirectResponse\x12\x1a\n" +
+	"\binjected\x18\x01 \x01(\bR\binjected\x12'\n" +
 	"\x0fblocking_reason\x18\x02 \x01(\tR\x0eblockingReason\"\xd6\x02\n" +
 	"\x10VerifyTCPRequest\x12%\n" +
 	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12\x17\n" +
@@ -2872,7 +3019,7 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\x1aMIGRATION_MODE_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17MIGRATION_MODE_PRE_COPY\x10\x01\x12\x1c\n" +
 	"\x18MIGRATION_MODE_POST_COPY\x10\x02\x12\x17\n" +
-	"\x13MIGRATION_MODE_COLD\x10\x032\x83\x0f\n" +
+	"\x13MIGRATION_MODE_COLD\x10\x032\xfe\x0f\n" +
 	"\x15MigrationAgentService\x12d\n" +
 	"\rPrepareSource\x12(.podmotion.agent.v1.PrepareSourceRequest\x1a).podmotion.agent.v1.PrepareSourceResponse\x12a\n" +
 	"\fPreDumpRound\x12'.podmotion.agent.v1.PreDumpRoundRequest\x1a(.podmotion.agent.v1.PreDumpRoundResponse\x12[\n" +
@@ -2891,7 +3038,8 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\x10GetCheckpointTar\x12+.podmotion.agent.v1.GetCheckpointTarRequest\x1a,.podmotion.agent.v1.GetCheckpointTarResponse\x12p\n" +
 	"\x11ReleaseCheckpoint\x12,.podmotion.agent.v1.ReleaseCheckpointRequest\x1a-.podmotion.agent.v1.ReleaseCheckpointResponse\x12j\n" +
 	"\x0fInjectIPHandoff\x12*.podmotion.agent.v1.InjectIPHandoffRequest\x1a+.podmotion.agent.v1.InjectIPHandoffResponse\x12\x7f\n" +
-	"\x16CleanupSourceIPHandoff\x121.podmotion.agent.v1.CleanupSourceIPHandoffRequest\x1a2.podmotion.agent.v1.CleanupSourceIPHandoffResponse\x12X\n" +
+	"\x16CleanupSourceIPHandoff\x121.podmotion.agent.v1.CleanupSourceIPHandoffRequest\x1a2.podmotion.agent.v1.CleanupSourceIPHandoffResponse\x12y\n" +
+	"\x14InjectSourceRedirect\x12/.podmotion.agent.v1.InjectSourceRedirectRequest\x1a0.podmotion.agent.v1.InjectSourceRedirectResponse\x12X\n" +
 	"\tVerifyTCP\x12$.podmotion.agent.v1.VerifyTCPRequest\x1a%.podmotion.agent.v1.VerifyTCPResponseB5Z3github.com/podmotion-io/podmotion/proto/gen;agentpbb\x06proto3"
 
 var (
@@ -2907,7 +3055,7 @@ func file_migration_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_migration_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_migration_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 37)
+var file_migration_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
 var file_migration_agent_proto_goTypes = []any{
 	(MigrationMode)(0),                      // 0: podmotion.agent.v1.MigrationMode
 	(*PrepareSourceRequest)(nil),            // 1: podmotion.agent.v1.PrepareSourceRequest
@@ -2945,8 +3093,10 @@ var file_migration_agent_proto_goTypes = []any{
 	(*InjectIPHandoffResponse)(nil),         // 33: podmotion.agent.v1.InjectIPHandoffResponse
 	(*CleanupSourceIPHandoffRequest)(nil),   // 34: podmotion.agent.v1.CleanupSourceIPHandoffRequest
 	(*CleanupSourceIPHandoffResponse)(nil),  // 35: podmotion.agent.v1.CleanupSourceIPHandoffResponse
-	(*VerifyTCPRequest)(nil),                // 36: podmotion.agent.v1.VerifyTCPRequest
-	(*VerifyTCPResponse)(nil),               // 37: podmotion.agent.v1.VerifyTCPResponse
+	(*InjectSourceRedirectRequest)(nil),     // 36: podmotion.agent.v1.InjectSourceRedirectRequest
+	(*InjectSourceRedirectResponse)(nil),    // 37: podmotion.agent.v1.InjectSourceRedirectResponse
+	(*VerifyTCPRequest)(nil),                // 38: podmotion.agent.v1.VerifyTCPRequest
+	(*VerifyTCPResponse)(nil),               // 39: podmotion.agent.v1.VerifyTCPResponse
 }
 var file_migration_agent_proto_depIdxs = []int32{
 	0,  // 0: podmotion.agent.v1.PrepareSourceRequest.mode:type_name -> podmotion.agent.v1.MigrationMode
@@ -2970,27 +3120,29 @@ var file_migration_agent_proto_depIdxs = []int32{
 	24, // 18: podmotion.agent.v1.MigrationAgentService.ReleaseCheckpoint:input_type -> podmotion.agent.v1.ReleaseCheckpointRequest
 	32, // 19: podmotion.agent.v1.MigrationAgentService.InjectIPHandoff:input_type -> podmotion.agent.v1.InjectIPHandoffRequest
 	34, // 20: podmotion.agent.v1.MigrationAgentService.CleanupSourceIPHandoff:input_type -> podmotion.agent.v1.CleanupSourceIPHandoffRequest
-	36, // 21: podmotion.agent.v1.MigrationAgentService.VerifyTCP:input_type -> podmotion.agent.v1.VerifyTCPRequest
-	2,  // 22: podmotion.agent.v1.MigrationAgentService.PrepareSource:output_type -> podmotion.agent.v1.PrepareSourceResponse
-	4,  // 23: podmotion.agent.v1.MigrationAgentService.PreDumpRound:output_type -> podmotion.agent.v1.PreDumpRoundResponse
-	6,  // 24: podmotion.agent.v1.MigrationAgentService.Checkpoint:output_type -> podmotion.agent.v1.CheckpointResponse
-	9,  // 25: podmotion.agent.v1.MigrationAgentService.PrepareDestination:output_type -> podmotion.agent.v1.PrepareDestinationResponse
-	13, // 26: podmotion.agent.v1.MigrationAgentService.Restore:output_type -> podmotion.agent.v1.RestoreResponse
-	15, // 27: podmotion.agent.v1.MigrationAgentService.Verify:output_type -> podmotion.agent.v1.VerifyResponse
-	11, // 28: podmotion.agent.v1.MigrationAgentService.PrepareDestinationNetns:output_type -> podmotion.agent.v1.PrepareDestinationNetnsResponse
-	27, // 29: podmotion.agent.v1.MigrationAgentService.ConfirmOverlayReady:output_type -> podmotion.agent.v1.ConfirmOverlayReadyResponse
-	29, // 30: podmotion.agent.v1.MigrationAgentService.ArmZeroWindow:output_type -> podmotion.agent.v1.ArmZeroWindowResponse
-	31, // 31: podmotion.agent.v1.MigrationAgentService.DisarmZeroWindow:output_type -> podmotion.agent.v1.DisarmZeroWindowResponse
-	17, // 32: podmotion.agent.v1.MigrationAgentService.Abort:output_type -> podmotion.agent.v1.AbortResponse
-	19, // 33: podmotion.agent.v1.MigrationAgentService.EstimateCheckpoint:output_type -> podmotion.agent.v1.EstimateCheckpointResponse
-	21, // 34: podmotion.agent.v1.MigrationAgentService.PutCheckpointTar:output_type -> podmotion.agent.v1.PutCheckpointTarResponse
-	23, // 35: podmotion.agent.v1.MigrationAgentService.GetCheckpointTar:output_type -> podmotion.agent.v1.GetCheckpointTarResponse
-	25, // 36: podmotion.agent.v1.MigrationAgentService.ReleaseCheckpoint:output_type -> podmotion.agent.v1.ReleaseCheckpointResponse
-	33, // 37: podmotion.agent.v1.MigrationAgentService.InjectIPHandoff:output_type -> podmotion.agent.v1.InjectIPHandoffResponse
-	35, // 38: podmotion.agent.v1.MigrationAgentService.CleanupSourceIPHandoff:output_type -> podmotion.agent.v1.CleanupSourceIPHandoffResponse
-	37, // 39: podmotion.agent.v1.MigrationAgentService.VerifyTCP:output_type -> podmotion.agent.v1.VerifyTCPResponse
-	22, // [22:40] is the sub-list for method output_type
-	4,  // [4:22] is the sub-list for method input_type
+	36, // 21: podmotion.agent.v1.MigrationAgentService.InjectSourceRedirect:input_type -> podmotion.agent.v1.InjectSourceRedirectRequest
+	38, // 22: podmotion.agent.v1.MigrationAgentService.VerifyTCP:input_type -> podmotion.agent.v1.VerifyTCPRequest
+	2,  // 23: podmotion.agent.v1.MigrationAgentService.PrepareSource:output_type -> podmotion.agent.v1.PrepareSourceResponse
+	4,  // 24: podmotion.agent.v1.MigrationAgentService.PreDumpRound:output_type -> podmotion.agent.v1.PreDumpRoundResponse
+	6,  // 25: podmotion.agent.v1.MigrationAgentService.Checkpoint:output_type -> podmotion.agent.v1.CheckpointResponse
+	9,  // 26: podmotion.agent.v1.MigrationAgentService.PrepareDestination:output_type -> podmotion.agent.v1.PrepareDestinationResponse
+	13, // 27: podmotion.agent.v1.MigrationAgentService.Restore:output_type -> podmotion.agent.v1.RestoreResponse
+	15, // 28: podmotion.agent.v1.MigrationAgentService.Verify:output_type -> podmotion.agent.v1.VerifyResponse
+	11, // 29: podmotion.agent.v1.MigrationAgentService.PrepareDestinationNetns:output_type -> podmotion.agent.v1.PrepareDestinationNetnsResponse
+	27, // 30: podmotion.agent.v1.MigrationAgentService.ConfirmOverlayReady:output_type -> podmotion.agent.v1.ConfirmOverlayReadyResponse
+	29, // 31: podmotion.agent.v1.MigrationAgentService.ArmZeroWindow:output_type -> podmotion.agent.v1.ArmZeroWindowResponse
+	31, // 32: podmotion.agent.v1.MigrationAgentService.DisarmZeroWindow:output_type -> podmotion.agent.v1.DisarmZeroWindowResponse
+	17, // 33: podmotion.agent.v1.MigrationAgentService.Abort:output_type -> podmotion.agent.v1.AbortResponse
+	19, // 34: podmotion.agent.v1.MigrationAgentService.EstimateCheckpoint:output_type -> podmotion.agent.v1.EstimateCheckpointResponse
+	21, // 35: podmotion.agent.v1.MigrationAgentService.PutCheckpointTar:output_type -> podmotion.agent.v1.PutCheckpointTarResponse
+	23, // 36: podmotion.agent.v1.MigrationAgentService.GetCheckpointTar:output_type -> podmotion.agent.v1.GetCheckpointTarResponse
+	25, // 37: podmotion.agent.v1.MigrationAgentService.ReleaseCheckpoint:output_type -> podmotion.agent.v1.ReleaseCheckpointResponse
+	33, // 38: podmotion.agent.v1.MigrationAgentService.InjectIPHandoff:output_type -> podmotion.agent.v1.InjectIPHandoffResponse
+	35, // 39: podmotion.agent.v1.MigrationAgentService.CleanupSourceIPHandoff:output_type -> podmotion.agent.v1.CleanupSourceIPHandoffResponse
+	37, // 40: podmotion.agent.v1.MigrationAgentService.InjectSourceRedirect:output_type -> podmotion.agent.v1.InjectSourceRedirectResponse
+	39, // 41: podmotion.agent.v1.MigrationAgentService.VerifyTCP:output_type -> podmotion.agent.v1.VerifyTCPResponse
+	23, // [23:42] is the sub-list for method output_type
+	4,  // [4:23] is the sub-list for method input_type
 	4,  // [4:4] is the sub-list for extension type_name
 	4,  // [4:4] is the sub-list for extension extendee
 	0,  // [0:4] is the sub-list for field type_name
@@ -3007,7 +3159,7 @@ func file_migration_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_migration_agent_proto_rawDesc), len(file_migration_agent_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   37,
+			NumMessages:   39,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
