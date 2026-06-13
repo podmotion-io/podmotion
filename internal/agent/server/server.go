@@ -109,6 +109,18 @@ type AgentServer struct {
 	// when the source is thawed on rollback/failure. On any error exit the PID must be
 	// SIGCONTed to prevent a permanently frozen source workload (ADR-0012 safety block).
 	frozenSourcePIDs map[string]int32 // migrationName -> host-namespace PID
+
+	// pendingResumePIDsMu guards pendingResumePIDs.
+	pendingResumePIDsMu sync.Mutex
+	// pendingResumePIDs tracks restored process PIDs whose SIGCONT (resume) has been
+	// DEFERRED on the TCP-stateful (Strict) path so the restored tree stays in SIGSTOP
+	// (CRIU --leave-stopped) until the destination OLD-IP datapath is installed and the
+	// reachability probe passes (ADR-0142 D3). The deferred SIGCONT fires as the final
+	// action of InjectIPHandoff. This realizes the seq_delta=0 "resume-after-handoff"
+	// invariant without a new gRPC method. On rollback/timeout the entry is dropped and
+	// the stopped tree is reaped with the rolled-back replacement pod (the held client
+	// connection survives via the still-frozen source — ADR-0012).
+	pendingResumePIDs map[string]int // migrationName -> restored root PID awaiting SIGCONT
 }
 
 // New constructs an AgentServer with the given Checkpointer implementation.
@@ -123,6 +135,7 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 		migrationSeqSnapshots: make(map[string][]*agentpb.SeqSnapshot),
 		zwHolds:               make(map[string]*zwHoldState),
 		frozenSourcePIDs:      make(map[string]int32),
+		pendingResumePIDs:     make(map[string]int),
 	}
 }
 
@@ -629,6 +642,44 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 		} else {
 			log.Info("InjectIPHandoff: reachability probe OK", "oldPodIP", req.OldPodIp)
 		}
+	}
+
+	// ADR-0142 D3: the deferred SIGCONT (seq_delta=0 path). The restored tree has been held
+	// in SIGSTOP since SocketsLive was confirmed in Restore. Now that the OLD-IP forward+reverse
+	// datapath (ADR-0133/0139/0140/0141) is installed and — when requested — the reachability
+	// probe passed, resume the tree as the FINAL action so the restored app only ever emits
+	// segments into a live datapath. Gate on the probe when one was requested; if the probe
+	// failed we leave the tree stopped and let the operator requeue (source still held).
+	if !req.Probe || resp.ProbeOk {
+		s.pendingResumePIDsMu.Lock()
+		resumePID, hasPending := s.pendingResumePIDs[req.MigrationName]
+		if hasPending {
+			delete(s.pendingResumePIDs, req.MigrationName)
+		}
+		s.pendingResumePIDsMu.Unlock()
+		if hasPending && resumePID > 0 {
+			socketsLiveAt := time.Now()
+			if err := syscall.Kill(resumePID, syscall.SIGCONT); err != nil {
+				// Re-record so a requeue can retry; do not fail the handoff (source held).
+				s.pendingResumePIDsMu.Lock()
+				s.pendingResumePIDs[req.MigrationName] = resumePID
+				s.pendingResumePIDsMu.Unlock()
+				log.Error(err, "InjectIPHandoff: deferred SIGCONT FAILED — restored tree still stopped, will retry on requeue (ADR-0142 D3)",
+					"migration", req.MigrationName, "pid", resumePID)
+			} else {
+				resumedAt := time.Now()
+				log.Info("InjectIPHandoff: deferred SIGCONT sent — restored tree resumed after datapath ready (ADR-0142 D3, seq_delta=0)",
+					"migration", req.MigrationName, "pid", resumePID, "resumedAt", resumedAt.UnixNano())
+				if s.k8sClient != nil {
+					if setErr := s.setOrderingConditions(req.MigrationName, resumePID, socketsLiveAt, resumedAt); setErr != nil {
+						log.Error(setErr, "InjectIPHandoff: failed to set ordering conditions after deferred SIGCONT", "migration", req.MigrationName)
+					}
+				}
+			}
+		}
+	} else {
+		log.Info("InjectIPHandoff: probe not OK — deferred SIGCONT withheld, restored tree held in SIGSTOP pending requeue (ADR-0142 D3)",
+			"migration", req.MigrationName)
 	}
 
 	log.Info("InjectIPHandoff: handoff injected (ADR-0133 D2)", "migration", req.MigrationName,
@@ -3066,7 +3117,13 @@ func (s *AgentServer) Restore(_ context.Context, req *agentpb.RestoreRequest) (*
 		// (SocketsLive) before sending SIGCONT. This is a hard gate — SIGCONT is withheld
 		// until the confirmed socket count matches the expected source connection count.
 		if req.DestNetnsFd != "" && pid > 0 {
-			socketsLiveAt, resumedAt, orderErr := enforceRestoreOrderingInvariant(pid, req.MigrationName, len(req.SeqSnapshots))
+			// ADR-0142 D3: defer SIGCONT past InjectIPHandoff whenever there is a
+			// TCP-established connection to preserve (the seq_delta=0 path). The restored
+			// tree stays SIGSTOP-held until the OLD-IP datapath is wired; InjectIPHandoff
+			// fires the deferred SIGCONT as its final action. When no TCP connections are
+			// expected, enforceRestoreOrderingInvariant resumes inline (deferResume ignored).
+			deferResume := len(req.SeqSnapshots) > 0
+			socketsLiveAt, resumedAt, orderErr := enforceRestoreOrderingInvariant(pid, req.MigrationName, len(req.SeqSnapshots), deferResume)
 			if orderErr != nil {
 				log.Error(orderErr, "Restore: ordering invariant FAILED — SIGCONT withheld, failing restore for rollback",
 					"migration", req.MigrationName, "pid", pid)
@@ -3075,13 +3132,22 @@ func (s *AgentServer) Restore(_ context.Context, req *agentpb.RestoreRequest) (*
 					ErrorMessage: fmt.Sprintf("ordering invariant: %v", orderErr),
 				}, nil
 			}
+			if deferResume && resumedAt.IsZero() {
+				// SocketsLive confirmed but SIGCONT deferred — record the pending PID so
+				// InjectIPHandoff can resume the tree after the datapath is live (ADR-0142 D3).
+				s.pendingResumePIDsMu.Lock()
+				s.pendingResumePIDs[req.MigrationName] = pid
+				s.pendingResumePIDsMu.Unlock()
+				log.Info("Restore: SIGCONT deferred — restored tree held in SIGSTOP until InjectIPHandoff (ADR-0142 D3)",
+					"migration", req.MigrationName, "pid", pid)
+			}
 			log.Info("Restore: ordering invariant satisfied",
 				"migration", req.MigrationName,
 				"socketsLiveAt", socketsLiveAt,
 				"resumedAt", resumedAt,
-				"socketsLiveBeforeResume", socketsLiveAt.Before(resumedAt),
+				"resumeDeferred", deferResume && resumedAt.IsZero(),
 			)
-			if s.k8sClient != nil {
+			if s.k8sClient != nil && !resumedAt.IsZero() {
 				if setErr := s.setOrderingConditions(req.MigrationName, pid, socketsLiveAt, resumedAt); setErr != nil {
 					// Ordering condition update failure is non-fatal for the migration itself,
 					// but we log it as an error because the condition API contract is violated.
@@ -3950,9 +4016,16 @@ func (s *AgentServer) thawFrozenSource(migrationName string) {
 //
 // expectedCount is the number of TCP connections from the source SeqSnapshots;
 // when 0 (non-TCP-stateful path) the function is a no-op that returns the current time.
-func enforceRestoreOrderingInvariant(pid int, migrationName string, expectedCount int) (time.Time, time.Time, error) {
+// deferResume (ADR-0142 D3): when true, this function confirms SocketsLive (ESTABLISHED
+// sockets ≥ expectedCount) but does NOT send SIGCONT — the restored tree stays in SIGSTOP
+// (CRIU --leave-stopped) and the caller records the PID for a later, datapath-gated SIGCONT
+// fired by InjectIPHandoff. resumedAt is returned as the zero time in that case. When false,
+// the legacy behavior is preserved: SIGCONT is sent inline immediately after SocketsLive.
+func enforceRestoreOrderingInvariant(pid int, migrationName string, expectedCount int, deferResume bool) (time.Time, time.Time, error) {
 	// If the restore was not TCP-stateful (no expected connections), skip socket
 	// polling and resume immediately — the invariant only applies to TCP migrations.
+	// (deferResume is irrelevant here: with no TCP sockets there is no seq_delta to
+	// preserve and no handoff to wait for.)
 	if expectedCount == 0 {
 		now := time.Now()
 		log.Info("enforceRestoreOrderingInvariant: no TCP connections expected, resuming immediately",
@@ -3989,6 +4062,21 @@ func enforceRestoreOrderingInvariant(pid int, migrationName string, expectedCoun
 		if lastCount >= expectedCount {
 			// Confirmed: at least expectedCount ESTABLISHED sockets observed.
 			socketsLiveAt := time.Now()
+			// ADR-0142 D3: on the seq_delta=0 path, defer SIGCONT until the destination
+			// OLD-IP datapath is installed (InjectIPHandoff). Confirm SocketsLive and
+			// return with a zero resumedAt; the caller records the pending PID. The
+			// restored tree stays in SIGSTOP, so it emits no segments into a not-yet-wired
+			// datapath — preserving the held client connection and seq_delta=0.
+			if deferResume {
+				log.Info("enforceRestoreOrderingInvariant: SocketsLive confirmed — SIGCONT DEFERRED until InjectIPHandoff (ADR-0142 D3)",
+					"migration", migrationName,
+					"pid", pid,
+					"establishedConnections", lastCount,
+					"expectedConnections", expectedCount,
+					"socketsLiveAt", socketsLiveAt.UnixNano(),
+				)
+				return socketsLiveAt, time.Time{}, nil
+			}
 			log.Info("enforceRestoreOrderingInvariant: SocketsLive confirmed — sending SIGCONT",
 				"migration", migrationName,
 				"pid", pid,
