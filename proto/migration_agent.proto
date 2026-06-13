@@ -53,6 +53,12 @@ service MigrationAgentService {
   // pm.Status.CheckpointTransferred has been durably persisted. Idempotent: returns
   // success if the directory is already absent (handles controller-restart replay).
   rpc ReleaseCheckpoint(ReleaseCheckpointRequest) returns (ReleaseCheckpointResponse);
+  // VerifyTCP reads /proc/<pid>/net/tcp[6] on the destination node post-restore and
+  // compares each ESTABLISHED 4-tuple's snd_nxt/rcv_nxt against the source SeqSnapshots
+  // captured at freeze. Returns verified=true only when all connections match within
+  // ±MSS (1448 bytes). Also issues the ApplicationProbe (SQL/TCP) when configured.
+  // Called by the controller during TCPVerifying phase per ADR-0019 Amendment A.
+  rpc VerifyTCP(VerifyTCPRequest) returns (VerifyTCPResponse);
 }
 
 message PrepareSourceRequest {
@@ -286,4 +292,26 @@ enum MigrationMode {
   MIGRATION_MODE_PRE_COPY    = 1;
   MIGRATION_MODE_POST_COPY   = 2;
   MIGRATION_MODE_COLD        = 3;
+}
+
+// VerifyTCPRequest asks the destination agent to read /proc/<pid>/net/tcp[6]
+// and compare 4-tuples + snd_nxt/rcv_nxt against source_seq_snapshots.
+message VerifyTCPRequest {
+  string migration_name          = 1;
+  string pod_uid                 = 2;
+  repeated SeqSnapshot source_seq_snapshots = 3;
+  // app_probe_protocol selects the optional SQL/TCP probe: "SQL", "TCP", or "".
+  string app_probe_protocol      = 4;
+  string app_probe_address       = 5; // host:port for TCP/SQL probe
+  string app_probe_query         = 6; // SQL query (e.g. "SELECT 1")
+  int32  app_probe_timeout_s     = 7;
+}
+
+message VerifyTCPResponse {
+  bool   verified              = 1;
+  string failure_reason        = 2;
+  int32  connections_verified  = 3;
+  int32  connections_expected  = 4;
+  bool   app_probe_ok          = 5;
+  string app_probe_error       = 6;
 }

@@ -34,6 +34,7 @@ const (
 	MigrationAgentService_PutCheckpointTar_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/PutCheckpointTar"
 	MigrationAgentService_GetCheckpointTar_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/GetCheckpointTar"
 	MigrationAgentService_ReleaseCheckpoint_FullMethodName       = "/podmotion.agent.v1.MigrationAgentService/ReleaseCheckpoint"
+	MigrationAgentService_VerifyTCP_FullMethodName               = "/podmotion.agent.v1.MigrationAgentService/VerifyTCP"
 )
 
 // MigrationAgentServiceClient is the client API for MigrationAgentService service.
@@ -87,6 +88,9 @@ type MigrationAgentServiceClient interface {
 	// pm.Status.CheckpointTransferred has been durably persisted. Idempotent: returns
 	// success if the directory is already absent (handles controller-restart replay).
 	ReleaseCheckpoint(ctx context.Context, in *ReleaseCheckpointRequest, opts ...grpc.CallOption) (*ReleaseCheckpointResponse, error)
+	// VerifyTCP reads /proc/<pid>/net/tcp[6] post-restore and compares snd_nxt/rcv_nxt
+	// against source SeqSnapshots. Issues SQL/TCP application probe when configured.
+	VerifyTCP(ctx context.Context, in *VerifyTCPRequest, opts ...grpc.CallOption) (*VerifyTCPResponse, error)
 }
 
 type migrationAgentServiceClient struct {
@@ -247,6 +251,16 @@ func (c *migrationAgentServiceClient) ReleaseCheckpoint(ctx context.Context, in 
 	return out, nil
 }
 
+func (c *migrationAgentServiceClient) VerifyTCP(ctx context.Context, in *VerifyTCPRequest, opts ...grpc.CallOption) (*VerifyTCPResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VerifyTCPResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_VerifyTCP_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MigrationAgentServiceServer is the server API for MigrationAgentService service.
 // All implementations must embed UnimplementedMigrationAgentServiceServer
 // for forward compatibility.
@@ -298,6 +312,9 @@ type MigrationAgentServiceServer interface {
 	// pm.Status.CheckpointTransferred has been durably persisted. Idempotent: returns
 	// success if the directory is already absent (handles controller-restart replay).
 	ReleaseCheckpoint(context.Context, *ReleaseCheckpointRequest) (*ReleaseCheckpointResponse, error)
+	// VerifyTCP reads /proc/<pid>/net/tcp[6] post-restore and compares snd_nxt/rcv_nxt
+	// against source SeqSnapshots. Issues SQL/TCP application probe when configured.
+	VerifyTCP(context.Context, *VerifyTCPRequest) (*VerifyTCPResponse, error)
 	mustEmbedUnimplementedMigrationAgentServiceServer()
 }
 
@@ -352,6 +369,9 @@ func (UnimplementedMigrationAgentServiceServer) GetCheckpointTar(context.Context
 }
 func (UnimplementedMigrationAgentServiceServer) ReleaseCheckpoint(context.Context, *ReleaseCheckpointRequest) (*ReleaseCheckpointResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReleaseCheckpoint not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) VerifyTCP(context.Context, *VerifyTCPRequest) (*VerifyTCPResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method VerifyTCP not implemented")
 }
 func (UnimplementedMigrationAgentServiceServer) mustEmbedUnimplementedMigrationAgentServiceServer() {}
 func (UnimplementedMigrationAgentServiceServer) testEmbeddedByValue()                               {}
@@ -644,6 +664,24 @@ func _MigrationAgentService_ReleaseCheckpoint_Handler(srv interface{}, ctx conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MigrationAgentService_VerifyTCP_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VerifyTCPRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).VerifyTCP(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_VerifyTCP_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).VerifyTCP(ctx, req.(*VerifyTCPRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // MigrationAgentService_ServiceDesc is the grpc.ServiceDesc for MigrationAgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -710,6 +748,10 @@ var MigrationAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReleaseCheckpoint",
 			Handler:    _MigrationAgentService_ReleaseCheckpoint_Handler,
+		},
+		{
+			MethodName: "VerifyTCP",
+			Handler:    _MigrationAgentService_VerifyTCP_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
