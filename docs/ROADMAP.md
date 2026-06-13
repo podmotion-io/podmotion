@@ -1,3 +1,5 @@
+> **See also: [NORTH_STAR_SPRINT_PLAN.md](NORTH_STAR_SPRINT_PLAN.md)** — the authoritative work plan including all ADR pipeline tasks and milestone gate conditions.
+
 # PodMotion Roadmap
 
 This document is the authoritative overview of where PodMotion is going and why. It
