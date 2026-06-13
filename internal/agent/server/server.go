@@ -203,20 +203,61 @@ func ReadReplVethMAC(pid int, sandboxNetnsPath string) (string, error) {
 	}
 	var lastErr error
 	for _, netnsArg := range attempts {
+		// Read the MAC via `ip link` (netlink, net-namespace-scoped) — NOT
+		// `cat /sys/class/net/eth0/address`. nsenter --net changes only the network
+		// namespace, leaving the host's /sys mount in place, so reading sysfs would
+		// return the HOST's interfaces, not the pod netns's. `ip -o link show eth0`
+		// queries the kernel via rtnetlink scoped to the entered netns.
 		out, err := exec.Command("nsenter", "--net="+netnsArg,
-			"cat", "/sys/class/net/eth0/address").CombinedOutput()
+			"ip", "-o", "link", "show", "eth0").CombinedOutput()
 		if err != nil {
-			lastErr = fmt.Errorf("ReadReplVethMAC: nsenter %s: %w (%s)", netnsArg, err, strings.TrimSpace(string(out)))
+			lastErr = fmt.Errorf("ReadReplVethMAC: nsenter %s ip link: %w (%s)", netnsArg, err, strings.TrimSpace(string(out)))
 			continue
 		}
-		mac := strings.TrimSpace(string(out))
+		mac := parseLinkEther(string(out))
 		if mac == "" {
-			lastErr = fmt.Errorf("ReadReplVethMAC: empty MAC via %s", netnsArg)
+			lastErr = fmt.Errorf("ReadReplVethMAC: no link/ether in `ip link show eth0` output via %s: %s", netnsArg, strings.TrimSpace(string(out)))
 			continue
 		}
 		return mac, nil
 	}
 	return "", lastErr
+}
+
+// parseLinkEther extracts the MAC from `ip -o link show <dev>` output, i.e. the token
+// following "link/ether". Returns "" if not found.
+func parseLinkEther(out string) string {
+	fields := strings.Fields(out)
+	for i, f := range fields {
+		if f == "link/ether" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	return ""
+}
+
+// resolvedNetnsPaths caches the netns path CRIU joined per migration (ADR-0133), so the NRI
+// restore callback can read eth0's MAC from the exact pod netns rather than the restored
+// PID's own ns/net (which can transiently resolve to the host netns post-restore).
+var (
+	resolvedNetnsPathsMu sync.RWMutex
+	resolvedNetnsPaths   = map[string]string{}
+)
+
+func storeResolvedNetnsPath(migrationName, path string) {
+	if migrationName == "" || path == "" {
+		return
+	}
+	resolvedNetnsPathsMu.Lock()
+	resolvedNetnsPaths[migrationName] = path
+	resolvedNetnsPathsMu.Unlock()
+}
+
+// ResolvedNetnsPath returns the netns path CRIU joined for migrationName, or "" if unknown.
+func (s *AgentServer) ResolvedNetnsPath(migrationName string) string {
+	resolvedNetnsPathsMu.RLock()
+	defer resolvedNetnsPathsMu.RUnlock()
+	return resolvedNetnsPaths[migrationName]
 }
 
 // SandboxNetnsPath resolves the network namespace path for a containerd sandbox ID, for use
@@ -1060,6 +1101,10 @@ func joinNsRestore(migrationName, checkpointDir, destNetnsFd, sandboxID string) 
 		// path, not by inherited fd.
 		_ = netnsFd.Close()
 		petnsPath = resolvedPath
+		// ADR-0133: stash the exact netns path CRIU joined so the NRI callback can read the
+		// replacement pod's eth0 MAC from it (the restored PID's own /proc/<pid>/ns/net can
+		// transiently resolve to the host netns right after CRIU exits).
+		storeResolvedNetnsPath(migrationName, petnsPath)
 		log.Info("joinNsRestore: joining replacement pod netns via --join-ns net:<path> (ADR-0125)",
 			"sandboxID", sandboxID, "netnsPath", petnsPath)
 	}
