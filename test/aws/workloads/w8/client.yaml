@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: w8-client
+  namespace: podmotion-gate
+  labels:
+    app: w8-client
+    podmotion.io/workload-type: w8
+spec:
+  nodeSelector:
+    podmotion.io/role: client
+  tolerations:
+    - key: podmotion.io/role
+      operator: Equal
+      value: client
+      effect: NoSchedule
+  restartPolicy: Never
+  containers:
+    - name: w8-client
+      # Client binary that maintains active connections to w8-svc:8080.
+      # Tag: podmotion/w8-client:latest
+      image: FILL_IN_DIGEST
+      env:
+        - name: TARGET_SVC
+          value: "w8-svc.podmotion-gate.svc.cluster.local:8080"
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "64Mi"
+        limits:
+          cpu: "100m"
+          memory: "128Mi"

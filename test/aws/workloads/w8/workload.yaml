@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: podmotion-gate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: w8-workload
+  namespace: podmotion-gate
+  labels:
+    app: w8
+    podmotion.io/workload-type: w8
+  annotations:
+    # W8 state hash assertion (ADR-0113 §4): harness execs this command pre- and
+    # post-migration and compares output (exact string match after whitespace trim).
+    podmotion.io/state-hash-cmd: "/app/hashstate"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: w8
+  template:
+    metadata:
+      labels:
+        app: w8
+        podmotion.io/workload-type: w8
+    spec:
+      nodeSelector:
+        podmotion.io/role: worker
+      tolerations:
+        - key: podmotion.io/role
+          operator: Equal
+          value: worker
+          effect: NoSchedule
+      containers:
+        - name: w8-compute
+          # CPU-bound Go binary; holds a large in-memory array; exposes /hashstate
+          # for state integrity assertion (ADR-0113 §4).
+          # Tag: podmotion/w8-compute:latest
+          image: FILL_IN_DIGEST
+          # No port needed — compute only; state hash via exec, not network.
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1024Mi"
