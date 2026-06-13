@@ -1,4 +1,115 @@
-# PodMotion — AWS Cost Plan (Local-First, AWS Only for Gate Runs)
+# AWS Cost Plan — PodMotion Gate Runs
+
+**Applies to:** M27 (single gate run) and M28 (80-run series)
+**Authority:** ADR-0116 (Cost Controls and Teardown SLA)
+**Last updated:** 2026-06-13
+
+---
+
+## Per-Run Cost Estimate
+
+Each gate run provisions 2 clusters (1 EKS + 1 self-managed kubeadm) for a maximum of 4 hours.
+All costs use us-east-1 on-demand pricing.
+
+| Component | Detail | Estimated Cost |
+|---|---|---|
+| EKS control plane | 2 clusters × $0.10/hr × 4 hr | $0.80 |
+| m7g.large worker nodes (arm64) | 2 nodes × $0.1626/hr × 4 hr | $1.30 |
+| m7i.large worker nodes (x86-64) | 2 nodes × $0.1904/hr × 4 hr | $1.52 |
+| m7i.large client node | 1 node × $0.1904/hr × 4 hr | $0.76 |
+| Self-managed EC2 nodes (kubeadm) | 4 nodes × mixed m7g/m7i × 4 hr | ~$3.00 |
+| EBS root volumes (node disks) | 5 nodes × 20 GiB gp3 × 4 hr | ~$3.00 |
+| ENI secondary IPs (aws-vpc-cni) | ~5 per node × 5 nodes | ~$5.00 |
+| Data transfer (inter-AZ) | Migration checkpoint payload × runs | ~$10.00 |
+| NAT gateway data processing | Outbound traffic from private subnets | ~$2.00 |
+| CloudWatch logs and metrics | Harness run log + node metrics | ~$2.00 |
+| ELB and miscellaneous | Headroom for unexpected AWS charges | ~$15.00 |
+| **Subtotal (estimated typical run)** | | **~$44–$55** |
+| **2× safety margin** | Per ADR-0116 §5 | **$100–$110** |
+| **Per-run budget cap** | Hard ceiling enforced by harness | **$200** |
+
+Note: typical run cost is estimated at $85–$110 USD per the harness pre-run prompt (ADR-0116 §6).
+
+---
+
+## Cost Circuit-Breaker
+
+- **Polling threshold:** $150 USD (75% of the $200 cap)
+- **Poll interval:** every 30 minutes via AWS Cost Explorer `GetCostAndUsage` API
+- **Scope:** resources tagged `podmotion:run-id=<run-uuid>`
+- **Metric:** `BLENDED_COST`
+- **Action on breach:** harness initiates immediate teardown; run marked `COST_EXCEEDED`
+
+The $150 threshold leaves $50 of buffer to absorb Cost Explorer data lag (up to 30–60 minutes)
+before the absolute $200 cap is reached.
+
+---
+
+## M27 Budget
+
+- **Milestone:** M27 pre-beta gate (single qualifying run)
+- **Runs:** 1
+- **Maximum spend:** $200
+- **Expected spend:** $85–$110
+
+---
+
+## M28 Budget Projection
+
+- **Milestone:** M28 80-run randomized gate series
+- **Runs:** 80
+- **On-demand maximum:** 80 runs × $200/run = **$16,000**
+- **Expected with spot instances:** 60–70% reduction once spot is enabled
+  - Estimated: 80 × $85 × 0.35 spot discount ≈ **$4,760–$5,600**
+
+Spot instances are **deferred to M28**. M27 uses on-demand only. Rationale: on-demand pricing
+eliminates spot interruption as a variable in the first qualifying run, ensuring the pass/fail
+result reflects PodMotion behavior rather than infrastructure instability. Reproducibility
+requires on-demand for M27.
+
+M28 spot instance design is tracked separately and requires a new ADR before implementation.
+
+---
+
+## Teardown SLA
+
+All clusters must be fully torn down within **10 minutes** of harness exit (ADR-0116 §4).
+
+- EKS deletion: typically 5–7 minutes
+- kubeadm EC2 termination: typically 1–2 minutes
+- Terraform VPC teardown: runs after cluster deletion completes
+
+Teardown failure writes `test/aws/run_reports/teardown_failed.json` and emits a `ERROR teardown_failed`
+line to stdout. Use `test/aws/cleanup_stale.sh` for manual recovery.
+
+---
+
+## Resource Tagging
+
+All AWS resources are tagged for cost scoping and recovery:
+
+| Tag | Value |
+|---|---|
+| `podmotion:run-id` | Run UUID (set per run by harness) |
+| `podmotion:gate` | `m27` or `m28` |
+| `podmotion:managed` | `true` |
+
+---
+
+## References
+
+- ADR-0116 — AWS Cost Controls and Teardown SLA
+- ADR-0111 — AWS Gate Cluster Provisioning Spec
+- ADR-0110 — AWS Gate Run Topology and Pass/Fail Adjudication
+- `test/aws/cleanup_stale.sh` — manual recovery for leaked resources
+- `test/aws/run_reports/` — per-run cost and teardown artifacts
+
+---
+
+## Prior Planning Notes (pre-ADR-0116)
+
+The following sections preserve the earlier local-first cost analysis that informed the M27 cluster
+topology decisions. They are superseded by ADR-0116 for gate run budget enforcement.
 
 **Status:** PLANNING — cost model for M27/M28 AWS proving
 **Author role:** AWS cost-efficiency architect
