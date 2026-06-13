@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pgbench-client-ns4
+  namespace: pm-ns4
+  labels:
+    app: pgbench-client-ns4
+spec:
+  nodeName: pm-worker
+  restartPolicy: Never
+  initContainers:
+  - name: pgbench-init
+    image: postgres:16
+    env:
+    - name: PGHOST
+      value: postgres-ns4-svc.pm-ns4.svc.cluster.local
+    - name: PGPORT
+      value: "5432"
+    - name: PGDATABASE
+      value: pgbench
+    - name: PGUSER
+      value: pguser
+    - name: PGPASSWORD
+      value: pgpass
+    command:
+    - pgbench
+    - -i
+    - -s
+    - "10"
+    - pgbench
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "100m"
+      limits:
+        memory: "128Mi"
+        cpu: "500m"
+  containers:
+  - name: pgbench
+    image: postgres:16
+    env:
+    - name: PGHOST
+      value: postgres-ns4-svc.pm-ns4.svc.cluster.local
+    - name: PGPORT
+      value: "5432"
+    - name: PGDATABASE
+      value: pgbench
+    - name: PGUSER
+      value: pguser
+    - name: PGPASSWORD
+      value: pgpass
+    command:
+    - pgbench
+    - -T
+    - "600"
+    - -c
+    - "8"
+    - -j
+    - "8"
+    - -P
+    - "1"
+    - pgbench
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "250m"
+      limits:
+        memory: "128Mi"
+        cpu: "1000m"
+---
+apiVersion: migration.podmotion.io/v1alpha1
+kind: PodMigration
+metadata:
+  name: pgbench-client-ns4-migrate
+  namespace: pm-ns4
+spec:
+  podName: pgbench-client-ns4
+  podNamespace: pm-ns4
+  targetNodeName: pm-control
+  mode: PreCopy
+  preCopyMaxRounds: 3
+  preCopyDirtyThresholdMB: 64
+  completionTimeoutSeconds: 300
+  rollbackOnFailure: true
+  affinityMode: ignore
+  tcpPreservationMode: Strict
+  freezeWindowBudgetMs: 500
+  applicationProbe:
+    protocol: SQL
+    query: "SELECT 1"
