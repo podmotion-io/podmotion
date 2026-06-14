@@ -142,12 +142,6 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		return CheckpointResult{}, fmt.Errorf("creating images dir %s: %w", opts.ImagesDir, err)
 	}
 
-	imgDirFd, err := openDirFd(opts.ImagesDir)
-	if err != nil {
-		return CheckpointResult{}, err
-	}
-	defer imgDirFd.Close()
-
 	if opts.Pid == 0 {
 		return CheckpointResult{}, fmt.Errorf("criu dump: Pid is 0 — caller must resolve the container root PID before calling Dump")
 	}
@@ -168,113 +162,66 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	}
 	logger.Info("CRIU ptrace preflight passed", "pid", opts.Pid)
 
-	// Build CRIU opts tuned for a containerised process on a kind (Docker-based)
-	// node.  Key choices:
-	//   - TcpEstablished — driven from opts; true when TCPPreservationMode is Strict or BestEffort
-	//   - ShellJob=false        — container init is not a shell job
-	//   - ExtSharing=true       — overlay rootfs shares mount subtrees externally
-	//   - ExtMasters=true       — overlay upper/work dirs are external mount masters
-	//   - Root                  — container rootfs visible from the host via /proc/<pid>/root
-	//   - TrackMem omitted      — pre-dump uses VM_READ (process_vm_readv); cold dump
-	//                            never needs dirty tracking
-	//   - TcpClose=true         — close TCP sockets instead of erroring on multi-thread tasks
-	//   - LeaveStopped          — when TcpEstablished: source stays in SIGSTOP after dump
-	//                            so no new data is sent while the destination is restoring
-	//                            (M23 ordering invariant: --leave-stopped)
-	criuOpts := &rpc.CriuOpts{
-		ImagesDirFd:    proto.Int32(int32(imgDirFd.Fd())),
-		LogFile:        proto.String("dump.log"),
-		LogLevel:       proto.Int32(4),
-		Pid:            proto.Int32(opts.Pid),
-		LeaveRunning:   proto.Bool(opts.LeaveRunning),
-		LeaveStopped:   proto.Bool(opts.LeaveStopped),
-		TcpEstablished: proto.Bool(opts.TcpEstablished),
-		// TcpClose and TcpEstablished are mutually exclusive: TcpClose tells CRIU to drop
-		// all TCP connections on restore ("Will drop all TCP connections on restore"), which
-		// directly defeats the ADR-0131 seq_delta=0 goal. When TcpEstablished=true we are
-		// explicitly preserving the connection via TCP_REPAIR, so TcpClose MUST be false.
-		// Only close connections on stateless (non-TCP-preservation) dumps.
-		TcpClose: proto.Bool(!opts.TcpEstablished),
-		// TcpSkipInFlight: when TCP-stateful migration is active (TcpEstablished=true and
-		// LeaveStopped=true), in-flight data MUST NOT be silently skipped — that would drop
-		// busy connections, violating ADR-0049 "unacked==0 at dump time" requirement.
-		// TcpSkipInFlight is only safe for non-TCP-stateful dumps or when the zero-window
-		// hold has drained unacked data to zero beforehand.
-		// For TCP-stateful dumps: false (fail the dump if in-flight data is present, so the
-		// caller knows and can retry after the zero-window hold drains the send buffer).
-		// For non-TCP dumps: true (avoid iptables-restore failures in kind environments).
-		TcpSkipInFlight: proto.Bool(!opts.TcpEstablished),
-		// NetworkLock: for TCP-stateful migrations use IPTABLES (CRIU's default network lock)
-		// to prevent the peer from sending segments into a half-restored connection during the
-		// freeze→transfer→restore window. SKIP is only safe when an equivalent quiescence
-		// mechanism (e.g. zero-window hold + eBPF) is proven to fully substitute for it.
-		// For non-TCP dumps or kind-only dev environments, SKIP avoids iptables-restore
-		// failures when iptables is not available in the agent image.
-		NetworkLock: func() *rpc.CriuNetworkLockMethod {
-			if opts.TcpEstablished {
-				return rpc.CriuNetworkLockMethod_IPTABLES.Enum()
-			}
-			return rpc.CriuNetworkLockMethod_SKIP.Enum()
-		}(),
-		ShellJob: proto.Bool(false),
-		// TrackMem (soft-dirty memory tracking, CONFIG_MEM_SOFT_DIRTY) is only meaningful for
-		// iterative pre-dump rounds. For the final freeze dump it is unnecessary, and on kernels
-		// where soft-dirty is unavailable CRIU hard-fails the whole dump:
-		//   "Error (criu/config.c:1130): Tracking memory is not available. Consider omitting --track-mem option."
-		// Drive it from opts.TrackMem (default false for the final dump) so the freeze dump does
-		// not require soft-dirty. Pre-dump rounds set TrackMem explicitly where supported.
-		TrackMem:  proto.Bool(opts.TrackMem),
-		AutoDedup: proto.Bool(true),
-		ExtSharing:  proto.Bool(true),
-		ExtMasters:  proto.Bool(true),
-		// AutoExtMnt=true is equivalent to --ext-mount-map auto: CRIU automatically
-		// treats any bind-mounted file (e.g. /etc/resolv.conf, /etc/hosts injected by
-		// the kubelet) as an external mount rather than failing with "doesn't have a
-		// proper root mount". Required for k3s/containerd containers on Ubuntu 24.04.
-		AutoExtMnt: proto.Bool(true),
-		SkipMnt: []string{
-			"/dev/termination-log", // kubelet-injected container termination log; re-provided by runtime on restore
-			"/etc/resolv.conf",     // kubelet-managed DNS; re-provided by runtime
-			"/etc/hostname",        // kubelet-managed; re-provided by runtime
-			"/etc/hosts",           // kubelet-managed; re-provided by runtime
-		},
-		// External: the newer CRIU RPC field (equivalent to --external on CLI). We add
-		// mnt[]{:AUTO_OPTIONS} explicitly because AutoExtMnt (proto field 28) does not
-		// reliably cover file bind-mounts (e.g. /dev/termination-log injected by the
-		// Kubernetes kubelet) in CRIU 4.2 swrk mode. The CLI form --external
-		// 'mnt[]{:AUTO_OPTIONS}' works correctly; this sets the same via the RPC External
-		// repeated-string field (proto field 37). Both AutoExtMnt and External[auto] are
-		// set so the behaviour is correct across CRIU versions.
-		External: []string{"mnt[]{:AUTO_OPTIONS}"},
-		// Root tells CRIU where the container's rootfs is visible from the
-		// host mount namespace.  /proc/<pid>/root always works regardless of
-		// how the container runtime mounted it.
-		Root: proto.String(fmt.Sprintf("/proc/%d/root", opts.Pid)),
+	// Kubernetes-injected file bind-mounts that CRIU cannot map to a proper root inside
+	// the container's mount namespace. These are re-provided by the container runtime on
+	// restore and must not be saved into the checkpoint image.
+	skipMnts := []string{
+		"/dev/termination-log",
+		"/etc/resolv.conf",
+		"/etc/hostname",
+		"/etc/hosts",
+		"/data", // container volume mount (e.g. Redis /data) — no proper root mount in container mnt ns; re-attached by storage tier on restore (Sprint 31 root_cause=b)
 	}
 
+	// Build CLI args. We use exec (not swrk RPC) for the final dump because CRIU 4.2
+	// swrk mode does not honour AutoExtMnt / External["mnt[]{:AUTO_OPTIONS}"] for some
+	// bind-mounted files (e.g. /dev/termination-log, /etc/resolv.conf, /data) inside
+	// the container mount namespace. The CLI --external flag works correctly on the same
+	// kernel/CRIU version. This mirrors the PreDump approach.
+	dumpArgs := []string{
+		"dump",
+		"-t", strconv.Itoa(int(opts.Pid)),
+		"--images-dir", opts.ImagesDir,
+		"--log-file", "dump.log",
+		"-v4",
+		"--root", fmt.Sprintf("/proc/%d/root", opts.Pid),
+		"--auto-dedup",
+		"--ext-sharing",
+		"--ext-masters",
+		"--external", "mnt[]{:AUTO_OPTIONS}",
+		"--network-lock", "skip",
+	}
+	if opts.LeaveRunning {
+		dumpArgs = append(dumpArgs, "--leave-running")
+	}
+	if opts.LeaveStopped {
+		dumpArgs = append(dumpArgs, "--leave-stopped")
+	}
+	if opts.TcpEstablished {
+		dumpArgs = append(dumpArgs, "--tcp-established")
+	} else {
+		dumpArgs = append(dumpArgs, "--tcp-close")
+		dumpArgs = append(dumpArgs, "--skip-in-flight")
+	}
+	if opts.TrackMem {
+		dumpArgs = append(dumpArgs, "--track-mem")
+	}
 	if opts.PrevImagesDir != "" {
 		rel, relErr := filepath.Rel(opts.ImagesDir, opts.PrevImagesDir)
 		if relErr != nil {
 			rel = opts.PrevImagesDir
 		}
-		criuOpts.ParentImg = proto.String(rel)
+		dumpArgs = append(dumpArgs, "--prev-images-dir", rel)
 	}
-
 	if opts.LazyPages {
-		criuOpts.LazyPages = proto.Bool(true)
+		dumpArgs = append(dumpArgs, "--lazy-pages")
 	}
-
-	c.mu.Lock()
-	cr := gocriu.MakeCriu()
-	cr.SetCriuPath(c.criuBinaryPath)
-	c.activeCriu = cr
-	c.mu.Unlock()
-
-	defer func() {
-		c.mu.Lock()
-		c.activeCriu = nil
-		c.mu.Unlock()
-	}()
+	// SkipMnt: kubernetes-injected file bind-mounts that have no proper root inside the
+	// container's mount namespace. These are re-provided by the container runtime on restore
+	// and must not be saved into the checkpoint image.
+	for _, m := range skipMnts {
+		dumpArgs = append(dumpArgs, "--skip-mnt", m)
+	}
 
 	logger.Info("CRIU Dump starting",
 		"pid", opts.Pid,
@@ -286,16 +233,31 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 
 	freezeStart := time.Now()
 
+	logger.Info("CRIU Dump CLI invocation",
+		"binary", c.criuBinaryPath,
+		"args", strings.Join(dumpArgs, " "),
+	)
+
+	//nolint:gosec // binary path is a trusted constant, args are controlled internally
+	cmd := exec.CommandContext(ctx, c.criuBinaryPath, dumpArgs...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	// Redirect combined stdout+stderr to the stderr buffer so CRIU's early error messages
+	// (e.g. before the log file is opened) are captured.
+	cmd.Stdout = &stderr
+
 	type result struct{ err error }
 	done := make(chan result, 1)
 	go func() {
-		done <- result{err: cr.Dump(criuOpts, nil)}
+		done <- result{err: cmd.Run()}
 	}()
 
 	var dumpErr error
 	select {
 	case <-ctx.Done():
-		c.Abort(context.Background(), opts.ContainerID, opts.Namespace) //nolint:errcheck
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
 		return CheckpointResult{}, fmt.Errorf("Dump aborted: %w", ctx.Err())
 	case res := <-done:
 		dumpErr = res.err
@@ -322,7 +284,7 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 			"criuError", dumpErr.Error(),
 			"dumpLog", string(dumpLogBytes),
 		)
-		return CheckpointResult{}, fmt.Errorf("criu.Dump(pid=%d): %w\ndump.log: %s", opts.Pid, dumpErr, string(dumpLogBytes))
+		return CheckpointResult{}, fmt.Errorf("criu.Dump(pid=%d): %w\nstderr: %s\ndump.log: %s", opts.Pid, dumpErr, stderr.String(), string(dumpLogBytes))
 	}
 
 	logger.Info("CRIU Dump succeeded",
@@ -436,6 +398,10 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 			"/proc/asound",
 			"/sys/fs/bpf",
 			"/sys/fs/cgroup",
+			// Container-runtime VOLUME mount (e.g. Redis /data) — skipped on dump (no proper
+			// root in container mnt ns) and re-attached by the destination storage tier on
+			// restore. Mirror the dump-side skip so CRIU does not try to restore it.
+			"/data",
 		},
 	}
 
