@@ -232,6 +232,20 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		// the kubelet) as an external mount rather than failing with "doesn't have a
 		// proper root mount". Required for k3s/containerd containers on Ubuntu 24.04.
 		AutoExtMnt: proto.Bool(true),
+		SkipMnt: []string{
+			"/dev/termination-log", // kubelet-injected container termination log; re-provided by runtime on restore
+			"/etc/resolv.conf",     // kubelet-managed DNS; re-provided by runtime
+			"/etc/hostname",        // kubelet-managed; re-provided by runtime
+			"/etc/hosts",           // kubelet-managed; re-provided by runtime
+		},
+		// External: the newer CRIU RPC field (equivalent to --external on CLI). We add
+		// mnt[]{:AUTO_OPTIONS} explicitly because AutoExtMnt (proto field 28) does not
+		// reliably cover file bind-mounts (e.g. /dev/termination-log injected by the
+		// Kubernetes kubelet) in CRIU 4.2 swrk mode. The CLI form --external
+		// 'mnt[]{:AUTO_OPTIONS}' works correctly; this sets the same via the RPC External
+		// repeated-string field (proto field 37). Both AutoExtMnt and External[auto] are
+		// set so the behaviour is correct across CRIU versions.
+		External: []string{"mnt[]{:AUTO_OPTIONS}"},
 		// Root tells CRIU where the container's rootfs is visible from the
 		// host mount namespace.  /proc/<pid>/root always works regardless of
 		// how the container runtime mounted it.
