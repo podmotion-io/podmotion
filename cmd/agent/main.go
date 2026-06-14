@@ -13,12 +13,14 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"runtime"
 	"syscall"
 	"time"
 
+	"github.com/go-logr/logr"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,6 +38,30 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/server"
 	agenttls "github.com/podmotion-io/podmotion/internal/agent/tls"
 )
+
+const tmpfsMagic = 0x01021994
+
+func mustEnsureCheckpointTmpfs(log logr.Logger, path string) {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		log.Error(err, "failed to create checkpoint root", "path", path)
+		os.Exit(1)
+	}
+	// The agent runs in its own mount namespace (container overlayfs), so statfs on
+	// the in-container path returns the overlayfs fstype. We verify via the host
+	// mount namespace by reading through /proc/1/root (hostPID=true + privileged).
+	hostPath := "/proc/1/root" + path
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(hostPath, &st); err != nil {
+		log.Error(err, "failed to statfs checkpoint root via host ns", "hostPath", hostPath)
+		os.Exit(1)
+	}
+	if st.Type != tmpfsMagic {
+		log.Error(fmt.Errorf("got fstype 0x%x, want 0x%x (tmpfs)", st.Type, tmpfsMagic),
+			"ADR-0146 §5 violation: checkpoint dir is not tmpfs — aborting", "path", path)
+		os.Exit(1)
+	}
+	log.Info("checkpoint tmpfs verified", "path", path, "mode", "0700")
+}
 
 var scheme = k8sruntime.NewScheme()
 
@@ -55,6 +81,8 @@ func main() {
 		log.Error(nil, "NODE_NAME env var not set")
 		os.Exit(1)
 	}
+
+	mustEnsureCheckpointTmpfs(log, "/run/podmotion/checkpoints")
 
 	// Try in-cluster config first (DaemonSet pod), fall back to kubeconfig file
 	// (bare binary on VM for PoC sprints).
