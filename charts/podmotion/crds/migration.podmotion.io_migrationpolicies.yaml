@@ -1,0 +1,513 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: migrationpolicies.migration.podmotion.io
+spec:
+  group: migration.podmotion.io
+  names:
+    categories:
+    - podmotion
+    kind: MigrationPolicy
+    listKind: MigrationPolicyList
+    plural: migrationpolicies
+    shortNames:
+    - mp
+    singular: migrationpolicy
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.activeMigrations
+      name: Active
+      type: integer
+    - jsonPath: .status.totalMigrations
+      name: Total
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: MigrationPolicy defines trigger rules and constraints for automated
+          pod migration.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: MigrationPolicySpec defines the desired state of MigrationPolicy.
+            properties:
+              affinityMode:
+                default: strict
+                description: |-
+                  AffinityMode sets the default affinityMode for all PodMigrations triggered by this policy.
+                  Individual PodMigration CRs may override this. Defaults to strict.
+                enum:
+                - strict
+                - patch
+                - ignore
+                type: string
+              blockedNamespaces:
+                description: BlockedNamespaces lists namespaces this policy will never
+                  target, regardless of selector.
+                items:
+                  type: string
+                type: array
+              gitOpsAwareness:
+                description: |-
+                  GitOpsAwareness configures how PodMotion interacts with GitOps controllers
+                  (ArgoCD, Flux) that manage the migrated workload. When enabled, PodMotion
+                  briefly suspends GitOps reconciliation for the narrow cases where the
+                  sub-controller migration approach is insufficient (see ADR-0046).
+                  Auto-detected when ArgoCD or Flux CRDs are present on the cluster.
+                properties:
+                  enabled:
+                    description: |-
+                      Enabled toggles GitOps suspension. Defaults to true when ArgoCD or Flux
+                      CRDs are detected via the discovery API.
+                    type: boolean
+                  resumeTimeoutSeconds:
+                    default: 60
+                    description: |-
+                      ResumeTimeoutSeconds is the maximum time to wait for GitOps controllers to
+                      acknowledge resume before failing the cleanup step. Default 60s.
+                    format: int32
+                    minimum: 10
+                    type: integer
+                  suspendDurationSeconds:
+                    default: 120
+                    description: |-
+                      SuspendDurationSeconds is how long to suspend GitOps controllers during the
+                      migration window. Must be longer than the expected freeze + restore time.
+                    format: int32
+                    minimum: 10
+                    type: integer
+                type: object
+              maxConcurrentMigrations:
+                default: 1
+                description: MaxConcurrentMigrations is the maximum number of simultaneous
+                  migrations this policy may manage.
+                format: int32
+                minimum: 1
+                type: integer
+              migrationDefaults:
+                description: MigrationDefaults provides default PodMigrationSpec values
+                  for migrations created by this policy.
+                properties:
+                  affinityMode:
+                    default: strict
+                    description: |-
+                      AffinityMode controls how PodMotion handles hard nodeAffinity / nodeSelector rules
+                      on the owning workload controller that pin pods to the source node.
+                      strict: reject at admission (default, safe for GitOps environments).
+                      patch: patch the Deployment/StatefulSet affinity at phase=Complete (requires M19 Part B).
+                      ignore: proceed without patching (standalone pods, no GitOps).
+                    enum:
+                    - strict
+                    - patch
+                    - ignore
+                    type: string
+                  applicationProbe:
+                    description: |-
+                      ApplicationProbe is an optional post-restore application-level health check.
+                      When set, the operator executes this probe before declaring phase=Complete.
+                    properties:
+                      grpcService:
+                        description: GRPCService is the fully-qualified gRPC service
+                          name for gRPC probes.
+                        type: string
+                      path:
+                        description: Path is the HTTP path for HTTP probes (e.g. "/healthz").
+                        type: string
+                      port:
+                        description: Port is the target port for HTTP, gRPC, and TCP
+                          probes.
+                        format: int32
+                        maximum: 65535
+                        minimum: 1
+                        type: integer
+                      protocol:
+                        description: Protocol selects the probe type.
+                        enum:
+                        - SQL
+                        - HTTP
+                        - gRPC
+                        - TCP
+                        type: string
+                      query:
+                        description: Query is the SQL query for SQL probes (e.g. "SELECT
+                          1").
+                        type: string
+                      timeoutSeconds:
+                        default: 5
+                        description: TimeoutSeconds is the probe deadline. Defaults
+                          to 5.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    required:
+                    - protocol
+                    type: object
+                  bandwidthLimitMbps:
+                    default: 0
+                    description: BandwidthLimitMbps caps per-migration transfer bandwidth.
+                      0 means unlimited.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  completionTimeoutSeconds:
+                    default: 600
+                    description: CompletionTimeoutSeconds aborts the migration if
+                      not complete within this window.
+                    format: int32
+                    minimum: 30
+                    type: integer
+                  destinationCluster:
+                    description: |-
+                      DestinationCluster is reserved for future multi-cluster migration (post-v1.0).
+                      Leave empty for intra-cluster migrations (the only supported mode in v0.x and v1.x).
+                    type: string
+                  destinationNode:
+                    description: |-
+                      DestinationNode is the pre-selected destination node for the replacement pod.
+                      Set by the controller after capacity reservation; read by the scheduler plugin
+                      and MutatingAdmissionWebhook to enforce exclusive node placement.
+                    type: string
+                  dryRun:
+                    default: false
+                    description: DryRun runs the estimation pipeline only; does not
+                      touch the running pod.
+                    type: boolean
+                  freezeWindowBudgetMs:
+                    default: 500
+                    description: |-
+                      FreezeWindowBudgetMs is the maximum allowed wall-clock milliseconds for the full
+                      ZW-arm-to-ZW-disarm critical path (ADR-0049). Migrations that exceed this budget
+                      are aborted and the source pod is thawed.
+                    format: int32
+                    maximum: 10000
+                    minimum: 50
+                    type: integer
+                  migrationPolicyRef:
+                    description: MigrationPolicyRef is the owning MigrationPolicy
+                      (may be empty for manual migrations).
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  mode:
+                    default: PreCopy
+                    description: Mode controls the memory transfer strategy.
+                    enum:
+                    - PreCopy
+                    - PostCopy
+                    - Cold
+                    type: string
+                  podName:
+                    description: PodName is the name of the source pod to migrate.
+                    type: string
+                  podNamespace:
+                    description: PodNamespace is the namespace of the source pod.
+                    type: string
+                  preCopyDirtyThresholdMB:
+                    default: 64
+                    description: PreCopyDirtyThresholdMB triggers the final freeze
+                      when remaining dirty pages drop below this value.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  preCopyMaxRounds:
+                    default: 5
+                    description: PreCopyMaxRounds is the maximum number of iterative
+                      pre-dump rounds before forced final freeze.
+                    format: int32
+                    maximum: 20
+                    minimum: 1
+                    type: integer
+                  rollbackOnFailure:
+                    default: true
+                    description: RollbackOnFailure unfreezes and restarts the source
+                      pod if migration fails post-checkpoint.
+                    type: boolean
+                  sourcePodIP:
+                    description: |-
+                      SourcePodIP is the original IP of the source pod. Injected as a CNI IPAM
+                      annotation on the replacement pod at admission so the original IP is pinned
+                      at CNI ADD time (Calico / Cilium only; Flannel does not support IP mobility).
+                    type: string
+                  sourcePodUID:
+                    description: SourcePodUID pins the migration to a specific pod
+                      UID to prevent races.
+                    type: string
+                  storageStrategy:
+                    default: Auto
+                    description: StorageStrategy overrides automatic storage tier
+                      classification.
+                    enum:
+                    - Auto
+                    - Skip
+                    - Sync
+                    - SnapshotClone
+                    - DualEngine
+                    type: string
+                  targetNodeName:
+                    description: TargetNodeName pins the destination node. If empty,
+                      the scheduler plugin selects.
+                    type: string
+                  tcpPreservationMode:
+                    default: None
+                    description: |-
+                      TCPPreservationMode controls TCP connection continuity behavior during migration.
+                      Strict triggers hard rollback if TCPSequenceContinuityVerified=False (ADR-0019 Amendment A).
+                      BestEffort emits a warning condition only.
+                      None skips the TCPVerifying phase entirely (stateless workloads).
+                    enum:
+                    - Strict
+                    - BestEffort
+                    - None
+                    type: string
+                required:
+                - podName
+                - podNamespace
+                type: object
+              safeOrdinalParallelism:
+                default: 1
+                description: |-
+                  SafeOrdinalParallelism controls how many StatefulSet ordinals may be migrated
+                  simultaneously. Must be ≥1. Non-adjacent constraint is still enforced regardless
+                  of this value; setting it >1 is only useful for large StatefulSets where
+                  non-adjacent pairs exist.
+                format: int32
+                minimum: 1
+                type: integer
+              selector:
+                description: Selector selects pods this policy applies to.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+              statefulSetRef:
+                description: |-
+                  StatefulSetRef, when set, targets all pods in the named StatefulSet for migration.
+                  The StatefulSetMigrationOrchestrator is used instead of single-pod migration,
+                  enforcing ordinal ordering and quorum safety (ADR-0033).
+                  Mutually exclusive with Selector-driven single-pod migration when set.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              triggers:
+                description: Triggers defines conditions that cause this policy to
+                  initiate migrations.
+                properties:
+                  nodeCPUPressurePercent:
+                    description: NodeCPUPressurePercent triggers migration when node
+                      CPU usage exceeds this threshold.
+                    format: int32
+                    maximum: 100
+                    minimum: 1
+                    type: integer
+                  nodeDrain:
+                    description: NodeDrain triggers migration for all eligible pods
+                      when the node is cordoned.
+                    type: boolean
+                  nodeMemoryPressurePercent:
+                    description: NodeMemoryPressurePercent triggers migration when
+                      node memory usage exceeds this threshold.
+                    format: int32
+                    maximum: 100
+                    minimum: 1
+                    type: integer
+                  spotReclaim:
+                    description: SpotReclaim triggers migration when the node receives
+                      a spot/preemptible termination notice.
+                    type: boolean
+                  spotReclaimTimeoutSeconds:
+                    default: 90
+                    description: |-
+                      SpotReclaimTimeoutSeconds overrides the default CompletionTimeoutSeconds used when
+                      creating PodMigration CRs in response to a spot interruption event.
+                      The AWS notice window is 120 s; default 90 s leaves a 30 s buffer.
+                    format: int32
+                    maximum: 115
+                    minimum: 10
+                    type: integer
+                type: object
+              window:
+                description: Window restricts when this policy may create migrations.
+                properties:
+                  allowedCron:
+                    description: |-
+                      AllowedCron is a cron expression defining when migrations are permitted.
+                      Example: "0 2 * * 1-5" (weekdays at 2am)
+                    type: string
+                  blockedCron:
+                    description: |-
+                      BlockedCron is a cron expression defining when migrations are explicitly forbidden.
+                      Takes precedence over AllowedCron.
+                    type: string
+                type: object
+            required:
+            - selector
+            type: object
+          status:
+            description: MigrationPolicyStatus defines the observed state of MigrationPolicy.
+            properties:
+              activeMigrations:
+                description: ActiveMigrations is the count of in-flight PodMigration
+                  CRs owned by this policy.
+                format: int32
+                type: integer
+              conditions:
+                description: Conditions provides status conditions including WindowBlocked,
+                  TriggerActive.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              lastTriggerTime:
+                description: LastTriggerTime is when this policy last created a PodMigration
+                  CR.
+                format: date-time
+                type: string
+              totalMigrations:
+                description: TotalMigrations is the lifetime count of migrations created
+                  by this policy.
+                format: int32
+                type: integer
+            required:
+            - activeMigrations
+            - totalMigrations
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

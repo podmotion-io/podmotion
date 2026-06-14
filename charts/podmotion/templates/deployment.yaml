@@ -33,10 +33,6 @@ spec:
             - --leader-elect
             - --metrics-bind-address=:8080
             - --health-probe-bind-address=:8081
-            {{- if .Values.checkpoint.registry.url }}
-            - --checkpoint-registry={{ .Values.checkpoint.registry.url }}
-            {{- end }}
-            - --transfer-mode={{ .Values.checkpoint.transferMode }}
             {{- if .Values.aws.spotReclaimTrigger }}
             - --enable-spot-reclaim
             {{- end }}
@@ -68,11 +64,15 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: [ALL]
+          {{- if .Values.webhook.certManager.enabled }}
           volumeMounts:
             - name: webhook-certs
               mountPath: /tmp/k8s-webhook-server/serving-certs
               readOnly: true
+          {{- end }}
+      {{- if .Values.webhook.certManager.enabled }}
       volumes:
         - name: webhook-certs
           secret:
             secretName: podmotion-webhook-tls
+      {{- end }}
