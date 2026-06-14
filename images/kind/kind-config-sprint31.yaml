@@ -1,0 +1,33 @@
+# PodMotion Sprint 31 amd64 cluster — 1 control-plane + 1 worker
+# Substrate: Docker Desktop 25.0.3 + WSL2 Ubuntu 24.04 + kind v0.22.0
+# ADR-0145: NP-AMD64-BASELINE substrate contract
+# ADR-0146: CRIU capability contract
+# Usage: kind create cluster --config images/kind/kind-config-sprint31.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: podmotion-sprint31
+nodes:
+  - role: control-plane
+    image: podmotion-node:sprint31-amd64
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            feature-gates: "ContainerCheckpoint=true"
+    extraMounts:
+      - hostPath: /sys/fs/bpf
+        containerPath: /sys/fs/bpf
+        propagation: Bidirectional
+  - role: worker
+    image: podmotion-node:sprint31-amd64
+    extraMounts:
+      - hostPath: /sys/fs/bpf
+        containerPath: /sys/fs/bpf
+        propagation: Bidirectional
+networking:
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+featureGates:
+  GracefulNodeShutdown: true
+  ContainerCheckpoint: true
