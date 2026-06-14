@@ -1,11 +1,5 @@
 # PodMotion Sprint 31 cluster — 1 control-plane + 1 worker (amd64/kind)
 # Usage: kind create cluster --name podmotion-sprint31 --config images/kind/kind-config.yaml
-#
-# NOTE: /sys/fs/bpf extraMounts are intentionally absent.
-# WSL2's /sys is not a shared mount; Bidirectional or HostToContainer propagation
-# both fail with "not a shared or slave mount" on Docker Desktop WSL2.
-# kind handles bpffs internally; sys-fs-bpf.mount systemd unit in the node image
-# handles it at runtime inside the container. (Discovered Sprint 31, 2026-06-13.)
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: podmotion-sprint31
@@ -18,8 +12,16 @@ nodes:
         nodeRegistration:
           kubeletExtraArgs:
             feature-gates: "ContainerCheckpoint=true"
+    extraMounts:
+      - hostPath: /sys/fs/bpf
+        containerPath: /sys/fs/bpf
+        propagation: Bidirectional
   - role: worker
     image: podmotion-node:sprint31-amd64
+    extraMounts:
+      - hostPath: /sys/fs/bpf
+        containerPath: /sys/fs/bpf
+        propagation: Bidirectional
 networking:
   podSubnet: "10.244.0.0/16"
   serviceSubnet: "10.96.0.0/12"
