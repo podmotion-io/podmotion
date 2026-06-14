@@ -3088,12 +3088,23 @@ func ownerHasHardNodeAffinity(pod *corev1.Pod, nodeName string) bool {
 }
 
 // setCondition is a convenience wrapper around meta.SetStatusCondition.
+// truncateConditionMsg bounds a condition message so it never exceeds the CRD
+// apiserver limit (status.conditions[].message must be <= 32768 bytes). CRIU dump
+// log output and gRPC error strings can be far larger; we cap well under the limit
+// at a human-readable length. (Sprint 31 fix: "Too long: may not be more than 32768 bytes".)
+func truncateConditionMsg(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max-3] + "..."
+}
+
 func setCondition(pm *pmv1.PodMigration, condType string, status metav1.ConditionStatus, reason, message string) {
 	meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
 		Type:               condType,
 		Status:             status,
 		Reason:             reason,
-		Message:            message,
+		Message:            truncateConditionMsg(message, 1024),
 		LastTransitionTime: metav1.Now(),
 	})
 }
