@@ -339,13 +339,13 @@ bpf-copy:
 bpf-objects:
 	$(MAKE) -C bpf all
 
-## kind-image: Build kind node image with CRIU and podmotion-agent.
+## kind-image: Build kind node image with CRIU and podmotion-agent, tagged as $(KIND_NODE_IMG).
 ## Prereq: bin/agent-linux-amd64 must exist (run 'make build-agent-linux-amd64' first).
 ## The bpf/ .o files are read from the repo root context; run 'make bpf-objects' first
 ## on a Linux host with clang ≥14 if the placeholder .o files need replacing.
 .PHONY: kind-image
 kind-image:
-	docker build -f images/kind/Dockerfile -t podmotion-node:dev .
+	docker build -f images/kind/Dockerfile -t $(KIND_NODE_IMG) .
 
 ## kind-node-image: Build the custom kind node image with CRIU + NRI (alias for kind-image)
 .PHONY: kind-node-image
@@ -355,7 +355,7 @@ kind-node-image: kind-image
 .PHONY: kind-create
 kind-create:
 	kind get clusters | grep -q $(KIND_CLUSTER) || \
-	  kind create cluster --config images/kind/kind-config.yaml
+	  kind create cluster --name $(KIND_CLUSTER) --config images/kind/kind-config.yaml
 
 ## watch: Live dashboard — pods, PodMigrations, events (auto-picks active PodMotion cluster)
 .PHONY: watch
