@@ -818,6 +818,31 @@ func (s *AgentServer) restoredPIDForMigration(ctx context.Context, migrationName
 	return 0
 }
 
+// resolveNamespaceForMigration returns the Kubernetes namespace of the named PodMigration CR.
+// The RestoreRequest proto does not carry a namespace field (no proto change allowed), so we
+// replicate the restoredPIDForMigration lookup strategy: try "default" first (the PoC namespace),
+// then list all PodMigrations and match by name. Returns "" if the CR cannot be found.
+func (s *AgentServer) resolveNamespaceForMigration(ctx context.Context, migrationName string) string {
+	if s.k8sClient == nil || migrationName == "" {
+		return ""
+	}
+	pm := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: migrationName}, pm); err == nil {
+		return pm.Namespace
+	}
+	pmList := &pmv1.PodMigrationList{}
+	if err := s.k8sClient.List(ctx, pmList); err != nil {
+		log.Info("resolveNamespaceForMigration: list PodMigrations failed", "migration", migrationName, "err", err)
+		return ""
+	}
+	for i := range pmList.Items {
+		if pmList.Items[i].Name == migrationName {
+			return pmList.Items[i].Namespace
+		}
+	}
+	return ""
+}
+
 // resolveReplVethPeer returns the HOST-side veth peer name for the replacement pod's eth0,
 // given the restored PID. Inside the pod netns `ip -o link show eth0` reports the peer's host
 // ifindex as `eth0@if<N>`; the host link with ifindex <N> (`ip -o link show`) is the veth peer.
@@ -3093,7 +3118,7 @@ func (s *AgentServer) PrepareDestination(_ context.Context, req *agentpb.Prepare
 // Restore recreates the container from dump images on the destination node.
 // On kind/dev where CRIU restore lacks permissions, a graceful fallback starts
 // a fresh nginx container via exec to simulate the restored workload.
-func (s *AgentServer) Restore(_ context.Context, req *agentpb.RestoreRequest) (*agentpb.RestoreResponse, error) {
+func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) (*agentpb.RestoreResponse, error) {
 	log.Info("Restore called", "migration", req.MigrationName, "checkpointRef", req.CheckpointRef)
 
 	imagesDir := req.CheckpointRef
@@ -3218,6 +3243,27 @@ func (s *AgentServer) Restore(_ context.Context, req *agentpb.RestoreRequest) (*
 			}
 		}
 
+		// GC-08 fix: set status.criuRestoreConfirmed on the PodMigration CR so the controller
+		// gate (and GC-08) passes on the direct gRPC Restore path (non-NRI). The RestoreRequest
+		// proto does not carry a pod_namespace field (would require proto amendment), so we
+		// resolve the namespace by name — mirroring the restoredPIDForMigration pattern.
+		if s.k8sClient != nil {
+			ns := s.resolveNamespaceForMigration(ctx, req.MigrationName)
+			if ns != "" {
+				if rcErr := s.ReportRestoreConfirmed(ctx, req.MigrationName, ns, int32(pid), ""); rcErr != nil {
+					// Non-fatal: the restore itself succeeded; log the failure but do not
+					// block the migration. The controller will not set TrafficVerified
+					// until criuRestoreConfirmed is true — this will surface as a gate
+					// timeout rather than a hard failure, preserving rollback semantics.
+					log.Error(rcErr, "Restore: ReportRestoreConfirmed failed (non-fatal — GC-08 will not pass)",
+						"migration", req.MigrationName, "namespace", ns)
+				}
+			} else {
+				log.Info("Restore: could not resolve namespace for migration — ReportRestoreConfirmed skipped",
+					"migration", req.MigrationName)
+			}
+		}
+
 		return &agentpb.RestoreResponse{
 			Success:           true,
 			RestoreDurationMs: restoreDurationMs,
@@ -3237,6 +3283,21 @@ func (s *AgentServer) Restore(_ context.Context, req *agentpb.RestoreRequest) (*
 	if err != nil {
 		log.Info("Restore: raw CRIU restore failed", "err", err)
 		return nil, fmt.Errorf("restore failed: %w", err)
+	}
+
+	// GC-08 fix (raw CRIU fallback path): same namespace resolution + ReportRestoreConfirmed
+	// as the join-ns path above. result.PID is the root PID of the restored process tree.
+	if s.k8sClient != nil {
+		ns := s.resolveNamespaceForMigration(ctx, req.MigrationName)
+		if ns != "" {
+			if rcErr := s.ReportRestoreConfirmed(ctx, req.MigrationName, ns, int32(result.PID), ""); rcErr != nil {
+				log.Error(rcErr, "Restore (raw CRIU path): ReportRestoreConfirmed failed (non-fatal)",
+					"migration", req.MigrationName, "namespace", ns)
+			}
+		} else {
+			log.Info("Restore (raw CRIU path): could not resolve namespace — ReportRestoreConfirmed skipped",
+				"migration", req.MigrationName)
+		}
 	}
 
 	return &agentpb.RestoreResponse{
