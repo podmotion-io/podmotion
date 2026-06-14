@@ -22,11 +22,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
 # Install CRIU 4.x and supporting tools.
-# bpftool is provided via linux-tools-virtual on Ubuntu 22.04 (no standalone package).
+# On Debian Bookworm bpftool is a standalone package (unlike Ubuntu 22.04 where
+# it required linux-tools-virtual). buildah and skopeo are in Debian Bookworm main.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     criu \
-    linux-tools-common \
-    linux-tools-virtual \
+    bpftool \
     iproute2 \
     buildah \
     skopeo \
