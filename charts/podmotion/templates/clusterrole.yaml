@@ -79,7 +79,7 @@ rules:
     verbs: [get, patch, update]
   - apiGroups: [migration.podmotion.io]
     resources: [migrationcheckpoints]
-    verbs: [get, list, watch, patch, update]
+    verbs: [create, get, list, watch, patch, update]
   - apiGroups: [migration.podmotion.io]
     resources: [migrationcheckpoints/status]
     verbs: [get, patch, update]
