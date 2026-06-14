@@ -186,8 +186,11 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		"-v4",
 		"--root", fmt.Sprintf("/proc/%d/root", opts.Pid),
 		"--auto-dedup",
-		"--ext-sharing",
-		"--ext-masters",
+		// NOTE: --ext-sharing / --ext-masters are NOT valid options in CRIU 4.2
+		// (the runtime binary). Passing them causes CRIU to abort during argument
+		// parsing with "unrecognized option" and exit status 1 before the log file
+		// is opened (empty dump.log) — which masked the real failure on Sprint 31.
+		// CRIU 4.2 handles shared/master mounts automatically via --external below.
 		"--external", "mnt[]{:AUTO_OPTIONS}",
 		"--network-lock", "skip",
 	}
@@ -202,6 +205,14 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	} else {
 		dumpArgs = append(dumpArgs, "--tcp-close")
 		dumpArgs = append(dumpArgs, "--skip-in-flight")
+		// Cold network migration (tcpPreservationMode=None): we do NOT preserve any
+		// network state — the pod is restored into a fresh (empty) network namespace
+		// provisioned by the destination CNI. Dump the net namespace as empty so CRIU
+		// does NOT invoke the external `ip` tool to save addresses/routes. The agent
+		// image is minimal and does not ship iproute2, so without --empty-ns net CRIU
+		// fails with: execvp("ip", ...) failed: No such file or directory ->
+		// "net: IP tool failed on addr save" -> "Dumping FAILED" (Sprint 31).
+		dumpArgs = append(dumpArgs, "--empty-ns", "net")
 	}
 	if opts.TrackMem {
 		dumpArgs = append(dumpArgs, "--track-mem")
@@ -403,6 +414,16 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 			// restore. Mirror the dump-side skip so CRIU does not try to restore it.
 			"/data",
 		},
+	}
+
+	// Cold network migration (tcpPreservationMode=None) is dumped with --empty-ns net,
+	// so the restore MUST also declare the net namespace empty. CRIU represents this in
+	// the RPC opts.empty_ns bitmask using the kernel CLONE_NEWNET flag (0x40000000).
+	// Without this, restore tries to recreate the (non-existent, empty) saved network
+	// state and/or invoke the `ip` tool, which is absent from the minimal agent image.
+	if !opts.TcpEstablished {
+		const cloneNewNet = 0x40000000 // CLONE_NEWNET — mirrors `criu --empty-ns net`
+		criuOpts.EmptyNs = proto.Uint32(cloneNewNet)
 	}
 
 	if opts.BundleDir != "" {
