@@ -6,13 +6,19 @@
 ARG KIND_BASE=kindest/node:v1.32.0
 FROM ${KIND_BASE}
 
-# Add CRIU PPA to get CRIU 4.x.
-# Ubuntu 22.04 universe ships CRIU 3.17 which is incompatible with go-criu v7.2
-# RPC protocol (requires 4.x). kindest/node:v1.32.0 is Ubuntu 22.04-based.
+# Add CRIU OBS repo to get CRIU 4.x.
+# kindest/node:v1.32.0 is Debian Bookworm (12). Debian Bookworm ships CRIU 3.17
+# which is incompatible with go-criu v7.2 RPC protocol (requires 4.x).
+# Ubuntu PPAs are not compatible with Debian; use the CRIU OpenSUSE Build Service
+# repository for Debian 12 instead.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    software-properties-common \
     ca-certificates \
-  && add-apt-repository -y ppa:criu/ppa \
+    curl \
+    gnupg \
+  && curl -fsSL https://download.opensuse.org/repositories/devel:/tools:/criu/Debian_12/Release.key \
+     | gpg --dearmor -o /etc/apt/trusted.gpg.d/criu.gpg \
+  && echo "deb https://download.opensuse.org/repositories/devel:/tools:/criu/Debian_12/ /" \
+     > /etc/apt/sources.list.d/criu.list \
   && rm -rf /var/lib/apt/lists/*
 
 # Install CRIU 4.x and supporting tools.
