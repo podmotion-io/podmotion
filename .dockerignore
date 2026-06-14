@@ -13,5 +13,10 @@
 # Re-include operator and agent binaries
 !bin/manager-linux-amd64
 !bin/agent-linux-amd64
+
+# Re-include compiled BPF objects (eBPF ELF relocatables for kind node image)
+!bpf/zero_window_bpfel.o
+!bpf/zero_window_bpfeb.o
+
 !images/capi/ansible/roles/podmotion-node/files/nri.toml
 !images/capi/ansible/roles/podmotion-node/files/sys-fs-bpf.mount
