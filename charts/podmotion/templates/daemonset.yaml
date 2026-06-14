@@ -34,6 +34,23 @@ spec:
           effect: NoSchedule
         - operator: Exists
           effect: NoExecute
+      initContainers:
+        - name: init-checkpoint-tmpfs
+          image: busybox:1.36
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /host-run/podmotion/checkpoints
+              chmod 0700 /host-run/podmotion/checkpoints
+              nsenter --mount=/proc/1/ns/mnt -- \
+                sh -c 'mountpoint -q /run/podmotion/checkpoints || \
+                  mount -t tmpfs -o mode=0700,size=4096m tmpfs /run/podmotion/checkpoints'
+          volumeMounts:
+            - name: host-run
+              mountPath: /host-run
       containers:
         - name: agent
           image: "{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"
@@ -82,3 +99,7 @@ spec:
         - name: sys
           hostPath:
             path: /sys
+        - name: host-run
+          hostPath:
+            path: /run
+            type: Directory
