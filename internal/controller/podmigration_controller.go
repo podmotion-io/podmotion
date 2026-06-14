@@ -1715,16 +1715,20 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 	// dump directory (including inventory.img). A zero value means the dump is still in
 	// progress or failed silently; we must not advance to Transferring in that case.
 	if checkpointResp == nil || checkpointResp.CheckpointSizeBytes == 0 {
-		log.Info("Checkpoint RPC returned but CheckpointSizeBytes==0 — dump not yet flushed; requeuing",
+		log.Error(nil, "Checkpoint RPC returned zero bytes — CRIU dump failed silently; failing fast",
 			"migration", pm.Name)
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CheckpointFailed",
+			"CRIU dump returned zero bytes — silent dump failure; check agent logs for CRIU error")
+		return ctrl.Result{}, r.statusUpdate(ctx, pm)
 	}
 
-	// Gate: treat a missing SHA256 as an incomplete dump and requeue.
+	// Gate: treat a missing SHA256 as a broken dump and fail fast.
 	if checkpointResp.CheckpointSha256 == "" {
-		log.Info("Checkpoint RPC returned but CheckpointSha256==\"\" — dump not yet flushed; requeuing",
+		log.Error(nil, "Checkpoint RPC returned empty SHA256 — CRIU dump failed silently; failing fast",
 			"migration", pm.Name)
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "CheckpointFailed",
+			"CRIU dump returned empty SHA256 — silent dump failure; check agent logs for CRIU error")
+		return ctrl.Result{}, r.statusUpdate(ctx, pm)
 	}
 
 	// Store the full filesystem dump path in CheckpointRef so reconcileRestoring can read it
