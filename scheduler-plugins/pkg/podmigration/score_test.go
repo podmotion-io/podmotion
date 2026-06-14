@@ -21,6 +21,11 @@ import (
 	"github.com/podmotion-io/podmotion/scheduler-plugins/pkg/podmigration"
 )
 
+// scorePod is a non-migration source pod used to exercise the Score path.
+func scorePod() *corev1.Pod {
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "workload", Namespace: "default"}}
+}
+
 func ptr32(i int32) *int32 { return &i }
 
 func nmcWithThermal(nodeName string, throttle *int32) *v1alpha1.NodeMigrationCapacity {
@@ -52,7 +57,7 @@ func TestMigrationAwareScore_NetworkLocality_SameZone(t *testing.T) {
 			},
 		},
 	}
-	score, err := s.Score(context.Background(), node)
+	score, err := s.Score(context.Background(), scorePod(), node)
 	if err != nil {
 		t.Fatalf("Score error: %v", err)
 	}
@@ -85,10 +90,10 @@ func TestMigrationAwareScore_NetworkLocality_CrossRegion(t *testing.T) {
 			},
 		},
 	}
-	scoreNear, _ := podmigration.NewMigrationAwareScore(reader, podmigration.DefaultWeights).Score(context.Background(), node)
+	scoreNear, _ := podmigration.NewMigrationAwareScore(reader, podmigration.DefaultWeights).Score(context.Background(), scorePod(), node)
 	_ = scoreNear
 
-	scoreFar, err := s.Score(context.Background(), node)
+	scoreFar, err := s.Score(context.Background(), scorePod(), node)
 	if err != nil {
 		t.Fatalf("Score error: %v", err)
 	}
@@ -126,8 +131,8 @@ func TestMigrationAwareScore_Thermal_Penalised(t *testing.T) {
 		Status:     node.Status,
 	}
 
-	scoreHot, _ := s.Score(context.Background(), node)
-	scoreCool, _ := sCool.Score(context.Background(), nodeCool)
+	scoreHot, _ := s.Score(context.Background(), scorePod(), node)
+	scoreCool, _ := sCool.Score(context.Background(), scorePod(), nodeCool)
 
 	if scoreHot >= scoreCool {
 		t.Fatalf("thermal penalty not applied: hot=%d cool=%d", scoreHot, scoreCool)
