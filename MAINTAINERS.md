@@ -8,7 +8,7 @@ members. It is governed by the process documented in `GOVERNANCE.md` and
 
 | Name | GitHub | Organization | Since |
 |------|--------|--------------|-------|
-| Chad Ingle | @cingle | OAN Ministries | 2025-01-01 |
+| Chad Ingle | @cingle | Independent | 2025-01-01 |
 
 ## Reviewers
 

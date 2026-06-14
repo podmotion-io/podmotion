@@ -28,3 +28,24 @@ go.work
 
 # Kubeconfig might contain secrets
 *.kubeconfig
+
+# AI agent session memory — contains PII and cross-project data, never publish
+docs/session-memory/
+
+# Session handoff notes — contain private IPs, hostnames, multi-project context
+docs/HANDOFF-*.md
+
+# Sprint VM provisioning docs — contain internal IPs, kubeadm tokens, lab topology
+docs/sprints/SPRINT*-VM-*.md
+
+# Compiled binaries at repo root
+local_gate
+pm-cni
+fleetctl
+
+# macOS artifacts
+.DS_Store
+**/.DS_Store
+
+# Claude Code project files
+.claude/settings.local.json
