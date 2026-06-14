@@ -1,0 +1,569 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: podmigrations.migration.podmotion.io
+spec:
+  group: migration.podmotion.io
+  names:
+    categories:
+    - podmotion
+    kind: PodMigration
+    listKind: PodMigrationList
+    plural: podmigrations
+    shortNames:
+    - pm
+    singular: podmigration
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.podName
+      name: Pod
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.tcpPreservationMode
+      name: TCPMode
+      type: string
+    - jsonPath: .status.sourceNodeName
+      name: Source
+      type: string
+    - jsonPath: .status.destinationNodeName
+      name: Dest
+      type: string
+    - jsonPath: .spec.mode
+      name: Mode
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          PodMigration is the work object for a single live pod migration operation.
+          Each migration is a discrete, auditable record with full rollback semantics.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: PodMigrationSpec defines the desired state of PodMigration.
+            properties:
+              affinityMode:
+                default: strict
+                description: |-
+                  AffinityMode controls how PodMotion handles hard nodeAffinity / nodeSelector rules
+                  on the owning workload controller that pin pods to the source node.
+                  strict: reject at admission (default, safe for GitOps environments).
+                  patch: patch the Deployment/StatefulSet affinity at phase=Complete (requires M19 Part B).
+                  ignore: proceed without patching (standalone pods, no GitOps).
+                enum:
+                - strict
+                - patch
+                - ignore
+                type: string
+              applicationProbe:
+                description: |-
+                  ApplicationProbe is an optional post-restore application-level health check.
+                  When set, the operator executes this probe before declaring phase=Complete.
+                properties:
+                  grpcService:
+                    description: GRPCService is the fully-qualified gRPC service name
+                      for gRPC probes.
+                    type: string
+                  path:
+                    description: Path is the HTTP path for HTTP probes (e.g. "/healthz").
+                    type: string
+                  port:
+                    description: Port is the target port for HTTP, gRPC, and TCP probes.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                  protocol:
+                    description: Protocol selects the probe type.
+                    enum:
+                    - SQL
+                    - HTTP
+                    - gRPC
+                    - TCP
+                    type: string
+                  query:
+                    description: Query is the SQL query for SQL probes (e.g. "SELECT
+                      1").
+                    type: string
+                  timeoutSeconds:
+                    default: 5
+                    description: TimeoutSeconds is the probe deadline. Defaults to
+                      5.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                required:
+                - protocol
+                type: object
+              bandwidthLimitMbps:
+                default: 0
+                description: BandwidthLimitMbps caps per-migration transfer bandwidth.
+                  0 means unlimited.
+                format: int32
+                minimum: 0
+                type: integer
+              completionTimeoutSeconds:
+                default: 600
+                description: CompletionTimeoutSeconds aborts the migration if not
+                  complete within this window.
+                format: int32
+                minimum: 30
+                type: integer
+              destinationCluster:
+                description: |-
+                  DestinationCluster is reserved for future multi-cluster migration (post-v1.0).
+                  Leave empty for intra-cluster migrations (the only supported mode in v0.x and v1.x).
+                type: string
+              destinationNode:
+                description: |-
+                  DestinationNode is the pre-selected destination node for the replacement pod.
+                  Set by the controller after capacity reservation; read by the scheduler plugin
+                  and MutatingAdmissionWebhook to enforce exclusive node placement.
+                type: string
+              dryRun:
+                default: false
+                description: DryRun runs the estimation pipeline only; does not touch
+                  the running pod.
+                type: boolean
+              freezeWindowBudgetMs:
+                default: 500
+                description: |-
+                  FreezeWindowBudgetMs is the maximum allowed wall-clock milliseconds for the full
+                  ZW-arm-to-ZW-disarm critical path (ADR-0049). Migrations that exceed this budget
+                  are aborted and the source pod is thawed.
+                format: int32
+                maximum: 10000
+                minimum: 50
+                type: integer
+              migrationPolicyRef:
+                description: MigrationPolicyRef is the owning MigrationPolicy (may
+                  be empty for manual migrations).
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              mode:
+                default: PreCopy
+                description: Mode controls the memory transfer strategy.
+                enum:
+                - PreCopy
+                - PostCopy
+                - Cold
+                type: string
+              podName:
+                description: PodName is the name of the source pod to migrate.
+                type: string
+              podNamespace:
+                description: PodNamespace is the namespace of the source pod.
+                type: string
+              preCopyDirtyThresholdMB:
+                default: 64
+                description: PreCopyDirtyThresholdMB triggers the final freeze when
+                  remaining dirty pages drop below this value.
+                format: int32
+                minimum: 1
+                type: integer
+              preCopyMaxRounds:
+                default: 5
+                description: PreCopyMaxRounds is the maximum number of iterative pre-dump
+                  rounds before forced final freeze.
+                format: int32
+                maximum: 20
+                minimum: 1
+                type: integer
+              rollbackOnFailure:
+                default: true
+                description: RollbackOnFailure unfreezes and restarts the source pod
+                  if migration fails post-checkpoint.
+                type: boolean
+              sourcePodIP:
+                description: |-
+                  SourcePodIP is the original IP of the source pod. Injected as a CNI IPAM
+                  annotation on the replacement pod at admission so the original IP is pinned
+                  at CNI ADD time (Calico / Cilium only; Flannel does not support IP mobility).
+                type: string
+              sourcePodUID:
+                description: SourcePodUID pins the migration to a specific pod UID
+                  to prevent races.
+                type: string
+              storageStrategy:
+                default: Auto
+                description: StorageStrategy overrides automatic storage tier classification.
+                enum:
+                - Auto
+                - Skip
+                - Sync
+                - SnapshotClone
+                - DualEngine
+                type: string
+              targetNodeName:
+                description: TargetNodeName pins the destination node. If empty, the
+                  scheduler plugin selects.
+                type: string
+              tcpPreservationMode:
+                default: None
+                description: |-
+                  TCPPreservationMode controls TCP connection continuity behavior during migration.
+                  Strict triggers hard rollback if TCPSequenceContinuityVerified=False (ADR-0019 Amendment A).
+                  BestEffort emits a warning condition only.
+                  None skips the TCPVerifying phase entirely (stateless workloads).
+                enum:
+                - Strict
+                - BestEffort
+                - None
+                type: string
+            required:
+            - podName
+            - podNamespace
+            type: object
+          status:
+            description: PodMigrationStatus defines the observed state of PodMigration.
+            properties:
+              checkpointRef:
+                description: CheckpointRef references the MigrationCheckpoint holding
+                  the checkpoint artifact.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              checkpointTransferred:
+                description: |-
+                  CheckpointTransferred is set true after the checkpoint tar has been durably written
+                  to the destination agent and the status has been persisted. Used as an idempotency
+                  marker: if the controller crashes after the Put but before transitioning to Restoring,
+                  the next reconcile skips the Get/Put and proceeds directly to gate removal + Restoring.
+                type: boolean
+              cniProvider:
+                description: |-
+                  CNIProvider is the detected CNI plugin on the source node (e.g. "calico", "cilium",
+                  "flannel"). Set during Validating phase and read by the webhook's IPAM annotation logic.
+                type: string
+              completionTime:
+                description: CompletionTime is when the migration reached Complete,
+                  Failed, or DryRunComplete.
+                format: date-time
+                type: string
+              conditions:
+                description: Conditions provides detailed status conditions.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              criuRestoreConfirmed:
+                description: |-
+                  CRIURestoreConfirmed is set to true by the NRI plugin after JoinNsRestore
+                  completes successfully, confirming memory images were replayed.
+                type: boolean
+              dataIntact:
+                description: |-
+                  DataIntact is set to true when post-restore application-level data integrity
+                  is confirmed (e.g. Redis key survives, Postgres row count matches).
+                  Set by the reconciler after the post-restore integrity gate passes.
+                type: boolean
+              destNetnsPath:
+                description: |-
+                  DestNetnsPath is the /proc/<pid>/fd/<n> path to the pre-staged migration netns on
+                  the destination node, returned by PrepareDestinationNetns. Passed as dest_netns_fd
+                  in RestoreRequest so the CRIU restore re-enters the correct netns (ADR-0048).
+                type: string
+              destVtepMac:
+                description: |-
+                  DestVtepMac is the VTEP MAC for the destination overlay interface, returned by
+                  PrepareDestinationNetns. Used to inject the AF_BRIDGE FDB entry on the source node
+                  and passed to ConfirmOverlayReady (ADR-0048).
+                type: string
+              destinationNodeName:
+                description: DestinationNodeName is the node the pod was migrated
+                  to.
+                type: string
+              dryRunEstimate:
+                description: DryRunEstimate is populated when spec.dryRun is true.
+                properties:
+                  blockingReason:
+                    description: BlockingReason explains why migration is not feasible,
+                      if Migratable is false.
+                    type: string
+                  dirtyPageRateMBps:
+                    description: DirtyPageRateMBps is the observed dirty page write
+                      rate during sampling.
+                    type: string
+                  estimatedFreezeDurationMs:
+                    description: EstimatedFreezeDurationMs is the predicted freeze
+                      duration based on dirty page sampling.
+                    format: int64
+                    type: integer
+                  migratable:
+                    description: Migratable indicates whether the pod is estimated
+                      to be migratable within policy constraints.
+                    type: boolean
+                  storageTier:
+                    description: StorageTier is the detected storage migration tier
+                      (0-4).
+                    format: int32
+                    type: integer
+                required:
+                - dirtyPageRateMBps
+                - estimatedFreezeDurationMs
+                - migratable
+                - storageTier
+                type: object
+              overlayFdbIfname:
+                description: |-
+                  OverlayFdbIfname is the overlay interface name on both nodes (e.g. "flannel.1") used
+                  for FDB and neighbor entry injection and RTM_GETNEIGH confirmation. Populated once
+                  during DestinationPrewarm and reused by ConfirmOverlayReady (ADR-0048).
+                type: string
+              phase:
+                default: Pending
+                description: Phase is the current migration phase.
+                enum:
+                - Pending
+                - SocketInventory
+                - Validating
+                - PreMigrating
+                - Checkpointing
+                - Transferring
+                - Restoring
+                - Verifying
+                - DestinationPrewarm
+                - PreCopyMemory
+                - ZeroWindowArm
+                - FinalFreezeStateCapture
+                - OverlayHandoff
+                - RestoreSocketReattach
+                - DisengageHold
+                - TCPVerifying
+                - ServiceVerifying
+                - CutoverComplete
+                - Complete
+                - Failed
+                - RollingBack
+                - DryRunComplete
+                type: string
+              preCopyStats:
+                description: PreCopyStats records metrics from the iterative pre-copy
+                  phase.
+                properties:
+                  finalDirtyPagesMB:
+                    description: FinalDirtyPagesMB is the dirty page delta at the
+                      start of the final freeze.
+                    format: int32
+                    type: integer
+                  freezeDurationMs:
+                    description: FreezeDurationMs is the wall-clock time the pod was
+                      frozen for final dump.
+                    format: int64
+                    type: integer
+                  roundsCompleted:
+                    description: RoundsCompleted is the number of pre-dump rounds
+                      completed.
+                    format: int32
+                    type: integer
+                required:
+                - finalDirtyPagesMB
+                - freezeDurationMs
+                - roundsCompleted
+                type: object
+              replVethMAC:
+                description: |-
+                  ReplVethMAC is the replacement pod's eth0 MAC address inside the pod netns,
+                  collected by the NRI plugin at restore time and threaded through
+                  ReportRestoreConfirmed. The controller passes it to InjectIPHandoff on the
+                  destination agent so the OLD pod IP resolves to the replacement veth (ADR-0133 D3).
+                type: string
+              replacementPodName:
+                description: |-
+                  ReplacementPodName is the name of the replacement pod created by the operator
+                  during live migration to receive the CRIU-restored process.
+                  Stored in Status (not Spec) because it is controller-derived runtime state,
+                  not user intent. Written once at Checkpointing and read by subsequent phases.
+                type: string
+              restoredPID:
+                description: |-
+                  RestoredPID is the root PID of the restored container process tree,
+                  set by the NRI plugin after successful CRIU restore.
+                format: int32
+                type: integer
+              sourceClockNs:
+                description: |-
+                  SourceClockNs is CLOCK_MONOTONIC nanoseconds captured on the source node at freeze
+                  time, returned in CheckpointResponse. Passed to ConfirmOverlayReady so the destination
+                  can compute the PAWS ts_delta for PM_SEQ_XLAT (ADR-0049).
+                format: int64
+                type: integer
+              sourceConntrackArmed:
+                description: |-
+                  SourceConntrackArmed indicates that the NOTRACK conntrack rule is confirmed on the
+                  source node. Set by the OverlayHandoff phase before calling ConfirmOverlayReady.
+                type: boolean
+              sourceFreezeTimestampNs:
+                description: |-
+                  SourceFreezeTimestampNs is CLOCK_REALTIME nanoseconds at the exact freeze instant,
+                  captured by the source agent after the CRIU dump completes with --leave-stopped.
+                  Passed as source_freeze_timestamp_ns in the RestoreRequest so the destination agent
+                  can compute the PAWS ts_delta for PM_SEQ_XLAT (ADR-0049).
+                format: int64
+                type: integer
+              sourceNodeName:
+                description: SourceNodeName is the node the pod was migrated from.
+                type: string
+              sourcePodMac:
+                description: |-
+                  SourcePodMac is the MAC address of the source pod's primary interface, populated
+                  during the DestinationPrewarm phase from the source pod annotation or netlink query.
+                  Used in AF_BRIDGE FDB lookups by ConfirmOverlayReady (ADR-0048).
+                type: string
+              startTime:
+                description: StartTime is when the migration was first admitted.
+                format: date-time
+                type: string
+              storageTier:
+                description: StorageTier is the detected storage migration tier (0=RWX,
+                  1=Longhorn, 2=CephRBD, 3=SnapshotRsync, 4=Blocked).
+                format: int32
+                type: integer
+              tcpConnectionsPreserved:
+                description: TCPConnectionsPreserved is the number of TCP connections
+                  successfully migrated.
+                format: int32
+                type: integer
+              tcpSeqSnapshots:
+                description: |-
+                  TCPSeqSnapshots holds the per-connection TCP sequence state captured at the exact
+                  freeze instant. Persisted across the Checkpoint→Restore phase boundary so the
+                  controller can pass it in RestoreRequest.seq_snapshots for PM_SEQ_XLAT seeding.
+                items:
+                  description: |-
+                    TCPSeqSnapshot captures the TCP sequence state for a single ESTABLISHED connection
+                    at the exact freeze instant. Mirrors proto SeqSnapshot but stored in CRD status for
+                    cross-phase persistence.
+                  properties:
+                    dstIP:
+                      type: string
+                    dstPort:
+                      format: int32
+                      type: integer
+                    rcvNxt:
+                      format: int32
+                      type: integer
+                    sndNxt:
+                      format: int32
+                      type: integer
+                    srcIP:
+                      type: string
+                    srcPort:
+                      format: int32
+                      type: integer
+                    tsRecent:
+                      format: int32
+                      type: integer
+                  required:
+                  - dstIP
+                  - dstPort
+                  - rcvNxt
+                  - sndNxt
+                  - srcIP
+                  - srcPort
+                  type: object
+                type: array
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
