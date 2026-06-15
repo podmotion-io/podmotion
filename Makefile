@@ -356,6 +356,9 @@ kind-node-image: kind-image
 kind-create:
 	kind get clusters | grep -q $(KIND_CLUSTER) || \
 	  kind create cluster --name $(KIND_CLUSTER) --config images/kind/kind-config.yaml
+	@echo "Waiting for nodes to be ready before installing Flannel..."
+	KUBECONFIG=/tmp/$(KIND_CLUSTER).kubeconfig kubectl wait --for=condition=Ready nodes --all --timeout=120s
+	KUBECONFIG=/tmp/$(KIND_CLUSTER).kubeconfig kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/v0.25.4/Documentation/kube-flannel.yml
 
 ## watch: Live dashboard — pods, PodMigrations, events (auto-picks active PodMotion cluster)
 .PHONY: watch
@@ -393,7 +396,8 @@ webhook-certs-dev:
 	mkdir -p /tmp/podmotion-webhook-certs
 	openssl req -x509 -newkey rsa:4096 -keyout /tmp/podmotion-webhook-certs/tls.key \
 	  -out /tmp/podmotion-webhook-certs/tls.crt -days 365 -nodes \
-	  -subj "/CN=podmotion-webhook-service.podmotion-system.svc"
+	  -subj "/CN=podmotion-webhook-service.podmotion-system.svc" \
+	  -addext "subjectAltName=DNS:podmotion-webhook-service.podmotion-system.svc,DNS:podmotion-webhook-service.podmotion-system.svc.cluster.local,DNS:localhost"
 	kubectl create secret tls podmotion-webhook-tls \
 	  --cert=/tmp/podmotion-webhook-certs/tls.crt \
 	  --key=/tmp/podmotion-webhook-certs/tls.key \
