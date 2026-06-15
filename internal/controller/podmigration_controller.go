@@ -562,6 +562,7 @@ func (r *PodMigrationReconciler) reconcileZeroWindowArm(ctx context.Context, pm 
 		MigrationName:        pm.Name,
 		PodUid:               podUID,
 		FreezeWindowBudgetMs: budget,
+		TcpPreservationMode:  string(pm.Spec.TCPPreservationMode),
 	})
 	if err != nil {
 		log.Error(err, "ZeroWindowArm: ArmZeroWindow RPC failed — requeuing", "migration", pm.Name)
@@ -669,6 +670,7 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 		// VTEP IP from FdbIfname at call time (avoids conflating MAC with IP).
 		SourceConntrackArmed: pm.Status.SourceConntrackArmed,
 		RestoreComplete:      false, // restore has not yet run at this phase
+		PreRestore:           true,  // pre-restore pass: defer source-conntrack (E) and F (gate20)
 		SourceClockNs:        pm.Status.SourceFreezeTimestampNs,
 	})
 	if confirmErr != nil {
@@ -788,7 +790,8 @@ func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm 
 			// VtepIp intentionally omitted: the destination agent resolves its local
 			// VTEP IP from FdbIfname at call time (avoids conflating MAC with IP).
 			SourceConntrackArmed: pm.Status.SourceConntrackArmed,
-			RestoreComplete:      true, // CRIU restore succeeded before this phase
+			RestoreComplete:      true,  // CRIU restore succeeded before this phase
+			PreRestore:           false, // post-restore pass: enforce all six predicates (gate20)
 			SourceClockNs:        pm.Status.SourceFreezeTimestampNs,
 		})
 		if overlayErr != nil {
@@ -2167,12 +2170,17 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 		})
 	}
 
+	if len(restoreSeqSnapshots) > 0 && pm.Status.DestNetnsPath == "" {
+		return ctrl.Result{}, fmt.Errorf("Strict restore: DestNetnsPath empty, DestinationNetnsReady not yet satisfied")
+	}
+
 	restoreResp, err := agentClient.Restore(ctx, &agentpb.RestoreRequest{
 		MigrationName:           pm.Name,
 		CheckpointRef:           checkpointRef,
 		SourceNodeAddr:          pm.Status.SourceNodeName,
 		SourceFreezeTimestampNs: pm.Status.SourceFreezeTimestampNs,
 		SeqSnapshots:            restoreSeqSnapshots,
+		DestNetnsFd:             pm.Status.DestNetnsPath,
 	})
 	if err != nil || (restoreResp != nil && !restoreResp.Success) {
 		msg := "restore RPC failed"
@@ -2409,6 +2417,7 @@ func (r *PodMigrationReconciler) reconcileRestoringNRI(ctx context.Context, pm *
 			restoreResp, restoreErr := destAgent.Restore(ctx, &agentpb.RestoreRequest{
 				MigrationName: pm.Name,
 				CheckpointRef: checkpointRef,
+				DestNetnsFd:   pm.Status.DestNetnsPath,
 			})
 			if restoreErr != nil {
 				log.Error(restoreErr, "NRI fallback: agent Restore RPC failed", "migration", pm.Name)

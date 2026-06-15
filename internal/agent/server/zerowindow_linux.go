@@ -91,23 +91,50 @@ func resolveVethIfindex(podUID string) (uint32, error) {
 // the network package's EBPFManager (ADR-0131 D1 / ADR-0049). It attaches the zero_window
 // TC-egress program to the source pod veth (by ifindex) and inserts the ifindex into
 // PM_ACTIVE_HOLDS. On kernels <5.9 NewEBPFManager returns the stub (logs only). Idempotent.
-// ifindex==0 means veth resolution failed upstream; skip the attach (nothing to arm).
-func armZeroWindowBPF(ctx context.Context, ifindex uint32) error {
+//
+// mgr is the EBPFManager to use; pass nil to auto-select via network.NewEBPFManager (prod path).
+// Accepting mgr as a parameter makes the function testable without a real kernel (inject a mock).
+//
+// tcpPreservationMode controls fail-closed behavior (ADR-0049 Amendment D):
+//   - Strict: ifindex==0 and ArmZeroWindowHold failures both return a typed error; the caller
+//     MUST NOT set ZeroWindowArmed=True. This closes the false-green where a hold that was
+//     never armed was reported as armed.
+//   - None/BestEffort: existing degrade-and-continue semantics retained, but errors are logged
+//     clearly so they are surfaced (BestEffort surfaces a queryable condition via the caller).
+func armZeroWindowBPF(ctx context.Context, ifindex uint32, tcpPreservationMode string, mgr ...network.EBPFManager) error {
+	strictMode := tcpPreservationMode == "Strict"
+
 	if ifindex == 0 {
-		log.Info("armZeroWindowBPF: ifindex=0 (veth unresolved) — skipping TC-BPF arm")
+		if strictMode {
+			// ADR-0049 Amendment D (C3): non-veth CNI (AWS VPC CNI/ENI/IPVLAN, Cilium netkit,
+			// Calico eBPF, macvlan, SR-IOV) resolved no veth peer ifindex. Under Strict the
+			// hold is required for fidelity — proceeding without it is a false-green. Fail closed
+			// so the caller returns armed=false with a blocking CR-status reason.
+			return fmt.Errorf("zero-window arm failed under Strict: ifindex=0 (CNI unsupported for zero-window hold — no eth0@if<N> veth peer resolved; non-veth CNI path)")
+		}
+		// None/BestEffort: degrade-and-continue (hold is a protective optimisation, not required for correctness).
+		log.Info("armZeroWindowBPF: ifindex=0 (veth unresolved) — skipping TC-BPF arm (degraded, non-fatal under BestEffort/None)")
 		return nil
 	}
-	mgr := network.NewEBPFManager(ctx)
-	if err := mgr.ArmZeroWindowHold(ctx, ifindex); err != nil {
-		// Graceful degradation: on this PoC the embedded arm64 zero_window BPF object can
-		// fail to load ("no symbol section") because the bpf2go-generated .o was not built
-		// with a valid arm64 BPF toolchain. The hold is a *protective optimisation* (it makes
-		// the client pause via window=0 during the freeze); the migration's correctness for
-		// seq_delta=0 comes from CRIU --tcp-established preserving the socket. Rather than
-		// hard-failing the whole migration on a missing BPF object, log and continue so the
-		// rest of the ADR-0131 orchestration (freeze, handoff, verify, disarm) is exercised.
-		// AC1 (observable window=0) requires a valid arm64 BPF object — tracked as a blocker.
-		log.Error(err, "armZeroWindowBPF: real TC-BPF arm failed — continuing WITHOUT hold (AC1 degraded; seq continuity still relies on CRIU --tcp-established)", "ifindex", ifindex)
+
+	var ebpfMgr network.EBPFManager
+	if len(mgr) > 0 && mgr[0] != nil {
+		ebpfMgr = mgr[0]
+	} else {
+		ebpfMgr = network.NewEBPFManager(ctx)
+	}
+
+	if err := ebpfMgr.ArmZeroWindowHold(ctx, ifindex); err != nil {
+		if strictMode {
+			// ADR-0049 Amendment D (A2): BPF arm failure under Strict is a hard failure.
+			// Returning error prevents the caller from setting ZeroWindowArmed=True, closing
+			// the false-green where a hold that was never armed was reported as armed.
+			return fmt.Errorf("zero-window arm failed under Strict: ArmZeroWindowHold: %w", err)
+		}
+		// None/BestEffort: graceful degradation. The hold is a protective optimisation; the
+		// migration's correctness for seq_delta=0 comes from CRIU --tcp-established preserving
+		// the socket. Log the error clearly (AC1 degraded; BPF object blocker tracked separately).
+		log.Error(err, "armZeroWindowBPF: real TC-BPF arm failed — continuing WITHOUT hold (AC1 degraded; seq continuity still relies on CRIU --tcp-established; non-fatal under BestEffort/None)", "ifindex", ifindex)
 		return nil
 	}
 	log.Info("armZeroWindowBPF: TC-BPF zero-window hold armed", "ifindex", ifindex)
