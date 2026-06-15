@@ -2943,6 +2943,17 @@ if os.path.exists(netdev_path):
 
 # ---- ifaddr: remove source pod IP addresses; keep loopback only (ADR-0125, ADR-0162) ----
 # strip-only image: skip-on-unknown-magic (S1)
+# Fallback (GC-1 fix): when pycriu cannot parse ifaddr-10.img (no IFADDR handler in
+# this pycriu build), write an empty CRIU v1.1 image (8-byte header: IMG_COMMON +
+# IFADDR magic, little-endian int32). This instructs CRIU to restore zero IP addresses
+# in the dest netns, which is correct because ADR-0165 pre-stages the dest netns with
+# the migrated IP before CRIU restore runs. Keeping the source IP in the image causes
+# CRIU to attempt 'ip addr add <source-ip>' in an already-configured netns, yielding
+# 'Error: ipv4: Address already assigned' (SPRINT32-COLD-GATE-R2-ATTEMPT-1 root cause).
+import struct as _struct
+IFADDR_MAGIC     = 1194725922  # pycriu/images/magic.py by_name['IFADDR']
+IMG_COMMON_MAGIC = 1414939417  # pycriu/images/magic.py by_name['IMG_COMMON']
+
 ifaddr_path = os.path.join(ckpt, 'ifaddr-10.img')
 if os.path.exists(ifaddr_path):
     src = backup(ifaddr_path)
@@ -2954,6 +2965,15 @@ if os.path.exists(ifaddr_path):
         with open(ifaddr_path, 'wb') as f:
             pycriu.images.dump(img, f)
         print('ifaddr: kept', len(kept), 'entries (loopback only)')
+    else:
+        # pycriu IFADDR handler missing — write empty v1.1 image (IMG_COMMON + IFADDR magic).
+        # Empty = no IP address entries; CRIU skips ip-addr restore entirely.
+        # The dest netns IP is already configured by ADR-0165 SP-1/SP-2/SP-3 pre-staging;
+        # an empty ifaddr image is therefore correct and avoids 'Address already assigned'.
+        empty_header = _struct.pack('<ii', IMG_COMMON_MAGIC, IFADDR_MAGIC)
+        with open(ifaddr_path, 'wb') as f:
+            f.write(empty_header)
+        print('ifaddr: pycriu handler missing — wrote empty v1.1 image (0 entries); dest netns IP pre-staged by ADR-0165')
 `
 	// /dev/shm is an in-memory filesystem (tmpfs) — avoids writing the script to disk.
 	// 0600 so only root can read the path; removed immediately after exec.
