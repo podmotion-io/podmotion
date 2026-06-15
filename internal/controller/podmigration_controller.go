@@ -144,6 +144,24 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	deadline, cancel := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
 	defer cancel()
 
+	// Normalize destination node: spec.destinationNode (webhook-populated) and
+	// spec.targetNodeName (user-set) are two synonymous fields. Populate
+	// status.destinationNodeName early from whichever is set so downstream
+	// reconcilers can use status.destinationNodeName unconditionally.
+	if pm.Status.DestinationNodeName == "" {
+		if pm.Spec.TargetNodeName != "" {
+			pm.Status.DestinationNodeName = pm.Spec.TargetNodeName
+		} else if pm.Spec.DestinationNode != "" {
+			pm.Status.DestinationNodeName = pm.Spec.DestinationNode
+		}
+		if pm.Status.DestinationNodeName != "" {
+			if err := r.statusUpdate(deadline, pm); err != nil {
+				log.Error(err, "failed to persist DestinationNodeName from spec", "migration", pm.Name)
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+		}
+	}
+
 	// Crash-safety (ADR-0018): if we restarted with the pod already frozen,
 	// issue restore immediately before anything else.
 	if r.isFrozenWithoutRestore(pm) {
@@ -1687,8 +1705,9 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		if grpcStatus, ok := status.FromError(err); ok {
 			switch grpcStatus.Code() {
 			case codes.Unavailable:
-				log.Error(err, "Checkpoint RPC unavailable — requeuing", "migration", pm.Name)
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+				log.Error(err, "Checkpoint RPC unavailable — invalidating cached connection and requeuing", "migration", pm.Name)
+				r.AgentPool.InvalidateNode(sourceNode)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			case codes.FailedPrecondition:
 				// Agent returned codes.FailedPrecondition for ErrCRIUCapability (missing
 				// CAP_SYS_PTRACE or blocking seccomp). Hard failure — do not retry.
@@ -1787,6 +1806,14 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		"tcpConnections", len(pm.Status.TCPSeqSnapshots))
 
 	setCondition(pm, conditionCheckpointed, metav1.ConditionTrue, "Checkpointed", checkpointMsg)
+
+	// Persist Checkpointed=True BEFORE creating the replacement pod so that if
+	// createReplacementPod fails and we requeue, the next reconcile sees True and skips
+	// the Checkpoint RPC. Without this write the in-memory condition is lost on requeue
+	// and the controller issues repeated CRIU dumps until the frozen pod's PID disappears.
+	if err := r.statusUpdate(ctx, pm); err != nil {
+		return ctrl.Result{}, fmt.Errorf("persisting Checkpointed=True: %w", err)
+	}
 
 	// Ensure DestinationNodeName is set before creating the replacement pod.
 	// It is normally set in reconcilePreMigrating and persisted via transitionTo, but
@@ -2333,17 +2360,57 @@ func (r *PodMigrationReconciler) reconcileRestoringNRI(ctx context.Context, pm *
 		}
 
 		if time.Since(waitStart) >= criuConfirmTimeout {
-			msg := fmt.Sprintf("CRIU restore was not confirmed within %s — replacement pod %s reached Ready "+
-				"but the NRI plugin never set criuRestoreConfirmed (memory state not restored)",
-				criuConfirmTimeout, pm.Status.ReplacementPodName)
-			log.Error(fmt.Errorf("restore not confirmed"), msg, "migration", pm.Name)
-			setCondition(pm, conditionRestored, metav1.ConditionFalse, "RestoreNotConfirmed", msg)
-			if err := r.statusUpdate(ctx, pm); err != nil {
-				return ctrl.Result{}, err
+			// NRI plugin did not confirm within the timeout window.
+			// Fall back to the agent Restore gRPC RPC (dev/kind clusters where NRI is not installed).
+			// The Restore RPC will call JoinNsRestore into the replacement pod's netns and
+			// then call ReportRestoreConfirmed on success, which will set criuRestoreConfirmed.
+			log.Info("NRI confirm timeout — falling back to agent Restore RPC",
+				"migration", pm.Name, "replacementPod", pm.Status.ReplacementPodName)
+
+			destNode := pm.Status.DestinationNodeName
+			if destNode == "" {
+				destNode = pm.Spec.TargetNodeName
 			}
-			// Do NOT mark Complete. Requeue so a late confirmation (or operator action)
-			// can still be observed; the timeout condition stands until then.
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			if destNode == "" || r.AgentPool == nil {
+				msg := fmt.Sprintf("CRIU restore was not confirmed within %s — replacement pod %s reached Ready "+
+					"but the NRI plugin never set criuRestoreConfirmed and destination node unknown",
+					criuConfirmTimeout, pm.Status.ReplacementPodName)
+				setCondition(pm, conditionRestored, metav1.ConditionFalse, "RestoreNotConfirmed", msg)
+				return ctrl.Result{}, r.statusUpdate(ctx, pm)
+			}
+			destAgent, agErr := r.AgentPool.ForNode(ctx, destNode)
+			if agErr != nil {
+				log.Error(agErr, "NRI fallback: cannot connect to destination agent — requeuing", "migration", pm.Name)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			checkpointRef := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", pm.Name)
+			if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
+				checkpointRef = pm.Status.CheckpointRef.Name
+			}
+			restoreResp, restoreErr := destAgent.Restore(ctx, &agentpb.RestoreRequest{
+				MigrationName: pm.Name,
+				CheckpointRef: checkpointRef,
+			})
+			if restoreErr != nil {
+				log.Error(restoreErr, "NRI fallback: agent Restore RPC failed", "migration", pm.Name)
+				setCondition(pm, conditionRestored, metav1.ConditionFalse, "RestoreFailed",
+					fmt.Sprintf("agent Restore RPC failed: %v", restoreErr))
+				if pm.Spec.RollbackOnFailure {
+					return r.initiateRollback(ctx, pm, restoreErr.Error())
+				}
+				return ctrl.Result{}, r.statusUpdate(ctx, pm)
+			}
+			if !restoreResp.Success {
+				log.Error(fmt.Errorf("restore failed: %s", restoreResp.ErrorMessage), "NRI fallback: Restore RPC returned success=false", "migration", pm.Name)
+				setCondition(pm, conditionRestored, metav1.ConditionFalse, "RestoreFailed", restoreResp.ErrorMessage)
+				if pm.Spec.RollbackOnFailure {
+					return r.initiateRollback(ctx, pm, restoreResp.ErrorMessage)
+				}
+				return ctrl.Result{}, r.statusUpdate(ctx, pm)
+			}
+			log.Info("NRI fallback: agent Restore RPC succeeded", "migration", pm.Name, "durationMs", restoreResp.RestoreDurationMs)
+			// Requeue to observe criuRestoreConfirmed written by the agent's ReportRestoreConfirmed.
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 
 		log.Info("CRIU restore not yet confirmed — polling criuRestoreConfirmed",
@@ -2599,7 +2666,12 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 		// probe (Decision 5) gates TrafficVerified for the directly-pinned pod-IP client;
 		// the service-path TrafficVerifier remains as the L4/Service backstop below.
 		if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
-			if res, err, done := r.injectIPHandoff(ctx, pm); !done {
+			if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeNone {
+				setCondition(pm, conditionIPHandoffInjected, metav1.ConditionTrue, "Skipped",
+					"TCPPreservationMode=None: IP handoff not required for cold migration")
+				setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "TrafficVerified",
+					"TCPPreservationMode=None: cold migration — replacement pod IP accepted")
+			} else if res, err, done := r.injectIPHandoff(ctx, pm); !done {
 				return res, err
 			}
 			if err := r.statusUpdate(ctx, pm); err != nil {
@@ -3312,6 +3384,9 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	if destNodeName == "" {
 		destNodeName = pm.Spec.TargetNodeName
 	}
+	if destNodeName == "" {
+		destNodeName = pm.Spec.DestinationNode
+	}
 	log := logf.FromContext(ctx)
 	log.Info("createReplacementPod: pinning node",
 		"migration", pm.Name,
@@ -3321,8 +3396,47 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 		"sourcePodNode", sourcePod.Spec.NodeName)
 	if destNodeName != "" {
 		spec.NodeName = destNodeName
+		// Clear nodeSelector and hard nodeAffinity: the source pod may be pinned to the
+		// source node (e.g. nodeSelector: kubernetes.io/hostname=worker). These constraints
+		// would reject the replacement pod on the destination node. NodeName already provides
+		// an authoritative node pin, so node selection constraints are not needed.
+		spec.NodeSelector = nil
+		if spec.Affinity != nil && spec.Affinity.NodeAffinity != nil {
+			spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = nil
+		}
 	} else {
 		spec.NodeName = "" // let scheduler decide if destination unknown
+	}
+
+	// Add tolerations for any taints on the destination node so the kubelet
+	// admits the replacement pod. This is necessary when migrating TO a control-plane
+	// node that carries node-role.kubernetes.io/control-plane:NoSchedule.
+	if destNodeName != "" {
+		destNode := &corev1.Node{}
+		if nodeErr := r.Get(ctx, types.NamespacedName{Name: destNodeName}, destNode); nodeErr == nil {
+			for _, taint := range destNode.Spec.Taints {
+				if taint.Effect == corev1.TaintEffectNoSchedule || taint.Effect == corev1.TaintEffectNoExecute {
+					alreadyTolerated := false
+					for _, t := range spec.Tolerations {
+						if t.Key == taint.Key && (t.Operator == corev1.TolerationOpExists ||
+							(t.Value == taint.Value && t.Effect == taint.Effect)) {
+							alreadyTolerated = true
+							break
+						}
+					}
+					if !alreadyTolerated {
+						spec.Tolerations = append(spec.Tolerations, corev1.Toleration{
+							Key:      taint.Key,
+							Operator: corev1.TolerationOpEqual,
+							Value:    taint.Value,
+							Effect:   taint.Effect,
+						})
+						log.Info("createReplacementPod: added toleration for destination node taint",
+							"migration", pm.Name, "taint", taint.Key, "effect", taint.Effect)
+					}
+				}
+			}
+		}
 	}
 
 	replacement := &corev1.Pod{
