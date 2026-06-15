@@ -135,6 +135,22 @@ type AgentServer struct {
 	// Gate30: avoids re-deriving the name from migrationName (which would diverge if the
 	// controller passes a pod UID to PrepareDestinationNetns and a migration name to Restore).
 	destHostVeth map[string]string // migrationName -> minted host veth name
+
+	// destWorkloadImageMu guards destWorkloadImage.
+	destWorkloadImageMu sync.RWMutex
+	// destWorkloadImage caches the workload OCI image reference delivered via
+	// PrepareDestinationNetnsRequest.workload_image (ADR-0168 B2). The Restore gRPC
+	// fallback path reads it when imageName=="" to start the placeholder container with
+	// the SAME image as the checkpointed workload, matching CRIU mapped-VMA file sizes.
+	destWorkloadImage map[string]string // migrationName -> OCI image ref
+
+	// destMigrationNetnsMu guards destMigrationNetns.
+	destMigrationNetnsMu sync.RWMutex
+	// destMigrationNetns stores the *network.MigrationNetns handle constructed by
+	// PrepareDestinationNetns so the Restore defer (GC-10, ADR-0168) can call
+	// TeardownMigrationNetns on restore-failure rollback without reconstructing the handle.
+	// Keyed by migrationName. Entry deleted on successful restore or teardown.
+	destMigrationNetns map[string]*network.MigrationNetns
 }
 
 // New constructs an AgentServer with the given Checkpointer implementation.
@@ -151,6 +167,8 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 		frozenSourcePIDs:      make(map[string]int32),
 		pendingResumePIDs:     make(map[string]int),
 		destHostVeth:          make(map[string]string),
+		destWorkloadImage:     make(map[string]string),
+		destMigrationNetns:    make(map[string]*network.MigrationNetns),
 	}
 }
 
@@ -3771,6 +3789,37 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		}
 	}()
 
+	// ADR-0168 GC-10: tear down the pre-staged dest migration netns on restore-failure rollback.
+	// Covers all early-return failure sites with a single call site. The teardown is warn-only
+	// (ADR-0012/ADR-0165-r2 SP-7). Only runs when a dest netns was pre-staged (DestNetnsFd set)
+	// and restore did not succeed.
+	defer func() {
+		if restoreConfirmed || req.DestNetnsFd == "" {
+			return
+		}
+		s.destMigrationNetnsMu.Lock()
+		ns, hasNs := s.destMigrationNetns[req.MigrationName]
+		if hasNs {
+			delete(s.destMigrationNetns, req.MigrationName)
+		}
+		s.destMigrationNetnsMu.Unlock()
+		if hasNs {
+			if teardownErr := network.TeardownMigrationNetns(context.Background(), ns); teardownErr != nil {
+				log.Error(teardownErr, "GC-10: TeardownMigrationNetns warn-only on restore-failure rollback", "migration", req.MigrationName)
+			} else {
+				log.Info("GC-10: dest migration netns torn down on restore-failure rollback", "migration", req.MigrationName)
+			}
+		} else {
+			log.Info("GC-10: no stored MigrationNetns handle for teardown (PrepareDestinationNetns may not have run on this path)", "migration", req.MigrationName)
+		}
+	}()
+
+	// ADR-0168 B2: read the cached workload image for this migration. If set, it will be used
+	// instead of the joinNsRestore hardcoded fallback when imageName is empty on this gRPC path.
+	s.destWorkloadImageMu.RLock()
+	storedWorkloadImage := s.destWorkloadImage[req.MigrationName]
+	s.destWorkloadImageMu.RUnlock()
+
 	// Pre-restore sanity: inventory.img must exist and be non-empty. If absent, CRIU
 	// fails immediately with "No inventory.img image / Unexpected EOF on (empty-image)".
 	// Catching this here gives a clear error instead of an opaque CRIU exit-1.
@@ -3819,7 +3868,8 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		s.destHostVethMu.RLock()
 		storedVeth := s.destHostVeth[req.MigrationName]
 		s.destHostVethMu.RUnlock()
-		pid, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, "", "", req.DestNetnsFd, "", storedVeth, false)
+		// ADR-0168 B2: pass storedWorkloadImage so the placeholder uses the correct image.
+		pid, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, "", storedVeth, false)
 		restoreDurationMs := time.Since(restoreStart).Milliseconds()
 		if joinErr != nil {
 			return nil, fmt.Errorf("runc restore failed: %w", joinErr)
@@ -3933,6 +3983,14 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 			}
 		}
 
+		// ADR-0168 GC-10: clean up maps on successful restore (defer only handles failure path).
+		s.destMigrationNetnsMu.Lock()
+		delete(s.destMigrationNetns, req.MigrationName)
+		s.destMigrationNetnsMu.Unlock()
+		s.destWorkloadImageMu.Lock()
+		delete(s.destWorkloadImage, req.MigrationName)
+		s.destWorkloadImageMu.Unlock()
+
 		restoreConfirmed = true
 		return &agentpb.RestoreResponse{
 			Success:           true,
@@ -3966,13 +4024,13 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	}
 
 	t0 := time.Now()
-	// imageName="" → joinNsRestore defaults to docker.io/library/redis:7 (adequate for gate10 test).
+	// ADR-0168 B2: storedWorkloadImage replaces the empty imageName on the gRPC fallback path.
 	// containerID="" → joinNsRestore uses the placeholder container path (no NRI hook).
 	// destNetnsFd=req.DestNetnsFd — cold migration passes empty string.
 	s.destHostVethMu.RLock()
 	storedVeth2 := s.destHostVeth[req.MigrationName]
 	s.destHostVethMu.RUnlock()
-	rawPID, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, "", "", req.DestNetnsFd, "", storedVeth2, false)
+	rawPID, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, "", storedVeth2, false)
 	if joinErr != nil {
 		log.Info("Restore: joinNsRestore failed", "err", joinErr)
 		return nil, fmt.Errorf("restore failed: %w", joinErr)
@@ -4000,6 +4058,14 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 			log.Info("Restore (raw CRIU path): could not resolve namespace — ReportRestoreConfirmed skipped", "migration", req.MigrationName)
 		}
 	}
+
+	// ADR-0168 GC-10: clean up maps on successful restore (defer only handles failure path).
+	s.destMigrationNetnsMu.Lock()
+	delete(s.destMigrationNetns, req.MigrationName)
+	s.destMigrationNetnsMu.Unlock()
+	s.destWorkloadImageMu.Lock()
+	delete(s.destWorkloadImage, req.MigrationName)
+	s.destWorkloadImageMu.Unlock()
 
 	restoreConfirmed = true
 	return &agentpb.RestoreResponse{

@@ -52,6 +52,14 @@ type MigrationCheckpointSpec struct {
 	// Encrypted indicates the checkpoint OCI layers are encrypted.
 	// +optional
 	Encrypted bool `json:"encrypted,omitempty"`
+
+	// WorkloadImage is the OCI image reference of the source pod's primary container
+	// (pod.Spec.Containers[0].Image). The destination agent uses it to start the
+	// restore placeholder container with the SAME image as the checkpointed workload,
+	// so the placeholder rootfs binary sizes match the CRIU checkpoint's mapped VMAs
+	// on the gRPC Restore fallback path (no NRI containerID). ADR-0168 B2.
+	// +optional
+	WorkloadImage string `json:"workloadImage,omitempty"`
 }
 
 // MigrationCheckpointStatus reflects the lifecycle of the checkpoint artifact.

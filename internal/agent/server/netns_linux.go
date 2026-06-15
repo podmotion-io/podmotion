@@ -64,6 +64,20 @@ func (s *AgentServer) PrepareDestinationNetns(ctx context.Context, req *agentpb.
 		return nil, status.Errorf(codes.Internal, "prepare destination netns: %v", err)
 	}
 
+	// ADR-0168 GC-10: persist the MigrationNetns handle for use by the Restore defer teardown.
+	s.destMigrationNetnsMu.Lock()
+	s.destMigrationNetns[req.MigrationName] = ns
+	s.destMigrationNetnsMu.Unlock()
+
+	// ADR-0168 B2: cache workload image for the Restore gRPC fallback path.
+	if req.WorkloadImage != nil && *req.WorkloadImage != "" {
+		s.destWorkloadImageMu.Lock()
+		s.destWorkloadImage[req.MigrationName] = *req.WorkloadImage
+		s.destWorkloadImageMu.Unlock()
+		log.Info("PrepareDestinationNetns: cached workload image (ADR-0168 B2)",
+			"migration", req.MigrationName, "image", *req.WorkloadImage)
+	}
+
 	// Discover the local VTEP MAC from the flannel.1 interface.
 	// The flannel annotation JSON is not available here (the server does not have k8s API access
 	// at this call site), so we fall directly to the RTM_GETLINK path on flannel.1.

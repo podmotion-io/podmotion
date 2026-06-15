@@ -353,13 +353,28 @@ func (r *PodMigrationReconciler) reconcileDestinationPrewarm(ctx context.Context
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
+	// ADR-0168 B2: read WorkloadImage from the MigrationCheckpoint CR to carry it
+	// to the destination agent via PrepareDestinationNetnsRequest.workload_image.
+	var workloadImageForPrep string
+	mcpForPrep := &pmv1.MigrationCheckpoint{}
+	if mcpFetchErr := r.Get(ctx, types.NamespacedName{Name: pm.Name, Namespace: pm.Namespace}, mcpForPrep); mcpFetchErr == nil {
+		workloadImageForPrep = mcpForPrep.Spec.WorkloadImage
+	} else {
+		log.Info("DestinationPrewarm: MCP not found for WorkloadImage (warn-only, fallback to agent default)",
+			"migration", pm.Name, "err", mcpFetchErr)
+	}
+
 	log.Info("DestinationPrewarm: calling PrepareDestinationNetns on destination agent (ADR-0048)",
-		"migration", pm.Name, "node", destNode, "podIP", podIP)
-	prepResp, prepErr := destAgent.PrepareDestinationNetns(ctx, &agentpb.PrepareDestinationNetnsRequest{
+		"migration", pm.Name, "node", destNode, "podIP", podIP, "workloadImage", workloadImageForPrep)
+	prepReq := &agentpb.PrepareDestinationNetnsRequest{
 		MigrationName: pm.Name,
 		PodIp:         podIP,
 		PodNamespace:  pm.Spec.PodNamespace,
-	})
+	}
+	if workloadImageForPrep != "" {
+		prepReq.WorkloadImage = &workloadImageForPrep
+	}
+	prepResp, prepErr := destAgent.PrepareDestinationNetns(ctx, prepReq)
 	if prepErr != nil {
 		log.Error(prepErr, "DestinationPrewarm: PrepareDestinationNetns RPC failed — requeuing",
 			"migration", pm.Name)
@@ -1271,6 +1286,24 @@ func (r *PodMigrationReconciler) reconcileCutoverComplete(ctx context.Context, p
 		}
 	}
 
+	// ADR-0168 GC-9: set MigrationCheckpoint CR Status.Phase=Consumed on successful cutover.
+	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
+		mcpSuccess := &pmv1.MigrationCheckpoint{}
+		mcpSuccessKey := types.NamespacedName{Name: pm.Name, Namespace: pm.Namespace}
+		if mcpGetErr := r.Get(ctx, mcpSuccessKey, mcpSuccess); mcpGetErr == nil {
+			nowMCP := metav1.Now()
+			mcpSuccess.Status.Phase = "Consumed"
+			mcpSuccess.Status.ConsumedAt = &nowMCP
+			if mcpUpdateErr := r.Status().Update(ctx, mcpSuccess); mcpUpdateErr != nil {
+				log.Error(mcpUpdateErr, "GC-9: failed to set MCP Status.Phase=Consumed (warn-only, ADR-0012)", "migration", pm.Name)
+			} else {
+				log.Info("GC-9: MCP Status.Phase set to Consumed", "migration", pm.Name)
+			}
+		} else {
+			log.Error(mcpGetErr, "GC-9: failed to fetch MCP for Consumed phase (warn-only)", "migration", pm.Name)
+		}
+	}
+
 	now := metav1.Now()
 	pm.Status.CompletionTime = &now
 	r.maybeSetGitOpsDriftWarning(ctx, pm)
@@ -1865,6 +1898,28 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 	// and the controller issues repeated CRIU dumps until the frozen pod's PID disappears.
 	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, fmt.Errorf("persisting Checkpointed=True: %w", err)
+	}
+
+	// ADR-0168 B2: write the workload image to the MigrationCheckpoint CR so the
+	// destination agent can use the correct image for the restore placeholder container.
+	// The MCP CR is created by the agent at checkpoint time; we update it here with
+	// the workload image from pod.Spec.Containers[0].Image. Warn-only (ADR-0012).
+	if len(sourcePod.Spec.Containers) > 0 {
+		workloadImage := sourcePod.Spec.Containers[0].Image
+		mcpRef := &pmv1.MigrationCheckpoint{}
+		mcpKey := types.NamespacedName{Name: pm.Name, Namespace: pm.Namespace}
+		if mcpGetErr := r.Get(ctx, mcpKey, mcpRef); mcpGetErr == nil {
+			if mcpRef.Spec.WorkloadImage != workloadImage {
+				mcpRef.Spec.WorkloadImage = workloadImage
+				if mcpUpdateErr := r.Update(ctx, mcpRef); mcpUpdateErr != nil {
+					log.Error(mcpUpdateErr, "ADR-0168 B2: failed to update MCP WorkloadImage (warn-only)", "migration", pm.Name, "image", workloadImage)
+				} else {
+					log.Info("ADR-0168 B2: MCP WorkloadImage set", "migration", pm.Name, "image", workloadImage)
+				}
+			}
+		} else {
+			log.Error(mcpGetErr, "ADR-0168 B2: failed to fetch MCP for WorkloadImage update (warn-only)", "migration", pm.Name)
+		}
 	}
 
 	// Ensure DestinationNodeName is set before creating the replacement pod.
@@ -3031,6 +3086,26 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 				log.Info("reconcileRollingBack: dest checkpoint released (GC-9)", "migration", pm.Name, "node", destNode)
 			}
 		}
+	}
+
+	// ADR-0168 GC-9: set MigrationCheckpoint CR Status.Phase=Failed on rollback completion.
+	// Re-entry guard: skip if PodMigration is already Failed (idempotent under re-queues).
+	if pm.Status.Phase != pmv1.MigrationPhaseFailed {
+		if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
+			mcpGC9 := &pmv1.MigrationCheckpoint{}
+			mcpGC9Key := types.NamespacedName{Name: pm.Name, Namespace: pm.Namespace}
+			if mcpGetErr := r.Get(ctx, mcpGC9Key, mcpGC9); mcpGetErr == nil {
+				mcpGC9.Status.Phase = "Failed"
+				if mcpUpdateErr := r.Status().Update(ctx, mcpGC9); mcpUpdateErr != nil {
+					log.Error(mcpUpdateErr, "GC-9: failed to set MCP Status.Phase=Failed (warn-only, ADR-0012)", "migration", pm.Name)
+				} else {
+					log.Info("GC-9: MCP Status.Phase set to Failed", "migration", pm.Name)
+				}
+			} else {
+				log.Error(mcpGetErr, "GC-9: failed to fetch MCP for phase update (warn-only)", "migration", pm.Name)
+			}
+		}
+		// When CheckpointRef.Name is empty there is no MCP CR to advance (failure before checkpoint).
 	}
 
 	pm.Status.Phase = pmv1.MigrationPhaseFailed
