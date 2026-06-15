@@ -3005,6 +3005,32 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 		return r.failMigration(ctx, pm, fmt.Sprintf("rollback failed: %v", err))
 	}
 
+	// GC-9 fix: release destination-side checkpoint images on the rollback/failure path.
+	// When CheckpointTransferred=true the dest agent holds checkpoint files in its tmpfs
+	// (/run/podmotion/checkpoints/<migration>/final/). On a failed restore these are
+	// never released by the normal success path, leaving orphaned .img files on the node.
+	// ReleaseCheckpoint is idempotent; errors are warn-only (ADR-0012: source pod is
+	// already safe, so we never block the Failed transition on a cleanup RPC failure).
+	if pm.Status.CheckpointTransferred && pm.Status.DestinationNodeName != "" && r.AgentPool != nil {
+		destNode := pm.Status.DestinationNodeName
+		destAgent, agErr := r.AgentPool.ForNode(ctx, destNode)
+		if agErr != nil {
+			log.Error(agErr, "reconcileRollingBack: cannot connect to dest agent for ReleaseCheckpoint (GC-9, warn-only)",
+				"migration", pm.Name, "node", destNode)
+		} else {
+			_, relErr := destAgent.ReleaseCheckpoint(ctx, &agentpb.ReleaseCheckpointRequest{
+				MigrationName:      pm.Name,
+				MigrationNamespace: pm.Namespace,
+			})
+			if relErr != nil {
+				log.Error(relErr, "reconcileRollingBack: dest ReleaseCheckpoint failed (GC-9, warn-only — images remain on dest tmpfs until reboot)",
+					"migration", pm.Name, "node", destNode)
+			} else {
+				log.Info("reconcileRollingBack: dest checkpoint released (GC-9)", "migration", pm.Name, "node", destNode)
+			}
+		}
+	}
+
 	pm.Status.Phase = pmv1.MigrationPhaseFailed
 	setCondition(pm, "RolledBack", metav1.ConditionTrue, "RollbackComplete", "Source pod restored to live state")
 	// M26: emit flow_loss counter at Failed (all TCP connections inventoried are treated as lost).
