@@ -165,6 +165,10 @@ func (s *AgentServer) EnsureXDPBridgeLoaded(ctx context.Context, hostIfname stri
 // Overridable in tests to inject stub behaviour without spawning nsenter.
 var readReplVethMACFn = ReadReplVethMAC
 
+// joinNsRestoreFn is the production implementation of joinNsRestore.
+// Overridable in tests to stub out the actual CRIU subprocess invocation.
+var joinNsRestoreFn = joinNsRestore
+
 // restoreResult is the shared finalization result populated by finalizeRestore.
 // All restore paths (NRI + both gRPC Restore branches) return this struct so that
 // MAC population and SingleHomeRestoredPod parity are path-independent (E1, ADR-0133 D3,
@@ -296,7 +300,7 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 	s.destHostVethMu.RLock()
 	storedVeth := s.destHostVeth[migrationName]
 	s.destHostVethMu.RUnlock()
-	pid, err := joinNsRestore(migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode)
+	pid, err := joinNsRestoreFn(migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode)
 	if err != nil {
 		return 0, "", err
 	}
@@ -3749,7 +3753,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		s.destHostVethMu.RLock()
 		storedVeth := s.destHostVeth[req.MigrationName]
 		s.destHostVethMu.RUnlock()
-		pid, joinErr := joinNsRestore(req.MigrationName, imagesDir, "", "", req.DestNetnsFd, "", storedVeth, false)
+		pid, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, "", "", req.DestNetnsFd, "", storedVeth, false)
 		restoreDurationMs := time.Since(restoreStart).Milliseconds()
 		if joinErr != nil {
 			return nil, fmt.Errorf("runc restore failed: %w", joinErr)
@@ -3916,7 +3920,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	s.destHostVethMu.RLock()
 	storedVeth2 := s.destHostVeth[req.MigrationName]
 	s.destHostVethMu.RUnlock()
-	rawPID, joinErr := joinNsRestore(req.MigrationName, imagesDir, "", "", req.DestNetnsFd, "", storedVeth2, false)
+	rawPID, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, "", "", req.DestNetnsFd, "", storedVeth2, false)
 	if joinErr != nil {
 		log.Info("Restore: joinNsRestore failed", "err", joinErr)
 		return nil, fmt.Errorf("restore failed: %w", joinErr)
