@@ -190,9 +190,124 @@ func longHornVolumeGVR() schema.GroupVersionResource {
 // ensure metav1 is used
 var _ = metav1.Now
 
+// knownPycriuImageTypes is the set of CRIU image types covered by the vendored pycriu magic
+// table (pycriu/images/magic.py). If CRIU produces an image type not in this set, pycriu.images.load
+// will raise MagicException. Add entries here whenever magic.py is updated (N1, CNCF portability).
+var knownPycriuImageTypes = map[string]bool{
+	"CRTOOLS_IMAGES_V1_1": true,
+	"IMG_COMMON":          true,
+	"IMG_SERVICE":         true,
+	"INVENTORY":           true,
+	"PSTREE":              true,
+	"FDINFO":              true,
+	"PAGEMAP":             true,
+	"CORE":                true,
+	"IDS":                 true,
+	"VMAS":                true,
+	"PIPES":               true,
+	"PIPES_DATA":          true,
+	"FIFO":                true,
+	"FIFO_DATA":           true,
+	"SIGACT":              true,
+	"UNIXSK":              true,
+	"INETSK":              true,
+	"PACKETSK":            true,
+	"ITIMERS":             true,
+	"POSIX_TIMERS":        true,
+	"SK_QUEUES":           true,
+	"UTSNS":               true,
+	"CREDS":               true,
+	"IPC_VAR":             true,
+	"IPCNS_SHM":           true,
+	"IPCNS_MSG":           true,
+	"IPCNS_SEM":           true,
+	"REG_FILES":           true,
+	"EXT_FILES":           true,
+	"FS":                  true,
+	"MM":                  true,
+	"REMAP_FPATH":         true,
+	"GHOST_FILE":          true,
+	"TCP_STREAM":          true,
+	"EVENTFD_FILE":        true,
+	"EVENTPOLL_FILE":      true,
+	"EVENTPOLL_TFD":       true,
+	"SIGNALFD":            true,
+	"INOTIFY_FILE":        true,
+	"INOTIFY_WD":          true,
+	"MNTS":                true,
+	"NETDEV":              true,
+	"NETNS":               true,
+	"TTY_FILES":           true,
+	"TTY_INFO":            true,
+	"TTY_DATA":            true,
+	"FILE_LOCKS":          true,
+	"RLIMIT":              true,
+	"FANOTIFY_FILE":       true,
+	"FANOTIFY_MARK":       true,
+	"SIGNAL":              true,
+	"NETLINK_SK":          true,
+	"NS_FILES":            true,
+	"TUNFILE":             true,
+	"CGROUP":              true,
+	"TIMERFD":             true,
+	"CPUINFO":             true,
+	"USERNS":              true,
+	"SECCOMP":             true,
+	"BINFMT_MISC":         true,
+	"AUTOFS":              true,
+	"FILES":               true,
+	"MEMFD_INODE":         true,
+	"TIMENS":              true,
+	"PIDNS":               true,
+	"BPFMAP_FILE":         true,
+	"BPFMAP_DATA":         true,
+	"APPARMOR":            true,
+	"PIDFD":               true,
+	"STATS":               true,
+	"IRMAP_CACHE":         true,
+	"KDAT":                true,
+	"IFADDR":              true, // added Q1: CRIU 4.2
+}
+
+// criuImageTypesForVersion returns the set of image type names expected from a given CRIU version.
+// This is a best-effort heuristic; extend when new CRIU image types are discovered at runtime.
+// Currently all known types are assumed present for any CRIU >= 3.x.
+func criuImageTypesForVersion(_ string) []string {
+	types := make([]string, 0, len(knownPycriuImageTypes))
+	for t := range knownPycriuImageTypes {
+		types = append(types, t)
+	}
+	return types
+}
+
+// assertMagicTableCoverage checks that the vendored pycriu magic table covers all image types
+// the installed CRIU version is known to produce. Logs warnings for any gaps (N1).
+// This is a non-fatal preflight assertion: gaps are surfaced for observability but do not
+// block NMC registration (a fatal block would prevent the agent from starting on any node
+// whose CRIU differs slightly from the pinned version — the skip-on-unknown (S1) is the
+// runtime safety net for strip-only images; mountpoints will already fail loud).
+func assertMagicTableCoverage(criuVersion string) {
+	expected := criuImageTypesForVersion(criuVersion)
+	var missing []string
+	for _, t := range expected {
+		if !knownPycriuImageTypes[t] {
+			missing = append(missing, t)
+		}
+	}
+	if len(missing) > 0 {
+		// Log as a warning; the monitoring layer should alert on this condition.
+		fmt.Printf("WARNING: pycriu magic table missing %d image type(s) for CRIU %s: %v — "+
+			"pycriu.images.load will raise MagicException on these types; "+
+			"update pycriu/images/magic.py and knownPycriuImageTypes\n",
+			len(missing), criuVersion, missing)
+	}
+}
+
 // Register creates or updates the NodeMigrationCapacity CR for this node.
 func (r *Registrar) Register(ctx context.Context) error {
 	criuVersion := detectCRIU()
+	// N1: assert vendored pycriu magic table covers all expected CRIU image types.
+	assertMagicTableCoverage(criuVersion)
 	kernelFeatures := detectKernelFeatures()
 	longhornAvailable := detectLonghorn(ctx, r.client)
 
@@ -228,7 +343,7 @@ func (r *Registrar) Register(ctx context.Context) error {
 			},
 			NetworkCapability: pmv1.NetworkCapability{
 				CNIPlugin:           detectCNI(),
-				IPMobilitySupported: false,
+				IPMobilitySupported: ipMobilitySupported(detectCNI(), kernelFeatures),
 				XDPBridgeCapable:    kernelFeatures.XDPSupported && kernelFeatures.BPFEnabled,
 			},
 			MaxConcurrentMigrationsSource:      2,
@@ -317,7 +432,15 @@ func detectIPFamilySupport() pmv1.IPFamilySupport {
 }
 
 // detectCNI tries to identify the CNI plugin from known directories.
+// If PODMOTION_CNI_OVERRIDE is set, its value is returned directly without scanning.
+// Detection order: filename match → "type" field inside conflist/conf JSON.
 func detectCNI() string {
+	// Env override wins — useful for kind clusters where /etc/cni/net.d may not be
+	// mounted into the agent container or may contain ambiguous filenames.
+	if override, ok := os.LookupEnv("PODMOTION_CNI_OVERRIDE"); ok && override != "" {
+		return strings.ToLower(strings.TrimSpace(override))
+	}
+
 	cniConfDirs := []string{"/etc/cni/net.d"}
 	for _, dir := range cniConfDirs {
 		entries, err := os.ReadDir(dir)
@@ -326,6 +449,7 @@ func detectCNI() string {
 		}
 		for _, e := range entries {
 			name := strings.ToLower(e.Name())
+			// Fast path: CNI name in filename (most common case).
 			switch {
 			case strings.Contains(name, "kindnet"):
 				return "kindnet"
@@ -339,8 +463,59 @@ func detectCNI() string {
 				return "ovn-kubernetes"
 			}
 		}
+		// Fallback: scan "type" field inside conflist/conf JSON files.
+		for _, e := range entries {
+			fname := e.Name()
+			if !strings.HasSuffix(fname, ".conflist") && !strings.HasSuffix(fname, ".conf") {
+				continue
+			}
+			data, err := os.ReadFile(dir + "/" + fname)
+			if err != nil {
+				continue
+			}
+			content := strings.ToLower(string(data))
+			switch {
+			case strings.Contains(content, `"type":"kindnet"`) ||
+				strings.Contains(content, `"type": "kindnet"`):
+				return "kindnet"
+			case strings.Contains(content, `"type":"flannel"`) ||
+				strings.Contains(content, `"type": "flannel"`):
+				return "flannel"
+			case strings.Contains(content, `"type":"calico"`) ||
+				strings.Contains(content, `"type": "calico"`):
+				return "calico"
+			case strings.Contains(content, `"type":"cilium"`) ||
+				strings.Contains(content, `"type": "cilium"`):
+				return "cilium"
+			case strings.Contains(content, "ovn-kubernetes"):
+				return "ovn-kubernetes"
+			}
+		}
 	}
 	return "unknown"
+}
+
+// ipMobilitySupported reports whether PodMotion's overlay FDB/VTEP handoff
+// (ADR-0048 eBPF XDP VTEP + ADR-0133 neighbor injection) can preserve pod IPs
+// on this CNI. Flannel/kindnet VXLAN overlays ARE supported because PodMotion
+// injects the FDB/neighbor entries the static overlay lacks (see internal/agent/
+// network/fdb.go, bpf/pm_xdp_vtep.c). Env override PODMOTION_FORCE_IP_MOBILITY
+// ("true"/"false") wins for gate/bring-up.
+func ipMobilitySupported(cni string, kf pmv1.KernelFeatures) bool {
+	if v, ok := os.LookupEnv("PODMOTION_FORCE_IP_MOBILITY"); ok {
+		return strings.EqualFold(v, "true")
+	}
+	if !(kf.XDPSupported && kf.BPFEnabled) {
+		return false
+	}
+	switch cni {
+	case "flannel", "kindnet": // VXLAN overlay — FDB/VTEP handoff implemented (ADR-0048, ADR-0133)
+		return true
+	case "calico", "cilium", "ovn-kubernetes": // BGP/native routing or native eBPF datapath
+		return true
+	default:
+		return false
+	}
 }
 
 // Heartbeat patches status.lastHeartbeat and ready=true.

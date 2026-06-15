@@ -30,6 +30,7 @@ func TestBuildCRIURestoreArgs_JoinNs(t *testing.T) {
 		"/run/podmotion/checkpoints/test/final/restore.log",
 		"/proc/12345/fd/7",
 		"",
+		"",
 		false,
 	)
 	joined := strings.Join(args, " ")
@@ -68,6 +69,7 @@ func TestBuildCRIURestoreArgs_ColdJoinNsPath(t *testing.T) {
 		"/run/podmotion/checkpoints/test/final/restore.log",
 		"",
 		"/var/run/netns/cni-abc123",
+		"",
 		false,
 	)
 	joined := strings.Join(args, " ")
@@ -105,6 +107,7 @@ func TestBuildCRIURestoreArgs_StrictModeNRIPath(t *testing.T) {
 		"/run/podmotion/checkpoints/test/final/restore.log",
 		"", // NRI path: destNetnsFd is always empty
 		"/var/run/netns/cni-abc123",
+		"",
 		true, // strictMode=true → must emit --leave-stopped (ADR-0144 D1)
 	)
 	joined := strings.Join(args, " ")
