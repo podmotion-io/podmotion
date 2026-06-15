@@ -67,15 +67,11 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: [ALL]
-          {{- if .Values.webhook.certManager.enabled }}
           volumeMounts:
             - name: webhook-certs
               mountPath: /tmp/k8s-webhook-server/serving-certs
               readOnly: true
-          {{- end }}
-      {{- if .Values.webhook.certManager.enabled }}
       volumes:
         - name: webhook-certs
           secret:
             secretName: podmotion-webhook-tls
-      {{- end }}
