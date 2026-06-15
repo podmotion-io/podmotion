@@ -6,6 +6,10 @@ operator:
     tag: latest
     pullPolicy: IfNotPresent
   replicas: 3
+  # featureGates enables experimental feature gates in the operator.
+  # Passed as --feature-gates=<value> to the manager binary.
+  # Example: "TCPPreservation=true,GPUMigration=false"
+  featureGates: "TCPPreservation=true"
   resources:
     requests:
       cpu: 100m
