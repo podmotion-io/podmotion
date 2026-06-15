@@ -43,14 +43,18 @@ type MigrationNetns struct {
 
 // PrepareDestinationNetns creates a migration netns on the destination node with:
 //  1. A new network namespace bind-mounted to /run/podmotion/netns/pm-mig-<uid>.
-//  2. A veth pair: <hostVeth> on the host side wired to cni0/flannel bridge, pmdst0 inside the netns.
+//  2. A veth pair: <hostVeth> on the host side wired via provider.WireDestinationVeth
+//     (bridge-enslave on Flannel; /32 host-route injection on kindnet/ptp — ADR-0167 C1).
 //  3. The source pod IP added as a /32 secondary address on pmdst0 inside the netns.
 //
-// The loopback interface inside the netns is brought up. The host-side veth is
-// enslaved to the bridge named by bridgeName (typically "cni0" for flannel).
+// The loopback interface inside the netns is brought up. The host-side veth is wired
+// via the provider's WireDestinationVeth method (ADR-0167 C1 provider-layer placement).
+//
+// provider must not be nil; pass &NoOpCNI{} for tcpPreservationMode=None contexts.
+// uid is used to name the netns and veth; migrationName is used for C4 structured log fields.
 //
 // Requires CAP_NET_ADMIN and CAP_SYS_ADMIN (for unshare/setns).
-func PrepareDestinationNetns(ctx context.Context, uid, podIP, podCIDR, bridgeName string) (*MigrationNetns, error) {
+func PrepareDestinationNetns(ctx context.Context, provider NetworkProvider, uid, podIP, podCIDR, bridgeName, migrationName string) (*MigrationNetns, error) {
 	log := logf.FromContext(ctx)
 
 	if err := os.MkdirAll(migrationNetnsDir, 0o700); err != nil {
@@ -114,20 +118,31 @@ func PrepareDestinationNetns(ctx context.Context, uid, podIP, podCIDR, bridgeNam
 		return nil, fmt.Errorf("PrepareDestinationNetns: create veth: %w", err)
 	}
 
-	if err := enslaveVethToBridge(hostVeth, bridgeName); err != nil {
-		_ = removeVeth(hostVeth)
-		_ = os.Remove(netnsPath)
-		return nil, fmt.Errorf("PrepareDestinationNetns: enslave to bridge %s: %w", bridgeName, err)
-	}
-
+	// SD-2 + SD-1: bring up host veth BEFORE wiring so that on the host-route path
+	// (kindnet/ptp, ADR-0167) the device is IFF_UP when SetPodIPHostRoute issues RTM_NEWROUTE.
+	// On the bridge path the bring-up order does not matter (bridge membership and IFF_UP
+	// are orthogonal), so hoisting bringUpInterface before WireDestinationVeth is safe for both paths.
 	if err := bringUpInterface(hostVeth); err != nil {
 		_ = removeVeth(hostVeth)
+		_ = unix.Unmount(netnsPath, unix.MNT_DETACH) // SD-2: unmount before remove
 		_ = os.Remove(netnsPath)
 		return nil, fmt.Errorf("PrepareDestinationNetns: bring up host veth: %w", err)
 	}
 
+	// SD-1 (ADR-0167 C1): substrate wiring via provider. On bridge-mode substrates:
+	// enslaves hostVeth to bridgeName. On kindnet/ptp: detects EOPNOTSUPP, validates C3,
+	// injects /32 host route for podIP via hostVeth, emits C4 log.
+	// migrationNetns.go never branches on raw errno — that is the provider's responsibility.
+	if err := provider.WireDestinationVeth(ctx, hostVeth, bridgeName, podIP, migrationName); err != nil {
+		_ = removeVeth(hostVeth)
+		_ = unix.Unmount(netnsPath, unix.MNT_DETACH) // SD-2: unmount before remove
+		_ = os.Remove(netnsPath)
+		return nil, fmt.Errorf("PrepareDestinationNetns: wire destination veth (bridge=%s): %w", bridgeName, err)
+	}
+
 	if err := configureNetnsInterfaces(netnsPath, ip); err != nil {
 		_ = removeVeth(hostVeth)
+		_ = unix.Unmount(netnsPath, unix.MNT_DETACH) // SD-2: unmount before remove
 		_ = os.Remove(netnsPath)
 		return nil, fmt.Errorf("PrepareDestinationNetns: configure netns: %w", err)
 	}

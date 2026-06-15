@@ -2977,6 +2977,23 @@ if os.path.exists(ifaddr_path):
         # Dest netns IP is pre-staged by ADR-0165 SP-1/SP-2/SP-3; no ifaddr image needed.
         os.remove(ifaddr_path)
         print('ifaddr: pycriu handler missing — deleted', ifaddr_path, '(CRIU skip-restore path; dest IP pre-staged by ADR-0165)')
+
+# ---- route-10.img / route6-10.img: delete (ADR-0167 SD-3) ----
+# Source-node routes reference the source veth device by index/name; on the destination
+# those indices differ. CRIU route restore fails with RTNETLINK: No such device
+# (criu/net.c:1969) when the device index/name in the route image does not match.
+# Destination routes are established by ADR-0167 SD-1 host-route injection (or by bridge
+# membership + provider-injected routes on the bridge path). Strip = delete, not rewrite:
+# CRIU skips route restore entirely when route-*.img is absent (proven safe by ifaddr pattern).
+for route_file in ['route-10.img', 'route6-10.img']:
+    route_path = os.path.join(ckpt, route_file)
+    if os.path.exists(route_path):
+        orig = route_path + '.orig'
+        if not os.path.exists(orig):
+            import shutil
+            shutil.copy2(route_path, orig)
+        os.remove(route_path)
+        print('route: deleted', route_file, '(CRIU skip-route-restore; dest routes via host-route injection or pre-staged)')
 `
 	// /dev/shm is an in-memory filesystem (tmpfs) — avoids writing the script to disk.
 	// 0600 so only root can read the path; removed immediately after exec.

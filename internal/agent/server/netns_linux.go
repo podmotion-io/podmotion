@@ -53,7 +53,11 @@ func (s *AgentServer) PrepareDestinationNetns(ctx context.Context, req *agentpb.
 	if bridgeName == "" {
 		bridgeName = "cni0" // Flannel fallback only — kindnet discovery returns a non-empty name.
 	}
-	ns, err := network.PrepareDestinationNetns(ctx, uid, req.PodIp, "", bridgeName)
+	// ADR-0167 C1: use KindnetProvider as the wiring provider so that EOPNOTSUPP detection
+	// and host-route fall-through live in the provider abstraction layer.
+	// BridgeIfname is set to the runtime-discovered interface (ADR-0154 Decision 3).
+	provider := &network.KindnetProvider{BridgeIfname: bridgeName}
+	ns, err := network.PrepareDestinationNetns(ctx, provider, uid, req.PodIp, "", bridgeName, req.MigrationName)
 	if err != nil {
 		log.Error(err, "PrepareDestinationNetns: failed to create migration netns",
 			"migration", req.MigrationName, "podIP", req.PodIp)
