@@ -243,6 +243,7 @@ func main() {
 		TrafficVerifier: compositeVerifier,
 		ReplicationMgr:  replicationMgr,
 		StorageMgr:      storageMgr,
+		Recorder:        mgr.GetEventRecorderFor("podmigration-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "podmigration")
 		os.Exit(1)
