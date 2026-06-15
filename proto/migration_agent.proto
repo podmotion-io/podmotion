@@ -185,6 +185,11 @@ message RestoreRequest {
   // relay_ifname is the overlay interface name on the destination where PM_RELAY_TC programs
   // are attached (typically "flannel.1"). Empty means use the default "flannel.1".
   string relay_ifname                = 8;
+  // tcp_preservation_mode mirrors spec.tcpPreservationMode ("None"|"BestEffort"|"Strict").
+  // Required for ADR-0049 Amendment D A1 fail-closed enforcement: patchCheckpointImages
+  // failure is a hard abort when mode=="Strict" (explicit field replaces the SeqSnapshots>0
+  // proxy, closing the narrow fail-open where Strict with zero TCP connections would degrade).
+  string tcp_preservation_mode       = 9;
 }
 message RestoreResponse {
   bool   success           = 1;

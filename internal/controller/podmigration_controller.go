@@ -2181,6 +2181,7 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 		SourceFreezeTimestampNs: pm.Status.SourceFreezeTimestampNs,
 		SeqSnapshots:            restoreSeqSnapshots,
 		DestNetnsFd:             pm.Status.DestNetnsPath,
+		TcpPreservationMode:     string(pm.Spec.TCPPreservationMode),
 	})
 	if err != nil || (restoreResp != nil && !restoreResp.Success) {
 		msg := "restore RPC failed"
@@ -2415,9 +2416,10 @@ func (r *PodMigrationReconciler) reconcileRestoringNRI(ctx context.Context, pm *
 				checkpointRef = pm.Status.CheckpointRef.Name
 			}
 			restoreResp, restoreErr := destAgent.Restore(ctx, &agentpb.RestoreRequest{
-				MigrationName: pm.Name,
-				CheckpointRef: checkpointRef,
-				DestNetnsFd:   pm.Status.DestNetnsPath,
+				MigrationName:       pm.Name,
+				CheckpointRef:       checkpointRef,
+				DestNetnsFd:         pm.Status.DestNetnsPath,
+				TcpPreservationMode: string(pm.Spec.TCPPreservationMode),
 			})
 			if restoreErr != nil {
 				log.Error(restoreErr, "NRI fallback: agent Restore RPC failed", "migration", pm.Name)

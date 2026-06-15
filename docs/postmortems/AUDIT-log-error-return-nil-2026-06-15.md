@@ -65,3 +65,7 @@ Two categories:
 ## Summary
 
 Three mutating `log.Error + return nil` patterns confirmed and fixed (A1, A2, C3). All remaining patterns are correctly classified as benign degrade-and-continue. No additional MUTATING patterns requiring immediate fix were identified in the audited files.
+
+## Tracking
+
+A1 SeqSnapshots proxy: server.go restore site previously used len(SeqSnapshots)>0 as Strict proxy. Replaced with explicit TCPPreservationMode field in RestoreRequest (commit: this). Tracked and resolved.
