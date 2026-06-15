@@ -128,6 +128,68 @@ func TestCheckAtomicityBarrier_MultipleFailures(t *testing.T) {
 	}
 }
 
+// TestCheckAtomicityBarrier_EmptySnapshot_SeqXlatSeededTrue verifies ADR-0163:
+// when TCPSeqSnapshots is empty (cold/stateless migration), barrier B is trivially
+// satisfied and SeqXlatSeeded must be true so CheckAtomicityBarrier does not
+// emit "B: PM_SEQ_XLAT not seeded" (Sprint 32 gate blocker B5).
+func TestCheckAtomicityBarrier_EmptySnapshot_SeqXlatSeededTrue(t *testing.T) {
+	// Simulate the controller-side computation: len(snapshots)==0 => seqXlatSeeded=true.
+	snapshots := []network.SeqSnapshot{}
+	relaySeedConfirmed := false // relay never called — no snapshots to seed
+	seqXlatSeeded := len(snapshots) == 0 || relaySeedConfirmed
+
+	p := network.BarrierPredicates{
+		SeqXlatSeeded:        seqXlatSeeded,
+		SourceConntrackArmed: true,
+		DestConntrackArmed:   true,
+		RestoreComplete:      true,
+		FDBManager:           nil,
+	}
+	result, err := network.CheckAtomicityBarrier(context.Background(), p)
+	if err != nil {
+		t.Fatalf("empty-snapshot cold migration: CheckAtomicityBarrier returned error: %v", err)
+	}
+	if !result.BPredicate {
+		t.Error("empty-snapshot cold migration: expected predicate B satisfied (ADR-0163 barrier-B trivially satisfied)")
+	}
+}
+
+// TestCheckAtomicityBarrier_NonEmptySnapshot_RelaySeedConfirmed verifies ADR-0163:
+// when TCPSeqSnapshots is non-empty, seqXlatSeeded must equal relaySeedConfirmed.
+func TestCheckAtomicityBarrier_NonEmptySnapshot_RelaySeedConfirmed(t *testing.T) {
+	snapshots := []network.SeqSnapshot{{SrcIP: "10.0.0.1", SrcPort: 1234, DstIP: "10.0.0.2", DstPort: 5678}}
+
+	t.Run("relay_seeded", func(t *testing.T) {
+		relaySeedConfirmed := true
+		seqXlatSeeded := len(snapshots) == 0 || relaySeedConfirmed
+		p := network.BarrierPredicates{
+			SeqXlatSeeded:        seqXlatSeeded,
+			SourceConntrackArmed: true,
+			DestConntrackArmed:   true,
+			RestoreComplete:      true,
+		}
+		_, err := network.CheckAtomicityBarrier(context.Background(), p)
+		if err != nil {
+			t.Fatalf("relay seeded: unexpected barrier error: %v", err)
+		}
+	})
+
+	t.Run("relay_not_seeded", func(t *testing.T) {
+		relaySeedConfirmed := false
+		seqXlatSeeded := len(snapshots) == 0 || relaySeedConfirmed
+		p := network.BarrierPredicates{
+			SeqXlatSeeded:        seqXlatSeeded,
+			SourceConntrackArmed: true,
+			DestConntrackArmed:   true,
+			RestoreComplete:      true,
+		}
+		_, err := network.CheckAtomicityBarrier(context.Background(), p)
+		if err == nil {
+			t.Fatal("relay not seeded with non-empty snapshots: expected barrier error for unsatisfied B")
+		}
+	})
+}
+
 func TestComputePAWSTsDelta(t *testing.T) {
 	cases := []struct {
 		name   string
