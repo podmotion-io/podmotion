@@ -564,6 +564,28 @@ func parseLinkEther(out string) string {
 	return ""
 }
 
+// readReplVethMACFn is the injectable seam for ReadReplVethMAC, used in tests (ADR-0133).
+// Production code must not replace this variable; it exists solely for unit test injection.
+var readReplVethMACFn = ReadReplVethMAC
+
+// finalizeRestoreMAC collects the replacement pod's eth0 MAC via readReplVethMACFn and
+// enforces the per-mode policy (ADR-0133 D3):
+//   - Strict: returns an error if the MAC is empty (fail-closed).
+//   - BestEffort/None: logs and returns "" without error (degrade path).
+//
+// The returned MAC is passed to ReportRestoreConfirmed by the caller.
+func finalizeRestoreMAC(pid int, sandboxNetnsPath, tcpPreservationMode string) (string, error) {
+	mac, err := readReplVethMACFn(pid, sandboxNetnsPath)
+	if err != nil || mac == "" {
+		if tcpPreservationMode == string(pmv1.TCPPreservationModeStrict) {
+			return "", fmt.Errorf("finalizeRestoreMAC: replVethMAC is empty under Strict mode (ADR-0133 D3): %w", err)
+		}
+		// BestEffort or None: degrade — MAC collection failed but we do not fail the restore.
+		return "", nil
+	}
+	return mac, nil
+}
+
 // resolvedNetnsPaths caches the netns path CRIU joined per migration (ADR-0133), so the NRI
 // restore callback can read eth0's MAC from the exact pod netns rather than the restored
 // PID's own ns/net (which can transiently resolve to the host netns post-restore).
