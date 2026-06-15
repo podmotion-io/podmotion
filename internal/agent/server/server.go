@@ -1802,12 +1802,21 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		"--skip-mnt", "/sys/devices/virtual/dmi/id/board_serial",
 		"--skip-mnt", "/sys/devices/virtual/dmi/id/chassis_serial",
 		"--skip-mnt", "/sys/devices/virtual/dmi/id/sys_vendor",
-		// CRIU 4.2 restore fails with "Cannot umount at ./sys: Device or resource busy"
-		// in kind containers because the sysfs and cgroupfs mounts are held open by the
-		// container runtime. Skip them on restore — the destination runtime re-provides
-		// both mounts for the replacement pod. (Sprint 32 fix.)
-		// /sys and /sys/fs/cgroup are skipped at DUMP time (criu_checkpointer.go skipMnts),
-		// so they are absent from the checkpoint images and never attempted at restore.
+		// --mntns-compat-mode causes CRIU restore to umount mounts that exist in the
+		// destination container's namespace but are absent from the checkpoint (because
+		// they were skipped at dump time). /sys is bind-mounted from the kind host and
+		// has an open reference that prevents umount — "Can't umount at ./sys: Device or
+		// resource busy". The children (/sys/fs/cgroup, /sys/fs/bpf, /sys/kernel/debug,
+		// /sys/kernel/config) are successfully umounted, but /sys itself cannot be
+		// removed. All four sysfs-family mounts must be skipped on the RESTORE path too
+		// so compat-mode leaves them in the destination namespace; the container runtime
+		// re-provides them fresh for the replacement pod.
+		// NOTE: previous sprint-32 attempt (commit 311933c) incorrectly concluded that
+		// restore-time --skip-mnt was a no-op. Gate6 CRIU restore log proves otherwise.
+		"--skip-mnt", "/sys",
+		"--skip-mnt", "/sys/fs/cgroup",
+		"--skip-mnt", "/sys/devices/virtual/powercap",
+		"--skip-mnt", "/sys/firmware",
 		"--ext-mount-map", "/dev/shm:/dev/shm",
 		"--ext-mount-map", "/etc/resolv.conf:/etc/resolv.conf",
 		"--ext-mount-map", "/etc/hostname:/etc/hostname",
