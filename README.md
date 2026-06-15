@@ -1,38 +1,48 @@
 # PodMotion
 
+> **Status: v0.1.0-alpha — experimental, not production-ready. No production deployments. Proof runs on single-maintainer kind cluster only.**
+
 Live pod migration for Kubernetes — live VM migration for containers — stateful pods migrate between nodes with zero downtime and zero connection loss.
 
 ## Description
 
 PodMotion migrates running pods between nodes with zero downtime, preserving in-memory state via CRIU 4.2 iterative pre-copy, active TCP connections via an eBPF XDP bridge with TCP_REPAIR, and persistent volumes across a multi-tier storage cutover (RWX re-attach, Longhorn dual-engine, Ceph RBD live, snapshot-rsync). It ships as a Kubernetes operator with five CRDs, an out-of-tree scheduler plugin, a custom descheduler plugin, and a per-node gRPC agent.
 
-For full architecture, API reference, and installation guides see [docs/](docs/) or [podmotion.io](https://podmotion.io).
+For full architecture, API reference, and installation guides see [docs/](docs/README.md) or [podmotion.io](https://podmotion.io).
 
-## NS#4 Proof: Live PostgreSQL Migration, Zero Failed Transactions (2026-06-12)
+## NS#4 Proof: arm64 Live TCP Migration Proven (2026-06-12)
 
-PodMotion has been proven to migrate a live pod with 8 active PostgreSQL TCP connections
-mid-query with **zero failed transactions, zero dropped connections, and a freeze window
-under 500ms** — on stock Ubuntu 24.04 kernel 6.8, flannel VXLAN overlay, reproducible on
-EC2/Azure/GCP without cloud API calls or custom kernels.
+PodMotion has been proven to live-migrate a running pod with **zero dropped TCP connections
+and a freeze window under 500ms** — on stock Ubuntu 24.04 kernel 6.8, flannel VXLAN
+overlay, without kernel patches or cloud API calls.
 
-**10-run result set** (randomized trigger offsets, sustained pgbench `-c 8 -j 8 -T 600 -P 1`):
+**Proven scope (NS#4, 10 runs):** single TCP flow, single container, single client.
+`seq_delta=0` across all 10 runs.
+
+**10-run result set** (randomized trigger offsets):
 
 | Metric | Result |
 |--------|--------|
-| `failed_transactions` (all 10 runs) | 0 |
+| `seq_delta` (all 10 runs) | 0 |
 | Freeze window p50 / p99 | 312ms / 487ms (budget: 500ms) |
 | RST segments on either node | 0 |
 | Comparison (kubectl drain) | ≥ 312 failed transactions |
+
+> **Note:** Multi-flow/multi-container live migration: not yet proven (Tier-0-blocking, see ROADMAP).
+> The NS#4 spike proves the mechanism is real; multi-container CRIU consistency and
+> N-flow simultaneous seq preservation are the remaining open problems.
 
 Full proof artifact: [docs/proof/ns4-proof.md](docs/proof/ns4-proof.md)
 
 ## Getting Started
 
 ### Prerequisites
-- go version v1.24.6+
+- go version v1.26+
 - docker version 17.03+.
-- kubectl version v1.25+.
+- kubectl version v1.30+.
 - Access to a Kubernetes 1.25+ cluster.
+
+> See [CONTRIBUTING.md](CONTRIBUTING.md) for current tool versions.
 - Linux kernel 5.15+ on all nodes (Ubuntu 22.04 HWE minimum; 6.8+ preferred).
 - CRIU 4.x installed on all nodes.
 - bpfman DaemonSet deployed on the cluster.
@@ -55,6 +65,8 @@ make install
 
 **Deploy the Manager to the cluster with the image specified by `IMG`:**
 
+> ⚠️ The kustomize path (config/default/) passes flags that crash the current operator binary. Use the Helm deploy path in CLAUDE.md for working installation.
+
 ```sh
 make deploy IMG=ghcr.io/podmotion-io/podmotion:tag
 ```
@@ -65,12 +77,14 @@ privileges or be logged in as admin.
 **Create a PodMigration to trigger a live migration:**
 
 ```sh
-kubectl apply -f config/samples/podmotion_v1alpha1_podmigration.yaml
+kubectl apply -f config/samples/migration_v1alpha1_podmigration.yaml
 ```
 
 > **NOTE**: The sample manifest requires two fields to be set before applying:
-> - `spec.sourcePod` — name of the running pod to migrate (must be in the same namespace)
-> - `spec.destinationNode` — name of the target node (must advertise `NodeMigrationCapacity`)
+> - `spec.podName` — name of the running pod to migrate
+> - `spec.podNamespace` — namespace of that pod
+> - `spec.targetNodeName` — (optional) destination node name; omit to let the scheduler plugin select
+> - `spec.tcpPreservationMode` — `None` for stateless workloads; `BestEffort` or `Strict` for TCP-preserving migrations
 >
 > Edit the sample file to supply these values, then apply.
 

@@ -14,6 +14,10 @@
 !bin/manager-linux-amd64
 !bin/agent-linux-amd64
 
+# Re-include pycriu Python package (required by agent Dockerfile)
+!pycriu/
+!pycriu/**
+
 # Re-include compiled BPF objects (eBPF ELF relocatables for kind node image)
 !bpf/zero_window_bpfel.o
 !bpf/zero_window_bpfeb.o

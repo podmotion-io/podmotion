@@ -107,7 +107,7 @@ For operators deploying PodMotion in production, the following mitigations are r
 - Run the `pm-controller` and `pm-agent` pods with a dedicated ServiceAccount; do not reuse the `default` ServiceAccount.
 - Mount checkpoint staging directories on an encrypted, size-limited `emptyDir` or dedicated PersistentVolume, not on the host filesystem.
 - Restrict `PodMigration` create/update RBAC to trusted namespaces only.
-- Enable mTLS between `pm-controller` and `pm-agent` gRPC endpoints (see docs/operations/mtls.md).
+- Enable mTLS between `pm-controller` and `pm-agent` gRPC endpoints (mTLS configuration is tracked in ADR-0159 and ADR-0161).
 - Review eBPF program permissions; PodMotion should not require `CAP_SYS_ADMIN` beyond the specific `BPF` capability in kernels >= 5.8.
 
 These recommendations will be enforced by default in a future release.

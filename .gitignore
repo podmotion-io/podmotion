@@ -49,3 +49,19 @@ fleetctl
 
 # Claude Code project files
 .claude/settings.local.json
+
+# Compiled binaries directory
+bin/
+
+# eBPF compiled objects
+*.o
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# Kubernetes config directory (may contain secrets)
+.kube/
+
+# Line-ending marker file (Windows artifact)
+LF
