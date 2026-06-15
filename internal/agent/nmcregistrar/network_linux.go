@@ -22,3 +22,7 @@ func detectWireGuardInterface(podCIDR *net.IPNet) (string, error) {
 func detectIPSecModeCNI(podCIDR *net.IPNet) (bool, error) {
 	return network.DetectIPSecModeCNI(podCIDR)
 }
+
+func probeTCClsact() bool {
+	return network.ProbeTCClsact()
+}

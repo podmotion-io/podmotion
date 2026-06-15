@@ -100,6 +100,14 @@ spec:
                     description: MemSoftDirty indicates CONFIG_MEM_SOFT_DIRTY is enabled
                       (required for iterative pre-copy).
                     type: boolean
+                  tcClsactSupported:
+                    description: |-
+                      TCClsactSupported indicates the node can attach a clsact qdisc to a veth-class
+                      interface (RTM_NEWQDISC for clsact returns success, not EOPNOTSUPP). Required for
+                      tcpPreservationMode=Strict zero-window hold. Set by an ACTIVE runtime probe at
+                      registration, NOT inferred from CONFIG_BPF_SYSCALL — BPFEnabled is not a reliable
+                      proxy for clsact-on-veth support (ADR-0169).
+                    type: boolean
                   userfaultfd:
                     description: Userfaultfd indicates CONFIG_USERFAULTFD is enabled
                       (required for post-copy lazy pages).
@@ -113,6 +121,7 @@ spec:
                 - checkpointRestore
                 - kernelVersion
                 - memSoftDirty
+                - tcClsactSupported
                 - userfaultfd
                 - xdpSupported
                 type: object
@@ -155,6 +164,12 @@ spec:
                       (e.g. Flannel). Pods on nodes where this is false can only use cold migration
                       (NetworkContinuity=false). Defaults to true for CNIs that support IPAM pinning.
                     type: boolean
+                  wireGuardInterface:
+                    description: |-
+                      WireGuardInterface is the name of the WireGuard tunnel interface on this node's
+                      primary CNI encryption path (e.g. "wireguard.cali", "cilium_wg0", "wg0").
+                      Empty string if WireGuard is not in use (ADR-0102).
+                    type: string
                   xdpBridgeCapable:
                     description: XDPBridgeCapable indicates the node can run the XDP
                       packet bridge program.
@@ -203,7 +218,6 @@ spec:
             - storageCapability
             type: object
           status:
-            description: NodeMigrationCapacityStatus reflects real-time node state.
             properties:
               activeDestinationMigrations:
                 description: ActiveDestinationMigrations is the number of migrations
@@ -215,6 +229,23 @@ spec:
                   sourced from this node.
                 format: int32
                 type: integer
+              clusterIPFamily:
+                description: |-
+                  ClusterIPFamily reports the IP address family support detected on this node's
+                  primary interface. Used by the admission webhook to reject IPv6-primary migrations
+                  (ADR-0081). Populated by the NMC probe on startup and on each resync.
+                enum:
+                - IPv4Only
+                - IPv6Only
+                - DualStack
+                - Unknown
+                type: string
+              ipSecEncryption:
+                description: |-
+                  IPSecEncryption is true when CNI-managed IPSec (XFRM pod-CIDR policies) is
+                  detected on this node. Migrations are rejected at admission for IPSec clusters
+                  (ADR-0102).
+                type: boolean
               lastHeartbeat:
                 description: LastHeartbeat is when the agent last updated this record.
                 format: date-time

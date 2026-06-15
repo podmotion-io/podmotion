@@ -119,7 +119,9 @@ func detectKernelFeatures() pmv1.KernelFeatures {
 	// Try to read kernel config from /proc/config.gz first
 	cfg := readKernelConfig()
 	if cfg == "" {
-		return kf // use defaults
+		// TCClsactSupported: always active-probe regardless of config readability (ADR-0169).
+		kf.TCClsactSupported = probeTCClsact()
+		return kf
 	}
 
 	kf.CheckpointRestore = configEnabled(cfg, "CONFIG_CHECKPOINT_RESTORE")
@@ -127,6 +129,9 @@ func detectKernelFeatures() pmv1.KernelFeatures {
 	kf.Userfaultfd = configEnabled(cfg, "CONFIG_USERFAULTFD")
 	kf.BPFEnabled = configEnabled(cfg, "CONFIG_BPF_SYSCALL")
 	kf.XDPSupported = configEnabled(cfg, "CONFIG_XDP_SOCKETS")
+	// TCClsactSupported: active runtime probe — BPFEnabled is NOT a reliable proxy
+	// for clsact-on-veth support on all substrates (ADR-0169). Probe error/failure → false.
+	kf.TCClsactSupported = probeTCClsact()
 	return kf
 }
 
