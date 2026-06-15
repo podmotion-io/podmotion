@@ -341,17 +341,100 @@ if os.path.exists(netdev_path):
         print('netdev: kept', len(kept), 'entries (loopback only)')
 
 # ifaddr: strip-only — skip-on-unknown-magic (S1)
+# When no non-loopback entries remain (or pycriu cannot parse the image), delete the
+# file so CRIU never launches its external 'ip addr restore' subprocess against it.
+# Writing any stub (even a zero-entry image) risks "Magic mismatch" from that subprocess.
 ifaddr_path = os.path.join(ckpt, 'ifaddr-10.img')
 if os.path.exists(ifaddr_path):
     src = backup(ifaddr_path)
     img = load_image(src, fail_on_magic_error=False)
     if img is not None:
         kept = [e for e in img.get('entries', []) if e.get('ifaddr', {}).get('ifindex') == 1]
-        img['entries'] = kept
-        with open(ifaddr_path, 'wb') as f:
-            pycriu.images.dump(img, f)
-        print('ifaddr: kept', len(kept), 'entries (loopback only)')
+        if kept:
+            img['entries'] = kept
+            with open(ifaddr_path, 'wb') as f:
+                pycriu.images.dump(img, f)
+            print('ifaddr: kept', len(kept), 'entries (loopback only)')
+        else:
+            os.remove(ifaddr_path)
+            print('ifaddr: 0 non-loopback entries — deleted', ifaddr_path, '(CRIU skip-restore path; dest IP pre-staged by ADR-0165)')
+    else:
+        os.remove(ifaddr_path)
+        print('ifaddr: pycriu handler missing — deleted', ifaddr_path, '(CRIU skip-restore path; dest IP pre-staged by ADR-0165)')
 `
+}
+
+// TestPatchCheckpointImages_IfaddrDeletedWhenNoNonLoopback is the regression guard for
+// SPRINT32-COLD-CHURN3: patchCheckpointImages must DELETE ifaddr-10.img (not write a stub)
+// when there are no non-loopback address entries, so CRIU's external 'ip addr restore'
+// subprocess is never launched against the file.
+//
+// Two sub-cases:
+//   A. pycriu CAN parse the image but all entries are non-loopback → file deleted.
+//   B. pycriu CANNOT parse the image (unknown magic / no handler) → file deleted.
+//
+// Regression: the old code wrote an 8-byte magic-only stub that CRIU's 'ip' tool
+// rejected with "Magic mismatch (1 elems, 54564319 magic)" (CHURN3 R2-ATTEMPT-3).
+func TestPatchCheckpointImages_IfaddrDeletedWhenNoNonLoopback(t *testing.T) {
+	pypath, extraEnv := pycriuEnv(t)
+
+	imgCommonMagic := magicByName(t, pypath, "IMG_COMMON")
+	mntsMagic := magicByName(t, pypath, "MNTS")
+	ifaddrMagic := magicByName(t, pypath, "IFADDR")
+	maskedJSON, _ := json.Marshal([]string{})
+
+	runScript := func(t *testing.T, ckptDir string) (string, error) {
+		t.Helper()
+		patchScript := buildPatchScript()
+		scriptPath := filepath.Join(t.TempDir(), "pm-patch-ckpt.py")
+		if err := os.WriteFile(scriptPath, []byte(patchScript), 0o600); err != nil {
+			t.Fatalf("write patch script: %v", err)
+		}
+		cmd := exec.Command("python3", scriptPath, ckptDir, string(maskedJSON))
+		cmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	// Sub-case A: parseable image with zero non-loopback entries → file must be absent after patch.
+	t.Run("parseable_zero_nonloopback_entries_deletes_file", func(t *testing.T) {
+		ckptDir := t.TempDir()
+		writeMinimalImg(t, filepath.Join(ckptDir, "mountpoints-10.img"), imgCommonMagic, mntsMagic)
+		// Minimal valid IFADDR image — zero entries (no non-loopback addresses).
+		writeMinimalImg(t, filepath.Join(ckptDir, "ifaddr-10.img"), imgCommonMagic, ifaddrMagic)
+
+		out, err := runScript(t, ckptDir)
+		if err != nil {
+			t.Fatalf("script failed: %v\noutput: %s", err, out)
+		}
+		ifaddrPath := filepath.Join(ckptDir, "ifaddr-10.img")
+		if _, statErr := os.Stat(ifaddrPath); statErr == nil {
+			t.Errorf("REGRESSION(CHURN3): ifaddr-10.img must be deleted when zero non-loopback entries, but file still exists; script output: %s", out)
+		}
+		if !strings.Contains(out, "deleted") {
+			t.Errorf("expected 'deleted' in script output; got: %s", out)
+		}
+	})
+
+	// Sub-case B: unknown-magic image (pycriu cannot parse) → file must be absent after patch.
+	t.Run("unknown_magic_ifaddr_deletes_file", func(t *testing.T) {
+		ckptDir := t.TempDir()
+		writeMinimalImg(t, filepath.Join(ckptDir, "mountpoints-10.img"), imgCommonMagic, mntsMagic)
+		// Write unknown-magic ifaddr image — pycriu will fail to parse it.
+		writeUnknownMagicImg(t, filepath.Join(ckptDir, "ifaddr-10.img"))
+
+		out, err := runScript(t, ckptDir)
+		if err != nil {
+			t.Fatalf("script failed: %v\noutput: %s", err, out)
+		}
+		ifaddrPath := filepath.Join(ckptDir, "ifaddr-10.img")
+		if _, statErr := os.Stat(ifaddrPath); statErr == nil {
+			t.Errorf("REGRESSION(CHURN3): ifaddr-10.img must be deleted when pycriu cannot parse it, but file still exists; script output: %s", out)
+		}
+		if !strings.Contains(out, "deleted") {
+			t.Errorf("expected 'deleted' in script output; got: %s", out)
+		}
+	})
 }
 
 // buildScanScript returns the embedded mount-scan script from buildMaskedPathExtMountArgs.

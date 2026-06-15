@@ -2943,16 +2943,12 @@ if os.path.exists(netdev_path):
 
 # ---- ifaddr: remove source pod IP addresses; keep loopback only (ADR-0125, ADR-0162) ----
 # strip-only image: skip-on-unknown-magic (S1)
-# Fallback (GC-1 fix): when pycriu cannot parse ifaddr-10.img (no IFADDR handler in
-# this pycriu build), write an empty CRIU v1.1 image (8-byte header: IMG_COMMON +
-# IFADDR magic, little-endian int32). This instructs CRIU to restore zero IP addresses
-# in the dest netns, which is correct because ADR-0165 pre-stages the dest netns with
-# the migrated IP before CRIU restore runs. Keeping the source IP in the image causes
-# CRIU to attempt 'ip addr add <source-ip>' in an already-configured netns, yielding
-# 'Error: ipv4: Address already assigned' (SPRINT32-COLD-GATE-R2-ATTEMPT-1 root cause).
-import struct as _struct
-IFADDR_MAGIC     = 1194725922  # pycriu/images/magic.py by_name['IFADDR']
-IMG_COMMON_MAGIC = 1414939417  # pycriu/images/magic.py by_name['IMG_COMMON']
+# ifaddr-10.img: strip all non-loopback addresses so CRIU does not attempt 'ip addr add
+# <source-ip>' in the dest netns (which is pre-staged by ADR-0165 SP-1/SP-2/SP-3).
+# When the image has zero non-loopback entries OR pycriu cannot parse it, delete the file
+# entirely — CRIU skips ip-addr restore when the file is absent, avoiding the external
+# 'ip addr restore' subprocess that rejects any malformed or empty framing
+# (SPRINT32-COLD-CHURN3: 8-byte magic-only stub → "Magic mismatch (1 elems, 54564319 magic)").
 
 ifaddr_path = os.path.join(ckpt, 'ifaddr-10.img')
 if os.path.exists(ifaddr_path):
@@ -2961,19 +2957,26 @@ if os.path.exists(ifaddr_path):
     if img is not None:
         kept = [e for e in img['entries']
                 if e.get('ifaddr', {}).get('ifindex') == 1]
-        img['entries'] = kept
-        with open(ifaddr_path, 'wb') as f:
-            pycriu.images.dump(img, f)
-        print('ifaddr: kept', len(kept), 'entries (loopback only)')
+        if kept:
+            img['entries'] = kept
+            with open(ifaddr_path, 'wb') as f:
+                pycriu.images.dump(img, f)
+            print('ifaddr: kept', len(kept), 'entries (loopback only)')
+        else:
+            # No non-loopback addresses to restore — delete the image file so CRIU's
+            # external 'ip addr restore' subprocess is never launched against it.
+            # CRIU skips ip-addr restore entirely when ifaddr-*.img is absent.
+            # Dest netns IP is pre-staged by ADR-0165 SP-1/SP-2/SP-3; no ifaddr image needed.
+            os.remove(ifaddr_path)
+            print('ifaddr: 0 non-loopback entries — deleted', ifaddr_path, '(CRIU skip-restore path; dest IP pre-staged by ADR-0165)')
     else:
-        # pycriu IFADDR handler missing — write empty v1.1 image (IMG_COMMON + IFADDR magic).
-        # Empty = no IP address entries; CRIU skips ip-addr restore entirely.
-        # The dest netns IP is already configured by ADR-0165 SP-1/SP-2/SP-3 pre-staging;
-        # an empty ifaddr image is therefore correct and avoids 'Address already assigned'.
-        empty_header = _struct.pack('<ii', IMG_COMMON_MAGIC, IFADDR_MAGIC)
-        with open(ifaddr_path, 'wb') as f:
-            f.write(empty_header)
-        print('ifaddr: pycriu handler missing — wrote empty v1.1 image (0 entries); dest netns IP pre-staged by ADR-0165')
+        # pycriu IFADDR handler missing (older pycriu build) — delete the image file entirely.
+        # Writing any stub risks CRIU's external 'ip addr restore' subprocess rejecting the
+        # framing with "Magic mismatch" (SPRINT32-COLD-CHURN3: 8-byte magic-only stub caused
+        # exactly this failure). Absence of the file causes CRIU to skip ip-addr restore.
+        # Dest netns IP is pre-staged by ADR-0165 SP-1/SP-2/SP-3; no ifaddr image needed.
+        os.remove(ifaddr_path)
+        print('ifaddr: pycriu handler missing — deleted', ifaddr_path, '(CRIU skip-restore path; dest IP pre-staged by ADR-0165)')
 `
 	// /dev/shm is an in-memory filesystem (tmpfs) — avoids writing the script to disk.
 	// 0600 so only root can read the path; removed immediately after exec.
