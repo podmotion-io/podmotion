@@ -24,34 +24,25 @@ nodes:
         nodeRegistration:
           kubeletExtraArgs:
             feature-gates: "ContainerCheckpoint=true"
-    containerdConfigPatches:
-      - |-
-        [plugins."io.containerd.nri.v1.nri"]
-          disable = false
-          disable_connections = false
-          plugin_registration_timeout = "5s"
-          plugin_request_timeout = "2s"
-          socket_path = "/var/run/nri/nri.sock"
-          state_dir = "/var/lib/nri"
     extraMounts:
       - hostPath: /sys/fs/bpf
         containerPath: /sys/fs/bpf
         propagation: Bidirectional
   - role: worker
     image: podmotion-node:sprint31-amd64
-    containerdConfigPatches:
-      - |-
-        [plugins."io.containerd.nri.v1.nri"]
-          disable = false
-          disable_connections = false
-          plugin_registration_timeout = "5s"
-          plugin_request_timeout = "2s"
-          socket_path = "/var/run/nri/nri.sock"
-          state_dir = "/var/lib/nri"
     extraMounts:
       - hostPath: /sys/fs/bpf
         containerPath: /sys/fs/bpf
         propagation: Bidirectional
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.nri.v1.nri"]
+      disable = false
+      disable_connections = false
+      plugin_registration_timeout = "5s"
+      plugin_request_timeout = "2s"
+      socket_path = "/var/run/nri/nri.sock"
+      state_dir = "/var/lib/nri"
 networking:
   podSubnet: "10.244.0.0/16"
   serviceSubnet: "10.96.0.0/12"
