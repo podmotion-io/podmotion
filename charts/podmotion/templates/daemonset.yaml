@@ -113,6 +113,10 @@ spec:
             - name: run-podmotion
               mountPath: /run/podmotion
               mountPropagation: HostToContainer
+            - name: host-var-run-netns
+              mountPath: /var/run/netns
+              mountPropagation: HostToContainer
+              readOnly: true
       volumes:
         - name: criu-socket
           hostPath:
@@ -148,4 +152,8 @@ spec:
         - name: run-podmotion
           hostPath:
             path: /run/podmotion
+            type: DirectoryOrCreate
+        - name: host-var-run-netns
+          hostPath:
+            path: /var/run/netns
             type: DirectoryOrCreate
