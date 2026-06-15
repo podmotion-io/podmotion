@@ -212,6 +212,17 @@ func isNsfsMounted(path string) bool {
 // the agent container's private mount namespace. CRIU receives the path via
 // --join-ns net:<path> and must be able to open it from the host mount namespace.
 func createBindMountedNetns(path string) error {
+	// Ensure the parent directory exists in the HOST mount namespace.
+	// os.MkdirAll above creates it only in the agent container's private mount namespace;
+	// the host mount namespace has a separate view and may lack /run/podmotion/netns/.
+	// Without this, the touch below fails with ENOENT (Sprint 32 cold-gate-attempt-2 root cause).
+	dir := filepath.Dir(path)
+	if out, err := exec.Command("nsenter", "--mount=/proc/1/ns/mnt", "--",
+		"mkdir", "-p", dir,
+	).CombinedOutput(); err != nil {
+		return fmt.Errorf("create netns dir in host mount namespace: %w\n%s", err, out)
+	}
+
 	// Create the bind-mount target file in the HOST mount namespace so CRIU
 	// (running in the host mount namespace via nsenter) can open it.
 	// We use nsenter to create the file on the host rather than os.OpenFile which
