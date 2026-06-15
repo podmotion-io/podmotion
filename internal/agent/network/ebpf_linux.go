@@ -15,14 +15,25 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/podmotion-io/podmotion/internal/agent/network/bpfloader"
 	"golang.org/x/sys/unix"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+const (
+	// bpfPinDir is the root BPF FS pin directory (ADR-0155 Decision 4).
+	bpfPinDir = "/sys/fs/bpf/podmotion"
+
+	// xdpWatchdogMargin is added to FreezeWindowBudgetMs before the watchdog fires.
+	// Mirrors zwWatchdogMargin (server.go). ADR-0155 Decision 7.
+	xdpWatchdogMargin = 500 * time.Millisecond
 )
 
 // ciliumEBPFManager is the production eBPFManager backed by the cilium/ebpf
@@ -47,6 +58,15 @@ type ciliumEBPFManager struct {
 	vtepObjs        *bpfloader.PmXdpVtepObjects
 	vtepXDPLinks    map[uint32]struct{} // dst ifindex
 	srcGuardXDPLinks map[uint32]struct{} // src ifindex
+
+	// xdp_bridge collection; nil until EnsureXDPBridgeLoaded succeeds.
+	// Node-scoped; loaded once at agent startup (ADR-0155 Decision 1).
+	bridgeObjs        *bpfloader.XdpBridgeObjects
+	bridgeHostIfindex uint32 // ifindex the XDP prog is attached to
+	// bridgeWatchdogs tracks per-migration watchdog cancel functions keyed by
+	// srcIP string.  Watchdog fires xdpWatchdogMargin after the freeze budget
+	// expires and auto-deletes the PM_BRIDGE_MAP key (ADR-0155 Decision 7).
+	bridgeWatchdogs map[string]context.CancelFunc
 }
 
 func newCiliumEBPFManager() eBPFManager {
@@ -56,7 +76,90 @@ func newCiliumEBPFManager() eBPFManager {
 		relayIngressFilters: make(map[uint32]uint32),
 		vtepXDPLinks:        make(map[uint32]struct{}),
 		srcGuardXDPLinks:    make(map[uint32]struct{}),
+		bridgeWatchdogs:     make(map[string]context.CancelFunc),
 	}
+}
+
+// EnsureXDPBridgeLoaded loads and pins the xdp_bridge program once per node at
+// agent startup (ADR-0155 Decision 1).  Idempotent: if pins exist and XDP link
+// is live, adopts existing state.  No-op if xdpBridgeCapable=false (Decision 2).
+func (m *ciliumEBPFManager) EnsureXDPBridgeLoaded(ctx context.Context, hostIfname string, xdpBridgeCapable bool) error {
+	log := logf.FromContext(ctx)
+	if !xdpBridgeCapable {
+		log.Info("EnsureXDPBridgeLoaded: XDPBridgeCapable=false — skipping (ADR-0155 D2)")
+		return nil
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := os.MkdirAll(bpfPinDir, 0o755); err != nil {
+		return fmt.Errorf("EnsureXDPBridgeLoaded: mkdir %s: %w", bpfPinDir, err)
+	}
+
+	progPin := bpfPinDir + "/xdp_bridge_prog"
+	mapPin := bpfPinDir + "/PM_BRIDGE_MAP"
+
+	// Attempt adopt path (ADR-0155 Decision 6).
+	if _, statErr := os.Stat(progPin); statErr == nil {
+		prog, pErr := ebpf.LoadPinnedProgram(progPin, nil)
+		if pErr == nil {
+			bridgeMap, mErr := ebpf.LoadPinnedMap(mapPin, nil)
+			if mErr == nil {
+				objs := &bpfloader.XdpBridgeObjects{}
+				objs.PmXdpBridge = prog
+				objs.PM_BRIDGE_MAP = bridgeMap
+				m.bridgeObjs = objs
+				ifindex, _ := resolveIfindex(hostIfname)
+				m.bridgeHostIfindex = ifindex
+				log.Info("EnsureXDPBridgeLoaded: adopted live pin (link alive, prog id)",
+					"progPin", progPin, "progFD", prog.FD())
+				return nil
+			}
+			prog.Close()
+		}
+		// Stale pin — reclaim and reload (ADR-0155 Decision 6).
+		log.Info("EnsureXDPBridgeLoaded: reclaiming stale pin (dead link) — re-pin")
+		_ = os.Remove(progPin)
+		_ = os.Remove(mapPin)
+		_ = os.Remove(bpfPinDir + "/PM_TUNNEL_IFACE")
+	}
+
+	// Fresh load from embedded .o.
+	objs := &bpfloader.XdpBridgeObjects{}
+	if err := bpfloader.LoadXdpBridgeObjects(objs, nil); err != nil {
+		return fmt.Errorf("EnsureXDPBridgeLoaded: load xdp_bridge objects: %w", err)
+	}
+
+	// Pin prog and maps (ADR-0155 Decision 4).
+	if err := objs.PmXdpBridge.Pin(progPin); err != nil {
+		objs.Close() //nolint:errcheck
+		return fmt.Errorf("EnsureXDPBridgeLoaded: pin prog: %w", err)
+	}
+	if err := objs.PM_BRIDGE_MAP.Pin(mapPin); err != nil {
+		objs.Close() //nolint:errcheck
+		return fmt.Errorf("EnsureXDPBridgeLoaded: pin PM_BRIDGE_MAP: %w", err)
+	}
+	if err := objs.PM_TUNNEL_IFACE.Pin(bpfPinDir + "/PM_TUNNEL_IFACE"); err != nil {
+		log.Error(err, "EnsureXDPBridgeLoaded: pin PM_TUNNEL_IFACE failed (non-fatal)")
+	}
+
+	// Attach XDP program to host interface (ADR-0155 Decision 1).
+	ifindex, err := resolveIfindex(hostIfname)
+	if err != nil {
+		objs.Close() //nolint:errcheck
+		return fmt.Errorf("EnsureXDPBridgeLoaded: resolve ifindex for %s: %w", hostIfname, err)
+	}
+	if err := attachXDP(int(ifindex), objs.PmXdpBridge); err != nil {
+		objs.Close() //nolint:errcheck
+		return fmt.Errorf("EnsureXDPBridgeLoaded: attach XDP to %s (ifindex=%d): %w", hostIfname, ifindex, err)
+	}
+
+	m.bridgeObjs = objs
+	m.bridgeHostIfindex = ifindex
+	log.Info("EnsureXDPBridgeLoaded: loaded and pinned",
+		"hostIfname", hostIfname, "ifindex", ifindex, "progPin", progPin)
+	return nil
 }
 
 // ArmZeroWindowHold loads the zero_window BPF program (if not already loaded),
@@ -121,14 +224,93 @@ func (m *ciliumEBPFManager) DisarmZeroWindowHold(ctx context.Context, ifindex ui
 	return nil
 }
 
+// ArmXDPBridge writes srcIP→{dstIP, genevePort} to the already-pinned PM_BRIDGE_MAP
+// (ADR-0155 Decision 3).  No load/attach work.  Registers a watchdog that auto-deletes
+// the map key after defaultFreezeBudget+xdpWatchdogMargin (ADR-0155 Decision 7).
 func (m *ciliumEBPFManager) ArmXDPBridge(ctx context.Context, srcIP, dstIP net.IP, genevePort uint16) error {
-	logf.FromContext(ctx).Info("ebpf cilium: ArmXDPBridge (M22)",
+	log := logf.FromContext(ctx)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.bridgeObjs == nil {
+		log.Info("ebpf cilium: ArmXDPBridge — bridge not loaded (XDPBridgeCapable=false), skipping")
+		return nil
+	}
+
+	src4 := srcIP.To4()
+	dst4 := dstIP.To4()
+	if src4 == nil || dst4 == nil {
+		return fmt.Errorf("ArmXDPBridge: non-IPv4 address srcIP=%s dstIP=%s", srcIP, dstIP)
+	}
+
+	// bridgeEntry layout mirrors C struct bridge_entry: __be32 dst_ip, __u16 geneve_port (host order), __u8 _pad[2].
+	var val [8]byte
+	copy(val[0:4], dst4)
+	binary.LittleEndian.PutUint16(val[4:6], genevePort)
+
+	var key [4]byte
+	copy(key[:], src4)
+
+	if err := m.bridgeObjs.PM_BRIDGE_MAP.Update(key, val, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("ArmXDPBridge: PM_BRIDGE_MAP update srcIP=%s: %w", srcIP, err)
+	}
+
+	log.Info("ebpf cilium: ArmXDPBridge: map update",
 		"srcIP", srcIP, "dstIP", dstIP, "genevePort", genevePort)
+
+	// Register per-migration watchdog (ADR-0155 Decision 7).
+	const defaultFreezeBudget = 5000 * time.Millisecond
+	wdCtx, wdCancel := context.WithCancel(context.Background())
+	srcKey := srcIP.String()
+	if prev, ok := m.bridgeWatchdogs[srcKey]; ok {
+		prev()
+	}
+	m.bridgeWatchdogs[srcKey] = wdCancel
+	capturedKey := key
+	capturedObjs := m.bridgeObjs
+	go func() {
+		select {
+		case <-wdCtx.Done():
+			return
+		case <-time.After(defaultFreezeBudget + xdpWatchdogMargin):
+			log.Info("ArmXDPBridge: watchdog triggered — emergency map-key delete", "srcIP", srcIP)
+			_ = capturedObjs.PM_BRIDGE_MAP.Delete(capturedKey)
+		}
+	}()
+
 	return nil
 }
 
+// DisarmXDPBridge removes the srcIP entry from PM_BRIDGE_MAP and cancels the watchdog.
+// Missing key is not an error (ADR-0155 Decision 5).
 func (m *ciliumEBPFManager) DisarmXDPBridge(ctx context.Context, srcIP net.IP) error {
-	logf.FromContext(ctx).Info("ebpf cilium: DisarmXDPBridge (M22)", "srcIP", srcIP)
+	log := logf.FromContext(ctx)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.bridgeObjs == nil {
+		return nil
+	}
+
+	src4 := srcIP.To4()
+	if src4 == nil {
+		return fmt.Errorf("DisarmXDPBridge: non-IPv4 address srcIP=%s", srcIP)
+	}
+
+	var key [4]byte
+	copy(key[:], src4)
+
+	if err := m.bridgeObjs.PM_BRIDGE_MAP.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return fmt.Errorf("DisarmXDPBridge: PM_BRIDGE_MAP delete srcIP=%s: %w", srcIP, err)
+	}
+
+	srcKey := srcIP.String()
+	if cancel, ok := m.bridgeWatchdogs[srcKey]; ok {
+		cancel()
+		delete(m.bridgeWatchdogs, srcKey)
+	}
+
+	log.Info("ebpf cilium: DisarmXDPBridge: map delete", "srcIP", srcIP)
 	return nil
 }
 
@@ -303,18 +485,35 @@ func (m *ciliumEBPFManager) DisarmVTEP(ctx context.Context, podIP net.IP) error 
 	return nil
 }
 
+// zeroWindowPinDir is the bpffs directory where PM_ACTIVE_HOLDS is pinned.
+// The map name "zero_window_holds" matches the LIBBPF_PIN_BY_NAME declaration in
+// bpf/zero_window.c, so libbpf will automatically pin/load at this path.
+const zeroWindowPinDir = "/sys/fs/bpf/podmotion"
+
 // ensureLoaded loads the zero_window BPF collection if not already loaded.
+// When the pinned map already exists at zeroWindowPinDir (e.g. after an agent
+// restart), cilium/ebpf reuses it via CollectionOptions.Maps.PinPath so the
+// existing hold entries and crash-recovery state are preserved (ADR-0157 D6).
 // Must be called with m.mu held.
 func (m *ciliumEBPFManager) ensureLoaded(ctx context.Context) error {
 	if m.objs != nil {
 		return nil
 	}
+	// Ensure the bpffs pin directory exists.
+	if err := os.MkdirAll(zeroWindowPinDir, 0700); err != nil {
+		return fmt.Errorf("create bpffs pin dir %s: %w", zeroWindowPinDir, err)
+	}
 	objs := &bpfloader.ZeroWindowObjects{}
-	if err := bpfloader.LoadZeroWindowObjects(objs, nil); err != nil {
+	opts := &ebpf.CollectionOptions{
+		Maps: ebpf.MapOptions{
+			PinPath: zeroWindowPinDir,
+		},
+	}
+	if err := bpfloader.LoadZeroWindowObjects(objs, opts); err != nil {
 		return fmt.Errorf("load zero_window BPF objects: %w", err)
 	}
 	m.objs = objs
-	logf.FromContext(ctx).Info("ebpf cilium: zero_window collection loaded")
+	logf.FromContext(ctx).Info("ebpf cilium: zero_window collection loaded", "pinDir", zeroWindowPinDir)
 	return nil
 }
 

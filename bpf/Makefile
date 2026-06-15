@@ -51,6 +51,14 @@ generate: $(BPF_OBJECTS)
 		-cflags "$(CFLAGS)" \
 		-output-dir ../internal/agent/network/bpfloader \
 		PmXdpVtep ./pm_xdp_vtep.c
+	GOPACKAGE=bpfloader go run github.com/cilium/ebpf/cmd/bpf2go \
+		-cc $(CLANG) \
+		-cflags "$(CFLAGS)" \
+		-output-dir ../internal/agent/network/bpfloader \
+		-no-global-types \
+		XdpBridge ./xdp_bridge.c
+	rm -f ../internal/agent/network/bpfloader/xdpbridge_bpfeb.go \
+	      ../internal/agent/network/bpfloader/xdpbridge_bpfeb.o
 	cp zero_window_bpfel.o ../internal/agent/network/bpfloader/zero_window_bpfel.o
 	cp zero_window_bpfeb.o ../internal/agent/network/bpfloader/zero_window_bpfeb.o
 

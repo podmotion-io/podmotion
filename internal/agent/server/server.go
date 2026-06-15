@@ -72,6 +72,11 @@ var ErrRestoredPIDNotFound = errors.New("restored process PID not found in repla
 type zwHoldState struct {
 	armedAtNs      int64
 	watchdogCancel context.CancelFunc
+	// watchdogFired is set to true by the watchdog goroutine when it auto-disarms
+	// due to budget+margin expiry (ADR-0157 D1/D3). A subsequent DisarmZeroWindow
+	// call checks this flag to return a distinct BlockingReason so the controller
+	// can surface ConditionZeroWindowDisarmed reason=WatchdogFired (ADR-0157 D3).
+	watchdogFired bool
 }
 
 // AgentServer implements agentpb.MigrationAgentServiceServer.
@@ -137,6 +142,13 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 		frozenSourcePIDs:      make(map[string]int32),
 		pendingResumePIDs:     make(map[string]int),
 	}
+}
+
+// EnsureXDPBridgeLoaded delegates to the embedded eBPFManager to load and pin
+// the xdp_bridge BPF program on the named host interface.  Must be called once
+// at agent startup after NMC registration (ADR-0155 Decision 1).
+func (s *AgentServer) EnsureXDPBridgeLoaded(ctx context.Context, hostIfname string, xdpBridgeCapable bool) error {
+	return s.ebpfMgr.EnsureXDPBridgeLoaded(ctx, hostIfname, xdpBridgeCapable)
 }
 
 // JoinNsRestore is the exported entry point for the NRI StartContainer hook.
@@ -595,7 +607,17 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 
 	bridgeIf := req.BridgeIfname
 	if bridgeIf == "" {
-		bridgeIf = "cni0"
+		// ADR-0158 Decision 5: no "cni0" literal fallback. Discover the host interface
+		// at runtime (ADR-0154 Decision 3 kindnetProvider discovery). On kind/kindnet
+		// the host-local CNI uses ptp (no bridge); the relevant interface is the node's
+		// primary non-loopback ethernet interface (e.g. "eth0").
+		discovered, discErr := discoverHostInterface(ctx)
+		if discErr != nil || discovered == "" {
+			return &agentpb.InjectIPHandoffResponse{Injected: false,
+				BlockingReason: fmt.Sprintf("provider did not resolve a bridge interface and runtime discovery failed: %v", discErr)}, nil
+		}
+		bridgeIf = discovered
+		log.Info("InjectIPHandoff: ADR-0154 runtime bridge interface discovery", "discovered", bridgeIf)
 	}
 	fdbIf := req.FdbIfname
 	if fdbIf == "" {
@@ -670,6 +692,17 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 	} else {
 		log.Info("InjectIPHandoff: ADR-0139 RestoredPID not yet in CR status — tc redirect deferred to requeue (non-fatal)",
 			"migration", req.MigrationName)
+	}
+
+	// ADR-0158 Decision 2+3: emit gratuitous ARP AFTER /32 route and neigh are installed,
+	// BEFORE returning Injected=true (i.e. before DisarmZeroWindow). Non-fatal — a gARP
+	// failure is logged but does not block the handoff; the /32 + neigh are already in place.
+	if garpErr := network.SendGratuitousARP(ctx, req.OldPodIp, bridgeIf); garpErr != nil {
+		log.Error(garpErr, "InjectIPHandoff: ADR-0158 gratuitous ARP failed (non-fatal)",
+			"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "bridgeIf", bridgeIf)
+	} else {
+		log.Info("InjectIPHandoff: ADR-0158 gratuitous ARP emitted",
+			"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "bridgeIf", bridgeIf)
 	}
 
 	resp := &agentpb.InjectIPHandoffResponse{Injected: true}
@@ -749,10 +782,9 @@ func (s *AgentServer) CleanupSourceIPHandoff(ctx context.Context, req *agentpb.C
 		return nil, status.Errorf(codes.InvalidArgument, "CleanupSourceIPHandoff: old_pod_ip %q is not a valid IPv4", req.OldPodIp)
 	}
 
+	// ADR-0158 Decision 5: BridgeIfname must come from provider runtime discovery (ADR-0154 D3).
+	// No "cni0" fallback — the caller (controller) must supply the discovered interface name.
 	bridgeIf := req.BridgeIfname
-	if bridgeIf == "" {
-		bridgeIf = "cni0"
-	}
 	fdbIf := req.FdbIfname
 	if fdbIf == "" {
 		fdbIf = "flannel.1"
@@ -3084,16 +3116,20 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		return nil, fmt.Errorf("checkpoint: cannot create images dir %s: %w", imagesDir, mkErr)
 	}
 
-	// Capture socket inventory immediately before freeze so snd_nxt/rcv_nxt reflect
-	// the exact pre-freeze sequence numbers (ADR-0049 seq_delta=0 invariant).
-	// Only populated when TCPPreservationMode is Strict or BestEffort.
+	// Capture TCP sequence state immediately before freeze (ADR-0049, ADR-0156 D4).
+	// On the Strict/BestEffort path we use TCP_REPAIR mode getsockopt to obtain real
+	// snd_nxt / rcv_nxt values. /proc/net/tcp does NOT contain sequence numbers in any
+	// kernel version (SocketInventory always returns SndNxt=0/RcvNxt=0), so SocketInventory
+	// alone cannot satisfy GC-27. TCP_REPAIR is entered and immediately exited per D4 so the
+	// socket is fully restored to normal operation before the CRIU dump begins.
 	var seqSnapshots []*agentpb.SeqSnapshot
 	if tcpEstablished && containerPID != 0 {
-		sockEntries, invErr := network.SocketInventory(containerPID)
-		if invErr != nil {
-			log.Error(invErr, "Checkpoint: socket inventory failed — continuing without SeqSnapshot", "pid", containerPID)
+		repairEntries, repairErr := network.ExportTCPRepairState(containerPID)
+		if repairErr != nil {
+			log.Error(repairErr, "Checkpoint: TCP_REPAIR export failed — continuing without SeqSnapshot (ADR-0156 D4)",
+				"pid", containerPID)
 		} else {
-			for _, e := range sockEntries {
+			for _, e := range repairEntries {
 				seqSnapshots = append(seqSnapshots, &agentpb.SeqSnapshot{
 					SrcIp:    e.SrcIP.String(),
 					SrcPort:  uint32(e.SrcPort),
@@ -3104,8 +3140,9 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 					TsRecent: e.TsRecent,
 				})
 			}
-			log.Info("Checkpoint: socket inventory complete", "migration", req.MigrationName,
-				"pid", containerPID, "connections", len(seqSnapshots))
+			log.Info("Checkpoint: TCP_REPAIR socket state exported (ADR-0156 D4, GC-27)",
+				"migration", req.MigrationName, "pid", containerPID,
+				"connections", len(seqSnapshots))
 		}
 	}
 
@@ -3135,29 +3172,22 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		s.registerFrozenSource(req.MigrationName, containerPID)
 	}
 
-	// Re-read socket inventory after dump succeeds. The post-dump read is for 4-tuple
-	// tracking (SrcIP/SrcPort/DstIP/DstPort) only — SndNxt/RcvNxt are left zero because
-	// /proc/net/tcp does not contain sequence numbers (see SocketEntry comment).
-	if err == nil && tcpEstablished && containerPID != 0 {
-		if postEntries, invErr := network.SocketInventory(containerPID); invErr != nil {
-			log.Error(invErr, "Checkpoint: post-dump socket inventory failed — retaining pre-dump snapshots",
-				"pid", containerPID, "migration", req.MigrationName)
+	// ADR-0156 D4: after dump, write tcp_socket_state.json to the checkpoint dir.
+	// The pre-dump TCP_REPAIR export (above) captured the real snd_nxt/rcv_nxt; we persist
+	// them to a sidecar JSON so GC-27 can be verified by inspecting the checkpoint dir.
+	// The post-dump SocketInventory call is intentionally omitted: it would overwrite the
+	// TCP_REPAIR sequence numbers with zeros (/proc/net/tcp has no seq columns), destroying
+	// the only valid snd_nxt/rcv_nxt values we hold. The pre-dump TCP_REPAIR values are
+	// captured at the freeze boundary (ArmZeroWindow engaged, no new data possible) and are
+	// exactly correct for seq_delta=0 verification.
+	if err == nil && tcpEstablished && len(seqSnapshots) > 0 {
+		if jsonErr := writeTCPSocketStateJSON(imagesDir, seqSnapshots); jsonErr != nil {
+			log.Error(jsonErr, "Checkpoint: failed to write tcp_socket_state.json (non-fatal, GC-27 evidence only)",
+				"migration", req.MigrationName)
 		} else {
-			seqSnapshots = seqSnapshots[:0]
-			for _, e := range postEntries {
-				seqSnapshots = append(seqSnapshots, &agentpb.SeqSnapshot{
-					SrcIp:    e.SrcIP.String(),
-					SrcPort:  uint32(e.SrcPort),
-					DstIp:    e.DstIP.String(),
-					DstPort:  uint32(e.DstPort),
-					SndNxt:   e.SndNxt,
-					RcvNxt:   e.RcvNxt,
-					TsRecent: e.TsRecent,
-				})
-			}
-			log.Info("Checkpoint: post-dump socket inventory (exact freeze instant)",
-				"migration", req.MigrationName, "pid", containerPID,
-				"connections", len(seqSnapshots), "freezeTimestampNs", freezeTimestampNs)
+			log.Info("Checkpoint: tcp_socket_state.json written (GC-27)",
+				"migration", req.MigrationName, "connections", len(seqSnapshots),
+				"path", imagesDir+"/tcp_socket_state.json")
 		}
 	}
 
@@ -4142,7 +4172,13 @@ func (s *AgentServer) ArmZeroWindow(ctx context.Context, req *agentpb.ArmZeroWin
 	go func() {
 		select {
 		case <-time.After(budget):
-			log.Info("ArmZeroWindow: watchdog triggered — auto-disarming ZW hold",
+			// ADR-0157 D1: watchdog is defense-in-depth ONLY. Firing means the
+			// controller did not call DisarmZeroWindow within budget+margin — an
+			// abnormal timing fault. Disarm BPF hold, mark watchdogFired so a
+			// subsequent DisarmZeroWindow RPC returns the distinct WatchdogFired
+			// blocking reason (ADR-0157 D3). State entry is NOT deleted here;
+			// it is cleaned up by the controller's DisarmZeroWindow call.
+			log.Info("ArmZeroWindow: watchdog triggered — emergency auto-disarm (ADR-0157 D1/D3)",
 				"migration", req.MigrationName, "budgetMs", req.FreezeWindowBudgetMs)
 			disarmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -4150,7 +4186,9 @@ func (s *AgentServer) ArmZeroWindow(ctx context.Context, req *agentpb.ArmZeroWin
 				log.Info("ArmZeroWindow: watchdog disarm BPF error", "migration", req.MigrationName, "err", dErr)
 			}
 			s.zwHoldMu.Lock()
-			delete(s.zwHolds, req.MigrationName)
+			if st, exists := s.zwHolds[req.MigrationName]; exists {
+				st.watchdogFired = true
+			}
 			s.zwHoldMu.Unlock()
 		case <-wdCtx.Done():
 			// Normal path: DisarmZeroWindow cancelled the watchdog.
@@ -4166,13 +4204,19 @@ func (s *AgentServer) ArmZeroWindow(ctx context.Context, req *agentpb.ArmZeroWin
 
 // DisarmZeroWindow implements MigrationAgentServiceServer.DisarmZeroWindow.
 // It cancels the watchdog goroutine and detaches the TC-BPF zero-window hold.
+// If the watchdog already fired (ADR-0157 D3), returns Disarmed=false with
+// BlockingReason="watchdog fired" so the controller can surface the distinct
+// WatchdogFired condition reason and ZeroWindowWatchdogFired event.
 func (s *AgentServer) DisarmZeroWindow(_ context.Context, req *agentpb.DisarmZeroWindowRequest) (*agentpb.DisarmZeroWindowResponse, error) {
 	log.Info("DisarmZeroWindow: disarming zero-window hold", "migration", req.MigrationName)
 
 	s.zwHoldMu.Lock()
 	state, ok := s.zwHolds[req.MigrationName]
 	if ok {
-		state.watchdogCancel()
+		if !state.watchdogFired {
+			// Normal path: cancel the watchdog goroutine so it does not also disarm.
+			state.watchdogCancel()
+		}
 		delete(s.zwHolds, req.MigrationName)
 	}
 	s.zwHoldMu.Unlock()
@@ -4181,6 +4225,18 @@ func (s *AgentServer) DisarmZeroWindow(_ context.Context, req *agentpb.DisarmZer
 		return &agentpb.DisarmZeroWindowResponse{
 			Disarmed:       false,
 			BlockingReason: "no active zero-window hold for migration",
+		}, nil
+	}
+
+	// ADR-0157 D3: if the watchdog already fired, the BPF hold is already gone.
+	// Return disarmed=false with a distinct reason so the controller surfaces
+	// ConditionZeroWindowDisarmed reason=WatchdogFired and emits ZeroWindowWatchdogFired event.
+	if state.watchdogFired {
+		log.Info("DisarmZeroWindow: watchdog already fired — BPF hold was auto-disarmed (ADR-0157 D3)",
+			"migration", req.MigrationName)
+		return &agentpb.DisarmZeroWindowResponse{
+			Disarmed:       false,
+			BlockingReason: "watchdog fired",
 		}, nil
 	}
 
@@ -4566,4 +4622,85 @@ func localInterfaceIP(ifname string) net.IP {
 		}
 	}
 	return nil
+}
+
+// writeTCPSocketStateJSON persists the TCP_REPAIR-captured sequence snapshots
+// to <checkpointDir>/tcp_socket_state.json (ADR-0156 GC-27 evidence).
+// The file is readable by the operator for post-restore seq verification and by
+// humans inspecting the checkpoint dir to validate GC-27.
+func writeTCPSocketStateJSON(checkpointDir string, snaps []*agentpb.SeqSnapshot) error {
+	type socketStateEntry struct {
+		SrcIP   string `json:"src_ip"`
+		SrcPort uint32 `json:"src_port"`
+		DstIP   string `json:"dst_ip"`
+		DstPort uint32 `json:"dst_port"`
+		SndNxt  uint32 `json:"snd_nxt"`
+		RcvNxt  uint32 `json:"rcv_nxt"`
+	}
+	entries := make([]socketStateEntry, 0, len(snaps))
+	for _, s := range snaps {
+		entries = append(entries, socketStateEntry{
+			SrcIP:   s.SrcIp,
+			SrcPort: s.SrcPort,
+			DstIP:   s.DstIp,
+			DstPort: s.DstPort,
+			SndNxt:  s.SndNxt,
+			RcvNxt:  s.RcvNxt,
+		})
+	}
+	data, err := json.Marshal(entries)
+	if err != nil {
+		return fmt.Errorf("writeTCPSocketStateJSON: marshal: %w", err)
+	}
+	path := checkpointDir + "/tcp_socket_state.json"
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("writeTCPSocketStateJSON: write %s: %w", path, err)
+	}
+	return nil
+}
+
+// discoverHostInterface returns the name of the first non-loopback, non-virtual
+// network interface with an IPv4 address. On kind/kindnet nodes this is "eth0",
+// which is the interface kindnet's host-local/ptp CNI routes pod traffic through.
+// This implements ADR-0154 Decision 3 runtime discovery when the caller (controller)
+// does not supply BridgeIfname (ADR-0158 Decision 5 — no "cni0" literal fallback).
+func discoverHostInterface(_ context.Context) (string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("discoverHostInterface: %w", err)
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		// Skip virtual/overlay devices that don't carry host IP traffic.
+		name := iface.Name
+		if name == "lo" || name == "flannel.1" || name == "cni0" || name == "docker0" {
+			continue
+		}
+		if strings.HasPrefix(name, "veth") || strings.HasPrefix(name, "tun") ||
+			strings.HasPrefix(name, "br-") || strings.HasPrefix(name, "dummy") {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil && ip.To4() != nil && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() {
+				return iface.Name, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("discoverHostInterface: no suitable non-loopback IPv4 interface found")
 }
