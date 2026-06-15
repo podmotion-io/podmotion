@@ -59,6 +59,13 @@ networkPolicy:
 
 installCRDs: false
 
+# nodeRequirements documents substrate prerequisites for the agent DaemonSet.
+# The netns-mount-prep init container satisfies runPodmotionSharedMount automatically
+# on most substrates. On non-rshared substrates where the init container's
+# mount --make-shared is blocked, this must be satisfied manually before migration.
+nodeRequirements:
+  runPodmotionSharedMount: true  # /run/podmotion must be rshared on every node
+
 metrics:
   enabled: true
   serviceMonitor:

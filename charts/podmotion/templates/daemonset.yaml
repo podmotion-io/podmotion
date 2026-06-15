@@ -35,6 +35,19 @@ spec:
         - operator: Exists
           effect: NoExecute
       initContainers:
+        - name: netns-mount-prep
+          image: busybox:1.36
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              mkdir -p /run/podmotion
+              mount --make-shared /run/podmotion || mount --bind /run/podmotion /run/podmotion && mount --make-shared /run/podmotion
+              echo "netns mount prep complete"
+          volumeMounts:
+            - name: run-podmotion
+              mountPath: /run/podmotion
         - name: init-checkpoint-tmpfs
           image: busybox:1.36
           securityContext:
@@ -97,6 +110,9 @@ spec:
             - name: host-cni-conf
               mountPath: /etc/cni/net.d
               readOnly: true
+            - name: run-podmotion
+              mountPath: /run/podmotion
+              mountPropagation: HostToContainer
       volumes:
         - name: criu-socket
           hostPath:
@@ -128,4 +144,8 @@ spec:
         - name: host-cni-conf
           hostPath:
             path: /etc/cni/net.d
+            type: DirectoryOrCreate
+        - name: run-podmotion
+          hostPath:
+            path: /run/podmotion
             type: DirectoryOrCreate
