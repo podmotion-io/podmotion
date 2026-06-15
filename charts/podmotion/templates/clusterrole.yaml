@@ -8,6 +8,9 @@ metadata:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
 rules:
   - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch, update]
+  - apiGroups: [""]
     resources: [nodes, persistentvolumeclaims]
     verbs: [get, list, watch]
   - apiGroups: [""]
