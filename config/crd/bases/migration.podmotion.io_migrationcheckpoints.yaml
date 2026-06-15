@@ -91,6 +91,14 @@ spec:
                 - DirectP2P
                 - Registry
                 type: string
+              workloadImage:
+                description: |-
+                  WorkloadImage is the OCI image reference of the source pod's primary container
+                  (pod.Spec.Containers[0].Image). The destination agent uses it to start the
+                  restore placeholder container with the SAME image as the checkpointed workload,
+                  so the placeholder rootfs binary sizes match the CRIU checkpoint's mapped VMAs
+                  on the gRPC Restore fallback path (no NRI containerID). ADR-0168 B2.
+                type: string
             required:
             - podMigrationRef
             - sourceNodeName
@@ -103,11 +111,37 @@ spec:
                 description: CapturedAt is when the checkpoint was completed.
                 format: date-time
                 type: string
+              conntrackNotrackArmed:
+                description: |-
+                  ConntrackNotrackArmed is True when iptables raw NOTRACK rules are active on
+                  both source and destination nodes for the migrated pod IP (M21).
+                type: boolean
+              conntrackNotrackArmedAt:
+                description: ConntrackNotrackArmedAt is when the NOTRACK rules were
+                  installed.
+                format: date-time
+                type: string
+              conntrackNotrackDisarmedAt:
+                description: |-
+                  ConntrackNotrackDisarmedAt is when the NOTRACK rules were removed.
+                  Populated after MigrationComplete so the cleanup path is auditable.
+                format: date-time
+                type: string
               consumedAt:
                 description: ConsumedAt is when the checkpoint was used for a successful
                   restore.
                 format: date-time
                 type: string
+              destinationNetnsPath:
+                description: |-
+                  DestinationNetnsPath is the bind-mount path of the migration netns on the
+                  destination node (e.g. /run/podmotion/netns/pm-mig-<uid>).
+                type: string
+              destinationNetnsReady:
+                description: |-
+                  DestinationNetnsReady is True when the migration netns has been created on
+                  the destination node with the source pod IP as a /32 secondary address (M21).
+                type: boolean
               phase:
                 description: 'Phase is the checkpoint lifecycle phase: Capturing,
                   Available, Consumed, Expired, Failed.'
@@ -118,6 +152,11 @@ spec:
                 - Expired
                 - Failed
                 type: string
+              vxlanFDBUpdated:
+                description: |-
+                  VXLANFDBUpdated is True when the two-sided AF_BRIDGE + AF_INET FDB entries
+                  have been confirmed via RTM_GETNEIGH read-back on both nodes (M21).
+                type: boolean
             type: object
         type: object
     served: true
