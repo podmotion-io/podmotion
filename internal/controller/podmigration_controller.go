@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -76,6 +77,9 @@ const (
 	// conditionIPHandoffInjected records that the ADR-0133 destination-side neighbor/FDB
 	// handoff for the OLD pod IP has been installed and the reachability probe passed.
 	conditionIPHandoffInjected            = "IPHandoffInjected"
+	// conditionRestoreTimedOut is set when the restore deadline elapses, driving
+	// the migration to RollingBack (ADR-0157 D3/GC-32). Reason: RestoreDeadlineExceeded.
+	conditionRestoreTimedOut              = "RestoreTimedOut"
 )
 
 // PodMigrationReconciler reconciles a PodMigration object.
@@ -84,6 +88,9 @@ type PodMigrationReconciler struct {
 	Scheme     *runtime.Scheme
 	Estimator  estimation.Estimator
 	Rollbacker rollback.Rollbacker
+	// Recorder emits Kubernetes events on PodMigration objects (e.g. ZeroWindowWatchdogFired).
+	// Nil in unit tests — event emission is skipped when nil.
+	Recorder record.EventRecorder
 	// AgentPool provides per-node gRPC connections to podmotion-agent DaemonSet pods.
 	// Nil in unit tests — phase handlers skip gRPC calls when nil.
 	AgentPool *agentclient.AgentClientPool
@@ -842,16 +849,28 @@ func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm 
 			PodUid:        podUID,
 		})
 		if err != nil {
-			// Non-fatal: the watchdog on the agent will auto-disarm. Log and continue.
-			log.Error(err, "DisengageHold: DisarmZeroWindow RPC error (watchdog will auto-disarm)",
+			// RPC error on the happy path: the watchdog backstop will auto-disarm.
+			// ADR-0157 D3: surface as WatchdogFired (not WatchdogDisarm) and emit event.
+			log.Error(err, "DisengageHold: DisarmZeroWindow RPC error — watchdog backstop will disarm (ADR-0157 D3)",
 				"migration", pm.Name)
 			setCondition(pm, pmv1.ConditionZeroWindowDisarmed, metav1.ConditionTrue,
-				"WatchdogDisarm", fmt.Sprintf("DisarmZeroWindow RPC failed (%v); watchdog auto-disarm assumed", err))
+				"WatchdogFired", fmt.Sprintf("DisarmZeroWindow RPC failed (%v); watchdog auto-disarm assumed (ADR-0157 D3)", err))
+			if r.Recorder != nil {
+				r.Recorder.Eventf(pm, corev1.EventTypeWarning, "ZeroWindowWatchdogFired",
+					"zero-window hold watchdog fired for migration %s (RPC error); FreezeWindowBudgetMs=%d",
+					pm.Name, pm.Spec.FreezeWindowBudgetMs)
+			}
 		} else if !disarmResp.Disarmed {
-			log.Info("DisengageHold: DisarmZeroWindow returned disarmed=false (watchdog likely fired)",
+			// disarmed=false means the watchdog already fired (ADR-0157 D3).
+			log.Info("DisengageHold: DisarmZeroWindow returned disarmed=false — watchdog fired (ADR-0157 D3)",
 				"migration", pm.Name, "reason", disarmResp.BlockingReason)
 			setCondition(pm, pmv1.ConditionZeroWindowDisarmed, metav1.ConditionTrue,
-				"WatchdogDisarmed", fmt.Sprintf("hold already disarmed by watchdog: %s", disarmResp.BlockingReason))
+				"WatchdogFired", fmt.Sprintf("hold auto-disarmed by agent watchdog: %s (ADR-0157 D3)", disarmResp.BlockingReason))
+			if r.Recorder != nil {
+				r.Recorder.Eventf(pm, corev1.EventTypeWarning, "ZeroWindowWatchdogFired",
+					"zero-window hold watchdog fired for migration %s; FreezeWindowBudgetMs=%d; reason=%s",
+					pm.Name, pm.Spec.FreezeWindowBudgetMs, disarmResp.BlockingReason)
+			}
 		} else {
 			msg := fmt.Sprintf("TC-BPF zero-window hold disarmed; disarmed_at_ns=%d hold_duration_ms=%d (ADR-0049)",
 				disarmResp.DisarmedAtNs, disarmResp.HoldDurationMs)
@@ -2570,7 +2589,7 @@ func (r *PodMigrationReconciler) injectIPHandoff(ctx context.Context, pm *pmv1.P
 		ReplVethMac:    pm.Status.ReplVethMAC,
 		SrcNodeVtepMac: pm.Status.SourcePodMac, // diagnostic; source VTEP MAC cached if available
 		FdbIfname:      fdbIfname,
-		BridgeIfname:   "cni0",
+		BridgeIfname:   "", // ADR-0158 D5: empty — agent discovers at runtime (ADR-0154 D3). No "cni0" literal.
 		Probe:          true,
 	})
 	if err != nil {
@@ -2839,7 +2858,7 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 					MigrationName: pm.Name,
 					OldPodIp:      pm.Spec.SourcePodIP,
 					FdbIfname:     fdbIfname,
-					BridgeIfname:  "cni0",
+					BridgeIfname:  "", // ADR-0158 D5: empty — agent discovers at runtime. No "cni0" literal.
 				}); cErr != nil {
 					log.Error(cErr, "ADR-0133 D4: CleanupSourceIPHandoff RPC failed (warn-only)", "migration", pm.Name)
 				} else if !cleanResp.Cleaned {
@@ -2907,6 +2926,11 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	// ADR-0157 D2: call DisarmZeroWindow FIRST on the failure path when the hold is armed
+	// and not yet disarmed. This cancels the agent watchdog immediately, releasing the peer
+	// instead of waiting up to FreezeWindowBudgetMs+500ms for the watchdog to fire.
+	r.disarmZeroWindowOnFailurePath(ctx, pm)
+
 	// Delete the replacement pod first — before rolling back the source — so there is
 	// never a window where both pods are running and matching Service selectors.
 	r.deleteReplacementPod(ctx, pm)
@@ -2927,6 +2951,89 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+// disarmZeroWindowOnFailurePath implements the ADR-0157 D2 contract: on any failure
+// path (RollingBack, failMigration), call DisarmZeroWindow FIRST when
+// ZeroWindowArmed=True && ZeroWindowDisarmed!=True. This cancels the agent watchdog
+// so the peer is released immediately rather than waiting for the watchdog budget.
+//
+// If the RPC errors or returns disarmed=false (watchdog already fired), the method
+// records ConditionZeroWindowDisarmed with reason WatchdogFired and emits the
+// ZeroWindowWatchdogFired Warning event (ADR-0157 D3). Source-pod preservation
+// (ADR-0012) is NEVER gated on a successful disarm; this call is best-effort.
+//
+// In None/BestEffort mode where ZeroWindowArmed is never set True, this is a no-op.
+func (r *PodMigrationReconciler) disarmZeroWindowOnFailurePath(ctx context.Context, pm *pmv1.PodMigration) {
+	log := logf.FromContext(ctx)
+
+	// Guard: only disarm when armed and not already disarmed (ADR-0157 D2).
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionZeroWindowArmed) {
+		return
+	}
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionZeroWindowDisarmed) {
+		return
+	}
+
+	if r.AgentPool == nil {
+		log.Info("disarmZeroWindowOnFailurePath: AgentPool not wired — skipping disarm", "migration", pm.Name)
+		return
+	}
+	sourceNode := pm.Status.SourceNodeName
+	if sourceNode == "" {
+		log.Info("disarmZeroWindowOnFailurePath: SourceNodeName not set — skipping disarm", "migration", pm.Name)
+		return
+	}
+	agentClient, err := r.AgentPool.ForNode(ctx, sourceNode)
+	if err != nil {
+		log.Error(err, "disarmZeroWindowOnFailurePath: cannot connect to source agent (ADR-0157 D2)",
+			"migration", pm.Name)
+		setCondition(pm, pmv1.ConditionZeroWindowDisarmed, metav1.ConditionTrue,
+			"WatchdogFired", fmt.Sprintf("DisarmZeroWindow skipped (agent unavailable: %v); watchdog backstop in effect (ADR-0157 D2)", err))
+		if r.Recorder != nil {
+			r.Recorder.Eventf(pm, corev1.EventTypeWarning, "ZeroWindowWatchdogFired",
+				"zero-window hold watchdog will fire for migration %s — could not reach source agent: %v; FreezeWindowBudgetMs=%d",
+				pm.Name, err, pm.Spec.FreezeWindowBudgetMs)
+		}
+		return
+	}
+
+	log.Info("disarmZeroWindowOnFailurePath: calling DisarmZeroWindow on source agent (ADR-0157 D2)",
+		"migration", pm.Name, "node", sourceNode)
+	disarmResp, rpcErr := agentClient.DisarmZeroWindow(ctx, &agentpb.DisarmZeroWindowRequest{
+		MigrationName: pm.Name,
+		PodUid:        pm.Spec.SourcePodUID,
+	})
+	if rpcErr != nil {
+		log.Error(rpcErr, "disarmZeroWindowOnFailurePath: DisarmZeroWindow RPC error (ADR-0157 D2/D3)",
+			"migration", pm.Name)
+		setCondition(pm, pmv1.ConditionZeroWindowDisarmed, metav1.ConditionTrue,
+			"WatchdogFired", fmt.Sprintf("DisarmZeroWindow RPC failed on failure path (%v); watchdog backstop in effect (ADR-0157 D3)", rpcErr))
+		if r.Recorder != nil {
+			r.Recorder.Eventf(pm, corev1.EventTypeWarning, "ZeroWindowWatchdogFired",
+				"zero-window hold watchdog will fire for migration %s — DisarmZeroWindow RPC failed: %v; FreezeWindowBudgetMs=%d",
+				pm.Name, rpcErr, pm.Spec.FreezeWindowBudgetMs)
+		}
+		return
+	}
+	if !disarmResp.Disarmed {
+		// watchdog already fired before the controller got here (ADR-0157 D3).
+		log.Info("disarmZeroWindowOnFailurePath: watchdog already fired (ADR-0157 D3)",
+			"migration", pm.Name, "reason", disarmResp.BlockingReason)
+		setCondition(pm, pmv1.ConditionZeroWindowDisarmed, metav1.ConditionTrue,
+			"WatchdogFired", fmt.Sprintf("hold auto-disarmed by agent watchdog before failure-path disarm: %s (ADR-0157 D3)", disarmResp.BlockingReason))
+		if r.Recorder != nil {
+			r.Recorder.Eventf(pm, corev1.EventTypeWarning, "ZeroWindowWatchdogFired",
+				"zero-window hold watchdog fired for migration %s; FreezeWindowBudgetMs=%d; reason=%s",
+				pm.Name, pm.Spec.FreezeWindowBudgetMs, disarmResp.BlockingReason)
+		}
+		return
+	}
+	msg := fmt.Sprintf("TC-BPF zero-window hold disarmed on failure path; disarmed_at_ns=%d hold_duration_ms=%d (ADR-0157 D2)",
+		disarmResp.DisarmedAtNs, disarmResp.HoldDurationMs)
+	log.Info("disarmZeroWindowOnFailurePath: hold disarmed successfully", "migration", pm.Name,
+		"disarmedAtNs", disarmResp.DisarmedAtNs, "holdDurationMs", disarmResp.HoldDurationMs)
+	setCondition(pm, pmv1.ConditionZeroWindowDisarmed, metav1.ConditionTrue, "Disarmed", msg)
+}
 
 // transitionTo sets pm.Status.Phase and patches status with retry on conflict.
 func (r *PodMigrationReconciler) transitionTo(ctx context.Context, pm *pmv1.PodMigration, phase pmv1.MigrationPhase) (ctrl.Result, error) {
@@ -2949,6 +3056,10 @@ func (r *PodMigrationReconciler) transitionTo(ctx context.Context, pm *pmv1.PodM
 }
 
 func (r *PodMigrationReconciler) failMigration(ctx context.Context, pm *pmv1.PodMigration, reason string) (ctrl.Result, error) {
+	// ADR-0157 D2: call DisarmZeroWindow FIRST when the hold is armed and not yet disarmed.
+	// Non-blocking: disarm failure is recorded as WatchdogFired and rollback continues.
+	r.disarmZeroWindowOnFailurePath(ctx, pm)
+
 	// Clean up the replacement pod on hard failure (not rollback — rollback handles its own).
 	// Prevents a gated orphan pod from lingering when the migration is permanently failed.
 	r.deleteReplacementPod(ctx, pm)
