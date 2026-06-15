@@ -1,9 +1,10 @@
-apiVersion: migration.podmotion.io/v1alpha1
+# Example PodMigration CR — replace podName/podNamespace with your target pod
+apiVersion: podmotion.io/v1alpha1
 kind: PodMigration
 metadata:
-  labels:
-    app.kubernetes.io/name: podmotion
-    app.kubernetes.io/managed-by: kustomize
-  name: podmigration-sample
+  name: example-migration
 spec:
-  # TODO(user): Add fields here
+  podName: my-pod
+  podNamespace: default
+  # targetNodeName: worker-node-2  # optional: omit to let the scheduler plugin select
+  tcpPreservationMode: None         # None (stateless) | BestEffort | Strict (TCP-preserving)

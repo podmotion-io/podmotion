@@ -69,13 +69,13 @@ curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 api/v1alpha1/           CRD type definitions (5 CRDs)
 bpf/                    eBPF C programs (XDP bridge, zero-window hold)
 charts/podmotion/       Helm chart for operator + agent DaemonSet
-cmd/operator/           Operator binary (controller-manager + webhooks)
+cmd/main.go             Operator binary entrypoint (controller-manager + webhooks)
 cmd/agent/              Node agent binary (gRPC server + NRI plugin)
 cmd/scheduler/          Custom scheduler binary
 config/                 Kustomize bases (CRDs, RBAC, webhook, default)
 descheduler/            Custom Balance plugin (creates PodMigration CRs)
 deploy/                 NFD rules, bpfman DaemonSet
-docs/adr/               Architectural Decision Records (35 ADRs)
+docs/adr/               Architectural Decision Records (see docs/adr/README.md for current list)
 images/kind/            Kind node image Dockerfile (CRIU + bpftool baked in)
 internal/agent/         Node agent packages (criu, network, storage, etc.)
 internal/controller/    Reconcilers — one package per CRD
@@ -172,7 +172,7 @@ make deploy
 kubectl create namespace pm-e2e
 kubectl apply -f test/e2e/fixtures/
 
-# 6. Trigger migrations (note: networkContinuity must be false — eBPF bridge not yet implemented)
+# 6. Trigger migrations
 kubectl apply -f - <<'EOF'
 apiVersion: migration.podmotion.io/v1alpha1
 kind: PodMigration
@@ -184,7 +184,7 @@ spec:
   podNamespace: pm-e2e
   targetNodeName: podmotion-worker2
   mode: Cold
-  networkContinuity: false
+  tcpPreservationMode: None
   rollbackOnFailure: false
   completionTimeoutSeconds: 180
 EOF
@@ -201,14 +201,20 @@ nginx-migration   Complete   podmotion-worker   podmotion-worker2  Cold   45s
 
 ### Important Notes (PoC Sprint 2)
 
-- `networkContinuity` CRD default is now `false`. The eBPF XDP bridge is not yet implemented.
-  Always set `networkContinuity: false` in PoC PodMigration CRs.
+- `tcpPreservationMode` controls TCP socket continuity. Use `None` for cold migrations.
+  The eBPF XDP bridge for `BestEffort`/`Strict` modes is not yet implemented.
 - CRIU runs with a mock fallback on kind (the agent is distroless and lacks `CAP_SYS_PTRACE`).
   Real CRIU checkpoint/restore requires a privileged node deployment (Sprint 3).
 - The agent image (`images/agent/Dockerfile`) is a distroless container with only the agent binary.
   It is separate from the kind node image (`images/kind/Dockerfile`) which is used for E2E clusters.
 - The `spec.nodeName` field index is now registered unconditionally (not just with `--enable-spot-reclaim`).
   This is required by `AgentClientPool.ForNode` to find agent pods on destination nodes.
+
+---
+
+## Sign-off (DCO)
+
+Contributors must sign off commits per the Developer Certificate of Origin. Use `git commit -s`. See GOVERNANCE.md and ADR-0090 for the full policy.
 
 ---
 
