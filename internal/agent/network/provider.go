@@ -39,7 +39,7 @@ type NetworkProvider interface {
 type NoOpCNI struct{}
 
 func (n *NoOpCNI) CanPreserveIP(_ context.Context, _ string) (bool, string, error) {
-	return false, "", nil
+	return false, "IP handoff not required for tcpPreservationMode=None", nil
 }
 func (n *NoOpCNI) ArmHold(_ context.Context, _ string) error                           { return nil }
 func (n *NoOpCNI) InjectDestinationRoutes(_ context.Context, _, _ string) error        { return nil }
