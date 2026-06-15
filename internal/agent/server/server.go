@@ -126,6 +126,15 @@ type AgentServer struct {
 	// the stopped tree is reaped with the rolled-back replacement pod (the held client
 	// connection survives via the still-frozen source — ADR-0012).
 	pendingResumePIDs map[string]int // migrationName -> restored root PID awaiting SIGCONT
+
+	// destHostVethMu guards destHostVeth.
+	destHostVethMu sync.RWMutex
+	// destHostVeth stores the host-side veth peer name minted by PrepareDestinationNetns
+	// (network.PrepareDestinationNetns → MigrationNetns.HostVethName, e.g. "pmh-<truncUID>").
+	// Keyed by migrationName. Read by joinNsRestore to pass --veth-pair to CRIU restore.
+	// Gate30: avoids re-deriving the name from migrationName (which would diverge if the
+	// controller passes a pod UID to PrepareDestinationNetns and a migration name to Restore).
+	destHostVeth map[string]string // migrationName -> minted host veth name
 }
 
 // New constructs an AgentServer with the given Checkpointer implementation.
@@ -141,6 +150,7 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 		zwHolds:               make(map[string]*zwHoldState),
 		frozenSourcePIDs:      make(map[string]int32),
 		pendingResumePIDs:     make(map[string]int),
+		destHostVeth:          make(map[string]string),
 	}
 }
 
@@ -180,7 +190,10 @@ func (s *AgentServer) EnsureXDPBridgeLoaded(ctx context.Context, hostIfname stri
 // restored tree resumes (ADR-0012).
 func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, containerID, sandboxID, tcpPreservationMode string) (int, error) {
 	strictMode := tcpPreservationMode == string(pmv1.TCPPreservationModeStrict)
-	pid, err := joinNsRestore(migrationName, checkpointDir, imageName, containerID, "", sandboxID, strictMode)
+	s.destHostVethMu.RLock()
+	storedVeth := s.destHostVeth[migrationName]
+	s.destHostVethMu.RUnlock()
+	pid, err := joinNsRestore(migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode)
 	if err != nil {
 		return 0, err
 	}
@@ -1756,7 +1769,7 @@ func checkpointHasEstablishedTCP(checkpointDir string) bool {
 	return len(matches) > 0
 }
 
-func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath string, strictMode bool) []string {
+func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath, hostVethName string, strictMode bool) []string {
 	// Choose --tcp-established whenever the checkpoint actually captured an established
 	// TCP connection (presence of a tcp-stream-*.img), NOT merely when a pre-staged
 	// migration netns fd was supplied. The NRI StartContainer restore path joins the
@@ -1841,6 +1854,23 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 			args = append(args, "--leave-stopped")
 		}
 	}
+	// Gate29: thread the host-side veth peer name (pmh-<uid>) into CRIU so it knows
+	// which interface to wire eth0 into.  Without --veth-pair CRIU cannot locate the
+	// host-bridge peer and fails with "Unknown peer net namespace".  When
+	// --tcp-established is in effect the veth must additionally be declared external
+	// (--external veth[eth0]:pmh-*) so CRIU does not try to re-assign the IP that
+	// PrepareDestinationNetns already set on eth0 — matching the go-criu restore path
+	// at criu_checkpointer.go:534-548.
+	if hostVethName != "" {
+		// CRIU's --veth-pair parses on '=' (criu/config.c) in the form
+		// outside_name=inside_name. The colon form ("eth0:pmh-*") is rejected
+		// with "invalid argument for --veth-pair". The inside name is eth0
+		// (container side); the outside name is the host-side peer.
+		args = append(args, "--veth-pair", hostVethName+"=eth0")
+		if tcpFlag == "--tcp-established" {
+			args = append(args, "--external", "veth[eth0]:"+hostVethName)
+		}
+	}
 	return args
 }
 
@@ -1917,7 +1947,21 @@ func copyFile(src, dst string) error {
 //  4. Bring up loopback in the restored process's network namespace.
 //
 // Returns the host PID of the restored process.
-func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID string, strictMode bool) (int, error) {
+// storedHostVeth is the host-side veth peer name stored by PrepareDestinationNetns (Gate30).
+func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, error) {
+	// Gate30: use the host-side veth name stored during PrepareDestinationNetns rather than
+	// re-deriving from migrationName.  Re-derivation diverges when the controller passes a
+	// pod UID to PrepareDestinationNetns and a migration name to Restore.
+	// On the cold / no-netns path (destNetnsFd=="") no veth exists; pass empty string.
+	hostVethName := ""
+	if destNetnsFd != "" {
+		if storedHostVeth != "" {
+			hostVethName = storedHostVeth
+		} else {
+			// Fallback: re-derive (safe when migrationName == uid passed to PrepareDestinationNetns).
+			hostVethName = network.HostVethPeerName(migrationName)
+		}
+	}
 	// Use the image name passed in from the NRI ContainerEvent (fetched via ctr containers
 	// info). The checkpoint dir is a CRIU dump dir and never contains an OCI bundle
 	// config.json, so we no longer attempt to read it here.
@@ -2073,7 +2117,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 		}
 	}
 
-	criuArgs := buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath, strictMode)
+	criuArgs := buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath, hostVethName, strictMode)
 	// ADR-0124: dynamically scan the (post-patch) mountpoints-*.img for containerd masked-path
 	// external mounts and append their --ext-mount-map <mnt_id>:/dev/null args. Fail loud before
 	// invoking CRIU if any external mount is not safely mappable (D4).
@@ -2722,6 +2766,19 @@ if os.path.exists(netdev_path):
     with open(netdev_path, 'wb') as f:
         pycriu.images.dump(img, f)
     print('netdev: kept', len(kept), 'entries (loopback only)')
+
+# ---- ifaddr: remove source pod IP addresses; keep loopback only (ADR-0125, ADR-0162) ----
+ifaddr_path = os.path.join(ckpt, 'ifaddr-10.img')
+if os.path.exists(ifaddr_path):
+    src = backup(ifaddr_path)
+    with open(src, 'rb') as f:
+        img = pycriu.images.load(f)
+    kept = [e for e in img['entries']
+            if e.get('ifaddr', {}).get('ifindex') == 1]
+    img['entries'] = kept
+    with open(ifaddr_path, 'wb') as f:
+        pycriu.images.dump(img, f)
+    print('ifaddr: kept', len(kept), 'entries (loopback only)')
 `
 	// /dev/shm is an in-memory filesystem (tmpfs) — avoids writing the script to disk.
 	// 0600 so only root can read the path; removed immediately after exec.
@@ -3477,9 +3534,17 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	if mkErr := os.MkdirAll(imagesDir, 0o700); mkErr != nil {
 		log.Info("Restore: cannot create images dir, proceeding to fallback", "err", mkErr)
 	}
-	// Zeroize checkpoint images after restore completes (success or failure) — the process
-	// tree is alive (or dead) at that point; the images are no longer needed.
-	defer func() { _ = zeroizeDir(imagesDir) }()
+	// Zeroize checkpoint images ONLY after restore is confirmed successful. The controller
+	// calls Restore more than once (retry/requeue paths); an unconditional defer would wipe
+	// the checkpoint dir on the first call and the second call would find inventory.img gone
+	// → RestoreFailed (Sprint 32 gate21 root cause). restoreConfirmed is set true only at the
+	// terminal confirmed-success returns.
+	restoreConfirmed := false
+	defer func() {
+		if restoreConfirmed {
+			_ = zeroizeDir(imagesDir)
+		}
+	}()
 
 	// Pre-restore sanity: inventory.img must exist and be non-empty. If absent, CRIU
 	// fails immediately with "No inventory.img image / Unexpected EOF on (empty-image)".
@@ -3494,6 +3559,20 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 				return -1
 			}(), statErr)
 		log.Error(statErr, msg, "migration", req.MigrationName)
+		return &agentpb.RestoreResponse{Success: false, ErrorMessage: msg}, nil
+	}
+
+	// B2 (Sprint 32 gate25) — strict-mode fail-closed netns-fd assertion.
+	// The RestoreRequest proto carries no tcpPreservationMode field; on this gRPC path a
+	// Strict migration is signalled by populated SeqSnapshots (per-connection TCP sequence
+	// state is only transferred when TCP preservation is active). When Strict is in effect
+	// the controller's DestinationNetnsReady stage MUST plumb the destination netns fd into
+	// DestNetnsFd. If it is empty, joinNsRestore would silently fall through the
+	// tcpPreservationMode=None cold path (no --join-ns), restoring the TCP-preserving process
+	// tree into the wrong namespace and bricking it post-checkpoint. Refuse instead.
+	if len(req.SeqSnapshots) > 0 && req.DestNetnsFd == "" {
+		msg := fmt.Sprintf("Restore: Strict migration %s refused: DestNetnsFd empty; DestinationNetnsReady stage did not plumb netns fd — refusing None cold path fallthrough to prevent post-checkpoint brick", req.MigrationName)
+		log.Info(msg, "migration", req.MigrationName)
 		return &agentpb.RestoreResponse{Success: false, ErrorMessage: msg}, nil
 	}
 
@@ -3512,7 +3591,10 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		// Operator Restore RPC: strictMode=false here because --leave-stopped is already gated
 		// on destNetnsFd != "" inside buildCRIURestoreArgs (the M23 ordering invariant path).
 		// ADR-0144: the NRI path uses strictMode=true when tcpPreservationMode=Strict.
-		pid, joinErr := joinNsRestore(req.MigrationName, imagesDir, "", "", req.DestNetnsFd, "", false)
+		s.destHostVethMu.RLock()
+		storedVeth := s.destHostVeth[req.MigrationName]
+		s.destHostVethMu.RUnlock()
+		pid, joinErr := joinNsRestore(req.MigrationName, imagesDir, "", "", req.DestNetnsFd, "", storedVeth, false)
 		restoreDurationMs := time.Since(restoreStart).Milliseconds()
 		if joinErr != nil {
 			return nil, fmt.Errorf("runc restore failed: %w", joinErr)
@@ -3626,6 +3708,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 			}
 		}
 
+		restoreConfirmed = true
 		return &agentpb.RestoreResponse{
 			Success:           true,
 			RestoreDurationMs: restoreDurationMs,
@@ -3646,7 +3729,10 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// imageName="" → joinNsRestore defaults to docker.io/library/redis:7 (adequate for gate10 test).
 	// containerID="" → joinNsRestore uses the placeholder container path (no NRI hook).
 	// destNetnsFd=req.DestNetnsFd — cold migration passes empty string.
-	rawPID, joinErr := joinNsRestore(req.MigrationName, imagesDir, "", "", req.DestNetnsFd, "", false)
+	s.destHostVethMu.RLock()
+	storedVeth2 := s.destHostVeth[req.MigrationName]
+	s.destHostVethMu.RUnlock()
+	rawPID, joinErr := joinNsRestore(req.MigrationName, imagesDir, "", "", req.DestNetnsFd, "", storedVeth2, false)
 	if joinErr != nil {
 		log.Info("Restore: joinNsRestore failed", "err", joinErr)
 		return nil, fmt.Errorf("restore failed: %w", joinErr)
@@ -3669,6 +3755,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		}
 	}
 
+	restoreConfirmed = true
 	return &agentpb.RestoreResponse{
 		Success:           true,
 		RestoreDurationMs: time.Since(result.RestoredAt).Milliseconds() + time.Since(t0).Milliseconds(),
@@ -4463,6 +4550,7 @@ func (s *AgentServer) ConfirmOverlayReady(ctx context.Context, req *agentpb.Conf
 		SourceConntrackArmed: req.SourceConntrackArmed,
 		DestConntrackArmed:   true, // destination conntrack is armed locally by PrepareDestinationNetns
 		RestoreComplete:      req.RestoreComplete,
+		PreRestore:           req.PreRestore,
 		FDBManager:           fdbMgr,
 	}
 
