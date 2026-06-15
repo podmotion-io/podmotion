@@ -12,11 +12,14 @@ Licensed under the Apache License, Version 2.0.
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -40,6 +43,40 @@ import (
 )
 
 const tmpfsMagic = 0x01021994
+
+// defaultRouteIface returns the name of the network interface associated with
+// the default (0.0.0.0/0) route, parsed from /proc/net/route.  This is the
+// interface to which the XDP bridge program should be attached (ADR-0155 D1).
+func defaultRouteIface() (string, error) {
+	f, err := os.Open("/proc/net/route")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Scan() // skip header
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 {
+			continue
+		}
+		// Destination 00000000 = 0.0.0.0 (default route).
+		if fields[1] == "00000000" {
+			return fields[0], nil
+		}
+	}
+	// Fallback: first non-loopback interface.
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "eth0", nil
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback == 0 && iface.Flags&net.FlagUp != 0 {
+			return iface.Name, nil
+		}
+	}
+	return "eth0", nil
+}
 
 func mustEnsureCheckpointTmpfs(log logr.Logger, path string) {
 	if err := os.MkdirAll(path, 0o700); err != nil {
@@ -300,6 +337,33 @@ func main() {
 		} else {
 			log.Info("NodeMigrationCapacity registered", "node", nodeName)
 		}
+	}
+
+	// EnsureXDPBridgeLoaded: load and pin the xdp_bridge BPF program on the host
+	// network interface at agent startup (ADR-0155 Decision 1).  Read XDPBridgeCapable
+	// from the NMC CR; fall back to true on Linux if the NMC is not yet readable.
+	{
+		xdpBridgeCapable := false
+		hostIfname := "eth0" // default for kind/VM; overridden by default route lookup below
+		if defaultIface, err := defaultRouteIface(); err == nil && defaultIface != "" {
+			hostIfname = defaultIface
+		}
+		if k8sClient != nil {
+			nmc := &pmv1.NodeMigrationCapacity{}
+			fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := k8sClient.Get(fetchCtx, types.NamespacedName{Name: nodeName}, nmc); err != nil {
+				log.Error(err, "EnsureXDPBridgeLoaded: could not read NMC — XDPBridgeCapable=false (no-op)")
+			} else {
+				xdpBridgeCapable = nmc.Spec.NetworkCapability.XDPBridgeCapable
+			}
+			fetchCancel()
+		}
+		xdpCtx, xdpCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := agentSrv.EnsureXDPBridgeLoaded(xdpCtx, hostIfname, xdpBridgeCapable); err != nil {
+			log.Error(err, "EnsureXDPBridgeLoaded failed (non-fatal — XDP bridge will be inactive)",
+				"hostIfname", hostIfname, "xdpBridgeCapable", xdpBridgeCapable)
+		}
+		xdpCancel()
 	}
 
 	// TODO(podmotion-io/podmotion#<issue>, M1): start metrics server on :9091 (Prometheus /metrics endpoint for agent DaemonSet scraping).

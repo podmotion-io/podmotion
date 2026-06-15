@@ -60,6 +60,12 @@ type VtepEntry struct {
 // (e.g. internal/agent/server) that need to arm/disarm eBPF programs.
 // It is identical to the unexported eBPFManager.
 type EBPFManager interface {
+	// EnsureXDPBridgeLoaded loads and pins the xdp_bridge program at node startup.
+	// It is idempotent: if the pins already exist and the XDP link is live it
+	// adopts the existing state without reloading.  hostIfname is the host-side
+	// network interface (e.g. "eth0") to attach the XDP program to.
+	// If xdpBridgeCapable is false the call is a no-op (returns nil).
+	EnsureXDPBridgeLoaded(ctx context.Context, hostIfname string, xdpBridgeCapable bool) error
 	ArmZeroWindowHold(ctx context.Context, ifindex uint32) error
 	DisarmZeroWindowHold(ctx context.Context, ifindex uint32) error
 	ArmXDPBridge(ctx context.Context, srcIP, dstIP net.IP, genevePort uint16) error
@@ -86,6 +92,9 @@ type EBPFManager interface {
 // eBPFManager is the interface consumed by NetworkBridgeAgent.
 // Production implementation loads real BPF objects; stub logs only.
 type eBPFManager interface {
+	// EnsureXDPBridgeLoaded loads and pins the xdp_bridge program at node startup.
+	EnsureXDPBridgeLoaded(ctx context.Context, hostIfname string, xdpBridgeCapable bool) error
+
 	// ArmZeroWindowHold loads zero_window.bpf.o on the TC egress hook of the
 	// veth identified by ifindex, then inserts ifindex into PM_ACTIVE_HOLDS.
 	// Idempotent — safe to call again if the hold is already armed.
@@ -165,6 +174,11 @@ type eBPFManagerStub struct{}
 // out of the cilium/ebpf loader (unit tests, integration harnesses).
 func NewStubEBPFManager() eBPFManager {
 	return &eBPFManagerStub{}
+}
+
+func (s *eBPFManagerStub) EnsureXDPBridgeLoaded(ctx context.Context, hostIfname string, xdpBridgeCapable bool) error {
+	logf.FromContext(ctx).Info("ebpf stub: EnsureXDPBridgeLoaded (no-op)", "hostIfname", hostIfname, "xdpBridgeCapable", xdpBridgeCapable)
+	return nil
 }
 
 func (s *eBPFManagerStub) ArmZeroWindowHold(ctx context.Context, ifindex uint32) error {
