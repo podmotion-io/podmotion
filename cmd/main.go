@@ -45,6 +45,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/controller"
 	"github.com/podmotion-io/podmotion/internal/controller/spotreclaim"
 	"github.com/podmotion-io/podmotion/internal/estimation"
+	"github.com/podmotion-io/podmotion/internal/featuregate"
 	"github.com/podmotion-io/podmotion/internal/rollback"
 	pmwebhook "github.com/podmotion-io/podmotion/internal/webhook"
 	corev1 "k8s.io/api/core/v1"
@@ -93,6 +94,10 @@ func main() {
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.BoolVar(&enableSpotReclaim, "enable-spot-reclaim", false,
 		"If set, the SpotReclaimReconciler is started. Enable only on AWS clusters with spot instances.")
+	var featureGates string
+	flag.StringVar(&featureGates, "feature-gates", "",
+		"Comma-separated list of <Gate>=true|false pairs enabling experimental features "+
+			"(e.g. TCPPreservation=true,GPUMigration=false). No gate is enabled by default.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -100,6 +105,15 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Apply experimental feature gates from --feature-gates before any reconciler
+	// or webhook consults featuregate.IsEnabled. Without this, gates such as
+	// TCPPreservation can never be enabled at runtime and the admission webhook
+	// hard-blocks every TCPPreservationMode=Strict/BestEffort migration.
+	if err := featuregate.ParseFlags(featureGates); err != nil {
+		setupLog.Error(err, "invalid --feature-gates")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
