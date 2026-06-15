@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -89,6 +90,24 @@ func PrepareDestinationNetns(ctx context.Context, uid, podIP, podCIDR, bridgeNam
 	if err := createBindMountedNetns(netnsPath); err != nil {
 		return nil, fmt.Errorf("PrepareDestinationNetns: %w", err)
 	}
+
+	// SP-5: bounded propagation barrier — wait up to 500 ms for the host-ns bind-mount
+	// to propagate into the container via mountPropagation: HostToContainer.
+	for i := 0; i < 10; i++ {
+		if _, err := os.Stat(netnsPath); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// SP-2: Arch-C regression guard — verify the path is os.Open-able in-process
+	// (producer/consumer mount-namespace coherence). If this fails, mount propagation
+	// is not active: check that /run/podmotion is rshared on the host and that
+	// mountPropagation: HostToContainer is set on the agent container's run-podmotion mount.
+	f, err := os.Open(netnsPath)
+	if err != nil {
+		return nil, fmt.Errorf("netns path not visible in container ns after bind-mount (mount propagation not active?): %w", err)
+	}
+	f.Close()
 
 	if err := createVethPair(hostVeth, migrationVethPeer, netnsPath); err != nil {
 		_ = os.Remove(netnsPath)
