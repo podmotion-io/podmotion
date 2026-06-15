@@ -171,6 +171,14 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		"/etc/hostname",
 		"/etc/hosts",
 		"/data", // container volume mount (e.g. Redis /data) — no proper root mount in container mnt ns; re-attached by storage tier on restore (Sprint 31 root_cause=b)
+		// sysfs and cgroupfs are managed by the container runtime; CRIU must not dump
+		// these mounts because the destination runtime provides them fresh on restore.
+		// Without skipping, CRIU restore fails: "Can't umount at ./sys: Device or resource
+		// busy" — the bind-mounted sysfs from the kind host cannot be umounted inside the
+		// restore context. --skip-mnt is a dump-time flag; skipping at dump means the
+		// images contain no sysfs/cgroupfs entries and restore never attempts to recreate them.
+		"/sys",
+		"/sys/fs/cgroup",
 		// dmi sysfs absent on kind control-plane nodes — bind-mount restore fails with
 		// "No such file or directory". These paths are not needed for checkpoint/restore
 		// correctness; the workload does not depend on DMI identity at runtime.
