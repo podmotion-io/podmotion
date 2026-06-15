@@ -52,6 +52,7 @@ import (
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"sync"
 )
 
 const (
@@ -80,6 +81,18 @@ const (
 	// conditionRestoreTimedOut is set when the restore deadline elapses, driving
 	// the migration to RollingBack (ADR-0157 D3/GC-32). Reason: RestoreDeadlineExceeded.
 	conditionRestoreTimedOut              = "RestoreTimedOut"
+)
+
+// macWritebackFirstSeen records the first time injectIPHandoff was entered for a migration
+// that still had an empty ReplVethMAC (ADR-0133 D3 deadline). Key: migrationName (string),
+// Value: time.Time. Injectable nowFn allows the deadline to be tested without wall-clock delays.
+var (
+	macWritebackFirstSeen sync.Map
+	// nowFn is the injectable time source for deadline checks. Tests replace this.
+	nowFn = time.Now
+	// macWritebackDeadlineSec is the number of seconds the controller will wait for the NRI
+	// plugin to write ReplVethMAC before failing the migration (ADR-0133 D3 / ADR-0157 D3).
+	macWritebackDeadlineSec = 30
 )
 
 // PodMigrationReconciler reconciles a PodMigration object.
@@ -2565,9 +2578,28 @@ func (r *PodMigrationReconciler) injectIPHandoff(ctx context.Context, pm *pmv1.P
 		pm.Status.ReplVethMAC = fresh.Status.ReplVethMAC
 	}
 	if pm.Status.ReplVethMAC == "" {
-		log.Info("injectIPHandoff: replVethMAC not yet present in status — requeuing (NRI plugin writeback pending)", "migration", pm.Name)
+		// Record the first time we saw an empty MAC for this migration (ADR-0133 D3 deadline).
+		now := nowFn()
+		firstSeenRaw, _ := macWritebackFirstSeen.LoadOrStore(pm.Name, now)
+		firstSeen := firstSeenRaw.(time.Time)
+		if now.Sub(firstSeen) > time.Duration(macWritebackDeadlineSec)*time.Second {
+			log.Error(nil, "injectIPHandoff: replVethMAC deadline exceeded — transitioning to RollingBack (ADR-0133 D3 / ADR-0157 D3)",
+				"migration", pm.Name, "elapsed", now.Sub(firstSeen))
+			macWritebackFirstSeen.Delete(pm.Name)
+			setCondition(pm, conditionRestoreTimedOut, metav1.ConditionTrue, "MACWritebackDeadlineExceeded",
+				"replVethMAC not written within deadline; restore path did not populate MAC (ADR-0133 D3)")
+			if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+				return ctrl.Result{}, sErr, false
+			}
+			res, tErr := r.transitionTo(ctx, pm, pmv1.MigrationPhaseRollingBack)
+			return res, tErr, false
+		}
+		log.Info("injectIPHandoff: replVethMAC not yet present in status — requeuing (NRI plugin writeback pending)",
+			"migration", pm.Name, "waitingSec", int(now.Sub(firstSeen).Seconds()))
 		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil, false
 	}
+	// MAC arrived — clear the deadline tracker.
+	macWritebackFirstSeen.Delete(pm.Name)
 
 	if r.AgentPool == nil {
 		log.Error(nil, "injectIPHandoff: AgentPool not wired — requeuing", "migration", pm.Name)
