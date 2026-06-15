@@ -10,6 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libnet1 \
     libgnutls30 \
     ca-certificates \
+    iproute2 \
+    python3 \
+    python3-protobuf \
   && rm -rf /var/lib/apt/lists/*
+COPY pycriu/ /usr/lib/python3/dist-packages/pycriu/
 COPY bin/agent-linux-amd64 /agent
 ENTRYPOINT ["/agent"]
