@@ -34,6 +34,10 @@ func (k *KindnetProvider) InjectGratuitousARP(_ context.Context, _, _ string) er
 	return fmt.Errorf("KindnetProvider.InjectGratuitousARP: only supported on Linux")
 }
 
+func (k *KindnetProvider) WireDestinationVeth(_ context.Context, _, _, _, _ string) error {
+	return fmt.Errorf("KindnetProvider.WireDestinationVeth: only supported on Linux")
+}
+
 // SendGratuitousARP is a no-op stub on non-Linux platforms.
 func SendGratuitousARP(_ context.Context, _, _ string) error {
 	return fmt.Errorf("SendGratuitousARP: only supported on Linux")
