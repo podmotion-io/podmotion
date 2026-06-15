@@ -3387,6 +3387,22 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// tree is alive (or dead) at that point; the images are no longer needed.
 	defer func() { _ = zeroizeDir(imagesDir) }()
 
+	// Pre-restore sanity: inventory.img must exist and be non-empty. If absent, CRIU
+	// fails immediately with "No inventory.img image / Unexpected EOF on (empty-image)".
+	// Catching this here gives a clear error instead of an opaque CRIU exit-1.
+	invPath := filepath.Join(imagesDir, "inventory.img")
+	if info, statErr := os.Stat(invPath); statErr != nil || info.Size() == 0 {
+		msg := fmt.Sprintf("Restore: inventory.img missing or empty at %s (size=%d, err=%v) — checkpoint transfer incomplete",
+			invPath, func() int64 {
+				if info != nil {
+					return info.Size()
+				}
+				return -1
+			}(), statErr)
+		log.Error(statErr, msg, "migration", req.MigrationName)
+		return &agentpb.RestoreResponse{Success: false, ErrorMessage: msg}, nil
+	}
+
 	// Check if we have a config.json (produced by ctr checkpoint) — use join-ns restore:
 	// launch a fresh placeholder container then restore checkpoint state into its namespaces.
 	cfgPath := filepath.Join(imagesDir, "config.json")
@@ -3926,6 +3942,11 @@ func (s *AgentServer) PutCheckpointTar(_ context.Context, req *agentpb.PutCheckp
 
 	tr := tar.NewReader(gzr)
 	var bytesWritten int64
+	type fileEntry struct {
+		name  string
+		bytes int64
+	}
+	var manifest []fileEntry
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -3956,14 +3977,31 @@ func (s *AgentServer) PutCheckpointTar(_ context.Context, req *agentpb.PutCheckp
 			return &agentpb.PutCheckpointTarResponse{Success: false, Error: fmt.Sprintf("write %s: %v", filename, err)}, nil
 		}
 		bytesWritten += n
+		manifest = append(manifest, fileEntry{name: filename, bytes: n})
 	}
 
 	extractOK = true // disarm the error-path zeroize defer
+
+	// Log per-file manifest so restore failures can pinpoint missing/empty images.
+	hasInventory := false
+	for _, e := range manifest {
+		log.Info("PutCheckpointTar: extracted file", "migration", req.MigrationName, "file", e.name, "bytes", e.bytes)
+		if e.name == "inventory.img" {
+			hasInventory = true
+		}
+	}
+	if !hasInventory {
+		log.Error(nil, "PutCheckpointTar: inventory.img NOT in tar — CRIU restore will fail",
+			"migration", req.MigrationName, "fileCount", len(manifest))
+	}
+
 	log.Info("PutCheckpointTar: extracted checkpoint images",
 		"migration", req.MigrationName,
 		"destDir", destDir,
+		"fileCount", len(manifest),
 		"bytesWritten", bytesWritten,
-		"tarSize", len(req.TarData))
+		"tarSize", len(req.TarData),
+		"hasInventory", hasInventory)
 	return &agentpb.PutCheckpointTarResponse{Success: true, BytesWritten: bytesWritten}, nil
 }
 
