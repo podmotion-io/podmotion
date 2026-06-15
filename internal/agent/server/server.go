@@ -1910,7 +1910,19 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		"--images-dir", checkpointDir,
 		"--root", rootfsDir,
 		tcpFlag,
-		"--mntns-compat-mode",
+		// --mntns-compat-mode is intentionally OMITTED here (gate-fix B1).
+		// Compat-mode runs an umount pass inside the destination container's mount namespace
+		// that tries to remove /sys → EBUSY (sysfs is kernel-referenced and cannot be
+		// unmounted even with MNT_DETACH when it has active references from the host).
+		// This causes CRIU to exit code 1 on kind control-plane nodes where the placeholder
+		// container has a different sysfs mount topology than the worker nodes used in
+		// Sprint 31. Without --mntns-compat-mode, CRIU uses mount-v2 mode
+		// (MOVE_MOUNT_SET_GROUP) which does NOT run the umount pass and only mounts what
+		// is recorded in the image (the 5 stripped entries: /, /proc, /dev, /dev/pts,
+		// /dev/mqueue). The go-criu RPC restore path already uses MntnsCompatMode=false
+		// for the same reason (see criu_checkpointer.go). Aligning the CLI path with the
+		// go-criu path resolves the control-plane restore failure (Sprint 32 GC-1 through
+		// GC-22 blocker).
 		// --ext-mount-map auto handles the standard pseudo-fs and containerd/runc submounts
 		// (/proc/*, /sys/*, /dev/*) that CRIU autodetects as external. The explicit
 		// "/data:<dataDir>" map below takes precedence for /data, overriding auto's

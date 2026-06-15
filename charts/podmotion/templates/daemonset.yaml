@@ -94,6 +94,9 @@ spec:
               readOnly: true
             - name: host-var-lib-podmotion
               mountPath: /var/lib/podmotion
+            - name: host-cni-conf
+              mountPath: /etc/cni/net.d
+              readOnly: true
       volumes:
         - name: criu-socket
           hostPath:
@@ -122,3 +125,7 @@ spec:
           hostPath:
             path: /run
             type: Directory
+        - name: host-cni-conf
+          hostPath:
+            path: /etc/cni/net.d
+            type: DirectoryOrCreate
