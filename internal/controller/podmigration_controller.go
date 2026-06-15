@@ -1975,6 +1975,8 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 		}
 		log.Info("reconcileTransferring: checkpoint transferred successfully",
 			"migration", pm.Name, "destNode", destNode, "bytesWritten", putResp.BytesWritten)
+		log.Info("GC-PROP: checkpoint transfer propagation barrier satisfied — images delivered to dest agent",
+			"migration", pm.Name, "destNode", destNode, "bytesWritten", putResp.BytesWritten)
 
 		// Persist the transfer marker BEFORE releasing the source. If the controller
 		// crashes between this write and the ReleaseCheckpoint call, the next reconcile
