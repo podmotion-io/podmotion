@@ -10,6 +10,56 @@ Current version: **v0.1.0-alpha**
 | ✅ Complete | All deliverables merged and testable |
 | 🔨 In Progress | Active implementation underway |
 | 🔲 Planned | Scoped but not started |
+| 💡 For Consideration | Research complete; not yet scoped into a Nav Point; requires human Nav Point approval before sprints begin |
+
+---
+
+## 💡 For Consideration — Workload-Facing Identity Transparency
+
+**Research doc:** [`docs/research/POD-IDENTITY-PRESERVATION-RESEARCH.md`](research/POD-IDENTITY-PRESERVATION-RESEARCH.md)  
+**Research date:** 2026-06-14  
+**Quorum:** 8 Opus agents (7 domain experts + lead architect synthesizer)
+
+### What this is
+
+The question: can PodMotion be developed so that `kubectl watch pod <name>` shows **only the node field changing** during a live migration — same name, same IP, same everything?
+
+The answer from the quorum: **not UID** (Kubernetes API invariant, requires upstream KEP), but **everything else is achievable** on stock clusters today.
+
+### Summary verdict
+
+| Facet | Achievable today? |
+|---|---|
+| Pod IP (Calico/Cilium) | Yes |
+| TCP connections, memory, storage | Yes — already built |
+| Pod name | Yes (sequential reuse) |
+| StatefulSet: name + ordinal + PVC + DNS + IP | Yes via SchedulingGate path |
+| Pod UID | No — requires `pods/relocation` KEP |
+
+### Candidate deliverables if approved as a Nav Point
+
+1. **`podmotion-ipam` chainable CNI meta-plugin** — suppress IP release on source DEL; adopt pinned IP on dest ADD. Closes IPAM-store consistency gap (Calico-first).
+2. **`IPAMOwnershipTransferred` condition** — proves the IP is recorded in Calico WorkloadEndpoint / Cilium CiliumEndpoint, not just reachable on wire.
+3. **Kubelet container-adoption via NRI** — eliminate `restartCount` bump; achieve no-op SyncPod adopt at destination kubelet.
+4. **StatefulSet-gated migration path** — same name, ordinal, PVC, DNS, IP via SchedulingGate pin + StatefulSet controller cooperation.
+5. **Predecessor lineage annotations** — stamp `migration.podmotion.io/predecessor-uid` + copy ownerReferences before source delete (prevents RS from spawning a third pod during the gap).
+
+### Upstream KEPs to drive (if PodMotion leads)
+
+1. **`pods/relocation` subresource** — modeled on KEP-1287 (in-place resize); mutates `spec.nodeName` on a running pod; preserves UID for free. Highest-leverage single change.
+2. **Kubelet ownership-handoff + CRI `RestoreContainer`** — symmetric restore half of KEP-2008 (Forensic Checkpointing). PodMotion's NRI handoff is the reference implementation.
+3. **CNI `MIGRATE` verb** — paired `ADD --reserve-from` + `DEL --no-release` for atomic IP transfer across nodes. PodMotion meta-plugin is the prototype; standardize at cni.dev.
+
+### Gate criterion (when this Nav Point closes)
+
+```
+kubectl get pod <name> -o wide --watch
+```
+During migration: a single transition line where **only the NODE column changes**. IP unchanged. Name unchanged. All TCP connections survive with seq_delta=0.
+
+### Relation to existing ADRs
+
+ADR-0048, ADR-0082, ADR-0085, ADR-0033, ADR-0119, and `docs/kep/kep-XXXX-kubelet-restore-api.md` are all directly load-bearing for this Nav Point. Read before scoping sprints.
 
 ---
 
