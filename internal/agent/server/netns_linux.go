@@ -47,7 +47,13 @@ func (s *AgentServer) PrepareDestinationNetns(ctx context.Context, req *agentpb.
 	// We use MigrationName as the uid here — the controller passes a stable identifier.
 	uid := req.MigrationName
 
-	ns, err := network.PrepareDestinationNetns(ctx, uid, req.PodIp, "", "cni0")
+	// ADR-0158 D5: discover bridge interface at runtime rather than hardcoding "cni0".
+	// On kindnet/kind there is no cni0 bridge; the host interface is discovered dynamically.
+	bridgeName, _ := discoverHostInterface(ctx)
+	if bridgeName == "" {
+		bridgeName = "cni0" // Flannel fallback only — kindnet discovery returns a non-empty name.
+	}
+	ns, err := network.PrepareDestinationNetns(ctx, uid, req.PodIp, "", bridgeName)
 	if err != nil {
 		log.Error(err, "PrepareDestinationNetns: failed to create migration netns",
 			"migration", req.MigrationName, "podIP", req.PodIp)
