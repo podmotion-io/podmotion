@@ -2,41 +2,55 @@
 Copyright 2026 PodMotion Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
 */
 
 package controller
+
+// inject_ip_handoff_deadline_test.go — E1 Condition 4 regression test:
+//
+//   - TestInjectIPHandoff_DeadlineExceeded: when CRIURestoreConfirmed=true and replVethMAC
+//     is still empty after macWritebackDeadlineSec, injectIPHandoff must transition the
+//     migration to RollingBack with reason "MACWritebackDeadlineExceeded".
 
 import (
 	"context"
 	"testing"
 	"time"
 
-	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 )
 
-// TestInjectIPHandoff_DeadlineExceeded verifies that injectIPHandoff transitions the
-// PodMigration to RollingBack when replVethMAC has not been written within the
-// macWritebackDeadlineSec window (ADR-0133 D3 / ADR-0157 D3).
+// TestInjectIPHandoff_DeadlineExceeded asserts that injectIPHandoff transitions to
+// RollingBack when replVethMAC remains empty for longer than macWritebackDeadlineSec
+// (E1 Condition 4). It manipulates macWritebackFirstSeen directly to simulate elapsed
+// time, then verifies that the phase transitioned to RollingBack.
 func TestInjectIPHandoff_DeadlineExceeded(t *testing.T) {
-	// Arrange: a migration in OverlayHandoff phase with SourcePodIP set but ReplVethMAC empty.
+	// Shorten the deadline so the test runs without sleeping.
+	origDeadline := macWritebackDeadlineSec
+	macWritebackDeadlineSec = 1 * time.Millisecond
+	defer func() {
+		macWritebackDeadlineSec = origDeadline
+		macWritebackFirstSeen.Delete("test-mac-deadline")
+	}()
+
+	confirmed := true
 	pm := &pmv1.PodMigration{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-migration-deadline",
+			Name:      "test-mac-deadline",
 			Namespace: "default",
 		},
 		Spec: pmv1.PodMigrationSpec{
-			PodName:             "redis-0",
-			PodNamespace:        "default",
-			TCPPreservationMode: pmv1.TCPPreservationModeStrict,
-			SourcePodIP:         "10.244.1.50",
+			SourcePodIP: "10.0.0.1",
 		},
 		Status: pmv1.PodMigrationStatus{
-			Phase:       pmv1.MigrationPhaseOverlayHandoff,
-			ReplVethMAC: "", // MAC not yet written — simulates NRI plugin lag
+			CRIURestoreConfirmed: &confirmed,
+			ReplVethMAC:          "", // empty — triggering the deadline path
+			Phase:                pmv1.MigrationPhaseRestoring,
 		},
 	}
 
@@ -47,8 +61,8 @@ func TestInjectIPHandoff_DeadlineExceeded(t *testing.T) {
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&pmv1.PodMigration{}).
 		WithObjects(pm).
+		WithStatusSubresource(pm).
 		Build()
 
 	r := &PodMigrationReconciler{
@@ -56,40 +70,44 @@ func TestInjectIPHandoff_DeadlineExceeded(t *testing.T) {
 		Scheme: scheme,
 	}
 
-	// Seed the firstSeen timestamp to 35 seconds ago — past the 30s deadline.
-	migrationKey := pm.Name
-	macWritebackFirstSeen.Store(migrationKey, time.Now().Add(-35*time.Second))
+	ctx := context.Background()
 
-	// Override nowFn so the deadline calculation uses the same wall clock as the seed above.
-	origNow := nowFn
-	nowFn = time.Now
-	defer func() {
-		nowFn = origNow
-		macWritebackFirstSeen.Delete(migrationKey)
-	}()
+	// Pre-seed macWritebackFirstSeen with a timestamp well in the past so the deadline
+	// triggers immediately.
+	macWritebackFirstSeen.Store("test-mac-deadline", time.Now().Add(-10*time.Second))
 
-	// Act
-	result, err, handled := r.injectIPHandoff(context.Background(), pm)
-	_ = result
+	// First call to injectIPHandoff: MAC is empty and deadline has elapsed.
+	_, _, done := r.injectIPHandoff(ctx, pm)
 
-	// Assert: deadline branch must have triggered — no requeue error, not handled (forwarded
-	// to RollingBack), and the condition RestoreTimedOut must be set on the in-memory pm.
-	if err != nil {
-		t.Fatalf("expected nil error from deadline transition; got: %v", err)
-	}
-	if handled {
-		t.Error("expected handled=false (deadline path transitions to RollingBack, not done)")
+	// done=true is returned on both deadline-exceeded (transition to RollingBack) and
+	// successful injection. The transition path sets the phase to RollingBack.
+	if !done {
+		t.Fatal("expected done=true after deadline exceeded, got false")
 	}
 
-	// The condition must be set on the in-memory pm object before the status update.
-	timedOut := false
-	for _, cond := range pm.Status.Conditions {
-		if cond.Type == conditionRestoreTimedOut && cond.Status == metav1.ConditionTrue {
-			timedOut = true
-			break
+	// transitionTo patches the CR via the k8s client — re-fetch from fake client to verify.
+	updated := &pmv1.PodMigration{}
+	if err := fakeClient.Get(ctx, client.ObjectKeyFromObject(pm), updated); err != nil {
+		t.Fatalf("re-fetch after transition: %v", err)
+	}
+	if updated.Status.Phase != pmv1.MigrationPhaseRollingBack {
+		t.Errorf("expected phase=RollingBack after deadline exceeded, got %q", updated.Status.Phase)
+	}
+
+	// The condition is set on pm (in-memory) before the statusUpdate/transitionTo calls.
+	var found bool
+	for _, c := range pm.Status.Conditions {
+		if c.Type == conditionIPHandoffInjected && c.Reason == "MACWritebackDeadlineExceeded" {
+			found = true
 		}
 	}
-	if !timedOut {
-		t.Errorf("expected conditionRestoreTimedOut=True on pm.Status.Conditions after deadline; got: %v", pm.Status.Conditions)
+	if !found {
+		t.Errorf("expected condition %s with reason MACWritebackDeadlineExceeded; conditions: %+v",
+			conditionIPHandoffInjected, pm.Status.Conditions)
+	}
+
+	// Verify the deadline entry was cleared.
+	if _, ok := macWritebackFirstSeen.Load("test-mac-deadline"); ok {
+		t.Error("expected macWritebackFirstSeen entry to be deleted after deadline exceeded")
 	}
 }

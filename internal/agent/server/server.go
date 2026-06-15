@@ -161,6 +161,105 @@ func (s *AgentServer) EnsureXDPBridgeLoaded(ctx context.Context, hostIfname stri
 	return s.ebpfMgr.EnsureXDPBridgeLoaded(ctx, hostIfname, xdpBridgeCapable)
 }
 
+// readReplVethMACFn is the production implementation of ReadReplVethMAC.
+// Overridable in tests to inject stub behaviour without spawning nsenter.
+var readReplVethMACFn = ReadReplVethMAC
+
+// restoreResult is the shared finalization result populated by finalizeRestore.
+// All restore paths (NRI + both gRPC Restore branches) return this struct so that
+// MAC population and SingleHomeRestoredPod parity are path-independent (E1, ADR-0133 D3,
+// ADR-0137/0138).
+type restoreResult struct {
+	pid         int
+	netnsPath   string
+	mac         string
+	singleHomed bool
+}
+
+// finalizeRestore is the shared restore-finalization primitive (Condition 1 + Condition 2).
+// It calls ReadReplVethMAC(pid, netnsPath) to populate the replacement pod's eth0 MAC, then
+// calls SingleHomeRestoredPod on both gRPC and NRI paths (parity — Condition 2).
+// For tcpPreservationMode Strict or Full: an empty MAC is a hard failure (fail-closed,
+// Condition 3). For None/BestEffort: an empty MAC records a queryable CR-status condition and
+// continues. Returns the populated restoreResult; callers must pass result.mac to
+// ReportRestoreConfirmed.
+func (s *AgentServer) finalizeRestore(ctx context.Context, pid int, netnsPath, migrationName, namespace, tcpPreservationMode string) (restoreResult, error) {
+	result := restoreResult{
+		pid:       pid,
+		netnsPath: netnsPath,
+	}
+
+	// Condition 1: call readReplVethMACFn (= ReadReplVethMAC in production; injectable in tests).
+	mac, macErr := readReplVethMACFn(pid, netnsPath)
+	result.mac = mac
+
+	// Condition 3: fail-closed on Strict/Full for empty MAC; degrade on None/BestEffort.
+	if macErr != nil || mac == "" {
+		mode := tcpPreservationMode
+		if mode == "Strict" || mode == "Full" {
+			reason := "replVethMAC empty after restore — MAC resolution failed (path-independent contract violation)"
+			log.Error(macErr, "finalizeRestore: "+reason, "migration", migrationName, "mode", mode)
+			return result, fmt.Errorf("finalizeRestore [%s]: %s", mode, reason)
+		}
+		// None/BestEffort: record queryable condition but continue.
+		if s.k8sClient != nil && namespace != "" {
+			pm := &pmv1.PodMigration{}
+			if getErr := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: migrationName}, pm); getErr == nil {
+				setConditionOnPM(pm, "ReplVethMACResolved", metav1.ConditionFalse,
+					"MACEmpty", "ReadReplVethMAC returned empty — InjectIPHandoff will wait for writeback")
+				_ = s.k8sClient.Status().Update(ctx, pm)
+			}
+		}
+		if macErr != nil {
+			log.Error(macErr, "finalizeRestore: ReadReplVethMAC failed (non-fatal under "+tcpPreservationMode+")",
+				"migration", migrationName)
+		} else {
+			log.Info("finalizeRestore: ReadReplVethMAC returned empty (non-fatal under "+tcpPreservationMode+")",
+				"migration", migrationName)
+		}
+	} else {
+		log.Info("finalizeRestore: ReadReplVethMAC collected (ADR-0133 D3)",
+			"migration", migrationName, "replVethMAC", mac)
+	}
+
+	// Condition 2: SingleHomeRestoredPod parity — call on ALL paths (gRPC and NRI).
+	if s.k8sClient != nil && namespace != "" && pid > 0 {
+		if shErr := s.SingleHomeRestoredPod(ctx, migrationName, namespace, pid); shErr != nil {
+			log.Error(shErr, "finalizeRestore: SingleHomeRestoredPod failed (ADR-0137) — pod may remain dual-homed",
+				"migration", migrationName, "restoredPID", pid)
+			// Non-fatal: log loud; source pod preserved per ADR-0012.
+		} else {
+			result.singleHomed = true
+			log.Info("finalizeRestore: replacement pod single-homed on OLD IP (ADR-0137/0138)",
+				"migration", migrationName, "restoredPID", pid)
+		}
+	}
+
+	return result, nil
+}
+
+// setConditionOnPM is a local helper to set a metav1.Condition on a PodMigration object
+// in-place (does not patch — caller must status-update).
+func setConditionOnPM(pm *pmv1.PodMigration, condType string, status metav1.ConditionStatus, reason, message string) {
+	now := metav1.Now()
+	for i, c := range pm.Status.Conditions {
+		if c.Type == condType {
+			pm.Status.Conditions[i].Status = status
+			pm.Status.Conditions[i].Reason = reason
+			pm.Status.Conditions[i].Message = message
+			pm.Status.Conditions[i].LastTransitionTime = now
+			return
+		}
+	}
+	pm.Status.Conditions = append(pm.Status.Conditions, metav1.Condition{
+		Type:               condType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: now,
+	})
+}
+
 // JoinNsRestore is the exported entry point for the NRI StartContainer hook.
 // It invokes the CRIU restore path that enters the container's existing namespaces
 // (created by runc) and restores the checkpointed process tree.
@@ -188,14 +287,18 @@ func (s *AgentServer) EnsureXDPBridgeLoaded(ctx context.Context, hostIfname stri
 // ADR-0012 invariant: the source pod is not released until TrafficVerified=True, which only
 // follows InjectIPHandoff returning success — the source is still frozen at the moment the
 // restored tree resumes (ADR-0012).
-func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, containerID, sandboxID, tcpPreservationMode string) (int, error) {
+//
+// Returns (pid, mac, error) where mac is the replacement pod's eth0 MAC (E1 Condition 1).
+// The NRI caller must pass mac directly to ReportRestoreConfirmed; it must NOT call
+// ReadReplVethMAC independently.
+func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, containerID, sandboxID, tcpPreservationMode string) (int, string, error) {
 	strictMode := tcpPreservationMode == string(pmv1.TCPPreservationModeStrict)
 	s.destHostVethMu.RLock()
 	storedVeth := s.destHostVeth[migrationName]
 	s.destHostVethMu.RUnlock()
 	pid, err := joinNsRestore(migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 
 	// ADR-0144 Decision Points 2–3: on the Strict path, enforce the gated-resume invariant.
@@ -217,7 +320,7 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 			log.Error(orderErr, "JoinNsRestore: ordering invariant FAILED — SIGCONT withheld; "+
 				"NRI callback will return error → containerd marks container failed → operator requeues (ADR-0144 NB-2)",
 				"migration", migrationName, "pid", pid)
-			return 0, fmt.Errorf("JoinNsRestore: ordering invariant: %w", orderErr)
+			return 0, "", fmt.Errorf("JoinNsRestore: ordering invariant: %w", orderErr)
 		}
 		if resumedAt.IsZero() {
 			// SocketsLive confirmed; SIGCONT deferred — record PID for InjectIPHandoff.
@@ -228,7 +331,18 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 				"migration", migrationName, "pid", pid, "expectedSocketCount", expectedSocketCount)
 		}
 	}
-	return pid, nil
+
+	// E1 Condition 1: resolve the netns path and call finalizeRestore so MAC is populated
+	// path-independently. Namespace is not available here (no CR fetch in JoinNsRestore);
+	// pass empty string — finalizeRestore will skip the k8s condition patch but still
+	// populate mac and call SingleHomeRestoredPod.
+	netnsPath := s.ResolvedNetnsPath(migrationName)
+	fr, frErr := s.finalizeRestore(context.Background(), pid, netnsPath, migrationName, "", tcpPreservationMode)
+	if frErr != nil {
+		// Strict/Full fail-closed: propagate.
+		return 0, "", frErr
+	}
+	return pid, fr.mac, nil
 }
 
 // ReportRestoreConfirmed patches the PodMigration CR status to record that CRIU
@@ -564,27 +678,6 @@ func parseLinkEther(out string) string {
 	return ""
 }
 
-// readReplVethMACFn is the injectable seam for ReadReplVethMAC, used in tests (ADR-0133).
-// Production code must not replace this variable; it exists solely for unit test injection.
-var readReplVethMACFn = ReadReplVethMAC
-
-// finalizeRestoreMAC collects the replacement pod's eth0 MAC via readReplVethMACFn and
-// enforces the per-mode policy (ADR-0133 D3):
-//   - Strict: returns an error if the MAC is empty (fail-closed).
-//   - BestEffort/None: logs and returns "" without error (degrade path).
-//
-// The returned MAC is passed to ReportRestoreConfirmed by the caller.
-func finalizeRestoreMAC(pid int, sandboxNetnsPath, tcpPreservationMode string) (string, error) {
-	mac, err := readReplVethMACFn(pid, sandboxNetnsPath)
-	if err != nil || mac == "" {
-		if tcpPreservationMode == string(pmv1.TCPPreservationModeStrict) {
-			return "", fmt.Errorf("finalizeRestoreMAC: replVethMAC is empty under Strict mode (ADR-0133 D3): %w", err)
-		}
-		// BestEffort or None: degrade — MAC collection failed but we do not fail the restore.
-		return "", nil
-	}
-	return mac, nil
-}
 
 // resolvedNetnsPaths caches the netns path CRIU joined per migration (ADR-0133), so the NRI
 // restore callback can read eth0's MAC from the exact pod netns rather than the restored
@@ -3749,14 +3842,28 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 			}
 		}
 
-		// GC-08 fix: set status.criuRestoreConfirmed on the PodMigration CR so the controller
-		// gate (and GC-08) passes on the direct gRPC Restore path (non-NRI). The RestoreRequest
-		// proto does not carry a pod_namespace field (would require proto amendment), so we
-		// resolve the namespace by name — mirroring the restoredPIDForMigration pattern.
+		// E1 Condition 1+2: call finalizeRestore to populate MAC and run SingleHomeRestoredPod
+		// on this gRPC path (parity with NRI path — Condition 2).
 		if s.k8sClient != nil {
 			ns := s.resolveNamespaceForMigration(ctx, req.MigrationName)
 			if ns != "" {
-				if rcErr := s.ReportRestoreConfirmed(ctx, req.MigrationName, ns, int32(pid), ""); rcErr != nil {
+				netnsPath := s.ResolvedNetnsPath(req.MigrationName)
+				fr, frErr := s.finalizeRestore(ctx, pid, netnsPath, req.MigrationName, ns, req.TcpPreservationMode)
+				if frErr != nil {
+					// Strict/Full fail-closed on empty MAC — abort so controller can roll back
+					// (source pod preserved per ADR-0012).
+					log.Error(frErr, "Restore: finalizeRestore failed (Strict/Full fail-closed)",
+						"migration", req.MigrationName)
+					return &agentpb.RestoreResponse{
+						Success:      false,
+						ErrorMessage: frErr.Error(),
+					}, nil
+				}
+				// GC-08 fix: set status.criuRestoreConfirmed on the PodMigration CR so the controller
+				// gate (and GC-08) passes on the direct gRPC Restore path (non-NRI). The RestoreRequest
+				// proto does not carry a pod_namespace field (would require proto amendment), so we
+				// resolve the namespace by name — mirroring the restoredPIDForMigration pattern.
+				if rcErr := s.ReportRestoreConfirmed(ctx, req.MigrationName, ns, int32(pid), fr.mac); rcErr != nil {
 					// Non-fatal: the restore itself succeeded; log the failure but do not
 					// block the migration. The controller will not set TrafficVerified
 					// until criuRestoreConfirmed is true — this will surface as a gate
@@ -3817,12 +3924,24 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	log.Info("Restore: joinNsRestore succeeded (raw CRIU path via joinNs)", "migration", req.MigrationName, "pid", rawPID)
 	result := criu.RestoreResult{PID: rawPID, RestoredAt: time.Now()}
 
-	// GC-08 fix (raw CRIU fallback path): same namespace resolution + ReportRestoreConfirmed
-	// as the join-ns path above. result.PID is the root PID of the restored process tree.
+	// E1 Condition 1+2: finalizeRestore for MAC population + SingleHomeRestoredPod parity
+	// on the raw CRIU fallback path (Conditions 1, 2, 3).
 	if s.k8sClient != nil {
 		ns := s.resolveNamespaceForMigration(ctx, req.MigrationName)
 		if ns != "" {
-			if rcErr := s.ReportRestoreConfirmed(ctx, req.MigrationName, ns, int32(result.PID), ""); rcErr != nil {
+			netnsPath2 := s.ResolvedNetnsPath(req.MigrationName)
+			fr2, frErr2 := s.finalizeRestore(ctx, result.PID, netnsPath2, req.MigrationName, ns, req.TcpPreservationMode)
+			if frErr2 != nil {
+				log.Error(frErr2, "Restore (raw CRIU path): finalizeRestore failed (Strict/Full fail-closed)",
+					"migration", req.MigrationName)
+				return &agentpb.RestoreResponse{
+					Success:      false,
+					ErrorMessage: frErr2.Error(),
+				}, nil
+			}
+			// GC-08 fix (raw CRIU fallback path): same namespace resolution + ReportRestoreConfirmed
+			// as the join-ns path above. result.PID is the root PID of the restored process tree.
+			if rcErr := s.ReportRestoreConfirmed(ctx, req.MigrationName, ns, int32(result.PID), fr2.mac); rcErr != nil {
 				log.Error(rcErr, "Restore (raw CRIU path): ReportRestoreConfirmed failed (non-fatal)",
 					"migration", req.MigrationName, "namespace", ns)
 			}
