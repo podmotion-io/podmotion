@@ -41,8 +41,12 @@ RUN criu --version && criu --version | grep -qE "^Version: [4-9]\." || \
 # Create required directories
 RUN mkdir -p /etc/containerd/conf.d /usr/local/lib/nri
 
-# Enable NRI in containerd
+# Enable NRI in containerd.
+# containerd v2 (used in kindest/node:v1.32.0) does NOT auto-load conf.d/*.toml —
+# it requires an explicit `imports` stanza in the main config.toml. Append the NRI
+# plugin block directly so it is always active regardless of containerd version.
 COPY images/capi/ansible/roles/podmotion-node/files/nri.toml /etc/containerd/conf.d/nri.toml
+RUN cat /etc/containerd/conf.d/nri.toml >> /etc/containerd/config.toml
 
 # bpffs systemd mount unit
 COPY images/capi/ansible/roles/podmotion-node/files/sys-fs-bpf.mount /etc/systemd/system/sys-fs-bpf.mount
