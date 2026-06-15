@@ -83,3 +83,12 @@ rules:
   - apiGroups: [migration.podmotion.io]
     resources: [migrationcheckpoints/status]
     verbs: [get, patch, update]
+  # Agent checkpoint path watches the PodMigration CR via an informer
+  # (CR lookup during Checkpoint RPC). Without list/watch the informer never
+  # syncs and every Checkpoint RPC fails with "failed waiting for Informer to sync".
+  - apiGroups: [migration.podmotion.io]
+    resources: [podmigrations]
+    verbs: [get, list, watch]
+  - apiGroups: [migration.podmotion.io]
+    resources: [podmigrations/status]
+    verbs: [get, patch, update]

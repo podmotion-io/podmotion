@@ -63,7 +63,7 @@ webhooks:
       service:
         name: podmotion-webhook-service
         namespace: {{ .Release.Namespace }}
-        path: /validate-migration-podmotion-io-v1alpha1-podmigration
+        path: /validate-podmotion-io-v1alpha1-podmigration
     failurePolicy: Fail
     rules:
       - apiGroups: [migration.podmotion.io]
@@ -90,7 +90,7 @@ webhooks:
       service:
         name: podmotion-webhook-service
         namespace: {{ .Release.Namespace }}
-        path: /mutate-migration-podmotion-io-v1alpha1-podmigration
+        path: /mutate-podmotion-io-v1alpha1-podmigration
     failurePolicy: Fail
     rules:
       - apiGroups: [migration.podmotion.io]
