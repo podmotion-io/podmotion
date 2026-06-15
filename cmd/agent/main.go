@@ -214,7 +214,7 @@ func main() {
 			// ADR-0122: pass the replacement pod's containerd sandbox ID (pod.GetId()) so
 			// JoinNsRestore can resolve its netns via the containerd sandbox API. Also pass
 			// tcpPreservationMode so JoinNsRestore can gate --leave-stopped on the Strict path.
-			pid, err := agentSrv.JoinNsRestore(checkpointRef, checkpointDir, event.ImageName, event.SandboxID, tcpPreservationMode)
+			pid, err := agentSrv.JoinNsRestore(checkpointRef, checkpointDir, event.ImageName, event.ID, event.SandboxID, tcpPreservationMode)
 			if err != nil {
 				log.Error(err, "NRI CRIU restore failed", "container", event.ID)
 				return err

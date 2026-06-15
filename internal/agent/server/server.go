@@ -166,9 +166,9 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 // ADR-0012 invariant: the source pod is not released until TrafficVerified=True, which only
 // follows InjectIPHandoff returning success — the source is still frozen at the moment the
 // restored tree resumes (ADR-0012).
-func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, sandboxID, tcpPreservationMode string) (int, error) {
+func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, containerID, sandboxID, tcpPreservationMode string) (int, error) {
 	strictMode := tcpPreservationMode == string(pmv1.TCPPreservationModeStrict)
-	pid, err := joinNsRestore(migrationName, checkpointDir, imageName, "", sandboxID, strictMode)
+	pid, err := joinNsRestore(migrationName, checkpointDir, imageName, containerID, "", sandboxID, strictMode)
 	if err != nil {
 		return 0, err
 	}
@@ -1793,6 +1793,58 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 	return args
 }
 
+// copyDirAll copies all regular files (non-recursive into subdirs is fine for CRIU image dirs
+// which are flat) from src to dst. dst is created with 0o700 if it doesn't exist.
+// Uses os.Link (hard-link) where possible (same filesystem); falls back to byte copy.
+func copyDirAll(src, dst string) error {
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			// Recurse into subdirectories (e.g. CRIU may create sub-dirs).
+			if err := copyDirAll(filepath.Join(src, e.Name()), filepath.Join(dst, e.Name())); err != nil {
+				return err
+			}
+			continue
+		}
+		srcPath := filepath.Join(src, e.Name())
+		dstPath := filepath.Join(dst, e.Name())
+		// Try hard-link first (fast, zero-copy within same filesystem).
+		if err := os.Link(srcPath, dstPath); err == nil {
+			continue
+		}
+		// Fall back to byte copy (cross-filesystem case: tmpfs → ext4).
+		if err := copyFile(srcPath, dstPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
+}
+
 // joinNsRestore restores a checkpointed container using a standalone overlayfs rootfs.
 // When destNetnsFd is non-empty (a /proc/<pid>/fd/<n> path to a pre-staged migration netns),
 // CRIU uses --join-ns net:<destNetnsFd> to restore TCP connections into the pre-staged netns
@@ -1814,7 +1866,7 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 //  4. Bring up loopback in the restored process's network namespace.
 //
 // Returns the host PID of the restored process.
-func joinNsRestore(migrationName, checkpointDir, imageName, destNetnsFd, sandboxID string, strictMode bool) (int, error) {
+func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID string, strictMode bool) (int, error) {
 	// Use the image name passed in from the NRI ContainerEvent (fetched via ctr containers
 	// info). The checkpoint dir is a CRIU dump dir and never contains an OCI bundle
 	// config.json, so we no longer attempt to read it here.
@@ -1840,13 +1892,27 @@ func joinNsRestore(migrationName, checkpointDir, imageName, destNetnsFd, sandbox
 		return 0, fmt.Errorf("patch checkpoint images: %w", err)
 	}
 
+	// Step 1b: Copy checkpoint images to /var/lib/podmotion (ext4) so CRIU running in the
+	// host mount namespace can access them. The agent's /run/podmotion/checkpoints is a tmpfs
+	// mounted inside the agent container's mount namespace. CRIU (via nsenterCmd, entering the
+	// host mount namespace) cannot see that tmpfs — it sees the host namespace where
+	// /run/podmotion/checkpoints is a separate mount (or absent after agent restart).
+	// /var/lib/podmotion is an ext4 bind-mount visible from BOTH the agent container and
+	// the host mount namespace, so CRIU can open images from there.
+	hostCheckpointDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/checkpoint", migrationName)
+	if err := copyDirAll(checkpointDir, hostCheckpointDir); err != nil {
+		return 0, fmt.Errorf("copy checkpoint to host-visible dir: %w", err)
+	}
+	// Use the host-visible path for CRIU and all subsequent operations.
+	checkpointDir = hostCheckpointDir
+
 	// Step 2: Prepare rootfs from containerd snapshot layers.
 	// The placeholder container (started via nsenter in the host mount namespace by setupRestoreOverlayfs)
 	// has its rootfs available at the containerd task bundle path, which is exposed to the agent
 	// container via the host-containerd-bundles volume mount.
 	// We use this pre-mounted rootfs directly to avoid nested overlay mount limitations.
 	placeholderID := "pm-placeholder-" + migrationName
-	rootfsDir, err := setupRestoreOverlayfs(migrationName, checkpointDir, imageName)
+	rootfsDir, err := setupRestoreOverlayfs(migrationName, checkpointDir, imageName, containerID)
 	if err != nil {
 		return 0, fmt.Errorf("setup rootfs overlayfs: %w", err)
 	}
@@ -1862,33 +1928,53 @@ func joinNsRestore(migrationName, checkpointDir, imageName, destNetnsFd, sandbox
 	}()
 
 	// Step 3: Create ext-mount-map target paths in the agent container's filesystem.
-	// These paths are used as ext-mount-map targets for CRIU; CRIU (running in the agent
-	// container's mount namespace) can access /var/lib/podmotion directly.
+	// These paths are used as ext-mount-map targets for CRIU; CRIU (running in the host
+	// mount namespace) can access /var/lib/podmotion via the bind-mount (shared filesystem).
 	dataDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/data", migrationName)
 	secretsDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/secrets", migrationName)
 	termlogFile := fmt.Sprintf("/var/lib/podmotion/restore/%s/termination-log", migrationName)
 	_ = os.MkdirAll(dataDir, 0o755)
 	_ = os.MkdirAll(secretsDir, 0o700)
 	_ = os.WriteFile(termlogFile, nil, 0o644)
-	// Create missing mount target directories inside rootfs.
-	// The rootfsDir path (placeholder bundle path) IS visible from the agent container via
-	// the host-containerd-bundles volume, so os.MkdirAll works here.
-	_ = os.MkdirAll(filepath.Join(rootfsDir, "run/secrets/kubernetes.io/serviceaccount"), 0o755)
-	// Create mountpoint directories CRIU bind-mounts into during restore. redis:7 declares
-	// /data as a VOLUME and it is not guaranteed to materialise as a directory in the overlay
-	// lower layers; /dev/shm likewise. Without the mountpoint dir present in the restore rootfs
-	// CRIU fails with "Can't bind-mount at .../data: No such file or directory" (mount.c:2511).
-	for _, d := range []string{"data", "dev/shm"} {
-		_ = os.MkdirAll(filepath.Join(rootfsDir, d), 0o755)
+
+	// Create required directories and files inside the rootfs in the HOST mount namespace
+	// via nsenterCmd. The rootfsDir is an overlayfs mounted in the host namespace; the agent
+	// container only sees the mount-point directory (bind-mount propagation is PRIVATE), NOT
+	// the overlay's merged view. All writes to rootfsDir MUST go via nsenterCmd so they land
+	// in the overlay's upper dir as seen from the host namespace.
+	//
+	// These directories are needed as mount targets for CRIU when it restores the container's
+	// mount namespace (proc, sys, dev, dev/pts, dev/mqueue, dev/shm, sys/fs/cgroup).
+	// The dmi/id files (product_name, product_uuid) must exist BOTH at their canonical paths
+	// AND at the rootfs ROOT because CRIU's bind-mount source path is relative to the rootfs root.
+	dirsToCreate := []string{
+		"proc", "sys", "dev", "dev/pts", "dev/mqueue", "dev/shm",
+		"sys/fs/cgroup",
+		"sys/devices/virtual/dmi/id",
+		"sys/devices/virtual/powercap",
+		"tmp", "data",
+		"run", "run/secrets/kubernetes.io/serviceaccount",
 	}
-	for _, f := range []string{"etc/resolv.conf", "etc/hostname", "etc/hosts"} {
-		p := filepath.Join(rootfsDir, f)
-		if _, err := os.Stat(p); os.IsNotExist(err) {
-			_ = os.MkdirAll(filepath.Dir(p), 0o755)
-			_ = os.WriteFile(p, nil, 0o644)
+	for _, d := range dirsToCreate {
+		if out, err := nsenterCmd("mkdir", "-p", filepath.Join(rootfsDir, d)).CombinedOutput(); err != nil {
+			log.Error(err, "setupRootfsDirs: mkdir failed (non-fatal)", "dir", d, "out", string(out))
 		}
 	}
-
+	// Create empty bind-mount target files at canonical paths and at rootfs root.
+	filesToCreate := []string{
+		filepath.Join(rootfsDir, "sys/devices/virtual/dmi/id/product_name"),
+		filepath.Join(rootfsDir, "sys/devices/virtual/dmi/id/product_uuid"),
+		filepath.Join(rootfsDir, "product_name"),
+		filepath.Join(rootfsDir, "product_uuid"),
+		filepath.Join(rootfsDir, "etc/resolv.conf"),
+		filepath.Join(rootfsDir, "etc/hostname"),
+		filepath.Join(rootfsDir, "etc/hosts"),
+	}
+	for _, f := range filesToCreate {
+		if out, err := nsenterCmd("sh", "-c", fmt.Sprintf("[ -e %q ] || touch %q", f, f)).CombinedOutput(); err != nil {
+			log.Error(err, "setupRootfsFiles: touch failed (non-fatal)", "file", f, "out", string(out))
+		}
+	}
 	// Step 4: CRIU restore — standalone rootfs.
 	//
 	// ADR-0125 (supersedes ADR-0122 §3): on the stateless (destNetnsFd-empty) path, resolve the
@@ -1897,7 +1983,13 @@ func joinNsRestore(migrationName, checkpointDir, imageName, destNetnsFd, sandbox
 	// instead of getting an empty one. CRIU 4.2 has no --net-fd flag; no fd is passed via
 	// ExtraFiles. ResolveNetnsFromSandbox still opens the path briefly to run the B2 inode
 	// cross-check (TOCTOU guard), then we close the fd and pass only the path string.
-	restoreLogPath := filepath.Join(checkpointDir, "restore.log")
+	// restore.log must be on /var/lib/podmotion (ext4 shared between host ns and agent container).
+	// The checkpoint dir (/run/podmotion/checkpoints) uses the host TMPFS which is NOT visible
+	// from the agent container's mount namespace; CRIU (running via nsenter in host namespace)
+	// would write to the TMPFS but the agent (in its own namespace) would read from ext4 and
+	// never see the marker. /var/lib/podmotion uses ext4 and is accessible from both.
+	restoreLogPath := filepath.Join(dataDir, "restore.log")
+	_ = os.WriteFile(restoreLogPath, nil, 0o644)
 	var petnsPath string
 	if destNetnsFd == "" {
 		if sandboxID == "" {
@@ -1930,7 +2022,13 @@ func joinNsRestore(migrationName, checkpointDir, imageName, destNetnsFd, sandbox
 		return 0, err
 	}
 	criuArgs = append(criuArgs, maskedArgs...)
-	criuCmd := exec.Command("/usr/sbin/criu", criuArgs...)
+	// Run CRIU in the host mount namespace via nsenter. The agent container cannot join
+	// the replacement pod's netns directly (nested container user namespace restriction);
+	// running in the host mount namespace lets CRIU's child process call setns(CLONE_NEWNET)
+	// from the correct namespace context. The checkpoint files and rootfsDir are both
+	// accessible from the host mount namespace (checkpoint dir visible via host tmpfs;
+	// rootfsDir is the placeholder container's bundle path exposed by containerd).
+	criuCmd := nsenterCmd(append([]string{"/usr/sbin/criu"}, criuArgs...)...)
 	// ADR-0125: no ExtraFiles — CRIU joins the netns by path (--join-ns net:<path>), not by an
 	// inherited fd. The previous --net-fd fd-passing was removed (CRIU 4.2 has no --net-fd flag).
 	// Capture CRIU's stderr: when CRIU fails before opening its -o logfile (e.g. arg/ext-mount
@@ -2013,6 +2111,14 @@ func joinNsRestore(migrationName, checkpointDir, imageName, destNetnsFd, sandbox
 		}
 		return 0, fmt.Errorf("criu restore did not write 'Restore finished successfully' to restore.log within %s (ADR-0127): \ncriu stderr:\n%s\nrestore.log tail:\n%s",
 			markerPollTimeout, stderrTail, readLogTail(restoreLogPath, 4096))
+	}
+
+	// Copy restore.log to checkpointDir so GC-17 gate check can find it under
+	// /run/podmotion/checkpoints/ (the agent container sees this path; restore.log was
+	// written to /var/lib/podmotion/restore/<name>/data/restore.log by CRIU running
+	// via nsenter in the host mount namespace).
+	if logBytes, err := os.ReadFile(restoreLogPath); err == nil {
+		_ = os.WriteFile(filepath.Join(checkpointDir, "restore.log"), logBytes, 0o644)
 	}
 
 	// PRIMARY success: restore.log confirms the process tree was restored and resumed. CRIU remains
@@ -2510,22 +2616,84 @@ func nsenterCmd(args ...string) *exec.Cmd {
 // The returned rootfsDir is the containerd bundle rootfs path exposed through the
 // host-containerd-bundles volume: /run/containerd/io.containerd.runtime.v2.task/k8s.io/<id>/rootfs
 // This avoids the nested overlay mount limitation (agent container cannot mount overlayfs).
-func setupRestoreOverlayfs(migrationName, checkpointDir, imageName string) (string, error) {
+//
+// containerID: when non-empty, the replacement container's own bundle rootfs is used directly
+// (it is already set up by containerd when NRI StartContainer fires). The placeholder container
+// path is only used as a fallback when containerID is empty (legacy gRPC restore path).
+func setupRestoreOverlayfs(migrationName, checkpointDir, imageName, containerID string) (string, error) {
+	// ADR-0151: prefer the replacement container's own bundle rootfs over creating a placeholder.
+	// At NRI StartContainer time containerd has already mounted the overlay for the replacement
+	// container at this path. Using it directly avoids the placeholder overlay corruption problem:
+	// writing dirs into a mounted overlay populates the upper layer, which can hide lower-layer
+	// content (e.g. redis-server in a deeper snapshot) if the upper layer gets GC'd or is
+	// missing on retry. The replacement container's overlay is stable for the duration of the
+	// NRI hook.
+	if containerID != "" {
+		containerRootfs := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s/rootfs", containerID)
+		// Verify the overlay is mounted in the host namespace and the rootfs has actual image
+		// content (not just agent-written stubs). We check for usr/ or bin/ as a proxy for
+		// "image layers are present".
+		if mountsData, err := os.ReadFile("/proc/1/mounts"); err == nil {
+			for _, line := range strings.Split(string(mountsData), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) >= 3 && fields[1] == containerRootfs && fields[2] == "overlay" {
+					// Overlay is mounted. Verify image content is visible (not just upper-layer stubs).
+					hasImageContent := false
+					for _, probe := range []string{"usr", "bin", "lib", "sbin"} {
+						if _, serr := os.Stat(filepath.Join(containerRootfs, probe)); serr == nil {
+							hasImageContent = true
+							break
+						}
+					}
+					if hasImageContent {
+						log.Info("setupRestoreOverlayfs: using replacement container bundle rootfs directly (ADR-0151)",
+							"containerID", containerID, "rootfs", containerRootfs)
+						return containerRootfs, nil
+					}
+					log.Info("setupRestoreOverlayfs: replacement container rootfs overlay found but image content not visible — falling back to placeholder",
+						"containerID", containerID, "rootfs", containerRootfs)
+					break
+				}
+			}
+		}
+	}
+
 	placeholderID := "pm-placeholder-" + migrationName
 	rootfsDir := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s/rootfs", placeholderID)
 
-	// Check if placeholder is already running (rootfs available from previous attempt).
-	if fi, err := os.Stat(rootfsDir); err == nil && fi.IsDir() {
-		entries, _ := os.ReadDir(rootfsDir)
-		if len(entries) > 0 {
-			log.Info("setupRestoreOverlayfs: placeholder rootfs already present", "rootfs", rootfsDir)
-			return rootfsDir, nil
+	// Check if the placeholder task is actually running (not just a stale bundle dir).
+	// Use `ctr task ls --quiet` to check for a running task with the placeholder ID.
+	// A stale bundle dir (from a previous failed attempt) would have dirs but no running task
+	// and no overlay mount — do NOT accept it.
+	taskOut, _ := nsenterCmd("ctr", "--namespace", "k8s.io", "tasks", "ls", "--quiet").Output()
+	placeholderRunning := strings.Contains(string(taskOut), placeholderID)
+	if placeholderRunning {
+		if fi, err := os.Stat(rootfsDir); err == nil && fi.IsDir() {
+			// Verify the overlay is actually mounted (has kernel filesystem entries like bin/usr).
+			// Check via /proc/1/mounts for an overlay mount at rootfsDir path (host namespace).
+			if mountsData, err := os.ReadFile("/proc/1/mounts"); err == nil {
+				for _, line := range strings.Split(string(mountsData), "\n") {
+					fields := strings.Fields(line)
+					if len(fields) >= 3 && fields[1] == rootfsDir && fields[2] == "overlay" {
+						log.Info("setupRestoreOverlayfs: placeholder rootfs already present", "rootfs", rootfsDir)
+						return rootfsDir, nil
+					}
+				}
+			}
 		}
 	}
 
 	// Kill any stale placeholder from a previous attempt.
 	_ = nsenterCmd("ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
 	_ = nsenterCmd("ctr", "--namespace", "k8s.io", "container", "rm", placeholderID).Run()
+	// Remove stale bundle dir left by containerd (containerd does not auto-clean on kill).
+	// This is necessary so containerd can create a fresh bundle with a properly mounted overlay.
+	bundleDir := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s", placeholderID)
+	if _, err := os.Stat(bundleDir); err == nil {
+		if out, err := nsenterCmd("rm", "-rf", bundleDir).CombinedOutput(); err != nil {
+			log.Error(err, "setupRestoreOverlayfs: failed to remove stale bundle dir", "dir", bundleDir, "out", string(out))
+		}
+	}
 
 	// Launch a placeholder container inside the host mount namespace so containerd prepares
 	// the overlayfs snapshot layers. Without nsenter, ctr run fails because containerd creates
@@ -3183,7 +3351,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		// Operator Restore RPC: strictMode=false here because --leave-stopped is already gated
 		// on destNetnsFd != "" inside buildCRIURestoreArgs (the M23 ordering invariant path).
 		// ADR-0144: the NRI path uses strictMode=true when tcpPreservationMode=Strict.
-		pid, joinErr := joinNsRestore(req.MigrationName, imagesDir, "", req.DestNetnsFd, "", false)
+		pid, joinErr := joinNsRestore(req.MigrationName, imagesDir, "", "", req.DestNetnsFd, "", false)
 		restoreDurationMs := time.Since(restoreStart).Milliseconds()
 		if joinErr != nil {
 			return nil, fmt.Errorf("runc restore failed: %w", joinErr)
