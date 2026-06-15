@@ -346,6 +346,19 @@ These require an explicit leadership / quorum ruling before scope is frozen.
 
 ---
 
+## 7a. Network / CNI Abstraction Status
+
+- **ADR-0143 — NetworkProvider abstraction (Accepted, GATE_PASS 14/14):** the CNI-agnostic
+  six-operation IP-preservation interface. v1.0 ships FlannelProvider + BlockingProvider;
+  Calico/Cilium/AWS/Azure are tracked v2.0 providers.
+- **ADR-0154 — CNI abstraction amendment (Proposed, HIGH quorum):** adds `kindnetProvider`
+  + `NoOpCNI` to the ADR-0143 v1.0 set and removes the residual `cni0` hardcoding from the
+  agent IP-handoff datapath. **Entry-gate for Sprint 32 (NP-TCP-FULL-STRICT)** — Full-mode
+  handoff on the kind substrate (ADR-0145) is blocked until this lands. See
+  [`docs/sprints/SPRINT32-PLAN.md`](./sprints/SPRINT32-PLAN.md) §3.
+
+---
+
 ## 8. Where to Go Next
 
 - **Implementation detail for M19–M25:** [`docs/SPRINT_PLAN_M19_M25.md`](./SPRINT_PLAN_M19_M25.md).
