@@ -171,6 +171,14 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		"/etc/hostname",
 		"/etc/hosts",
 		"/data", // container volume mount (e.g. Redis /data) — no proper root mount in container mnt ns; re-attached by storage tier on restore (Sprint 31 root_cause=b)
+		// dmi sysfs absent on kind control-plane nodes — bind-mount restore fails with
+		// "No such file or directory". These paths are not needed for checkpoint/restore
+		// correctness; the workload does not depend on DMI identity at runtime.
+		"/sys/devices/virtual/dmi/id/product_name",
+		"/sys/devices/virtual/dmi/id/product_uuid",
+		"/sys/devices/virtual/dmi/id/board_serial",
+		"/sys/devices/virtual/dmi/id/chassis_serial",
+		"/sys/devices/virtual/dmi/id/sys_vendor",
 	}
 
 	// Build CLI args. We use exec (not swrk RPC) for the final dump because CRIU 4.2
