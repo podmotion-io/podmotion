@@ -4354,6 +4354,29 @@ func (s *AgentServer) Abort(_ context.Context, req *agentpb.AbortRequest) (*agen
 	// This is idempotent — if the source was never frozen, this is a no-op.
 	s.thawFrozenSource(req.MigrationName)
 
+	// GC-10 (ADR-0173): tear down the pre-staged destination migration netns on the
+	// NRI/operator-driven restore-failure path. The ADR-0168 Restore defer never fires
+	// on this path (Restore RPC was never the entry point), so the operator's rollback
+	// drives teardown via Abort. This MUST run unconditionally — defer it BEFORE the
+	// checkpointer.Abort call so an early error return cannot skip dest-netns cleanup.
+	// Idempotent: the map entry is deleted on first call (Restore-defer or repeat Abort
+	// become safe no-ops). Warn-only (ADR-0012 / ADR-0165-r2 SP-7): never blocks Abort.
+	defer func() {
+		s.destMigrationNetnsMu.Lock()
+		ns, hasNs := s.destMigrationNetns[req.MigrationName]
+		if hasNs {
+			delete(s.destMigrationNetns, req.MigrationName)
+		}
+		s.destMigrationNetnsMu.Unlock()
+		if hasNs {
+			if teardownErr := network.TeardownMigrationNetns(context.Background(), ns); teardownErr != nil {
+				log.Error(teardownErr, "GC-10: TeardownMigrationNetns warn-only on Abort", "migration", req.MigrationName)
+			} else {
+				log.Info("GC-10: dest migration netns torn down on Abort", "migration", req.MigrationName)
+			}
+		}
+	}()
+
 	if err := s.checkpointer.Abort(context.Background(), "", "k8s.io"); err != nil {
 		return &agentpb.AbortResponse{Success: false}, err
 	}

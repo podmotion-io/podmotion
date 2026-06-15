@@ -3127,6 +3127,24 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 			} else {
 				log.Info("reconcileRollingBack: dest checkpoint released (GC-9)", "migration", pm.Name, "node", destNode)
 			}
+
+			// GC-10 (ADR-0173): tear down the pre-staged dest migration netns on the
+			// NRI/operator-driven restore-failure path via the Abort RPC. This is issued
+			// STRICTLY SEQUENTIALLY — only after disarmZeroWindowOnFailurePath (DisarmZeroWindow)
+			// and Rollbacker.Rollback (NetworkRollback) have already returned above; it is NOT
+			// concurrent with them and reuses the same dest-agent handle. AbortRequest carries
+			// only migration_name and reason (no namespace field exists in the proto).
+			// Warn-only (ADR-0012 / ADR-0165-r2 SP-7): never blocks the Failed transition.
+			_, abErr := destAgent.Abort(ctx, &agentpb.AbortRequest{
+				MigrationName: pm.Name,
+				Reason:        "GC-10 restore-failure rollback: tear down dest migration netns",
+			})
+			if abErr != nil {
+				log.Error(abErr, "reconcileRollingBack: dest Abort/teardown failed (GC-10, warn-only — dest netns may remain until reboot)",
+					"migration", pm.Name, "node", destNode)
+			} else {
+				log.Info("reconcileRollingBack: dest migration netns teardown signalled (GC-10)", "migration", pm.Name, "node", destNode)
+			}
 		}
 	}
 
