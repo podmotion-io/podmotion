@@ -187,6 +187,11 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		"/sys/devices/virtual/dmi/id/board_serial",
 		"/sys/devices/virtual/dmi/id/chassis_serial",
 		"/sys/devices/virtual/dmi/id/sys_vendor",
+		// kernel 6.17+ (Ubuntu 24.04 HWE) mounts powercap as its own independent tmpfs
+		// (s_dev 0x904, mnt_id separate from /sys). When /sys parent is skipped, CRIU's
+		// mount-tree builder finds powercap as an orphan ("No parent found for mountpoint")
+		// and aborts the dump. Must be skipped independently of /sys.
+		"/sys/devices/virtual/powercap",
 	}
 
 	// Build CLI args. We use exec (not swrk RPC) for the final dump because CRIU 4.2
