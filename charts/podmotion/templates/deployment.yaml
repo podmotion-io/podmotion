@@ -36,6 +36,9 @@ spec:
             {{- if .Values.aws.spotReclaimTrigger }}
             - --enable-spot-reclaim
             {{- end }}
+            {{- if .Values.operator.featureGates }}
+            - --feature-gates={{ .Values.operator.featureGates }}
+            {{- end }}
           ports:
             - name: metrics
               containerPort: 8080

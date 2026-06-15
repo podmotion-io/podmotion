@@ -25,7 +25,7 @@ spec:
     spec:
       serviceAccountName: podmotion-agent
       hostPID: true
-      hostNetwork: false
+      hostNetwork: true
       # Agent needs to be on every worker node that can participate in migrations.
       nodeSelector:
         kubernetes.io/os: linux
@@ -85,8 +85,15 @@ spec:
               mountPath: /var/run/criu
             - name: containerd-socket
               mountPath: /run/containerd/containerd.sock
+            - name: nri-socket
+              mountPath: /var/run/nri
             - name: sys
               mountPath: /sys
+            - name: host-usr-sbin
+              mountPath: /usr/sbin
+              readOnly: true
+            - name: host-var-lib-podmotion
+              mountPath: /var/lib/podmotion
       volumes:
         - name: criu-socket
           hostPath:
@@ -99,6 +106,18 @@ spec:
         - name: sys
           hostPath:
             path: /sys
+        - name: nri-socket
+          hostPath:
+            path: /var/run/nri
+            type: DirectoryOrCreate
+        - name: host-usr-sbin
+          hostPath:
+            path: /usr/sbin
+            type: Directory
+        - name: host-var-lib-podmotion
+          hostPath:
+            path: /var/lib/podmotion
+            type: DirectoryOrCreate
         - name: host-run
           hostPath:
             path: /run
