@@ -903,6 +903,9 @@ type RestoreRequest struct {
 	// relay_ifname is the overlay interface name on the destination where PM_RELAY_TC programs
 	// are attached (typically "flannel.1"). Empty means use the default "flannel.1".
 	RelayIfname string `protobuf:"bytes,8,opt,name=relay_ifname,json=relayIfname,proto3" json:"relay_ifname,omitempty"`
+	// TcpPreservationMode mirrors spec.tcpPreservationMode ("None"|"BestEffort"|"Strict").
+	// Required for ADR-0049 Amendment D A1 fail-closed enforcement.
+	TcpPreservationMode string `protobuf:"bytes,9,opt,name=tcp_preservation_mode,json=tcpPreservationMode,proto3" json:"tcp_preservation_mode,omitempty"`
 }
 
 func (x *RestoreRequest) Reset() {
@@ -982,6 +985,13 @@ func (x *RestoreRequest) GetSeqSnapshots() []*SeqSnapshot {
 func (x *RestoreRequest) GetRelayIfname() string {
 	if x != nil {
 		return x.RelayIfname
+	}
+	return ""
+}
+
+func (x *RestoreRequest) GetTcpPreservationMode() string {
+	if x != nil {
+		return x.TcpPreservationMode
 	}
 	return ""
 }

@@ -2641,6 +2641,10 @@ func sandboxPausePID(sandboxID string) (int, error) {
 //   - netns:       remove the extRootNetNS ext_key (references the source host's net ns).
 //   - netdev:      remove VETH interfaces (peer ifindex doesn't exist on destination); keep lo.
 //
+// patchCheckpointImagesFn is the production implementation of patchCheckpointImages.
+// Tests can replace this variable to inject failures without requiring real CRIU images.
+var patchCheckpointImagesFn = patchCheckpointImages
+
 // Idempotent: backs up originals as *.orig on first call; subsequent calls are no-ops.
 func patchCheckpointImages(checkpointDir string) error {
 	// Write the patch script to a temp file and run it with the system python3 + pycriu.
@@ -3762,12 +3766,12 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// failure is a hard failure — proceeding on un-patched images is a security fail-open
 	// (source-pod IP / netns identity remnants survive per ADR-0125/0162). Abort and let
 	// the controller initiate rollback (source pod preserved per ADR-0012).
-	// On SeqSnapshots>0 the migration is Strict (the Restore proto has no explicit mode field;
-	// SeqSnapshots are only populated when TCP preservation is active).
+	// Mode is now carried explicitly via req.TCPPreservationMode (field 9); this replaces
+	// the previous SeqSnapshots>0 proxy which failed-open when Strict had zero TCP connections.
 	// Under None/BestEffort: log clearly and continue (typed PATCH_ERROR from Python layer
 	// is surfaced in the error string via patchCheckpointImages return value).
-	if patchErr := patchCheckpointImages(imagesDir); patchErr != nil {
-		if len(req.SeqSnapshots) > 0 {
+	if patchErr := patchCheckpointImagesFn(imagesDir); patchErr != nil {
+		if req.TcpPreservationMode == "Strict" {
 			// Strict: fail closed. The controller will initiate rollback.
 			log.Error(patchErr, "Restore: patchCheckpointImages failed under Strict — aborting restore (ADR-0049 Amendment D A1)", "migration", req.MigrationName)
 			return nil, fmt.Errorf("restore aborted (strict): patchCheckpointImages: %w", patchErr)
