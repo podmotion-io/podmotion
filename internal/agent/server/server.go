@@ -3757,8 +3757,23 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// joinNsRestore runs CRIU via nsenter in the HOST mount namespace with --root pointing to
 	// the container's overlayfs, which avoids the agent namespace /sys issue entirely.
 	// Gate10: patch checkpoint images first (same as the config.json path).
+	//
+	// ADR-0049 Amendment D (A1): under tcpPreservationMode=Strict, patchCheckpointImages
+	// failure is a hard failure — proceeding on un-patched images is a security fail-open
+	// (source-pod IP / netns identity remnants survive per ADR-0125/0162). Abort and let
+	// the controller initiate rollback (source pod preserved per ADR-0012).
+	// On SeqSnapshots>0 the migration is Strict (the Restore proto has no explicit mode field;
+	// SeqSnapshots are only populated when TCP preservation is active).
+	// Under None/BestEffort: log clearly and continue (typed PATCH_ERROR from Python layer
+	// is surfaced in the error string via patchCheckpointImages return value).
 	if patchErr := patchCheckpointImages(imagesDir); patchErr != nil {
-		log.Error(patchErr, "Restore: patchCheckpointImages failed (non-fatal, proceeding)", "migration", req.MigrationName)
+		if len(req.SeqSnapshots) > 0 {
+			// Strict: fail closed. The controller will initiate rollback.
+			log.Error(patchErr, "Restore: patchCheckpointImages failed under Strict — aborting restore (ADR-0049 Amendment D A1)", "migration", req.MigrationName)
+			return nil, fmt.Errorf("restore aborted (strict): patchCheckpointImages: %w", patchErr)
+		}
+		// None/BestEffort: degrade-and-continue. Surface the typed PATCH_ERROR from pycriu.
+		log.Error(patchErr, "Restore: patchCheckpointImages failed (non-fatal under BestEffort/None, proceeding on un-patched images)", "migration", req.MigrationName)
 	}
 
 	t0 := time.Now()
@@ -4411,7 +4426,10 @@ func (s *AgentServer) ArmZeroWindow(ctx context.Context, req *agentpb.ArmZeroWin
 	}
 
 	// Arm the TC-BPF zero-window hold. On non-Linux this is a no-op stub.
-	if err := armZeroWindowBPF(ctx, ifindex); err != nil {
+	// Pass tcpPreservationMode so armZeroWindowBPF can enforce fail-closed under Strict
+	// (ADR-0049 Amendment D A2/C3): on arm failure or ifindex==0 under Strict it returns
+	// a typed error, and we MUST NOT set Armed=true in that case.
+	if err := armZeroWindowBPF(ctx, ifindex, req.TcpPreservationMode); err != nil {
 		return &agentpb.ArmZeroWindowResponse{
 			Armed:          false,
 			BlockingReason: fmt.Sprintf("BPF arm failed: %v", err),

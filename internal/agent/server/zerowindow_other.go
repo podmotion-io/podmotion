@@ -12,6 +12,8 @@ package server
 import (
 	"context"
 	"time"
+
+	"github.com/podmotion-io/podmotion/internal/agent/network"
 )
 
 // resolveVethIfindex is a no-op stub on non-Linux platforms.
@@ -20,7 +22,8 @@ func resolveVethIfindex(_ string) (uint32, error) {
 }
 
 // armZeroWindowBPF is a no-op stub on non-Linux platforms.
-func armZeroWindowBPF(_ context.Context, _ uint32) error {
+// The variadic mgr parameter mirrors the Linux signature for interface compatibility.
+func armZeroWindowBPF(_ context.Context, _ uint32, _ string, _ ...network.EBPFManager) error {
 	return nil
 }
 

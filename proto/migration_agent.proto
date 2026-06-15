@@ -276,6 +276,12 @@ message ConfirmOverlayReadyRequest {
   // source_clock_ns is CLOCK_MONOTONIC ns captured on the source node at freeze time.
   // Used with dest_clock_ns to compute PAWS ts_delta (RFC 7323 §5.3).
   int64  source_clock_ns          = 9;
+  // pre_restore selects the barrier mode. When true (OverlayHandoff phase, before CRIU
+  // restore) the source-side conntrack arm check in predicate E and predicate F
+  // (restore_complete) are deferred; only B/C/D and dest-side conntrack must hold so the
+  // handoff can proceed to restore. When false (DisengageHold, post-restore) all six
+  // predicates are enforced. See ADR-0049 / Sprint 32 gate20.
+  bool   pre_restore              = 10;
 }
 
 message ConfirmOverlayReadyResponse {
@@ -304,6 +310,10 @@ message ArmZeroWindowRequest {
   string migration_name         = 1;
   string pod_uid                = 2; // used to resolve the source pod veth ifindex
   int64  freeze_window_budget_ms = 3; // watchdog auto-disarm deadline from FreezeWindowBudgetMs
+  // tcp_preservation_mode mirrors spec.tcpPreservationMode ("None"|"BestEffort"|"Strict").
+  // Required for ADR-0049 Amendment D fail-closed enforcement: armZeroWindowBPF returns a
+  // typed error (rather than nil) on arm failure or ifindex==0 when mode=="Strict".
+  string tcp_preservation_mode  = 4;
 }
 message ArmZeroWindowResponse {
   bool   armed          = 1;
