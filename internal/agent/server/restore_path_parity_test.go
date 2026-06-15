@@ -33,6 +33,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -186,5 +187,39 @@ func TestJoinNsRestore_ReturnsMACToCaller(t *testing.T) {
 	}
 	if gotMAC != wantMAC {
 		t.Errorf("JoinNsRestore returned mac=%q, want %q", gotMAC, wantMAC)
+	}
+}
+
+// TestRestoreBranch1_StrictFailsWhenNoK8sClient proves that under Strict mode with a nil
+// k8sClient, Restore still runs finalizeRestore and fails-closed when MAC resolution fails.
+// This test FAILS before the C1 fix (finalizeRestore was gated on k8sClient != nil) and
+// PASSES after (finalizeRestore is called unconditionally).
+func TestRestoreBranch1_StrictFailsWhenNoK8sClient(t *testing.T) {
+	imagesDir := makeBranch1Dir(t)
+
+	// Stub readReplVethMACFn to return an error — simulates MAC resolution failure.
+	orig := readReplVethMACFn
+	readReplVethMACFn = func(pid int, netnsPath string) (string, error) {
+		return "", errors.New("stub: MAC resolution failed")
+	}
+	defer func() { readReplVethMACFn = orig }()
+
+	origJoin := joinNsRestoreFn
+	joinNsRestoreFn = func(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, error) {
+		return 12345, nil
+	}
+	defer func() { joinNsRestoreFn = origJoin }()
+
+	s := New("test-node", &criu.StubCheckpointer{}, nil) // nil k8s client
+
+	req := &agentpb.RestoreRequest{
+		MigrationName:       "test-migration",
+		TcpPreservationMode: "Strict",
+		CheckpointRef:       imagesDir,
+	}
+	resp, err := s.Restore(context.Background(), req)
+	// Under Strict + empty MAC + nil k8sClient, must fail-closed.
+	if err == nil && (resp == nil || resp.Success) {
+		t.Fatal("expected Restore to fail-closed under Strict with empty MAC even when k8sClient is nil, but got Success=true")
 	}
 }

@@ -209,9 +209,13 @@ func (s *AgentServer) finalizeRestore(ctx context.Context, pid int, netnsPath, m
 		if s.k8sClient != nil && namespace != "" {
 			pm := &pmv1.PodMigration{}
 			if getErr := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: migrationName}, pm); getErr == nil {
+				base := pm.DeepCopy()
 				setConditionOnPM(pm, "ReplVethMACResolved", metav1.ConditionFalse,
 					"MACEmpty", "ReadReplVethMAC returned empty — InjectIPHandoff will wait for writeback")
-				_ = s.k8sClient.Status().Update(ctx, pm)
+				if patchErr := s.k8sClient.Status().Patch(ctx, pm, client.MergeFrom(base)); patchErr != nil {
+					log.Error(patchErr, "finalizeRestore: failed to patch ReplVethMACResolved condition",
+						"migration", migrationName)
+				}
 			}
 		}
 		if macErr != nil {
@@ -3848,36 +3852,22 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 
 		// E1 Condition 1+2: call finalizeRestore to populate MAC and run SingleHomeRestoredPod
 		// on this gRPC path (parity with NRI path — Condition 2).
+		// Unconditional: finalizeRestore always runs (MAC resolution + Strict/Full fail-closed applies even without k8s client).
+		netnsPath := s.ResolvedNetnsPath(req.MigrationName)
+		fr, frErr := s.finalizeRestore(ctx, pid, netnsPath, req.MigrationName, "", req.TcpPreservationMode)
+		if frErr != nil {
+			log.Error(frErr, "Restore: finalizeRestore failed (Strict/Full fail-closed)", "migration", req.MigrationName)
+			return &agentpb.RestoreResponse{Success: false, ErrorMessage: frErr.Error()}, nil
+		}
+		// Gate k8s side-effects (ReportRestoreConfirmed, namespace resolution) on k8sClient.
 		if s.k8sClient != nil {
 			ns := s.resolveNamespaceForMigration(ctx, req.MigrationName)
 			if ns != "" {
-				netnsPath := s.ResolvedNetnsPath(req.MigrationName)
-				fr, frErr := s.finalizeRestore(ctx, pid, netnsPath, req.MigrationName, ns, req.TcpPreservationMode)
-				if frErr != nil {
-					// Strict/Full fail-closed on empty MAC — abort so controller can roll back
-					// (source pod preserved per ADR-0012).
-					log.Error(frErr, "Restore: finalizeRestore failed (Strict/Full fail-closed)",
-						"migration", req.MigrationName)
-					return &agentpb.RestoreResponse{
-						Success:      false,
-						ErrorMessage: frErr.Error(),
-					}, nil
-				}
-				// GC-08 fix: set status.criuRestoreConfirmed on the PodMigration CR so the controller
-				// gate (and GC-08) passes on the direct gRPC Restore path (non-NRI). The RestoreRequest
-				// proto does not carry a pod_namespace field (would require proto amendment), so we
-				// resolve the namespace by name — mirroring the restoredPIDForMigration pattern.
 				if rcErr := s.ReportRestoreConfirmed(ctx, req.MigrationName, ns, int32(pid), fr.mac); rcErr != nil {
-					// Non-fatal: the restore itself succeeded; log the failure but do not
-					// block the migration. The controller will not set TrafficVerified
-					// until criuRestoreConfirmed is true — this will surface as a gate
-					// timeout rather than a hard failure, preserving rollback semantics.
-					log.Error(rcErr, "Restore: ReportRestoreConfirmed failed (non-fatal — GC-08 will not pass)",
-						"migration", req.MigrationName, "namespace", ns)
+					log.Error(rcErr, "Restore: ReportRestoreConfirmed failed (non-fatal — GC-08 will not pass)", "migration", req.MigrationName, "namespace", ns)
 				}
 			} else {
-				log.Info("Restore: could not resolve namespace for migration — ReportRestoreConfirmed skipped",
-					"migration", req.MigrationName)
+				log.Info("Restore: could not resolve namespace for migration — ReportRestoreConfirmed skipped", "migration", req.MigrationName)
 			}
 		}
 
@@ -3930,28 +3920,22 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 
 	// E1 Condition 1+2: finalizeRestore for MAC population + SingleHomeRestoredPod parity
 	// on the raw CRIU fallback path (Conditions 1, 2, 3).
+	// Unconditional: finalizeRestore always runs (MAC resolution + Strict/Full fail-closed applies even without k8s client).
+	netnsPath2 := s.ResolvedNetnsPath(req.MigrationName)
+	fr2, frErr2 := s.finalizeRestore(ctx, result.PID, netnsPath2, req.MigrationName, "", req.TcpPreservationMode)
+	if frErr2 != nil {
+		log.Error(frErr2, "Restore (raw CRIU path): finalizeRestore failed (Strict/Full fail-closed)", "migration", req.MigrationName)
+		return &agentpb.RestoreResponse{Success: false, ErrorMessage: frErr2.Error()}, nil
+	}
+	// Gate k8s side-effects (ReportRestoreConfirmed, namespace resolution) on k8sClient.
 	if s.k8sClient != nil {
 		ns := s.resolveNamespaceForMigration(ctx, req.MigrationName)
 		if ns != "" {
-			netnsPath2 := s.ResolvedNetnsPath(req.MigrationName)
-			fr2, frErr2 := s.finalizeRestore(ctx, result.PID, netnsPath2, req.MigrationName, ns, req.TcpPreservationMode)
-			if frErr2 != nil {
-				log.Error(frErr2, "Restore (raw CRIU path): finalizeRestore failed (Strict/Full fail-closed)",
-					"migration", req.MigrationName)
-				return &agentpb.RestoreResponse{
-					Success:      false,
-					ErrorMessage: frErr2.Error(),
-				}, nil
-			}
-			// GC-08 fix (raw CRIU fallback path): same namespace resolution + ReportRestoreConfirmed
-			// as the join-ns path above. result.PID is the root PID of the restored process tree.
 			if rcErr := s.ReportRestoreConfirmed(ctx, req.MigrationName, ns, int32(result.PID), fr2.mac); rcErr != nil {
-				log.Error(rcErr, "Restore (raw CRIU path): ReportRestoreConfirmed failed (non-fatal)",
-					"migration", req.MigrationName, "namespace", ns)
+				log.Error(rcErr, "Restore (raw CRIU path): ReportRestoreConfirmed failed (non-fatal)", "migration", req.MigrationName, "namespace", ns)
 			}
 		} else {
-			log.Info("Restore (raw CRIU path): could not resolve namespace — ReportRestoreConfirmed skipped",
-				"migration", req.MigrationName)
+			log.Info("Restore (raw CRIU path): could not resolve namespace — ReportRestoreConfirmed skipped", "migration", req.MigrationName)
 		}
 	}
 
