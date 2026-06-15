@@ -1802,6 +1802,12 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		"--skip-mnt", "/sys/devices/virtual/dmi/id/board_serial",
 		"--skip-mnt", "/sys/devices/virtual/dmi/id/chassis_serial",
 		"--skip-mnt", "/sys/devices/virtual/dmi/id/sys_vendor",
+		// CRIU 4.2 restore fails with "Cannot umount at ./sys: Device or resource busy"
+		// in kind containers because the sysfs and cgroupfs mounts are held open by the
+		// container runtime. Skip them on restore — the destination runtime re-provides
+		// both mounts for the replacement pod. (Sprint 32 fix.)
+		"--skip-mnt", "/sys",
+		"--skip-mnt", "/sys/fs/cgroup",
 		"--ext-mount-map", "/dev/shm:/dev/shm",
 		"--ext-mount-map", "/etc/resolv.conf:/etc/resolv.conf",
 		"--ext-mount-map", "/etc/hostname:/etc/hostname",
