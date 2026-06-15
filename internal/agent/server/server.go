@@ -4467,23 +4467,27 @@ func (s *AgentServer) ReleaseCheckpoint(_ context.Context, req *agentpb.ReleaseC
 		return &agentpb.ReleaseCheckpointResponse{Success: false, Error: "migration_name required"}, nil
 	}
 
-	srcDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", req.MigrationName)
-	if _, err := os.Stat(srcDir); os.IsNotExist(err) {
+	// Clean the entire migration directory (round-N/ pre-dump rounds + final/).
+	// ADR-0165 GC-9: pre-dump round artifacts in round-N/ subdirs were not removed on
+	// rollback path — only final/ was cleaned. Remove the whole migration tree so no
+	// pre-dump img files are orphaned on source after rollback or success.
+	migDir := fmt.Sprintf("/run/podmotion/checkpoints/%s", req.MigrationName)
+	if _, err := os.Stat(migDir); os.IsNotExist(err) {
 		// Already released (or never existed) — idempotent success.
 		log.Info("ReleaseCheckpoint: source dir already absent (idempotent)",
-			"migration", req.MigrationName, "dir", srcDir)
+			"migration", req.MigrationName, "dir", migDir)
 		return &agentpb.ReleaseCheckpointResponse{Success: true}, nil
 	}
 
-	if err := zeroizeDir(srcDir); err != nil {
+	if err := zeroizeDir(migDir); err != nil {
 		log.Error(err, "ReleaseCheckpoint: zeroize failed — images remain on tmpfs until node reboot",
-			"migration", req.MigrationName, "dir", srcDir)
+			"migration", req.MigrationName, "dir", migDir)
 		// Non-fatal: tmpfs is volatile; images are gone on node reboot.
 		// Return success so the controller doesn't retry in a loop.
 	}
 
 	log.Info("ReleaseCheckpoint: source checkpoint zeroized and removed",
-		"migration", req.MigrationName, "dir", srcDir)
+		"migration", req.MigrationName, "dir", migDir)
 	return &agentpb.ReleaseCheckpointResponse{Success: true}, nil
 }
 
