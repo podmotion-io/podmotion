@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
@@ -43,9 +44,16 @@ type tcpInfoUnacked struct {
 
 const tcpInfoUnackedSize = uint32(unsafe.Sizeof(tcpInfoUnacked{}))
 
-// resolveVethIfindex resolves the veth ifindex for the pod identified by podUID
-// by scanning /proc/<pid>/net/dev against host /sys/class/net veth peers.
-// Returns 0 without error if the pod PID or veth cannot be found (non-fatal).
+// resolveVethIfindex resolves the HOST-side veth peer ifindex for the pod identified by
+// podUID. It enters the pod's network namespace via nsenter and runs `ip -o link show eth0`
+// to read the peer ifindex encoded as `eth0@if<N>`. N is the ifindex of the host-side veth
+// peer and is passed directly to armZeroWindowBPF / TC clsact attachment.
+//
+// The previous implementation used a broken heuristic that matched the FIRST host interface
+// with ifindex != iflink, which could return eth0 (ifindex=2, the kind node Docker uplink)
+// instead of the actual pod veth peer, causing TC clsact attachment to fail with EOPNOTSUPP.
+//
+// Returns 0 without error if the pod PID or veth cannot be found (non-fatal stub path).
 func resolveVethIfindex(podUID string) (uint32, error) {
 	if podUID == "" {
 		return 0, nil
@@ -55,61 +63,28 @@ func resolveVethIfindex(podUID string) (uint32, error) {
 		return 0, nil
 	}
 
-	// Read non-loopback interfaces from the container's /proc/<pid>/net/dev.
-	devData, err := os.ReadFile(fmt.Sprintf("/proc/%d/net/dev", pid))
+	// Enter the pod's network namespace and ask eth0 for its peer ifindex.
+	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+	out, err := exec.Command("nsenter", "--net="+netnsPath,
+		"ip", "-o", "link", "show", "eth0").CombinedOutput()
 	if err != nil {
+		log.Info("resolveVethIfindex: ip link show eth0 in pod netns failed",
+			"pid", pid, "podUID", podUID, "err", err, "output", strings.TrimSpace(string(out)))
 		return 0, nil
-	}
-	var cIfNames []string
-	for i, line := range strings.Split(string(devData), "\n") {
-		if i < 2 {
-			continue // skip header lines
-		}
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
-		name := strings.TrimRight(fields[0], ":")
-		if name != "" && name != "lo" {
-			cIfNames = append(cIfNames, name)
-		}
 	}
 
-	// For each container interface, check if it has a veth peer on the host by comparing
-	// iflink (read from /proc/<pid>/net) with host interface ifindex values.
-	hostEntries, err := os.ReadDir("/sys/class/net")
-	if err != nil {
+	// parseVethPeerIndex extracts N from "eth0@if<N>" in the ip -o link output.
+	peerIdx := parseVethPeerIndex(string(out))
+	if peerIdx <= 0 {
+		log.Info("resolveVethIfindex: no eth0@if<N> peer index in ip output",
+			"pid", pid, "podUID", podUID, "output", strings.TrimSpace(string(out)))
 		return 0, nil
 	}
-	for _, cIfName := range cIfNames {
-		// The iflink for a container veth endpoint points to the host-side peer's ifindex.
-		// We can read this from /sys/class/net inside the netns, but we don't have direct
-		// access without entering the netns. Use the host /proc/<pid>/net/dev iface list
-		// combined with /sys/class/net to find veth pairs by matching iflink != ifindex.
-		for _, hostEntry := range hostEntries {
-			hName := hostEntry.Name()
-			hIfIndexData, err1 := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/ifindex", hName))
-			hIfLinkData, err2 := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/iflink", hName))
-			if err1 != nil || err2 != nil {
-				continue
-			}
-			hIfIndex, _ := strconv.ParseUint(strings.TrimSpace(string(hIfIndexData)), 10, 32)
-			hIfLink, _ := strconv.ParseUint(strings.TrimSpace(string(hIfLinkData)), 10, 32)
-			if hIfIndex == 0 || hIfIndex == hIfLink {
-				continue // not a veth
-			}
-			// The peer of this host veth has ifindex == hIfLink. Check if the container
-			// interface's iflink matches this host interface's ifindex by scanning
-			// /proc/<pid>/net/if_inet6 for the peer's ifindex.
-			// Simplified heuristic: match by interface count (1 non-lo in container → 1 veth pair).
-			if len(cIfNames) == 1 {
-				log.Info("resolveVethIfindex: found host veth", "veth", hName, "ifindex", hIfIndex)
-				return uint32(hIfIndex), nil
-			}
-			_ = cIfName
-		}
-	}
-	return 0, nil
+
+	// peerIdx IS the host-side veth's ifindex — use it directly for TC attachment.
+	log.Info("resolveVethIfindex: resolved host-side veth peer ifindex via netns",
+		"podUID", podUID, "pid", pid, "hostVethIfindex", peerIdx)
+	return uint32(peerIdx), nil
 }
 
 // armZeroWindowBPF performs the real TC-BPF zero-window arm on Linux by delegating to
