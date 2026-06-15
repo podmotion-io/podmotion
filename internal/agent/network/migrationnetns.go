@@ -357,6 +357,14 @@ func removeVeth(ifname string) error {
 	return netlinkDelLink(fd, iface.Index)
 }
 
+// HostVethPeerName derives the host-side veth interface name from a migration UID or
+// migration name using the same formula as PrepareDestinationNetns ("pmh-" + first 8
+// non-hyphen chars of uid). Used as a fallback by joinNsRestore when the stored host-veth
+// name is not available (e.g. cold-path, pre-Gate30 callers).
+func HostVethPeerName(uid string) string {
+	return "pmh-" + truncUID(uid, 8)
+}
+
 // truncUID returns the first n runes of uid, safe for use in interface names.
 func truncUID(uid string, n int) string {
 	uid = strings.ReplaceAll(uid, "-", "")

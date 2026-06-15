@@ -43,6 +43,12 @@ type BarrierPredicates struct {
 	// RestoreComplete is set to true after the Restore RPC has succeeded on the destination (predicate F).
 	RestoreComplete bool
 
+	// PreRestore selects barrier mode. When true (OverlayHandoff phase, before CRIU restore)
+	// predicate E's source-conntrack check and predicate F (restore_complete) are deferred so
+	// the handoff can proceed to CRIU restore with only B/C/D and dest-side conntrack satisfied.
+	// When false (DisengageHold, post-restore) all six predicates are enforced. ADR-0049 §gate20.
+	PreRestore bool
+
 	// FDBManager is used to call ConfirmOverlayReady for predicates C+D.
 	// When nil, the FDB confirmation step is skipped (non-Linux / test environments).
 	FDBManager FDBManager
@@ -107,20 +113,37 @@ func CheckAtomicityBarrier(ctx context.Context, p BarrierPredicates) (BarrierRes
 	}
 
 	// Predicate E: conntrack NOTRACK armed on both nodes.
-	result.EPredicate = p.SourceConntrackArmed && p.DestConntrackArmed
-	if !result.EPredicate {
-		errs = append(errs, fmt.Sprintf("E: conntrack NOTRACK not armed (source=%v dest=%v)",
-			p.SourceConntrackArmed, p.DestConntrackArmed))
+	// In pre-restore mode only dest-side conntrack is required; source-side arm is deferred
+	// until post-restore (DisengageHold) to avoid a race with the source agent. ADR-0049 §gate20.
+	if p.PreRestore {
+		result.EPredicate = p.DestConntrackArmed
+		if !p.DestConntrackArmed {
+			errs = append(errs, "E(pre-restore): dest conntrack NOTRACK not armed")
+		} else {
+			log.Info("barrier: predicate E satisfied (pre-restore) — dest conntrack NOTRACK armed")
+		}
 	} else {
-		log.Info("barrier: predicate E satisfied — conntrack NOTRACK armed on both nodes")
+		result.EPredicate = p.SourceConntrackArmed && p.DestConntrackArmed
+		if !result.EPredicate {
+			errs = append(errs, fmt.Sprintf("E: conntrack NOTRACK not armed (source=%v dest=%v)",
+				p.SourceConntrackArmed, p.DestConntrackArmed))
+		} else {
+			log.Info("barrier: predicate E satisfied — conntrack NOTRACK armed on both nodes")
+		}
 	}
 
 	// Predicate F: CRIU restore complete.
-	result.FPredicate = p.RestoreComplete
-	if !p.RestoreComplete {
-		errs = append(errs, "F: CRIU restore not complete")
+	// In pre-restore mode F is deferred (restore has not yet run). ADR-0049 §gate20.
+	if p.PreRestore {
+		result.FPredicate = true
+		log.Info("barrier: predicate F deferred (pre-restore mode)")
 	} else {
-		log.Info("barrier: predicate F satisfied — CRIU restore complete")
+		result.FPredicate = p.RestoreComplete
+		if !p.RestoreComplete {
+			errs = append(errs, "F: CRIU restore not complete")
+		} else {
+			log.Info("barrier: predicate F satisfied — CRIU restore complete")
+		}
 	}
 
 	if len(errs) > 0 {
