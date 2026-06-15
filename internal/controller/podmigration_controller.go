@@ -579,6 +579,18 @@ func (r *PodMigrationReconciler) reconcileZeroWindowArm(ctx context.Context, pm 
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	if !resp.Armed {
+		// Under Strict mode, a failed zero-window arm is a hard failure per ADR-0049
+		// Amendment D (C1/C3). The hold is required for TCP fidelity; proceeding without
+		// it is a false-green. Fail closed: transition to Failed so the source pod is
+		// preserved and the operator can diagnose (e.g. EOPNOTSUPP on TC clsact qdisc
+		// means the kind node kernel/veth does not support TC-BPF — Sprint 32 gate B7).
+		// BestEffort: requeue so transient failures can recover on retry.
+		if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict {
+			reason := fmt.Sprintf("ZeroWindowArm fail-closed under Strict: %s", resp.BlockingReason)
+			log.Error(nil, "ZeroWindowArm: armed=false under Strict — transitioning to Failed (ADR-0049 Amendment D)",
+				"migration", pm.Name, "reason", resp.BlockingReason)
+			return r.failMigration(ctx, pm, reason)
+		}
 		log.Error(nil, "ZeroWindowArm: agent returned armed=false — requeuing",
 			"migration", pm.Name, "reason", resp.BlockingReason)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -664,12 +676,19 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 		fdbIfname = "flannel.1"
 	}
 
-	// seq_xlat_seeded: seeded if TCPSeqSnapshots are present (predicate B).
-	seqXlatSeeded := len(pm.Status.TCPSeqSnapshots) > 0
+	// seq_xlat_seeded: predicate B of the atomicity barrier.
+	// When TCPSeqSnapshots is non-empty, SeedSeqXlat ran during Restore to populate
+	// PM_SEQ_XLAT — seeded=true.
+	// When TCPSeqSnapshots is empty there are no active TCP connections to translate:
+	// PM_SEQ_XLAT needs no entries, so predicate B is vacuously satisfied — seeded=true.
+	// Sending seeded=false when snapshots are absent causes an infinite OverlayHandoff
+	// retry loop because CheckAtomicityBarrier always appends "B: PM_SEQ_XLAT not seeded"
+	// regardless of whether seeding was necessary (Sprint 32 gate blocker B5).
+	seqXlatSeeded := true
 
 	log.Info("OverlayHandoff: calling ConfirmOverlayReady on destination agent (pre-restore, predicates B-E)",
 		"migration", pm.Name, "node", destNode, "fdbIfname", fdbIfname,
-		"seqXlatSeeded", seqXlatSeeded)
+		"seqXlatSeeded", seqXlatSeeded, "tcpSeqSnapshotCount", len(pm.Status.TCPSeqSnapshots))
 	confirmResp, confirmErr := destAgent.ConfirmOverlayReady(ctx, &agentpb.ConfirmOverlayReadyRequest{
 		MigrationName:        pm.Name,
 		SeqXlatSeeded:        seqXlatSeeded,
@@ -787,7 +806,8 @@ func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm 
 		if fdbIfname == "" {
 			fdbIfname = "flannel.1"
 		}
-		seqXlatSeeded := len(pm.Status.TCPSeqSnapshots) > 0
+		// Vacuously true when no TCP connections exist (same fix as OverlayHandoff B5).
+		seqXlatSeeded := true
 
 		log.Info("DisengageHold: calling ConfirmOverlayReady on destination agent (post-restore, all 6 predicates)",
 			"migration", pm.Name, "node", destNode)
