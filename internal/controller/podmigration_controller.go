@@ -3711,18 +3711,20 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	// process; the real workload is supplied solely by the CRIU-restored tree. Pod
 	// readiness is only a precondition here — the authoritative restore signal is
 	// status.criuRestoreConfirmed (ADR-0120 D1/D4).
-	// ADR-0130 / ADR-0175: unconditional holder-command override. Every replacement pod
-	// is a CRIU-restore target; running the real workload command would collide with the
-	// restored process tree in the shared pod netns (exact failure ADR-0130 prevents).
-	// /bin/sh + sleep are present in standard base images (incl. redis:7).
-	// `exec sleep` makes sleep the container PID 1 so SIGTERM on pod delete
-	// terminates it cleanly. 2147483647 (~68y) is a portable "infinity" that
-	// works on BusyBox and GNU sleep alike.
-	holderCmd := []string{"/bin/sh", "-c"}
-	holderArgs := []string{"echo podmotion-holder ready; exec sleep 2147483647"}
+	// ADR-0176: derive the holder command from the workload image's own entrypoint.
+	// The replacement pod must NOT run the real workload (ADR-0130), but the holder
+	// binary must exist in the container rootfs so runc create succeeds and the NRI
+	// StartContainer hook fires (a failed runc create silently swallows the hook and
+	// CRIU restore is never reached). Hardcoding /bin/sh breaks FROM scratch images.
+	// Instead, preserve the original container Command/Args from the deep-copied source
+	// pod spec and append --podmotion-holder, which makes the workload binary park
+	// itself (no port bind, SIGTERM-clean) rather than run the real workload.
+	// The holder binary is guaranteed to exist in the rootfs because it IS the image
+	// entrypoint. See ADR-0176 for the full rationale and timing contract.
 	for i := range spec.Containers {
-		spec.Containers[i].Command = holderCmd
-		spec.Containers[i].Args = holderArgs
+		// Preserve original Command/Args from the deep-copied source pod spec.
+		// Append --podmotion-holder so the workload binary enters holder mode.
+		spec.Containers[i].Args = append(spec.Containers[i].Args, "--podmotion-holder")
 		// Strip probes: a probe against the holder (no real workload in that
 		// process tree) would fail, and a probe that hit the restored process on
 		// the pod IP would couple container readiness to a process containerd
