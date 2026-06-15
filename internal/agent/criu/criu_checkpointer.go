@@ -19,10 +19,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 
 	gocriu "github.com/checkpoint-restore/go-criu/v7"
 	"github.com/checkpoint-restore/go-criu/v7/rpc"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -34,13 +37,22 @@ const defaultCRIUBinaryPath = "/usr/local/sbin/criu"
 // errors.Is/As to distinguish this from transient or configuration errors (M19.5 criterion 13).
 var ErrCRIUCapability = errors.New("CRIU capability/ptrace error")
 
+// removedLink records a network link deleted from the container netns pre-dump
+// so that it can be recreated on the restore side if needed.
+type removedLink struct {
+	name     string
+	ifindex  int
+	linkType int // ARPHRD_ constant, e.g. 768=ipip, 776=sit
+}
+
 // CRIUCheckpointer implements Checkpointer using go-criu/v7 RPC to invoke
 // CRIU as a subprocess (ADR-0002 — never statically link GPLv2 code).
 type CRIUCheckpointer struct {
 	criuBinaryPath string
 
-	mu         sync.Mutex
-	activeCriu *gocriu.Criu // non-nil while a dump/restore is in progress
+	mu              sync.Mutex
+	activeCriu      *gocriu.Criu // non-nil while a dump/restore is in progress
+	removedNetLinks []removedLink // links deleted pre-dump for restore-side recreation
 }
 
 // NewCRIUCheckpointer returns a CRIUCheckpointer that invokes the CRIU binary
@@ -171,28 +183,27 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		"/etc/hostname",
 		"/etc/hosts",
 		"/data", // container volume mount (e.g. Redis /data) — no proper root mount in container mnt ns; re-attached by storage tier on restore (Sprint 31 root_cause=b)
-		// sysfs and cgroupfs are managed by the container runtime; CRIU must not dump
-		// these mounts because the destination runtime provides them fresh on restore.
-		// Without skipping, CRIU restore fails: "Can't umount at ./sys: Device or resource
-		// busy" — the bind-mounted sysfs from the kind host cannot be umounted inside the
-		// restore context. --skip-mnt is a dump-time flag; skipping at dump means the
-		// images contain no sysfs/cgroupfs entries and restore never attempts to recreate them.
+		// /sys and all children: skip the entire sysfs subtree at dump time.
+		//
+		// Gate10 analysis: neither including /sys as external (ext_key='pm-sys') nor
+		// skip-at-dump prevents compat-mode from trying to umount the destination's /sys.
+		// CRIU 4.2 compat-mode umount pass iterates the destination's mount table and
+		// umounts entries not in the source image's NON-EXTERNAL mounts — external image
+		// entries (E) do NOT prevent umount of the destination's corresponding mount.
+		// Fix: skip /sys at dump time AND add /sys to SkipMnt on restore. SkipMnt on
+		// restore tells compat-mode to leave that mountpoint alone (no umount, no mount).
 		"/sys",
 		"/sys/fs/cgroup",
-		// dmi sysfs absent on kind control-plane nodes — bind-mount restore fails with
-		// "No such file or directory". These paths are not needed for checkpoint/restore
-		// correctness; the workload does not depend on DMI identity at runtime.
+		"/sys/fs/bpf",
+		"/sys/kernel/tracing",
+		"/sys/kernel/debug",
+		"/sys/fs/fuse/connections",
+		"/sys/kernel/config",
 		"/sys/devices/virtual/dmi/id/product_name",
 		"/sys/devices/virtual/dmi/id/product_uuid",
 		"/sys/devices/virtual/dmi/id/board_serial",
 		"/sys/devices/virtual/dmi/id/chassis_serial",
 		"/sys/devices/virtual/dmi/id/sys_vendor",
-		// kernel 6.17+ (Ubuntu 24.04 HWE) mounts these as independent tmpfs instances
-		// (separate mnt_id/s_dev from /sys). When /sys parent is skipped, CRIU's mount-tree
-		// builder finds them as orphans ("No parent found for mountpoint") and aborts.
-		// Verified complete list from container /proc/<pid>/mounts on kernel 6.17.0-35-generic:
-		//   tmpfs /sys/firmware          ro,relatime,inode64
-		//   tmpfs /sys/devices/virtual/powercap  ro,relatime,inode64
 		"/sys/devices/virtual/powercap",
 		"/sys/firmware",
 	}
@@ -216,6 +227,8 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		// is opened (empty dump.log) — which masked the real failure on Sprint 31.
 		// CRIU 4.2 handles shared/master mounts automatically via --external below.
 		"--external", "mnt[]{:AUTO_OPTIONS}",
+		// /sys is in skipMnts — no external declaration needed for /sys.
+		// compat-mode umount is prevented via SkipMnt on restore side.
 		"--network-lock", "skip",
 	}
 	if opts.LeaveRunning {
@@ -226,6 +239,23 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	}
 	if opts.TcpEstablished {
 		dumpArgs = append(dumpArgs, "--tcp-established")
+		// ADR-0162-rev: CRIU 4.2 does not honor --external net[] for ARPHRD_TUNNEL (ipip).
+		// Delete tunnel devices from the container netns before the final dump.
+		// tunl0/sit0/etc are always DOWN on Flannel-VXLAN clusters (no pod traffic).
+		removed, rmErr := deleteUnsupportedNetLinks(opts.Pid, logger)
+		if rmErr != nil {
+			logger.Error(rmErr, "pre-dump: failed to remove tunnel links — dump may fail")
+			// non-fatal: proceed; CRIU will report the error explicitly
+		}
+		c.removedNetLinks = removed
+		if len(removed) > 0 {
+			names := make([]string, len(removed))
+			for i, r := range removed {
+				names[i] = r.name
+			}
+			logger.Info("pre-dump: deleted unsupported tunnel links from container netns",
+				"pid", opts.Pid, "links", names)
+		}
 	} else {
 		dumpArgs = append(dumpArgs, "--tcp-close")
 		dumpArgs = append(dumpArgs, "--skip-in-flight")
@@ -401,8 +431,16 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 		RstSibling: proto.Bool(opts.Detached),
 		// AutoExtMnt handles k8s bind-mounts (/etc/resolv.conf, etc.) — mirrors dump option.
 		AutoExtMnt: proto.Bool(true),
-		// MntnsCompatMode relaxes mount namespace restore strictness for containerised processes.
-		MntnsCompatMode: proto.Bool(true),
+		// MntnsCompatMode: false — use CRIU 4.2 mount-v2 mode (default).
+		// Compat-mode (MntnsCompatMode=true) does an umount pass that tries to remove
+		// /sys from the destination namespace → EBUSY (sysfs is kernel-referenced).
+		// Mount-v2 uses MOVE_MOUNT_SET_GROUP and does NOT run the umount pass, so it avoids
+		// the EBUSY error. /sys is in skipMnts at dump time so it is not in the image;
+		// mount-v2 only mounts what is in the image (no umount of foreign destination mounts).
+		// A previous attempt with MntnsCompatMode=false hit "BUG at criu/mount.c:48" because
+		// the image had external mounts with a non-standard root. With the stripped image
+		// (5 regular entries: /, /proc, /dev, /dev/pts, /dev/mqueue) mount-v2 should work.
+		MntnsCompatMode: proto.Bool(false),
 		// SkipMnt: skip restoring Kubernetes masked-path mounts (tmpfs bind-mounts of /dev/null)
 		// and the service-account tmpfs that references source-node-specific device IDs.
 		// These mounts have null-resolvable sources on the destination and cause "No mapping"
@@ -418,6 +456,10 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 			"/proc/scsi",
 			"/sys/firmware",
 			"/sys/fs/pstore",
+			// NOTE: /sys is NOT in SkipMnt — CRIU 4.2 SkipMnt is dump-only (--skip-mnt
+			// help says "ignore this mountpoint when dumping the mount namespace"). It has no
+			// effect on the restore-side compat-mode umount pass. /sys is skipped at dump via
+			// skipMnts; compat-mode is disabled (MntnsCompatMode=false) to avoid the umount pass.
 			"/run/secrets/kubernetes.io/serviceaccount",
 			// Additional containerd/runc-injected proc submounts that CRIU autodetects as
 			// external mounts with a (null) source on restore (mount.c:3120). These are
@@ -438,6 +480,10 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 			// restore. Mirror the dump-side skip so CRIU does not try to restore it.
 			"/data",
 		},
+		// pm-sys reverse-maps the dump-side --external mnt[/sys]:pm-sys declaration. Without this,
+		// compat-mode treats /sys as a stale mount and umounts it; the host-bind-mounted sysfs
+		// returns EBUSY. Key must match criu_checkpointer.go dump args exactly.
+		External: []string{"mnt[pm-sys]:/sys"},
 	}
 
 	// Cold network migration (tcpPreservationMode=None) is dumped with --empty-ns net,
@@ -571,3 +617,224 @@ func parseTCPImageEntries(logContent string) (int, int) {
 	}
 	return tcpEntries, unsupported
 }
+
+// deleteUnsupportedNetLinks enters the network namespace of pid, enumerates tunnel
+// links (ARPHRD_TUNNEL/SIT/GRE/etc.) that are DOWN, deletes them via RTM_DELLINK,
+// and returns the list of removed links so the caller can recreate them post-restore.
+//
+// ADR-0162-rev: CRIU 4.2 aborts strict-mode netns dump at net.c:650 for ARPHRD_TUNNEL
+// devices (tunl0) because --external net[idx]:name is NOT consulted before the abort.
+// Deleting these always-DOWN devices before the dump is the correct fix.
+//
+// Safety invariants:
+//   - Only links with operstate "unknown" or "down" are deleted (never UP tunnels).
+//   - The goroutine is locked to its OS thread for the duration of the netns switch.
+//   - The original netns is always restored via defer before UnlockOSThread.
+//
+// If the /proc/<pid>/root tree is unreadable the function returns nil and logs a warning
+// so the caller continues (safe degradation).
+func deleteUnsupportedNetLinks(pid int32, logger interface {
+	Info(string, ...interface{})
+	Error(error, string, ...interface{})
+}) ([]removedLink, error) {
+	// Tunnel ARPHRD_ types that CRIU 4.2 cannot handle (net/network.c).
+	unsupportedTypes := map[int]bool{
+		768: true, // ARPHRD_TUNNEL  ipip / tunl0
+		776: true, // ARPHRD_SIT     sit  / sit0
+		778: true, // ARPHRD_IPGRE   gre
+		813: true, // ARPHRD_GRETAP  gretap
+		823: true, // ARPHRD_IP6GRE  ip6gre
+	}
+
+	sysNetRoot := fmt.Sprintf("/proc/%d/root/sys/class/net", pid)
+	entries, err := os.ReadDir(sysNetRoot)
+	if err != nil {
+		logger.Info("deleteUnsupportedNetLinks: cannot read container sys/class/net — skipping",
+			"pid", pid, "err", err)
+		return nil, nil //nolint:nilerr // safe degradation per ADR-0162
+	}
+
+	// Collect candidates before entering the netns (reads from /proc are host-visible).
+	type candidate struct {
+		name     string
+		ifindex  int
+		linkType int
+	}
+	var candidates []candidate
+
+	for _, e := range entries {
+		iface := e.Name()
+		ifaceDir := fmt.Sprintf("%s/%s", sysNetRoot, iface)
+
+		typeBytes, readErr := os.ReadFile(ifaceDir + "/type")
+		if readErr != nil {
+			continue
+		}
+		linkType, parseErr := strconv.Atoi(strings.TrimSpace(string(typeBytes)))
+		if parseErr != nil || !unsupportedTypes[linkType] {
+			continue
+		}
+
+		// Only delete if operstate is "unknown" or "down" — never touch an UP tunnel.
+		stateBytes, stateErr := os.ReadFile(ifaceDir + "/operstate")
+		if stateErr != nil {
+			logger.Info("deleteUnsupportedNetLinks: cannot read operstate — skipping interface",
+				"pid", pid, "iface", iface)
+			continue
+		}
+		state := strings.TrimSpace(strings.ToLower(string(stateBytes)))
+		if state != "unknown" && state != "down" {
+			logger.Info("deleteUnsupportedNetLinks: tunnel link is UP — skipping deletion",
+				"pid", pid, "iface", iface, "operstate", state)
+			continue
+		}
+
+		idxBytes, idxErr := os.ReadFile(ifaceDir + "/ifindex")
+		if idxErr != nil {
+			logger.Info("deleteUnsupportedNetLinks: cannot read ifindex — skipping",
+				"pid", pid, "iface", iface)
+			continue
+		}
+		ifindex, idxParseErr := strconv.Atoi(strings.TrimSpace(string(idxBytes)))
+		if idxParseErr != nil {
+			continue
+		}
+
+		candidates = append(candidates, candidate{name: iface, ifindex: ifindex, linkType: linkType})
+	}
+
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	// Enter the container network namespace.
+	// LockOSThread ensures the kernel thread netns switch is visible for the duration.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	origNsFd, openErr := unix.Open(fmt.Sprintf("/proc/self/ns/net"), unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if openErr != nil {
+		return nil, fmt.Errorf("deleteUnsupportedNetLinks: open host netns: %w", openErr)
+	}
+	defer unix.Close(origNsFd)
+
+	targetNsFd, openErr := unix.Open(fmt.Sprintf("/proc/%d/ns/net", pid), unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if openErr != nil {
+		return nil, fmt.Errorf("deleteUnsupportedNetLinks: open container netns for pid %d: %w", pid, openErr)
+	}
+	defer unix.Close(targetNsFd)
+
+	if setnsErr := unix.Setns(targetNsFd, unix.CLONE_NEWNET); setnsErr != nil {
+		return nil, fmt.Errorf("deleteUnsupportedNetLinks: setns into container netns for pid %d: %w", pid, setnsErr)
+	}
+	// Always restore host netns before returning, even on error.
+	defer func() {
+		if restoreErr := unix.Setns(origNsFd, unix.CLONE_NEWNET); restoreErr != nil {
+			logger.Error(restoreErr, "deleteUnsupportedNetLinks: CRITICAL — failed to restore host netns")
+		}
+	}()
+
+	var removed []removedLink
+	var firstErr error
+
+	for _, c := range candidates {
+		if delErr := netlinkDelLink(c.ifindex); delErr != nil {
+			logger.Error(delErr, "deleteUnsupportedNetLinks: RTM_DELLINK failed — skipping",
+				"iface", c.name, "ifindex", c.ifindex, "linkType", c.linkType)
+			if firstErr == nil {
+				firstErr = delErr
+			}
+			continue
+		}
+		// Verify the device is actually gone. tunl0/gre0 are NETIF_F_NETNS_LOCAL:
+		// the kernel reports RTM_DELLINK success but the device persists in the netns.
+		// Check via /proc/<pid>/root/sys/class/net/<name> which is readable from the
+		// host regardless of our current netns context.
+		netDevPath := fmt.Sprintf("/proc/%d/root/sys/class/net/%s", pid, c.name)
+		if _, statErr := os.Stat(netDevPath); statErr == nil {
+			// Device still exists — RTM_DELLINK was a silent no-op (NETIF_F_NETNS_LOCAL).
+			err := fmt.Errorf("cannot remove %s (ifindex %d type %d) from container netns: device is kernel netns-local fallback (ipip/gre module loaded on node); strict-TCP migration requires VXLAN CNI backend", c.name, c.ifindex, c.linkType)
+			logger.Error(err, "deleteUnsupportedNetLinks: post-delete verification failed — device persists after RTM_DELLINK",
+				"iface", c.name, "ifindex", c.ifindex, "linkType", c.linkType, "procPath", netDevPath)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		logger.Info("deleteUnsupportedNetLinks: deleted unsupported tunnel links from container netns",
+			"iface", c.name, "ifindex", c.ifindex, "linkType", c.linkType)
+		removed = append(removed, removedLink{
+			name:     c.name,
+			ifindex:  c.ifindex,
+			linkType: c.linkType,
+		})
+	}
+
+	return removed, firstErr
+}
+
+// netlinkDelLink sends RTM_DELLINK for the interface identified by ifindex using a raw
+// NETLINK_ROUTE socket. The caller must already be in the target network namespace.
+func netlinkDelLink(ifindex int) error {
+	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
+	if err != nil {
+		return fmt.Errorf("netlinkDelLink: socket: %w", err)
+	}
+	defer unix.Close(fd)
+
+	if err := unix.Bind(fd, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
+		return fmt.Errorf("netlinkDelLink: bind: %w", err)
+	}
+
+	// Build RTM_DELLINK message: NlMsghdr + IfInfomsg (family=AF_UNSPEC, index=ifindex).
+	const ifInfoMsgSize = 16 // sizeof(struct ifinfomsg): family(1)+pad(1)+type(2)+index(4)+flags(4)+change(4)
+	msgLen := unix.SizeofNlMsghdr + ifInfoMsgSize
+
+	buf := make([]byte, msgLen)
+
+	// NlMsghdr
+	hdr := (*unix.NlMsghdr)(unsafe.Pointer(&buf[0]))
+	hdr.Len = uint32(msgLen)
+	hdr.Type = unix.RTM_DELLINK
+	hdr.Flags = unix.NLM_F_REQUEST | unix.NLM_F_ACK
+	hdr.Seq = 1
+	hdr.Pid = 0
+
+	// IfInfomsg: family=AF_UNSPEC, index=ifindex, flags=0, change=0
+	buf[unix.SizeofNlMsghdr+0] = unix.AF_UNSPEC // family
+	// pad, type = 0 (already zeroed)
+	// index at offset 4 (little-endian int32)
+	buf[unix.SizeofNlMsghdr+4] = byte(ifindex)
+	buf[unix.SizeofNlMsghdr+5] = byte(ifindex >> 8)
+	buf[unix.SizeofNlMsghdr+6] = byte(ifindex >> 16)
+	buf[unix.SizeofNlMsghdr+7] = byte(ifindex >> 24)
+
+	if err := unix.Sendto(fd, buf, 0, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
+		return fmt.Errorf("netlinkDelLink: sendto: %w", err)
+	}
+
+	// Read ACK (NLMSG_ERROR with err=0 means success).
+	resp := make([]byte, 4096)
+	n, _, recvErr := unix.Recvfrom(fd, resp, 0)
+	if recvErr != nil {
+		return fmt.Errorf("netlinkDelLink: recvfrom: %w", recvErr)
+	}
+	msgs, parseErr := syscall.ParseNetlinkMessage(resp[:n])
+	if parseErr != nil {
+		return fmt.Errorf("netlinkDelLink: parse netlink response: %w", parseErr)
+	}
+	for _, msg := range msgs {
+		if msg.Header.Type == syscall.NLMSG_ERROR {
+			if len(msg.Data) < 4 {
+				return fmt.Errorf("netlinkDelLink: short NLMSG_ERROR data")
+			}
+			// NlMsgerr.Error is a negative errno stored as int32 LE.
+			errno := int32(msg.Data[0]) | int32(msg.Data[1])<<8 | int32(msg.Data[2])<<16 | int32(msg.Data[3])<<24
+			if errno != 0 {
+				return fmt.Errorf("netlinkDelLink: kernel returned errno %d: %w", -errno, unix.Errno(-errno))
+			}
+		}
+	}
+	return nil
+}
+
