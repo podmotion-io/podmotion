@@ -33,6 +33,7 @@ struct {
     __uint(max_entries, 256);
     __type(key, __u32);   /* ifindex */
     __type(value, __u8);  /* 1 = active hold */
+    __uint(pinning, LIBBPF_PIN_BY_NAME); /* pinned to /sys/fs/bpf/podmotion/zero_window_holds */
 } PM_ACTIVE_HOLDS SEC(".maps");
 
 /*
