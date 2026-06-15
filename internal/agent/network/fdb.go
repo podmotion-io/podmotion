@@ -417,7 +417,7 @@ func netlinkRecvAck(fd int) error {
 			if errno == 0 {
 				return nil
 			}
-			return fmt.Errorf("netlink errno: %d", -errno)
+			return syscall.Errno(-errno)
 		}
 	}
 	return nil
