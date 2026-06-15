@@ -13,3 +13,4 @@ import "net"
 
 func detectWireGuardInterface(_ *net.IPNet) (string, error) { return "", nil }
 func detectIPSecModeCNI(_ *net.IPNet) (bool, error)         { return false, nil }
+func probeTCClsact() bool                                   { return false }

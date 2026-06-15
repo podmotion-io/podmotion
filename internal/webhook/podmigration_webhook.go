@@ -257,6 +257,43 @@ func (v *PodMigrationValidator) validate(ctx context.Context, pm *pmv1.PodMigrat
 		}
 	}
 
+	// Rule 10c: TCPPreservationMode=Strict requires TC clsact support on the destination node
+	// (ADR-0169). Enforced at admission — fail early before any dest netns is staged.
+	// No silent fallback: a substrate without clsact must use BestEffort.
+	if pm.Spec.TCPPreservationMode == "Strict" && featuregate.IsEnabled(featuregate.TCPPreservation) {
+		if pm.Spec.TargetNodeName != "" {
+			// Direct case: named destination node — check its NMC.
+			destNMC, destNMCErr := v.getNMC(ctx, pm.Spec.TargetNodeName)
+			if destNMCErr != nil || !destNMC.Status.Ready || !destNMC.Spec.KernelFeatures.TCClsactSupported {
+				substrate := ""
+				if destNMCErr == nil {
+					substrate = fmt.Sprintf("%s/%s", destNMC.Spec.NetworkCapability.CNIPlugin, destNMC.Spec.KernelFeatures.KernelVersion)
+				}
+				msg := fmt.Sprintf("tcpPreservationMode=Strict requires TC clsact support; node %q reports tcClsactSupported=false (substrate %s). Use tcpPreservationMode=BestEffort or target a clsact-capable node.", pm.Spec.TargetNodeName, substrate)
+				allErrs = append(allErrs, field.Forbidden(spec.Child("tcpPreservationMode"), msg))
+			}
+		} else {
+			// Scheduler-selected case: reject if NO ready NMC reports tcClsactSupported=true.
+			nmcList := &pmv1.NodeMigrationCapacityList{}
+			if listErr := v.client.List(ctx, nmcList); listErr == nil {
+				anyCapable := false
+				for i := range nmcList.Items {
+					n := &nmcList.Items[i]
+					if n.Status.Ready && n.Spec.KernelFeatures.TCClsactSupported {
+						anyCapable = true
+						break
+					}
+				}
+				if !anyCapable {
+					allErrs = append(allErrs, field.Forbidden(spec.Child("tcpPreservationMode"),
+						"tcpPreservationMode=Strict requires TC clsact support; no Ready node in the cluster reports tcClsactSupported=true. Use tcpPreservationMode=BestEffort or ensure at least one clsact-capable node is available."))
+				}
+			}
+			// If list fails, allow admission (fail-open on webhook list failure; the pre-prewarm
+			// controller re-check is the binding gate on the scheduler-selected path).
+		}
+	}
+
 	// Rule 11: destinationCluster cross-cluster checks (ADR-0022, ADR-0034)
 	if pm.Spec.DestinationCluster != "" {
 		// Verify remote cluster connectivity.

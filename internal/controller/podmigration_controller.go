@@ -313,6 +313,48 @@ func (r *PodMigrationReconciler) reconcileDestinationPrewarm(ctx context.Context
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhasePreCopyMemory)
 	}
 
+	// ADR-0169 §3 — pre-prewarm TC clsact capability re-check (MANDATORY, non-optional).
+	// For tcpPreservationMode=Strict, re-assert that the resolved destination node reports
+	// tcClsactSupported=true BEFORE any dest netns is staged. This closes GC-10 on the
+	// scheduler-selected path: the admission webhook only checks "some capable node exists";
+	// the resolved node may differ. Fail to Failed before any netns artifact is created.
+	if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict {
+		recheckNode := pm.Status.DestinationNodeName
+		if recheckNode == "" {
+			recheckNode = pm.Spec.TargetNodeName
+		}
+		if recheckNode != "" {
+			destNMC := &pmv1.NodeMigrationCapacity{}
+			recheckErr := r.Get(ctx, types.NamespacedName{Name: recheckNode}, destNMC)
+			capable := recheckErr == nil && destNMC.Status.Ready && destNMC.Spec.KernelFeatures.TCClsactSupported
+			if !capable {
+				substrate := "unknown"
+				if recheckErr == nil {
+					substrate = fmt.Sprintf("%s/%s",
+						destNMC.Spec.NetworkCapability.CNIPlugin,
+						destNMC.Spec.KernelFeatures.KernelVersion)
+				}
+				msg := fmt.Sprintf(
+					"Resolved destination node %q does not support TC clsact (tcClsactSupported=false, substrate %s); "+
+						"tcpPreservationMode=Strict cannot be honored. Migration failed before prewarm. "+
+						"Use tcpPreservationMode=BestEffort or constrain targetNodeName to a clsact-capable node.",
+					recheckNode, substrate)
+				log.Error(nil, "DestinationPrewarm: Strict clsact pre-check failed — failing migration",
+					"migration", pm.Name, "node", recheckNode, "substrate", substrate)
+				setCondition(pm, pmv1.ConditionStrictCapabilitySatisfied, metav1.ConditionFalse,
+					"ClsactUnsupportedOnResolvedNode", msg)
+				if r.Recorder != nil {
+					r.Recorder.Eventf(pm, corev1.EventTypeWarning, "StrictClsactUnsupported", "%s", msg)
+				}
+				pm.Status.Phase = pmv1.MigrationPhaseFailed
+				if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+					return ctrl.Result{}, sErr
+				}
+				return ctrl.Result{}, nil
+			}
+		}
+	}
+
 	// For TCPPreservationMode=None the overlay netns setup is not required.
 	if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeNone {
 		log.Info("DestinationPrewarm: skipped (TCPPreservationMode=None)", "migration", pm.Name)

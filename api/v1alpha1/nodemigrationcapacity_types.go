@@ -23,6 +23,12 @@ type KernelFeatures struct {
 	BPFEnabled bool `json:"bpfEnabled"`
 	// XDPSupported indicates XDP on veth is supported (kernel 4.19+).
 	XDPSupported bool `json:"xdpSupported"`
+	// TCClsactSupported indicates the node can attach a clsact qdisc to a veth-class
+	// interface (RTM_NEWQDISC for clsact returns success, not EOPNOTSUPP). Required for
+	// tcpPreservationMode=Strict zero-window hold. Set by an ACTIVE runtime probe at
+	// registration, NOT inferred from CONFIG_BPF_SYSCALL — BPFEnabled is not a reliable
+	// proxy for clsact-on-veth support (ADR-0169).
+	TCClsactSupported bool `json:"tcClsactSupported"`
 	// KernelVersion is the full kernel version string reported by uname -r.
 	KernelVersion string `json:"kernelVersion"`
 }

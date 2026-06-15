@@ -312,6 +312,10 @@ const (
 	// TCPSequenceContinuityVerified=True and ConnectionCountParity=True.
 	// False triggers hard rollback when TCPPreservationMode=Strict (ADR-0019 Amendment A).
 	ConditionTCPVerified = "TCPVerified"
+	// ConditionStrictCapabilitySatisfied is False when tcpPreservationMode=Strict cannot
+	// be honored because the resolved destination node does not support TC clsact
+	// (tcClsactSupported=false). Set by the pre-prewarm controller re-check (ADR-0169 §3b).
+	ConditionStrictCapabilitySatisfied = "StrictCapabilitySatisfied"
 	// ConditionServiceVerified is True when the application-level probe configured in
 	// spec.applicationProbe returns healthy from the destination pod post-restore.
 	ConditionServiceVerified = "ServiceVerified"
