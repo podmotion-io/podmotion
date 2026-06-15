@@ -2736,12 +2736,20 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
+		// Requeue immediately so the next pass starts from etcd (TrafficVerified=True)
+		// and proceeds to source pod deletion. Status updates do not self-trigger the
+		// controller watch, so an explicit requeue is required here.
+		log.Info("Verifying: TrafficVerified set — requeueing for source pod deletion", "migration", pm.Name)
+		return ctrl.Result{Requeue: true}, nil
 	}
+
+	log.Info("Verifying: TrafficVerified=True — proceeding to source pod deletion gates", "migration", pm.Name)
 
 	// ADR-0040 + ADR-0046: delete source pod only when BOTH TrafficVerified=True AND
 	// DestinationVolumeReady=True. Deleting before volume attachment is confirmed risks
 	// RWO PVC detach races (EBS/RBD attach window 30-120s).
 	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionDestinationVolumeReady) {
+		log.Info("Verifying: DestinationVolumeReady not yet set — checking volume readiness", "migration", pm.Name)
 		ready, err := r.checkDestinationVolumeReady(ctx, pm)
 		if err != nil {
 			log.Error(err, "volume readiness check error — requeuing", "migration", pm.Name)
@@ -2751,25 +2759,33 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 			log.Info("waiting for DestinationVolumeReady before deleting source pod", "migration", pm.Name)
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
+		log.Info("Verifying: DestinationVolumeReady confirmed — setting condition", "migration", pm.Name)
 		setCondition(pm, conditionDestinationVolumeReady, metav1.ConditionTrue,
 			"VolumeAttached", "RWO PVC attached on destination node (or no PVCs)")
 		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
+	} else {
+		log.Info("Verifying: DestinationVolumeReady already True — skipping volume check", "migration", pm.Name)
 	}
 
-	// PDB gate: block deletion if any PodDisruptionBudget disallowsAllowing it.
+	// PDB gate: block deletion if any PodDisruptionBudget disallows it.
+	log.Info("Verifying: checking PDB gate", "migration", pm.Name)
 	if err := r.checkPDBAllowsDeletion(ctx, pm); err != nil {
+		log.Info("Verifying: PDB gate blocking source pod deletion — requeuing", "migration", pm.Name, "reason", err.Error())
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	// ResourceQuota gate: defer deletion if the destination namespace is at pod quota capacity.
+	log.Info("Verifying: checking ResourceQuota gate", "migration", pm.Name)
 	if err := r.checkResourceQuotaCapacity(ctx, pm); err != nil {
+		log.Info("Verifying: ResourceQuota gate blocking source pod deletion — requeuing", "migration", pm.Name, "reason", err.Error())
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	// ADR-0012 defensive re-fetch: re-read TrafficVerified from API before any source pod deletion.
 	// In-memory pm.Status may be stale; the authoritative state is in etcd.
+	log.Info("Verifying: re-fetching PodMigration from API for ADR-0012 safety check", "migration", pm.Name)
 	{
 		freshPM := &pmv1.PodMigration{}
 		if fetchErr := r.Get(ctx, client.ObjectKeyFromObject(pm), freshPM); fetchErr != nil {
@@ -2780,6 +2796,7 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 			log.Error(nil, "Verifying: SAFETY BLOCK — TrafficVerified is not True on re-fetch; refusing to delete source pod (ADR-0012)", "migration", pm.Name)
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
+		log.Info("Verifying: ADR-0012 re-fetch confirmed TrafficVerified=True — proceeding to source pod deletion", "migration", pm.Name)
 	}
 
 	sourcePod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
@@ -3647,9 +3664,19 @@ func (r *PodMigrationReconciler) checkPDBAllowsDeletion(ctx context.Context, pm 
 // capacity — the net-zero delete+create sequence is safe, but races with other controllers
 // could cause the replacement pod to be rejected if we delete too early.
 func (r *PodMigrationReconciler) checkResourceQuotaCapacity(ctx context.Context, pm *pmv1.PodMigration) error {
+	log := logf.FromContext(ctx)
+	// Use a short-deadline context for the List call: if the informer cache for ResourceQuota
+	// has not synced (e.g., RBAC forbids listing at cluster scope), r.Client.List will block
+	// indefinitely waiting for WaitForCacheSync. A 3-second timeout causes fail-open, which is
+	// the correct behavior when quota data is unavailable — the migration proceeds.
+	listCtx, listCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer listCancel()
 	quotaList := &corev1.ResourceQuotaList{}
-	if err := r.Client.List(ctx, quotaList, client.InNamespace(pm.Spec.PodNamespace)); err != nil || len(quotaList.Items) == 0 {
-		return nil // no quotas — allow
+	if err := r.Client.List(listCtx, quotaList, client.InNamespace(pm.Spec.PodNamespace)); err != nil || len(quotaList.Items) == 0 {
+		if err != nil {
+			log.Info("Verifying: ResourceQuota list failed or timed out — fail-open (allow deletion)", "migration", pm.Name, "err", err.Error())
+		}
+		return nil // no quotas or list unavailable — allow
 	}
 
 	for _, quota := range quotaList.Items {
