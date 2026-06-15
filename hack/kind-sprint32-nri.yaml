@@ -1,0 +1,60 @@
+# PodMotion Sprint 32 cluster — NRI-enabled — 1 control-plane + 1 worker (amd64/kind)
+# Authored by ADR-0172 (NRI-enabled kind cluster spec).
+# Usage: kind create cluster --name podmotion-s32-int --config hack/kind-sprint32-nri.yaml
+#
+# Difference from images/kind/kind-config.yaml: each node carries a
+# `containerdConfigPatches` block that enables the containerd NRI v1 plugin.
+# kind merges these TOML patches into /etc/containerd/config.toml at cluster
+# init and restarts containerd before kubelet starts, so containerd creates
+# /var/run/nri/nri.sock and the PodMotion NRI plugin
+# (/usr/local/lib/nri/podmotion-nri -> /usr/local/bin/podmotion-agent) can
+# connect. No node-image rebuild is required: the existing
+# podmotion-node:sprint31-amd64 image already ships conf.d/nri.toml and the
+# plugin symlink on-node; this patch supplies the config.toml stanza that the
+# image's missing `imports`/append step never delivered.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: podmotion-s32-int
+nodes:
+  - role: control-plane
+    image: podmotion-node:sprint31-amd64
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            feature-gates: "ContainerCheckpoint=true"
+    containerdConfigPatches:
+      - |-
+        [plugins."io.containerd.nri.v1.nri"]
+          disable = false
+          disable_connections = false
+          plugin_registration_timeout = "5s"
+          plugin_request_timeout = "2s"
+          socket_path = "/var/run/nri/nri.sock"
+          state_dir = "/var/lib/nri"
+    extraMounts:
+      - hostPath: /sys/fs/bpf
+        containerPath: /sys/fs/bpf
+        propagation: Bidirectional
+  - role: worker
+    image: podmotion-node:sprint31-amd64
+    containerdConfigPatches:
+      - |-
+        [plugins."io.containerd.nri.v1.nri"]
+          disable = false
+          disable_connections = false
+          plugin_registration_timeout = "5s"
+          plugin_request_timeout = "2s"
+          socket_path = "/var/run/nri/nri.sock"
+          state_dir = "/var/lib/nri"
+    extraMounts:
+      - hostPath: /sys/fs/bpf
+        containerPath: /sys/fs/bpf
+        propagation: Bidirectional
+networking:
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+featureGates:
+  GracefulNodeShutdown: true
+  ContainerCheckpoint: true
