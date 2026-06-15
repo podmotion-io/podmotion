@@ -3685,7 +3685,17 @@ func (s *AgentServer) upsertMigrationCheckpoint(migrationName, checkpointPath, s
 
 func (s *AgentServer) PrepareDestination(_ context.Context, req *agentpb.PrepareDestinationRequest) (*agentpb.PrepareDestinationResponse, error) {
 	log.Info("PrepareDestination called", "migration", req.MigrationName, "sourceNode", req.SourceNode)
-	// M4: stub — cgroup/netns setup wired in M5.
+	// Ensure /run/podmotion/netns/ exists on the destination node so that CRIU
+	// --join-ns net:<path> can access the bind-mounted netns file. PrepareDestinationNetns
+	// creates this directory, but PrepareDestination is called first and on failure paths
+	// the netns dir may be absent. Creating it here is idempotent and guarantees the
+	// parent directory exists before any bind-mount attempt (Sprint 32 gate blocker B6).
+	if err := os.MkdirAll("/run/podmotion/netns", 0o700); err != nil {
+		log.Error(err, "PrepareDestination: failed to create /run/podmotion/netns — CRIU join-ns will fail",
+			"migration", req.MigrationName)
+		// Non-fatal: return ready so the controller can proceed to PrepareDestinationNetns
+		// which will fail with a clearer error if the directory is truly inaccessible.
+	}
 	return &agentpb.PrepareDestinationResponse{
 		Ready:        true,
 		IpReserved:   true,
