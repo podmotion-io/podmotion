@@ -17,8 +17,10 @@ package nri
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"regexp"
 	"time"
 
@@ -61,6 +63,10 @@ type ContainerEvent struct {
 	// Annotations carries pod annotations forwarded by the NRI runtime. In real NRI v2,
 	// pod annotations appear here. The JSON stub must include them to test the restore path.
 	Annotations map[string]string `json:"annotations,omitempty"`
+	// ImageName is the container image reference fetched from the containerd container
+	// record (ctr containers info) at StartContainer time. Used by setupRestoreOverlayfs
+	// to launch a placeholder container without needing config.json in the checkpoint dir.
+	ImageName string `json:"imageName,omitempty"`
 }
 
 // Plugin is the NRI lifecycle hook handler.
@@ -193,8 +199,15 @@ func (p *Plugin) verifyPodMigration(ctx context.Context, namespace, checkpointRe
 		if pm.Name != checkpointRef {
 			continue
 		}
-		if pm.Status.Phase != pmv1.MigrationPhaseRestoring {
-			return fmt.Errorf("PodMigration %s/%s phase is %s, expected Restoring",
+		// Accept any phase in the restoring window: the controller may have
+		// advanced to RestoreSocketReattach or DisengageHold by the time NRI fires.
+		switch pm.Status.Phase {
+		case pmv1.MigrationPhaseRestoring,
+			pmv1.MigrationPhaseRestoreSocketReattach,
+			pmv1.MigrationPhaseDisengageHold:
+			// ok — restore is expected
+		default:
+			return fmt.Errorf("PodMigration %s/%s phase is %s, expected Restoring/RestoreSocketReattach",
 				namespace, pm.Name, pm.Status.Phase)
 		}
 		// Prefer status.DestinationNodeName (set by controller after scheduling);
@@ -260,6 +273,7 @@ func (a *nriAdapter) StartContainer(ctx context.Context, pod *nriapi.PodSandbox,
 		SandboxID:   pod.GetId(),
 		Labels:      container.GetLabels(),
 		Annotations: pod.GetAnnotations(),
+		ImageName:   fetchContainerImage(container.GetId()),
 	}
 	// Also merge container-level annotations (containerd may forward them on either).
 	if cAnnotations := container.GetAnnotations(); len(cAnnotations) > 0 {
@@ -273,6 +287,26 @@ func (a *nriAdapter) StartContainer(ctx context.Context, pod *nriapi.PodSandbox,
 		}
 	}
 	return a.plugin.HandleStartContainer(ctx, event)
+}
+
+// fetchContainerImage queries containerd for the image name associated with the given
+// container ID using `ctr --namespace k8s.io containers info`. Returns an empty string
+// if the query fails — callers fall back to a default image name.
+func fetchContainerImage(containerID string) string {
+	if containerID == "" {
+		return ""
+	}
+	out, err := exec.Command("ctr", "--namespace", "k8s.io", "containers", "info", containerID).Output()
+	if err != nil {
+		return ""
+	}
+	var rec struct {
+		Image string `json:"Image"`
+	}
+	if err := json.Unmarshal(out, &rec); err != nil {
+		return ""
+	}
+	return rec.Image
 }
 
 // StopContainer implements stub.StopContainerInterface.
