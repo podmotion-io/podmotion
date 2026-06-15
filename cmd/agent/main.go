@@ -251,12 +251,18 @@ func main() {
 			// ADR-0122: pass the replacement pod's containerd sandbox ID (pod.GetId()) so
 			// JoinNsRestore can resolve its netns via the containerd sandbox API. Also pass
 			// tcpPreservationMode so JoinNsRestore can gate --leave-stopped on the Strict path.
-			pid, err := agentSrv.JoinNsRestore(checkpointRef, checkpointDir, event.ImageName, event.ID, event.SandboxID, tcpPreservationMode)
+			// E1 Condition 1: JoinNsRestore now returns (pid, mac, error). The MAC is populated
+			// by the shared finalizeRestore primitive inside JoinNsRestore — this closure must
+			// NOT call ReadReplVethMAC independently (path-independent contract, ADR-0133 D3).
+			// E1 Condition 2: SingleHomeRestoredPod is called inside finalizeRestore; do not
+			// call it independently here.
+			pid, replVethMAC, err := agentSrv.JoinNsRestore(checkpointRef, checkpointDir, event.ImageName, event.ID, event.SandboxID, tcpPreservationMode)
 			if err != nil {
 				log.Error(err, "NRI CRIU restore failed", "container", event.ID)
 				return err
 			}
-			log.Info("NRI CRIU restore complete", "container", event.ID, "restoredPID", pid)
+			log.Info("NRI CRIU restore complete", "container", event.ID, "restoredPID", pid,
+				"replVethMAC", replVethMAC)
 
 			// ADR-0120 D3: propagate authoritative restore confirmation back to the
 			// PodMigration CR. The migration name equals the checkpoint-ref; the CR
@@ -266,54 +272,6 @@ func main() {
 			// cause the k8s patch to hit "context deadline exceeded".
 			reportCtx, reportCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer reportCancel()
-			// ADR-0133 D3: collect the replacement pod's eth0 MAC inside the restored
-			// process's netns so the operator can install the destination IP handoff for
-			// the OLD pod IP. Best-effort: log on failure, the operator has a fallback.
-			// Resolve the sandbox netns path (the join-ns restore target) as the authoritative
-			// source for eth0's MAC; the restored PID's netns can transiently lack eth0 and the
-			// `ctr containers info` lookup can race the post-restore settle. Retry both briefly.
-			var replVethMAC string
-			var macErr error
-			for attempt := 0; attempt < 6; attempt++ {
-				// Prefer the exact netns path CRIU joined (stashed by joinNsRestore); fall back
-				// to resolving it from the sandbox spec. Both can lag the post-restore settle,
-				// so retry briefly.
-				netnsPath := agentSrv.ResolvedNetnsPath(checkpointRef)
-				if netnsPath == "" {
-					if p, nsErr := agentSrv.SandboxNetnsPath(reportCtx, event.SandboxID); nsErr == nil {
-						netnsPath = p
-					} else {
-						log.Info("NRI CRIU restore: SandboxNetnsPath lookup retrying (ADR-0133)",
-							"attempt", attempt, "err", nsErr.Error())
-					}
-				}
-				replVethMAC, macErr = server.ReadReplVethMAC(pid, netnsPath)
-				if macErr == nil && replVethMAC != "" {
-					break
-				}
-				time.Sleep(500 * time.Millisecond)
-			}
-			if macErr != nil {
-				log.Error(macErr, "NRI CRIU restore: could not read replacement pod eth0 MAC (ADR-0133) — operator will fall back to diagnostic exec",
-					"migration", checkpointRef, "restoredPID", pid)
-			} else {
-				log.Info("NRI CRIU restore: collected replacement pod eth0 MAC (ADR-0133)",
-					"migration", checkpointRef, "replVethMAC", replVethMAC)
-			}
-			// ADR-0138 (single-home, assign-not-assume): strip the CNI-assigned NEW Flannel IP,
-			// assign the OLD pod IP, and add the destination cni0-gateway routes on the
-			// replacement pod's eth0, leaving it single-homed on the OLD IP. This removes the
-			// dual-homed conflict (Sprint 26 B6) so the destination kernel delivers VXLAN-decapped
-			// transit traffic for the OLD IP to the pod veth instead of local-input-dropping it.
-			// Non-fatal on the live path: log loud on failure, AC5 catches a missed strip; the
-			// source pod is preserved until TrafficVerified=True regardless (ADR-0012).
-			if shErr := agentSrv.SingleHomeRestoredPod(reportCtx, checkpointRef, migrationNamespace, pid); shErr != nil {
-				log.Error(shErr, "NRI CRIU restore: SingleHomeRestoredPod failed (ADR-0137) — pod may remain dual-homed; OLD-IP transit delivery may fail",
-					"migration", checkpointRef, "restoredPID", pid)
-			} else {
-				log.Info("NRI CRIU restore: replacement pod single-homed on OLD IP (ADR-0137)",
-					"migration", checkpointRef, "restoredPID", pid)
-			}
 
 			if err := agentSrv.ReportRestoreConfirmed(reportCtx, checkpointRef, migrationNamespace, int32(pid), replVethMAC); err != nil {
 				log.Error(err, "NRI CRIU restore: failed to report confirmation to CR — controller poll will time out",
