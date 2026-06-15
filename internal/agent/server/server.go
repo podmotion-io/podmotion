@@ -2655,6 +2655,7 @@ func patchCheckpointImages(checkpointDir string) error {
 	patchScript := `
 import sys, os, shutil, glob, json
 import pycriu
+from pycriu.images import MagicException
 
 ckpt = sys.argv[1]
 null_ext_key_masked = set(json.loads(sys.argv[2]))
@@ -2665,11 +2666,43 @@ def backup(path):
         shutil.copy2(path, orig)
     return orig
 
+def load_image(image_file, fail_on_magic_error=True):
+    """Load a CRIU image file, with configurable error handling.
+
+    For strip-only images (netdev, netns, ifaddr): fail_on_magic_error=False — log warning, skip.
+    For mountpoints images: fail_on_magic_error=True — fail loud with typed error.
+
+    Catches MagicException (unknown magic value) AND generic Exception (no handler registered
+    for a known-magic-but-unhandled image type, e.g. IFADDR in older pycriu builds).
+    Both are treated equivalently: fail-loud for mountpoints, skip-on-unknown for strip-only.
+    """
+    try:
+        with open(image_file, 'rb') as f:
+            return pycriu.images.load(f)
+    except MagicException as e:
+        magic_val = getattr(e, 'magic', 'unknown')
+        if fail_on_magic_error:
+            print('PATCH_ERROR: %s:%s:%s' % (image_file, magic_val, str(e)), file=sys.stderr)
+            sys.exit(1)
+        else:
+            print('WARNING: skipping %s — unknown magic %s: %s' % (image_file, magic_val, str(e)))
+            return None
+    except Exception as e:
+        # Catches "No handler found for image with magic <name>" when magic is known
+        # but the vendored pycriu lacks the handler (e.g. IFADDR in older pycriu).
+        if fail_on_magic_error:
+            print('PATCH_ERROR: %s:unknown:%s' % (image_file, str(e)), file=sys.stderr)
+            sys.exit(1)
+        else:
+            print('WARNING: skipping %s — no pycriu handler: %s' % (image_file, str(e)))
+            return None
+
 # ---- mountpoints: keep only mounts with valid (non-null) ext_key or standard in-container mounts ----
 for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     src = backup(mp_path)
-    with open(src, 'rb') as f:
-        img = pycriu.images.load(f)
+    img = load_image(src, fail_on_magic_error=True)
+    if img is None:
+        continue
     # Remove entries that have no ext_key AND are masked paths (proc/* or sys/firmware, sys/fs/pstore)
     # that cannot be recreated cross-node. Entries with a valid ext_key are handled via --ext-mount-map.
     # Also unconditionally drop the kubelet service-account tmpfs mount: it is source-node-specific
@@ -2738,47 +2771,50 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     print('mountpoints:', os.path.basename(mp_path), 'kept', len(kept), 'entries')
 
 # ---- netns: remove extRootNetNS dependency (references source host net ns) ----
+# strip-only image: skip-on-unknown-magic (S1)
 netns_path = os.path.join(ckpt, 'netns-10.img')
 if os.path.exists(netns_path):
     src = backup(netns_path)
-    with open(src, 'rb') as f:
-        img = pycriu.images.load(f)
-    for e in img['entries']:
-        e.pop('ext_key', None)
-    with open(netns_path, 'wb') as f:
-        pycriu.images.dump(img, f)
-    print('netns: removed ext_key entries')
+    img = load_image(src, fail_on_magic_error=False)
+    if img is not None:
+        for e in img['entries']:
+            e.pop('ext_key', None)
+        with open(netns_path, 'wb') as f:
+            pycriu.images.dump(img, f)
+        print('netns: removed ext_key entries')
 
 # ---- netdev: remove VETH (peer missing cross-node); keep loopback only ----
+# strip-only image: skip-on-unknown-magic (S1)
 netdev_path = os.path.join(ckpt, 'netdev-10.img')
 if os.path.exists(netdev_path):
     src = backup(netdev_path)
-    with open(src, 'rb') as f:
-        img = pycriu.images.load(f)
-    kept = []
-    for e in img['entries']:
-        lnk = e.get('link', {})
-        # LOOPBACK type = 772; keep only loopback, remove VETH and others
-        if lnk.get('type') == 772:
-            lnk.pop('peer_nsid', None)
-            kept.append(e)
-    img['entries'] = kept
-    with open(netdev_path, 'wb') as f:
-        pycriu.images.dump(img, f)
-    print('netdev: kept', len(kept), 'entries (loopback only)')
+    img = load_image(src, fail_on_magic_error=False)
+    if img is not None:
+        kept = []
+        for e in img['entries']:
+            lnk = e.get('link', {})
+            # LOOPBACK type = 772; keep only loopback, remove VETH and others
+            if lnk.get('type') == 772:
+                lnk.pop('peer_nsid', None)
+                kept.append(e)
+        img['entries'] = kept
+        with open(netdev_path, 'wb') as f:
+            pycriu.images.dump(img, f)
+        print('netdev: kept', len(kept), 'entries (loopback only)')
 
 # ---- ifaddr: remove source pod IP addresses; keep loopback only (ADR-0125, ADR-0162) ----
+# strip-only image: skip-on-unknown-magic (S1)
 ifaddr_path = os.path.join(ckpt, 'ifaddr-10.img')
 if os.path.exists(ifaddr_path):
     src = backup(ifaddr_path)
-    with open(src, 'rb') as f:
-        img = pycriu.images.load(f)
-    kept = [e for e in img['entries']
-            if e.get('ifaddr', {}).get('ifindex') == 1]
-    img['entries'] = kept
-    with open(ifaddr_path, 'wb') as f:
-        pycriu.images.dump(img, f)
-    print('ifaddr: kept', len(kept), 'entries (loopback only)')
+    img = load_image(src, fail_on_magic_error=False)
+    if img is not None:
+        kept = [e for e in img['entries']
+                if e.get('ifaddr', {}).get('ifindex') == 1]
+        img['entries'] = kept
+        with open(ifaddr_path, 'wb') as f:
+            pycriu.images.dump(img, f)
+        print('ifaddr: kept', len(kept), 'entries (loopback only)')
 `
 	// /dev/shm is an in-memory filesystem (tmpfs) — avoids writing the script to disk.
 	// 0600 so only root can read the path; removed immediately after exec.
