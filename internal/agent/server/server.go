@@ -1806,8 +1806,8 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		// in kind containers because the sysfs and cgroupfs mounts are held open by the
 		// container runtime. Skip them on restore — the destination runtime re-provides
 		// both mounts for the replacement pod. (Sprint 32 fix.)
-		"--skip-mnt", "/sys",
-		"--skip-mnt", "/sys/fs/cgroup",
+		// /sys and /sys/fs/cgroup are skipped at DUMP time (criu_checkpointer.go skipMnts),
+		// so they are absent from the checkpoint images and never attempted at restore.
 		"--ext-mount-map", "/dev/shm:/dev/shm",
 		"--ext-mount-map", "/etc/resolv.conf:/etc/resolv.conf",
 		"--ext-mount-map", "/etc/hostname:/etc/hostname",
