@@ -1604,7 +1604,7 @@ func ResolveNetnsFromSandbox(ctx context.Context, containerdClient interface{}, 
 // sandbox shares the host network namespace (no path).
 func sandboxNetnsPath(_ context.Context, sandboxID string) (string, error) {
 	// `ctr containers info` prints the container record including the OCI runtime Spec.
-	out, err := exec.Command("ctr", "--namespace", "k8s.io", "containers", "info", sandboxID).Output()
+	out, err := nsenterCmd("ctr", "--namespace", "k8s.io", "containers", "info", sandboxID).Output()
 	if err != nil {
 		return "", fmt.Errorf("ctr containers info %s: %w", sandboxID, err)
 	}
