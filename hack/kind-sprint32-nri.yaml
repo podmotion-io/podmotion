@@ -6,18 +6,16 @@
 # `containerdConfigPatches` block that enables the containerd NRI v1 plugin.
 # kind merges these TOML patches into /etc/containerd/config.toml at cluster
 # init and restarts containerd before kubelet starts, so containerd creates
-# /var/run/nri/nri.sock and the PodMotion NRI plugin
-# (/usr/local/lib/nri/podmotion-nri -> /usr/local/bin/podmotion-agent) can
-# connect. No node-image rebuild is required: the existing
-# podmotion-node:sprint31-amd64 image already ships conf.d/nri.toml and the
-# plugin symlink on-node; this patch supplies the config.toml stanza that the
-# image's missing `imports`/append step never delivered.
+# /var/run/nri/nri.sock and the PodMotion NRI plugin can connect.
+# ADR-0174: node image updated to kindest/node:v1.33.0 (containerd v2.0.5)
+# to satisfy the prober.go:166 major >= 2 gate. Digest pinned in ADR-0174 (C3).
+# sha256:91e9ed777db80279c22d1d1068c091b899b2078506e4a0f797fbf6e397c0b0b2
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: podmotion-s32-int
 nodes:
   - role: control-plane
-    image: podmotion-node:sprint31-amd64
+    image: kindest/node:v1.33.0
     kubeadmConfigPatches:
       - |
         kind: InitConfiguration
@@ -29,7 +27,7 @@ nodes:
         containerPath: /sys/fs/bpf
         propagation: Bidirectional
   - role: worker
-    image: podmotion-node:sprint31-amd64
+    image: kindest/node:v1.33.0
     extraMounts:
       - hostPath: /sys/fs/bpf
         containerPath: /sys/fs/bpf
