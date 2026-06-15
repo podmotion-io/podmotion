@@ -1763,6 +1763,13 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		// (redis) does not depend on the SA token. Mirrors the SkipMnt policy already used on
 		// the go-criu restore path. (ADR-0131 restore path.)
 		"--skip-mnt", "/run/secrets/kubernetes.io/serviceaccount",
+		// dmi sysfs absent on kind control-plane nodes — bind-mount restore fails with
+		// "No such file or directory". Not needed for checkpoint/restore correctness.
+		"--skip-mnt", "/sys/devices/virtual/dmi/id/product_name",
+		"--skip-mnt", "/sys/devices/virtual/dmi/id/product_uuid",
+		"--skip-mnt", "/sys/devices/virtual/dmi/id/board_serial",
+		"--skip-mnt", "/sys/devices/virtual/dmi/id/chassis_serial",
+		"--skip-mnt", "/sys/devices/virtual/dmi/id/sys_vendor",
 		"--ext-mount-map", "/dev/shm:/dev/shm",
 		"--ext-mount-map", "/etc/resolv.conf:/etc/resolv.conf",
 		"--ext-mount-map", "/etc/hostname:/etc/hostname",
@@ -1775,7 +1782,7 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		// --leave-stopped: restored process tree stays in SIGSTOP until we send SIGCONT.
 		// SIGCONT is sent only after SocketsLive=True is confirmed (M23 ordering invariant).
 		args = append(args, "--leave-stopped")
-	} else {
+	} else if petnsPath != "" {
 		// ADR-0125 (supersedes ADR-0122 §3): join the replacement pod's pause container netns
 		// by PATH instead of minting an empty one. CRIU 4.2 has no --net-fd flag; the documented
 		// flag is --join-ns net:<path>. The restored process inherits the pod IP, veth, and CNI
@@ -1993,24 +2000,32 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	var petnsPath string
 	if destNetnsFd == "" {
 		if sandboxID == "" {
-			return 0, fmt.Errorf("ADR-0125: replacement pod sandbox ID required to resolve netns for --join-ns net:<path> restore")
+			// tcpPreservationMode=None on the gRPC Restore path: no sandbox ID is supplied
+			// because the operator does not pass one (RestoreRequest has no sandbox_id field).
+			// For cold migration (no TCP state to preserve) the --join-ns net:<path> is not
+			// required — petnsPath stays empty and buildCRIURestoreArgs omits --join-ns.
+			// The NRI hook path always supplies a sandboxID; this branch is only hit on the
+			// fallback gRPC Restore path used in kind/dev clusters with tcpPreservationMode=None.
+			log.Info("joinNsRestore: no sandboxID and no destNetnsFd — skipping netns join (tcpPreservationMode=None cold path)",
+				"migration", migrationName)
+		} else {
+			// B1: resolve via the containerd sandbox API (unambiguous per pod, no /proc comm scan).
+			// B2: ResolveNetnsFromSandbox opens the netns path and cross-checks fd/path inodes.
+			netnsFd, resolvedPath, rerr := ResolveNetnsFromSandbox(context.Background(), nil, sandboxID)
+			if rerr != nil {
+				return 0, fmt.Errorf("resolve replacement pod sandbox netns: %w", rerr)
+			}
+			// ADR-0125: the fd existed only for the B2 inode cross-check. Close it now; CRIU joins by
+			// path, not by inherited fd.
+			_ = netnsFd.Close()
+			petnsPath = resolvedPath
+			// ADR-0133: stash the exact netns path CRIU joined so the NRI callback can read the
+			// replacement pod's eth0 MAC from it (the restored PID's own /proc/<pid>/ns/net can
+			// transiently resolve to the host netns right after CRIU exits).
+			storeResolvedNetnsPath(migrationName, petnsPath)
+			log.Info("joinNsRestore: joining replacement pod netns via --join-ns net:<path> (ADR-0125)",
+				"sandboxID", sandboxID, "netnsPath", petnsPath)
 		}
-		// B1: resolve via the containerd sandbox API (unambiguous per pod, no /proc comm scan).
-		// B2: ResolveNetnsFromSandbox opens the netns path and cross-checks fd/path inodes.
-		netnsFd, resolvedPath, rerr := ResolveNetnsFromSandbox(context.Background(), nil, sandboxID)
-		if rerr != nil {
-			return 0, fmt.Errorf("resolve replacement pod sandbox netns: %w", rerr)
-		}
-		// ADR-0125: the fd existed only for the B2 inode cross-check. Close it now; CRIU joins by
-		// path, not by inherited fd.
-		_ = netnsFd.Close()
-		petnsPath = resolvedPath
-		// ADR-0133: stash the exact netns path CRIU joined so the NRI callback can read the
-		// replacement pod's eth0 MAC from it (the restored PID's own /proc/<pid>/ns/net can
-		// transiently resolve to the host netns right after CRIU exits).
-		storeResolvedNetnsPath(migrationName, petnsPath)
-		log.Info("joinNsRestore: joining replacement pod netns via --join-ns net:<path> (ADR-0125)",
-			"sandboxID", sandboxID, "netnsPath", petnsPath)
 	}
 
 	criuArgs := buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath, strictMode)
