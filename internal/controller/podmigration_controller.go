@@ -3681,19 +3681,18 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	}
 	delete(newAnnotations, "kubectl.kubernetes.io/last-applied-configuration")
 
-	// ADR-0120 D3: stamp the checkpoint-ref so the NRI StartContainer hook fires CRIU
-	// restore, and the migration namespace so the NRI plugin can patch the correct
-	// PodMigration CR with criuRestoreConfirmed after JoinNsRestore succeeds.
-	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
-		// Use pm.Name (DNS-label safe) as the annotation value so the NRI plugin's
-		// validCheckpointRef regex accepts it. The plugin reconstructs the full
-		// checkpoint path as /run/podmotion/checkpoints/<ref>/final in main.go.
-		newAnnotations["podmotion.io/checkpoint-ref"] = pm.Name
-		newAnnotations["podmotion.io/migration-namespace"] = pm.Namespace
-		// ADR-0130: mark that this pod's container command was replaced with a holder
-		// (the real workload is supplied by the CRIU-restored tree).
-		newAnnotations["podmotion.io/original-command-overridden"] = "true"
-	}
+	// ADR-0120 D3 / ADR-0175: stamp the checkpoint-ref unconditionally. The annotation
+	// value is pm.Name (DNS-label safe, stable from first reconcile) — it does not
+	// depend on CheckpointRef being populated. The NRI plugin reconstructs the full
+	// checkpoint path as /run/podmotion/checkpoints/<ref>/final from pm.Name. The
+	// prior nil-guard caused a race where CheckpointRef was not yet set at
+	// createReplacementPod time, silently dropping the annotation and preventing the
+	// NRI StartContainer hook from firing CRIU restore.
+	newAnnotations["podmotion.io/checkpoint-ref"] = pm.Name
+	newAnnotations["podmotion.io/migration-namespace"] = pm.Namespace
+	// ADR-0130: mark that this pod's container command was replaced with a holder
+	// (the real workload is supplied by the CRIU-restored tree).
+	newAnnotations["podmotion.io/original-command-overridden"] = "true"
 
 	// Deep-copy spec; clear scheduler-assigned and mutable fields.
 	spec := *sourcePod.Spec.DeepCopy()
@@ -3712,25 +3711,26 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	// process; the real workload is supplied solely by the CRIU-restored tree. Pod
 	// readiness is only a precondition here — the authoritative restore signal is
 	// status.criuRestoreConfirmed (ADR-0120 D1/D4).
-	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
-		// /bin/sh + sleep are present in standard base images (incl. redis:7).
-		// `exec sleep` makes sleep the container PID 1 so SIGTERM on pod delete
-		// terminates it cleanly. 2147483647 (~68y) is a portable "infinity" that
-		// works on BusyBox and GNU sleep alike.
-		holderCmd := []string{"/bin/sh", "-c"}
-		holderArgs := []string{"echo podmotion-holder ready; exec sleep 2147483647"}
-		for i := range spec.Containers {
-			spec.Containers[i].Command = holderCmd
-			spec.Containers[i].Args = holderArgs
-			// Strip probes: a probe against the holder (no real workload in that
-			// process tree) would fail, and a probe that hit the restored process on
-			// the pod IP would couple container readiness to a process containerd
-			// does not own. Readiness is gated by criuRestoreConfirmed + TrafficVerified.
-			spec.Containers[i].LivenessProbe = nil
-			spec.Containers[i].ReadinessProbe = nil
-			spec.Containers[i].StartupProbe = nil
-			spec.Containers[i].Lifecycle = nil
-		}
+	// ADR-0130 / ADR-0175: unconditional holder-command override. Every replacement pod
+	// is a CRIU-restore target; running the real workload command would collide with the
+	// restored process tree in the shared pod netns (exact failure ADR-0130 prevents).
+	// /bin/sh + sleep are present in standard base images (incl. redis:7).
+	// `exec sleep` makes sleep the container PID 1 so SIGTERM on pod delete
+	// terminates it cleanly. 2147483647 (~68y) is a portable "infinity" that
+	// works on BusyBox and GNU sleep alike.
+	holderCmd := []string{"/bin/sh", "-c"}
+	holderArgs := []string{"echo podmotion-holder ready; exec sleep 2147483647"}
+	for i := range spec.Containers {
+		spec.Containers[i].Command = holderCmd
+		spec.Containers[i].Args = holderArgs
+		// Strip probes: a probe against the holder (no real workload in that
+		// process tree) would fail, and a probe that hit the restored process on
+		// the pod IP would couple container readiness to a process containerd
+		// does not own. Readiness is gated by criuRestoreConfirmed + TrafficVerified.
+		spec.Containers[i].LivenessProbe = nil
+		spec.Containers[i].ReadinessProbe = nil
+		spec.Containers[i].StartupProbe = nil
+		spec.Containers[i].Lifecycle = nil
 	}
 
 	// Pin NodeName directly to the destination node if known.
