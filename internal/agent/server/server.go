@@ -3534,6 +3534,47 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 	// process memory and secrets are never written to persistent disk (ADR-0046).
 	imagesDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", req.MigrationName)
 
+	// ADR-0182 CHURN-15 Issue 2 (GC-9 / Standing Rule 7): PreDumpRound writes pre-dump images
+	// containing live workload memory pages to /run/podmotion/checkpoints/<mig>/round-<N>/ BEFORE
+	// this handler runs. On ANY Checkpoint-phase abort (CR-lookup failure at L3552, ctr fatal at
+	// L3615, CRIU dump failure at L3773, etc.) those round-N dirs were previously left intact on
+	// tmpfs until node reboot — a Standing Rule 7 violation ("zeroized on all exit paths").
+	//
+	// Register a single deferred zeroize-then-unlink sweep at the TOP of the handler, armed by
+	// default, disarmed only on the success-return path via checkpointSucceeded. This guarantees
+	// no current or future failure-return path can silently skip cleanup. We use zeroizeDir
+	// (zeroize-then-unlink) — NOT os.RemoveAll — because a bare unlink leaves recoverable live
+	// memory pages on tmpfs. The sweep covers every round-* subdir AND the final/ images dir.
+	//
+	// C-3 (Performance Reviewer): the zeroize runs SYNCHRONOUSLY on the gRPC handler goroutine.
+	// This is intentional and within budget: it executes only on the failure-return path, which
+	// has NO live-migration latency SLA (the migration is already aborting/rolling back). A
+	// synchronous sweep is strictly more secure than async-with-timeout — an incomplete async
+	// zeroize would leave live memory pages recoverable on tmpfs across a restart. Per the
+	// Security Reviewer, that exposure outweighs any failure-path latency concern; bounded
+	// sub-10ms tmpfs zeroize of the pre-dump set is well within the (non-existent) failure budget.
+	checkpointSucceeded := false
+	defer func() {
+		if checkpointSucceeded {
+			return
+		}
+		migDir := fmt.Sprintf("/run/podmotion/checkpoints/%s", req.MigrationName)
+		rounds, _ := filepath.Glob(filepath.Join(migDir, "round-*"))
+		for _, rd := range rounds {
+			if zErr := zeroizeDir(rd); zErr != nil {
+				log.Error(zErr, "Checkpoint abort cleanup: zeroize round dir failed (GC-9/SR-7, warn-only)",
+					"migration", req.MigrationName, "dir", rd)
+			}
+		}
+		// Also zeroize the final/ images dir — a partial ctr/CRIU dump may have written pages there.
+		if zErr := zeroizeDir(imagesDir); zErr != nil && !os.IsNotExist(zErr) {
+			log.Error(zErr, "Checkpoint abort cleanup: zeroize final images dir failed (GC-9/SR-7, warn-only)",
+				"migration", req.MigrationName, "dir", imagesDir)
+		}
+		log.Info("Checkpoint abort cleanup: pre-dump round-N and final images zeroized (GC-9/SR-7)",
+			"migration", req.MigrationName)
+	}()
+
 	// Fetch the PodMigration CR up front (ADR-0118). The CR is the canonical source of
 	// migration identity: it provides both the TCPPreservationMode and the SourcePodUID
 	// fallback used when the in-memory map has been lost across an agent restart.
@@ -3617,7 +3658,10 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 				log.Info("Checkpoint: ctr failed due to established TCP socket — falling back to raw CRIU with --tcp-established (ADR-0131 D2: connection preserved)",
 					"taskID", taskID, "tcpEstablished", tcpEstablished, "err", ctrErr)
 				// Clear any partial ctr images before raw CRIU writes to the same dir.
-				if rmErr := os.RemoveAll(imagesDir); rmErr != nil {
+				// ADR-0182 CHURN-15 Issue 2 (SRE non-blocking note): zeroize-then-unlink, NOT a
+				// bare os.RemoveAll — a partial ctr dump may already contain live memory pages in
+				// final/, and a bare unlink leaves them recoverable on tmpfs (Standing Rule 7).
+				if rmErr := zeroizeDir(imagesDir); rmErr != nil {
 					return nil, fmt.Errorf("checkpoint: clearing partial ctr images before raw CRIU: %w", rmErr)
 				}
 			} else {
@@ -3646,6 +3690,10 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 						}
 					}
 				}
+				// Success (ctr path): disarm the deferred abort-zeroize sweep. The final/ dir
+				// holds the completed checkpoint which the transfer phase consumes; round-N dirs
+				// are released later by ReleaseCheckpoint (ADR-0179) on the controller path.
+				checkpointSucceeded = true
 				return &agentpb.CheckpointResponse{
 					FreezeDurationMs:    freezeDurationMs,
 					CheckpointSha256:    sha,
@@ -3840,6 +3888,11 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 	}
 
 	log.Info("Checkpoint complete", "path", checkpointPath, "sha256", sha256sum, "fallback", fallbackNote)
+
+	// Success (raw-CRIU path): disarm the deferred abort-zeroize sweep. The completed
+	// checkpoint in final/ is consumed by the transfer phase; round-N dirs are released
+	// later by ReleaseCheckpoint (ADR-0179). ADR-0182 CHURN-15 Issue 2.
+	checkpointSucceeded = true
 
 	// Update MigrationCheckpoint CR if we have a k8s client.
 	// The CR name convention mirrors the PodMigration name.

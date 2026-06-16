@@ -1819,12 +1819,18 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 	}
 
 	// Step 2b: Checkpoint — freeze and dump via real CRIU gRPC call.
-	// WorkloadNamespace must be the pod's namespace (NOT the operator namespace) so the
-	// agent can look up the PodMigration CR in the correct namespace (ADR-0047 §safety).
+	// WorkloadNamespace carries the PodMigration CR's namespace (pm.Namespace, e.g.
+	// podmotion-system) — NOT the workload pod's namespace. The agent uses this value
+	// solely to Get the PodMigration CR (server.go Checkpoint, L3548) to resolve
+	// TCPPreservationMode and the SourcePodUID fallback (ADR-0047 §safety, ADR-0182 CHURN-15).
+	// V-1 (ADR-0182 r2): Attempt-1 CR cold-0181-gate-1 was in namespace "default" (== pod ns),
+	// so pm.Spec.PodNamespace coincidentally equalled pm.Namespace and the lookup succeeded by
+	// accident; Attempt-2 CR cold-0181-gate-2 was in "podmotion-system" with pod in "default",
+	// exposing the latent conflation. pm.Namespace is the only correct value.
 	checkpointResp, err := agentClient.Checkpoint(ctx, &agentpb.CheckpointRequest{
-		MigrationName:      pm.Name,
-		ApplyZeroWindow:    pm.Spec.TCPPreservationMode != pmv1.TCPPreservationModeNone,
-		WorkloadNamespace:  pm.Spec.PodNamespace,
+		MigrationName:     pm.Name,
+		ApplyZeroWindow:   pm.Spec.TCPPreservationMode != pmv1.TCPPreservationModeNone,
+		WorkloadNamespace: pm.Namespace,
 	})
 	if err != nil {
 		errStr := err.Error()
@@ -3110,34 +3116,52 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 	// never released by the normal success path, leaving orphaned .img files on the node.
 	// ReleaseCheckpoint is idempotent; errors are warn-only (ADR-0012: source pod is
 	// already safe, so we never block the Failed transition on a cleanup RPC failure).
-	if pm.Status.CheckpointTransferred && pm.Status.DestinationNodeName != "" && r.AgentPool != nil {
+	//
+	// ADR-0182 CHURN-15 Issue 3 (GC-10): the GC-9 ReleaseCheckpoint gate and the GC-10
+	// dest-netns Abort gate are SEPARATE conditions. ReleaseCheckpoint depends on
+	// CheckpointTransferred (dest images exist only post-transfer). Abort/dest-netns teardown
+	// depends only on netns *staging* (ConditionDestinationNetnsReady), which is set during
+	// DestinationPrewarm BEFORE Checkpoint runs — so a Checkpoint-phase failure (where
+	// CheckpointTransferred is never set) must still tear the netns down. The old single guard
+	// on CheckpointTransferred skipped Abort entirely on early failure, leaking the bind-mount.
+	destStaged := r.AgentPool != nil && pm.Status.DestinationNodeName != "" &&
+		meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionDestinationNetnsReady)
+	if destStaged {
 		destNode := pm.Status.DestinationNodeName
 		destAgent, agErr := r.AgentPool.ForNode(ctx, destNode)
 		if agErr != nil {
-			log.Error(agErr, "reconcileRollingBack: cannot connect to dest agent for ReleaseCheckpoint (GC-9, warn-only)",
+			log.Error(agErr, "reconcileRollingBack: cannot connect to dest agent for GC-9/GC-10 cleanup (warn-only)",
 				"migration", pm.Name, "node", destNode)
 		} else {
-			_, relErr := destAgent.ReleaseCheckpoint(ctx, &agentpb.ReleaseCheckpointRequest{
-				MigrationName:      pm.Name,
-				MigrationNamespace: pm.Namespace,
-			})
-			if relErr != nil {
-				log.Error(relErr, "reconcileRollingBack: dest ReleaseCheckpoint failed (GC-9, warn-only — images remain on dest tmpfs until reboot)",
-					"migration", pm.Name, "node", destNode)
-			} else {
-				log.Info("reconcileRollingBack: dest checkpoint released (GC-9)", "migration", pm.Name, "node", destNode)
+			// GC-9: dest checkpoint images exist ONLY after transfer — retain that gate.
+			if pm.Status.CheckpointTransferred {
+				_, relErr := destAgent.ReleaseCheckpoint(ctx, &agentpb.ReleaseCheckpointRequest{
+					MigrationName:      pm.Name,
+					MigrationNamespace: pm.Namespace,
+				})
+				if relErr != nil {
+					log.Error(relErr, "reconcileRollingBack: dest ReleaseCheckpoint failed (GC-9, warn-only — images remain on dest tmpfs until reboot)",
+						"migration", pm.Name, "node", destNode)
+				} else {
+					log.Info("reconcileRollingBack: dest checkpoint released (GC-9)", "migration", pm.Name, "node", destNode)
+				}
 			}
 
 			// GC-10 (ADR-0173): tear down the pre-staged dest migration netns on the
-			// NRI/operator-driven restore-failure path via the Abort RPC. This is issued
+			// NRI/operator-driven restore-failure path via the Abort RPC. Conditioned on
+			// ConditionDestinationNetnsReady (netns staging), NOT on CheckpointTransferred —
+			// the netns is staged at DestinationPrewarm, independent of transfer, so this
+			// fires on Checkpoint-phase failures too (ADR-0182 CHURN-15 Issue 3). Issued
 			// STRICTLY SEQUENTIALLY — only after disarmZeroWindowOnFailurePath (DisarmZeroWindow)
 			// and Rollbacker.Rollback (NetworkRollback) have already returned above; it is NOT
 			// concurrent with them and reuses the same dest-agent handle. AbortRequest carries
-			// only migration_name and reason (no namespace field exists in the proto).
-			// Warn-only (ADR-0012 / ADR-0165-r2 SP-7): never blocks the Failed transition.
+			// only migration_name and reason (no namespace field exists in the proto). The
+			// agent's Abort handler is idempotent (server.go delete-on-first-call), so an
+			// unconditional dispatch is safe under re-queues. Warn-only (ADR-0012 /
+			// ADR-0165-r2 SP-7): never blocks the Failed transition.
 			_, abErr := destAgent.Abort(ctx, &agentpb.AbortRequest{
 				MigrationName: pm.Name,
-				Reason:        "GC-10 restore-failure rollback: tear down dest migration netns",
+				Reason:        "GC-10 rollback: tear down dest migration netns (phase-independent)",
 			})
 			if abErr != nil {
 				log.Error(abErr, "reconcileRollingBack: dest Abort/teardown failed (GC-10, warn-only — dest netns may remain until reboot)",
