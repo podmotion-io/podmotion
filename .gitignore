@@ -52,6 +52,31 @@ fleetctl
 CLAUDE.md
 AGENTS.md
 
+# IP-protected tessera methodology — lives locally only, never committed or pushed
+docs/AGENTIC_STRATEGY.md
+docs/AGENTIC_STRATEGY_*.md
+
+# Tessera methodology corpus — sprint plans, quorum logs, personas, process docs
+# These document the AI delivery methodology and must never be published
+docs/sprints/
+docs/personas/
+docs/review/
+docs/postmortems/
+docs/process/
+docs/chaos/
+docs/proof/
+docs/cncf/
+docs/compliance/
+
+# Top-level methodology and strategy docs
+docs/STRATEGY-REVIEW-*.md
+docs/NORTH_STAR_SPRINT_PLAN.md
+docs/SPRINT_PLAN.md
+docs/SPRINT_PLAN_M19_M25.md
+docs/ns4-revolutionary-plan.md
+docs/AWS_COST_PLAN.md
+docs/VALIDATION_AND_CERTIFICATION_PLAN.md
+
 # Compiled binaries directory
 bin/
 
