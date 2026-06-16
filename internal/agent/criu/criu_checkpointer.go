@@ -10,6 +10,7 @@ package criu
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -374,6 +375,69 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	}, nil
 }
 
+// cgroupRegFileFd is one regular-file fd whose recorded path is under /sys/fs/cgroup,
+// enumerated from the checkpoint images for ADR-0180 InheritFd redirection.
+type cgroupRegFileFd struct {
+	Fd   int    // restored-task fd number == CRIU InheritFd NUM
+	Path string // recorded /sys/fs/cgroup path == CRIU InheritFd Key (RES)
+}
+
+// enumerateCgroupRegFileFds parses files.img + fdinfo-*.img in imagesDir via pycriu and
+// returns every regular-file fd whose recorded path is under /sys/fs/cgroup (ADR-0180,
+// predicate-based — never cpu.max-hardcoded). Mirrors the server-side enumeration; used
+// by the go-criu RPC restore path.
+func enumerateCgroupRegFileFds(imagesDir string) ([]cgroupRegFileFd, error) {
+	script := `
+import pycriu, glob, json, sys, os
+cpdir = sys.argv[1]
+id2path = {}
+fi = os.path.join(cpdir, 'files.img')
+if os.path.exists(fi):
+    with open(fi, 'rb') as f:
+        files = pycriu.images.load(f)
+    for e in files.get('entries', []):
+        if e.get('type') == 'REG' and 'reg' in e:
+            id2path[e['id']] = e['reg'].get('name')
+out, seen = [], set()
+for img in sorted(glob.glob(os.path.join(cpdir, 'fdinfo-*.img'))):
+    with open(img, 'rb') as f:
+        fdinfo = pycriu.images.load(f)
+    for e in fdinfo.get('entries', []):
+        if e.get('type') != 'REG':
+            continue
+        p = id2path.get(e.get('id'))
+        if p and p.startswith('/sys/fs/cgroup'):
+            k = (e.get('fd'), p)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append({'fd': e.get('fd'), 'path': p})
+print(json.dumps(out))
+`
+	cmd := exec.Command("python3", "-c", script, imagesDir)
+	cmd.Env = append(os.Environ(), "PYTHONPATH=/usr/lib/python3/dist-packages")
+	raw, err := cmd.Output()
+	if err != nil {
+		stderr := ""
+		if ee, ok := err.(*exec.ExitError); ok {
+			stderr = string(ee.Stderr)
+		}
+		return nil, fmt.Errorf("enumerateCgroupRegFileFds pycriu: %w: %s", err, stderr)
+	}
+	var parsed []struct {
+		Fd   int    `json:"fd"`
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("enumerateCgroupRegFileFds parse %q: %w", string(raw), err)
+	}
+	fds := make([]cgroupRegFileFd, 0, len(parsed))
+	for _, p := range parsed {
+		fds = append(fds, cgroupRegFileFd{Fd: p.Fd, Path: p.Path})
+	}
+	return fds, nil
+}
+
 // Restore recreates the container from dump images on the destination node.
 func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (RestoreResult, error) {
 	if runtime.GOOS == "darwin" {
@@ -484,6 +548,70 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 		// compat-mode treats /sys as a stale mount and umounts it; the host-bind-mounted sysfs
 		// returns EBUSY. Key must match criu_checkpointer.go dump args exactly.
 		External: []string{"mnt[pm-sys]:/sys"},
+	}
+
+	// ADR-0180: redirect every regular-file fd whose recorded path is under /sys/fs/cgroup
+	// (predicate-based, never cpu.max-hardcoded — Arch-A S5) via CRIU InheritFd so the
+	// files-reg.c regular-file restore pass dups an agent-held cgroupfs descriptor instead of
+	// open()-ing the absent image path (abort at files-reg.c:2353). On the go-criu RPC (swrk)
+	// path InheritFd.Fd is a fd number in the CRIU swrk process; go-criu's Prepare() execs
+	// `criu swrk` and only sets CloseOnExec on its control socketpair, so a fd the agent holds
+	// open WITHOUT O_CLOEXEC at the exact target number is inherited by the swrk child. We dup
+	// each opened cgroupfs source to its target fd number (NUM) with O_CLOEXEC cleared and
+	// record InheritFd{Key: recordedPath, Fd: NUM}.
+	//
+	// Cleanup contract (ADR-0180 OC-2 / Standing Rule 7): every dup'd cgroup fd is closed on
+	// EVERY exit path of Restore via the deferred closer below (success, failure, ctx-cancel/
+	// Abort). No cgroup fd is leaked into the agent process.
+	var heldInheritFds []int
+	closeHeldInheritFds := func() {
+		for i, fd := range heldInheritFds {
+			if fd >= 0 {
+				_ = unix.Close(fd)
+				heldInheritFds[i] = -1
+			}
+		}
+	}
+	defer closeHeldInheritFds()
+	if cgFds, enumErr := enumerateCgroupRegFileFds(opts.ImagesDir); enumErr != nil {
+		// Degrade-and-continue: proceed without InheritFd. Restore then either succeeds (no
+		// cgroup fd held) or aborts loudly at files-reg.c:2353 — never worse than pre-ADR-0180.
+		logger.Info("ADR-0180: cgroup InheritFd enumeration failed; proceeding without InheritFd", "err", enumErr)
+	} else {
+		for _, cg := range cgFds {
+			if cg.Fd < 3 {
+				continue // std streams; CRIU does not request inherit-fd for them
+			}
+			src := cg.Path
+			if _, statErr := os.Stat(src); statErr != nil {
+				// Recorded pod-cgroup path may not exist on the destination pre-restore; fall
+				// back to the cgroup-v2 root file of the same controller (e.g. cpu.max). The
+				// restore still advances past files-reg.c:2353 (S1); the post-restore cgroup
+				// move + Go live re-read corrects the quota value (S2).
+				src = filepath.Join("/sys/fs/cgroup", filepath.Base(cg.Path))
+			}
+			f, oerr := os.OpenFile(src, os.O_RDONLY, 0)
+			if oerr != nil {
+				closeHeldInheritFds()
+				return RestoreResult{}, fmt.Errorf("ADR-0180: open cgroup inherit source %q for fd[%d] (recorded %q): %w",
+					src, cg.Fd, cg.Path, oerr)
+			}
+			// dup the opened source to the exact target fd number so the swrk child sees it at
+			// NUM. unix.Dup3 with flags=0 clears O_CLOEXEC on the new fd (inheritable by exec).
+			if derr := unix.Dup3(int(f.Fd()), cg.Fd, 0); derr != nil {
+				_ = f.Close()
+				closeHeldInheritFds()
+				return RestoreResult{}, fmt.Errorf("ADR-0180: dup cgroup inherit fd %d->%d: %w", int(f.Fd()), cg.Fd, derr)
+			}
+			_ = f.Close() // the dup at cg.Fd is the held descriptor now
+			heldInheritFds = append(heldInheritFds, cg.Fd)
+			criuOpts.InheritFd = append(criuOpts.InheritFd, &rpc.InheritFd{
+				Key: proto.String(cg.Path),
+				Fd:  proto.Int32(int32(cg.Fd)),
+			})
+			logger.Info("ADR-0180: redirecting cgroup reg-file fd via InheritFd",
+				"fd", cg.Fd, "recordedPath", cg.Path, "hostSource", src)
+		}
 	}
 
 	// Cold network migration (tcpPreservationMode=None) is dumped with --empty-ns net,

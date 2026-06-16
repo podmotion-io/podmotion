@@ -1910,6 +1910,123 @@ func checkpointHasEstablishedTCP(checkpointDir string) bool {
 	return len(matches) > 0
 }
 
+// cgroupInheritFd describes one regular-file file-descriptor whose recorded path is
+// under /sys/fs/cgroup, enumerated from the checkpoint images (ADR-0180). CRIU's
+// files-reg.c regular-file restore pass aborts on the first such fd because the
+// placeholder rootfs has no populated /sys/fs/cgroup subtree (files-reg.c:2353). We
+// redirect each via --inherit-fd so CRIU dups an agent-held descriptor instead of
+// calling open_path() against the (absent) image path.
+type cgroupInheritFd struct {
+	// Fd is the file-descriptor NUMBER the restored task holds (the "fd" field in
+	// fdinfo-*.img). It is the NUM in CRIU's --inherit-fd fd[NUM]:RES form.
+	Fd int
+	// Path is the recorded path of the file (the "name" of the REG entry in files.img),
+	// always under /sys/fs/cgroup. It is the RES in --inherit-fd fd[NUM]:RES; CRIU
+	// matches the agent-held inherited fd to the image entry by this path string.
+	Path string
+}
+
+// enumerateCgroupInheritFds parses the CRIU checkpoint images in checkpointDir via
+// pycriu and returns every open regular-file fd whose recorded path is under
+// /sys/fs/cgroup (ADR-0180 OC-2 / OC-3). The class is determined DYNAMICALLY by the
+// predicate "path starts with /sys/fs/cgroup" — never hardcoded to cpu.max — so any
+// Go 1.25+/cgroup-v2 runtime fd (cpu.max today, memory.max/cpu.stat tomorrow) is
+// covered without code change (Arch-A S5 mandate). It joins fdinfo-*.img (fd -> file
+// id, REG entries only) with files.img (file id -> path for REG files).
+//
+// CRIU 4.2 stores regular-file metadata in files.img (the modern equivalent of the
+// older reg-files-*.img); the OC-2 inventory artifact documents the exact image layout.
+func enumerateCgroupInheritFds(checkpointDir string) ([]cgroupInheritFd, error) {
+	script := `
+import pycriu, glob, json, sys, os
+
+cpdir = sys.argv[1]
+
+# files.img: REG file id -> path
+id2path = {}
+files_img = os.path.join(cpdir, 'files.img')
+if os.path.exists(files_img):
+    with open(files_img, 'rb') as f:
+        files = pycriu.images.load(f)
+    for e in files.get('entries', []):
+        if e.get('type') == 'REG' and 'reg' in e:
+            id2path[e['id']] = e['reg'].get('name')
+
+# fdinfo-*.img: fd -> file id (REG only)
+out = []
+for fdinfo_img in sorted(glob.glob(os.path.join(cpdir, 'fdinfo-*.img'))):
+    with open(fdinfo_img, 'rb') as f:
+        fdinfo = pycriu.images.load(f)
+    for e in fdinfo.get('entries', []):
+        if e.get('type') != 'REG':
+            continue
+        p = id2path.get(e.get('id'))
+        if p and p.startswith('/sys/fs/cgroup'):
+            out.append({'fd': e.get('fd'), 'path': p})
+
+# de-dup on (fd, path) — a path may appear in multiple fdinfo images for the same fd
+seen = set()
+uniq = []
+for o in out:
+    k = (o['fd'], o['path'])
+    if k in seen:
+        continue
+    seen.add(k)
+    uniq.append(o)
+print(json.dumps(uniq))
+`
+	cmd := exec.Command("python3", "-c", script, checkpointDir)
+	cmd.Env = append(os.Environ(), "PYTHONPATH=/usr/lib/python3/dist-packages")
+	out, err := cmd.Output()
+	if err != nil {
+		stderr := ""
+		if ee, ok := err.(*exec.ExitError); ok {
+			stderr = string(ee.Stderr)
+		}
+		return nil, fmt.Errorf("enumerateCgroupInheritFds pycriu: %w: %s", err, stderr)
+	}
+	var raw []struct {
+		Fd   int    `json:"fd"`
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return nil, fmt.Errorf("enumerateCgroupInheritFds parse %q: %w", string(out), err)
+	}
+	fds := make([]cgroupInheritFd, 0, len(raw))
+	for _, r := range raw {
+		fds = append(fds, cgroupInheritFd{Fd: r.Fd, Path: r.Path})
+	}
+	return fds, nil
+}
+
+// resolveInheritCgroupSource picks the host cgroupfs cpu-controller file the agent
+// opens for an inherited cgroup fd (ADR-0180 OC-1 / S2). The Go 1.25 containermaxprocs
+// runtime re-reads the SAME held fd live (empirically verified: an in-place cpu.max
+// quota change is reflected in GOMAXPROCS), but the held fd does NOT follow a cgroup
+// MOVE. Therefore, so that the inherited fd reflects the destination pod's real quota
+// after moveProcessToPodCgroup relocates the process, we open the file from the
+// DESTINATION POD's own cgroup subtree (resolved via the sandbox pause PID) whenever a
+// sandboxID is available. When it is not (or resolution fails) we fall back to the
+// recorded image path if it exists on the destination, and finally to the cgroup-v2
+// root cpu.max — the restore still advances past files-reg.c:2353 in every case (S1).
+func resolveInheritCgroupSource(recordedPath, sandboxID string) string {
+	base := filepath.Base(recordedPath) // e.g. "cpu.max" — preserve the controller file name
+	if sandboxID != "" {
+		if pausePID, err := sandboxPausePID(sandboxID); err == nil {
+			if podCgroup, cerr := cgroupV2Path(pausePID); cerr == nil {
+				cand := filepath.Join("/sys/fs/cgroup", podCgroup, base)
+				if _, serr := os.Stat(cand); serr == nil {
+					return cand
+				}
+			}
+		}
+	}
+	if _, err := os.Stat(recordedPath); err == nil {
+		return recordedPath
+	}
+	return filepath.Join("/sys/fs/cgroup", base)
+}
+
 func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath, hostVethName string, strictMode bool) []string {
 	// Choose --tcp-established whenever the checkpoint actually captured an established
 	// TCP connection (presence of a tcp-stream-*.img), NOT merely when a pre-staged
@@ -2353,9 +2470,102 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// from the correct namespace context. The checkpoint files and rootfsDir are both
 	// accessible from the host mount namespace (checkpoint dir visible via host tmpfs;
 	// rootfsDir is the placeholder container's bundle path exposed by containerd).
+	// ADR-0180: enumerate every regular-file fd whose recorded path is under /sys/fs/cgroup
+	// (predicate-based, never cpu.max-hardcoded — Arch-A S5) and redirect each via CRIU
+	// --inherit-fd so the files-reg.c regular-file restore pass dups an agent-held cgroupfs
+	// descriptor instead of open()-ing the (absent) image path against the placeholder rootfs.
+	// Without this the restore aborts at files-reg.c:2353 on the Go 1.25 containermaxprocs
+	// cpu.max fd. The enumeration runs on the host-visible checkpoint dir (post patch/copy;
+	// patchCheckpointImages does not touch files.img/fdinfo-*.img).
+	//
+	// Cleanup contract (ADR-0180 OC-2 / Standing Rule 7): every agent-held cgroup fd opened
+	// here is closed on EVERY exit path of this function via the deferred closer below
+	// (success, failure, and the ctx-cancel/Abort path that returns through joinNsRestore).
+	// No cgroup fd is leaked into the agent process.
+	cgInheritFds, cgEnumErr := enumerateCgroupInheritFds(checkpointDir)
+	if cgEnumErr != nil {
+		// Degrade-and-continue: if enumeration fails we proceed without --inherit-fd. The
+		// restore then either succeeds (no cgroup fd held) or aborts loudly at files-reg.c:2353,
+		// which is the pre-ADR-0180 behavior — never worse.
+		log.Info("ADR-0180: cgroup inherit-fd enumeration failed; proceeding without --inherit-fd",
+			"err", cgEnumErr, "migration", migrationName)
+		cgInheritFds = nil
+	}
+	var heldCgroupFds []*os.File
+	// closeHeldCgroupFds is the single cleanup site for the agent-held cgroup descriptors.
+	// Deferred immediately so it fires on ALL standard exit paths (Standing Rule 7 / OC-2
+	// Abort-path cleanup). Idempotent: nils each handle after close.
+	closeHeldCgroupFds := func() {
+		for i, f := range heldCgroupFds {
+			if f != nil {
+				_ = f.Close()
+				heldCgroupFds[i] = nil
+			}
+		}
+	}
+	defer closeHeldCgroupFds()
+	var inheritExtraFiles []*os.File
+	if len(cgInheritFds) > 0 {
+		// CRIU --inherit-fd fd[NUM]:RES treats NUM as a fd already open in CRIU's own process
+		// pointing at RES. We therefore position each agent-held cgroupfs source file at the
+		// exact fd number NUM (== the recorded restored-task fd) in the CRIU child. cmd.ExtraFiles
+		// assigns ExtraFiles[i] to child fd 3+i, so we build a contiguous slice from fd 3 up to
+		// the max recorded cgroup fd, filling gaps with a /dev/null placeholder; only the cgroup
+		// slots carry real cgroupfs descriptors. nsenter passes inherited fds straight through.
+		maxFd := 2
+		for _, c := range cgInheritFds {
+			if c.Fd > maxFd {
+				maxFd = c.Fd
+			}
+		}
+		slots := make([]*os.File, maxFd-2) // indices 0..(maxFd-3) -> child fds 3..maxFd
+		for _, c := range cgInheritFds {
+			if c.Fd < 3 {
+				// fds 0/1/2 are std streams the restored task already gets; CRIU would not
+				// request an inherit-fd for them. Skip defensively.
+				log.Info("ADR-0180: skipping cgroup inherit-fd with reserved fd number",
+					"fd", c.Fd, "path", c.Path)
+				continue
+			}
+			src := resolveInheritCgroupSource(c.Path, sandboxID)
+			f, oerr := os.OpenFile(src, os.O_RDONLY, 0)
+			if oerr != nil {
+				// If we cannot open a real cgroupfs source the inherited-fd redirect for this
+				// entry is impossible; close everything opened so far (cleanup contract — no
+				// partial fd leak) and fail loud so the abort is attributable, not silent.
+				closeHeldCgroupFds()
+				return 0, fmt.Errorf("ADR-0180: open cgroup inherit source %q for fd[%d] (recorded %q): %w",
+					src, c.Fd, c.Path, oerr)
+			}
+			heldCgroupFds = append(heldCgroupFds, f)
+			slots[c.Fd-3] = f
+			criuArgs = append(criuArgs, "--inherit-fd", fmt.Sprintf("fd[%d]:%s", c.Fd, c.Path))
+			log.Info("ADR-0180: redirecting cgroup reg-file fd via --inherit-fd",
+				"fd", c.Fd, "recordedPath", c.Path, "hostSource", src, "migration", migrationName)
+		}
+		// Fill any gap slots with a /dev/null placeholder so the real cgroup descriptors land at
+		// their exact target fd numbers in the child.
+		for i := range slots {
+			if slots[i] == nil {
+				devnull, derr := os.OpenFile(os.DevNull, os.O_RDONLY, 0)
+				if derr != nil {
+					closeHeldCgroupFds()
+					return 0, fmt.Errorf("ADR-0180: open placeholder %s for inherit-fd padding: %w", os.DevNull, derr)
+				}
+				heldCgroupFds = append(heldCgroupFds, devnull)
+				slots[i] = devnull
+			}
+		}
+		inheritExtraFiles = slots
+		// criuArgs changed after buildCRIURestoreArgs/maskedArgs assembly; rebuild the command.
+	}
+
 	criuCmd := nsenterCmd(append([]string{"/usr/sbin/criu"}, criuArgs...)...)
-	// ADR-0125: no ExtraFiles — CRIU joins the netns by path (--join-ns net:<path>), not by an
-	// inherited fd. The previous --net-fd fd-passing was removed (CRIU 4.2 has no --net-fd flag).
+	// ADR-0125: netns is joined by path (--join-ns net:<path>), not by an inherited fd.
+	// ADR-0180: ExtraFiles carry the agent-held cgroupfs descriptors so CRIU can satisfy each
+	// --inherit-fd fd[NUM]:RES from a real host descriptor at fd number NUM in its own process.
+	// nsenter forwards these inherited fds to CRIU unchanged.
+	criuCmd.ExtraFiles = inheritExtraFiles
 	// Capture CRIU's stderr: when CRIU fails before opening its -o logfile (e.g. arg/ext-mount
 	// resolution errors), the only diagnostic is on stderr. A bounded buffer keeps it cheap.
 	var criuStderr bytes.Buffer
