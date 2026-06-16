@@ -242,6 +242,9 @@ message EstimateCheckpointResponse {
 message PutCheckpointTarRequest {
   string migration_name = 1; // used to determine destination directory
   bytes  tar_data       = 2; // gzip-compressed tar of the checkpoint final/ directory
+  string tar_sha256     = 3; // ADR-SEC-B: expected hash of tar_data — dest verifies BEFORE decompress (C-334)
+  bytes  manifest       = 4; // ADR-SEC-B: canonical_json(checkpoint-manifest) — see §2.2 (C-332)
+  bytes  manifest_sig   = 5; // ADR-SEC-B: operator signature over manifest (C-332)
 }
 message PutCheckpointTarResponse {
   bool   success      = 1;
@@ -257,6 +260,7 @@ message GetCheckpointTarResponse {
   string error        = 2;
   bytes  tar_data     = 3; // gzip-compressed tar of the checkpoint final/ directory
   int64  bytes_read   = 4;
+  string tar_sha256   = 5; // ADR-SEC-B: source agent's hash of the exact gzip tar bytes it returns (C-334)
 }
 
 message ReleaseCheckpointRequest {

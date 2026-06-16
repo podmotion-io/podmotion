@@ -17,7 +17,6 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -25,6 +24,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	"github.com/podmotion-io/podmotion/internal/agent/grpclimits"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 )
 
@@ -179,13 +179,25 @@ func (p *AgentClientPool) dial(ctx context.Context, addr string) (*grpc.ClientCo
 			Timeout:             30 * time.Second,
 			PermitWithoutStream: true,
 		}),
+		// ADR-SEC-A §2.3 (C-333): client-side message-size caps, shared from the single
+		// server.MaxCheckpointTarBytes constant so server/client cannot skew.
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(grpclimits.MaxCheckpointTarBytes),
+			grpc.MaxCallSendMsgSize(grpclimits.MaxCheckpointTarBytes),
+		),
 	}
 
 	if p.tlsCfg != nil {
 		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(p.tlsCfg)))
 	} else {
-		// Insecure is only permitted when no TLS config is provided (dev/test mode).
-		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		// ADR-SEC-A §2.1 (C-330/N-340): fail-closed. In the default build adrSecADialNoTLS
+		// returns a fatal error so the operator NEVER dials plaintext; in the //go:build dev
+		// build it appends insecure creds (PODMOTION_INSECURE_GRPC path, gated in
+		// LoadClientConfig). The "ADR-SEC-A" marker string lands in the operator binary here.
+		var derr error
+		if opts, derr = adrSecADialNoTLS(opts); derr != nil {
+			return nil, derr
+		}
 	}
 
 	//nolint:staticcheck // grpc.DialContext deprecated in newer grpc but kept for controller-runtime compat

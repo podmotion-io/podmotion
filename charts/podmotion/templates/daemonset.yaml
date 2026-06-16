@@ -139,7 +139,21 @@ spec:
               mountPath: /var/run/netns
               mountPropagation: HostToContainer
               readOnly: true
+            {{- if .Values.agent.tls.enabled }}
+            # ADR-SEC-A §2.1 (C-330): mount the mTLS material the agent fail-closed path requires.
+            # Without this mount filesExist() is always false and the agent CrashLoopBackOffs
+            # (default build) instead of serving plaintext. This is the load-bearing deploy fix.
+            - name: agent-tls
+              mountPath: /etc/podmotion/tls
+              readOnly: true
+            {{- end }}
       volumes:
+        {{- if .Values.agent.tls.enabled }}
+        - name: agent-tls
+          secret:
+            secretName: {{ .Values.agent.tls.secretName }}
+            defaultMode: 0400
+        {{- end }}
         - name: criu-socket
           hostPath:
             path: /var/run/criu

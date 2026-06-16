@@ -411,6 +411,35 @@ webhook-certs-dev:
 	  --key=/tmp/podmotion-webhook-certs/tls.key \
 	  --namespace=podmotion-system --dry-run=client -o yaml | kubectl apply -f -
 
+## agent-certs-dev: Mint a self-signed CA + agent/operator SPIFFE leaf certs and create the
+## podmotion-agent-tls and podmotion-operator-agent-client-tls secrets (ADR-SEC-A §2.1 kind/dev
+## fallback for substrates without cert-manager). Keeps the fail-closed path exercised — the
+## certs are PRESENT, so it never re-introduces fail-open. Keys are ECDSA-P256 (ADR-SEC-B signing).
+.PHONY: agent-certs-dev
+agent-certs-dev:
+	mkdir -p /tmp/podmotion-agent-certs
+	@cd /tmp/podmotion-agent-certs && \
+	  openssl ecparam -name prime256v1 -genkey -noout -out ca.key && \
+	  openssl req -x509 -new -key ca.key -days 365 -out ca.crt -subj "/CN=podmotion-grpc-ca" && \
+	  printf 'subjectAltName=URI:spiffe://podmotion.io/ns/podmotion-system/sa/podmotion-agent\nextendedKeyUsage=serverAuth,clientAuth\n' > agent.ext && \
+	  printf 'subjectAltName=URI:spiffe://podmotion.io/ns/podmotion-system/sa/podmotion-operator\nextendedKeyUsage=clientAuth\n' > operator.ext && \
+	  openssl ecparam -name prime256v1 -genkey -noout -out agent.key && \
+	  openssl req -new -key agent.key -out agent.csr -subj "/CN=podmotion-agent" && \
+	  openssl x509 -req -in agent.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 365 -out agent.crt -extfile agent.ext && \
+	  openssl ecparam -name prime256v1 -genkey -noout -out operator.key && \
+	  openssl req -new -key operator.key -out operator.csr -subj "/CN=podmotion-operator" && \
+	  openssl x509 -req -in operator.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 365 -out operator.crt -extfile operator.ext
+	kubectl create secret generic podmotion-agent-tls \
+	  --from-file=tls.crt=/tmp/podmotion-agent-certs/agent.crt \
+	  --from-file=tls.key=/tmp/podmotion-agent-certs/agent.key \
+	  --from-file=ca.crt=/tmp/podmotion-agent-certs/ca.crt \
+	  --namespace=podmotion-system --dry-run=client -o yaml | kubectl apply -f -
+	kubectl create secret generic podmotion-operator-agent-client-tls \
+	  --from-file=tls.crt=/tmp/podmotion-agent-certs/operator.crt \
+	  --from-file=tls.key=/tmp/podmotion-agent-certs/operator.key \
+	  --from-file=ca.crt=/tmp/podmotion-agent-certs/ca.crt \
+	  --namespace=podmotion-system --dry-run=client -o yaml | kubectl apply -f -
+
 ## proto-gen: Regenerate Go code from .proto files
 .PHONY: proto-gen
 proto-gen:

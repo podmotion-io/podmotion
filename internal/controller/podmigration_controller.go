@@ -2060,6 +2060,15 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 			}
 		}()
 
+		// ADR-SEC-B §2.2/§2.3: the operator is the signing authority. Build the signed checkpoint
+		// manifest over the exact tar the source returned, forward the source-computed tar_sha256
+		// unchanged (so a controller-memory corruption between Get and Put is also caught), and
+		// carry manifest+signature to the destination in the same PutCheckpointTar call.
+		manifestBytes, manifestSig, tarSha256, provErr := r.buildSignedCheckpointManifest(ctx, pm, sourceNode, tarData, getResp.TarSha256)
+		if provErr != nil {
+			return ctrl.Result{}, fmt.Errorf("ADR-SEC-B: build signed checkpoint manifest: %w", provErr)
+		}
+
 		// Push the tar to the DESTINATION agent.
 		destClient, err := r.AgentPool.ForNode(ctx, destNode)
 		if err != nil {
@@ -2068,6 +2077,9 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 		putResp, err := destClient.PutCheckpointTar(ctx, &agentpb.PutCheckpointTarRequest{
 			MigrationName: pm.Name,
 			TarData:       tarData,
+			TarSha256:     tarSha256,
+			Manifest:      manifestBytes,
+			ManifestSig:   manifestSig,
 		})
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("PutCheckpointTar to %s: %w", destNode, err)

@@ -16,6 +16,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+var log = logf.Log.WithName("agent-tls")
+
 const (
 	// DefaultCertFile is the standard mount path for the TLS certificate.
 	DefaultCertFile = "/etc/podmotion/tls/tls.crt"
@@ -25,16 +27,17 @@ const (
 	DefaultCAFile = "/etc/podmotion/tls/ca.crt"
 )
 
-var log = logf.Log.WithName("agent-tls")
-
 // LoadServerConfig returns a *tls.Config suitable for the gRPC server.
 // Requires client certificates signed by the PodMotion CA (mTLS).
-// Falls back to insecure (nil) if cert files are absent — dev/test mode only.
+//
+// ADR-SEC-A §2.1 (C-330/N-339): in the default (non-dev) build this is FAIL-CLOSED —
+// absent cert material is a FATAL error (the agent refuses to start fail-open). The
+// fail-open branch survives ONLY under //go:build dev + PODMOTION_INSECURE_GRPC=true
+// (see tls_insecure_dev.go). loadServerConfigInsecureDev is provided by exactly one of
+// tls_insecure.go (default: returns a fatal error) or tls_insecure_dev.go (dev build).
 func LoadServerConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 	if !filesExist(certFile, keyFile, caFile) {
-		log.Info("TLS cert files not found — starting gRPC server without TLS (dev mode only)",
-			"certFile", certFile, "keyFile", keyFile, "caFile", caFile)
-		return nil, nil //nolint:nilnil // intentional: nil means insecure
+		return loadServerConfigInsecureDev(certFile, keyFile, caFile)
 	}
 
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
@@ -57,11 +60,13 @@ func LoadServerConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 }
 
 // LoadClientConfig returns a *tls.Config for the operator-to-agent gRPC client.
-// Falls back to insecure if cert files are absent.
+//
+// ADR-SEC-A §2.1 (C-330/N-340): fail-closed in the default build — absent cert material
+// is a FATAL error. The fail-open branch survives ONLY under //go:build dev +
+// PODMOTION_INSECURE_GRPC=true (see tls_insecure_dev.go).
 func LoadClientConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 	if !filesExist(certFile, keyFile, caFile) {
-		log.Info("TLS cert files not found — connecting to agent without TLS (dev mode only)")
-		return nil, nil //nolint:nilnil
+		return loadClientConfigInsecureDev(certFile, keyFile, caFile)
 	}
 
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)

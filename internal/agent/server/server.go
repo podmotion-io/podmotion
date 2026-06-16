@@ -41,12 +41,26 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	"github.com/podmotion-io/podmotion/internal/agent/authz"
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
+	"github.com/podmotion-io/podmotion/internal/agent/grpclimits"
 	"github.com/podmotion-io/podmotion/internal/agent/network"
+	"github.com/podmotion-io/podmotion/internal/agent/provenance"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 )
 
 var log = logf.Log.WithName("agent-server")
+
+// ADR-SEC-A §2.3 / ADR-SEC-B size bounds live in internal/agent/grpclimits (single source of
+// truth shared with the operator client so server/client cannot skew).
+
+// adrSecAServerMarker forces the ADR-SEC-A marker string into the agent binary string table for
+// §P-VERIFY-MULTI deployed-provenance grep, in addition to the authz package and the fail-closed
+// error strings. adrSecBServerMarker does the same for ADR-SEC-B (verify-reject + sentinel paths).
+const (
+	adrSecAServerMarker = "ADR-SEC-A"
+	adrSecBServerMarker = "ADR-SEC-B"
+)
 
 // adr0195Provenance is printed at server startup so the marker string is retained in the
 // binary and is observable in agent logs. Deploy verification:
@@ -1561,11 +1575,24 @@ func (s *AgentServer) ListenAndServe(ctx context.Context, addr string, tlsCfg *t
 			Time:              30 * time.Second,
 			Timeout:           10 * time.Second,
 		}),
+		// ADR-SEC-A §2.3 (C-333): bound gRPC message sizes (512 MiB) on the privileged
+		// host-network daemon. The transfer RPC is the only one that legitimately approaches it.
+		grpc.MaxRecvMsgSize(grpclimits.MaxCheckpointTarBytes),
+		grpc.MaxSendMsgSize(grpclimits.MaxCheckpointTarBytes),
+		// ADR-SEC-A §2.2 (C-331): deny-by-default per-RPC authz interceptor, registered FIRST in
+		// the chain so authz runs before any handler logic.
+		grpc.ChainUnaryInterceptor(authz.UnaryInterceptor(s.nodeName, s)),
 	}
 	if tlsCfg != nil {
 		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsCfg)))
 	} else {
-		log.Info("gRPC server starting without TLS — dev mode", "addr", addr)
+		// ADR-SEC-A §2.1 (C-330): defense-in-depth. In the default build adrSecAHandleNoTLS
+		// returns a fatal error (NEVER serves plaintext, NEVER logs "gRPC server starting
+		// without TLS"). In the //go:build dev build it logs the insecure WARN and permits
+		// plaintext (PODMOTION_INSECURE_GRPC path already gated in LoadServerConfig).
+		if err := adrSecAHandleNoTLS(addr); err != nil {
+			return err
+		}
 	}
 
 	grpcSrv := grpc.NewServer(opts...)
@@ -1942,7 +1969,7 @@ func ctrCheckpoint(taskID, imagesDir string) (int64, error) {
 	srcCfg := filepath.Join(bundleDir, "config.json")
 	dstCfg := filepath.Join(imagesDir, "config.json")
 	if data, readErr := os.ReadFile(srcCfg); readErr == nil {
-		_ = os.WriteFile(dstCfg, data, 0o644)
+		_ = os.WriteFile(dstCfg, data, 0o600) // ADR-SEC-B N-342: 0600 in checkpoint dir (invariant 7)
 	}
 
 	// Compute checkpoint size.
@@ -2845,7 +2872,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// written to /var/lib/podmotion/restore/<name>/data/restore.log by CRIU running
 	// via nsenter in the host mount namespace).
 	if logBytes, err := os.ReadFile(restoreLogPath); err == nil {
-		_ = os.WriteFile(filepath.Join(checkpointDir, "restore.log"), logBytes, 0o644)
+		_ = os.WriteFile(filepath.Join(checkpointDir, "restore.log"), logBytes, 0o600) // ADR-SEC-B N-342: 0600 in checkpoint dir (invariant 7)
 	}
 
 	log.Info("joinNsRestore: cgroup-PID signal confirmed workload live — proceeding to PID resolution",
@@ -4467,7 +4494,9 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 			return nil, fmt.Errorf("checkpoint fallback: cannot create images dir: %w", mkErr)
 		}
 
-		manifestPath := filepath.Join(imagesDir, "checkpoint-manifest.json")
+		// ADR-SEC-B §3h-SYM: renamed from checkpoint-manifest.json to avoid colliding with the
+		// new signed provenance manifest filename; mode 0o644→0o600 (N-342, invariant 7).
+		manifestPath := filepath.Join(imagesDir, "checkpoint-mock-manifest.json")
 		manifest := fmt.Sprintf(`{
   "migrationName": %q,
   "node": %q,
@@ -4477,7 +4506,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 }
 `, req.MigrationName, s.nodeName, time.Now().UTC().Format(time.RFC3339), err.Error())
 
-		if writeErr := os.WriteFile(manifestPath, []byte(manifest), 0o644); writeErr != nil {
+		if writeErr := os.WriteFile(manifestPath, []byte(manifest), 0o600); writeErr != nil {
 			return nil, fmt.Errorf("checkpoint fallback: cannot write manifest: %w", writeErr)
 		}
 
@@ -4511,7 +4540,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 				srcCfg := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s/config.json", stageTaskID)
 				dstCfg := filepath.Join(checkpointPath, "config.json")
 				if data, readErr := os.ReadFile(srcCfg); readErr == nil {
-					if wErr := os.WriteFile(dstCfg, data, 0o644); wErr != nil {
+					if wErr := os.WriteFile(dstCfg, data, 0o600); wErr != nil { // ADR-SEC-B N-342: 0600 (invariant 7)
 						log.Error(wErr, "Checkpoint: failed to stage config.json into checkpoint dir (raw CRIU path) — restore will fail", "dst", dstCfg)
 					} else {
 						log.Info("Checkpoint: staged config.json into checkpoint dir (raw CRIU path)", "dst", dstCfg, "taskID", stageTaskID)
@@ -4547,6 +4576,35 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		SeqSnapshots:        seqSnapshots,
 		FreezeTimestampNs:   freezeTimestampNs,
 	}, nil
+}
+
+// MigrationNodes implements authz.MigrationBinder (ADR-SEC-A §2.2.4). It reads the PodMigration
+// CR via the agent's cached k8s client and returns the source and destination node names so the
+// authz interceptor can bind a PEER_AGENT caller to a migration its node is actually party to.
+// found=false when there is no k8s client or the CR is absent (deny).
+func (s *AgentServer) MigrationNodes(ctx context.Context, migrationName string) (sourceNode, destNode string, found bool) {
+	if s.k8sClient == nil || migrationName == "" {
+		return "", "", false
+	}
+	ns := os.Getenv("POD_NAMESPACE")
+	if ns == "" {
+		ns = "podmotion-system"
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	pm := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(lookupCtx, types.NamespacedName{Name: migrationName, Namespace: ns}, pm); err != nil {
+		return "", "", false
+	}
+	src := pm.Status.SourceNodeName
+	dst := pm.Status.DestinationNodeName
+	if dst == "" {
+		dst = pm.Spec.DestinationNode
+	}
+	if dst == "" {
+		dst = pm.Spec.TargetNodeName
+	}
+	return src, dst, true
 }
 
 // upsertMigrationCheckpoint creates or updates the MigrationCheckpoint CR for this migration.
@@ -5303,7 +5361,7 @@ func (s *AgentServer) EstimateCheckpoint(ctx context.Context, req *agentpb.Estim
 // and extracts them into the migration's checkpoint directory on this (destination) node.
 // This implements the LAN cold-migration transfer path: the operator reads the source
 // checkpoint files (local on pm-control) and streams them here via gRPC unary call.
-func (s *AgentServer) PutCheckpointTar(_ context.Context, req *agentpb.PutCheckpointTarRequest) (*agentpb.PutCheckpointTarResponse, error) {
+func (s *AgentServer) PutCheckpointTar(ctx context.Context, req *agentpb.PutCheckpointTarRequest) (*agentpb.PutCheckpointTarResponse, error) {
 	if req.MigrationName == "" {
 		return &agentpb.PutCheckpointTarResponse{Success: false, Error: "migration_name required"}, nil
 	}
@@ -5311,91 +5369,222 @@ func (s *AgentServer) PutCheckpointTar(_ context.Context, req *agentpb.PutCheckp
 		return &agentpb.PutCheckpointTarResponse{Success: false, Error: "tar_data is empty"}, nil
 	}
 
-	// Stage on tmpfs (/run is tmpfs), root-only. Do NOT defer zeroize here — the Restore
-	// RPC reads these files after PutCheckpointTar returns. Zeroize is done by CleanupCheckpoint
-	// after restore completes (or by migration CR deletion finalizer).
-	destDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", req.MigrationName)
-	if err := os.MkdirAll(destDir, 0o700); err != nil {
-		return &agentpb.PutCheckpointTarResponse{Success: false, Error: fmt.Sprintf("mkdir %s: %v", destDir, err)}, nil
+	// ── ADR-SEC-B §2.3 verify-before-extract gate. Bytes reach the restore dir (final/) only
+	// after ALL checks pass, in cheap→expensive order. Decompression goes to a STAGING dir, not
+	// final/; staging is zeroized on every reject path.
+
+	// (1) ADR-SEC-A §2.3: on-wire size cap + gzip decompression bound (defense-in-depth; the gRPC
+	// MaxRecvMsgSize already rejected oversize frames before this handler).
+	if int64(len(req.TarData)) > grpclimits.MaxCheckpointTarBytes {
+		return nil, status.Errorf(codes.ResourceExhausted, "ADR-SEC-A: tar_data %d exceeds cap %d", len(req.TarData), grpclimits.MaxCheckpointTarBytes)
 	}
-	// Zeroize on extraction failure so partial checkpoint data doesn't linger.
-	extractOK := false
+
+	// (2) Wire-integrity (C-334): verify sha256(tar_data) BEFORE any decompression begins.
+	if req.TarSha256 == "" {
+		return nil, status.Error(codes.DataLoss, "ADR-SEC-B: tar_sha256 absent — refusing checkpoint without wire-integrity hash")
+	}
+	computed := provenance.SHA256Hex(req.TarData)
+	if computed != req.TarSha256 {
+		log.Error(nil, "ADR-SEC-B: PutCheckpointTar wire-hash mismatch — rejecting before decompress",
+			"migration", req.MigrationName, "expected", req.TarSha256, "computed", computed)
+		return nil, status.Errorf(codes.DataLoss, "ADR-SEC-B: tar wire-hash mismatch (expected %s, got %s)", req.TarSha256, computed)
+	}
+
+	// (3) Signature (C-332): verify manifest_sig over manifest using the operator public key,
+	// pinned via the trusted CA + operator SPIFFE ID.
+	if len(req.Manifest) == 0 || len(req.ManifestSig) == 0 {
+		return nil, status.Error(codes.PermissionDenied, "ADR-SEC-B: manifest or signature absent — refusing unverified checkpoint")
+	}
+	var manifest provenance.Manifest
+	if err := json.Unmarshal(req.Manifest, &manifest); err != nil {
+		return nil, status.Errorf(codes.PermissionDenied, "ADR-SEC-B: manifest decode: %v", err)
+	}
+	caPEM, caErr := os.ReadFile(agentCAPath())
+	if caErr != nil {
+		return nil, status.Errorf(codes.PermissionDenied, "ADR-SEC-B: read CA for operator-key pin: %v", caErr)
+	}
+	pub, pubErr := provenance.OperatorPublicKeyFromCA(caPEM, []byte(manifest.OperatorCertPEM))
+	if pubErr != nil {
+		log.Error(pubErr, "ADR-SEC-B: operator cert failed CA/SPIFFE pin — rejecting", "migration", req.MigrationName)
+		return nil, status.Errorf(codes.PermissionDenied, "ADR-SEC-B: operator key pin failed: %v", pubErr)
+	}
+	canonical, cErr := provenance.CanonicalJSON(&manifest)
+	if cErr != nil {
+		return nil, status.Errorf(codes.PermissionDenied, "ADR-SEC-B: canonicalize manifest: %v", cErr)
+	}
+	if !provenance.Verify(pub, canonical, req.ManifestSig) {
+		log.Error(nil, "ADR-SEC-B: manifest signature INVALID — rejecting checkpoint", "migration", req.MigrationName)
+		return nil, status.Error(codes.PermissionDenied, "ADR-SEC-B: manifest signature verification failed")
+	}
+	// set_digest must match the file set the signature commits to.
+	if manifest.SetDigest != provenance.ComputeSetDigest(manifest.Files) {
+		return nil, status.Error(codes.DataLoss, "ADR-SEC-B: manifest set_digest does not match file list")
+	}
+
+	// (5) Migration binding (anti-replay, §2.5): manifest.migration == req name AND
+	// manifest.migration_uid == the live PodMigration CR's UID. (Checked before extraction.)
+	if manifest.Migration != req.MigrationName {
+		return nil, status.Errorf(codes.PermissionDenied, "ADR-SEC-B: manifest migration %q != request %q", manifest.Migration, req.MigrationName)
+	}
+	if err := s.verifyMigrationUID(ctx, req.MigrationName, manifest.MigrationUID); err != nil {
+		log.Error(err, "ADR-SEC-B: migration_uid binding failed — rejecting (anti-replay)", "migration", req.MigrationName)
+		return nil, status.Errorf(codes.PermissionDenied, "ADR-SEC-B: migration_uid binding failed: %v", err)
+	}
+
+	// (4) Manifest↔tar binding + extraction to STAGING. Decompress to a staging dir, hash each
+	// extracted file, and require the extracted set to EXACTLY equal manifest.files.
+	stagingDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/staging", req.MigrationName)
+	_ = zeroizeDir(stagingDir) // clean any prior partial staging
+	if err := os.MkdirAll(stagingDir, 0o700); err != nil {
+		return &agentpb.PutCheckpointTarResponse{Success: false, Error: fmt.Sprintf("mkdir staging %s: %v", stagingDir, err)}, nil
+	}
+	stagingOK := false
 	defer func() {
-		if !extractOK {
-			_ = zeroizeDir(destDir)
+		if !stagingOK {
+			_ = zeroizeDir(stagingDir)
 		}
 	}()
 
-	// Decompress and extract tar.
 	gzr, err := gzip.NewReader(bytes.NewReader(req.TarData))
 	if err != nil {
-		return &agentpb.PutCheckpointTarResponse{Success: false, Error: fmt.Sprintf("gzip open: %v", err)}, nil
+		return nil, status.Errorf(codes.DataLoss, "ADR-SEC-B: gzip open: %v", err)
 	}
 	defer gzr.Close()
 
-	tr := tar.NewReader(gzr)
+	tr := tar.NewReader(io.LimitReader(gzr, grpclimits.MaxDecompressedTarBytes+1))
 	var bytesWritten int64
-	type fileEntry struct {
-		name  string
-		bytes int64
-	}
-	var manifest []fileEntry
+	extracted := map[string]int64{} // flat filename -> size
 	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
+		hdr, hErr := tr.Next()
+		if hErr == io.EOF {
 			break
 		}
-		if err != nil {
-			return &agentpb.PutCheckpointTarResponse{Success: false, Error: fmt.Sprintf("tar read: %v", err)}, nil
+		if hErr != nil {
+			return nil, status.Errorf(codes.DataLoss, "ADR-SEC-B: tar read: %v", hErr)
 		}
-
-		// Security: only allow plain files, no directory traversal.
 		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
 			continue
 		}
-		// Strip any leading path components — write all files flat into destDir.
+		// Path-traversal mitigation retained: write all files flat into stagingDir.
 		filename := filepath.Base(hdr.Name)
 		if filename == "" || filename == "." || filename == ".." {
 			continue
 		}
-
-		outPath := filepath.Join(destDir, filename)
-		f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
-		if err != nil {
-			return &agentpb.PutCheckpointTarResponse{Success: false, Error: fmt.Sprintf("create %s: %v", outPath, err)}, nil
+		outPath := filepath.Join(stagingDir, filename)
+		f, oErr := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
+		if oErr != nil {
+			return nil, status.Errorf(codes.Internal, "ADR-SEC-B: create %s: %v", outPath, oErr)
 		}
-		n, err := io.Copy(f, tr)
+		n, wErr := io.Copy(f, tr)
 		f.Close()
-		if err != nil {
-			return &agentpb.PutCheckpointTarResponse{Success: false, Error: fmt.Sprintf("write %s: %v", filename, err)}, nil
+		if wErr != nil {
+			return nil, status.Errorf(codes.Internal, "ADR-SEC-B: write %s: %v", filename, wErr)
 		}
 		bytesWritten += n
-		manifest = append(manifest, fileEntry{name: filename, bytes: n})
+		if bytesWritten > grpclimits.MaxDecompressedTarBytes {
+			return nil, status.Errorf(codes.ResourceExhausted, "ADR-SEC-B: decompressed size exceeds %d (gzip-bomb guard)", grpclimits.MaxDecompressedTarBytes)
+		}
+		extracted[filename] = n
 	}
 
-	extractOK = true // disarm the error-path zeroize defer
+	// Per-file digest + size verification against the signed manifest; set membership equality.
+	if len(extracted) != len(manifest.Files) {
+		return nil, status.Errorf(codes.DataLoss, "ADR-SEC-B: tar file count %d != manifest %d", len(extracted), len(manifest.Files))
+	}
+	for _, want := range manifest.Files {
+		gotSize, present := extracted[want.Name]
+		if !present {
+			return nil, status.Errorf(codes.DataLoss, "ADR-SEC-B: manifest file %q missing from tar", want.Name)
+		}
+		if gotSize != want.Size {
+			return nil, status.Errorf(codes.DataLoss, "ADR-SEC-B: file %q size %d != manifest %d", want.Name, gotSize, want.Size)
+		}
+		data, rErr := os.ReadFile(filepath.Join(stagingDir, want.Name))
+		if rErr != nil {
+			return nil, status.Errorf(codes.Internal, "ADR-SEC-B: re-read staged %q: %v", want.Name, rErr)
+		}
+		if got := provenance.SHA256Hex(data); got != want.SHA256 {
+			log.Error(nil, "ADR-SEC-B: per-file digest mismatch — rejecting checkpoint",
+				"migration", req.MigrationName, "file", want.Name, "expected", want.SHA256, "got", got)
+			return nil, status.Errorf(codes.DataLoss, "ADR-SEC-B: file %q digest mismatch", want.Name)
+		}
+	}
 
-	// Log per-file manifest so restore failures can pinpoint missing/empty images.
+	// (6) All checks passed. Atomically move staging → final/ and write the checkpoint-verified
+	// sentinel (0600) that the NRI restore gate (§2.6) and the socket-reattach path require.
+	destDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", req.MigrationName)
+	_ = zeroizeDir(destDir)
+	if err := os.Rename(stagingDir, destDir); err != nil {
+		return nil, status.Errorf(codes.Internal, "ADR-SEC-B: promote staging→final: %v", err)
+	}
+	stagingOK = true // staging is now final/ — disarm the staging zeroize defer
+	if err := os.WriteFile(filepath.Join(destDir, checkpointVerifiedSentinel), []byte(manifest.SetDigest), 0o600); err != nil {
+		// Sentinel write failure: fail closed (zeroize final so an unverified-but-present dir
+		// cannot be restored from). Source pod is never deleted pre-TrafficVerified (invariant 5).
+		_ = zeroizeDir(destDir)
+		return nil, status.Errorf(codes.Internal, "ADR-SEC-B: write verification sentinel: %v", err)
+	}
+
 	hasInventory := false
-	for _, e := range manifest {
-		log.Info("PutCheckpointTar: extracted file", "migration", req.MigrationName, "file", e.name, "bytes", e.bytes)
-		if e.name == "inventory.img" {
+	for name := range extracted {
+		if name == "inventory.img" {
 			hasInventory = true
 		}
 	}
 	if !hasInventory {
 		log.Error(nil, "PutCheckpointTar: inventory.img NOT in tar — CRIU restore will fail",
-			"migration", req.MigrationName, "fileCount", len(manifest))
+			"migration", req.MigrationName, "fileCount", len(extracted))
 	}
 
-	log.Info("PutCheckpointTar: extracted checkpoint images",
+	log.Info("ADR-SEC-B: PutCheckpointTar: extracted checkpoint images (provenance-verified)",
 		"migration", req.MigrationName,
 		"destDir", destDir,
-		"fileCount", len(manifest),
+		"fileCount", len(extracted),
 		"bytesWritten", bytesWritten,
 		"tarSize", len(req.TarData),
-		"hasInventory", hasInventory)
+		"hasInventory", hasInventory,
+		"migrationUID", manifest.MigrationUID)
 	return &agentpb.PutCheckpointTarResponse{Success: true, BytesWritten: bytesWritten}, nil
+}
+
+// checkpointVerifiedSentinel is the ADR-SEC-B §2.3 step 6 / §2.6 sentinel written into final/
+// after the provenance gate passes. The NRI restore path and the socket-reattach path refuse to
+// proceed without it.
+const checkpointVerifiedSentinel = "checkpoint-verified"
+
+// verifyMigrationUID checks the signed manifest's migration_uid matches the live PodMigration
+// CR's .metadata.uid (ADR-SEC-B §2.5 anti-replay). A nil k8s client cannot verify the binding —
+// fail closed.
+func (s *AgentServer) verifyMigrationUID(ctx context.Context, migrationName, manifestUID string) error {
+	if manifestUID == "" {
+		return fmt.Errorf("manifest migration_uid empty")
+	}
+	if s.k8sClient == nil {
+		return fmt.Errorf("no k8s client to verify migration_uid binding")
+	}
+	ns := os.Getenv("POD_NAMESPACE")
+	if ns == "" {
+		ns = "podmotion-system"
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	pm := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(lookupCtx, types.NamespacedName{Name: migrationName, Namespace: ns}, pm); err != nil {
+		return fmt.Errorf("read PodMigration CR: %w", err)
+	}
+	if string(pm.UID) != manifestUID {
+		return fmt.Errorf("manifest migration_uid %q != live CR UID %q (replay)", manifestUID, string(pm.UID))
+	}
+	return nil
+}
+
+// agentCAPath is the trusted CA bundle the agent uses to pin the operator signing cert
+// (ADR-SEC-B §2.1). Same ca.crt ADR-SEC-A mounts; no new secret.
+func agentCAPath() string {
+	if p := os.Getenv("PODMOTION_CA_FILE"); p != "" {
+		return p
+	}
+	return "/etc/podmotion/tls/ca.crt"
 }
 
 // GetCheckpointTar reads the checkpoint image directory on this (source) node and
@@ -5425,15 +5614,22 @@ func (s *AgentServer) GetCheckpointTar(_ context.Context, req *agentpb.GetCheckp
 		}, nil
 	}
 
+	// ADR-SEC-B §2.3 (C-334): compute the source-side hash of the EXACT gzip tar bytes returned so
+	// the destination can verify wire-integrity before decompress, and the operator forwards it
+	// unchanged (catching controller-memory corruption between Get and Put).
+	tarSha256 := provenance.SHA256Hex(tarData)
+
 	log.Info("GetCheckpointTar: checkpoint packaged (source intact until ReleaseCheckpoint)",
 		"migration", req.MigrationName,
 		"srcDir", srcDir,
-		"tarSizeBytes", len(tarData))
+		"tarSizeBytes", len(tarData),
+		"tarSha256", tarSha256)
 
 	return &agentpb.GetCheckpointTarResponse{
 		Success:   true,
 		TarData:   tarData,
 		BytesRead: int64(len(tarData)),
+		TarSha256: tarSha256,
 	}, nil
 }
 

@@ -17,6 +17,12 @@ operator:
     limits:
       cpu: 500m
       memory: 512Mi
+  # ADR-SEC-A §2.1 / ADR-SEC-B §2.1: operator mTLS client cert (also the checkpoint signing key).
+  # The operator fails closed without it. Default true (fail-closed).
+  tls:
+    agentClient:
+      enabled: true
+      secretName: podmotion-operator-agent-client-tls
 
 agent:
   image:
@@ -32,6 +38,12 @@ agent:
     limits:
       cpu: 500m
       memory: 256Mi
+  # ADR-SEC-A §2.1 (C-330): agent mTLS material. Default true — fail-closed. Mounted at
+  # /etc/podmotion/tls/{tls.crt,tls.key,ca.crt}. Without it the agent refuses to start (default
+  # build) rather than serving plaintext on the privileged host-network :9090.
+  tls:
+    enabled: true
+    secretName: podmotion-agent-tls
 
 checkpoint:
   # registry: use an in-cluster OCI registry for checkpoint staging (cross-AZ / cross-cluster)
