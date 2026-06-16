@@ -460,7 +460,7 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 			// help says "ignore this mountpoint when dumping the mount namespace"). It has no
 			// effect on the restore-side compat-mode umount pass. /sys is skipped at dump via
 			// skipMnts; compat-mode is disabled (MntnsCompatMode=false) to avoid the umount pass.
-			"/run/secrets/kubernetes.io/serviceaccount",
+			"/var/run/secrets/kubernetes.io/serviceaccount",
 			// Additional containerd/runc-injected proc submounts that CRIU autodetects as
 			// external mounts with a (null) source on restore (mount.c:3120). These are
 			// re-provided by the destination runtime's own bundle, so skipping them on
