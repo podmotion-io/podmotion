@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgnutls30 \
     ca-certificates \
     iproute2 \
+    iptables \
     python3 \
     python3-protobuf \
   && rm -rf /var/lib/apt/lists/*
