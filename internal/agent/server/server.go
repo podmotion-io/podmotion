@@ -2520,7 +2520,9 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 
 	// ADR-0181: launch podmotion-criu-wrapper instead of criu directly.
 	// wrapperArgs: wrapper binary, per-fd --cgroup-fd=N:path flags, separator, criu binary+args.
-	wrapperArgs := append([]string{"/usr/local/bin/podmotion-criu-wrapper"}, cgroupFdMapArgs...)
+	// ADR-0183 r1: wrapper installed to PodMotion-owned non-PATH dir (/opt/podmotion/bin),
+	// not host system PATH (/usr/local/bin). Path resolves against host mount namespace via nsenter.
+	wrapperArgs := append([]string{"/opt/podmotion/bin/podmotion-criu-wrapper"}, cgroupFdMapArgs...)
 	wrapperArgs = append(wrapperArgs, "--", "/usr/sbin/criu")
 	wrapperArgs = append(wrapperArgs, criuArgs...)
 	criuCmd := nsenterCmd(wrapperArgs...)
