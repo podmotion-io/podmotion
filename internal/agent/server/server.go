@@ -3238,6 +3238,12 @@ func mountCgroupfsIntoRootfs(rootfsPath string) error {
 		// non-fatal on remount failure — log and continue; rbind already provides CRIU access
 		log.Info("mountCgroupfsIntoRootfs: remount ro failed (non-fatal)", "err", err, "output", string(out))
 	}
+	// ADR-0184 post-bind assertion (ADR-0186): cpu.max must be visible after the bind.
+	// Converts a racy ENOENT inside CRIU (files-reg.c:2353) into a clear agent-side failure.
+	cpuMaxPath := filepath.Join(target, "cpu.max")
+	if out, err := nsenterCmd("test", "-f", cpuMaxPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("mountCgroupfsIntoRootfs: cpu.max not visible after bind at %s: %w: %s", cpuMaxPath, err, out)
+	}
 	return nil
 }
 
@@ -3281,23 +3287,20 @@ func setupRestoreOverlayfs(migrationName, checkpointDir, imageName, containerID 
 			for _, line := range strings.Split(string(mountsData), "\n") {
 				fields := strings.Fields(line)
 				if len(fields) >= 3 && fields[1] == containerRootfs && fields[2] == "overlay" {
-					// Overlay is mounted. Verify image content via nsenterCmd (host namespace).
-					hasImageContent := false
-					for _, probe := range []string{"usr", "bin", "lib", "sbin"} {
-						probeOut, probeErr := nsenterCmd("test", "-d", filepath.Join(containerRootfs, probe)).Output()
-						_ = probeOut
-						if probeErr == nil {
-							hasImageContent = true
-							break
-						}
-					}
+					// ADR-0186: non-empty ls-A replaces fixed allowlist — works for distroless/symlink
+					// layouts where test -d {usr,bin,lib,sbin} is a false negative. A mounted overlay
+					// with ≥1 top-level entry IS the real image rootfs (mirrors the placeholder path's
+					// own readiness check below). Use the SAME acceptance criterion on both paths.
+					lsOut, lsErr := nsenterCmd("ls", "-A", containerRootfs).Output()
+					hasImageContent := lsErr == nil && len(strings.TrimSpace(string(lsOut))) > 0
 					if hasImageContent {
 						log.Info("setupRestoreOverlayfs: using replacement container bundle rootfs directly (ADR-0151)",
 							"containerID", containerID, "rootfs", containerRootfs)
 						return containerRootfs, nil
 					}
 					log.Info("setupRestoreOverlayfs: replacement container rootfs overlay found but image content not visible — falling back to placeholder",
-						"containerID", containerID, "rootfs", containerRootfs)
+						"containerID", containerID, "rootfs", containerRootfs,
+						"lsErr", lsErr, "lsOut", strings.TrimSpace(string(lsOut)))
 					break
 				}
 			}
