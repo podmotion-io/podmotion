@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -81,6 +82,13 @@ const (
 	// conditionRestoreTimedOut is set when the restore deadline elapses, driving
 	// the migration to RollingBack (ADR-0157 D3/GC-32). Reason: RestoreDeadlineExceeded.
 	conditionRestoreTimedOut = "RestoreTimedOut"
+	// conditionDataplaneReachabilityVerified (ADR-0210) is the authoritative cross-node
+	// reachability gate. The CONTROLLER sets it True only after a source-node agent
+	// (a node != destination) dials the preserved pod IP and reads back a controller-issued
+	// nonce echoed by the destination — proving the real overlay/host-route datapath is live.
+	// It REPLACES TrafficVerified as the necessary predicate for source-pod deletion under
+	// Strict. Mirrors pmv1.ConditionDataplaneReachabilityVerified.
+	conditionDataplaneReachabilityVerified = pmv1.ConditionDataplaneReachabilityVerified
 )
 
 // macWritebackDeadline tracks the first time injectIPHandoff observed
@@ -1121,13 +1129,45 @@ func (r *PodMigrationReconciler) reconcileTCPVerifying(ctx context.Context, pm *
 			"VerifiedPostRestore", "Socket inventory confirmed via VerifyTCP post-restore snd_nxt/rcv_nxt comparison")
 	}
 
-	connMsg := fmt.Sprintf("TCP sequence continuity verified: %d/%d connections snd_nxt/rcv_nxt within ±MSS",
-		vtcpResp.ConnectionsVerified, vtcpResp.ConnectionsExpected)
+	// ADR-0210: the MEASURED per-direction seqDelta now flows from the agent's VerifyTCP
+	// response (no longer a hard-coded literal 0). Take the larger of the two directions as
+	// the reported delta. Under Strict, a non-zero measured delta is a North Star violation
+	// and FAILS verification (the prior code asserted seq_delta=0 unconditionally, making the
+	// claim unfalsifiable).
+	measuredSeqDelta := vtcpResp.SndSeqDeltaMax
+	if vtcpResp.RcvSeqDeltaMax > measuredSeqDelta {
+		measuredSeqDelta = vtcpResp.RcvSeqDeltaMax
+	}
+	// Persist the measured value so the seq_delta gauge in reconcileServiceVerifying reads the
+	// real number instead of fabricating 0.
+	if pm.Annotations == nil {
+		pm.Annotations = make(map[string]string)
+	}
+	pm.Annotations["podmotion.io/measured-seq-delta"] = fmt.Sprintf("%d", measuredSeqDelta)
+	if aErr := r.Update(ctx, pm); aErr != nil {
+		log.Error(aErr, "TCPVerifying: failed to persist measured seq-delta annotation (non-fatal)", "migration", pm.Name)
+	}
+
+	if measuredSeqDelta != 0 && pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict {
+		msg := fmt.Sprintf("ADR-0210: Strict mode requires seq_delta=0 but measured snd=%d rcv=%d (max=%d) — failing verification",
+			vtcpResp.SndSeqDeltaMax, vtcpResp.RcvSeqDeltaMax, measuredSeqDelta)
+		log.Error(nil, msg, "migration", pm.Name)
+		setCondition(pm, pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionFalse,
+			"NonZeroSeqDelta", msg)
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
+		return r.initiateRollback(ctx, pm, msg)
+	}
+
+	connMsg := fmt.Sprintf("TCP sequence continuity verified: %d/%d connections snd_nxt/rcv_nxt within ±MSS (ADR-0210 measured seq_delta: snd=%d rcv=%d)",
+		vtcpResp.ConnectionsVerified, vtcpResp.ConnectionsExpected, vtcpResp.SndSeqDeltaMax, vtcpResp.RcvSeqDeltaMax)
 	if vtcpResp.AppProbeOk {
 		connMsg += fmt.Sprintf("; %s probe OK", pm.Spec.ApplicationProbe.Protocol)
 	}
 	log.Info("TCPVerifying: sequence continuity confirmed", "migration", pm.Name,
-		"verified", vtcpResp.ConnectionsVerified, "expected", vtcpResp.ConnectionsExpected)
+		"verified", vtcpResp.ConnectionsVerified, "expected", vtcpResp.ConnectionsExpected,
+		"measuredSndSeqDelta", vtcpResp.SndSeqDeltaMax, "measuredRcvSeqDelta", vtcpResp.RcvSeqDeltaMax)
 	setCondition(pm, pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionTrue,
 		"SequenceContinuityVerified", connMsg)
 	if err := r.statusUpdate(ctx, pm); err != nil {
@@ -1141,7 +1181,11 @@ func (r *PodMigrationReconciler) reconcileTCPVerifying(ctx context.Context, pm *
 func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionTrafficVerified) {
+	// ADR-0210: the prior short-circuit (TrafficVerified=True => jump to CutoverComplete) is
+	// REMOVED — TrafficVerified is no longer a sufficient gate (it was set by the tautological
+	// self-probe). Advance only when the AUTHORITATIVE cross-node DataplaneReachabilityVerified
+	// is True; otherwise fall through to the real HTTP/endpoint verifier below.
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionDataplaneReachabilityVerified) {
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
 	}
 
@@ -1214,12 +1258,20 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 		return ctrl.Result{}, err
 	}
 
-	// M26: emit seq_delta gauge at TrafficVerified=True.
-	// seq_delta is the net TCP sequence advancement across the migration window.
-	// North Star target is 0 (ADR-0049 §seq_delta=0). When VerifyTCP confirmed
-	// continuity the observed delta across all verified connections is 0 — any
-	// non-zero advancement is visible via the VerifyTCP failure path above.
+	// M26 / ADR-0210: emit seq_delta gauge from the MEASURED value persisted by
+	// reconcileTCPVerifying (podmotion.io/measured-seq-delta), NOT a hard-coded literal 0.
+	// The North Star claim (seq_delta=0) is now FALSIFIABLE: the gauge reports whatever
+	// VerifyTCP actually measured. Strict mode already failed above on any non-zero value.
 	seqDelta := 0.0
+	if raw, ok := pm.Annotations["podmotion.io/measured-seq-delta"]; ok {
+		if v, perr := strconv.ParseFloat(raw, 64); perr == nil {
+			seqDelta = v
+		} else {
+			log.Error(perr, "ServiceVerifying: could not parse measured-seq-delta annotation — gauge may be stale", "migration", pm.Name, "raw", raw)
+		}
+	} else {
+		log.Info("ServiceVerifying: ADR-0210 measured-seq-delta annotation absent (TCP verify may have been skipped) — gauge reports 0", "migration", pm.Name)
+	}
 	cniPlugin := pm.Status.CNIProvider
 	if cniPlugin == "" {
 		cniPlugin = "unknown"
@@ -1279,7 +1331,17 @@ func (r *PodMigrationReconciler) reconcileCutoverComplete(ctx context.Context, p
 			log.Error(fetchErr, "CutoverComplete: failed to re-fetch PodMigration before source pod deletion — requeuing for safety", "migration", pm.Name)
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		if !meta.IsStatusConditionTrue(freshPM.Status.Conditions, conditionTrafficVerified) {
+		// ADR-0210: DataplaneReachabilityVerified=True is now the NECESSARY predicate for
+		// source-pod deletion under Strict (TrafficVerified is demoted to a non-gating pre-check
+		// — it was set by the tautological self-probe and no longer proves off-node reachability).
+		// For Strict, require the cross-node gate. For BestEffort/None (no Strict guarantee),
+		// TrafficVerified remains the legacy pre-check so non-Strict cold/stateless flows proceed.
+		if freshPM.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict {
+			if !meta.IsStatusConditionTrue(freshPM.Status.Conditions, conditionDataplaneReachabilityVerified) {
+				log.Error(nil, "CutoverComplete: SAFETY BLOCK — DataplaneReachabilityVerified is not True (ADR-0210 cross-node gate); refusing to delete source pod", "migration", pm.Name)
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
+		} else if !meta.IsStatusConditionTrue(freshPM.Status.Conditions, conditionTrafficVerified) {
 			log.Error(nil, "CutoverComplete: SAFETY BLOCK — TrafficVerified is not True; refusing to delete source pod (ADR-0012)", "migration", pm.Name)
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
@@ -2147,9 +2209,9 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 	// ADR-0185 C7: This transitionTo(Restoring) is dead code on the 12-phase path —
 	// reconcileFinalFreezeStateCapture (the 12-phase delegator) returns early via OverlayHandoff
 	// delegation, bypassing this line, so Restoring is reached only after conditionVXLANFDBUpdated.
-	// Left in place; guarded by the P-VERIFY-NRI-PHASE-ORDER invariant asserting Restoring is only
-	// reachable post-conditionVXLANFDBUpdated (a C3 regression firing this tail before OverlayHandoff
-	// would be caught by that contract test, since OverlayHandoff is NOT in the NRI accept-set under
+	// Left in place; a contract test asserts Restoring is only reachable
+	// post-conditionVXLANFDBUpdated (a regression firing this tail before OverlayHandoff
+	// would be caught by that test, since OverlayHandoff is NOT in the NRI accept-set under
 	// Option B). See ADR-0185 r1.
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoring)
 }
@@ -2817,16 +2879,14 @@ func (r *PodMigrationReconciler) injectIPHandoff(ctx context.Context, pm *pmv1.P
 		log.Info("injectIPHandoff: destination VTEP MAC", "migration", pm.Name, "destVTEPMAC", resp.DestVtepMac)
 	}
 
-	// Decision 5: reachability probe gates TrafficVerified for the pinned pod-IP path.
+	// ADR-0210a: the agent's in-netns ProbeOk is now a DEMOTED, advisory LOCAL PRE-CHECK —
+	// it no longer gates the handoff, TrafficVerified, or deletion. It was a tautology (dial
+	// of an lo/32-aliased IP inside the same netns always returned RST). We log it for
+	// diagnostics but do NOT requeue on a failed pre-check; the authoritative gate is the
+	// cross-node DataplaneReachabilityVerified set below.
 	if !resp.ProbeOk {
-		log.Info("injectIPHandoff: reachability probe to oldPodIP failed — requeuing (do not disarm, source held)",
+		log.Info("injectIPHandoff: ADR-0210a in-netns local pre-check did not pass (advisory only — cross-node gate is authoritative)",
 			"migration", pm.Name, "oldPodIP", pm.Spec.SourcePodIP, "probeOutput", resp.ProbeOutput)
-		setCondition(pm, conditionIPHandoffInjected, metav1.ConditionFalse, "ProbeFailed",
-			fmt.Sprintf("ping %s from destination node failed: %s", pm.Spec.SourcePodIP, resp.ProbeOutput))
-		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
-			return ctrl.Result{}, sErr, false
-		}
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
 	}
 
 	// ADR-0136: now that the destination handoff is proven (probe passed), install the
@@ -2859,16 +2919,118 @@ func (r *PodMigrationReconciler) injectIPHandoff(ctx context.Context, pm *pmv1.P
 		}
 	}
 
-	log.Info("injectIPHandoff: handoff injected and reachability probe passed (ADR-0133 AC1)",
+	log.Info("injectIPHandoff: handoff injected (ADR-0133 AC1)",
 		"migration", pm.Name, "oldPodIP", pm.Spec.SourcePodIP)
 	setCondition(pm, conditionIPHandoffInjected, metav1.ConditionTrue, "Injected",
-		fmt.Sprintf("OLD pod IP %s reachable at replacement veth %s on %s; ping probe passed (ADR-0133 D2/D5)",
+		fmt.Sprintf("OLD pod IP %s installed at replacement veth %s on %s (ADR-0133 D2)",
 			pm.Spec.SourcePodIP, pm.Status.ReplVethMAC, destNode))
-	// The L3 reachability of the OLD pod IP is proven — set TrafficVerified=True for the
-	// pinned-IP client. The Service-path verifier below remains a backstop but is now
-	// short-circuited because trafficVerified will read True on the next reconcile.
-	setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "TrafficVerified",
-		fmt.Sprintf("OLD pod IP %s reachable at replacement pod (ADR-0133 reachability probe)", pm.Spec.SourcePodIP))
+	// ADR-0210: TrafficVerified is DEMOTED to a non-gating PRE-CHECK. The IP handoff is
+	// installed; that is necessary but NOT sufficient (it does not prove an off-node client
+	// can reach the IP). The authoritative gate is the cross-node DataplaneReachabilityVerified
+	// established in verifyDataplaneReachability below. TrafficVerified=True here only records
+	// that the local handoff completed; it no longer permits deletion on its own (see the
+	// deletion gates re-pointed to DataplaneReachabilityVerified).
+	setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "HandoffInstalled",
+		fmt.Sprintf("OLD pod IP %s installed at replacement pod (ADR-0210 non-gating pre-check)", pm.Spec.SourcePodIP))
+
+	// ADR-0210: authoritative cross-node reachability. The CONTROLLER drives a nonce round-trip:
+	// (1) ask the DEST agent to open an in-netns echo listener bound to the preserved IP,
+	// (2) ask a SOURCE-node agent (node != dest) to dial it cross-node and read the nonce back.
+	// DataplaneReachabilityVerified is set True ONLY on a matched nonce — the source agent
+	// cannot synthesize success, and the IP-handoff alone cannot fake an off-node datapath.
+	if res, err, done := r.verifyDataplaneReachability(ctx, pm, destNode); !done {
+		return res, err, false
+	}
+	return ctrl.Result{}, nil, true
+}
+
+// verifyDataplaneReachability performs the ADR-0210 cross-node nonce round-trip and sets
+// conditionDataplaneReachabilityVerified. The controller is the authority. done=false means
+// requeue (not yet verified, source held); done=true means the condition was set True.
+func (r *PodMigrationReconciler) verifyDataplaneReachability(ctx context.Context, pm *pmv1.PodMigration, destNode string) (ctrl.Result, error, bool) {
+	log := logf.FromContext(ctx)
+
+	srcNode := pm.Status.SourceNodeName
+	if srcNode == "" || srcNode == destNode {
+		// No node != dest vantage available (single-node / source already gone). Cannot prove
+		// cross-node reachability — do NOT set the condition True; hold the source (ADR-0012).
+		log.Error(nil, "ADR-0210: no source-node vantage (node != dest) for cross-node probe — holding source, requeuing",
+			"migration", pm.Name, "srcNode", srcNode, "destNode", destNode)
+		setCondition(pm, conditionDataplaneReachabilityVerified, metav1.ConditionFalse, "NoCrossNodeVantage",
+			"ADR-0210: no node != destination available to originate the cross-node probe")
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr, false
+		}
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil, false
+	}
+
+	// Controller-issued correlation nonce — destination must echo it back through the dialed
+	// listener. Bound to the migration UID + a monotonic timestamp; the source agent cannot
+	// synthesize this value (Security-C3).
+	nonce := fmt.Sprintf("adr0210-%s-%d", pm.UID, time.Now().UnixNano())
+	const probePort = 7350
+
+	// Step 1: open the in-netns nonce-echo listener on the DESTINATION agent.
+	destAgent, err := r.AgentPool.ForNode(ctx, destNode)
+	if err != nil {
+		log.Error(err, "ADR-0210: cannot connect to destination agent for echo listener — requeuing", "migration", pm.Name, "destNode", destNode)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
+	}
+	echoResp, echoErr := destAgent.StartReachabilityEcho(ctx, &agentpb.StartReachabilityEchoRequest{
+		MigrationName: pm.Name,
+		ListenIp:      pm.Spec.SourcePodIP,
+		ListenPort:    probePort,
+		Nonce:         nonce,
+		TtlS:          15,
+	})
+	if echoErr != nil || echoResp == nil || !echoResp.Started {
+		detail := ""
+		if echoResp != nil {
+			detail = echoResp.Detail
+		}
+		log.Error(echoErr, "ADR-0210: destination echo listener not started — requeuing", "migration", pm.Name, "detail", detail)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
+	}
+
+	// Step 2: dial cross-node from the SOURCE-node agent and require the nonce round-trip.
+	srcAgent, err := r.AgentPool.ForNode(ctx, srcNode)
+	if err != nil {
+		log.Error(err, "ADR-0210: cannot connect to source agent for cross-node probe — requeuing", "migration", pm.Name, "srcNode", srcNode)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
+	}
+	probeResp, probeErr := srcAgent.ProbeDataplaneReachability(ctx, &agentpb.ProbeDataplaneReachabilityRequest{
+		MigrationName: pm.Name,
+		TargetIp:      pm.Spec.SourcePodIP,
+		TargetPort:    probePort,
+		ExpectedNonce: nonce,
+		TimeoutS:      5,
+	})
+	if probeErr != nil || probeResp == nil || !probeResp.Reachable {
+		detail := ""
+		egress := ""
+		if probeResp != nil {
+			detail = probeResp.Detail
+			egress = probeResp.EgressDev
+		}
+		log.Error(probeErr, "ADR-0210: cross-node reachability NOT verified (nonce round-trip failed) — holding source, requeuing",
+			"migration", pm.Name, "srcNode", srcNode, "destNode", destNode, "egressDev", egress, "detail", detail)
+		setCondition(pm, conditionDataplaneReachabilityVerified, metav1.ConditionFalse, "CrossNodeUnreachable",
+			fmt.Sprintf("ADR-0210: cross-node probe from %s to %s failed nonce round-trip (egressDev=%s): %s",
+				srcNode, pm.Spec.SourcePodIP, egress, detail))
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr, false
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
+	}
+
+	log.Info("ADR-0210: cross-node DataplaneReachability VERIFIED via controller-authority nonce round-trip",
+		"migration", pm.Name, "srcNode", srcNode, "destNode", destNode, "egressDev", probeResp.EgressDev)
+	setCondition(pm, conditionDataplaneReachabilityVerified, metav1.ConditionTrue, "CrossNodeReachable",
+		fmt.Sprintf("ADR-0210: preserved IP %s reachable cross-node from %s (egressDev=%s); controller-issued nonce round-trip OK",
+			pm.Spec.SourcePodIP, srcNode, probeResp.EgressDev))
+	if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+		return ctrl.Result{}, sErr, false
+	}
 	return ctrl.Result{}, nil, true
 }
 
@@ -2899,10 +3061,12 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 		}
 
 		// Drive verification: call the TrafficVerifier and set the condition.
-		// Skip if the ADR-0133 reachability probe already set TrafficVerified=True
-		// (the OLD pod IP is reachable at the replacement — the strongest proof).
-		if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionTrafficVerified) {
-			log.Info("Verifying: TrafficVerified already set by ADR-0133 IP handoff probe — skipping service-path verifier",
+		// ADR-0210: the short-circuit now keys on the AUTHORITATIVE cross-node gate
+		// (DataplaneReachabilityVerified), not the demoted TrafficVerified self-probe. The
+		// service-path verifier is skipped only when the cross-node nonce round-trip has
+		// already proven the OLD pod IP reachable off-node — the strongest proof.
+		if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionDataplaneReachabilityVerified) {
+			log.Info("Verifying: DataplaneReachabilityVerified set by ADR-0210 cross-node probe — skipping service-path verifier",
 				"migration", pm.Name)
 		} else if r.TrafficVerifier != nil {
 			// Build verify request with correct pod names and IPs.
@@ -3002,20 +3166,28 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// ADR-0012 defensive re-fetch: re-read TrafficVerified from API before any source pod deletion.
-	// In-memory pm.Status may be stale; the authoritative state is in etcd.
-	log.Info("Verifying: re-fetching PodMigration from API for ADR-0012 safety check", "migration", pm.Name)
+	// ADR-0012 + ADR-0210 defensive re-fetch: re-read the authoritative conditions from the API
+	// before any source pod deletion. In-memory pm.Status may be stale; etcd is authoritative.
+	log.Info("Verifying: re-fetching PodMigration from API for ADR-0012/ADR-0210 safety check", "migration", pm.Name)
 	{
 		freshPM := &pmv1.PodMigration{}
 		if fetchErr := r.Get(ctx, client.ObjectKeyFromObject(pm), freshPM); fetchErr != nil {
 			log.Error(fetchErr, "Verifying: failed to re-fetch PodMigration before source pod deletion — requeuing for safety (ADR-0012)", "migration", pm.Name)
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		if !meta.IsStatusConditionTrue(freshPM.Status.Conditions, conditionTrafficVerified) {
+		// ADR-0210: under Strict, DataplaneReachabilityVerified=True (cross-node nonce round-trip)
+		// is the necessary deletion predicate; TrafficVerified is a demoted non-gating pre-check.
+		// Non-Strict modes retain the legacy TrafficVerified gate.
+		if freshPM.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict {
+			if !meta.IsStatusConditionTrue(freshPM.Status.Conditions, conditionDataplaneReachabilityVerified) {
+				log.Error(nil, "Verifying: SAFETY BLOCK — DataplaneReachabilityVerified is not True on re-fetch (ADR-0210 cross-node gate); refusing to delete source pod", "migration", pm.Name)
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
+			log.Info("Verifying: ADR-0210 re-fetch confirmed DataplaneReachabilityVerified=True — proceeding to source pod deletion", "migration", pm.Name)
+		} else if !meta.IsStatusConditionTrue(freshPM.Status.Conditions, conditionTrafficVerified) {
 			log.Error(nil, "Verifying: SAFETY BLOCK — TrafficVerified is not True on re-fetch; refusing to delete source pod (ADR-0012)", "migration", pm.Name)
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
-		log.Info("Verifying: ADR-0012 re-fetch confirmed TrafficVerified=True — proceeding to source pod deletion", "migration", pm.Name)
 	}
 
 	sourcePod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
@@ -3077,7 +3249,7 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 	// instant the migration completes. So, like the source redirect, it persists for the life
 	// of the replacement pod and is retired only when the OLD IP is reclaimed by IPAM via the
 	// DisarmTCRedirect RPC (r.disarmTCRedirect). It is intentionally NOT called in the
-	// steady-state cutover completion. (Quorum R1/Lead: keep reachability.)
+	// steady-state cutover completion, to keep the OLD IP reachable.
 
 	// ADR-0015 overlap-then-delete: now that TrafficVerified=True and source is deleted,
 	// remove the source pod IP from EndpointSlices. The destination IP was added in
@@ -3666,7 +3838,7 @@ func (r *PodMigrationReconciler) reserveDestinationCapacity(ctx context.Context,
 // checkpoint-ref annotation so the pod waits at PodSchedulingGated until the
 // controller removes the gate post-transfer.
 //
-// Quorum requirements (Architecture Sprint 1 review):
+// Required invariants for the replacement pod:
 //   - ownerRef → PodMigration CR (not Deployment/RS — workload controller must not see this pod)
 //   - Selector labels stripped (pod-template-hash and any RS selector key) so the ReplicaSet
 //     controller does not count the gated clone against its desired replica count
@@ -3758,7 +3930,7 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	// args, relying on the workload binary to implement a park-first/no-bind branch. This is SILENT
 	// for arbitrary third-party images (e.g. stock redis:7-alpine rejects --podmotion-holder as an
 	// unknown config directive and exits non-zero before binding, causing sk-inet.c:1059 EADDRINUSE
-	// when CRIU tries to restore the TCP_LISTEN socket — ADR-0195 §P-MECHANISM M6).
+	// when CRIU tries to restore the TCP_LISTEN socket — ADR-0195).
 	//
 	// ADR-0195 Rule A replaces the workload-entrypoint-dependent approach with a universal injected
 	// no-op holder binary that:
@@ -3769,7 +3941,7 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	//   4. Never binds any port, writes /run/podmotion/holder-ready, prints "podmotion-holder ready"
 	//      to stdout, and is SIGTERM-clean (ADR-0176 C2 readiness-sentinel contract).
 	//
-	// §3h-SYM removal-symmetry: hack/gate-workload/main.go retains --podmotion-holder for
+	// Removal symmetry: hack/gate-workload/main.go retains --podmotion-holder for
 	// standalone testing; the operator no longer passes it. validateNoEmptyDir is scoped to the
 	// SOURCE pod (see below); the holder emptyDir is on the REPLACEMENT pod (different lifecycle).
 
@@ -3782,7 +3954,7 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	// agentImage is the agent image from which the holder binary is sourced. The init-container
 	// uses the same image as the agent DaemonSet pod running on the destination node (always
 	// present in the node's image store after ImagePullPolicy=Never kind-load or registry pull).
-	// Engineering C1 (quorum): init-container source image is the agent DaemonSet image;
+	// Engineering note: init-container source image is the agent DaemonSet image;
 	// exact holder binary path is /podmotion/holder (built by make build-linux → Dockerfile COPY).
 	// We derive the image from the operator's own image by convention; in a production deployment
 	// this would be set from the Helm agent.image values. For now the init-container image is
@@ -3796,7 +3968,7 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	// Never, sprint-tagged images) and silently masked the misconfiguration as ImagePullBackOff.
 	agentImage := os.Getenv("AGENT_IMAGE")
 	if agentImage == "" {
-		// fail loudly — never fabricate an image string (see ADR-0196 §3h-SYM).
+		// fail loudly — never fabricate an image string (see ADR-0196).
 		return fmt.Errorf("AGENT_IMAGE env not set on operator Deployment: cannot resolve holder init-container image (ADR-0195 Rule A / ADR-0196); set agent.image via Helm")
 	}
 	// Init-container pull policy must match how the agent image reached the node: Never on
@@ -3855,7 +4027,7 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	// the holder is the container init that CRIU restores OVER.
 	for i := range spec.Containers {
 		// ADR-0195 Rule A: set Command to the injected holder; clear Args (the holder takes none).
-		// §3h-SYM: --podmotion-holder is NO LONGER appended here. The flag-append path is REMOVED.
+		// Removal symmetry: --podmotion-holder is NO LONGER appended here. The flag-append path is REMOVED.
 		spec.Containers[i].Command = []string{holderBinPath}
 		spec.Containers[i].Args = nil
 		// Mount the holder emptyDir so the binary resolves at holderBinPath inside the container.
