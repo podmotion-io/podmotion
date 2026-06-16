@@ -996,31 +996,41 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 	// Decision 5: in-node reachability probe — TCP L4 dial to the OLD pod IP.
 	// ADR-0192 R2: replaced exec ping (absent on kind nodes, requires CAP_NET_RAW) with
 	// net.DialTimeout (no binary dependency, no capability required). A TCP SYN-ACK or
-	// RST both confirm the IP is routable on this node; ECONNREFUSED is also a success
-	// (the kernel responded — the IP is live). Only a network-level timeout is a failure.
+	// RST both confirm the IP is routable; ECONNREFUSED is also a success (the kernel
+	// responded — the IP is live). Only a network-level timeout is a failure.
+	//
+	// ADR-0200 D1: the dial is anchored INSIDE the replacement pod netns, not the agent's
+	// host netns. On the kindnet host-routed substrate the OLD IP is owned (ADR-0138 M7)
+	// only inside the pod's eth0; a host-netns dial is on the wrong datapath (the ingress-
+	// only M3 mirred redirect cannot carry a host-locally-originated SYN onto the pod veth),
+	// so it always times out. Dialing from where the IP is owned returns RST → ProbeOk.
+	// The probe PORT (:7) and the RST=success semantics are UNCHANGED (ADR-0200 D3); only
+	// the dial's execution netns changes. The in-netns dial reuses the established in-tree
+	// nsenter --net=/proc/<replPID>/ns/net idiom (no new external binary, ADR-0200 D1 (i)),
+	// re-executing this same agent binary's __inetns_probe helper subcommand.
 	if req.Probe {
-		probeAddr := net.JoinHostPort(req.OldPodIp, "7") // port 7 (echo); RST confirms IP live
-		conn, perr := net.DialTimeout("tcp", probeAddr, 2*time.Second)
-		if conn != nil {
-			conn.Close()
-		}
-		// ECONNREFUSED = RST = IP is reachable (no listener, but the kernel responded).
-		// Any syscall.ECONNREFUSED (or its wrapped form) is a probe success.
-		probeOk := perr == nil
-		if perr != nil {
-			if isConnRefused(perr) {
-				probeOk = true
-			}
-		}
-		resp.ProbeOutput = ""
-		if perr != nil {
-			resp.ProbeOutput = perr.Error()
-		}
-		resp.ProbeOk = probeOk
-		if !probeOk {
-			log.Info("InjectIPHandoff: reachability probe failed", "oldPodIP", req.OldPodIp, "err", perr)
+		// ADR-0200 D1: resolve the replacement PID (already resolved earlier in this RPC for
+		// the M3 redirect install at server.go:919 — same lookup, no new failure surface).
+		replPID := s.restoredPIDForMigration(ctx, req.MigrationName)
+		if replPID <= 0 {
+			// ADR-0200 D4: PID-unresolved defers to requeue exactly as the M3 redirect install
+			// already defers (server.go:957). Source held (TrafficVerified never True). The
+			// deferred-SIGCONT gate below leaves the tree stopped on ProbeOk=false.
+			resp.ProbeOk = false
+			resp.ProbeOutput = "ADR-0200: RestoredPID not yet resolvable — probe deferred to requeue"
+			log.Info("InjectIPHandoff: ADR-0200 reachability probe deferred — RestoredPID not yet in CR status (non-fatal, requeue)",
+				"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 		} else {
-			log.Info("InjectIPHandoff: reachability probe OK", "oldPodIP", req.OldPodIp)
+			probeOk, probeOut := s.probeOldIPInPodNetns(ctx, replPID, req.OldPodIp)
+			resp.ProbeOk = probeOk
+			resp.ProbeOutput = probeOut
+			if !probeOk {
+				log.Info("InjectIPHandoff: ADR-0200 in-netns reachability probe failed",
+					"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "replPID", replPID, "probeOutput", probeOut)
+			} else {
+				log.Info("InjectIPHandoff: ADR-0200 reachability probe OK (dial executed in replacement pod netns)",
+					"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "replPID", replPID, "netns", fmt.Sprintf("/proc/%d/ns/net", replPID), "probeOutput", probeOut)
+			}
 		}
 	}
 
@@ -2872,9 +2882,65 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 // readLogTail was removed: ADR-0127 scaffold (restore.log success-signal) removed per ADR-0192 §3h.
 // The liveness signal is now the cgroup-PID diff (see joinNsRestore above).
 
+// ADR-0200: exit codes for the __inetns_probe helper subcommand. The helper performs the
+// TCP dial INSIDE the replacement pod netns (entered via nsenter by probeOldIPInPodNetns)
+// and reports the refused/timeout/success classification through its exit code — preserving
+// the exact isConnRefused() semantics (§3h-SYM item 1: error-classification preservation
+// across the host-netns→pod-netns relocation, same commit).
+const (
+	inetnsProbeExitSuccess   = 0 // SYN-ACK: a listener answered — IP live
+	inetnsProbeExitRefused   = 64 // RST (ECONNREFUSED): kernel answered, no listener — IP live (success)
+	inetnsProbeExitTimeout   = 65 // i/o timeout: no kernel on the path owns the IP — failure
+	inetnsProbeExitOtherErr  = 66 // any other dial error — failure
+)
+
+// probeOldIPInPodNetns performs the ADR-0200 D1 reachability probe by re-executing this same
+// agent binary's __inetns_probe helper INSIDE the replacement pod's network namespace via the
+// established in-tree nsenter --net=/proc/<replPID>/ns/net idiom (the same idiom used by
+// SingleHomeRestoredPod (server.go:535) and resolveReplVethPeer (server.go:1182); ADR-0045 —
+// no netlink/new external dependency). Dialing the OLD IP:7 from where the IP is owned returns
+// RST (ECONNREFUSED) → ProbeOk=true (ADR-0200 D3: port :7 and RST=success are unchanged).
+// Returns (probeOk, probeOutput) mirroring the prior in-process dial's contract exactly.
+func probeOldIPInPodNetnsImpl(replPID int, oldPodIP string) (bool, string) {
+	netnsPath := fmt.Sprintf("/proc/%d/ns/net", replPID)
+	self, err := os.Executable()
+	if err != nil {
+		self = "/proc/self/exe"
+	}
+	// nsenter --net=<pod netns> <agent-binary> __inetns_probe <oldIP> 7
+	cmd := exec.Command("nsenter", "--net="+netnsPath, self, "__inetns_probe", oldPodIP, "7")
+	out, runErr := cmd.CombinedOutput()
+	output := strings.TrimSpace(string(out))
+	if runErr == nil {
+		// Exit 0 — SYN-ACK success.
+		return true, output
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		switch exitErr.ExitCode() {
+		case inetnsProbeExitRefused:
+			// RST / ECONNREFUSED — the kernel in the pod netns answered: IP is live (success),
+			// identical to the host-netns isConnRefused()==true classification it replaces.
+			return true, output
+		case inetnsProbeExitTimeout:
+			return false, output
+		default:
+			return false, output
+		}
+	}
+	// Could not even launch nsenter / the helper — treat as failure (deferred to requeue).
+	return false, fmt.Sprintf("ADR-0200: in-netns probe exec failed: %v (%s)", runErr, output)
+}
+
+// probeOldIPInPodNetns is the AgentServer method seam (overridable in tests).
+func (s *AgentServer) probeOldIPInPodNetns(_ context.Context, replPID int, oldPodIP string) (bool, string) {
+	return probeOldIPInPodNetnsImpl(replPID, oldPodIP)
+}
+
 // isConnRefused reports whether err is a connection-refused error (TCP RST). ECONNREFUSED
 // means the kernel responded — the IP is routable on this node — which is sufficient for the
-// ADR-0192 Decision 5 reachability probe. Used by InjectIPHandoff.
+// ADR-0192 Decision 5 reachability probe. Used by the ADR-0200 __inetns_probe helper to
+// classify the in-netns dial error.
 func isConnRefused(err error) bool {
 	if err == nil {
 		return false

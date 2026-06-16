@@ -14,6 +14,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -113,7 +114,56 @@ func init() {
 	utilruntime.Must(corev1.AddToScheme(scheme))
 }
 
+// inetnsProbe exit codes — MUST match server.inetnsProbeExit* (ADR-0200 D1 (i)).
+const (
+	inetnsProbeExitSuccess  = 0
+	inetnsProbeExitRefused  = 64
+	inetnsProbeExitTimeout  = 65
+	inetnsProbeExitOtherErr = 66
+)
+
+// runInetnsProbe is the ADR-0200 __inetns_probe helper subcommand. It is invoked by
+// AgentServer.probeOldIPInPodNetns via `nsenter --net=/proc/<replPID>/ns/net <self>
+// __inetns_probe <oldIP> <port>` so the TCP dial executes INSIDE the replacement pod
+// netns (where the OLD IP is owned per ADR-0138 M7) instead of the agent's host netns.
+// It performs the exact same net.DialTimeout the host-netns probe used (ADR-0192 R2) and
+// classifies the result with the same ECONNREFUSED=success semantics (ADR-0200 D3),
+// reporting the classification through the process exit code. Port :7 unchanged.
+func runInetnsProbe(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "ADR-0200 __inetns_probe: usage: __inetns_probe <ip> <port>")
+		os.Exit(inetnsProbeExitOtherErr)
+	}
+	probeAddr := net.JoinHostPort(args[0], args[1])
+	conn, perr := net.DialTimeout("tcp", probeAddr, 2*time.Second)
+	if conn != nil {
+		conn.Close()
+	}
+	if perr == nil {
+		os.Exit(inetnsProbeExitSuccess) // SYN-ACK — listener answered, IP live
+	}
+	// ECONNREFUSED = RST = the kernel in this (pod) netns answered: IP is live (success).
+	var opErr *net.OpError
+	if errors.As(perr, &opErr) && errors.Is(opErr.Err, syscall.ECONNREFUSED) {
+		fmt.Fprint(os.Stderr, perr.Error())
+		os.Exit(inetnsProbeExitRefused)
+	}
+	fmt.Fprint(os.Stderr, perr.Error())
+	if ne, ok := perr.(net.Error); ok && ne.Timeout() {
+		os.Exit(inetnsProbeExitTimeout) // i/o timeout — no owner on the path, failure
+	}
+	os.Exit(inetnsProbeExitOtherErr)
+}
+
 func main() {
+	// ADR-0200: in-netns probe helper subcommand dispatch. MUST run before any logging,
+	// k8s client, or NRI setup — this process is a short-lived re-exec inside a pod netns
+	// (entered via nsenter by the parent agent), does the dial, and exits with a coded status.
+	if len(os.Args) > 1 && os.Args[1] == "__inetns_probe" {
+		runInetnsProbe(os.Args[2:])
+		return
+	}
+
 	log := zap.New().WithName("podmotion-agent")
 	// Wire the controller-runtime global logger so packages that use ctrl.Log / logf.Log
 	// (e.g. internal/agent/server, internal/agent/nri) produce structured output instead
