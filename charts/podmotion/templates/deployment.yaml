@@ -23,6 +23,11 @@ spec:
       serviceAccountName: podmotion-operator
       securityContext:
         runAsNonRoot: true
+        # fsGroup 65532 (distroless nonroot UID/GID) so the kubelet chowns mounted
+        # secret volumes to this GID. Without it the operator (runAsNonRoot, UID 65532)
+        # cannot read the root:root 0400 operator-agent-client-tls cert and CrashLoops
+        # ("open /etc/podmotion/tls/tls.crt: permission denied"). Sprint 34 §P-VERIFY-D fix.
+        fsGroup: 65532
       terminationGracePeriodSeconds: 10
       containers:
         - name: manager
@@ -92,5 +97,7 @@ spec:
         - name: operator-agent-client-tls
           secret:
             secretName: {{ .Values.operator.tls.agentClient.secretName }}
-            defaultMode: 0400
+            # 0440 (group-readable) + pod fsGroup 65532 so the non-root operator can read
+            # the cert. 0400 here is unreadable to UID 65532 even with fsGroup. Sprint 34.
+            defaultMode: 0440
         {{- end }}
