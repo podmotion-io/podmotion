@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strings"
 	"time"
 
 	nriapi "github.com/containerd/nri/pkg/api"
@@ -166,11 +167,39 @@ func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent)
 
 	// Verify that a PodMigration CR with this checkpointRef actually exists and
 	// is in Restoring phase targeting this node. Prevents annotation spoofing.
+	//
+	// ADR-0185 r1: bounded retry to tolerate operator phase advance at NRI hook fire time.
+	// Controller is NOT changed. Accept-set is NOT widened (Option B per quorum C3 resolution).
+	// The operator advances phase asynchronously via requeues while NRI fires synchronously at
+	// container start; we retry until the operator naturally advances past OverlayHandoff (at
+	// which point the ADR-0048/0049 FDB barrier is confirmed) into an accepted restore phase, or
+	// the deadline expires. A spoofed/absent CR never enters an accepted phase, so this still
+	// hard-blocks on timeout with the same blocking error.
 	if p.k8sClient != nil {
-		if err := p.verifyPodMigration(ctx, event.Namespace, checkpointRef); err != nil {
-			log.Error(err, "NRI StartContainer: PodMigration verification failed — blocking restore",
+		// verifyTimeout(45s) + verifyInterval(1s) must sit under containerd
+		// plugin_request_timeout (60s — §P-VERIFY C1 asserts this on all nodes; default 30s FAILS).
+		verifyDeadline := time.Now().Add(45 * time.Second)
+		var verifyErr error
+		for time.Now().Before(verifyDeadline) {
+			verifyErr = p.verifyPodMigration(ctx, event.Namespace, checkpointRef)
+			if verifyErr == nil {
+				break
+			}
+			// Only retry on phase-ordering transients — fail fast on all other errors
+			// (missing/forged CR, node mismatch, List failure) with the same blocking error.
+			if !isPhaseTransientErr(verifyErr) {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("NRI StartContainer: context cancelled during phase-wait: %w", ctx.Err())
+			case <-time.After(1 * time.Second):
+			}
+		}
+		if verifyErr != nil {
+			log.Error(verifyErr, "NRI StartContainer: PodMigration verification failed — blocking restore",
 				"checkpointRef", checkpointRef, "container", event.ID)
-			return fmt.Errorf("PodMigration verification failed: %w", err)
+			return fmt.Errorf("NRI StartContainer: PodMigration verification failed: %w", verifyErr)
 		}
 	}
 
@@ -189,6 +218,15 @@ func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent)
 // is in Restoring phase, and targets this node — blocking restore if not.
 func (p *Plugin) verifyPodMigration(ctx context.Context, namespace, checkpointRef string) error {
 	// List PodMigrations in the pod's namespace looking for one whose CheckpointRef matches.
+	//
+	// ADR-0185 r1 C6 (cache-staleness): this List is served by the controller-runtime
+	// informer-backed cache (eventually consistent). Cache-read is acceptable: controller-runtime
+	// informer resync on kind clusters is well under 45s (default 10h but explicit --sync-period=30s
+	// set by operator; kind cluster not partition-prone). Phase transitions are written
+	// synchronously by the operator — List lag is bounded by one sync cycle. If cache staleness
+	// causes the 45s timeout: migration fails with verifyErr, source pod is thawed by the
+	// ZeroWindow watchdog (ADR-0157 D3), CR enters phase=Failed, source pod remains Running.
+	// No data loss.
 	pmList := &pmv1.PodMigrationList{}
 	if err := p.k8sClient.List(ctx, pmList, client.InNamespace(namespace)); err != nil {
 		return fmt.Errorf("list PodMigrations: %w", err)
@@ -199,16 +237,12 @@ func (p *Plugin) verifyPodMigration(ctx context.Context, namespace, checkpointRe
 		if pm.Name != checkpointRef {
 			continue
 		}
-		// Accept any phase in the restoring window: the controller may have
-		// advanced to RestoreSocketReattach or DisengageHold by the time NRI fires.
-		switch pm.Status.Phase {
-		case pmv1.MigrationPhaseRestoring,
-			pmv1.MigrationPhaseRestoreSocketReattach,
-			pmv1.MigrationPhaseDisengageHold:
-			// ok — restore is expected
-		default:
-			return fmt.Errorf("PodMigration %s/%s phase is %s, expected Restoring/RestoreSocketReattach",
-				namespace, pm.Name, pm.Status.Phase)
+		// ADR-0185 r1 (Option B): accept-set is NOT widened. OverlayHandoff is deliberately
+		// excluded — CRIU restore must not begin until the FDB barrier (conditionVXLANFDBUpdated)
+		// is confirmed. The bounded retry in HandleStartContainer waits for the operator to
+		// advance past OverlayHandoff into an accepted restore phase.
+		if err := verifyPhaseInAcceptSet(string(pm.Status.Phase)); err != nil {
+			return fmt.Errorf("PodMigration %s/%s %w", namespace, pm.Name, err)
 		}
 		// Prefer status.DestinationNodeName (set by controller after scheduling);
 		// fall back to spec.TargetNodeName for early-phase races.
@@ -224,6 +258,33 @@ func (p *Plugin) verifyPodMigration(ctx context.Context, namespace, checkpointRe
 	}
 	// No matching PodMigration found — treat as spoofed annotation.
 	return fmt.Errorf("no PodMigration in %s with checkpointRef %q in Restoring phase", namespace, checkpointRef)
+}
+
+// verifyPhaseInAcceptSet returns nil if the given PodMigration phase is in the NRI
+// anti-spoof accept-set, or a "phase is ..." error otherwise.
+//
+// ADR-0185 r1 (Option B): the accept-set is EXACTLY the phases reachable after
+// conditionVXLANFDBUpdated=True — {Restoring, RestoreSocketReattach, DisengageHold}.
+// OverlayHandoff is NOT included (FDB not yet confirmed); FinalFreezeStateCapture and all
+// earlier phases are NOT included. The phase-mismatch error string contains "phase is" so the
+// bounded retry loop (isPhaseTransientErr) waits for the operator to advance, while forged/missing
+// CR errors (which do NOT contain "phase is") fail fast.
+func verifyPhaseInAcceptSet(phase string) error {
+	switch pmv1.MigrationPhase(phase) {
+	case pmv1.MigrationPhaseRestoring,
+		pmv1.MigrationPhaseRestoreSocketReattach,
+		pmv1.MigrationPhaseDisengageHold:
+		return nil
+	default:
+		return fmt.Errorf("phase is %s, expected Restoring/RestoreSocketReattach/DisengageHold", phase)
+	}
+}
+
+// isPhaseTransientErr returns true for phase-ordering errors where retry is safe.
+// Only errors containing "phase is" (phase mismatch, not forged/missing CR, node mismatch, or
+// List failure) are transient — the operator is mid-transition and will advance.
+func isPhaseTransientErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "phase is")
 }
 
 // HandleStopping is called by the NRI runtime bridge when containerd fires the
