@@ -1,5 +1,12 @@
 # PodMotion
 
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Go Version](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)](go.mod)
+[![Status](https://img.shields.io/badge/Status-v0.1.0--alpha-orange)](CHANGELOG.md)
+[![DCO](https://img.shields.io/badge/DCO-signed-brightgreen)](GOVERNANCE.md)
+[![CRIU](https://img.shields.io/badge/CRIU-4.2-blueviolet)](https://criu.org)
+[![eBPF](https://img.shields.io/badge/eBPF-XDP%2FTCP__REPAIR-yellow)](docs/adr)
+
 > **Status: v0.1.0-alpha — experimental, not production-ready. No production deployments. Proof runs on single-maintainer kind cluster only.**
 
 Live pod migration for Kubernetes — live VM migration for containers — stateful pods migrate between nodes with zero downtime and zero connection loss.
