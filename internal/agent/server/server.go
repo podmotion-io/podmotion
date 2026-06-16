@@ -3082,6 +3082,11 @@ func patchCheckpointImages(checkpointDir string, inheritFdNames []string) error 
 	if err != nil {
 		return fmt.Errorf("marshal masked paths: %w", err)
 	}
+	// Normalize nil to empty slice so json.Marshal emits "[]" not "null".
+	// pm-patch-ckpt.py:10 calls set(json.loads(argv[3])) — set(None) raises TypeError.
+	if inheritFdNames == nil {
+		inheritFdNames = []string{}
+	}
 	inheritJSON, err := json.Marshal(inheritFdNames)
 	if err != nil {
 		return fmt.Errorf("marshal inherit fd names: %w", err)
@@ -3095,7 +3100,7 @@ ckpt = sys.argv[1]
 null_ext_key_masked = set(json.loads(sys.argv[2]))
 # ADR-0193 C-R3-1: inherit-fd name set (slash-stripped, from same builder as buildCRIURestoreArgs).
 # Used by P-0193-1 to exclude inherited fds from the PLAIN-REG firing class.
-inherit_fd_names = set(json.loads(sys.argv[3]))
+_raw_inherit = json.loads(sys.argv[3]); inherit_fd_names = set(_raw_inherit) if _raw_inherit is not None else set()
 
 def backup(path):
     orig = path + '.orig'
