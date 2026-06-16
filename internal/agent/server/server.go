@@ -5562,15 +5562,43 @@ func (s *AgentServer) verifyMigrationUID(ctx context.Context, migrationName, man
 	if s.k8sClient == nil {
 		return fmt.Errorf("no k8s client to verify migration_uid binding")
 	}
-	ns := os.Getenv("POD_NAMESPACE")
-	if ns == "" {
-		ns = "podmotion-system"
-	}
 	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+
+	// ADR-SEC-D: The PodMigration CR namespace is NOT carried on the wire and is NOT the
+	// agent's own namespace. The original ADR-SEC-B impl read os.Getenv("POD_NAMESPACE")
+	// with a hardcoded "podmotion-system" default; the agent DaemonSet sets no POD_NAMESPACE
+	// (ADR-SEC-B §5.2, §3i/§P-VERIFY-D ENV-PROVENANCE), so the Get targeted the wrong
+	// namespace and returned NotFound for default-namespace migrations. Resolve the namespace
+	// namespace-agnostically using the codebase's established default-first-then-List-by-name
+	// pattern (resolveNamespaceForMigration / restoredPIDForMigration, server.go:1186-1228).
+	// Namespace LOCATES the CR only; it never authorizes — the UID comparison below is the
+	// sole binding decision (C2).
 	pm := &pmv1.PodMigration{}
-	if err := s.k8sClient.Get(lookupCtx, types.NamespacedName{Name: migrationName, Namespace: ns}, pm); err != nil {
-		return fmt.Errorf("read PodMigration CR: %w", err)
+	if ns := s.resolveNamespaceForMigration(lookupCtx, migrationName); ns != "" {
+		if err := s.k8sClient.Get(lookupCtx, types.NamespacedName{Name: migrationName, Namespace: ns}, pm); err != nil {
+			return fmt.Errorf("read PodMigration CR %q in ns %q: %w", migrationName, ns, err)
+		}
+	} else {
+		// C1: List-by-name across all namespaces; require EXACTLY one match. Zero or
+		// more-than-one match → fail closed (PermissionDenied semantics — caller wraps).
+		pmList := &pmv1.PodMigrationList{}
+		if err := s.k8sClient.List(lookupCtx, pmList); err != nil {
+			return fmt.Errorf("list PodMigrations to bind migration_uid: %w", err)
+		}
+		var matches []*pmv1.PodMigration
+		for i := range pmList.Items {
+			if pmList.Items[i].Name == migrationName {
+				matches = append(matches, &pmList.Items[i])
+			}
+		}
+		if len(matches) == 0 {
+			return fmt.Errorf("no PodMigration CR named %q found to verify migration_uid binding", migrationName)
+		}
+		if len(matches) > 1 {
+			return fmt.Errorf("ambiguous migration_uid binding: %d PodMigration CRs named %q across namespaces — failing closed", len(matches), migrationName)
+		}
+		pm = matches[0]
 	}
 	if string(pm.UID) != manifestUID {
 		return fmt.Errorf("manifest migration_uid %q != live CR UID %q (replay)", manifestUID, string(pm.UID))
