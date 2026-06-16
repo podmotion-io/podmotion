@@ -3233,16 +3233,26 @@ func mountCgroupfsIntoRootfs(rootfsPath string) error {
 	if out, err := nsenterCmd("mount", "--rbind", "/sys/fs/cgroup", target).CombinedOutput(); err != nil {
 		return fmt.Errorf("mountCgroupfsIntoRootfs: rbind: %w: %s", err, out)
 	}
-	// C1.1: remount read-only — prevents cgroup.procs write during restore window (ADR-0128 guard)
+	// ADR-0187: make bind recursively shared so it propagates into CRIU's unshare(CLONE_NEWNS).
+	// A plain rbind is PRIVATE on the kind containerd bundle subtree and does NOT cross into the
+	// fresh mnt ns CRIU's mount-v2 engine resolves open_path() against → files-reg.c:2353 ENOENT.
+	if out, err := nsenterCmd("mount", "--make-rshared", target).CombinedOutput(); err != nil {
+		return fmt.Errorf("mountCgroupfsIntoRootfs: make-rshared: %w: %s", err, out)
+	}
+	// C1.1: remount read-only — prevents cgroup.procs write during restore window (ADR-0128 guard).
+	// Applied AFTER make-rshared so the ro flag lands on the shared peer-group member (ADR-0187).
 	if out, err := nsenterCmd("mount", "-o", "remount,bind,ro", target).CombinedOutput(); err != nil {
 		// non-fatal on remount failure — log and continue; rbind already provides CRIU access
 		log.Info("mountCgroupfsIntoRootfs: remount ro failed (non-fatal)", "err", err, "output", string(out))
 	}
-	// ADR-0184 post-bind assertion (ADR-0186): cpu.max must be visible after the bind.
-	// Converts a racy ENOENT inside CRIU (files-reg.c:2353) into a clear agent-side failure.
+	// ADR-0187 post-bind assertion: assert inside a fresh mnt ns (mirrors CRIU's unshare context).
+	// The ADR-0186 host-ns `test -f` is a structural false-green — it confirms host-ns visibility,
+	// a precondition CRIU does not consume. `unshare --propagation unchanged` creates a child mnt ns
+	// WITHOUT forcing it private, so a shared rbind propagates in; test -f there fails iff the bind
+	// would also be invisible to CRIU. Converts the silent CRIU ENOENT into a retriable agent error.
 	cpuMaxPath := filepath.Join(target, "cpu.max")
-	if out, err := nsenterCmd("test", "-f", cpuMaxPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("mountCgroupfsIntoRootfs: cpu.max not visible after bind at %s: %w: %s", cpuMaxPath, err, out)
+	if out, err := nsenterCmd("unshare", "--mount", "--propagation", "unchanged", "test", "-f", cpuMaxPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("mountCgroupfsIntoRootfs: cpu.max not visible in fresh mnt ns at %s: %w: %s", cpuMaxPath, err, out)
 	}
 	return nil
 }
