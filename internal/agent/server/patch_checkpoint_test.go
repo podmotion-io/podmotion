@@ -343,16 +343,23 @@ func TestPatchScript_DropLogicInSyncWithProduction(t *testing.T) {
 		}
 	}
 
-	// Load-bearing invariant anchors that must be present in production:
-	//   - /sys must be a drop PREFIX (drops the whole subtree atomically — the
-	//     Attempt-3 root cause was a partial /sys drop that orphaned children).
-	//   - the prefix-subtree mechanism (startswith on "<prefix>/") must exist,
-	//     so dropping a parent necessarily drops every descendant.
-	if !strings.Contains(src, "drop_prefixes") {
-		t.Errorf("production script no longer defines drop_prefixes — the /sys subtree drop (Arch-B fix) is missing; mount.c:381 can regress")
+	// Load-bearing invariant anchors that must be present in production (graph-traversal
+	// implementation — Arch-A spec, commit d6b57fe):
+	//   - DROP_ROOT_FSTYPES must include 'sysfs' so both sysfs instances in kind are seeded
+	//   - drop_ids must be computed via parent_mnt_id graph closure so every descendant of a
+	//     dropped root is also dropped (the Attempt-3 mount.c:381 fix: dropping /sys alone
+	//     orphaned children 7730/8591/9117/9119)
+	if !strings.Contains(src, "DROP_ROOT_FSTYPES") {
+		t.Errorf("production script no longer defines DROP_ROOT_FSTYPES — the sysfs-by-type seed (Arch-A spec) is missing; mount.c:381 can regress")
 	}
-	if !strings.Contains(src, "startswith(prefix + '/')") {
-		t.Errorf("production script no longer prefix-drops descendants (startswith(prefix + '/')): a dropped parent could leave orphaned children → mount.c:381 regression")
+	if !strings.Contains(src, "'sysfs'") {
+		t.Errorf("production script DROP_ROOT_FSTYPES no longer contains 'sysfs' — /sys subtree will not be dropped; mount.c:381 can regress")
+	}
+	if !strings.Contains(src, "drop_ids") {
+		t.Errorf("production script no longer computes drop_ids — the graph-closure subtree drop is missing; orphan children will cause mount.c:381")
+	}
+	if !strings.Contains(src, "parent_mnt_id") {
+		t.Errorf("production script no longer references parent_mnt_id — the graph-closure traversal is missing; orphan children will cause mount.c:381")
 	}
 }
 
