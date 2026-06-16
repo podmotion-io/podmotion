@@ -133,6 +133,103 @@ func DiscoverVTEPMAC(ctx context.Context, flannelAnnotationJSON, ifName string) 
 	return iface.HardwareAddr, nil
 }
 
+// DiscoverFdbInterface returns the name of the first VXLAN-class link on the host
+// (link type "vxlan" per IFLA_INFO_KIND, discovered via RTM_GETLINK enumeration).
+// This is the single source of truth for FDB/VTEP device resolution (ADR-0192 Site B,
+// B4 fix): it discriminates by link type, not by name heuristic, so it never returns
+// "flannel.1" or any other CNI literal — it returns the actual device that exists.
+// On kind/kindnet there is no VXLAN overlay device; this function returns "".
+// On Flannel VXLAN it returns the VTEP device (e.g. "flannel.1") if present.
+// Error is non-nil only when interface enumeration itself fails.
+func DiscoverFdbInterface() (string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("DiscoverFdbInterface: net.Interfaces: %w", err)
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		// Discriminate by IFLA_INFO_KIND = "vxlan" via RTM_GETLINK (link-type discrimination,
+		// not name heuristic — ADR-0192 §4 Site B Rule, C-335).
+		kind, kindErr := getLinkKind(iface.Index)
+		if kindErr != nil {
+			continue
+		}
+		if kind == "vxlan" {
+			return iface.Name, nil
+		}
+	}
+	// No VXLAN device found — substrate has no FDB overlay (kind/kindnet or unsupported CNI).
+	return "", nil
+}
+
+// getLinkKind returns the IFLA_INFO_KIND for the interface at ifindex, or "" if absent.
+func getLinkKind(ifindex int) (string, error) {
+	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
+	if err != nil {
+		return "", fmt.Errorf("getLinkKind: socket: %w", err)
+	}
+	defer unix.Close(fd)
+	if err := unix.Bind(fd, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
+		return "", fmt.Errorf("getLinkKind: bind: %w", err)
+	}
+
+	type ifInfoMsg struct {
+		Family uint8
+		_      uint8
+		Type   uint16
+		Index  int32
+		Flags  uint32
+		Change uint32
+	}
+	const ifInfoMsgSize = 16
+	ifm := ifInfoMsg{Index: int32(ifindex)}
+
+	// Use unsafe.Pointer to copy struct bytes.
+	ifmBytes := make([]byte, ifInfoMsgSize)
+	for i := 0; i < ifInfoMsgSize; i++ {
+		ifmBytes[i] = (*[ifInfoMsgSize]byte)(unsafe.Pointer(&ifm))[i]
+	}
+
+	nlmsgLen := uint32(unix.SizeofNlMsghdr + ifInfoMsgSize)
+	hdr := unix.NlMsghdr{
+		Len:   nlmsgLen,
+		Type:  unix.RTM_GETLINK,
+		Flags: unix.NLM_F_REQUEST,
+		Seq:   20,
+	}
+	hdrBytes := (*[unix.SizeofNlMsghdr]byte)(unsafe.Pointer(&hdr))[:]
+	msg := append(hdrBytes, ifmBytes...)
+	if err := unix.Sendto(fd, msg, 0, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
+		return "", fmt.Errorf("getLinkKind: sendto: %w", err)
+	}
+
+	buf := make([]byte, 4096)
+	n, _, err := unix.Recvfrom(fd, buf, 0)
+	if err != nil {
+		return "", fmt.Errorf("getLinkKind: recvfrom: %w", err)
+	}
+	buf = buf[:n]
+
+	for len(buf) >= unix.SizeofNlMsghdr {
+		nlh := (*unix.NlMsghdr)(unsafe.Pointer(&buf[0]))
+		if nlh.Type == unix.NLMSG_ERROR || nlh.Type == unix.NLMSG_DONE {
+			break
+		}
+		if nlh.Type == unix.RTM_NEWLINK && int(nlh.Len) <= len(buf) {
+			payload := buf[unix.SizeofNlMsghdr+ifInfoMsgSize : nlh.Len]
+			kind := parseLinkKind(payload)
+			return kind, nil
+		}
+		if nlh.Len < unix.SizeofNlMsghdr {
+			break
+		}
+		buf = buf[nlh.Len:]
+	}
+	return "", nil
+}
+
 // SetPodIPNeigh installs (RTM_NEWNEIGH, NLM_F_CREATE|NLM_F_REPLACE) an AF_INET
 // permanent neighbor entry mapping podIP -> lladdr on the named device (e.g. "cni0"
 // or "flannel.1"). This is the ADR-0133 Decision 2 destination-side handoff: it tells

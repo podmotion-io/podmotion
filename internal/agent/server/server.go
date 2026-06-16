@@ -773,79 +773,99 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 		bridgeIf = discovered
 		log.Info("InjectIPHandoff: ADR-0154 runtime bridge interface discovery", "discovered", bridgeIf)
 	}
+	// fdbIf resolution: use operator-supplied FdbIfname if present (override path), otherwise
+	// resolve at runtime via link-type VXLAN discrimination (ADR-0192 Site B B4 fix).
+	// DiscoverFdbInterface returns "" on substrates with no VXLAN overlay (kind/kindnet).
+	// No "flannel.1" literal: the provider method is the single source of truth (C-335).
 	fdbIf := req.FdbIfname
 	if fdbIf == "" {
-		fdbIf = "flannel.1"
+		discovered, discErr := network.DiscoverFdbInterface()
+		if discErr != nil {
+			log.Error(discErr, "InjectIPHandoff: fdbIf VXLAN discovery error (non-fatal, treating as no-overlay)",
+				"migration", req.MigrationName)
+		}
+		fdbIf = discovered // "" on kind/kindnet — FDB overlay leg will be skipped below
+		if fdbIf != "" {
+			log.Info("InjectIPHandoff: ADR-0192 runtime FDB interface discovery", "discovered", fdbIf)
+		}
 	}
 
-	// ADR-0135: install a /32 link-scoped host route for the OLD pod IP via cni0 so the
-	// kernel's route lookup selects the LOCAL bridge instead of the default per-CIDR
-	// flannel.1 overlay route back to the source node. Without this the neighbor entries
-	// below are never consulted (the destination is routed out flannel.1 toward the source
-	// VTEP) and the reachability probe blackholes.
+	// ADR-0135: install a /32 link-scoped host route for the OLD pod IP via the bridge/host
+	// interface so the kernel's route lookup selects the LOCAL bridge instead of routing back
+	// to the source node. Without this the neighbor entries below are never consulted and the
+	// reachability probe blackholes.
 	if err := network.SetPodIPHostRoute(ctx, bridgeIf, oldIP); err != nil {
 		return &agentpb.InjectIPHandoffResponse{Injected: false,
-			BlockingReason: fmt.Sprintf("cni0 /32 route: %v", err)}, nil
+			BlockingReason: fmt.Sprintf("%s /32 route: %v", bridgeIf, err)}, nil
 	}
 
-	// D2.1: ip neigh replace <oldPodIP> lladdr <replVethMAC> dev cni0 nud permanent
+	// D2.1: ip neigh replace <oldPodIP> lladdr <replVethMAC> dev <bridgeIf> nud permanent
 	if err := network.SetPodIPNeigh(ctx, bridgeIf, oldIP, mac); err != nil {
 		return &agentpb.InjectIPHandoffResponse{Injected: false,
-			BlockingReason: fmt.Sprintf("cni0 neigh: %v", err)}, nil
-	}
-	// D2.2: ip neigh replace <oldPodIP> lladdr <replVethMAC> dev flannel.1 nud permanent
-	if err := network.SetPodIPNeigh(ctx, fdbIf, oldIP, mac); err != nil {
-		return &agentpb.InjectIPHandoffResponse{Injected: false,
-			BlockingReason: fmt.Sprintf("flannel.1 neigh: %v", err)}, nil
+			BlockingReason: fmt.Sprintf("%s neigh: %v", bridgeIf, err)}, nil
 	}
 
-	// ADR-0139 Decision 1 (forward path, blocker B8): the ADR-0135 /32 cni0 host route makes
-	// the kernel local-input-classify the VXLAN-decapped inner packet for the OLD IP (FORWARD
-	// never traversed → never reaches the pod veth). Install a tc-ingress redirect on flannel.1
-	// that moves decapped frames for the OLD IP straight to the replacement pod's host-side veth
-	// peer, bypassing L3 local-input classification (proven live Sprint 27). Best-effort: a
-	// resolution/setup failure is non-fatal (logged loud) so an otherwise-good handoff is not
-	// blocked; the source is held until TrafficVerified so a requeue re-asserts it (idempotent).
-	if replPID := s.restoredPIDForMigration(ctx, req.MigrationName); replPID > 0 {
-		if vethPeer, vErr := resolveReplVethPeer(replPID); vErr != nil {
-			log.Error(vErr, "InjectIPHandoff: ADR-0139 could not resolve repl veth peer — tc redirect NOT installed (non-fatal)",
-				"migration", req.MigrationName, "replPID", replPID)
-		} else if vethPeer == "" {
-			log.Info("InjectIPHandoff: ADR-0139 repl veth peer empty — tc redirect NOT installed (non-fatal)",
-				"migration", req.MigrationName, "replPID", replPID)
-		} else if tcErr := installTCRedirect(ctx, fdbIf, oldIP, vethPeer); tcErr != nil {
-			log.Error(tcErr, "InjectIPHandoff: ADR-0139 tc redirect install failed (non-fatal)",
-				"migration", req.MigrationName, "fdbIf", fdbIf, "oldPodIP", req.OldPodIp, "vethPeer", vethPeer)
-		} else {
-			log.Info("InjectIPHandoff: ADR-0139 tc-ingress redirect installed (forward path B8)",
-				"migration", req.MigrationName, "fdbIf", fdbIf, "oldPodIP", req.OldPodIp, "vethPeer", vethPeer)
-			// ADR-0140 (blocker B9): the tc `mirred` redirect steals the forward frame before
-			// conntrack's ingress hook, so the pod's reply is conntrack-INVALID and kube-proxy's
-			// KUBE-FORWARD `ctstate INVALID -j DROP` rule drops it (reply reaches `cni0 In` but
-			// never `flannel.1 Out`). Insert a narrow OLD-IP/32 FORWARD ACCEPT pair at the head
-			// of FORWARD (before KUBE-FORWARD) so the reply is forwarded back over VXLAN. Non-fatal.
-			if fwErr := installOldIPForwardAccept(ctx, oldIP); fwErr != nil {
-				log.Error(fwErr, "InjectIPHandoff: ADR-0140 FORWARD ACCEPT install failed (non-fatal)",
-					"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
-			} else {
-				log.Info("InjectIPHandoff: ADR-0140 OLD-IP FORWARD ACCEPT installed (reverse path B9)",
-					"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
-			}
-			// ADR-0140's filter ACCEPT fixes control/ICMP forwarding but the stateful-TCP DATA
-			// segment is still conntrack-INVALID (the tc mirred redirect made the forward leg
-			// conntrack-invisible), so the kernel RSTs it (B10). NOTRACK the OLD-IP flow in the
-			// raw table (pre-conntrack) on this destination node, both directions. Non-fatal.
-			if ntErr := installOldIPNotrack(ctx, oldIP, "both"); ntErr != nil {
-				log.Error(ntErr, "InjectIPHandoff: ADR-0141 NOTRACK install failed (non-fatal)",
-					"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
-			} else {
-				log.Info("InjectIPHandoff: ADR-0141 OLD-IP NOTRACK installed (reverse data path B10)",
-					"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
-			}
-		}
+	// D2.2 + overlay-redirect block: gated on fdbIf != "" (provider returned a VXLAN device).
+	// When fdbIf == "" the substrate has no VXLAN overlay (kind/kindnet); the entire FDB
+	// overlay leg — D2.2 neigh, tc-redirect, FORWARD-ACCEPT, NOTRACK — is skipped.
+	// This is a truthful, logged, provider-driven absence — NOT a silent-skip (ADR-0192 §4 B Rule).
+	if fdbIf == "" {
+		// Substrate has no VXLAN FDB device; FDB overlay leg is not applicable.
+		// The bridgeIf neigh + /32 route + gARP path (below) is sufficient on host-routed CNIs.
+		log.Info("InjectIPHandoff: FDB overlay leg not applicable on this substrate (provider resolved no VXLAN device) — D2.2 neigh, tc-redirect, FORWARD-ACCEPT, NOTRACK skipped; Injected=true",
+			"migration", req.MigrationName, "bridgeIf", bridgeIf)
 	} else {
-		log.Info("InjectIPHandoff: ADR-0139 RestoredPID not yet in CR status — tc redirect deferred to requeue (non-fatal)",
-			"migration", req.MigrationName)
+		// D2.2: ip neigh replace <oldPodIP> lladdr <replVethMAC> dev <fdbIf> nud permanent
+		if err := network.SetPodIPNeigh(ctx, fdbIf, oldIP, mac); err != nil {
+			return &agentpb.InjectIPHandoffResponse{Injected: false,
+				BlockingReason: fmt.Sprintf("%s neigh: %v", fdbIf, err)}, nil
+		}
+
+		// ADR-0139 Decision 1 (forward path, blocker B8): install a tc-ingress redirect on the
+		// VXLAN overlay device that moves decapped frames for the OLD IP straight to the replacement
+		// pod's host-side veth peer, bypassing L3 local-input classification. Best-effort: a
+		// resolution/setup failure is non-fatal so an otherwise-good handoff is not blocked;
+		// the source is held until TrafficVerified so a requeue re-asserts it (idempotent).
+		if replPID := s.restoredPIDForMigration(ctx, req.MigrationName); replPID > 0 {
+			if vethPeer, vErr := resolveReplVethPeer(replPID); vErr != nil {
+				log.Error(vErr, "InjectIPHandoff: ADR-0139 could not resolve repl veth peer — tc redirect NOT installed (non-fatal)",
+					"migration", req.MigrationName, "replPID", replPID)
+			} else if vethPeer == "" {
+				log.Info("InjectIPHandoff: ADR-0139 repl veth peer empty — tc redirect NOT installed (non-fatal)",
+					"migration", req.MigrationName, "replPID", replPID)
+			} else if tcErr := installTCRedirect(ctx, fdbIf, oldIP, vethPeer); tcErr != nil {
+				log.Error(tcErr, "InjectIPHandoff: ADR-0139 tc redirect install failed (non-fatal)",
+					"migration", req.MigrationName, "fdbIf", fdbIf, "oldPodIP", req.OldPodIp, "vethPeer", vethPeer)
+			} else {
+				log.Info("InjectIPHandoff: ADR-0139 tc-ingress redirect installed (forward path B8)",
+					"migration", req.MigrationName, "fdbIf", fdbIf, "oldPodIP", req.OldPodIp, "vethPeer", vethPeer)
+				// ADR-0140 (blocker B9): the tc `mirred` redirect steals the forward frame before
+				// conntrack's ingress hook, so the pod's reply is conntrack-INVALID and kube-proxy's
+				// KUBE-FORWARD `ctstate INVALID -j DROP` rule drops it. Insert a narrow OLD-IP/32
+				// FORWARD ACCEPT pair at the head of FORWARD (before KUBE-FORWARD). Non-fatal.
+				if fwErr := installOldIPForwardAccept(ctx, oldIP); fwErr != nil {
+					log.Error(fwErr, "InjectIPHandoff: ADR-0140 FORWARD ACCEPT install failed (non-fatal)",
+						"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+				} else {
+					log.Info("InjectIPHandoff: ADR-0140 OLD-IP FORWARD ACCEPT installed (reverse path B9)",
+						"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+				}
+				// ADR-0140's filter ACCEPT fixes control/ICMP forwarding but the stateful-TCP DATA
+				// segment is still conntrack-INVALID (the tc mirred redirect made the forward leg
+				// conntrack-invisible), so the kernel RSTs it (B10). NOTRACK the OLD-IP flow in the
+				// raw table (pre-conntrack) on this destination node, both directions. Non-fatal.
+				if ntErr := installOldIPNotrack(ctx, oldIP, "both"); ntErr != nil {
+					log.Error(ntErr, "InjectIPHandoff: ADR-0141 NOTRACK install failed (non-fatal)",
+						"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+				} else {
+					log.Info("InjectIPHandoff: ADR-0141 OLD-IP NOTRACK installed (reverse data path B10)",
+						"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+				}
+			}
+		} else {
+			log.Info("InjectIPHandoff: ADR-0139 RestoredPID not yet in CR status — tc redirect deferred to requeue (non-fatal)",
+				"migration", req.MigrationName)
+		}
 	}
 
 	// ADR-0158 Decision 2+3: emit gratuitous ARP AFTER /32 route and neigh are installed,
@@ -859,13 +879,27 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 			"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "bridgeIf", bridgeIf)
 	}
 
-	resp := &agentpb.InjectIPHandoffResponse{Injected: true}
+	// Build response: set ResolvedFdbIf for observability (ADR-0192 VERIFY-11).
+	// When req.FdbIfname was supplied by the operator, ResolvedFdbIf is left empty (override path).
+	// When auto-discovered: the resolved device name, or "none:substrate-not-applicable" if absent.
+	resolvedFdbIfAnnotation := ""
+	if req.FdbIfname == "" {
+		if fdbIf == "" {
+			resolvedFdbIfAnnotation = "none:substrate-not-applicable"
+		} else {
+			resolvedFdbIfAnnotation = fdbIf
+		}
+	}
+	resp := &agentpb.InjectIPHandoffResponse{Injected: true, ResolvedFdbIf: resolvedFdbIfAnnotation}
 
 	// Decision 3: return this node's VTEP MAC for the operator to thread to source cleanup.
-	if vtepMAC, derr := network.DiscoverVTEPMAC(ctx, "", fdbIf); derr == nil {
-		resp.DestVtepMac = vtepMAC.String()
-	} else {
-		log.Error(derr, "InjectIPHandoff: DiscoverVTEPMAC failed (non-fatal)", "ifName", fdbIf)
+	// Only meaningful when fdbIf != "" (an overlay FDB device is present on this substrate).
+	if fdbIf != "" {
+		if vtepMAC, derr := network.DiscoverVTEPMAC(ctx, "", fdbIf); derr == nil {
+			resp.DestVtepMac = vtepMAC.String()
+		} else {
+			log.Error(derr, "InjectIPHandoff: DiscoverVTEPMAC failed (non-fatal)", "ifName", fdbIf)
+		}
 	}
 
 	// Decision 5: in-node reachability probe — ping the OLD pod IP from this node.

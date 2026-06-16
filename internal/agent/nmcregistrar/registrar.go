@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	"github.com/podmotion-io/podmotion/internal/agent/network"
 )
 
 // defaultAgentPort is the port the agent gRPC server listens on.
@@ -502,10 +503,12 @@ func detectCNI() string {
 
 // ipMobilitySupported reports whether PodMotion's overlay FDB/VTEP handoff
 // (ADR-0048 eBPF XDP VTEP + ADR-0133 neighbor injection) can preserve pod IPs
-// on this CNI. Flannel/kindnet VXLAN overlays ARE supported because PodMotion
-// injects the FDB/neighbor entries the static overlay lacks (see internal/agent/
-// network/fdb.go, bpf/pm_xdp_vtep.c). Env override PODMOTION_FORCE_IP_MOBILITY
-// ("true"/"false") wins for gate/bring-up.
+// on this CNI. A CNI match is a necessary condition but not sufficient: the overlay
+// FDB/VTEP device must actually exist on this node (ADR-0192 Site B, B2 fix).
+// The device is probed via DiscoverFdbInterface (link-type VXLAN discrimination —
+// no "flannel.1" literal). On kind/kindnet DiscoverFdbInterface returns "" because
+// kindnet is host-routed with no VXLAN overlay; this returns false.
+// Env override PODMOTION_FORCE_IP_MOBILITY ("true"/"false") wins for gate/bring-up.
 func ipMobilitySupported(cni string, kf pmv1.KernelFeatures) bool {
 	if v, ok := os.LookupEnv("PODMOTION_FORCE_IP_MOBILITY"); ok {
 		return strings.EqualFold(v, "true")
@@ -514,8 +517,18 @@ func ipMobilitySupported(cni string, kf pmv1.KernelFeatures) bool {
 		return false
 	}
 	switch cni {
-	case "flannel", "kindnet": // VXLAN overlay — FDB/VTEP handoff implemented (ADR-0048, ADR-0133)
+	case "flannel": // VXLAN overlay — FDB/VTEP handoff implemented (ADR-0048, ADR-0133)
+		// Probe whether the VXLAN FDB device actually exists on this node (ADR-0192 B2).
+		// DiscoverFdbInterface uses link-type VXLAN discrimination — no "flannel.1" literal.
+		fdbIf, probeErr := network.DiscoverFdbInterface()
+		if probeErr != nil || fdbIf == "" {
+			return false
+		}
 		return true
+	case "kindnet":
+		// kindnet is host-routed (no VXLAN overlay); no FDB device exists.
+		// DiscoverFdbInterface would return "" — return false directly (ADR-0192 B2).
+		return false
 	case "calico", "cilium", "ovn-kubernetes": // BGP/native routing or native eBPF datapath
 		return true
 	default:

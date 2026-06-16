@@ -480,14 +480,12 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 		// non-TCP-stateful restores. For TCP-stateful restores the connection state must
 		// be fully intact (no in-flight data was present at dump time per ADR-0049).
 		TcpSkipInFlight: proto.Bool(!opts.TcpEstablished),
-		// NetworkLock on restore: CRIU uses this to prevent the peer from racing segments
-		// during the restore window. Mirror the dump policy — use IPTABLES for TCP-stateful.
-		NetworkLock: func() *rpc.CriuNetworkLockMethod {
-			if opts.TcpEstablished {
-				return rpc.CriuNetworkLockMethod_IPTABLES.Enum()
-			}
-			return rpc.CriuNetworkLockMethod_SKIP.Enum()
-		}(),
+		// NetworkLock on restore: the dump uses --network-lock skip unconditionally (line 233),
+		// so the restore MUST also use SKIP to honor the dump/restore-pair invariant — a restore
+		// must not replay lock state the paired dump never captured (ADR-0192 Site A, §4 Decision).
+		// TcpClose and TcpSkipInFlight remain coupled to TcpEstablished by design: they govern
+		// socket reconstruction, not lock-state replay, and are NOT changed by ADR-0192.
+		NetworkLock: rpc.CriuNetworkLockMethod_SKIP.Enum(),
 		ShellJob:    proto.Bool(false),
 		ExtSharing:  proto.Bool(true),
 		ExtMasters:  proto.Bool(true),
