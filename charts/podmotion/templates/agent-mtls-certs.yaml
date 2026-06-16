@@ -1,0 +1,89 @@
+{{- if .Values.webhook.certManager.enabled }}
+# ADR-SEC-A §2.1 / ADR-0159: mTLS PKI for the operator↔agent gRPC channel (:9090).
+# A PodMotion internal CA issues two leaf certs with SPIFFE SANs:
+#   - agent server cert (server+client auth — agents are also transfer peers)
+#   - operator client cert (client auth; also the ADR-SEC-B checkpoint signing key)
+# Both chain to the same CA so RequireAndVerifyClientCert succeeds on both ends.
+# Gated on webhook.certManager.enabled (reused as the issuer gate per ADR-SEC-A §2.1). For
+# substrates without cert-manager use `make agent-certs-dev` (self-signed CA + leaf secrets).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: podmotion-grpc-ca
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  isCA: true
+  commonName: podmotion-grpc-ca
+  secretName: podmotion-grpc-ca
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    kind: Issuer
+    name: podmotion-selfsigned-issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: podmotion-grpc-ca-issuer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  ca:
+    secretName: podmotion-grpc-ca
+---
+{{- if .Values.agent.tls.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: podmotion-agent-tls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  secretName: {{ .Values.agent.tls.secretName }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  # SPIFFE identity the authz interceptor classifies as PEER_AGENT (ADR-SEC-A §2.2.2).
+  uris:
+    - spiffe://podmotion.io/ns/{{ .Release.Namespace }}/sa/podmotion-agent
+  usages:
+    - server auth
+    - client auth
+  issuerRef:
+    kind: Issuer
+    name: podmotion-grpc-ca-issuer
+---
+{{- end }}
+{{- if .Values.operator.tls.agentClient.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: podmotion-operator-agent-client-tls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  secretName: {{ .Values.operator.tls.agentClient.secretName }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  # SPIFFE identity the authz interceptor classifies as OPERATOR (ADR-SEC-A §2.2.2); the same
+  # leaf+key signs the ADR-SEC-B checkpoint manifest (ECDSA-P256 read from the key).
+  uris:
+    - spiffe://podmotion.io/ns/{{ .Release.Namespace }}/sa/podmotion-operator
+  usages:
+    - client auth
+  issuerRef:
+    kind: Issuer
+    name: podmotion-grpc-ca-issuer
+{{- end }}
+{{- end }}

@@ -321,11 +321,33 @@ func (p *Plugin) HandlePostStartContainer(ctx context.Context, event ContainerEv
 		return fmt.Errorf("NRI PostStartContainer: holder-quiescent barrier: %w", barrierErr)
 	}
 
+	// ADR-SEC-B §2.6 — provenance gate on the restore path. The final/ dir for this checkpoint-ref
+	// MUST contain the checkpoint-verified sentinel written by PutCheckpointTar (§2.3 step 6) only
+	// after signature + per-file digest + migration-binding all passed. Absent → restore is blocked
+	// (no CRIU restore on unverified images). Placed AFTER the anti-spoof verifyPodMigration check
+	// and BEFORE CRIU engages. Fail-closed: a missing sentinel is a hard block.
+	if err := verifyCheckpointProvenanceSentinel(checkpointRef); err != nil {
+		log.Error(err, "ADR-SEC-B: checkpoint not provenance-verified — refusing restore",
+			"container", event.ID, "checkpointRef", checkpointRef)
+		return fmt.Errorf("ADR-SEC-B: checkpoint not provenance-verified — refusing restore: %w", err)
+	}
+
 	// ADR-0198 Rule F item 4 — CRIU restore-over-running-holder. The restore lands over the
 	// running, parked holder (which binds no port and parks on <-sigCh). The JoinNsRestore argv is
 	// UNCHANGED and does NOT use --restore-detached (Standing Rule 6).
 	if p.OnStartContainer != nil {
 		return p.OnStartContainer(ctx, event, checkpointRef)
+	}
+	return nil
+}
+
+// verifyCheckpointProvenanceSentinel enforces the ADR-SEC-B §2.6 restore-path gate: the
+// checkpoint-verified sentinel must exist in the migration's final/ dir before CRIU restore may
+// engage. The sentinel is written by PutCheckpointTar only after the full provenance gate passes.
+func verifyCheckpointProvenanceSentinel(checkpointRef string) error {
+	sentinel := filepath.Join("/run/podmotion/checkpoints", checkpointRef, "final", "checkpoint-verified")
+	if _, err := os.Stat(sentinel); err != nil {
+		return fmt.Errorf("checkpoint-verified sentinel absent at %q: %w", sentinel, err)
 	}
 	return nil
 }
