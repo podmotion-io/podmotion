@@ -3823,6 +3823,21 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 		},
 	})
 
+	// ADR-0197 Rule D (operator side) — per-container restore-target discriminator.
+	// The pod-scoped podmotion.io/checkpoint-ref annotation has no per-container discriminator,
+	// so the NRI StartContainer hook (which fires on the FIRST container to start) matches the
+	// cp-only podmotion-inject-holder init container instead of the holder-running main container,
+	// wedging the barrier on the init container (gate-10 deadlock). Stamp the comma-joined list of
+	// MAIN container names so the agent gates restore+barrier on container NAME, not first-to-fire.
+	// The init container name (podmotion-inject-holder) is, by construction, NOT in this list.
+	restoreTargetNames := make([]string, 0, len(spec.Containers))
+	for i := range spec.Containers {
+		restoreTargetNames = append(restoreTargetNames, spec.Containers[i].Name)
+	}
+	newAnnotations["podmotion.io/restore-target-containers"] = strings.Join(restoreTargetNames, ",")
+	logf.FromContext(ctx).Info("ADR-0197 Rule D: stamped restore-target-containers (init container excluded by construction)",
+		"migration", pm.Name, "restoreTargets", newAnnotations["podmotion.io/restore-target-containers"])
+
 	// Override every main container: replace Command/Args with the injected holder binary.
 	// The workload command (e.g. redis-server) is restored BY CRIU from the checkpoint image;
 	// the holder is the container init that CRIU restores OVER.
