@@ -1778,6 +1778,8 @@ var standardPodMounts = []string{
 	"/data",
 	"/dev/termination-log",
 	"/var/run/secrets/kubernetes.io/serviceaccount",
+	"/run/secrets/kubernetes.io/serviceaccount", // /var/run is a symlink to /run on modern Linux; ctr checkpoint records the canonical form; handled by --skip-mnt in buildCRIURestoreArgs (ADR-0190)
+	"/sys",                                      // captured by ctr checkpoint as an external mount; handled by --ext-mount-map auto in buildCRIURestoreArgs (ADR-0190)
 	"/dev/shm",
 	"/etc/resolv.conf",
 	"/etc/hostname",
@@ -2078,6 +2080,7 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		// (redis) does not depend on the SA token. Mirrors the SkipMnt policy already used on
 		// the go-criu restore path. (ADR-0131 restore path.)
 		"--skip-mnt", "/var/run/secrets/kubernetes.io/serviceaccount",
+		"--skip-mnt", "/run/secrets/kubernetes.io/serviceaccount", // canonical form used by ctr checkpoint (/var/run is symlink to /run on modern Linux) (ADR-0190)
 		// dmi sysfs absent on kind control-plane nodes — bind-mount restore fails with
 		// "No such file or directory". Not needed for checkpoint/restore correctness.
 		"--skip-mnt", "/sys/devices/virtual/dmi/id/product_name",
@@ -3046,6 +3049,7 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     # or directory" (mount.c:2511). Strip them at dump time (ADR-0131 restore path).
     drop_mnts = {
         '/var/run/secrets/kubernetes.io/serviceaccount',
+        '/run/secrets/kubernetes.io/serviceaccount',  # canonical form used by ctr checkpoint (/var/run is symlink to /run on modern Linux) (ADR-0190)
         '/etc/hosts',
         '/etc/hostname',
         '/etc/resolv.conf',
@@ -3059,6 +3063,7 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
         '/proc/acpi', '/proc/scsi', '/proc/interrupts', '/proc/kcore', '/proc/keys',
         '/proc/latency_stats', '/proc/timer_list', '/proc/sched_debug',
         '/sys/firmware', '/sys/fs/pstore', '/sys/fs/bpf', '/sys/fs/cgroup',
+        '/sys',  # ctr checkpoint captures /sys as an external mount; CRIU 4.2 cannot restore it via --ext-mount-map auto in the NRI path (no placeholder container / lazy-umount path); drop it so the destination runtime re-provides /sys fresh (ADR-0190)
     }
     kept = [e for e in img['entries']
             if not (e.get('mountpoint') in null_ext_key_masked and not e.get('ext_key'))
