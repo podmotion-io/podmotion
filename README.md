@@ -34,6 +34,31 @@ overlay, without kernel patches or cloud API calls.
 
 Full proof artifact: [docs/proof/ns4-proof.md](docs/proof/ns4-proof.md)
 
+## Sprint 32 Proof: amd64 Cold-Path CRIU Checkpoint/Restore Baseline (2026-06-16)
+
+PodMotion has been proven to execute a complete cold-path CRIU checkpoint/restore pod migration on an **amd64 kind cluster** — worker node to control-plane node, no PVCs, BestEffort TCP — with **CRIU restore completing successfully and the source pod preserved intact throughout**.
+
+**Proven scope (Sprint 32):** single container, cold path (no pre-copy rounds), BestEffort TCP preservation.
+Gate: **21/22** — GC-21 (Kubernetes Running phase) is EXPECTED FAIL per ADR-0166 (iptables-restore exit code 1 in kind network namespaces; workload PID alive in destination cgroup; pre-existing substrate behavior, out of Sprint 32 scope).
+
+**Key proof points:**
+
+| Check | Result |
+|-------|--------|
+| CRIU "Restore finished successfully" in restore.log | Confirmed |
+| Restored process in destination pod cgroup | Confirmed (pid=21592) |
+| Source pod intact post-migration (ADR-0012 invariant) | Confirmed (Running at 33m) |
+| NMC READY=true both nodes (CRIU=4.2, IPMobility=true) | Confirmed |
+| Migration phase advanced past Restoring | Confirmed (RestoreSocketReattach) |
+
+**Gate close commit:** `8c16993` | **ADRs exercised:** ADR-0183 r1 through ADR-0191 (10 ADRs, 9 ACCEPTED, 1 SUPERSEDED)
+
+> **Note:** GC-21 (destination pod reaches Kubernetes Running phase) is scoped out of Sprint 32.
+> The CRIU restore mechanism is proven end-to-end; iptables-restore post-resume in kind network
+> namespaces is a substrate-tier defect tracked in ADR-0166, targeted in Sprint 33+.
+
+Full proof artifact: [docs/proof/sprint32-proof.md](docs/proof/sprint32-proof.md)
+
 ## Getting Started
 
 ### Prerequisites
