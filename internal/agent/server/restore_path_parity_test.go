@@ -123,7 +123,7 @@ func TestRestoreBranch2_MACFlowsToReportRestoreConfirmed(t *testing.T) {
 
 	// Stub patchCheckpointImagesFn — Branch 2 calls this; without stub it would exec Python.
 	origPatch := patchCheckpointImagesFn
-	patchCheckpointImagesFn = func(_ string) error { return nil }
+	patchCheckpointImagesFn = func(_ string, _ []string) error { return nil }
 	defer func() { patchCheckpointImagesFn = origPatch }()
 
 	// Track that joinNsRestoreFn was called.
