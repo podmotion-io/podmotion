@@ -5,7 +5,7 @@ apiVersion: kind.x-k8s.io/v1alpha4
 name: podmotion-sprint31
 nodes:
   - role: control-plane
-    image: podmotion-node:sprint31-amd64
+    image: podmotion-node:sprint33-amd64
     kubeadmConfigPatches:
       - |
         kind: InitConfiguration
@@ -17,7 +17,7 @@ nodes:
         containerPath: /sys/fs/bpf
         propagation: Bidirectional
   - role: worker
-    image: podmotion-node:sprint31-amd64
+    image: podmotion-node:sprint33-amd64
     extraMounts:
       - hostPath: /sys/fs/bpf
         containerPath: /sys/fs/bpf
