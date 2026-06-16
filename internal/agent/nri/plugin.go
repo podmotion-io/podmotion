@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -200,6 +201,31 @@ func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent)
 			log.Error(verifyErr, "NRI StartContainer: PodMigration verification failed — blocking restore",
 				"checkpointRef", checkpointRef, "container", event.ID)
 			return fmt.Errorf("NRI StartContainer: PodMigration verification failed: %w", verifyErr)
+		}
+	}
+
+	// ADR-0197 Rule D (agent side) — per-container restore-target gate.
+	// The pod-scoped checkpoint-ref above has no per-container discriminator, so this hook
+	// matches whichever container fires StartContainer FIRST — which is the cp-only
+	// podmotion-inject-holder init container, not the holder-running main container
+	// (gate-10: inject-holder=6, redis=0). Firing CRIU restore + the holder-quiescent barrier
+	// against the init container wedges it (the init container never runs the holder, never
+	// writes the sentinel), deadlocking the main container behind it → 50s timeout →
+	// RunContainerError → CrashLoopBackOff.
+	//
+	// Gate on container identity AFTER the verifyPodMigration anti-spoof check and BEFORE the
+	// restore trigger + barrier: proceed ONLY if event.Name is in the operator-stamped
+	// podmotion.io/restore-target-containers list (main container names; the init container is
+	// excluded by construction). For any non-listed container (the init container), return nil
+	// immediately — clean pass-through, no restore, no barrier — so the init container completes,
+	// the emptyDir is populated, and the main container starts. Its StartContainer then fires and
+	// restore+barrier engage against the holder-running container, which DOES write the sentinel.
+	const restoreTargetsKey = "podmotion.io/restore-target-containers"
+	if targets := event.Annotations[restoreTargetsKey]; targets != "" {
+		if !containerInList(event.Name, targets) {
+			log.Info("ADR-0197 Rule D: container is not a restore target — clean pass-through (no restore, no barrier)",
+				"container", event.ID, "name", event.Name, "restoreTargets", targets)
+			return nil
 		}
 	}
 
@@ -506,11 +532,24 @@ func waitForHolderQuiescent(ctx context.Context, event ContainerEvent, timeout t
 		return nil
 	}
 
+	// ADR-0197 Rule E (§3h co-located) — dual quiescence transport.
+	// The barrier is satisfied by EITHER:
+	//   (i)  the holder-ready sentinel file at /proc/<pid>/root/run/podmotion/holder-ready, OR
+	//   (ii) the holder's stdout token "podmotion-holder ready" in the container CRI log.
+	// Rule D lets the holder run in the MAIN container, which on a FROM-scratch rootfs may make
+	// /proc/<pid>/root/run/podmotion/holder-ready traversal of the read-only emptyDir-shadowed
+	// path unreliable. The doc-comment (:472-481) and the holder (cmd/holder/main.go:53) always
+	// advertised this dual transport, but only the file stat was implemented. Implementing the
+	// stdout token (OR-ed with the file) prevents Rule D from merely moving the timeout from the
+	// init container to the main container. The satisfied-transport is attributed in the log so
+	// §P-VERIFY can tell which one fired.
+	const holderStdoutToken = "podmotion-holder ready"
+
 	// Poll for the sentinel file via /proc/<pid>/root traversal.
 	// The container PID is the init PID of the container; it appears under /proc once the
 	// container runtime has created the cgroup and forked the init process.
 	for time.Now().Before(deadline) {
-		// Try to find the container's init PID by scanning /proc/*/cgroup for the container ID.
+		// Transport (i): sentinel file. Find the container's init PID by scanning /proc/*/cgroup.
 		pid := findContainerInitPID(event.ID)
 		if pid > 0 {
 			sentinelPath := fmt.Sprintf("/proc/%d/root/%s", pid, holderReadySentinel)
@@ -521,6 +560,15 @@ func waitForHolderQuiescent(ctx context.Context, event ContainerEvent, timeout t
 			}
 		}
 
+		// Transport (ii): stdout token. Observe the holder container's CRI stdout log for the
+		// "podmotion-holder ready" token. The token is read ONLY from the Rule-D-selected holder
+		// container's own log stream — it does not widen trust to any other writer.
+		if observeHolderStdoutToken(event, holderStdoutToken) {
+			log.Info("holder-quiescent barrier satisfied (stdout token)",
+				"container", event.ID, "name", event.Name, "token", holderStdoutToken)
+			return nil
+		}
+
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("context cancelled waiting for holder-quiescent sentinel: %w", ctx.Err())
@@ -529,8 +577,56 @@ func waitForHolderQuiescent(ctx context.Context, event ContainerEvent, timeout t
 	}
 
 	// Timeout: emit a loud, attributable error log (Quorum Observability C2).
-	return fmt.Errorf("holder-quiescent barrier: sentinel %q not observed within %s for container %s (non-conforming holder or init delay exceeded barrier timeout)",
-		holderReadySentinel, timeout, event.ID)
+	return fmt.Errorf("holder-quiescent barrier: sentinel %q / stdout token %q not observed within %s for container %s (non-conforming holder or init delay exceeded barrier timeout)",
+		holderReadySentinel, holderStdoutToken, timeout, event.ID)
+}
+
+// observeHolderStdoutToken implements ADR-0197 Rule E transport (ii): it scans the holder
+// container's CRI stdout log for the quiescence token (e.g. "podmotion-holder ready"). The CRI
+// (containerd) log layout on the host is:
+//
+//	/var/log/pods/<namespace>_<pod>_<podUID>/<containerName>/<N>.log
+//
+// Each line is the CRI log format: "<RFC3339Nano> <stdout|stderr> <F|P> <message>". We do a
+// substring match against the whole file content (the token is unambiguous). The token is read
+// ONLY from the Rule-D-selected holder container's own log stream — it does not widen trust to a
+// different writer; both transports are satisfied only by the holder process the agent already
+// gates on by container identity (Rule D). Returns false (not an error) on any I/O miss so the
+// caller keeps polling until the sentinel-file transport or the deadline resolves.
+func observeHolderStdoutToken(event ContainerEvent, token string) bool {
+	if event.Namespace == "" || event.Pod == "" || event.PodUID == "" || event.Name == "" {
+		// Insufficient identity to locate the CRI log deterministically — fall back to the
+		// sentinel-file transport (do not guess a path that could match another container).
+		return false
+	}
+	logDir := fmt.Sprintf("/var/log/pods/%s_%s_%s/%s", event.Namespace, event.Pod, event.PodUID, event.Name)
+	logFiles, err := filepath.Glob(filepath.Join(logDir, "*.log"))
+	if err != nil || len(logFiles) == 0 {
+		return false
+	}
+	for _, lf := range logFiles {
+		data, err := os.ReadFile(lf)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(data), token) {
+			return true
+		}
+	}
+	return false
+}
+
+// containerInList reports whether name is a member of the comma-joined list (ADR-0197 Rule D
+// restore-target-containers annotation). Whitespace around each element is trimmed; empty
+// elements are ignored. The init container (podmotion-inject-holder) is never in this list by
+// construction, so it is excluded as a consequence of the allow-list, not a hard-coded deny.
+func containerInList(name, csv string) bool {
+	for _, part := range strings.Split(csv, ",") {
+		if strings.TrimSpace(part) == name {
+			return true
+		}
+	}
+	return false
 }
 
 // findContainerInitPID scans /proc for the init PID of the container with the given containerID.
