@@ -65,3 +65,9 @@ RUN chmod 644 /usr/lib/podmotion/bpf/zero_window_bpfel.o \
 COPY bin/agent-linux-amd64 /usr/local/bin/podmotion-agent
 RUN chmod +x /usr/local/bin/podmotion-agent \
   && ln -sf /usr/local/bin/podmotion-agent /usr/local/lib/nri/podmotion-nri
+
+# ADR-0181: install the cgroup-fd delivery wrapper so nsenter can exec it before criu.
+# The wrapper opens cgroup fds after nsenter's own opens are complete, preventing fd-table
+# displacement of Go ExtraFiles positions.
+COPY bin/criu-wrapper-linux-amd64 /usr/local/bin/podmotion-criu-wrapper
+RUN chmod +x /usr/local/bin/podmotion-criu-wrapper

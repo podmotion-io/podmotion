@@ -173,6 +173,8 @@ build-linux: ## Build operator and agent for linux/arm64 and linux/amd64 (no cgo
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/podmotion-manager-amd64 ./cmd/main.go
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/podmotion-agent-arm64 ./cmd/agent/main.go
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/podmotion-agent-amd64 ./cmd/agent/main.go
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/podmotion-criu-wrapper-arm64 ./cmd/criu-wrapper/main.go
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/podmotion-criu-wrapper-amd64 ./cmd/criu-wrapper/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.

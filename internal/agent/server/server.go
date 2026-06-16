@@ -2491,81 +2491,41 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 			"err", cgEnumErr, "migration", migrationName)
 		cgInheritFds = nil
 	}
-	var heldCgroupFds []*os.File
-	// closeHeldCgroupFds is the single cleanup site for the agent-held cgroup descriptors.
-	// Deferred immediately so it fires on ALL standard exit paths (Standing Rule 7 / OC-2
-	// Abort-path cleanup). Idempotent: nils each handle after close.
-	closeHeldCgroupFds := func() {
-		for i, f := range heldCgroupFds {
-			if f != nil {
-				_ = f.Close()
-				heldCgroupFds[i] = nil
-			}
+	// ADR-0181: build the --cgroup-fd=N:path args for the wrapper and the --inherit-fd fd[N]:path
+	// args for CRIU from the same enumeration so fd numbers and resolved paths cannot drift.
+	// The agent does NOT hold any cgroup fds — the wrapper process opens them fresh inside the
+	// host mount namespace (already entered by nsenter before the wrapper runs), dup3s each to
+	// its target N, and execve()s criu. nsenter's internal opens happen before the wrapper runs
+	// and cannot displace target N because the wrapper sets each slot last.
+	//
+	// OC-5(a): the heldCgroupFds / closeHeldCgroupFds / inheritExtraFiles / ExtraFiles block
+	// from ADR-0180 is removed here. There are no agent-held cgroup fds. The wrapper process
+	// owns the descriptors; they are released when criu exits (reaped by the background Wait
+	// goroutine below). Abort clean-teardown contract: Abort kills the wrapper/criu child via
+	// checkpointer.Abort; the kernel releases the child's fd table on exit. No agent-side
+	// defer chain is needed.
+	var cgroupFdMapArgs []string
+	for _, c := range cgInheritFds {
+		if c.Fd < 3 {
+			log.Info("ADR-0181: skipping cgroup inherit-fd with reserved fd number",
+				"fd", c.Fd, "path", c.Path)
+			continue
 		}
-	}
-	defer closeHeldCgroupFds()
-	var inheritExtraFiles []*os.File
-	if len(cgInheritFds) > 0 {
-		// CRIU --inherit-fd fd[NUM]:RES treats NUM as a fd already open in CRIU's own process
-		// pointing at RES. We therefore position each agent-held cgroupfs source file at the
-		// exact fd number NUM (== the recorded restored-task fd) in the CRIU child. cmd.ExtraFiles
-		// assigns ExtraFiles[i] to child fd 3+i, so we build a contiguous slice from fd 3 up to
-		// the max recorded cgroup fd, filling gaps with a /dev/null placeholder; only the cgroup
-		// slots carry real cgroupfs descriptors. nsenter passes inherited fds straight through.
-		maxFd := 2
-		for _, c := range cgInheritFds {
-			if c.Fd > maxFd {
-				maxFd = c.Fd
-			}
-		}
-		slots := make([]*os.File, maxFd-2) // indices 0..(maxFd-3) -> child fds 3..maxFd
-		for _, c := range cgInheritFds {
-			if c.Fd < 3 {
-				// fds 0/1/2 are std streams the restored task already gets; CRIU would not
-				// request an inherit-fd for them. Skip defensively.
-				log.Info("ADR-0180: skipping cgroup inherit-fd with reserved fd number",
-					"fd", c.Fd, "path", c.Path)
-				continue
-			}
-			src := resolveInheritCgroupSource(c.Path, sandboxID)
-			f, oerr := os.OpenFile(src, os.O_RDONLY, 0)
-			if oerr != nil {
-				// If we cannot open a real cgroupfs source the inherited-fd redirect for this
-				// entry is impossible; close everything opened so far (cleanup contract — no
-				// partial fd leak) and fail loud so the abort is attributable, not silent.
-				closeHeldCgroupFds()
-				return 0, fmt.Errorf("ADR-0180: open cgroup inherit source %q for fd[%d] (recorded %q): %w",
-					src, c.Fd, c.Path, oerr)
-			}
-			heldCgroupFds = append(heldCgroupFds, f)
-			slots[c.Fd-3] = f
-			criuArgs = append(criuArgs, "--inherit-fd", fmt.Sprintf("fd[%d]:%s", c.Fd, c.Path))
-			log.Info("ADR-0180: redirecting cgroup reg-file fd via --inherit-fd",
-				"fd", c.Fd, "recordedPath", c.Path, "hostSource", src, "migration", migrationName)
-		}
-		// Fill any gap slots with a /dev/null placeholder so the real cgroup descriptors land at
-		// their exact target fd numbers in the child.
-		for i := range slots {
-			if slots[i] == nil {
-				devnull, derr := os.OpenFile(os.DevNull, os.O_RDONLY, 0)
-				if derr != nil {
-					closeHeldCgroupFds()
-					return 0, fmt.Errorf("ADR-0180: open placeholder %s for inherit-fd padding: %w", os.DevNull, derr)
-				}
-				heldCgroupFds = append(heldCgroupFds, devnull)
-				slots[i] = devnull
-			}
-		}
-		inheritExtraFiles = slots
-		// criuArgs changed after buildCRIURestoreArgs/maskedArgs assembly; rebuild the command.
+		src := resolveInheritCgroupSource(c.Path, sandboxID)
+		cgroupFdMapArgs = append(cgroupFdMapArgs, fmt.Sprintf("--cgroup-fd=%d:%s", c.Fd, src))
+		criuArgs = append(criuArgs, "--inherit-fd", fmt.Sprintf("fd[%d]:%s", c.Fd, c.Path))
+		log.Info("ADR-0181: cgroup fd routed via wrapper+dup3 (not ExtraFiles)",
+			"fd", c.Fd, "recordedPath", c.Path, "hostSource", src, "migration", migrationName)
 	}
 
-	criuCmd := nsenterCmd(append([]string{"/usr/sbin/criu"}, criuArgs...)...)
+	// ADR-0181: launch podmotion-criu-wrapper instead of criu directly.
+	// wrapperArgs: wrapper binary, per-fd --cgroup-fd=N:path flags, separator, criu binary+args.
+	wrapperArgs := append([]string{"/usr/local/bin/podmotion-criu-wrapper"}, cgroupFdMapArgs...)
+	wrapperArgs = append(wrapperArgs, "--", "/usr/sbin/criu")
+	wrapperArgs = append(wrapperArgs, criuArgs...)
+	criuCmd := nsenterCmd(wrapperArgs...)
 	// ADR-0125: netns is joined by path (--join-ns net:<path>), not by an inherited fd.
-	// ADR-0180: ExtraFiles carry the agent-held cgroupfs descriptors so CRIU can satisfy each
-	// --inherit-fd fd[NUM]:RES from a real host descriptor at fd number NUM in its own process.
-	// nsenter forwards these inherited fds to CRIU unchanged.
-	criuCmd.ExtraFiles = inheritExtraFiles
+	// ADR-0181: no ExtraFiles — the wrapper owns fd delivery; the agent holds no cgroup fds.
 	// Capture CRIU's stderr: when CRIU fails before opening its -o logfile (e.g. arg/ext-mount
 	// resolution errors), the only diagnostic is on stderr. A bounded buffer keeps it cheap.
 	var criuStderr bytes.Buffer
