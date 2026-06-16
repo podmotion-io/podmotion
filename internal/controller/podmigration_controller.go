@@ -727,11 +727,11 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Determine overlay FDB interface name; default to "flannel.1" per ADR-0048.
+	// ADR-0192 R2 B2c: pass empty FdbIfname when OverlayFdbIfname is unset — delegate to agent
+	// discovery (VXLAN link-type probe). No "flannel.1" literal (C-335). The agent returns
+	// ResolvedFdbIf on the response path (see injectIPHandoff / 2796-2805).
 	fdbIfname := pm.Status.OverlayFdbIfname
-	if fdbIfname == "" {
-		fdbIfname = "flannel.1"
-	}
+	// fdbIfname may be "" — that is intentional; the agent discovers the VXLAN device at runtime.
 
 	// seq_xlat_seeded: predicate B of the atomicity barrier.
 	// When TCPSeqSnapshots is non-empty, SeedSeqXlat ran during Restore to populate
@@ -859,10 +859,9 @@ func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm 
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 
+		// ADR-0192 R2 B2c: pass empty FdbIfname — delegate to agent VXLAN discovery. No "flannel.1" literal.
 		fdbIfname := pm.Status.OverlayFdbIfname
-		if fdbIfname == "" {
-			fdbIfname = "flannel.1"
-		}
+		// fdbIfname may be "" — intentional; agent discovers at runtime.
 		// Vacuously true when no TCP connections exist (same fix as OverlayHandoff B5).
 		seqXlatSeeded := true
 
@@ -2673,10 +2672,8 @@ func (r *PodMigrationReconciler) disarmTCRedirect(ctx context.Context, pm *pmv1.
 	if err != nil {
 		return err
 	}
+	// ADR-0192 R2 B2c: pass empty FdbIfname — agent discovers the VXLAN device at runtime. No literal.
 	fdbIfname := pm.Status.OverlayFdbIfname
-	if fdbIfname == "" {
-		fdbIfname = "flannel.1"
-	}
 	_, err = destAgent.DisarmTCRedirect(ctx, &agentpb.DisarmTCRedirectRequest{
 		MigrationName: pm.Name,
 		FdbIfname:     fdbIfname,
@@ -2753,10 +2750,10 @@ func (r *PodMigrationReconciler) injectIPHandoff(ctx context.Context, pm *pmv1.P
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
 	}
 
-	fdbIfname := pm.Status.OverlayFdbIfname
-	if fdbIfname == "" {
-		fdbIfname = "flannel.1"
-	}
+	// ADR-0192 R2 B2c (load-bearing InjectIPHandoff request): pass FdbIfname="" when
+	// OverlayFdbIfname is unset so the agent runs DiscoverFdbInterface() and skip-coherence.
+	// Exactly as BridgeIfname:"" already does (line 2769). No "flannel.1" literal (C-335).
+	fdbIfname := pm.Status.OverlayFdbIfname // "" = delegate to agent VXLAN discovery
 
 	log.Info("injectIPHandoff: calling InjectIPHandoff on destination agent (ADR-0133 D2)",
 		"migration", pm.Name, "node", destNode, "oldPodIP", pm.Spec.SourcePodIP, "replVethMAC", pm.Status.ReplVethMAC)
@@ -3042,10 +3039,8 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 				log.Error(agErr, "ADR-0133 D4: cannot connect to source agent for IP handoff cleanup (warn-only)",
 					"migration", pm.Name, "node", srcNode)
 			} else {
+				// ADR-0192 R2 B2c: pass empty FdbIfname — agent discovers at runtime. No "flannel.1" literal.
 				fdbIfname := pm.Status.OverlayFdbIfname
-				if fdbIfname == "" {
-					fdbIfname = "flannel.1"
-				}
 				if cleanResp, cErr := srcAgent.CleanupSourceIPHandoff(ctx, &agentpb.CleanupSourceIPHandoffRequest{
 					MigrationName: pm.Name,
 					OldPodIp:      pm.Spec.SourcePodIP,
