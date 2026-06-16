@@ -229,30 +229,101 @@ func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent)
 		}
 	}
 
-	log.Info("NRI StartContainer: CRIU restore triggered",
+	// ADR-0198 Rule F — defer the holder-quiescent barrier + CRIU restore trigger to
+	// PostStartContainer.
+	//
+	// The NRI StartContainer hook is SYNCHRONOUS: it must RETURN before containerd executes
+	// the container entrypoint. ADR-0197 correctly relocated the barrier+restore onto the
+	// holder-hosting main container, but the holder-quiescent barrier waits for a signal
+	// (sentinel file OR stdout token) that ONLY the main container's own entrypoint
+	// (/podmotion/holder, cmd/holder/main.go:39-53) can emit — and that entrypoint cannot run
+	// until THIS hook returns. Circular wait → 50s timeout → RunContainerError (gate-11).
+	//
+	// The fix: StartContainer returns NIL immediately for a restore-target container WITHOUT
+	// invoking waitForHolderQuiescent or OnStartContainer, so containerd starts the holder
+	// entrypoint. The wait+trigger run in HandlePostStartContainer, which fires AFTER the
+	// entrypoint has started — at which point the holder is running and CAN signal quiescence.
+	//
+	// The verifyPodMigration anti-spoof gate above DELIBERATELY STAYS in StartContainer
+	// (pre-entrypoint): a forged/absent/wrong-node CR is rejected before the entrypoint is
+	// ever allowed to run. Only the holder-quiescent WAIT and the restore TRIGGER move.
+	log.Info("NRI StartContainer: restore deferred to PostStartContainer (holder must start first)",
+		"adr", "ADR-0198",
+		"container", event.ID,
+		"checkpointRef", checkpointRef,
+	)
+	return nil
+}
+
+// HandlePostStartContainer is called by the NRI runtime bridge when containerd fires the
+// PostStartContainer lifecycle event — AFTER containerd has started the container's entrypoint.
+//
+// ADR-0198 Rule F: this is the lifecycle phase in which the holder-quiescent barrier may safely
+// wait. By the time PostStartContainer fires, the main container's entrypoint (the injected
+// holder, ADR-0195 Rule A) is executing and parked — so it CAN write the sentinel file / emit
+// the stdout token the barrier waits for. The barrier therefore becomes satisfiable, and on
+// success the CRIU restore (OnStartContainer → JoinNsRestore) engages against the now-running,
+// parked holder's namespaces.
+//
+// The Rule D container-target gate is re-applied here: PostStartContainer fires for every
+// container (including the init container's post-start), and non-restore-target containers return
+// nil immediately, exactly as in HandleStartContainer.
+func (p *Plugin) HandlePostStartContainer(ctx context.Context, event ContainerEvent) error {
+	// Re-read the checkpoint-ref (dual-path: pod annotation, then container-linux annotation),
+	// mirroring HandleStartContainer.
+	const refKey = "podmotion.io/checkpoint-ref"
+	checkpointRef := event.Annotations[refKey]
+	if checkpointRef == "" {
+		if v, ok := event.Labels[refKey]; ok {
+			checkpointRef = v
+		}
+	}
+	if checkpointRef == "" {
+		return nil // not a restore target
+	}
+
+	// Re-validate the ref before it touches the filesystem (defense-in-depth; HandleStartContainer
+	// already validated, but PostStartContainer is reachable independently via the NRI dispatch).
+	if !validCheckpointRef.MatchString(checkpointRef) {
+		log.Error(nil, "NRI PostStartContainer: rejecting invalid checkpointRef — possible path traversal",
+			"checkpointRef", checkpointRef, "container", event.ID)
+		return fmt.Errorf("invalid checkpointRef %q: must match [a-z0-9][a-z0-9-]{0,61}[a-z0-9]", checkpointRef)
+	}
+
+	// ADR-0197 Rule D (re-applied) — per-container restore-target gate. Non-restore-target
+	// containers (the init container's post-start) return nil immediately.
+	const restoreTargetsKey = "podmotion.io/restore-target-containers"
+	if targets := event.Annotations[restoreTargetsKey]; targets != "" {
+		if !containerInList(event.Name, targets) {
+			log.Info("ADR-0197 Rule D: container is not a restore target — clean pass-through (PostStartContainer)",
+				"container", event.ID, "name", event.Name, "restoreTargets", targets)
+			return nil
+		}
+	}
+
+	log.Info("NRI PostStartContainer: CRIU restore triggered",
 		"container", event.ID,
 		"checkpointRef", checkpointRef,
 	)
 
-	// ADR-0195 Rule C — holder-quiescent barrier.
-	// Block until the universal injected holder (ADR-0195 Rule A) signals quiescence
-	// (sentinel file /run/podmotion/holder-ready OR stdout token "podmotion-holder ready")
-	// before invoking JoinNsRestore (via OnStartContainer).
+	// ADR-0195 Rule C — holder-quiescent barrier (relocated to PostStartContainer by ADR-0198
+	// Rule F; mechanism UNCHANGED — still polls the sentinel file via /proc/<pid>/root OR observes
+	// the stdout token, ADR-0197 Rule D/E dual transport). The holder entrypoint is now running, so
+	// one of the two transports fires and the barrier is satisfied.
 	//
-	// The barrier prevents restore from racing a non-conforming or still-initialising holder
-	// that has not yet cleared the workload port from the sandbox netns.  With the universal
-	// injected holder, the barrier is ALWAYS satisfiable; if a future non-conforming holder is
-	// introduced it fails-fast with a deterministic error rather than racing into sk-inet.c:1059.
-	//
-	// Barrier timeout: 50 s — within the plugin_request_timeout budget (60 s, §P-VERIFY C1)
-	// and above the existing 45 s verifyDeadline.  On timeout the hook returns a hard error;
-	// containerd will fire the container-start failure path and the migration will fail cleanly.
+	// Barrier timeout: 50 s — within the plugin_request_timeout budget (60 s, §P-VERIFY C1). NRI
+	// applies one request timeout to all plugin event handlers, so this governs PostStartContainer
+	// identically to StartContainer. On timeout the handler returns a hard error which surfaces as a
+	// container post-start failure rather than silently proceeding.
 	if barrierErr := waitForHolderQuiescent(ctx, event, 50*time.Second); barrierErr != nil {
-		log.Error(barrierErr, "NRI StartContainer: holder-quiescent barrier FAILED — blocking restore",
+		log.Error(barrierErr, "NRI PostStartContainer: holder-quiescent barrier FAILED — blocking restore",
 			"container", event.ID, "checkpointRef", checkpointRef)
-		return fmt.Errorf("NRI StartContainer: holder-quiescent barrier: %w", barrierErr)
+		return fmt.Errorf("NRI PostStartContainer: holder-quiescent barrier: %w", barrierErr)
 	}
 
+	// ADR-0198 Rule F item 4 — CRIU restore-over-running-holder. The restore lands over the
+	// running, parked holder (which binds no port and parks on <-sigCh). The JoinNsRestore argv is
+	// UNCHANGED and does NOT use --restore-detached (Standing Rule 6).
 	if p.OnStartContainer != nil {
 		return p.OnStartContainer(ctx, event, checkpointRef)
 	}
@@ -370,6 +441,30 @@ func (a *nriAdapter) StartContainer(ctx context.Context, pod *nriapi.PodSandbox,
 	if pod == nil || container == nil {
 		return nil
 	}
+	return a.plugin.HandleStartContainer(ctx, buildContainerEvent(pod, container))
+}
+
+// PostStartContainer implements stub.PostStartContainerInterface (NRI v0.12.0).
+// Implementing this interface causes the stub's setupHandlers (stub.go:1052-1055) to register
+// the handler AND subscribe the plugin to Event_POST_START_CONTAINER automatically — no other
+// wiring is required. It fires AFTER containerd has started the container's entrypoint, which is
+// the lifecycle phase in which ADR-0198 Rule F runs the holder-quiescent barrier + CRIU restore.
+//
+// The same ContainerEvent (identical field set, including ImageName, Annotations, and the
+// container-level annotation merge) is built as for StartContainer and dispatched to
+// HandlePostStartContainer.
+func (a *nriAdapter) PostStartContainer(ctx context.Context, pod *nriapi.PodSandbox, container *nriapi.Container) error {
+	// Defensive nil guard, identical to StartContainer (ADR-0119 D2).
+	if pod == nil || container == nil {
+		return nil
+	}
+	return a.plugin.HandlePostStartContainer(ctx, buildContainerEvent(pod, container))
+}
+
+// buildContainerEvent constructs the ContainerEvent from an NRI pod sandbox + container, applying
+// the container-level annotation merge. Shared by StartContainer and PostStartContainer so both
+// hooks see an identical event field set (ADR-0198 Rule F item 1).
+func buildContainerEvent(pod *nriapi.PodSandbox, container *nriapi.Container) ContainerEvent {
 	event := ContainerEvent{
 		ID:          container.GetId(),
 		Name:        container.GetName(),
@@ -392,7 +487,7 @@ func (a *nriAdapter) StartContainer(ctx context.Context, pod *nriapi.PodSandbox,
 			}
 		}
 	}
-	return a.plugin.HandleStartContainer(ctx, event)
+	return event
 }
 
 // fetchContainerImage queries containerd for the image name associated with the given
