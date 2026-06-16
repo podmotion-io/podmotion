@@ -19,26 +19,28 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	MigrationAgentService_PrepareSource_FullMethodName           = "/podmotion.agent.v1.MigrationAgentService/PrepareSource"
-	MigrationAgentService_PreDumpRound_FullMethodName            = "/podmotion.agent.v1.MigrationAgentService/PreDumpRound"
-	MigrationAgentService_Checkpoint_FullMethodName              = "/podmotion.agent.v1.MigrationAgentService/Checkpoint"
-	MigrationAgentService_PrepareDestination_FullMethodName      = "/podmotion.agent.v1.MigrationAgentService/PrepareDestination"
-	MigrationAgentService_Restore_FullMethodName                 = "/podmotion.agent.v1.MigrationAgentService/Restore"
-	MigrationAgentService_Verify_FullMethodName                  = "/podmotion.agent.v1.MigrationAgentService/Verify"
-	MigrationAgentService_PrepareDestinationNetns_FullMethodName = "/podmotion.agent.v1.MigrationAgentService/PrepareDestinationNetns"
-	MigrationAgentService_ConfirmOverlayReady_FullMethodName     = "/podmotion.agent.v1.MigrationAgentService/ConfirmOverlayReady"
-	MigrationAgentService_ArmZeroWindow_FullMethodName           = "/podmotion.agent.v1.MigrationAgentService/ArmZeroWindow"
-	MigrationAgentService_DisarmZeroWindow_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/DisarmZeroWindow"
-	MigrationAgentService_Abort_FullMethodName                   = "/podmotion.agent.v1.MigrationAgentService/Abort"
-	MigrationAgentService_EstimateCheckpoint_FullMethodName      = "/podmotion.agent.v1.MigrationAgentService/EstimateCheckpoint"
-	MigrationAgentService_PutCheckpointTar_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/PutCheckpointTar"
-	MigrationAgentService_GetCheckpointTar_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/GetCheckpointTar"
-	MigrationAgentService_ReleaseCheckpoint_FullMethodName       = "/podmotion.agent.v1.MigrationAgentService/ReleaseCheckpoint"
-	MigrationAgentService_InjectIPHandoff_FullMethodName         = "/podmotion.agent.v1.MigrationAgentService/InjectIPHandoff"
-	MigrationAgentService_CleanupSourceIPHandoff_FullMethodName  = "/podmotion.agent.v1.MigrationAgentService/CleanupSourceIPHandoff"
-	MigrationAgentService_InjectSourceRedirect_FullMethodName    = "/podmotion.agent.v1.MigrationAgentService/InjectSourceRedirect"
-	MigrationAgentService_DisarmTCRedirect_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/DisarmTCRedirect"
-	MigrationAgentService_VerifyTCP_FullMethodName               = "/podmotion.agent.v1.MigrationAgentService/VerifyTCP"
+	MigrationAgentService_PrepareSource_FullMethodName              = "/podmotion.agent.v1.MigrationAgentService/PrepareSource"
+	MigrationAgentService_PreDumpRound_FullMethodName               = "/podmotion.agent.v1.MigrationAgentService/PreDumpRound"
+	MigrationAgentService_Checkpoint_FullMethodName                 = "/podmotion.agent.v1.MigrationAgentService/Checkpoint"
+	MigrationAgentService_PrepareDestination_FullMethodName         = "/podmotion.agent.v1.MigrationAgentService/PrepareDestination"
+	MigrationAgentService_Restore_FullMethodName                    = "/podmotion.agent.v1.MigrationAgentService/Restore"
+	MigrationAgentService_Verify_FullMethodName                     = "/podmotion.agent.v1.MigrationAgentService/Verify"
+	MigrationAgentService_PrepareDestinationNetns_FullMethodName    = "/podmotion.agent.v1.MigrationAgentService/PrepareDestinationNetns"
+	MigrationAgentService_ConfirmOverlayReady_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/ConfirmOverlayReady"
+	MigrationAgentService_ArmZeroWindow_FullMethodName              = "/podmotion.agent.v1.MigrationAgentService/ArmZeroWindow"
+	MigrationAgentService_DisarmZeroWindow_FullMethodName           = "/podmotion.agent.v1.MigrationAgentService/DisarmZeroWindow"
+	MigrationAgentService_Abort_FullMethodName                      = "/podmotion.agent.v1.MigrationAgentService/Abort"
+	MigrationAgentService_EstimateCheckpoint_FullMethodName         = "/podmotion.agent.v1.MigrationAgentService/EstimateCheckpoint"
+	MigrationAgentService_PutCheckpointTar_FullMethodName           = "/podmotion.agent.v1.MigrationAgentService/PutCheckpointTar"
+	MigrationAgentService_GetCheckpointTar_FullMethodName           = "/podmotion.agent.v1.MigrationAgentService/GetCheckpointTar"
+	MigrationAgentService_ReleaseCheckpoint_FullMethodName          = "/podmotion.agent.v1.MigrationAgentService/ReleaseCheckpoint"
+	MigrationAgentService_InjectIPHandoff_FullMethodName            = "/podmotion.agent.v1.MigrationAgentService/InjectIPHandoff"
+	MigrationAgentService_CleanupSourceIPHandoff_FullMethodName     = "/podmotion.agent.v1.MigrationAgentService/CleanupSourceIPHandoff"
+	MigrationAgentService_InjectSourceRedirect_FullMethodName       = "/podmotion.agent.v1.MigrationAgentService/InjectSourceRedirect"
+	MigrationAgentService_DisarmTCRedirect_FullMethodName           = "/podmotion.agent.v1.MigrationAgentService/DisarmTCRedirect"
+	MigrationAgentService_VerifyTCP_FullMethodName                  = "/podmotion.agent.v1.MigrationAgentService/VerifyTCP"
+	MigrationAgentService_ProbeDataplaneReachability_FullMethodName = "/podmotion.agent.v1.MigrationAgentService/ProbeDataplaneReachability"
+	MigrationAgentService_StartReachabilityEcho_FullMethodName      = "/podmotion.agent.v1.MigrationAgentService/StartReachabilityEcho"
 )
 
 // MigrationAgentServiceClient is the client API for MigrationAgentService service.
@@ -124,6 +126,22 @@ type MigrationAgentServiceClient interface {
 	// ±MSS (1448 bytes). Also issues the ApplicationProbe (SQL/TCP) when configured.
 	// Called by the controller during TCPVerifying phase per ADR-0019 Amendment A.
 	VerifyTCP(ctx context.Context, in *VerifyTCPRequest, opts ...grpc.CallOption) (*VerifyTCPResponse, error)
+	// ProbeDataplaneReachability is called by the CONTROLLER on the SOURCE-NODE agent
+	// (a node != destination) to dial the preserved pod IP cross-node and confirm the
+	// real overlay/host-route datapath is live. ADR-0210: this replaces the ADR-0200/0201
+	// in-netns self-probe tautology. The dial originates from the source node's HOST netns
+	// (NOT a pod netns) so its SYN traverses the real overlay (VXLAN/VTEP), not a local
+	// lo/32 alias. The destination must echo back the controller-issued correlation nonce
+	// (round-tripped through the dialed listener) — the source agent cannot synthesize
+	// success alone. The controller is the authority that flips DataplaneReachabilityVerified.
+	ProbeDataplaneReachability(ctx context.Context, in *ProbeDataplaneReachabilityRequest, opts ...grpc.CallOption) (*ProbeDataplaneReachabilityResponse, error)
+	// StartReachabilityEcho is called by the controller on the DESTINATION-node agent to
+	// open a short-lived TCP listener INSIDE the replacement pod netns, bound to the
+	// preserved pod IP, that echoes back the controller-issued nonce to any connecting
+	// client and then closes. This is the destination half of the ADR-0210 nonce round-trip:
+	// it proves a SYN that reached the preserved IP traversed the real cross-node datapath
+	// (the listener owns the IP only inside the replacement pod netns on THIS node).
+	StartReachabilityEcho(ctx context.Context, in *StartReachabilityEchoRequest, opts ...grpc.CallOption) (*StartReachabilityEchoResponse, error)
 }
 
 type migrationAgentServiceClient struct {
@@ -334,6 +352,26 @@ func (c *migrationAgentServiceClient) VerifyTCP(ctx context.Context, in *VerifyT
 	return out, nil
 }
 
+func (c *migrationAgentServiceClient) ProbeDataplaneReachability(ctx context.Context, in *ProbeDataplaneReachabilityRequest, opts ...grpc.CallOption) (*ProbeDataplaneReachabilityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ProbeDataplaneReachabilityResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_ProbeDataplaneReachability_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *migrationAgentServiceClient) StartReachabilityEcho(ctx context.Context, in *StartReachabilityEchoRequest, opts ...grpc.CallOption) (*StartReachabilityEchoResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StartReachabilityEchoResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_StartReachabilityEcho_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MigrationAgentServiceServer is the server API for MigrationAgentService service.
 // All implementations must embed UnimplementedMigrationAgentServiceServer
 // for forward compatibility.
@@ -417,6 +455,22 @@ type MigrationAgentServiceServer interface {
 	// ±MSS (1448 bytes). Also issues the ApplicationProbe (SQL/TCP) when configured.
 	// Called by the controller during TCPVerifying phase per ADR-0019 Amendment A.
 	VerifyTCP(context.Context, *VerifyTCPRequest) (*VerifyTCPResponse, error)
+	// ProbeDataplaneReachability is called by the CONTROLLER on the SOURCE-NODE agent
+	// (a node != destination) to dial the preserved pod IP cross-node and confirm the
+	// real overlay/host-route datapath is live. ADR-0210: this replaces the ADR-0200/0201
+	// in-netns self-probe tautology. The dial originates from the source node's HOST netns
+	// (NOT a pod netns) so its SYN traverses the real overlay (VXLAN/VTEP), not a local
+	// lo/32 alias. The destination must echo back the controller-issued correlation nonce
+	// (round-tripped through the dialed listener) — the source agent cannot synthesize
+	// success alone. The controller is the authority that flips DataplaneReachabilityVerified.
+	ProbeDataplaneReachability(context.Context, *ProbeDataplaneReachabilityRequest) (*ProbeDataplaneReachabilityResponse, error)
+	// StartReachabilityEcho is called by the controller on the DESTINATION-node agent to
+	// open a short-lived TCP listener INSIDE the replacement pod netns, bound to the
+	// preserved pod IP, that echoes back the controller-issued nonce to any connecting
+	// client and then closes. This is the destination half of the ADR-0210 nonce round-trip:
+	// it proves a SYN that reached the preserved IP traversed the real cross-node datapath
+	// (the listener owns the IP only inside the replacement pod netns on THIS node).
+	StartReachabilityEcho(context.Context, *StartReachabilityEchoRequest) (*StartReachabilityEchoResponse, error)
 	mustEmbedUnimplementedMigrationAgentServiceServer()
 }
 
@@ -486,6 +540,12 @@ func (UnimplementedMigrationAgentServiceServer) DisarmTCRedirect(context.Context
 }
 func (UnimplementedMigrationAgentServiceServer) VerifyTCP(context.Context, *VerifyTCPRequest) (*VerifyTCPResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method VerifyTCP not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) ProbeDataplaneReachability(context.Context, *ProbeDataplaneReachabilityRequest) (*ProbeDataplaneReachabilityResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ProbeDataplaneReachability not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) StartReachabilityEcho(context.Context, *StartReachabilityEchoRequest) (*StartReachabilityEchoResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method StartReachabilityEcho not implemented")
 }
 func (UnimplementedMigrationAgentServiceServer) mustEmbedUnimplementedMigrationAgentServiceServer() {}
 func (UnimplementedMigrationAgentServiceServer) testEmbeddedByValue()                               {}
@@ -868,6 +928,42 @@ func _MigrationAgentService_VerifyTCP_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MigrationAgentService_ProbeDataplaneReachability_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProbeDataplaneReachabilityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).ProbeDataplaneReachability(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_ProbeDataplaneReachability_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).ProbeDataplaneReachability(ctx, req.(*ProbeDataplaneReachabilityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MigrationAgentService_StartReachabilityEcho_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StartReachabilityEchoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).StartReachabilityEcho(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_StartReachabilityEcho_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).StartReachabilityEcho(ctx, req.(*StartReachabilityEchoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // MigrationAgentService_ServiceDesc is the grpc.ServiceDesc for MigrationAgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -954,6 +1050,14 @@ var MigrationAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "VerifyTCP",
 			Handler:    _MigrationAgentService_VerifyTCP_Handler,
+		},
+		{
+			MethodName: "ProbeDataplaneReachability",
+			Handler:    _MigrationAgentService_ProbeDataplaneReachability_Handler,
+		},
+		{
+			MethodName: "StartReachabilityEcho",
+			Handler:    _MigrationAgentService_StartReachabilityEcho_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

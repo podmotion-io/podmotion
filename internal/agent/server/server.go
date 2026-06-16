@@ -54,9 +54,10 @@ var log = logf.Log.WithName("agent-server")
 // ADR-SEC-A §2.3 / ADR-SEC-B size bounds live in internal/agent/grpclimits (single source of
 // truth shared with the operator client so server/client cannot skew).
 
-// adrSecAServerMarker forces the ADR-SEC-A marker string into the agent binary string table for
-// §P-VERIFY-MULTI deployed-provenance grep, in addition to the authz package and the fail-closed
-// error strings. adrSecBServerMarker does the same for ADR-SEC-B (verify-reject + sentinel paths).
+// adrSecAServerMarker forces the ADR-SEC-A marker string into the agent binary string table so a
+// deployed-binary grep can confirm the build carries this change, in addition to the authz package
+// and the fail-closed error strings. adrSecBServerMarker does the same for ADR-SEC-B (verify-reject
+// + sentinel paths).
 const (
 	adrSecAServerMarker = "ADR-SEC-A"
 	adrSecBServerMarker = "ADR-SEC-B"
@@ -1023,69 +1024,43 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 	// nsenter --net=/proc/<replPID>/ns/net idiom (no new external binary, ADR-0200 D1 (i)),
 	// re-executing this same agent binary's __inetns_probe helper subcommand.
 	if req.Probe {
-		// ADR-0200 D1: resolve the replacement PID (already resolved earlier in this RPC for
-		// the M3 redirect install at server.go:919 — same lookup, no new failure surface).
+		// ADR-0210a (atomic alias removal): the ADR-0201 lo/32 alias on the replacement pod's
+		// loopback — and the ADR-0200 in-netns dial probe that depended on it — are REMOVED here.
+		// They formed a tautology: the dial and the aliased IP lived in the SAME netns, so the
+		// local kernel always answered RST and ProbeOk was True even when no off-node datapath
+		// existed (cross-node clients saw 100% loss while TrafficVerified=True). The authoritative
+		// reachability signal is now the CONTROLLER-driven cross-node nonce round-trip
+		// (StartReachabilityEcho on this dest agent + ProbeDataplaneReachability on the source
+		// agent), which flips DataplaneReachabilityVerified. PM-C4: the in-netns dial is DEMOTED
+		// to a fast LOCAL PRE-CHECK (not deleted) — its result is advisory ProbeOk only and no
+		// longer gates the deferred SIGCONT, source disarm, TrafficVerified, or deletion.
 		replPID := s.restoredPIDForMigration(ctx, req.MigrationName)
-
-		// ADR-0201: before the in-netns reachability probe runs, add the OLD pod IP as a
-		// host-scoped /32 secondary alias on the replacement pod's loopback interface, inside
-		// the pod netns. On the Cold gate path SingleHomeRestoredPod (server.go:521-526) is a
-		// no-op (SourcePodIP empty), so no kernel on the in-netns probe path owns the OLD IP and
-		// a SYN to :7 black-holes to i/o timeout instead of eliciting a local RST. With the /32
-		// on lo, the local kernel — finding no listener on :7 — replies RST → ProbeOk=true. The
-		// alias is netns-local, host-scoped, never advertised/ARP'd/routed off the netns (no
-		// external surface). It is KEPT (not removed) post-probe: removal introduces a requeue
-		// re-add race and lo is harmless. Idempotent: tolerate EEXIST exactly as ADR-0138's
-		// eth0 assign does (server.go:596). Reuses the in-tree nsenter --net idiom; no new
-		// binary dependency (nsenter + ip already used by SingleHomeRestoredPod, §3i clean).
-		if replPID > 0 {
-			netnsPath := fmt.Sprintf("/proc/%d/ns/net", replPID)
-			aliasOut, aliasErr := exec.Command("nsenter", "--net="+netnsPath,
-				"ip", "addr", "add", req.OldPodIp+"/32", "dev", "lo").CombinedOutput()
-			if aliasErr != nil {
-				msg := strings.TrimSpace(string(aliasOut))
-				if strings.Contains(strings.ToLower(msg), "exists") {
-					log.Info("InjectIPHandoff: oldPodIP alias already present on lo (idempotent) (ADR-0201)",
-						"migration", req.MigrationName, "replPID", replPID, "oldPodIP", req.OldPodIp)
-				} else {
-					log.Error(aliasErr, "InjectIPHandoff: oldPodIP alias add to lo failed (non-fatal, probe may time out) (ADR-0201)",
-						"migration", req.MigrationName, "replPID", replPID, "oldPodIP", req.OldPodIp, "output", msg)
-				}
-			} else {
-				log.Info("InjectIPHandoff: oldPodIP alias added to lo (ADR-0201)",
-					"migration", req.MigrationName, "replPID", replPID, "oldPodIP", req.OldPodIp)
-			}
-		}
-
 		if replPID <= 0 {
-			// ADR-0200 D4: PID-unresolved defers to requeue exactly as the M3 redirect install
-			// already defers (server.go:957). Source held (TrafficVerified never True). The
-			// deferred-SIGCONT gate below leaves the tree stopped on ProbeOk=false.
 			resp.ProbeOk = false
-			resp.ProbeOutput = "ADR-0200: RestoredPID not yet resolvable — probe deferred to requeue"
-			log.Info("InjectIPHandoff: ADR-0200 reachability probe deferred — RestoredPID not yet in CR status (non-fatal, requeue)",
-				"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+			resp.ProbeOutput = "ADR-0210: RestoredPID not yet resolvable — local pre-check deferred (advisory only; cross-node gate is authoritative)"
+			log.Info("InjectIPHandoff: ADR-0210 local pre-check deferred — RestoredPID not yet in CR status (advisory, non-gating)",
+				"migration", req.MigrationName, "oldPodIp", req.OldPodIp)
 		} else {
 			probeOk, probeOut := s.probeOldIPInPodNetns(ctx, replPID, req.OldPodIp)
 			resp.ProbeOk = probeOk
 			resp.ProbeOutput = probeOut
-			if !probeOk {
-				log.Info("InjectIPHandoff: ADR-0200 in-netns reachability probe failed",
-					"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "replPID", replPID, "probeOutput", probeOut)
-			} else {
-				log.Info("InjectIPHandoff: ADR-0200 reachability probe OK (dial executed in replacement pod netns)",
-					"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "replPID", replPID, "netns", fmt.Sprintf("/proc/%d/ns/net", replPID), "probeOutput", probeOut)
-			}
+			log.Info("InjectIPHandoff: ADR-0210 in-netns LOCAL PRE-CHECK complete (advisory only — cross-node DataplaneReachabilityVerified is authoritative)",
+				"migration", req.MigrationName, "oldPodIp", req.OldPodIp, "replPID", replPID, "preCheckOk", probeOk, "probeOutput", probeOut)
 		}
 	}
 
 	// ADR-0142 D3: the deferred SIGCONT (seq_delta=0 path). The restored tree has been held
 	// in SIGSTOP since SocketsLive was confirmed in Restore. Now that the OLD-IP forward+reverse
-	// datapath (ADR-0133/0139/0140/0141) is installed and — when requested — the reachability
-	// probe passed, resume the tree as the FINAL action so the restored app only ever emits
-	// segments into a live datapath. Gate on the probe when one was requested; if the probe
-	// failed we leave the tree stopped and let the operator requeue (source still held).
-	if !req.Probe || resp.ProbeOk {
+	// datapath (ADR-0133/0139/0140/0141) is installed, resume the tree as the FINAL action so the
+	// restored app only ever emits segments into a live datapath.
+	// ADR-0210a: SIGCONT NO LONGER gates on the (now-demoted, tautological) in-netns ProbeOk.
+	// The restored tree must resume so its preserved IP becomes dialable for the cross-node
+	// nonce round-trip; the authoritative reachability gate (DataplaneReachabilityVerified) runs
+	// at the controller AFTER resume and still holds the source pod until it passes. Re-anchoring
+	// SIGCONT to the cross-node signal would deadlock (the cross-node dial needs a live listener
+	// inside the resumed tree). QA-A1 consumer re-point: the resume gate is unconditioned on the
+	// removed self-loop signal.
+	{
 		s.pendingResumePIDsMu.Lock()
 		resumePID, hasPending := s.pendingResumePIDs[req.MigrationName]
 		if hasPending {
@@ -1112,9 +1087,6 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 				}
 			}
 		}
-	} else {
-		log.Info("InjectIPHandoff: probe not OK — deferred SIGCONT withheld, restored tree held in SIGSTOP pending requeue (ADR-0142 D3)",
-			"migration", req.MigrationName)
 	}
 
 	log.Info("InjectIPHandoff: handoff injected (ADR-0133 D2)", "migration", req.MigrationName,
@@ -1429,7 +1401,7 @@ func removeOldIPForwardAccept(ctx context.Context, oldIP net.IP) {
 // DisarmTCRedirect removes the ADR-0139 tc-ingress filter + qdisc from the overlay interface
 // after TrafficVerified=True (Decision 3 disarm order). Idempotent: tolerates ENOENT.
 func (s *AgentServer) DisarmTCRedirect(ctx context.Context, req *agentpb.DisarmTCRedirectRequest) (*agentpb.DisarmTCRedirectResponse, error) {
-	// ADR-0199 §3h-SYM (removal-symmetry, item 4): the forward install (InjectIPHandoff)
+	// ADR-0199 (removal symmetry, item 4): the forward install (InjectIPHandoff)
 	// now installs the tc-ingress redirect on `bridgeIf` when the substrate has no VXLAN
 	// device (kindnet), NOT on `flannel.1`. The teardown MUST remove the filter from the
 	// SAME interface it was installed on, else a stale /32 redirect survives on the host
@@ -1767,14 +1739,14 @@ func FindContainerPID(podUID string) (int32, error) {
 // (open path, fstat fd vs stat path). It is no longer handed to CRIU — the caller closes
 // it and passes the returned path string to CRIU via --join-ns net:<path>.
 //
-// ADR-0122 B1 (post-quorum): this replaces the previous /proc/*/comm "pause" scan, which
+// ADR-0122 B1: this replaces the previous /proc/*/comm "pause" scan, which
 // was ambiguous on multi-pod nodes (every pod's pause process matches, so the scan could
 // not reliably pick the correct sandbox). The sandbox ID comes from the NRI pod sandbox
 // object (pod.GetId()) and is unambiguous per pod. We read the sandbox's OCI spec under
 // the containerd "k8s.io" namespace, locate the spec.Linux.Namespaces entry with
 // Type == "network", and open its Path directly.
 //
-// ADR-0122 B2 (post-quorum): TOCTOU close-out. We open the netns *path* (e.g.
+// ADR-0122 B2: TOCTOU close-out. We open the netns *path* (e.g.
 // /var/run/netns/<id> or a bind-mounted handle), then fstat the resulting fd and stat the
 // path and compare inodes. If they differ the sandbox netns was torn down and its inode
 // recycled between resolution and open; we return a "netns inode mismatch" error and abort
@@ -2291,7 +2263,7 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		// GC-22 blocker).
 		// --ext-mount-map auto handles the standard pseudo-fs and containerd/runc submounts
 		// (/proc/*, /sys/*, /dev/*) that CRIU autodetects as external.
-		// ADR-0193 §3h: the disproven "pm-data" ext-mount-map (which targeted a phantom mount
+		// ADR-0193: the disproven "pm-data" ext-mount-map (which targeted a phantom mount
 		// that was never in the mountpoints image on this checkpoint shape) is REMOVED.
 		// Image evidence proved /data is absent from mountpoints entirely; the files.img REG fd
 		// id 15 (/data) is now rebound to the restored ROOT mnt_id by patchCheckpointImages.
@@ -2792,7 +2764,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 		return 0, nil, fmt.Errorf("criu restore start: %w", err)
 	}
 
-	// ADR-0192 R2 (supersedes ADR-0127 §3h): liveness detection via cgroup-PID signal.
+	// ADR-0192 R2 (supersedes ADR-0127): liveness detection via cgroup-PID signal.
 	//
 	// On the cold --join-ns net:<path> path CRIU does NOT self-exit: after restore it stays as
 	// the foreground workload parent (blocking in wait4 for the lifetime of the workload). A
@@ -2800,7 +2772,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// --restore-detached is forbidden (CLAUDE.md Standing Rule 6). --leave-stopped is only on
 	// the TCP-stateful branch.
 	//
-	// The ADR-0127 log-marker scaffold (removed here per §3h) detected success via
+	// The ADR-0127 log-marker scaffold (removed here) detected success via
 	// "Restore finished successfully" in restore.log — a brittle log-format dependency that
 	// masked the still-firing Site A iptables-restore failure. With the --network-lock skip
 	// fix landed (buildCRIURestoreArgs), CRIU now exits 0 on failure and the workload PIDs
@@ -2937,13 +2909,13 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	return pid, droppedMounts, nil
 }
 
-// readLogTail was removed: ADR-0127 scaffold (restore.log success-signal) removed per ADR-0192 §3h.
+// readLogTail was removed: ADR-0127 scaffold (restore.log success-signal) removed per ADR-0192.
 // The liveness signal is now the cgroup-PID diff (see joinNsRestore above).
 
 // ADR-0200: exit codes for the __inetns_probe helper subcommand. The helper performs the
 // TCP dial INSIDE the replacement pod netns (entered via nsenter by probeOldIPInPodNetns)
 // and reports the refused/timeout/success classification through its exit code — preserving
-// the exact isConnRefused() semantics (§3h-SYM item 1: error-classification preservation
+// the exact isConnRefused() semantics (error-classification preservation
 // across the host-netns→pod-netns relocation, same commit).
 const (
 	inetnsProbeExitSuccess   = 0 // SYN-ACK: a listener answered — IP live
@@ -2993,6 +2965,137 @@ func probeOldIPInPodNetnsImpl(replPID int, oldPodIP string) (bool, string) {
 // probeOldIPInPodNetns is the AgentServer method seam (overridable in tests).
 func (s *AgentServer) probeOldIPInPodNetns(_ context.Context, replPID int, oldPodIP string) (bool, string) {
 	return probeOldIPInPodNetnsImpl(replPID, oldPodIP)
+}
+
+// ProbeDataplaneReachability is the ADR-0210 cross-node dataplane probe. It is called by
+// the CONTROLLER on the SOURCE-node agent (a node != destination) to dial the preserved pod
+// IP and confirm the real overlay/host-route datapath is live. Unlike the disproven
+// ADR-0200/0201 in-netns self-probe (which dialed an IP aliased onto lo in the SAME netns —
+// the local kernel always answered, a tautology), this dial originates from the SOURCE
+// node's HOST netns, so its SYN must traverse the real overlay (VXLAN/VTEP) to reach the
+// destination. A positive result REQUIRES the destination's nonce-echo listener
+// (StartReachabilityEcho) to return the controller-issued nonce — the source agent cannot
+// synthesize success alone (Security-C3). The controller is the authority that flips
+// DataplaneReachabilityVerified based on this nonce round-trip.
+func (s *AgentServer) ProbeDataplaneReachability(ctx context.Context, req *agentpb.ProbeDataplaneReachabilityRequest) (*agentpb.ProbeDataplaneReachabilityResponse, error) {
+	resp := &agentpb.ProbeDataplaneReachabilityResponse{}
+	timeout := time.Duration(req.TimeoutS) * time.Second
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	if req.TargetIp == "" || req.TargetPort == 0 {
+		resp.Reachable = false
+		resp.Detail = "ADR-0210: target_ip/target_port required"
+		return resp, nil
+	}
+	// Positive-evidence egress assertion: record which host device the route to TargetIP
+	// resolves to. On a 2-node fallback this VTEP-egress assertion is the non-waivable
+	// proof the SYN leaves on the overlay (flannel.1/VTEP), not a local /32 host route.
+	resp.EgressDev = egressDevForIP(req.TargetIp)
+
+	addr := net.JoinHostPort(req.TargetIp, fmt.Sprintf("%d", req.TargetPort))
+	d := net.Dialer{Timeout: timeout}
+	conn, derr := d.DialContext(ctx, "tcp", addr)
+	if derr != nil {
+		resp.Reachable = false
+		resp.Detail = fmt.Sprintf("ADR-0210: cross-node dial %s failed (egressDev=%s): %v", addr, resp.EgressDev, derr)
+		log.Info("ProbeDataplaneReachability: cross-node dial failed (ADR-0210)",
+			"migration", req.MigrationName, "target", addr, "egressDev", resp.EgressDev, "err", derr.Error())
+		return resp, nil
+	}
+	defer conn.Close()
+	// Nonce round-trip: read what the destination echo listener wrote. Reachability is
+	// asserted ONLY when the echoed bytes match the controller-issued nonce.
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	buf := make([]byte, len(req.ExpectedNonce)+16)
+	n, rerr := conn.Read(buf)
+	got := ""
+	if n > 0 {
+		got = string(buf[:n])
+	}
+	if rerr != nil && n == 0 {
+		resp.Reachable = false
+		resp.Detail = fmt.Sprintf("ADR-0210: connected %s but nonce read failed (egressDev=%s): %v", addr, resp.EgressDev, rerr)
+		log.Info("ProbeDataplaneReachability: connected but no nonce echoed — NOT reachable (ADR-0210)",
+			"migration", req.MigrationName, "target", addr, "egressDev", resp.EgressDev)
+		return resp, nil
+	}
+	if got != req.ExpectedNonce {
+		resp.Reachable = false
+		resp.Detail = fmt.Sprintf("ADR-0210: nonce mismatch from %s (egressDev=%s): want=%q got=%q", addr, resp.EgressDev, req.ExpectedNonce, got)
+		log.Info("ProbeDataplaneReachability: nonce mismatch — NOT reachable (ADR-0210)",
+			"migration", req.MigrationName, "target", addr, "egressDev", resp.EgressDev)
+		return resp, nil
+	}
+	resp.Reachable = true
+	resp.Detail = fmt.Sprintf("ADR-0210: cross-node datapath reachable to %s, nonce round-trip OK (egressDev=%s)", addr, resp.EgressDev)
+	log.Info("ProbeDataplaneReachability: cross-node datapath VERIFIED via nonce round-trip (ADR-0210)",
+		"migration", req.MigrationName, "target", addr, "egressDev", resp.EgressDev)
+	return resp, nil
+}
+
+// egressDevForIP returns the host interface the kernel would use to reach ip, per
+// `ip route get`. Best-effort observability for the ADR-0210 VTEP-egress assertion;
+// returns "" when it cannot be resolved (non-fatal — the nonce round-trip is the proof).
+func egressDevForIP(ip string) string {
+	out, err := exec.Command("ip", "route", "get", ip).CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	fields := strings.Fields(string(out))
+	for i, f := range fields {
+		if f == "dev" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	return ""
+}
+
+// StartReachabilityEcho is the ADR-0210 destination half of the cross-node nonce round-trip.
+// Called by the controller on the DESTINATION-node agent, it re-executes this agent binary's
+// __inetns_echo helper INSIDE the replacement pod netns (same nsenter idiom as the disproven
+// __inetns_probe, but now bind+echo instead of self-dial) to open a short-lived TCP listener
+// bound to the preserved pod IP that echoes the controller-issued nonce. The SOURCE-node
+// agent's ProbeDataplaneReachability then connects cross-node and must read that nonce back.
+func (s *AgentServer) StartReachabilityEcho(ctx context.Context, req *agentpb.StartReachabilityEchoRequest) (*agentpb.StartReachabilityEchoResponse, error) {
+	resp := &agentpb.StartReachabilityEchoResponse{}
+	if req.ListenIp == "" || req.ListenPort == 0 || req.Nonce == "" {
+		resp.Started = false
+		resp.Detail = "ADR-0210: listen_ip/listen_port/nonce required"
+		return resp, nil
+	}
+	replPID := s.restoredPIDForMigration(ctx, req.MigrationName)
+	if replPID <= 0 {
+		resp.Started = false
+		resp.Detail = "ADR-0210: replacement PID not yet resolvable — echo deferred to requeue"
+		return resp, nil
+	}
+	ttl := req.TtlS
+	if ttl <= 0 {
+		ttl = 15
+	}
+	self, err := os.Executable()
+	if err != nil {
+		self = "/proc/self/exe"
+	}
+	netnsPath := fmt.Sprintf("/proc/%d/ns/net", replPID)
+	// Launch the in-netns echo listener detached — it serves for ttl seconds then exits.
+	cmd := exec.Command("nsenter", "--net="+netnsPath, self, "__inetns_echo",
+		req.ListenIp, fmt.Sprintf("%d", req.ListenPort), req.Nonce, fmt.Sprintf("%d", ttl))
+	if startErr := cmd.Start(); startErr != nil {
+		resp.Started = false
+		resp.Detail = fmt.Sprintf("ADR-0210: failed to start in-netns echo listener: %v", startErr)
+		log.Error(startErr, "StartReachabilityEcho: launch failed (ADR-0210)", "migration", req.MigrationName)
+		return resp, nil
+	}
+	// Reap the helper asynchronously so it does not become a zombie.
+	go func() { _ = cmd.Wait() }()
+	resp.Started = true
+	resp.Detail = fmt.Sprintf("ADR-0210: in-netns nonce-echo listener started on %s:%d (replPID=%d, ttl=%ds)",
+		req.ListenIp, req.ListenPort, replPID, ttl)
+	log.Info("StartReachabilityEcho: in-netns nonce-echo listener started (ADR-0210)",
+		"migration", req.MigrationName, "listenIP", req.ListenIp, "port", req.ListenPort, "replPID", replPID, "ttl", ttl)
+	return resp, nil
 }
 
 // isConnRefused reports whether err is a connection-refused error (TCP RST). ECONNREFUSED
@@ -3349,7 +3452,7 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     img = load_image(src, fail_on_magic_error=True)
     if img is None:
         continue
-    # ADR-0190 (Sprint 32 §14g, Arch-B): subtree-closed mount drop via mnt_id graph closure.
+    # ADR-0190: subtree-closed mount drop via mnt_id graph closure.
     #
     # The previous prefix-based approach dropped /sys by path but left children with
     # different mnt_ids (e.g. mnt_id 7730 → parent_mnt_id 9107=/sys) in the image.
@@ -3446,12 +3549,12 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
         if mp in null_ext_key_masked and not e.get('ext_key'):
             continue
         kept.append(e)
-    # ADR-0193 §3h: the disproven /data ext_key→pm-data rewrite loop is REMOVED.
+    # ADR-0193: the disproven /data ext_key→pm-data rewrite loop is REMOVED.
     # ADR-0194 Outcome-A symmetric-remap block (MntpImageInconsistencyError/P-0194-1-remap) is REVERTED (SC-1).
 
     # ADR-0194 B-2 (DROP-together): find and drop external mount entries from the kept set.
     # An "external" mountpoints entry is one whose ext_key is set (and non-empty).
-    # These entries require an --ext-mount-map at restore time; since ADR-0193 §3h removed
+    # These entries require an --ext-mount-map at restore time; since ADR-0193 removed
     # the pm-data binding (correctly under B-2), any remaining external entry without a
     # matching restore-arg binding is an unresolved external mount → mount.c:3141.
     # Direction B-2: DROP the external entry AND rebind all files.img REG fds whose mnt_id
@@ -3567,7 +3670,7 @@ if os.path.exists(netdev_path):
 # When the image has zero non-loopback entries OR pycriu cannot parse it, delete the file
 # entirely — CRIU skips ip-addr restore when the file is absent, avoiding the external
 # 'ip addr restore' subprocess that rejects any malformed or empty framing
-# (SPRINT32-COLD-CHURN3: 8-byte magic-only stub → "Magic mismatch (1 elems, 54564319 magic)").
+# (observed: 8-byte magic-only stub → "Magic mismatch (1 elems, 54564319 magic)").
 
 ifaddr_path = os.path.join(ckpt, 'ifaddr-10.img')
 if os.path.exists(ifaddr_path):
@@ -3591,7 +3694,7 @@ if os.path.exists(ifaddr_path):
     else:
         # pycriu IFADDR handler missing (older pycriu build) — delete the image file entirely.
         # Writing any stub risks CRIU's external 'ip addr restore' subprocess rejecting the
-        # framing with "Magic mismatch" (SPRINT32-COLD-CHURN3: 8-byte magic-only stub caused
+        # framing with "Magic mismatch" (observed: 8-byte magic-only stub caused
         # exactly this failure). Absence of the file causes CRIU to skip ip-addr restore.
         # Dest netns IP is pre-staged by ADR-0165 SP-1/SP-2/SP-3; no ifaddr image needed.
         os.remove(ifaddr_path)
@@ -4199,7 +4302,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 	// process memory and secrets are never written to persistent disk (ADR-0046).
 	imagesDir := fmt.Sprintf("/run/podmotion/checkpoints/%s/final", req.MigrationName)
 
-	// ADR-0182 CHURN-15 Issue 2 (GC-9 / Standing Rule 7): PreDumpRound writes pre-dump images
+	// ADR-0182 Issue 2 (Standing Rule 7): PreDumpRound writes pre-dump images
 	// containing live workload memory pages to /run/podmotion/checkpoints/<mig>/round-<N>/ BEFORE
 	// this handler runs. On ANY Checkpoint-phase abort (CR-lookup failure at L3552, ctr fatal at
 	// L3615, CRIU dump failure at L3773, etc.) those round-N dirs were previously left intact on
@@ -4323,7 +4426,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 				log.Info("Checkpoint: ctr failed due to established TCP socket — falling back to raw CRIU with --tcp-established (ADR-0131 D2: connection preserved)",
 					"taskID", taskID, "tcpEstablished", tcpEstablished, "err", ctrErr)
 				// Clear any partial ctr images before raw CRIU writes to the same dir.
-				// ADR-0182 CHURN-15 Issue 2 (SRE non-blocking note): zeroize-then-unlink, NOT a
+				// ADR-0182 Issue 2: zeroize-then-unlink, NOT a
 				// bare os.RemoveAll — a partial ctr dump may already contain live memory pages in
 				// final/, and a bare unlink leaves them recoverable on tmpfs (Standing Rule 7).
 				if rmErr := zeroizeDir(imagesDir); rmErr != nil {
@@ -4494,7 +4597,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 			return nil, fmt.Errorf("checkpoint fallback: cannot create images dir: %w", mkErr)
 		}
 
-		// ADR-SEC-B §3h-SYM: renamed from checkpoint-manifest.json to avoid colliding with the
+		// ADR-SEC-B: renamed from checkpoint-manifest.json to avoid colliding with the
 		// new signed provenance manifest filename; mode 0o644→0o600 (N-342, invariant 7).
 		manifestPath := filepath.Join(imagesDir, "checkpoint-mock-manifest.json")
 		manifest := fmt.Sprintf(`{
@@ -4558,7 +4661,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 
 	// Success (raw-CRIU path): disarm the deferred abort-zeroize sweep. The completed
 	// checkpoint in final/ is consumed by the transfer phase; round-N dirs are released
-	// later by ReleaseCheckpoint (ADR-0179). ADR-0182 CHURN-15 Issue 2.
+	// later by ReleaseCheckpoint (ADR-0179). ADR-0182 Issue 2.
 	checkpointSucceeded = true
 
 	// Update MigrationCheckpoint CR if we have a k8s client.
@@ -5131,6 +5234,11 @@ func (s *AgentServer) VerifyTCP(ctx context.Context, req *agentpb.VerifyTCPReque
 	const mss uint32 = 1448
 	verified := 0
 	var failures []string
+	// ADR-0210: track the MEASURED maximum per-direction sequence delta across all
+	// connections. This is returned to the controller, which sets the seq_delta gauge and
+	// the North Star assertion from it — never from a hard-coded literal 0. A non-zero value
+	// fails Strict verification at the controller.
+	var sndDeltaMax, rcvDeltaMax uint32
 
 	for _, snap := range sourceSnaps {
 		matched := false
@@ -5145,6 +5253,13 @@ func (s *AgentServer) VerifyTCP(ctx context.Context, req *agentpb.VerifyTCPReque
 			// Compare snd_nxt with ±MSS tolerance using 32-bit modular arithmetic.
 			sndDelta := absDiffU32(dest.SndNxt, snap.SndNxt)
 			rcvDelta := absDiffU32(dest.RcvNxt, snap.RcvNxt)
+			// ADR-0210: record measured maxima (whether or not within MSS tolerance).
+			if sndDelta > sndDeltaMax {
+				sndDeltaMax = sndDelta
+			}
+			if rcvDelta > rcvDeltaMax {
+				rcvDeltaMax = rcvDelta
+			}
 			if sndDelta > mss {
 				failures = append(failures, fmt.Sprintf(
 					"4-tuple %s:%d→%s:%d snd_nxt delta %d > MSS %d (src=%d dest=%d)",
@@ -5170,6 +5285,10 @@ func (s *AgentServer) VerifyTCP(ctx context.Context, req *agentpb.VerifyTCPReque
 	resp := &agentpb.VerifyTCPResponse{
 		ConnectionsVerified: int32(verified),
 		ConnectionsExpected: int32(len(sourceSnaps)),
+		// ADR-0210: measured maxima — controller plumbs these to the gauge/North Star,
+		// never a hard-coded 0.
+		SndSeqDeltaMax: sndDeltaMax,
+		RcvSeqDeltaMax: rcvDeltaMax,
 	}
 	if len(failures) > 0 {
 		resp.Verified = false
@@ -5568,7 +5687,7 @@ func (s *AgentServer) verifyMigrationUID(ctx context.Context, migrationName, man
 	// ADR-SEC-D: The PodMigration CR namespace is NOT carried on the wire and is NOT the
 	// agent's own namespace. The original ADR-SEC-B impl read os.Getenv("POD_NAMESPACE")
 	// with a hardcoded "podmotion-system" default; the agent DaemonSet sets no POD_NAMESPACE
-	// (ADR-SEC-B §5.2, §3i/§P-VERIFY-D ENV-PROVENANCE), so the Get targeted the wrong
+	// (ADR-SEC-B §5.2, env-provenance), so the Get targeted the wrong
 	// namespace and returned NotFound for default-namespace migrations. Resolve the namespace
 	// namespace-agnostically using the codebase's established default-first-then-List-by-name
 	// pattern (resolveNamespaceForMigration / restoredPIDForMigration, server.go:1186-1228).

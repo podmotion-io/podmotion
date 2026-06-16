@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -106,7 +107,7 @@ var scheme = k8sruntime.NewScheme()
 
 func init() {
 	utilruntime.Must(pmv1.AddToScheme(scheme))
-	// ADR-0195 §3h secondary: register corev1 so the agent k8sClient can Create/Get
+	// ADR-0195: register corev1 so the agent k8sClient can Create/Get
 	// corev1.Event objects (emitCRIUImageInconsistencyEvent, emitExternalMountDroppedEvent,
 	// emitExternalMountUnresolvedEvent at server.go:5735/5786/5836).
 	// Without this registration, client.Create(&corev1.Event{}) fails with
@@ -155,12 +156,60 @@ func runInetnsProbe(args []string) {
 	os.Exit(inetnsProbeExitOtherErr)
 }
 
+// runInetnsEcho is the ADR-0210 __inetns_echo helper subcommand. It is invoked by
+// AgentServer.StartReachabilityEcho on the DESTINATION node via
+// `nsenter --net=/proc/<replPID>/ns/net <self> __inetns_echo <listenIP> <port> <nonce> <ttlSeconds>`
+// so the listener binds the preserved pod IP INSIDE the replacement pod netns (where the
+// IP is owned). It accepts ONE connection, writes the nonce, closes, and exits. The
+// cross-node SOURCE-agent probe (ProbeDataplaneReachability) connects to this listener and
+// must read back the nonce — proving the SYN traversed the real overlay datapath, not a
+// netns-local lo/32 alias. This is the destination half of the ADR-0210 nonce round-trip.
+func runInetnsEcho(args []string) {
+	if len(args) < 4 {
+		fmt.Fprintln(os.Stderr, "ADR-0210 __inetns_echo: usage: __inetns_echo <ip> <port> <nonce> <ttlSeconds>")
+		os.Exit(2)
+	}
+	listenAddr := net.JoinHostPort(args[0], args[1])
+	nonce := args[2]
+	ttlSecs, _ := strconv.Atoi(args[3])
+	if ttlSecs <= 0 {
+		ttlSecs = 15
+	}
+	ln, lerr := net.Listen("tcp", listenAddr)
+	if lerr != nil {
+		fmt.Fprintf(os.Stderr, "ADR-0210 __inetns_echo: listen %s failed: %v", listenAddr, lerr)
+		os.Exit(1)
+	}
+	defer ln.Close()
+	deadline := time.Now().Add(time.Duration(ttlSecs) * time.Second)
+	if tl, ok := ln.(*net.TCPListener); ok {
+		_ = tl.SetDeadline(deadline)
+	}
+	// Serve connections until the TTL elapses (probe may retry); echo nonce on each.
+	for time.Now().Before(deadline) {
+		conn, aerr := ln.Accept()
+		if aerr != nil {
+			break // deadline reached
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		_, _ = conn.Write([]byte(nonce))
+		_ = conn.Close()
+	}
+	os.Exit(0)
+}
+
 func main() {
 	// ADR-0200: in-netns probe helper subcommand dispatch. MUST run before any logging,
 	// k8s client, or NRI setup — this process is a short-lived re-exec inside a pod netns
 	// (entered via nsenter by the parent agent), does the dial, and exits with a coded status.
 	if len(os.Args) > 1 && os.Args[1] == "__inetns_probe" {
 		runInetnsProbe(os.Args[2:])
+		return
+	}
+	// ADR-0210: in-netns nonce-echo helper subcommand dispatch (destination half of the
+	// cross-node reachability round-trip). Same early-dispatch discipline as __inetns_probe.
+	if len(os.Args) > 1 && os.Args[1] == "__inetns_echo" {
+		runInetnsEcho(os.Args[2:])
 		return
 	}
 
