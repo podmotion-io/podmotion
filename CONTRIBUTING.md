@@ -212,6 +212,114 @@ nginx-migration   Complete   podmotion-worker   podmotion-worker2  Cold   45s
 
 ---
 
+## Binary Names and Build Output
+
+`make build-linux` produces binaries with a different name than the Dockerfiles expect. The Makefile handles the rename automatically — **always use `make build-linux`, never hand-build and copy**.
+
+```bash
+make build-linux
+# Produces: bin/manager-linux-amd64, bin/agent-linux-amd64, bin/criu-wrapper-linux-amd64
+```
+
+The Dockerfiles and `.dockerignore` expect exactly these names. A hand-built binary with a different name will produce a silent empty image (`.dockerignore` blocks the wrong name).
+
+---
+
+## Helm Deploy (kind/dev)
+
+**`make deploy` uses kustomize and is not the working path for kind.** Deploy via Helm directly:
+
+```bash
+# 1. Build binaries
+make build-linux
+
+# 2. Build and load images
+docker build -f images/operator/Dockerfile -t podmotion-operator:dev .
+docker build -f images/agent/Dockerfile -t podmotion-agent:dev .
+kind load docker-image podmotion-operator:dev --name <cluster>
+kind load docker-image podmotion-agent:dev --name <cluster>
+
+# 3. Apply CRDs (chart crds/ dir is empty — must apply manually)
+kubectl apply -f config/crd/bases/
+
+# 4. Helm install
+helm upgrade --install podmotion charts/podmotion/ \
+  --namespace podmotion-system \
+  --create-namespace \
+  --set operator.image.repository=podmotion-operator \
+  --set operator.image.tag=dev \
+  --set operator.image.pullPolicy=Never \
+  --set agent.image.repository=podmotion-agent \
+  --set agent.image.tag=dev \
+  --set agent.image.pullPolicy=Never \
+  --set operator.replicas=1 \
+  --set webhook.certManager.enabled=false \
+  --set scheduler.enabled=false \
+  --set installCRDs=false \
+  --set operator.featureGates="TCPPreservation=true"
+```
+
+**Critical values for kind:**
+- `webhook.certManager.enabled=false` — cert-manager is not present in kind; also removes the volume mount so `podmotion-webhook-tls` secret is not required
+- `installCRDs=false` — chart `crds/` dir is empty; apply CRDs manually (step 3)
+- `operator.replicas=1` — single replica for dev
+
+**Flags that do NOT exist in the operator binary** — passing these causes an immediate crash:
+- `--transfer-mode` — not a real flag
+- `--checkpoint-registry` — not a real flag
+
+---
+
+## Operator Flags (cmd/main.go)
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--metrics-bind-address` | `"0"` | Use `:8080` for HTTP |
+| `--health-probe-bind-address` | `":8081"` | |
+| `--leader-elect` | `false` | Enable for multi-replica |
+| `--metrics-secure` | `true` | Set false for dev |
+| `--webhook-cert-path` | `""` | Dir containing TLS cert |
+| `--enable-http2` | `false` | |
+| `--enable-spot-reclaim` | `false` | AWS only |
+
+**The agent does not parse CLI flags.** It reads from environment variables only. The only required env var is `NODE_NAME` (set by the DaemonSet via Kubernetes downward API). The gRPC port is hardcoded to `:9090`.
+
+---
+
+## CRDs and PodMigration Fields
+
+| CRD | Short | Scope | Purpose |
+|-----|-------|-------|---------|
+| PodMigration | pm | Namespaced | Work object per migration |
+| MigrationPolicy | mp | Namespaced | Trigger rules and constraints |
+| NodeMigrationCapacity | nmc | Cluster | Per-node capability from agent |
+| MigrationCheckpoint | mcp | Namespaced | Checkpoint artifact metadata |
+| MigrationWebhookConfig | — | Namespaced | Singleton operator config |
+
+**PodMigration spec fields:**
+
+```yaml
+spec:
+  podName: <name>           # required — name of the source pod
+  podNamespace: <namespace> # required — namespace of the source pod
+  targetNodeName: <node>    # optional — pins destination; scheduler selects if empty
+  tcpPreservationMode: None # None | BestEffort | Strict
+```
+
+Fields that **do not exist**: `destinationNode`, `sourcePodName`, `sourcePodNamespace`. Using these will be silently ignored or rejected by the webhook.
+
+---
+
+## eBPF Object Files
+
+The `bpf/` and `internal/agent/network/bpfloader/` directories contain pre-compiled eBPF object files (`.o`). These are committed so users can build without requiring clang/llvm. To rebuild them from source:
+
+```bash
+make build-bpf   # requires clang, llvm, libbpf-dev
+```
+
+---
+
 ## Sign-off (DCO)
 
 Contributors must sign off commits per the Developer Certificate of Origin. Use `git commit -s`. See GOVERNANCE.md and ADR-0090 for the full policy.
