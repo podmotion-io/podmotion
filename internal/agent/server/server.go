@@ -5557,10 +5557,10 @@ const checkpointVerifiedSentinel = "checkpoint-verified"
 // fail closed.
 func (s *AgentServer) verifyMigrationUID(ctx context.Context, migrationName, manifestUID string) error {
 	if manifestUID == "" {
-		return fmt.Errorf("manifest migration_uid empty")
+		return fmt.Errorf("ADR-SEC-D: manifest migration_uid empty")
 	}
 	if s.k8sClient == nil {
-		return fmt.Errorf("no k8s client to verify migration_uid binding")
+		return fmt.Errorf("ADR-SEC-D: no k8s client to verify migration_uid binding")
 	}
 	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -5577,14 +5577,14 @@ func (s *AgentServer) verifyMigrationUID(ctx context.Context, migrationName, man
 	pm := &pmv1.PodMigration{}
 	if ns := s.resolveNamespaceForMigration(lookupCtx, migrationName); ns != "" {
 		if err := s.k8sClient.Get(lookupCtx, types.NamespacedName{Name: migrationName, Namespace: ns}, pm); err != nil {
-			return fmt.Errorf("read PodMigration CR %q in ns %q: %w", migrationName, ns, err)
+			return fmt.Errorf("ADR-SEC-D: read PodMigration CR %q in ns %q: %w", migrationName, ns, err)
 		}
 	} else {
 		// C1: List-by-name across all namespaces; require EXACTLY one match. Zero or
 		// more-than-one match → fail closed (PermissionDenied semantics — caller wraps).
 		pmList := &pmv1.PodMigrationList{}
 		if err := s.k8sClient.List(lookupCtx, pmList); err != nil {
-			return fmt.Errorf("list PodMigrations to bind migration_uid: %w", err)
+			return fmt.Errorf("ADR-SEC-D: list PodMigrations to bind migration_uid: %w", err)
 		}
 		var matches []*pmv1.PodMigration
 		for i := range pmList.Items {
@@ -5593,15 +5593,15 @@ func (s *AgentServer) verifyMigrationUID(ctx context.Context, migrationName, man
 			}
 		}
 		if len(matches) == 0 {
-			return fmt.Errorf("no PodMigration CR named %q found to verify migration_uid binding", migrationName)
+			return fmt.Errorf("ADR-SEC-D: no PodMigration CR named %q found to verify migration_uid binding", migrationName)
 		}
 		if len(matches) > 1 {
-			return fmt.Errorf("ambiguous migration_uid binding: %d PodMigration CRs named %q across namespaces — failing closed", len(matches), migrationName)
+			return fmt.Errorf("ADR-SEC-D: ambiguous migration_uid binding: %d PodMigration CRs named %q across namespaces — failing closed", len(matches), migrationName)
 		}
 		pm = matches[0]
 	}
 	if string(pm.UID) != manifestUID {
-		return fmt.Errorf("manifest migration_uid %q != live CR UID %q (replay)", manifestUID, string(pm.UID))
+		return fmt.Errorf("ADR-SEC-D: manifest migration_uid %q != live CR UID %q (replay)", manifestUID, string(pm.UID))
 	}
 	return nil
 }
