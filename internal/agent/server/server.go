@@ -2513,7 +2513,9 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 		}
 		src := resolveInheritCgroupSource(c.Path, sandboxID)
 		cgroupFdMapArgs = append(cgroupFdMapArgs, fmt.Sprintf("--cgroup-fd=%d:%s", c.Fd, src))
-		criuArgs = append(criuArgs, "--inherit-fd", fmt.Sprintf("fd[%d]:%s", c.Fd, c.Path))
+		// CRIU files-reg.c:2611 stores rfi->path = rfe->name+1 (no leading slash).
+		// --inherit-fd key must match exactly — strip the leading '/'. ADR-0188.
+		criuArgs = append(criuArgs, "--inherit-fd", fmt.Sprintf("fd[%d]:%s", c.Fd, strings.TrimPrefix(c.Path, "/")))
 		log.Info("ADR-0181: cgroup fd routed via wrapper+dup3 (not ExtraFiles)",
 			"fd", c.Fd, "recordedPath", c.Path, "hostSource", src, "migration", migrationName)
 	}

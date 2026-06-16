@@ -606,7 +606,9 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 			_ = f.Close() // the dup at cg.Fd is the held descriptor now
 			heldInheritFds = append(heldInheritFds, cg.Fd)
 			criuOpts.InheritFd = append(criuOpts.InheritFd, &rpc.InheritFd{
-				Key: proto.String(cg.Path),
+				// CRIU files-reg.c:2611 stores rfi->path = rfe->name+1 (no leading slash).
+				// inherit-fd match is literal strcmp — key must omit the leading '/'. ADR-0188.
+				Key: proto.String(strings.TrimPrefix(cg.Path, "/")),
 				Fd:  proto.Int32(int32(cg.Fd)),
 			})
 			logger.Info("ADR-0180: redirecting cgroup reg-file fd via InheritFd",
