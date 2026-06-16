@@ -83,9 +83,9 @@ func TestRestoreBranch1_MACFlowsToReportRestoreConfirmed(t *testing.T) {
 	// Track that joinNsRestoreFn was called.
 	joinNsCalled := false
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, error) {
+	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error) {
 		joinNsCalled = true
-		return 99999, nil
+		return 99999, nil, nil
 	}
 	defer func() { joinNsRestoreFn = origJoin }()
 
@@ -129,9 +129,9 @@ func TestRestoreBranch2_MACFlowsToReportRestoreConfirmed(t *testing.T) {
 	// Track that joinNsRestoreFn was called.
 	joinNsCalled := false
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, error) {
+	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error) {
 		joinNsCalled = true
-		return 99999, nil
+		return 99999, nil, nil
 	}
 	defer func() { joinNsRestoreFn = origJoin }()
 
@@ -167,8 +167,8 @@ func TestJoinNsRestore_ReturnsMACToCaller(t *testing.T) {
 
 	// Stub joinNsRestoreFn — avoids real CRIU subprocess.
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, error) {
-		return 99999, nil
+	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error) {
+		return 99999, nil, nil
 	}
 	defer func() { joinNsRestoreFn = origJoin }()
 
@@ -205,8 +205,8 @@ func TestRestoreBranch1_StrictFailsWhenNoK8sClient(t *testing.T) {
 	defer func() { readReplVethMACFn = orig }()
 
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, error) {
-		return 12345, nil
+	joinNsRestoreFn = func(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error) {
+		return 12345, nil, nil
 	}
 	defer func() { joinNsRestoreFn = origJoin }()
 

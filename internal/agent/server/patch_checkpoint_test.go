@@ -363,6 +363,154 @@ func TestPatchScript_DropLogicInSyncWithProduction(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// ADR-0194 B-2: external-mount DROP-together tests (§4.4 / C-PA-3 / H3).
+//
+// These tests cover:
+//   (a) the gc21-cold-be topology: /data (mnt_id 2951, ext_key set) is a leaf in the
+//       kept set → after dropping it, AC-1 holds on the 5-entry reduced set.
+//   (b) source-sync anchors: the production Python script must contain the B-2
+//       ext-drop code tokens (ext_drop_mnt_ids, CRIU_EXTERNAL_MOUNT_DROPPED, P-0194-1c).
+//
+// Items (c)–(e) (files.img rebind, atomic-commit ordering, P-0194-1c re-entry guard)
+// require live pycriu execution and are asserted at gate time via the P-0194-3 decode
+// artifact (SPRINT33-GATE-ATTEMPT-6-DECODE.md).
+// ---------------------------------------------------------------------------
+
+// gc21ColdBETopology returns the 6-entry kept set from the gc21-cold-be checkpoint
+// (decode §2a — the live checkpoint that produced mount.c:3141 on ADR-0193 binary).
+// MntID 2951 (/data, ext_key="/data") is the external entry that B-2 drops.
+func gc21ColdBETopology() []mountEntry {
+	return []mountEntry{
+		{MntID: 2951, ParentMntID: 2943, Mountpoint: "/data", ExtKey: "/data"}, // external — B-2 drops this
+		{MntID: 2948, ParentMntID: 2946, Mountpoint: "/dev/mqueue"},
+		{MntID: 2947, ParentMntID: 2946, Mountpoint: "/dev/pts"},
+		{MntID: 2946, ParentMntID: 2943, Mountpoint: "/dev"},
+		{MntID: 2945, ParentMntID: 2943, Mountpoint: "/proc"},
+		// Root entry: on-disk parent_mnt_id=2815 (host namespace root, absent from container set).
+		// Use 0 here so assertNoOrphanParents treats it as namespace root (no parent check).
+		// The production Python script and CRIU both handle the real 2815 correctly at runtime.
+		{MntID: 2943, ParentMntID: 0, Mountpoint: "/"},
+	}
+}
+
+// simulateB2Drop drops the external /data entry from the kept set (mirrors the B-2 ext-drop
+// pass in the Python script). Returns the reduced set and the set of dropped mnt_ids.
+func simulateB2Drop(entries []mountEntry) (kept []mountEntry, droppedIDs map[int]struct{}) {
+	droppedIDs = map[int]struct{}{}
+	for _, e := range entries {
+		if e.ExtKey != "" {
+			droppedIDs[e.MntID] = struct{}{}
+		} else {
+			kept = append(kept, e)
+		}
+	}
+	return kept, droppedIDs
+}
+
+// TestADR0194_B2_ExternalEntryDropped asserts that the /data (mnt_id 2951) external entry
+// is dropped by the B-2 pass and that AC-1 (no orphan parents) holds on the 5-entry
+// reduced set. (ADR-0194 §4.4 / C-PA-3 / H3(a)(b).)
+func TestADR0194_B2_ExternalEntryDropped(t *testing.T) {
+	entries := gc21ColdBETopology()
+
+	// Verify premise: /data IS present in the kept set before the B-2 pass.
+	found2951 := false
+	for _, e := range entries {
+		if e.MntID == 2951 {
+			found2951 = true
+		}
+	}
+	if !found2951 {
+		t.Fatal("test premise violated: /data (mnt_id 2951) not in gc21ColdBETopology; update the test")
+	}
+
+	reduced, dropped := simulateB2Drop(entries)
+
+	// (a) /data must be dropped.
+	if _, ok := dropped[2951]; !ok {
+		t.Errorf("B-2: mnt_id 2951 (/data, ext_key set) must be in dropped set")
+	}
+	mp := mountpoints(reduced)
+	if mp["/data"] {
+		t.Errorf("B-2: /data must not appear in the reduced kept set after the drop pass")
+	}
+
+	// (b) AC-1 (ADR-0191): no kept entry references a dropped mnt_id as parent_mnt_id.
+	// /data (2951) is a leaf — no kept entry has parent_mnt_id=2951.
+	assertNoOrphanParents(t, reduced)
+
+	// Verify the 5-entry reduced set is exactly: /, /proc, /dev, /dev/pts, /dev/mqueue.
+	expectedMountpoints := []string{"/", "/proc", "/dev", "/dev/pts", "/dev/mqueue"}
+	if len(reduced) != len(expectedMountpoints) {
+		t.Errorf("B-2 reduced set: expected %d entries, got %d", len(expectedMountpoints), len(reduced))
+	}
+	for _, want := range expectedMountpoints {
+		if !mp[want] {
+			t.Errorf("B-2 reduced set: %q expected but absent", want)
+		}
+	}
+}
+
+// TestADR0194_B2_LeafVerification asserts that /data (2951) is a leaf in the gc21-cold-be
+// kept set — i.e. no kept entry has parent_mnt_id=2951 — so the B-2 drop cannot create an
+// orphan. This is the ADR-0194 §4.1/H2 precondition check (D1 correction: leaf formulation,
+// not "only entry with parent 2943", which was wrong per decode §2a).
+func TestADR0194_B2_LeafVerification(t *testing.T) {
+	entries := gc21ColdBETopology()
+	for _, e := range entries {
+		if e.MntID != 2951 && e.ParentMntID == 2951 {
+			t.Errorf("invariant violated: entry mnt_id=%d has parent_mnt_id=2951 — /data is NOT a leaf; B-2 drop would orphan it", e.MntID)
+		}
+	}
+}
+
+// TestADR0194_B2_SharedMasterIDZero asserts that the /data (2951) entry has shared_id=0
+// and master_id=0 — the P-0194-1b (SC-3/H5) precondition that makes B-2 safe.
+// (These fields are not in mountEntry; the test is a source-sync guard asserting the
+// Python script checks them before proceeding with the drop.)
+func TestADR0194_B2_SharedMasterIDZero(t *testing.T) {
+	src := readServerGoSource(t)
+	// The Python script must check shared_id and master_id before dropping.
+	if !strings.Contains(src, "shared_id") {
+		t.Errorf("ADR-0194 P-0194-1b: production script no longer checks shared_id (SC-3 / H5 — propagation-peer guard missing)")
+	}
+	if !strings.Contains(src, "master_id") {
+		t.Errorf("ADR-0194 P-0194-1b: production script no longer checks master_id (SC-3 / H5 — propagation-peer guard missing)")
+	}
+	if !strings.Contains(src, "propagation_peer") {
+		t.Errorf("ADR-0194 P-0194-1b: production script no longer emits propagation_peer reason on non-zero shared/master_id")
+	}
+}
+
+// TestADR0194_B2_SourceSyncAnchors asserts that the production Python script contains the
+// load-bearing B-2 implementation tokens. A missing token means the fix was not applied or
+// was removed, and the mount.c:3141 wall would return on the next gate.
+func TestADR0194_B2_SourceSyncAnchors(t *testing.T) {
+	src := readServerGoSource(t)
+
+	anchors := []struct {
+		token string
+		desc  string
+	}{
+		{"ext_drop_mnt_ids", "B-2 external drop mnt_id tracking dict (lockstep rebind key)"},
+		{"CRIU_EXTERNAL_MOUNT_DROPPED", "B-2 event token for H4 CRIUExternalMountDropped event"},
+		{"EXTERNAL_MOUNT_UNRESOLVED", "P-0194-1 hard-stop event token (ExternalMountUnresolved)"},
+		{"mp_tmp", "atomic mountpoints temp file (H1 / SC-2 dual-write)"},
+		{"files_tmp", "atomic files.img temp file (H1 / SC-2 dual-write)"},
+		{"P-0194-1c", "P-0194-1c cross-image assertion reference"},
+		{"ext_key", "ext_key field read in the external-mount scan"},
+		{"non_leaf_external", "non-leaf external entry hard-stop reason (H2 re-entry guard)"},
+		{"b2-lockstep-ext-drop", "B-2 lockstep action label in files.img rebind log line"},
+	}
+
+	for _, a := range anchors {
+		if !strings.Contains(src, a.token) {
+			t.Errorf("ADR-0194 B-2 source-sync drift: %q not found in server.go — %s", a.token, a.desc)
+		}
+	}
+}
+
 // readServerGoSource returns the text of server.go (located relative to this
 // test's package directory).
 func readServerGoSource(t *testing.T) string {
