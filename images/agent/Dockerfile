@@ -16,4 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 COPY pycriu/ /usr/lib/python3/dist-packages/pycriu/
 COPY bin/agent-linux-amd64 /agent
+# ADR-0181: cgroup fd delivery wrapper — must be present at /usr/local/bin/podmotion-criu-wrapper
+# inside the agent image. nsenter exec-chains into this binary before execve-ing criu.
+# Build: make build-linux → cp bin/podmotion-criu-wrapper-amd64 bin/criu-wrapper-linux-amd64
+COPY bin/criu-wrapper-linux-amd64 /usr/local/bin/podmotion-criu-wrapper
 ENTRYPOINT ["/agent"]
