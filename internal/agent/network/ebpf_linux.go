@@ -1,11 +1,11 @@
+//go:build linux
+
 /*
 Copyright 2026 PodMotion Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 */
-
-//go:build linux
 
 package network
 
@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -55,8 +56,8 @@ type ciliumEBPFManager struct {
 	relayIngressFilters map[uint32]uint32 // ifindex → ingress handle
 
 	// pm_xdp_vtep collection; nil until first ArmVTEP call.
-	vtepObjs        *bpfloader.PmXdpVtepObjects
-	vtepXDPLinks    map[uint32]struct{} // dst ifindex
+	vtepObjs         *bpfloader.PmXdpVtepObjects
+	vtepXDPLinks     map[uint32]struct{} // dst ifindex
 	srcGuardXDPLinks map[uint32]struct{} // src ifindex
 
 	// xdp_bridge collection; nil until EnsureXDPBridgeLoaded succeeds.
@@ -528,6 +529,101 @@ func (m *ciliumEBPFManager) ensureLoaded(ctx context.Context) error {
 // unix.NLMSG_HDRSIZE is not always exported; local const ensures cross-compilation.
 const nlmsgHdrSize = 16
 
+// nlSeqCounter is the package-level monotonic netlink sequence source (ADR-0204
+// Decision 3). Each netlink request claims a fresh Seq via nextNlSeq() so that
+// readNetlinkAck can correlate replies by Seq+Pid instead of acting on the first
+// datagram it happens to read. Replaces the former shared hardcoded Seq:1..6.
+var nlSeqCounter uint32
+
+// nextNlSeq returns the next netlink sequence number (never 0).
+func nextNlSeq() uint32 {
+	s := atomic.AddUint32(&nlSeqCounter, 1)
+	if s == 0 {
+		s = atomic.AddUint32(&nlSeqCounter, 1)
+	}
+	return s
+}
+
+// readNetlinkAck reads the ACK/error reply for a netlink request on fd, correlating
+// by Seq+Pid (ADR-0204 — correlated netlink read fix). The prior code read a single
+// unconditional datagram and parsed buf[0] as the reply WITHOUT matching the request
+// Seq or the socket's bound Pid; when that datagram was an NLMSG_ERROR belonging to a
+// different request it returned a spurious non-zero errno, driving the clsact probe
+// false-negative that blocked Strict-mode admission.
+//
+// It loops, discarding any datagram whose first message Seq != wantSeq OR Pid !=
+// wantPort, walking every message in a buffer by NlMsghdr.Len. On a matching
+// NLMSG_ERROR it extracts the errno: 0 or -EEXIST → success (nil); any other value →
+// syscall.Errno surfaced verbatim. NLMSG_NOOP/NLMSG_DONE are skipped; any other
+// matching message type is treated as a success ACK.
+func readNetlinkAck(fd int, wantSeq, wantPort uint32) error {
+	buf := make([]byte, 8192)
+	for {
+		n, err := unix.Read(fd, buf)
+		if err != nil {
+			return fmt.Errorf("netlink read: %w", err)
+		}
+		if n < nlmsgHdrSize {
+			return fmt.Errorf("netlink: short reply (%d bytes)", n)
+		}
+
+		// Walk every message in the datagram.
+		offset := 0
+		for offset+nlmsgHdrSize <= n {
+			hdr := (*unix.NlMsghdr)(unsafe.Pointer(&buf[offset]))
+			msgLen := int(hdr.Len)
+			if msgLen < nlmsgHdrSize || offset+msgLen > n {
+				break
+			}
+
+			// Skip uncorrelated messages (different request or different socket).
+			if hdr.Seq != wantSeq || hdr.Pid != wantPort {
+				offset += nlmsgAlign(msgLen)
+				continue
+			}
+
+			switch hdr.Type {
+			case unix.NLMSG_NOOP, unix.NLMSG_DONE:
+				offset += nlmsgAlign(msgLen)
+				continue
+			case unix.NLMSG_ERROR:
+				if offset+nlmsgHdrSize+4 > n {
+					return fmt.Errorf("netlink: truncated NLMSG_ERROR")
+				}
+				errVal := int32(binary.LittleEndian.Uint32(buf[offset+nlmsgHdrSize:]))
+				if errVal == 0 || errVal == -int32(syscall.EEXIST) {
+					return nil
+				}
+				e := syscall.Errno(-errVal)
+				return fmt.Errorf("netlink kernel error %d: %w", errVal, e)
+			default:
+				// Matching, non-error, non-noop message — treat as success ACK.
+				return nil
+			}
+		}
+		// No correlated message in this datagram — keep reading.
+	}
+}
+
+// nlmsgAlign rounds a netlink message length up to the 4-byte NLMSG alignment.
+func nlmsgAlign(l int) int {
+	return (l + 3) &^ 3
+}
+
+// boundNetlinkPort returns the port (Pid) the kernel auto-assigned to fd at bind.
+// readNetlinkAck correlates replies against this value (ADR-0204 Decision 3).
+func boundNetlinkPort(fd int) (uint32, error) {
+	sa, err := unix.Getsockname(fd)
+	if err != nil {
+		return 0, fmt.Errorf("netlink getsockname: %w", err)
+	}
+	nl, ok := sa.(*unix.SockaddrNetlink)
+	if !ok {
+		return 0, fmt.Errorf("netlink getsockname: unexpected sockaddr type %T", sa)
+	}
+	return nl.Pid, nil
+}
+
 // TC netlink constants not yet in golang.org/x/sys/unix.
 const (
 	tcHandleRoot    = 0xFFFFFFFF
@@ -538,15 +634,15 @@ const (
 	tcParentEgress = 0xFFFFFFF3 // TC_H_MIN_EGRESS
 
 	// rtnetlink message types
-	rtmNewQdisc   = unix.RTM_NEWQDISC
-	rtmGetQdisc   = unix.RTM_GETQDISC
-	rtmNewFilter  = unix.RTM_NEWTFILTER
-	rtmDelFilter  = unix.RTM_DELTFILTER
+	rtmNewQdisc  = unix.RTM_NEWQDISC
+	rtmGetQdisc  = unix.RTM_GETQDISC
+	rtmNewFilter = unix.RTM_NEWTFILTER
+	rtmDelFilter = unix.RTM_DELTFILTER
 
 	// TC attribute types
-	tcaKind     = 1
-	tcaOptions  = 2
-	tcaFdArray  = 22
+	tcaKind    = 1
+	tcaOptions = 2
+	tcaFdArray = 22
 
 	// BPF filter attribute types
 	tcaBpfFd       = 1
@@ -602,6 +698,11 @@ func ensureClsactQdisc(ifindex int) error {
 		return fmt.Errorf("netlink bind: %w", err)
 	}
 
+	wantPort, err := boundNetlinkPort(fd)
+	if err != nil {
+		return err
+	}
+
 	// Build RTM_NEWQDISC for clsact.
 	type tcmsg struct {
 		Family  uint8
@@ -621,11 +722,16 @@ func ensureClsactQdisc(ifindex int) error {
 	kind := tcAttrStr(tcaKind, "clsact")
 	payload := append(tcBytes, kind...)
 
+	// ADR-0204: NLM_F_ACK keeps deterministic request hygiene (always an
+	// NLMSG_ERROR reply, errno=0 on success). The former NLM_F_EXCL is replaced by
+	// NLM_F_REPLACE so an already-present clsact qdisc is idempotent; -EEXIST is
+	// still mapped to success in readNetlinkAck as defense-in-depth.
+	wantSeq := nextNlSeq()
 	hdr := unix.NlMsghdr{
 		Len:   uint32(nlmsgHdrSize + len(payload)),
 		Type:  rtmNewQdisc,
-		Flags: unix.NLM_F_REQUEST | unix.NLM_F_CREATE | unix.NLM_F_EXCL,
-		Seq:   1,
+		Flags: unix.NLM_F_REQUEST | unix.NLM_F_ACK | unix.NLM_F_CREATE | unix.NLM_F_REPLACE,
+		Seq:   wantSeq,
 	}
 	hdrBytes := (*[nlmsgHdrSize]byte)(unsafe.Pointer(&hdr))[:]
 	msg := append(hdrBytes, payload...)
@@ -638,21 +744,8 @@ func ensureClsactQdisc(ifindex int) error {
 		return fmt.Errorf("RTM_NEWQDISC write: %w", err)
 	}
 
-	buf := make([]byte, 4096)
-	n, err := unix.Read(fd, buf)
-	if err != nil {
-		return fmt.Errorf("RTM_NEWQDISC read: %w", err)
-	}
-	if n < nlmsgHdrSize {
-		return fmt.Errorf("RTM_NEWQDISC: short reply (%d bytes)", n)
-	}
-	replyHdr := (*unix.NlMsghdr)(unsafe.Pointer(&buf[0]))
-	if replyHdr.Type == unix.NLMSG_ERROR {
-		errno := int32(binary.LittleEndian.Uint32(buf[nlmsgHdrSize:]))
-		if errno != 0 && errno != -int32(syscall.EEXIST) {
-			return fmt.Errorf("RTM_NEWQDISC: kernel error %d", errno)
-		}
-		// EEXIST means clsact is already present — idempotent, treat as success.
+	if err := readNetlinkAck(fd, wantSeq, wantPort); err != nil {
+		return fmt.Errorf("RTM_NEWQDISC: %w", err)
 	}
 	return nil
 }
@@ -673,6 +766,11 @@ func attachTCEgress(ifindex int, prog *ebpf.Program) (uint32, error) {
 
 	if err := unix.Bind(fd, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
 		return 0, fmt.Errorf("netlink bind: %w", err)
+	}
+
+	wantPort, err := boundNetlinkPort(fd)
+	if err != nil {
+		return 0, err
 	}
 
 	type tcmsg struct {
@@ -714,11 +812,13 @@ func attachTCEgress(ifindex int, prog *ebpf.Program) (uint32, error) {
 	tcBytesH := (*[unsafe.Sizeof(tc)]byte)(unsafe.Pointer(&tc))[:]
 	payload = append(tcBytesH, attrs...)
 
+	// ADR-0204: NLM_F_ACK forces an NLMSG_ERROR reply readNetlinkAck can correlate.
+	wantSeq := nextNlSeq()
 	hdr := unix.NlMsghdr{
 		Len:   uint32(nlmsgHdrSize + len(payload)),
 		Type:  rtmNewFilter,
-		Flags: unix.NLM_F_REQUEST | unix.NLM_F_CREATE | unix.NLM_F_REPLACE,
-		Seq:   2,
+		Flags: unix.NLM_F_REQUEST | unix.NLM_F_ACK | unix.NLM_F_CREATE | unix.NLM_F_REPLACE,
+		Seq:   wantSeq,
 	}
 	hdrBytes := (*[nlmsgHdrSize]byte)(unsafe.Pointer(&hdr))[:]
 	msg := append(hdrBytes, payload...)
@@ -730,20 +830,8 @@ func attachTCEgress(ifindex int, prog *ebpf.Program) (uint32, error) {
 		return 0, fmt.Errorf("RTM_NEWTFILTER write: %w", err)
 	}
 
-	buf := make([]byte, 4096)
-	n, err := unix.Read(fd, buf)
-	if err != nil {
-		return 0, fmt.Errorf("RTM_NEWTFILTER read: %w", err)
-	}
-	if n < nlmsgHdrSize {
-		return 0, fmt.Errorf("RTM_NEWTFILTER: short reply (%d bytes)", n)
-	}
-	replyHdr := (*unix.NlMsghdr)(unsafe.Pointer(&buf[0]))
-	if replyHdr.Type == unix.NLMSG_ERROR {
-		errno := int32(binary.LittleEndian.Uint32(buf[nlmsgHdrSize:]))
-		if errno != 0 {
-			return 0, fmt.Errorf("RTM_NEWTFILTER: kernel error %d", errno)
-		}
+	if err := readNetlinkAck(fd, wantSeq, wantPort); err != nil {
+		return 0, fmt.Errorf("RTM_NEWTFILTER: %w", err)
 	}
 
 	return filterHandle, nil
@@ -759,6 +847,11 @@ func detachTCEgress(ifindex int, handle uint32) error {
 
 	if err := unix.Bind(fd, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
 		return fmt.Errorf("netlink bind: %w", err)
+	}
+
+	wantPort, err := boundNetlinkPort(fd)
+	if err != nil {
+		return err
 	}
 
 	type tcmsg struct {
@@ -779,11 +872,14 @@ func detachTCEgress(ifindex int, handle uint32) error {
 	kind := tcAttrStr(tcaKind, "bpf")
 	payload := append(tcBytes, kind...)
 
+	// ADR-0204: NLM_F_ACK forces a correlatable NLMSG_ERROR reply. ENOENT (filter
+	// already gone) is treated as success in readNetlinkAck's caller below.
+	wantSeq := nextNlSeq()
 	hdr := unix.NlMsghdr{
 		Len:   uint32(nlmsgHdrSize + len(payload)),
 		Type:  rtmDelFilter,
-		Flags: unix.NLM_F_REQUEST,
-		Seq:   3,
+		Flags: unix.NLM_F_REQUEST | unix.NLM_F_ACK,
+		Seq:   wantSeq,
 	}
 	hdrBytes := (*[nlmsgHdrSize]byte)(unsafe.Pointer(&hdr))[:]
 	msg := append(hdrBytes, payload...)
@@ -795,20 +891,11 @@ func detachTCEgress(ifindex int, handle uint32) error {
 		return fmt.Errorf("RTM_DELTFILTER write: %w", err)
 	}
 
-	buf := make([]byte, 4096)
-	n, err := unix.Read(fd, buf)
-	if err != nil {
-		return fmt.Errorf("RTM_DELTFILTER read: %w", err)
-	}
-	if n < nlmsgHdrSize {
-		return fmt.Errorf("RTM_DELTFILTER: short reply (%d bytes)", n)
-	}
-	replyHdr := (*unix.NlMsghdr)(unsafe.Pointer(&buf[0]))
-	if replyHdr.Type == unix.NLMSG_ERROR {
-		errno := int32(binary.LittleEndian.Uint32(buf[nlmsgHdrSize:]))
-		if errno != 0 && errno != -int32(syscall.ENOENT) {
-			return fmt.Errorf("RTM_DELTFILTER: kernel error %d", errno)
+	if err := readNetlinkAck(fd, wantSeq, wantPort); err != nil {
+		if errors.Is(err, syscall.ENOENT) {
+			return nil
 		}
+		return fmt.Errorf("RTM_DELTFILTER: %w", err)
 	}
 	return nil
 }
@@ -828,6 +915,11 @@ func attachTCIngress(ifindex int, prog *ebpf.Program) (uint32, error) {
 
 	if err := unix.Bind(fd, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
 		return 0, fmt.Errorf("netlink bind: %w", err)
+	}
+
+	wantPort, err := boundNetlinkPort(fd)
+	if err != nil {
+		return 0, err
 	}
 
 	type tcmsg struct {
@@ -865,11 +957,13 @@ func attachTCIngress(ifindex int, prog *ebpf.Program) (uint32, error) {
 	)
 	payload := append(tcBytes, attrs...)
 
+	// ADR-0204: NLM_F_ACK forces a correlatable NLMSG_ERROR reply.
+	wantSeq := nextNlSeq()
 	hdr := unix.NlMsghdr{
 		Len:   uint32(nlmsgHdrSize + len(payload)),
 		Type:  rtmNewFilter,
-		Flags: unix.NLM_F_REQUEST | unix.NLM_F_CREATE | unix.NLM_F_REPLACE,
-		Seq:   4,
+		Flags: unix.NLM_F_REQUEST | unix.NLM_F_ACK | unix.NLM_F_CREATE | unix.NLM_F_REPLACE,
+		Seq:   wantSeq,
 	}
 	hdrBytes := (*[nlmsgHdrSize]byte)(unsafe.Pointer(&hdr))[:]
 	msg := append(hdrBytes, payload...)
@@ -881,20 +975,8 @@ func attachTCIngress(ifindex int, prog *ebpf.Program) (uint32, error) {
 		return 0, fmt.Errorf("RTM_NEWTFILTER (ingress) write: %w", err)
 	}
 
-	buf := make([]byte, 4096)
-	n, err := unix.Read(fd, buf)
-	if err != nil {
-		return 0, fmt.Errorf("RTM_NEWTFILTER (ingress) read: %w", err)
-	}
-	if n < nlmsgHdrSize {
-		return 0, fmt.Errorf("RTM_NEWTFILTER (ingress): short reply (%d bytes)", n)
-	}
-	rHdr := (*unix.NlMsghdr)(unsafe.Pointer(&buf[0]))
-	if rHdr.Type == unix.NLMSG_ERROR {
-		errno := int32(binary.LittleEndian.Uint32(buf[nlmsgHdrSize:]))
-		if errno != 0 {
-			return 0, fmt.Errorf("RTM_NEWTFILTER (ingress): kernel error %d", errno)
-		}
+	if err := readNetlinkAck(fd, wantSeq, wantPort); err != nil {
+		return 0, fmt.Errorf("RTM_NEWTFILTER (ingress): %w", err)
 	}
 	return filterHandle, nil
 }
@@ -909,6 +991,11 @@ func detachTCIngress(ifindex int, handle uint32) error {
 
 	if err := unix.Bind(fd, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
 		return fmt.Errorf("netlink bind: %w", err)
+	}
+
+	wantPort, err := boundNetlinkPort(fd)
+	if err != nil {
+		return err
 	}
 
 	const tcParentIngress = 0xFFFFFFF2
@@ -930,11 +1017,13 @@ func detachTCIngress(ifindex int, handle uint32) error {
 	kind := tcAttrStr(tcaKind, "bpf")
 	payload := append(tcBytes, kind...)
 
+	// ADR-0204: NLM_F_ACK forces a correlatable NLMSG_ERROR reply. ENOENT is success.
+	wantSeq := nextNlSeq()
 	hdr := unix.NlMsghdr{
 		Len:   uint32(nlmsgHdrSize + len(payload)),
 		Type:  rtmDelFilter,
-		Flags: unix.NLM_F_REQUEST,
-		Seq:   5,
+		Flags: unix.NLM_F_REQUEST | unix.NLM_F_ACK,
+		Seq:   wantSeq,
 	}
 	hdrBytes := (*[nlmsgHdrSize]byte)(unsafe.Pointer(&hdr))[:]
 	msg := append(hdrBytes, payload...)
@@ -946,20 +1035,11 @@ func detachTCIngress(ifindex int, handle uint32) error {
 		return fmt.Errorf("RTM_DELTFILTER (ingress) write: %w", err)
 	}
 
-	buf := make([]byte, 4096)
-	n, err := unix.Read(fd, buf)
-	if err != nil {
-		return fmt.Errorf("RTM_DELTFILTER (ingress) read: %w", err)
-	}
-	if n < nlmsgHdrSize {
-		return fmt.Errorf("RTM_DELTFILTER (ingress): short reply (%d bytes)", n)
-	}
-	rHdr := (*unix.NlMsghdr)(unsafe.Pointer(&buf[0]))
-	if rHdr.Type == unix.NLMSG_ERROR {
-		errno := int32(binary.LittleEndian.Uint32(buf[nlmsgHdrSize:]))
-		if errno != 0 && errno != -int32(syscall.ENOENT) {
-			return fmt.Errorf("RTM_DELTFILTER (ingress): kernel error %d", errno)
+	if err := readNetlinkAck(fd, wantSeq, wantPort); err != nil {
+		if errors.Is(err, syscall.ENOENT) {
+			return nil
 		}
+		return fmt.Errorf("RTM_DELTFILTER (ingress): %w", err)
 	}
 	return nil
 }
@@ -968,12 +1048,12 @@ func detachTCIngress(ifindex int, handle uint32) error {
 // via the netlink XDP attribute (generic XDP mode, which works on all drivers).
 func attachXDP(ifindex int, prog *ebpf.Program) error {
 	type ifinfomsg struct {
-		Family     uint8
-		Pad        uint8
-		Type       uint16
-		Index      int32
-		Flags      uint32
-		Change     uint32
+		Family uint8
+		Pad    uint8
+		Type   uint16
+		Index  int32
+		Flags  uint32
+		Change uint32
 	}
 	const RTM_SETLINK = 19
 	const IFLA_XDP = 43
@@ -991,6 +1071,11 @@ func attachXDP(ifindex int, prog *ebpf.Program) error {
 		return fmt.Errorf("netlink bind: %w", err)
 	}
 
+	wantPort, err := boundNetlinkPort(fd)
+	if err != nil {
+		return err
+	}
+
 	ifinfo := ifinfomsg{Index: int32(ifindex)}
 	ifBytes := (*[unsafe.Sizeof(ifinfo)]byte)(unsafe.Pointer(&ifinfo))[:]
 
@@ -1002,11 +1087,13 @@ func attachXDP(ifindex int, prog *ebpf.Program) error {
 	xdpAttr := tcAttr(IFLA_XDP, xdpAttrs)
 	payload := append(ifBytes, xdpAttr...)
 
+	// ADR-0204: correlated read; Seq from the atomic counter, Pid from the bound port.
+	wantSeq := nextNlSeq()
 	hdr := unix.NlMsghdr{
 		Len:   uint32(nlmsgHdrSize + len(payload)),
 		Type:  RTM_SETLINK,
 		Flags: unix.NLM_F_REQUEST | unix.NLM_F_ACK,
-		Seq:   6,
+		Seq:   wantSeq,
 	}
 	hdrBytes := (*[nlmsgHdrSize]byte)(unsafe.Pointer(&hdr))[:]
 	msg := append(hdrBytes, payload...)
@@ -1018,20 +1105,8 @@ func attachXDP(ifindex int, prog *ebpf.Program) error {
 		return fmt.Errorf("RTM_SETLINK XDP write: %w", err)
 	}
 
-	buf := make([]byte, 4096)
-	n, err := unix.Read(fd, buf)
-	if err != nil {
-		return fmt.Errorf("RTM_SETLINK XDP read: %w", err)
-	}
-	if n < nlmsgHdrSize {
-		return fmt.Errorf("RTM_SETLINK XDP: short reply (%d bytes)", n)
-	}
-	rHdr := (*unix.NlMsghdr)(unsafe.Pointer(&buf[0]))
-	if rHdr.Type == unix.NLMSG_ERROR {
-		errno := int32(binary.LittleEndian.Uint32(buf[nlmsgHdrSize:]))
-		if errno != 0 {
-			return fmt.Errorf("RTM_SETLINK XDP: kernel error %d", errno)
-		}
+	if err := readNetlinkAck(fd, wantSeq, wantPort); err != nil {
+		return fmt.Errorf("RTM_SETLINK XDP: %w", err)
 	}
 	return nil
 }

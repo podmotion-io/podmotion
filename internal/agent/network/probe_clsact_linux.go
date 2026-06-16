@@ -12,6 +12,8 @@ package network
 import (
 	"net"
 	"os/exec"
+
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // ProbeTCClsact actively tests whether the kernel can attach a clsact qdisc to a
@@ -50,5 +52,17 @@ func ProbeTCClsact() bool {
 
 	// Attempt clsact qdisc attach — this is the actual capability test.
 	err = ensureClsactQdisc(ifindex)
-	return err == nil
+	// ADR-0204: surface the netlink errno verbatim before collapsing to bool. The
+	// prior swallow at `return err == nil` hid the real cause of the clsact
+	// false-negative across three live gates. Log a POSITIVE firing line on success
+	// (errno=0 attach OK) and the verbatim error on failure.
+	log := logf.Log.WithName("probe-tc-clsact")
+	if err != nil {
+		log.Error(err, "ADR-0204: ProbeTCClsact clsact attach FAILED — surfaced netlink errno",
+			"ifindex", ifindex, "probeLink", probeLinkA)
+		return false
+	}
+	log.Info("ADR-0204: ProbeTCClsact errno=0 attach OK — tcClsactSupported=true",
+		"ifindex", ifindex, "probeLink", probeLinkA)
+	return true
 }
