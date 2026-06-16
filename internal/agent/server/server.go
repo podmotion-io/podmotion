@@ -1638,7 +1638,7 @@ func sandboxNetnsPath(_ context.Context, sandboxID string) (string, error) {
 // Falls back to scanning /run/containerd/io.containerd.runtime.v2.task/k8s.io/ directly
 // when the ctr binary is not available (e.g. inside the agent container on kind clusters).
 func FindContainerTaskID(podUID string) (string, error) {
-	out, err := exec.Command("ctr", "--namespace", "k8s.io", "tasks", "list").Output()
+	out, err := nsenterCmd("/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "list").Output()
 	if err == nil {
 		lines := strings.Split(string(out), "\n")
 		for _, line := range lines[1:] { // skip header
@@ -1707,7 +1707,7 @@ func ctrCheckpoint(taskID, imagesDir string) (int64, error) {
 	if err := os.MkdirAll(imagesDir, 0o700); err != nil {
 		return 0, fmt.Errorf("mkdir %s: %w", imagesDir, err)
 	}
-	cmd := exec.Command("ctr", "--namespace", "k8s.io", "tasks", "checkpoint",
+	cmd := nsenterCmd("/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "checkpoint",
 		"--image-path", imagesDir, taskID)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -2939,7 +2939,7 @@ func procPPid(pid int) int {
 // via `ctr --namespace k8s.io tasks list`. The sandbox ID is the pause container's containerd
 // task ID (from the NRI pod sandbox object, pod.GetId()), so its PID is the task's PID.
 func sandboxPausePID(sandboxID string) (int, error) {
-	out, err := exec.Command("ctr", "--namespace", "k8s.io", "tasks", "list").Output()
+	out, err := nsenterCmd("/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "list").Output()
 	if err != nil {
 		return 0, fmt.Errorf("ctr tasks list: %w", err)
 	}
