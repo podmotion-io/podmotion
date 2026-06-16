@@ -206,10 +206,20 @@ func main() {
 
 	// Build mTLS client config for operator→agent calls.
 	// Falls back to insecure when certs are absent (dev/kind environment).
+	// ADR-SEC-C (GC-B7): the operator verifies the agent peer by SPIFFE identity (custom
+	// VerifyPeerCertificate), pinning spiffe://podmotion.io/ns/<ns>/sa/podmotion-agent. The
+	// namespace is read from POD_NAMESPACE (downward API, deployment.yaml) — NOT hardcoded — so a
+	// non-default-namespace install pins the correct agent identity (M2).
+	operatorNamespace := os.Getenv("POD_NAMESPACE")
+	if operatorNamespace == "" {
+		operatorNamespace = "podmotion-system"
+		setupLog.Info("POD_NAMESPACE unset; defaulting operator namespace for agent SPIFFE pin (ADR-SEC-C M2)", "namespace", operatorNamespace)
+	}
 	agentTLSCfg, err := agenttls.LoadClientConfig(
 		agenttls.DefaultCertFile,
 		agenttls.DefaultKeyFile,
 		agenttls.DefaultCAFile,
+		operatorNamespace,
 	)
 	if err != nil {
 		setupLog.Error(err, "Failed to load agent client TLS config")
