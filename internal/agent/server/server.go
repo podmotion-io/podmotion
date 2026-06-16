@@ -885,24 +885,34 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 			BlockingReason: fmt.Sprintf("%s neigh: %v", bridgeIf, err)}, nil
 	}
 
-	// D2.2 + overlay-redirect block: gated on fdbIf != "" (provider returned a VXLAN device).
-	// When fdbIf == "" the substrate has no VXLAN overlay (kind/kindnet); the entire FDB
-	// overlay leg — D2.2 neigh, tc-redirect, FORWARD-ACCEPT, NOTRACK — is skipped.
-	// This is a truthful, logged, provider-driven absence — NOT a silent-skip (ADR-0192 §4 B Rule).
-	if fdbIf == "" {
-		// Substrate has no VXLAN FDB device; FDB overlay leg is not applicable.
-		// The bridgeIf neigh + /32 route + gARP path (below) is sufficient on host-routed CNIs.
-		log.Info("InjectIPHandoff: FDB overlay leg not applicable on this substrate (provider resolved no VXLAN device) — D2.2 neigh, tc-redirect, FORWARD-ACCEPT, NOTRACK skipped; Injected=true",
+	// ADR-0199 D1: the OLD-IP destination datapath-wiring leg (D2.2 neigh where applicable,
+	// ADR-0139 tc-redirect, ADR-0140 FORWARD-ACCEPT, ADR-0141 NOTRACK) is substrate-portable —
+	// it does NOT require a VXLAN device. Previously this entire leg was gated behind
+	// `fdbIf != ""` and SILENT on kindnet (the M3 active-but-silent mechanism, §P-MECHANISM),
+	// which made the in-node OLD-IP dial blackhole (`i/o timeout`) and wedged the handoff.
+	//
+	// The redirect needs a SOURCE interface on which OLD-IP frames arrive and a TARGET veth
+	// peer to redirect them to. On VXLAN the source is `fdbIf` (unchanged — zero regression).
+	// On kindnet/host-routed (`fdbIf == ""`) the equivalent source is the node's host
+	// interface `bridgeIf` (already discovered above, already used by M1/M2). The TARGET
+	// (resolveReplVethPeer) is identical on both substrates (no VXLAN dependency).
+	redirectIf := fdbIf
+	if redirectIf == "" {
+		redirectIf = bridgeIf // ADR-0199: kindnet host-routed substrate — redirect on bridgeIf
+		log.Info("InjectIPHandoff: ADR-0199 host-routed substrate — installing OLD-IP datapath leg on bridgeIf (no VXLAN device)",
 			"migration", req.MigrationName, "bridgeIf", bridgeIf)
-	} else {
-		// D2.2: ip neigh replace <oldPodIP> lladdr <replVethMAC> dev <fdbIf> nud permanent
-		if err := network.SetPodIPNeigh(ctx, fdbIf, oldIP, mac); err != nil {
+	}
+	{
+		// D2.2: ip neigh replace <oldPodIP> lladdr <replVethMAC> dev <redirectIf> nud permanent.
+		// On kindnet redirectIf == bridgeIf, where the M1 neigh already lives; RTM_NEWNEIGH
+		// NLM_F_REPLACE makes this idempotent (a no-op re-assert), so it is safe on both substrates.
+		if err := network.SetPodIPNeigh(ctx, redirectIf, oldIP, mac); err != nil {
 			return &agentpb.InjectIPHandoffResponse{Injected: false,
-				BlockingReason: fmt.Sprintf("%s neigh: %v", fdbIf, err)}, nil
+				BlockingReason: fmt.Sprintf("%s neigh: %v", redirectIf, err)}, nil
 		}
 
 		// ADR-0139 Decision 1 (forward path, blocker B8): install a tc-ingress redirect on the
-		// VXLAN overlay device that moves decapped frames for the OLD IP straight to the replacement
+		// redirect-source device that moves frames for the OLD IP straight to the replacement
 		// pod's host-side veth peer, bypassing L3 local-input classification. Best-effort: a
 		// resolution/setup failure is non-fatal so an otherwise-good handoff is not blocked;
 		// the source is held until TrafficVerified so a requeue re-asserts it (idempotent).
@@ -913,16 +923,17 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 			} else if vethPeer == "" {
 				log.Info("InjectIPHandoff: ADR-0139 repl veth peer empty — tc redirect NOT installed (non-fatal)",
 					"migration", req.MigrationName, "replPID", replPID)
-			} else if tcErr := installTCRedirect(ctx, fdbIf, oldIP, vethPeer); tcErr != nil {
+			} else if tcErr := installTCRedirect(ctx, redirectIf, oldIP, vethPeer); tcErr != nil {
 				log.Error(tcErr, "InjectIPHandoff: ADR-0139 tc redirect install failed (non-fatal)",
-					"migration", req.MigrationName, "fdbIf", fdbIf, "oldPodIP", req.OldPodIp, "vethPeer", vethPeer)
+					"migration", req.MigrationName, "redirectIf", redirectIf, "oldPodIP", req.OldPodIp, "vethPeer", vethPeer)
 			} else {
 				log.Info("InjectIPHandoff: ADR-0139 tc-ingress redirect installed (forward path B8)",
-					"migration", req.MigrationName, "fdbIf", fdbIf, "oldPodIP", req.OldPodIp, "vethPeer", vethPeer)
+					"migration", req.MigrationName, "redirectIf", redirectIf, "oldPodIP", req.OldPodIp, "vethPeer", vethPeer)
 				// ADR-0140 (blocker B9): the tc `mirred` redirect steals the forward frame before
 				// conntrack's ingress hook, so the pod's reply is conntrack-INVALID and kube-proxy's
 				// KUBE-FORWARD `ctstate INVALID -j DROP` rule drops it. Insert a narrow OLD-IP/32
-				// FORWARD ACCEPT pair at the head of FORWARD (before KUBE-FORWARD). Non-fatal.
+				// FORWARD ACCEPT pair at the head of FORWARD (before KUBE-FORWARD). These rules match
+				// on OLD-IP, not on the overlay device, so they are interface-independent. Non-fatal.
 				if fwErr := installOldIPForwardAccept(ctx, oldIP); fwErr != nil {
 					log.Error(fwErr, "InjectIPHandoff: ADR-0140 FORWARD ACCEPT install failed (non-fatal)",
 						"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
@@ -1363,9 +1374,26 @@ func removeOldIPForwardAccept(ctx context.Context, oldIP net.IP) {
 // DisarmTCRedirect removes the ADR-0139 tc-ingress filter + qdisc from the overlay interface
 // after TrafficVerified=True (Decision 3 disarm order). Idempotent: tolerates ENOENT.
 func (s *AgentServer) DisarmTCRedirect(ctx context.Context, req *agentpb.DisarmTCRedirectRequest) (*agentpb.DisarmTCRedirectResponse, error) {
+	// ADR-0199 §3h-SYM (removal-symmetry, item 4): the forward install (InjectIPHandoff)
+	// now installs the tc-ingress redirect on `bridgeIf` when the substrate has no VXLAN
+	// device (kindnet), NOT on `flannel.1`. The teardown MUST remove the filter from the
+	// SAME interface it was installed on, else a stale /32 redirect survives on the host
+	// interface after migration (the load-bearing asymmetry V3 catches). On kindnet
+	// `req.FdbIfname` is empty (operator passes pm.Status.OverlayFdbIfname == ""), so we
+	// must resolve the redirect-source interface the same way InjectIPHandoff did: discover
+	// the host interface at runtime rather than defaulting to a `flannel.1` literal.
 	fdbIf := req.FdbIfname
 	if fdbIf == "" {
-		fdbIf = "flannel.1"
+		discovered, discErr := discoverHostInterface(ctx)
+		if discErr == nil && discovered != "" {
+			fdbIf = discovered // ADR-0199: kindnet host-routed substrate — teardown on bridgeIf
+		} else {
+			// Last-resort fallback preserves prior behavior on a VXLAN substrate where
+			// discovery is irrelevant; tolerated because filter del is ENOENT-safe below.
+			fdbIf = "flannel.1"
+			log.Info("DisarmTCRedirect: host interface discovery failed; falling back to flannel.1 (ENOENT-tolerant)",
+				"migration", req.MigrationName, "err", discErr)
+		}
 	}
 	log.Info("DisarmTCRedirect called (ADR-0139 D3)", "migration", req.MigrationName, "fdbIf", fdbIf)
 	// Remove the filter, then the ingress qdisc. Both tolerate "does not exist"/ENOENT.
