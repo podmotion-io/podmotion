@@ -84,6 +84,32 @@ func (e *CRIUImageInconsistencyError) Error() string {
 	return criuImageInconsistencyEventMsg(e.FdID, e.NameLeaf, e.BackingMntID)
 }
 
+// ExternalMountUnresolvedError is returned by patchCheckpointImages (ADR-0194 P-0194-1) when a
+// kept EXTERNAL mountpoints entry (ext_key set) survives without either a matching --ext-mount-map
+// or a lockstep DROP+files.img reconcile. This converts mount.c:3141 into a loud, agent-side,
+// pre-CRIU hard-stop. The Reason field indicates why: "propagation_peer" (shared_id/master_id
+// non-zero, Security DECLINE class), "non_leaf_external" (has child entries), "survived_drop"
+// (external entry not removed in the B-2 drop pass), "p0194_1c_dual_write_mismatch" (SC-2 guard).
+type ExternalMountUnresolvedError struct {
+	MntID    int
+	ExtKey   string
+	SharedID int
+	MasterID int
+	Reason   string
+}
+
+func (e *ExternalMountUnresolvedError) Error() string {
+	return fmt.Sprintf("external mount mnt_id=%d ext_key=%s unresolved (reason=%s, shared_id=%d, master_id=%d): hard-stopped before criu restore (ADR-0194 P-0194-1)", e.MntID, e.ExtKey, e.Reason, e.SharedID, e.MasterID)
+}
+
+// ExternalMountDroppedInfo carries the structured info for a single B-2 external mount drop.
+// Emitted as a Normal CRIUExternalMountDropped event on the PodMigration CR (H4 / C-2).
+type ExternalMountDroppedInfo struct {
+	MntID  int    `json:"mnt_id"`
+	ExtKey string `json:"ext_key"`
+	Source string `json:"source"`
+}
+
 // criuImageInconsistencyEventMsg constructs the Kubernetes Event message for a
 // CRIUImageInconsistency event (ADR-0193 P-0193-4 / S1). nameLeaf MUST be
 // filepath.Base(name) — never the full path — so the full volume path is not
@@ -91,35 +117,6 @@ func (e *CRIUImageInconsistencyError) Error() string {
 // agent log line (P-0193-1b / C-STATE).
 func criuImageInconsistencyEventMsg(fdID int, nameLeaf string, backingMntID int) string {
 	return fmt.Sprintf("files.img REG fd id=%d name_leaf=%s backing_mnt_id=%d: positive orphan mnt_id not in kept mountpoints — hard-stopped before criu restore (ADR-0193 P-0193-1)", fdID, nameLeaf, backingMntID)
-}
-
-// MntpImageInconsistencyError is returned by patchCheckpointImages (ADR-0194 P-0194-1) when a
-// kept mountpoints entry references an mnt_id (parent_mnt_id, shared_id, or master_id) that is
-// absent from the kept mnt_id set and was not reconciled by the ADR-0194 remap pass — the
-// mountpoints-side inconsistency that causes mount.c:3141 "No mapping for X:(null) mountpoint".
-// The error carries {EntryMntID, MountpointLeaf, OrphanMntID, Field} for structured event
-// emission (P-0194-4 / Security C-3). MountpointLeaf is filepath.Base(mountpoint) — never the
-// full path — so it is safe to surface in a world-readable Kubernetes Event (Security C-3).
-type MntpImageInconsistencyError struct {
-	EntryMntID    int
-	MountpointLeaf string // filepath.Base(mountpoint) — e.g. "data" for "/data"
-	OrphanMntID   int
-	Field         string // "parent_mnt_id", "shared_id", or "master_id"
-	SecurityDecline bool // true when carrier is shared_id/master_id (propagation group — Security C-4)
-}
-
-func (e *MntpImageInconsistencyError) Error() string {
-	return mntpImageInconsistencyEventMsg(e.EntryMntID, e.MountpointLeaf, e.OrphanMntID, e.Field, e.SecurityDecline)
-}
-
-// mntpImageInconsistencyEventMsg constructs the Kubernetes Event message for an ADR-0194
-// P-0194-1 / P-0194-4 mountpoints-side CRIUImageInconsistency event.
-// MountpointLeaf MUST be filepath.Base(mountpoint) — never the full path (Security C-3).
-func mntpImageInconsistencyEventMsg(entryMntID int, mountpointLeaf string, orphanMntID int, field string, securityDecline bool) string {
-	if securityDecline {
-		return fmt.Sprintf("mountpoints entry mnt_id=%d mountpoint_leaf=%s: %s=%d references absent mnt_id — Security DECLINE (shared/master propagation-group carrier, remap-to-root forbidden) — hard-stopped before criu restore (ADR-0194 P-0194-1)", entryMntID, mountpointLeaf, field, orphanMntID)
-	}
-	return fmt.Sprintf("mountpoints entry mnt_id=%d mountpoint_leaf=%s: %s=%d references absent mnt_id not in kept set — hard-stopped before criu restore (ADR-0194 P-0194-1)", entryMntID, mountpointLeaf, field, orphanMntID)
 }
 
 // zwHoldState tracks per-migration zero-window hold state including armed timestamp and
@@ -240,6 +237,7 @@ var readReplVethMACFn = ReadReplVethMAC
 
 // joinNsRestoreFn is the production implementation of joinNsRestore.
 // Overridable in tests to stub out the actual CRIU subprocess invocation.
+// Signature: (migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error)
 var joinNsRestoreFn = joinNsRestore
 
 // restoreResult is the shared finalization result populated by finalizeRestore.
@@ -377,7 +375,7 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 	s.destHostVethMu.RLock()
 	storedVeth := s.destHostVeth[migrationName]
 	s.destHostVethMu.RUnlock()
-	pid, err := joinNsRestoreFn(migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode)
+	pid, droppedMounts, err := joinNsRestoreFn(migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode)
 	if err != nil {
 		// ADR-0193 P-0193-4 / S1: emit a Warning CRIUImageInconsistency Kubernetes Event on the
 		// PodMigration CR when the P-0193-1 hard-stop fires. The event message carries only
@@ -386,15 +384,16 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 		if errors.As(err, &imgErr) {
 			s.emitCRIUImageInconsistencyEvent(context.Background(), migrationName, imgErr)
 		}
-		// ADR-0194 P-0194-4 / Security C-3: emit a Warning CRIUImageInconsistency Kubernetes Event
-		// on the PodMigration CR when the P-0194-1 mountpoints-side hard-stop fires. The event
-		// message carries only {entry_mnt_id, mountpoint_leaf, orphan_mnt_id} — the full
-		// mountpoint path is NOT included (Security C-3 leaf-only constraint).
-		var mntpErr *MntpImageInconsistencyError
-		if errors.As(err, &mntpErr) {
-			s.emitMntpImageInconsistencyEvent(context.Background(), migrationName, mntpErr)
+		// ADR-0194 P-0194-1: emit ExternalMountUnresolved Warning event on hard-stop.
+		var extErr *ExternalMountUnresolvedError
+		if errors.As(err, &extErr) {
+			s.emitExternalMountUnresolvedEvent(context.Background(), migrationName, extErr)
 		}
 		return 0, "", err
+	}
+	// ADR-0194 B-2 H4: emit CRIUExternalMountDropped Normal event for each B-2 drop.
+	for _, d := range droppedMounts {
+		s.emitExternalMountDroppedEvent(context.Background(), migrationName, d)
 	}
 
 	// ADR-0144 Decision Points 2–3: on the Strict path, enforce the gated-resume invariant.
@@ -2334,7 +2333,7 @@ func copyFile(src, dst string) error {
 //
 // Returns the host PID of the restored process.
 // storedHostVeth is the host-side veth peer name stored by PrepareDestinationNetns (Gate30).
-func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, error) {
+func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error) {
 	// Gate30: use the host-side veth name stored during PrepareDestinationNetns rather than
 	// re-deriving from migrationName.  Re-derivation diverges when the controller passes a
 	// pod UID to PrepareDestinationNetns and a migration name to Restore.
@@ -2365,7 +2364,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	pullOut, _ := nsenterCmd("ctr", "--namespace", "k8s.io", "images", "ls", "-q").Output()
 	if !strings.Contains(string(pullOut), imageName) {
 		if out, err := nsenterCmd("ctr", "--namespace", "k8s.io", "images", "pull", imageName).CombinedOutput(); err != nil {
-			return 0, fmt.Errorf("pull %s: %w\n%s", imageName, err, out)
+			return 0, nil, fmt.Errorf("pull %s: %w\n%s", imageName, err, out)
 		}
 	}
 
@@ -2391,8 +2390,9 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// the files.img↔mountpoints consistency invariant (ADR-0193 P-0193-1).
 	// inheritFdNamesForPatch is the same set that buildCRIURestoreArgs will pass via --inherit-fd
 	// (C-R3-1 single source of truth — no independent recomputation).
-	if err := patchCheckpointImages(checkpointDir, inheritFdNamesForPatch); err != nil {
-		return 0, fmt.Errorf("patch checkpoint images: %w", err)
+	droppedMounts, patchErr := patchCheckpointImages(checkpointDir, inheritFdNamesForPatch)
+	if patchErr != nil {
+		return 0, nil, fmt.Errorf("patch checkpoint images: %w", patchErr)
 	}
 
 	// Step 1b: Copy checkpoint images to /var/lib/podmotion (ext4) so CRIU running in the
@@ -2416,7 +2416,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 		}
 	}()
 	if err := copyDirAll(checkpointDir, hostCheckpointDir); err != nil {
-		return 0, fmt.Errorf("copy checkpoint to host-visible dir: %w", err)
+		return 0, nil, fmt.Errorf("copy checkpoint to host-visible dir: %w", err)
 	}
 	// Use the host-visible path for CRIU and all subsequent operations.
 	checkpointDir = hostCheckpointDir
@@ -2429,7 +2429,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	placeholderID := "pm-placeholder-" + migrationName
 	rootfsDir, err := setupRestoreOverlayfs(migrationName, checkpointDir, imageName, containerID)
 	if err != nil {
-		return 0, fmt.Errorf("setup rootfs overlayfs: %w", err)
+		return 0, nil, fmt.Errorf("setup rootfs overlayfs: %w", err)
 	}
 
 	// On any error after this point: kill placeholder to release the rootfs mount.
@@ -2521,7 +2521,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 			// B2: ResolveNetnsFromSandbox opens the netns path and cross-checks fd/path inodes.
 			netnsFd, resolvedPath, rerr := ResolveNetnsFromSandbox(context.Background(), nil, sandboxID)
 			if rerr != nil {
-				return 0, fmt.Errorf("resolve replacement pod sandbox netns: %w", rerr)
+				return 0, nil, fmt.Errorf("resolve replacement pod sandbox netns: %w", rerr)
 			}
 			// ADR-0125: the fd existed only for the B2 inode cross-check. Close it now; CRIU joins by
 			// path, not by inherited fd.
@@ -2542,7 +2542,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// invoking CRIU if any external mount is not safely mappable (D4).
 	maskedArgs, err := buildMaskedPathExtMountArgs(checkpointDir)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	criuArgs = append(criuArgs, maskedArgs...)
 
@@ -2682,7 +2682,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	beforeAgentPIDs, agentPIDsErr := getAgentCgroupPIDs()
 
 	if err := criuCmd.Start(); err != nil {
-		return 0, fmt.Errorf("criu restore start: %w", err)
+		return 0, nil, fmt.Errorf("criu restore start: %w", err)
 	}
 
 	// ADR-0192 R2 (supersedes ADR-0127 §3h): liveness detection via cgroup-PID signal.
@@ -2723,7 +2723,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 				if len(stderrTail) > 4096 {
 					stderrTail = stderrTail[len(stderrTail)-4096:]
 				}
-				return 0, fmt.Errorf("criu restore exited (exit code %d): %w\ncriu stderr:\n%s",
+				return 0, nil, fmt.Errorf("criu restore exited (exit code %d): %w\ncriu stderr:\n%s",
 					exitCode, waitErr, stderrTail)
 			}
 			// Exit 0 means restore succeeded and CRIU is done (detached-like path or early exit).
@@ -2756,7 +2756,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 		if len(stderrTail) > 4096 {
 			stderrTail = stderrTail[len(stderrTail)-4096:]
 		}
-		return 0, fmt.Errorf("criu restore did not produce workload PIDs in agent cgroup within %s: criu stderr:\n%s",
+		return 0, nil, fmt.Errorf("criu restore did not produce workload PIDs in agent cgroup within %s: criu stderr:\n%s",
 			cgroupPollTimeout, stderrTail)
 	}
 
@@ -2784,33 +2784,33 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 		// cgroup against the pre-CRIU snapshot to find the new workload PID, then move it into the
 		// pod's sandbox cgroup so containerd/k8s can manage it.
 		if agentPIDsErr != nil {
-			return 0, fmt.Errorf("ADR-0128: snapshot agent cgroup PIDs before restore: %w", agentPIDsErr)
+			return 0, nil, fmt.Errorf("ADR-0128: snapshot agent cgroup PIDs before restore: %w", agentPIDsErr)
 		}
 		pid, err = findRestoredPIDInAgentCgroup(beforeAgentPIDs, criuCmd.Process.Pid)
 		if err != nil {
 			// Fail loud — never fall back to comm-scan on the cold path (D2 step 5 / AC5).
-			return 0, err
+			return 0, nil, err
 		}
 		// Resolve the pod's sandbox cgroup path from the pause PID (same anchor as ADR-0123 D2).
 		pausePID, perr := sandboxPausePID(sandboxID)
 		if perr != nil {
-			return 0, fmt.Errorf("ADR-0128: resolve pause PID for sandbox %s: %w", sandboxID, perr)
+			return 0, nil, fmt.Errorf("ADR-0128: resolve pause PID for sandbox %s: %w", sandboxID, perr)
 		}
 		podCgroup, cerr := cgroupV2Path(pausePID)
 		if cerr != nil {
-			return 0, fmt.Errorf("ADR-0128: read pod cgroup from pause PID %d (sandbox %s): %w",
+			return 0, nil, fmt.Errorf("ADR-0128: read pod cgroup from pause PID %d (sandbox %s): %w",
 				pausePID, sandboxID, cerr)
 		}
 		// Move the restored tree root into the pod cgroup (single cgroup.procs write moves the group).
 		if merr := moveProcessToPodCgroup(pid, podCgroup); merr != nil {
-			return 0, fmt.Errorf("ADR-0128: move restored PID %d into pod cgroup %s: %w", pid, podCgroup, merr)
+			return 0, nil, fmt.Errorf("ADR-0128: move restored PID %d into pod cgroup %s: %w", pid, podCgroup, merr)
 		}
 		log.Info("joinNsRestore: moved restored process into pod cgroup (ADR-0128)",
 			"pid", pid, "podCgroup", podCgroup, "sandboxID", sandboxID)
 	} else {
 		pid, err = findRestoredProcessPID(checkpointDir)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 	}
 	log.Info("joinNsRestore: found restored process", "pid", pid)
@@ -2827,7 +2827,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	}
 
 	success = true
-	return pid, nil
+	return pid, droppedMounts, nil
 }
 
 // readLogTail was removed: ADR-0127 scaffold (restore.log success-signal) removed per ADR-0192 §3h.
@@ -3094,9 +3094,11 @@ func sandboxPausePID(sandboxID string) (int, error) {
 //
 // patchCheckpointImagesFn is the production implementation of patchCheckpointImages.
 // Tests can replace this variable to inject failures without requiring real CRIU images.
-// The function variable matches the production signature (checkpointDir, inheritFdNames).
+// The function variable wraps patchCheckpointImages; it discards the dropped-mounts info
+// (callers that need events use patchCheckpointImages directly).
 var patchCheckpointImagesFn = func(checkpointDir string, inheritFdNames []string) error {
-	return patchCheckpointImages(checkpointDir, inheritFdNames)
+	_, err := patchCheckpointImages(checkpointDir, inheritFdNames)
+	return err
 }
 
 // patchCheckpointImages modifies the CRIU image files in checkpointDir to remove entries
@@ -3109,7 +3111,9 @@ var patchCheckpointImagesFn = func(checkpointDir string, inheritFdNames []string
 // line-2200 decision. Pass nil/empty when no cgroup fds are inherited (degrade-and-continue).
 //
 // Idempotent: backs up originals as *.orig on first call; subsequent calls are no-ops.
-func patchCheckpointImages(checkpointDir string, inheritFdNames []string) error {
+// Returns (droppedMounts, error). droppedMounts is non-nil when B-2 external drops fired
+// successfully; callers should emit CRIUExternalMountDropped Normal events for each entry.
+func patchCheckpointImages(checkpointDir string, inheritFdNames []string) ([]ExternalMountDroppedInfo, error) {
 	// Write the patch script to a temp file and run it with the system python3 + pycriu.
 	// containerdMaskedPaths is injected as a JSON argv so the patch step consumes the same
 	// single source of truth as buildMaskedPathExtMountArgs (ADR-0124 R2 / AC6) — no divergent
@@ -3117,7 +3121,7 @@ func patchCheckpointImages(checkpointDir string, inheritFdNames []string) error 
 	// are disjoint by construction: entries deleted here are never presented to CRIU.
 	maskedJSON, err := json.Marshal(containerdMaskedPaths)
 	if err != nil {
-		return fmt.Errorf("marshal masked paths: %w", err)
+		return nil, fmt.Errorf("marshal masked paths: %w", err)
 	}
 	// Normalize nil to empty slice so json.Marshal emits "[]" not "null".
 	// pm-patch-ckpt.py:10 calls set(json.loads(argv[3])) — set(None) raises TypeError.
@@ -3126,7 +3130,7 @@ func patchCheckpointImages(checkpointDir string, inheritFdNames []string) error 
 	}
 	inheritJSON, err := json.Marshal(inheritFdNames)
 	if err != nil {
-		return fmt.Errorf("marshal inherit fd names: %w", err)
+		return nil, fmt.Errorf("marshal inherit fd names: %w", err)
 	}
 	patchScript := `
 import sys, os, shutil, glob, json
@@ -3279,116 +3283,87 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
         if mp in null_ext_key_masked and not e.get('ext_key'):
             continue
         kept.append(e)
-    # ADR-0193 §3h: the disproven /data ext_key→pm-data rewrite loop (server.go:3181-3183 prior)
-    # is REMOVED. Image evidence proves /data is ABSENT from mountpoints on this checkpoint shape
-    # (0 entries in raw .orig, 0 in patched); the match set was always empty and no pm-data token
-    # was ever written. Re-proposing keep-together here is wrong-sign (ADR-0193 §4).
-    img['entries'] = kept
-    # Build the set of kept mountpoints mnt_ids for the P-0193-1 cross-image consistency check.
-    kept_mnt_ids = {e['mnt_id'] for e in kept if 'mnt_id' in e}
-    # Identify the root mnt_id for rebind-to-root (the kept entry at mountpoint '/').
+    # ADR-0193 §3h: the disproven /data ext_key→pm-data rewrite loop is REMOVED.
+    # ADR-0194 Outcome-A symmetric-remap block (MntpImageInconsistencyError/P-0194-1-remap) is REVERTED (SC-1).
+
+    # ADR-0194 B-2 (DROP-together): find and drop external mount entries from the kept set.
+    # An "external" mountpoints entry is one whose ext_key is set (and non-empty).
+    # These entries require an --ext-mount-map at restore time; since ADR-0193 §3h removed
+    # the pm-data binding (correctly under B-2), any remaining external entry without a
+    # matching restore-arg binding is an unresolved external mount → mount.c:3141.
+    # Direction B-2: DROP the external entry AND rebind all files.img REG fds whose mnt_id
+    # references the dropped entry to root_mnt_id (lockstep). See ADR-0194 §4.
+    #
+    # P-0194-1b (SC-3, H5): HARD-STOP if any external entry has non-zero shared_id or
+    # master_id — collapsing a propagation-peer group is forbidden (Security DECLINE class).
+    # Runtime check so this is not silently skipped on a future non-zero-propagation image.
+    for e in kept:
+        ext_key = e.get('ext_key')
+        if not ext_key:
+            continue
+        sid = e.get('shared_id', 0) or 0
+        mid_prop = e.get('master_id', 0) or 0
+        if sid != 0 or mid_prop != 0:
+            print('EXTERNAL_MOUNT_UNRESOLVED:{"mnt_id":%d,"ext_key":"%s","shared_id":%d,"master_id":%d,"reason":"propagation_peer"}' % (
+                e.get('mnt_id', -1), ext_key.replace('"', '\\"'), sid, mid_prop), file=sys.stderr)
+            sys.exit(1)
+
+    # Identify root mnt_id (dynamic lookup of the kept '/' entry — not hardcoded).
     root_mnt_id = None
     for e in kept:
         if e.get('mountpoint') == '/':
             root_mnt_id = e.get('mnt_id')
             break
-    # ---- ADR-0194: mountpoints-image symmetric reconciliation (P-0194-1 / P-0194-1b) ----
-    # Enforce mountpoints↔files.img cross-image consistency: remap any kept mountpoints
-    # entry that references an absent mnt_id (parent_mnt_id, shared_id, master_id) to the
-    # surviving ROOT mnt_id. This is the symmetric counterpart of ADR-0193's files.img
-    # rebind (server.go:3435): ADR-0193 rebound files.img REG fd mnt_id 2951 → root 3093;
-    # this block applies the IDENTICAL remap on the mountpoints side so both images point
-    # at the same surviving ROOT, making the /data/2951 boundary self-consistent in BOTH
-    # directions. Bounded to the first active-but-silent mechanism N2 (§P-MECHANISM
-    # SPRINT33-PMECHANISM-MOUNT3141.md §3).
-    #
-    # Security C-1 (cross-file atomicity): the remap and the files.img rebind (ADR-0193)
-    # run in the same patchCheckpointImages invocation. Both succeed and write, or neither
-    # writes — P-0193-1 + P-0194-1 jointly enforce this: a non-zero exit before criu restore
-    # prevents any interleaved state from reaching CRIU.
-    #
-    # Security C-2 (field-set scan): P-0194-1 scans the COMPLETE set of mnt_id-bearing
-    # reference fields on each kept MntEntry, not only the field that happened to carry 2951
-    # this run. Fields: parent_mnt_id, shared_id, master_id. (root_dev / source carry the
-    # device path string, not an mnt_id integer — they are not in scope for integer remap.)
-    #
-    # Security C-4 (shared/master DECLINE): if the absent mnt_id is carried by shared_id or
-    # master_id, remapping to ROOT would collapse a mount-propagation peer/master group into
-    # root — automatic Security DECLINE. On Outcome A (non-shared parent carrier) the remap
-    # is sound. This implementation remaps shared_id/master_id carriers with a loud warning
-    # AND emits MNTP_IMAGE_INCONSISTENCY to stderr (hard-stop) if either is the carrier and
-    # shared_id/master_id != entry's own mnt_id (i.e. it references a DIFFERENT group peer).
-    # A shared_id/master_id that equals the entry's own mnt_id (self-referential, normal) is
-    # safe to remap if it references an absent id — but the conservative path is hard-stop.
-    #
-    # Outcome B guard: if no kept entry references an absent mnt_id in any field, this block
-    # is a no-op (P-0194-1 passes trivially). The block does NOT assume Outcome A.
-    if root_mnt_id is not None:
-        # MNT_REFERENCE_FIELDS: integer fields on MntEntry that carry mnt_id references.
-        # parent_mnt_id is a direct parent edge; shared_id/master_id are propagation group ids.
-        MNT_REFERENCE_FIELDS = ('parent_mnt_id', 'shared_id', 'master_id')
 
-        mntp_remapped = False
-        for mntp_e in img['entries']:
-            entry_mnt_id = mntp_e.get('mnt_id')
-            mountpoint = mntp_e.get('mountpoint', '')
-            mountpoint_leaf = os.path.basename(mountpoint) if mountpoint else str(entry_mnt_id)
-            for ref_field in MNT_REFERENCE_FIELDS:
-                ref_val = mntp_e.get(ref_field)
-                if ref_val is None:
-                    continue
-                if ref_val in kept_mnt_ids:
-                    continue  # Reference resolves — no action.
-                # ref_val is absent from the kept mnt_id set: reconcile.
-                # Security C-4: shared_id/master_id carrier — hard-stop (propagation-group
-                # collapse into ROOT is a Security DECLINE per ADR-0194 §0.4 / §10).
-                if ref_field in ('shared_id', 'master_id'):
-                    print('MNTP_IMAGE_INCONSISTENCY:{"entry_mnt_id":%s,"mountpoint_leaf":"%s","orphan_mnt_id":%s,"field":"%s","security_decline":true}' % (
-                        json.dumps(entry_mnt_id), mountpoint_leaf.replace('"', '\\"'),
-                        json.dumps(ref_val), ref_field), file=sys.stderr)
-                    sys.exit(1)
-                # parent_mnt_id carrier — remap to ROOT (Outcome A, §4.1, symmetric with
-                # ADR-0193 files.img rebind 2951→3093).
-                # P-0194-1b: loud structured log line; full mountpoint path here (stays in
-                # 0700-bounded agent log); leaf-only goes to Events (enforced by Go caller).
-                print('pm-mntp-consistency: remap entry_mnt_id=%s field=%s old=%s new=%d mountpoint=%s mountpoint_leaf=%s action=rebind-to-root' % (
-                    entry_mnt_id, ref_field, ref_val, root_mnt_id, mountpoint, mountpoint_leaf))
-                mntp_e[ref_field] = root_mnt_id
-                mntp_remapped = True
-
-        if mntp_remapped:
-            # Rebuild kept_mnt_ids after remap (mnt_ids themselves did not change, only
-            # reference fields — but rebuild defensively for P-0194-1 scan below).
-            kept_mnt_ids = {e['mnt_id'] for e in img['entries'] if 'mnt_id' in e}
-
-        # P-0194-1 hard-stop assertion: after remap, verify no kept entry references an
-        # mnt_id (in any reference field) that is absent from the kept set and unreconciled.
-        # This converts the silent CRIU mount.c:3141 into a loud agent-side pre-CRIU failure.
-        for mntp_e in img['entries']:
-            entry_mnt_id = mntp_e.get('mnt_id')
-            mountpoint = mntp_e.get('mountpoint', '')
-            mountpoint_leaf = os.path.basename(mountpoint) if mountpoint else str(entry_mnt_id)
-            for ref_field in MNT_REFERENCE_FIELDS:
-                ref_val = mntp_e.get(ref_field)
-                if ref_val is None:
-                    continue
-                if ref_val in kept_mnt_ids:
-                    continue
-                # Still absent after remap — hard-stop.
-                print('MNTP_IMAGE_INCONSISTENCY:{"entry_mnt_id":%s,"mountpoint_leaf":"%s","orphan_mnt_id":%s,"field":"%s"}' % (
-                    json.dumps(entry_mnt_id), mountpoint_leaf.replace('"', '\\"'),
-                    json.dumps(ref_val), ref_field), file=sys.stderr)
+    # Identify and drop external entries. Collect the mnt_ids being dropped (ext_drop_mnt_ids)
+    # for the lockstep files.img rebind in the next section.
+    ext_drop_mnt_ids = {}  # mnt_id -> ext_key (for event emission)
+    kept_after_ext_drop = []
+    for e in kept:
+        ext_key = e.get('ext_key')
+        mnt_id = e.get('mnt_id')
+        if ext_key and mnt_id is not None:
+            # P-0194-1b re-entry guard (H2): before dropping, assert no kept entry references
+            # this mnt_id as parent_mnt_id (i.e. confirm it is a leaf — AC-1 re-assertion).
+            referencing_parents = [x for x in kept if x.get('parent_mnt_id') == mnt_id and x.get('mnt_id') != mnt_id]
+            if referencing_parents:
+                print('EXTERNAL_MOUNT_UNRESOLVED:{"mnt_id":%d,"ext_key":"%s","shared_id":0,"master_id":0,"reason":"non_leaf_external"}' % (
+                    mnt_id, ext_key.replace('"', '\\"')), file=sys.stderr)
                 sys.exit(1)
-
-        if mntp_remapped:
-            print('mountpoints: P-0194-1 remap complete — all kept entries reference kept mnt_ids (ADR-0194)')
+            ext_drop_mnt_ids[mnt_id] = ext_key
+            # Emit CRIUExternalMountDropped event token (H4 / Platform PM C-2).
+            # ext_key is the path (e.g. "/data") — safe as a name, not a full volume path.
+            print('CRIU_EXTERNAL_MOUNT_DROPPED:{"mnt_id":%d,"ext_key":"%s","source":"%s"}' % (
+                mnt_id,
+                ext_key.replace('"', '\\"'),
+                (e.get('source') or '').replace('"', '\\"')))
         else:
-            print('mountpoints: P-0194-1 no-op — no absent mnt_id references in kept set (Outcome B or already consistent)')
-    # ---- end ADR-0194 mountpoints remap ----
+            kept_after_ext_drop.append(e)
 
-    with open(mp_path, 'wb') as f:
+    img['entries'] = kept_after_ext_drop
+    # Build the set of kept mountpoints mnt_ids AFTER external-drop (for P-0193-1 + P-0194-1c).
+    kept_mnt_ids = {e['mnt_id'] for e in kept_after_ext_drop if 'mnt_id' in e}
+
+    # P-0194-1 (H2 re-entry guard / P-0194-1c pre-check): verify no external entry survives
+    # without a mapping. Under B-2 all external entries were dropped above; if any survived
+    # (e.g. future code path adds one back), HARD-STOP before writing the image.
+    for e in kept_after_ext_drop:
+        if e.get('ext_key'):
+            print('EXTERNAL_MOUNT_UNRESOLVED:{"mnt_id":%d,"ext_key":"%s","shared_id":0,"master_id":0,"reason":"survived_drop"}' % (
+                e.get('mnt_id', -1), (e.get('ext_key') or '').replace('"', '\\"')), file=sys.stderr)
+            sys.exit(1)
+
+    # Atomic mountpoints write: temp file → fsync → rename (H1 / SC-2).
+    # The original is already backed up as .orig; the rename is both-or-neither with files.img
+    # rename (see P-0194-1c below). A failure before the rename leaves the .orig intact.
+    mp_tmp = mp_path + '.tmp.' + str(os.getpid())
+    with open(mp_tmp, 'wb') as f:
         pycriu.images.dump(img, f)
-    print('mountpoints:', os.path.basename(mp_path), 'kept', len(kept), 'entries')
+        f.flush()
+        os.fsync(f.fileno())
+    # (rename happens after files.img temp write, in P-0194-1c block below)
+    print('mountpoints:', os.path.basename(mp_path), 'kept', len(kept_after_ext_drop), 'entries',
+          '(ext-dropped:', len(ext_drop_mnt_ids), ')')
 
 # ---- netns: remove extRootNetNS dependency (references source host net ns) ----
 # strip-only image: skip-on-unknown-magic (S1)
@@ -3476,23 +3451,18 @@ for route_file in ['route-10.img', 'route6-10.img']:
         os.remove(route_path)
         print('route: deleted', route_file, '(CRIU skip-route-restore; dest routes via host-route injection or pre-staged)')
 
-# ---- ADR-0193: files.img / fdinfo-*.img reconciliation (P-0193-1 / P-0193-1b) ----
+# ---- ADR-0193/ADR-0194: files.img / fdinfo-*.img reconciliation (P-0193-1 / P-0194-1 unified) ----
 # Enforce files.img↔mountpoints cross-image consistency for PLAIN-REG fds.
 # A PLAIN-REG fd is one that reaches open_path() line 2263 in CRIU (files-reg.c) —
 # i.e. NOT inherited, NOT external (rfe->ext unset), NOT a remap, AND carries a POSITIVE
 # mnt_id. Such a fd fires mount.c:3953 BUG_ON if its mnt_id is not in the restored mount set.
 # Source-proven discriminant: CRIU 4.2 files-reg.c:2191-2263, mount.c:3946-3953.
 #
-# This block:
-#   1. Loads files.img and identifies all PLAIN-REG fds in scope.
-#   2. For each in-scope fd carrying a positive orphan mnt_id not in kept_mnt_ids:
-#      - If it is a REG directory fd (S_IFDIR, mode & 0o170000 == 0o040000) with no remap:
-#        REBIND to root_mnt_id (drop-together per ADR-0193 §4).
-#      - Otherwise: HARD-STOP (P-0193-1b non-directory or content-bearing fd).
-#      Emits a loud P-0193-1b log line for every reconciled fd.
-#   3. After reconciliation: P-0193-1 hard-stop assertion — any remaining in-scope fd
-#      with a positive orphan mnt_id is an error. Prints CRIU_IMAGE_INCONSISTENCY:<json>
-#      to stderr and exits 1 (Go caller parses this to CRIUImageInconsistencyError).
+# ADR-0194 B-2 extension: fds whose mnt_id is in ext_drop_mnt_ids are now ALSO orphans
+# (those mnt_ids were dropped from the mountpoints image by the external-drop pass above).
+# The existing dir-rebind path handles them correctly — they will appear as "mnt_id not in
+# kept_mnt_ids" below. The lockstep rebind to root_mnt_id IS the ADR-0194 B-2 symmetric
+# operation that ADR-0193 claimed but never applied on the real checkpoint shape.
 #
 # C-R3-1: inherit_fd_names is sourced from the same builder as buildCRIURestoreArgs so the
 # "NOT inherited" exclusion is byte-identical to CRIU's own inherited_fd() line-2200 decision.
@@ -3500,6 +3470,10 @@ for route_file in ['route-10.img', 'route6-10.img']:
 
 files_img_path = os.path.join(ckpt, 'files.img')
 if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id is not None:
+    # P-0194-1c re-entry guard (H2): if the mountpoints temp file exists but the final image has
+    # already been renamed (i.e. a prior call completed), check consistency and skip.
+    mp_tmp_exists = os.path.exists(mp_tmp)
+
     # Build remap set: fd ids that have a remap entry (graceful rfi_remap path — out of scope).
     remap_ids = set()
     for remap_f in glob.glob(os.path.join(ckpt, 'remap-*.img')):
@@ -3559,10 +3533,16 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
         name_leaf = os.path.basename(name) if name else str(fd_id)
 
         if is_dir:
-            # C-R3-3: REG directory fd with no remap — rebind to root mnt_id (drop-together).
-            # P-0193-1b: loud structured log line (full path goes here, stays in 0700-bounded log).
-            print('pm-image-consistency: reconcile fd_id=%d name=%s backing_mnt_id=%d action=rebind-to-root mnt_id=%d' % (
-                fd_id, name, mnt_id, root_mnt_id))
+            # C-R3-3 / ADR-0194 B-2 lockstep: REG directory fd with no remap — rebind to
+            # root mnt_id (drop-together). This fires for both:
+            #   (a) generic PLAIN-REG dir orphans (ADR-0193 §4), and
+            #   (b) fds whose mnt_id was in ext_drop_mnt_ids (ADR-0194 B-2 lockstep rebind —
+            #       the symmetric operation that ADR-0193 claimed but never applied).
+            # P-0193-1b / P-0194-1 unified: structured log line (full path stays in
+            # 0700-bounded log — not leaked to world-readable K8s Events).
+            action = 'b2-lockstep-ext-drop' if mnt_id in ext_drop_mnt_ids else 'rebind-to-root'
+            print('pm-image-consistency: reconcile fd_id=%d name=%s backing_mnt_id=%d action=%s new_mnt_id=%d' % (
+                fd_id, name, mnt_id, action, root_mnt_id))
             reg['mnt_id'] = root_mnt_id
             modified = True
         else:
@@ -3572,21 +3552,30 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
                 fd_id, name_leaf.replace('"', '\\"'), mnt_id), file=sys.stderr)
             sys.exit(1)
 
+    # Atomic files.img write: temp file → fsync → rename (H1 / SC-2 dual-image atomicity).
+    files_tmp = files_img_path + '.tmp.' + str(os.getpid())
+    with open(files_tmp, 'wb') as f:
+        pycriu.images.dump(files_img, f)
+        f.flush()
+        os.fsync(f.fileno())
     if modified:
-        with open(files_img_path, 'wb') as f:
-            pycriu.images.dump(files_img, f)
-        # Patch fdinfo-*.img: update mnt_id for any fdinfo entry referencing the same fd id.
-        # fdinfo-*.img does not store mnt_id directly (it references the file id); the mnt_id
-        # lives in files.img. No fdinfo-*.img mutation is needed — CRIU looks up the mnt_id
-        # from the files.img REG entry at restore time. The fdinfo images are backed up for
-        # zeroize coverage (Standing Rule 7 / ADR-0193 S2).
+        # Back up fdinfo-*.img for zeroize coverage (Standing Rule 7 / ADR-0193 S2).
         for fdinfo_f in glob.glob(os.path.join(ckpt, 'fdinfo-*.img')):
             backup(fdinfo_f)
-        print('files.img: reconciled PLAIN-REG fds with positive orphan mnt_ids (ADR-0193 P-0193-1b)')
 
-    # P-0193-1 hard-stop assertion: after reconciliation, verify no in-scope PLAIN-REG fd
-    # still carries a positive mnt_id absent from the kept mountpoints set.
-    # Re-load the (possibly rewritten) files.img to check the final state.
+    # P-0194-1c (SC-2 atomic dual-write, H2): commit BOTH images in sequence.
+    # Both temp files exist and are fsynced; rename them into place now.
+    # A failure between the two os.rename calls is the only residual window;
+    # both originals remain intact (backed up as .orig) and are recoverable.
+    os.rename(mp_tmp, mp_path)
+    os.rename(files_tmp, files_img_path)
+
+    if modified:
+        print('files.img: reconciled PLAIN-REG fds with positive orphan mnt_ids (ADR-0193/0194 unified)')
+
+    # P-0193-1 / P-0194-1 unified hard-stop assertion: after reconciliation and rename,
+    # verify no in-scope PLAIN-REG fd still carries a positive mnt_id absent from kept_mnt_ids.
+    # Re-load the committed files.img to check the final on-disk state.
     with open(files_img_path, 'rb') as f:
         files_img_final = pycriu.images.load(f)
     for entry in files_img_final.get('entries', []):
@@ -3608,17 +3597,43 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
             continue
         if mnt_id not in kept_mnt_ids:
             name_leaf = os.path.basename(name) if name else str(fd_id)
-            # P-0193-1: hard-stop — this fd would still fire mount.c:3953 BUG_ON.
+            # P-0193-1 / P-0194-1 unified: hard-stop — this fd would still fire mount.c:3953.
             print('CRIU_IMAGE_INCONSISTENCY:{"fd_id":%d,"name_leaf":"%s","backing_mnt_id":%d}' % (
                 fd_id, name_leaf.replace('"', '\\"'), mnt_id), file=sys.stderr)
             sys.exit(1)
-    print('files.img: P-0193-1 consistency check passed (no PLAIN-REG orphan mnt_ids)')
+
+    # P-0194-1c cross-image assertion (SC-2): verify dual-write consistency.
+    # After rename: mountpoints must have no /data (ext_drop mnt_ids absent from kept_mnt_ids),
+    # AND files.img must have no REG fd still referencing those dropped mnt_ids.
+    # This is the both-or-neither enforcement at the assertion layer.
+    with open(mp_path, 'rb') as f:
+        mp_img_final = pycriu.images.load(f)
+    surviving_ext_in_mp = {e['mnt_id'] for e in mp_img_final.get('entries', [])
+                           if e.get('ext_key') and 'mnt_id' in e}
+    surviving_ext_in_files = set()
+    for entry in files_img_final.get('entries', []):
+        if entry.get('type') != 'REG':
+            continue
+        reg = entry.get('reg', {})
+        mnt_id = reg.get('mnt_id')
+        if mnt_id in ext_drop_mnt_ids:
+            surviving_ext_in_files.add(mnt_id)
+    if surviving_ext_in_mp or surviving_ext_in_files:
+        print('EXTERNAL_MOUNT_UNRESOLVED:{"mnt_id":-1,"ext_key":"","shared_id":0,"master_id":0,"reason":"p0194_1c_dual_write_mismatch","mp_surviving":%s,"files_surviving":%s}' % (
+            list(surviving_ext_in_mp), list(surviving_ext_in_files)), file=sys.stderr)
+        sys.exit(1)
+
+    print('files.img: P-0193-1/P-0194-1 unified consistency check passed (no PLAIN-REG orphan mnt_ids; P-0194-1c dual-write verified)')
+else:
+    # files.img not present or preconditions not met: still commit mountpoints rename.
+    if os.path.exists(mp_tmp):
+        os.rename(mp_tmp, mp_path)
 `
 	// /dev/shm is an in-memory filesystem (tmpfs) — avoids writing the script to disk.
 	// 0600 so only root can read the path; removed immediately after exec.
 	scriptPath := "/dev/shm/pm-patch-ckpt.py"
 	if err := os.WriteFile(scriptPath, []byte(patchScript), 0o600); err != nil {
-		return fmt.Errorf("write patch script: %w", err)
+		return nil, fmt.Errorf("write patch script: %w", err)
 	}
 	defer os.Remove(scriptPath)
 	// argv[1]=checkpointDir argv[2]=maskedJSON argv[3]=inheritJSON (C-R3-1).
@@ -3627,14 +3642,24 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 	out, runErr := cmd.Output()
+	// Parse CRIU_EXTERNAL_MOUNT_DROPPED tokens from stdout (H4 / Platform PM C-2).
+	// These are informational (Normal event) and do not indicate failure.
+	outStr := string(out)
+	var droppedMounts []ExternalMountDroppedInfo
+	for _, line := range strings.Split(outStr, "\n") {
+		if strings.HasPrefix(line, "CRIU_EXTERNAL_MOUNT_DROPPED:") {
+			payload := strings.TrimPrefix(line, "CRIU_EXTERNAL_MOUNT_DROPPED:")
+			var d ExternalMountDroppedInfo
+			if jsonErr := json.Unmarshal([]byte(payload), &d); jsonErr == nil {
+				droppedMounts = append(droppedMounts, d)
+			}
+		}
+	}
 	if runErr != nil {
 		stderrStr := stderrBuf.String()
 		// ADR-0193 P-0193-1: parse structured CRIU_IMAGE_INCONSISTENCY error from stderr.
 		// The script writes: CRIU_IMAGE_INCONSISTENCY:{"fd_id":N,"name_leaf":"X","backing_mnt_id":M}
 		// The full path is NOT in this line — only the leaf basename (SEC-EVENT-1 / S1).
-		// ADR-0194 P-0194-1: parse structured MNTP_IMAGE_INCONSISTENCY error from stderr.
-		// The script writes: MNTP_IMAGE_INCONSISTENCY:{"entry_mnt_id":N,"mountpoint_leaf":"X","orphan_mnt_id":M,"field":"parent_mnt_id"[,"security_decline":true]}
-		// The full mountpoint path is NOT in this line — only the leaf basename (Security C-3).
 		for _, line := range strings.Split(stderrStr, "\n") {
 			if strings.HasPrefix(line, "CRIU_IMAGE_INCONSISTENCY:") {
 				payload := strings.TrimPrefix(line, "CRIU_IMAGE_INCONSISTENCY:")
@@ -3644,37 +3669,40 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
 					BackingMntID int   `json:"backing_mnt_id"`
 				}
 				if jsonErr := json.Unmarshal([]byte(payload), &parsed); jsonErr == nil {
-					return &CRIUImageInconsistencyError{
+					return nil, &CRIUImageInconsistencyError{
 						FdID:        parsed.FdID,
 						NameLeaf:    parsed.NameLeaf,
 						BackingMntID: parsed.BackingMntID,
 					}
 				}
 			}
-			if strings.HasPrefix(line, "MNTP_IMAGE_INCONSISTENCY:") {
-				payload := strings.TrimPrefix(line, "MNTP_IMAGE_INCONSISTENCY:")
+			// ADR-0194 P-0194-1: parse EXTERNAL_MOUNT_UNRESOLVED hard-stop from stderr.
+			// The script writes: EXTERNAL_MOUNT_UNRESOLVED:{"mnt_id":N,"ext_key":"X",...}
+			if strings.HasPrefix(line, "EXTERNAL_MOUNT_UNRESOLVED:") {
+				payload := strings.TrimPrefix(line, "EXTERNAL_MOUNT_UNRESOLVED:")
 				var parsed struct {
-					EntryMntID      int    `json:"entry_mnt_id"`
-					MountpointLeaf  string `json:"mountpoint_leaf"`
-					OrphanMntID     int    `json:"orphan_mnt_id"`
-					Field           string `json:"field"`
-					SecurityDecline bool   `json:"security_decline"`
+					MntID    int    `json:"mnt_id"`
+					ExtKey   string `json:"ext_key"`
+					SharedID int    `json:"shared_id"`
+					MasterID int    `json:"master_id"`
+					Reason   string `json:"reason"`
 				}
 				if jsonErr := json.Unmarshal([]byte(payload), &parsed); jsonErr == nil {
-					return &MntpImageInconsistencyError{
-						EntryMntID:      parsed.EntryMntID,
-						MountpointLeaf:  parsed.MountpointLeaf,
-						OrphanMntID:     parsed.OrphanMntID,
-						Field:           parsed.Field,
-						SecurityDecline: parsed.SecurityDecline,
+					return nil, &ExternalMountUnresolvedError{
+						MntID:    parsed.MntID,
+						ExtKey:   parsed.ExtKey,
+						SharedID: parsed.SharedID,
+						MasterID: parsed.MasterID,
+						Reason:   parsed.Reason,
 					}
 				}
 			}
 		}
-		return fmt.Errorf("patch script failed: %w\n%s\n%s", runErr, string(out), stderrStr)
+		return nil, fmt.Errorf("patch script failed: %w\n%s\n%s", runErr, outStr, stderrStr)
 	}
-	log.Info("patchCheckpointImages", "output", strings.TrimSpace(string(out)))
-	return nil
+	log.Info("patchCheckpointImages", "output", strings.TrimSpace(outStr))
+	// Return dropped mounts info for caller to emit CRIUExternalMountDropped events (H4).
+	return droppedMounts, nil
 }
 
 // hostMntNS returns the path to the host's mount namespace via PID 1 (requires hostPID: true).
@@ -4566,7 +4594,10 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		storedVeth := s.destHostVeth[req.MigrationName]
 		s.destHostVethMu.RUnlock()
 		// ADR-0168 B2: pass storedWorkloadImage so the placeholder uses the correct image.
-		pid, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, "", storedVeth, false)
+		pid, droppedMnts, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, "", storedVeth, false)
+		for _, d := range droppedMnts {
+			s.emitExternalMountDroppedEvent(context.Background(), req.MigrationName, d)
+		}
 		restoreDurationMs := time.Since(restoreStart).Milliseconds()
 		if joinErr != nil {
 			return nil, fmt.Errorf("runc restore failed: %w", joinErr)
@@ -4730,7 +4761,10 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	s.destHostVethMu.RLock()
 	storedVeth2 := s.destHostVeth[req.MigrationName]
 	s.destHostVethMu.RUnlock()
-	rawPID, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, "", storedVeth2, false)
+	rawPID, droppedMnts2, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, "", storedVeth2, false)
+	for _, d := range droppedMnts2 {
+		s.emitExternalMountDroppedEvent(context.Background(), req.MigrationName, d)
+	}
 	if joinErr != nil {
 		log.Info("Restore: joinNsRestore failed", "err", joinErr)
 		return nil, fmt.Errorf("restore failed: %w", joinErr)
@@ -5727,14 +5761,13 @@ func (s *AgentServer) emitCRIUImageInconsistencyEvent(ctx context.Context, migra
 	}
 }
 
-// emitMntpImageInconsistencyEvent emits a Warning CRIUImageInconsistency Kubernetes Event on
-// the PodMigration CR identified by migrationName (ADR-0194 P-0194-4 / Security C-3).
-// The event message is constructed from {EntryMntID, MountpointLeaf, OrphanMntID, Field} ONLY —
-// the full mountpoint path is NOT included because Kubernetes Events are world-readable (C-3).
+// emitExternalMountUnresolvedEvent emits a Warning ExternalMountUnresolved Kubernetes Event on
+// the PodMigration CR when ADR-0194 P-0194-1 hard-stops before criu restore (H4).
+// ext_key is safe to include (it is the mount path, e.g. "/data" — not a volume UUID).
 // Best-effort: logs on failure but does not block the caller's error path.
-func (s *AgentServer) emitMntpImageInconsistencyEvent(ctx context.Context, migrationName string, mntpErr *MntpImageInconsistencyError) {
+func (s *AgentServer) emitExternalMountUnresolvedEvent(ctx context.Context, migrationName string, extErr *ExternalMountUnresolvedError) {
 	if s.k8sClient == nil {
-		log.Info("emitMntpImageInconsistencyEvent: k8sClient nil — event not emitted",
+		log.Info("emitExternalMountUnresolvedEvent: k8sClient nil — event not emitted",
 			"migration", migrationName)
 		return
 	}
@@ -5744,15 +5777,15 @@ func (s *AgentServer) emitMntpImageInconsistencyEvent(ctx context.Context, migra
 	}
 	pm := &pmv1.PodMigration{}
 	if getErr := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: migrationName}, pm); getErr != nil {
-		log.Error(getErr, "emitMntpImageInconsistencyEvent: could not fetch PodMigration to emit event",
+		log.Error(getErr, "emitExternalMountUnresolvedEvent: could not fetch PodMigration",
 			"migration", migrationName)
 		return
 	}
-	msg := mntpImageInconsistencyEventMsg(mntpErr.EntryMntID, mntpErr.MountpointLeaf, mntpErr.OrphanMntID, mntpErr.Field, mntpErr.SecurityDecline)
+	msg := extErr.Error()
 	now := metav1.Now()
 	event := &corev1.Event{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s.mntp-image-inconsistency.%d", migrationName, now.UnixNano()),
+			Name:      fmt.Sprintf("%s.external-mount-unresolved.%d", migrationName, now.UnixNano()),
 			Namespace: namespace,
 		},
 		InvolvedObject: corev1.ObjectReference{
@@ -5762,20 +5795,70 @@ func (s *AgentServer) emitMntpImageInconsistencyEvent(ctx context.Context, migra
 			Namespace:  pm.Namespace,
 			UID:        pm.UID,
 		},
-		Reason:         "CRIUImageInconsistency",
+		Reason:         "ExternalMountUnresolved",
 		Message:        msg,
 		Type:           corev1.EventTypeWarning,
 		FirstTimestamp: now,
 		LastTimestamp:  now,
 		Count:          1,
-		Source: corev1.EventSource{Component: "podmotion-agent"},
+		Source:         corev1.EventSource{Component: "podmotion-agent"},
 	}
 	if createErr := s.k8sClient.Create(ctx, event); createErr != nil {
-		log.Error(createErr, "emitMntpImageInconsistencyEvent: failed to create Event",
-			"migration", migrationName, "msg", msg)
+		log.Error(createErr, "emitExternalMountUnresolvedEvent: failed to create Event",
+			"migration", migrationName)
 	} else {
-		log.Info("emitMntpImageInconsistencyEvent: Warning CRIUImageInconsistency Event emitted (ADR-0194 P-0194-4)",
-			"migration", migrationName, "msg", msg)
+		log.Info("emitExternalMountUnresolvedEvent: Warning ExternalMountUnresolved Event emitted (ADR-0194 P-0194-1)",
+			"migration", migrationName, "mnt_id", extErr.MntID, "ext_key", extErr.ExtKey, "reason", extErr.Reason)
+	}
+}
+
+// emitExternalMountDroppedEvent emits a Normal CRIUExternalMountDropped Kubernetes Event on
+// the PodMigration CR when ADR-0194 B-2 drops an external mountpoints entry (H4 / C-2).
+// Best-effort: logs on failure but does not block the caller's success path.
+func (s *AgentServer) emitExternalMountDroppedEvent(ctx context.Context, migrationName string, d ExternalMountDroppedInfo) {
+	if s.k8sClient == nil {
+		log.Info("emitExternalMountDroppedEvent: k8sClient nil — event not emitted",
+			"migration", migrationName)
+		return
+	}
+	namespace := s.resolveNamespaceForMigration(ctx, migrationName)
+	if namespace == "" {
+		namespace = "default"
+	}
+	pm := &pmv1.PodMigration{}
+	if getErr := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: migrationName}, pm); getErr != nil {
+		log.Error(getErr, "emitExternalMountDroppedEvent: could not fetch PodMigration",
+			"migration", migrationName)
+		return
+	}
+	msg := fmt.Sprintf("external mount mnt_id=%d ext_key=%s source=%s dropped by B-2 lockstep with files.img rebind to root (ADR-0194 B-2)", d.MntID, d.ExtKey, d.Source)
+	now := metav1.Now()
+	event := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s.criu-ext-mount-dropped.%d", migrationName, now.UnixNano()),
+			Namespace: namespace,
+		},
+		InvolvedObject: corev1.ObjectReference{
+			APIVersion: "podmotion.io/v1alpha1",
+			Kind:       "PodMigration",
+			Name:       pm.Name,
+			Namespace:  pm.Namespace,
+			UID:        pm.UID,
+		},
+		Reason:         "CRIUExternalMountDropped",
+		Message:        msg,
+		Type:           corev1.EventTypeNormal,
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+		Count:          1,
+		Source:         corev1.EventSource{Component: "podmotion-agent"},
+	}
+	if createErr := s.k8sClient.Create(ctx, event); createErr != nil {
+		log.Error(createErr, "emitExternalMountDroppedEvent: failed to create Event",
+			"migration", migrationName)
+	} else {
+		log.Info("emitExternalMountDroppedEvent: Normal CRIUExternalMountDropped Event emitted (ADR-0194 B-2)",
+			"migration", migrationName, "mnt_id", d.MntID, "ext_key", d.ExtKey)
 	}
 }
 
