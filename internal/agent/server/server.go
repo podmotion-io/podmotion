@@ -2081,30 +2081,11 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		// the go-criu restore path. (ADR-0131 restore path.)
 		"--skip-mnt", "/var/run/secrets/kubernetes.io/serviceaccount",
 		"--skip-mnt", "/run/secrets/kubernetes.io/serviceaccount", // canonical form used by ctr checkpoint (/var/run is symlink to /run on modern Linux) (ADR-0190)
-		// dmi sysfs absent on kind control-plane nodes — bind-mount restore fails with
-		// "No such file or directory". Not needed for checkpoint/restore correctness.
-		// ADR-0190: these per-path --skip-mnt entries are now REDUNDANT for the patched-image
-		// path — patchCheckpointImages drops the entire /sys subtree by prefix, so CRIU never
-		// sees /sys/* in the image and has nothing to skip. They are KEPT deliberately as
-		// belt-and-suspenders: the CRIU-direct (non-NRI, unpatched-image) restore path and any
-		// future change to the dump-side drop set still rely on them to avoid the dmi-id
-		// bind-mount failure. Harmless when the image is already stripped.
-		"--skip-mnt", "/sys/devices/virtual/dmi/id/product_uuid",
-		"--skip-mnt", "/sys/devices/virtual/dmi/id/board_serial",
-		"--skip-mnt", "/sys/devices/virtual/dmi/id/chassis_serial",
-		"--skip-mnt", "/sys/devices/virtual/dmi/id/sys_vendor",
-		// /sys and all children are in skipMnts at dump time (criu_checkpointer.go gate10
-		// final fix). The entire sysfs subtree is absent from the checkpoint image.
-		// CRIU at restore never sees /sys in the image → no ext-mount-map needed, no
-		// compat-mode umount attempted. The destination runtime re-provisions /sys fresh.
-		// Gate10 analysis: CRIU 4.2 does not reliably write ext_key for either path-form
-		// (mnt[/sys]) or ID-form (mnt[<id>]) external declarations when kind presents two
-		// sysfs instances at /sys (different s_dev, different parent mount IDs). Only one
-		// is visible from the agent's /proc/<pid>/mountinfo view; the other is only visible
-		// inside the container mount namespace (via --root). Skipping /sys entirely is the
-		// definitive fix (no dependency on ext_key being written or read).
-		"--skip-mnt", "/sys/devices/virtual/powercap",
-		"--skip-mnt", "/sys/firmware",
+		// ADR-0190: /sys and its entire subtree are dropped from the checkpoint image by
+		// patchCheckpointImages (subtree-closed mnt_id graph closure). No /sys* entries
+		// survive into the image, so --skip-mnt for dmi/id/*, powercap, firmware are
+		// not needed and have been removed. Defense-in-depth --skip-mnt for service
+		// account paths is kept (see above).
 		"--ext-mount-map", "/dev/shm:/dev/shm",
 		"--ext-mount-map", "/etc/resolv.conf:/etc/resolv.conf",
 		"--ext-mount-map", "/etc/hostname:/etc/hostname",
@@ -3042,74 +3023,103 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     img = load_image(src, fail_on_magic_error=True)
     if img is None:
         continue
-    # Remove entries that have no ext_key AND are masked paths (proc/* or sys/firmware, sys/fs/pstore)
-    # that cannot be recreated cross-node. Entries with a valid ext_key are handled via --ext-mount-map.
-    # Also unconditionally drop the kubelet service-account tmpfs mount: it is source-node-specific
-    # (token files not pre-staged on the destination) and is re-provided by the destination kubelet
-    # for the replacement pod. Leaving it makes CRIU restore fail with "Can't bind-mount at
-    # .../run/secrets/kubernetes.io/serviceaccount: No such file or directory" (ADR-0131 restore path).
-    # Kubelet-injected, source-node-specific bind mounts. The destination containerd/kubelet
-    # re-provides equivalents for the replacement pod, and their source files are not staged in
-    # the CRIU restore mntns, so CRIU fails with "Can't bind-mount at .../<path>: No such file
-    # or directory" (mount.c:2511). Strip them at dump time (ADR-0131 restore path).
-    # ADR-0190 (Sprint 32 §14g, Arch-B): the static drop set dropped /sys but left its
-    # children (e.g. /sys/devices/virtual/dmi/id/product_name, mnt_id 7730 → parent 9107=/sys)
-    # in the image with a dangling parent reference. CRIU's mount-tree builder then aborts:
-    #   Error (criu/mount.c:381): mnt: No parent found for mountpoint 7730
-    #     (@/sys/devices/virtual/dmi/id/product_name)
-    # Fix: drop the WHOLE subtree by prefix, not just the listed node. Dropping a parent
-    # mountpoint must drop every descendant or the orphaned child has no parent to attach to.
+    # ADR-0190 (Sprint 32 §14g, Arch-B): subtree-closed mount drop via mnt_id graph closure.
     #
-    # drop_prefixes: entries equal to the prefix OR nested under "<prefix>/" are dropped.
-    #   /sys  — ctr checkpoint captures /sys as an external mount; CRIU 4.2 cannot restore it
-    #           via --ext-mount-map auto in the NRI path (no placeholder container /
-    #           lazy-umount path). Dropping the entire /sys subtree (every /sys/* child:
-    #           dmi/id/*, fs/cgroup, fs/pstore, fs/bpf, firmware, devices/virtual/powercap, ...)
-    #           lets the destination runtime re-provide /sys fresh with a consistent tree.
-    #   /proc — NOT prefix-dropped. ctr checkpoint captures /proc itself (the proc root) as a
-    #           recorded in-container mount that CRIU restores normally; only specific runc-/
-    #           containerd-injected /proc/* submounts (listed in drop_mnts_exact below) are
-    #           external-with-null-source and must be stripped. A blanket /proc prefix drop
-    #           would also remove /proc itself, orphaning the container's proc tree. Keep exact.
-    #   /dev  — NOT prefix-dropped. /dev and its retained children (/dev, /dev/pts, /dev/mqueue)
-    #           stay together in the image with /dev present as parent; only /dev/shm and
-    #           /dev/termination-log are external bind mounts handled exactly below. No orphan.
-    drop_prefixes = ['/sys']
-    drop_mnts_exact = {
+    # The previous prefix-based approach dropped /sys by path but left children with
+    # different mnt_ids (e.g. mnt_id 7730 → parent_mnt_id 9107=/sys) in the image.
+    # CRIU's mount-tree builder aborted: "No parent found for mountpoint 7730
+    # (@/sys/devices/virtual/dmi/id/product_name)" (mount.c:381).
+    #
+    # Fix: seed drop_ids from DROP_ROOT_FSTYPES (sysfs) and DROP_PATHS, then run a
+    # fixpoint closure over the parent_mnt_id graph. Any entry whose parent is in
+    # drop_ids is also dropped. The closure terminates because drop_ids only grows.
+    # /proc and /dev are NOT in DROP_ROOT_FSTYPES — policy keeps /proc root and /dev;
+    # only specific submounts listed in DROP_PATHS are removed exactly.
+
+    DROP_ROOT_FSTYPES = {
+        'sysfs',   # /sys — re-provided by destination runtime; catches both sysfs instances in kind
+        # NOTE: procfs NOT here — policy keeps /proc root, drops only named submounts
+    }
+
+    DROP_PATHS = {
         '/var/run/secrets/kubernetes.io/serviceaccount',
-        '/run/secrets/kubernetes.io/serviceaccount',  # canonical form used by ctr checkpoint (/var/run is symlink to /run on modern Linux) (ADR-0190)
-        '/etc/hosts',
-        '/etc/hostname',
-        '/etc/resolv.conf',
-        '/dev/termination-log',
-        '/dev/shm',
-        # containerd/runc-injected proc submounts that CRIU otherwise autodetects as
-        # external with a (null) source on restore (mount.c:3120). The destination runtime
-        # re-provides them; stripping avoids needing --ext-mount-map auto (which collides with
-        # the /data CRIU:AUTOGENERATED key). (ADR-0131 restore path.) These are leaf/parent-
-        # present submounts of /proc — /proc itself is kept, so no orphan results.
+        '/run/secrets/kubernetes.io/serviceaccount',  # canonical form (ADR-0190)
+        '/etc/hosts', '/etc/hostname', '/etc/resolv.conf',
+        '/dev/termination-log', '/dev/shm',
         '/proc/bus', '/proc/fs', '/proc/irq', '/proc/sys', '/proc/sysrq-trigger',
         '/proc/acpi', '/proc/scsi', '/proc/interrupts', '/proc/kcore', '/proc/keys',
         '/proc/latency_stats', '/proc/timer_list', '/proc/sched_debug',
-        # Explicit /sys/* entries retained for CRIU-direct checkpoint paths where the subtree
-        # is enumerated differently; they are also covered by the '/sys' prefix above
-        # (belt-and-suspenders — harmless overlap).
         '/sys/firmware', '/sys/fs/pstore', '/sys/fs/bpf', '/sys/fs/cgroup',
+        '/sys',
     }
 
-    def _should_drop(mp):
-        if mp is None:
-            return False
-        if mp in drop_mnts_exact:
+    def is_drop_root(entry):
+        mp = entry.get('mountpoint')
+        if mp in DROP_PATHS:
             return True
-        for prefix in drop_prefixes:
-            if mp == prefix or mp.startswith(prefix + '/'):
-                return True
+        if entry.get('fstype') in DROP_ROOT_FSTYPES:
+            return True
         return False
 
-    kept = [e for e in img['entries']
-            if not (e.get('mountpoint') in null_ext_key_masked and not e.get('ext_key'))
-            and not _should_drop(e.get('mountpoint'))]
+    # Phase B: close drop_ids under the parent_mnt_id relation (computed once, not per-entry).
+    # Seed: all drop-root mnt_ids.
+    drop_ids = {e['mnt_id'] for e in img['entries'] if is_drop_root(e) and 'mnt_id' in e}
+
+    # Root mount protection: / must never be dropped even if a logic error tries to add it.
+    root_entries = [e for e in img['entries'] if e.get('mountpoint') == '/']
+    root_ids = {e['mnt_id'] for e in root_entries if 'mnt_id' in e}
+    if root_ids & drop_ids:
+        print('mountpoints: WARNING root mount (/) found in drop_ids — removing from drop set (should be impossible)')
+        drop_ids -= root_ids
+
+    # Fixpoint closure: if an entry's parent is in drop_ids, add it to drop_ids.
+    changed = True
+    while changed:
+        changed = False
+        for e in img['entries']:
+            mid = e.get('mnt_id')
+            pid = e.get('parent_mnt_id')
+            if mid is None or mid in drop_ids:
+                continue
+            if pid in drop_ids:
+                drop_ids.add(mid)
+                changed = True
+
+    # Re-check root protection after closure (belt-and-suspenders).
+    if root_ids & drop_ids:
+        print('mountpoints: WARNING root mount (/) in drop_ids after closure — removing')
+        drop_ids -= root_ids
+
+    # Filter: keep entries NOT in drop_ids, AND apply existing null_ext_key_masked test.
+    # Entries lacking mnt_id fall back to path-prefix drop (belt-and-suspenders for
+    # images produced by older ctr checkpoint versions that omit mnt_id).
+    def _fallback_drop(entry):
+        """Path-prefix drop for entries missing mnt_id."""
+        mp = entry.get('mountpoint')
+        if mp is None:
+            return False
+        for p in DROP_PATHS:
+            if mp == p or mp.startswith(p + '/'):
+                return True
+        if entry.get('fstype') in DROP_ROOT_FSTYPES:
+            return True
+        return False
+
+    kept = []
+    for e in img['entries']:
+        mid = e.get('mnt_id')
+        mp = e.get('mountpoint')
+        # Skip entries in drop_ids.
+        if mid is not None and mid in drop_ids:
+            continue
+        # For entries without mnt_id, fall back to path-prefix matching.
+        if mid is None and _fallback_drop(e):
+            print('mountpoints: WARNING missing mnt_id on entry mountpoint=%r fstype=%r — dropped by path fallback' % (mp, e.get('fstype')))
+            continue
+        # Apply existing null_ext_key_masked test.
+        if mp in null_ext_key_masked and not e.get('ext_key'):
+            continue
+        kept.append(e)
     # Rewrite the /data volume mount into a self-contained tmpfs that CRIU creates fresh in
     # its restore yard, instead of an external bind to a source-node containerd volume path
     # that does not exist on the destination (CRIU:AUTOGENERATED ext_key → "Can't bind-mount
@@ -3127,12 +3137,9 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     for e in kept:
         if e.get('mountpoint') == '/data' and e.get('ext_key'):
             e['ext_key'] = 'pm-data'
-    # ADR-0190 (Sprint 32 §14g, Arch-B): the former Gate10 "inject ext_key=pm-sys on /sys"
-    # block is removed. With the '/sys' prefix drop above, NO /sys entry (root or child)
-    # survives into kept[], so there is nothing to label — the entire sysfs subtree is absent
-    # from the image and the destination runtime re-provides /sys fresh. Re-introducing a
-    # single /sys entry without its children was the exact source of the mount.c:381 orphan
-    # (children dropped, parent kept, or vice versa). The subtree is now dropped atomically.
+    # ADR-0190: /sys and its entire subtree are dropped above by the subtree-closed
+    # filter. This block now operates on an empty match set and is dead code.
+    # Will be removed after Arch-C confirms AC-2 (no sysfs survivors) in the live gate.
     img['entries'] = kept
     with open(mp_path, 'wb') as f:
         pycriu.images.dump(img, f)
