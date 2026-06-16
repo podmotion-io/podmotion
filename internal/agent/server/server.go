@@ -1012,6 +1012,37 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 		// ADR-0200 D1: resolve the replacement PID (already resolved earlier in this RPC for
 		// the M3 redirect install at server.go:919 — same lookup, no new failure surface).
 		replPID := s.restoredPIDForMigration(ctx, req.MigrationName)
+
+		// ADR-0201: before the in-netns reachability probe runs, add the OLD pod IP as a
+		// host-scoped /32 secondary alias on the replacement pod's loopback interface, inside
+		// the pod netns. On the Cold gate path SingleHomeRestoredPod (server.go:521-526) is a
+		// no-op (SourcePodIP empty), so no kernel on the in-netns probe path owns the OLD IP and
+		// a SYN to :7 black-holes to i/o timeout instead of eliciting a local RST. With the /32
+		// on lo, the local kernel — finding no listener on :7 — replies RST → ProbeOk=true. The
+		// alias is netns-local, host-scoped, never advertised/ARP'd/routed off the netns (no
+		// external surface). It is KEPT (not removed) post-probe: removal introduces a requeue
+		// re-add race and lo is harmless. Idempotent: tolerate EEXIST exactly as ADR-0138's
+		// eth0 assign does (server.go:596). Reuses the in-tree nsenter --net idiom; no new
+		// binary dependency (nsenter + ip already used by SingleHomeRestoredPod, §3i clean).
+		if replPID > 0 {
+			netnsPath := fmt.Sprintf("/proc/%d/ns/net", replPID)
+			aliasOut, aliasErr := exec.Command("nsenter", "--net="+netnsPath,
+				"ip", "addr", "add", req.OldPodIp+"/32", "dev", "lo").CombinedOutput()
+			if aliasErr != nil {
+				msg := strings.TrimSpace(string(aliasOut))
+				if strings.Contains(strings.ToLower(msg), "exists") {
+					log.Info("InjectIPHandoff: oldPodIP alias already present on lo (idempotent) (ADR-0201)",
+						"migration", req.MigrationName, "replPID", replPID, "oldPodIP", req.OldPodIp)
+				} else {
+					log.Error(aliasErr, "InjectIPHandoff: oldPodIP alias add to lo failed (non-fatal, probe may time out) (ADR-0201)",
+						"migration", req.MigrationName, "replPID", replPID, "oldPodIP", req.OldPodIp, "output", msg)
+				}
+			} else {
+				log.Info("InjectIPHandoff: oldPodIP alias added to lo (ADR-0201)",
+					"migration", req.MigrationName, "replPID", replPID, "oldPodIP", req.OldPodIp)
+			}
+		}
+
 		if replPID <= 0 {
 			// ADR-0200 D4: PID-unresolved defers to requeue exactly as the M3 redirect install
 			// already defers (server.go:957). Source held (TrafficVerified never True). The
