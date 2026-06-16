@@ -26,6 +26,7 @@ import (
 	"github.com/go-logr/logr"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -104,6 +105,12 @@ var scheme = k8sruntime.NewScheme()
 
 func init() {
 	utilruntime.Must(pmv1.AddToScheme(scheme))
+	// ADR-0195 §3h secondary: register corev1 so the agent k8sClient can Create/Get
+	// corev1.Event objects (emitCRIUImageInconsistencyEvent, emitExternalMountDroppedEvent,
+	// emitExternalMountUnresolvedEvent at server.go:5735/5786/5836).
+	// Without this registration, client.Create(&corev1.Event{}) fails with
+	// "no kind is registered for the type v1.Event in scheme".
+	utilruntime.Must(corev1.AddToScheme(scheme))
 }
 
 func main() {

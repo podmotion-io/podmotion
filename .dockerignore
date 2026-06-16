@@ -15,6 +15,8 @@
 !bin/agent-linux-amd64
 # Re-include criu-wrapper binary (ADR-0181 — installed onto kind node image)
 !bin/criu-wrapper-linux-amd64
+# Re-include holder binary (ADR-0195 Rule A — universal no-op holder for replacement pods)
+!bin/holder-linux-amd64
 
 # Re-include pycriu Python package (required by agent Dockerfile)
 !pycriu/

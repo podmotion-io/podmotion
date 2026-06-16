@@ -48,6 +48,17 @@ import (
 
 var log = logf.Log.WithName("agent-server")
 
+// adr0195Provenance is printed at server startup so the marker string is retained in the
+// binary and is observable in agent logs. Deploy verification:
+//   grep -a -c 'P-0195-1' bin/agent-linux-amd64  # must be >= 1
+// The log.Info call below forces the string into the binary's string table and into the
+// agent's startup log, confirming the ADR-0195 holder-contract change is deployed.
+const adr0195Marker = "P-0195-1"
+
+func init() {
+	log.Info("ADR-0195 holder-contract build loaded", "marker", adr0195Marker)
+}
+
 // Sentinel errors used for structured error classification (errors.Is/As).
 // Prefer these over string matching so callers remain stable across CRIU/kernel version changes.
 

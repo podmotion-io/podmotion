@@ -16,6 +16,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 COPY pycriu/ /usr/lib/python3/dist-packages/pycriu/
 COPY bin/agent-linux-amd64 /agent
+# ADR-0195 Rule A: universal no-op holder binary injected into replacement pods via init-container
+# + emptyDir side-load. Staged in the agent image at /podmotion/holder.
+# The init-container (podmotion-inject-holder) copies this binary into the replacement pod's
+# emptyDir volume at /holder-bin/holder (mounted at /podmotion/holder in the main container).
+# Static binary (CGO_ENABLED=0) — resolves in FROM-scratch rootfs; no base-image tool dependency.
+# Build: make build-linux → bin/holder-linux-amd64
+COPY bin/holder-linux-amd64 /podmotion/holder
 # ADR-0181: cgroup fd delivery wrapper — staged in the agent image at /usr/local/bin/podmotion-criu-wrapper.
 # nsenter exec-chains into this binary (on the host) before execve-ing criu.
 # ADR-0183 r1: the install-criu-wrapper init container copies this binary onto the host node
