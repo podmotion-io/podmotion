@@ -2133,6 +2133,13 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 		}
 	}
 
+	// ADR-0185 C7: This transitionTo(Restoring) is dead code on the 12-phase path —
+	// reconcileFinalFreezeStateCapture (the 12-phase delegator) returns early via OverlayHandoff
+	// delegation, bypassing this line, so Restoring is reached only after conditionVXLANFDBUpdated.
+	// Left in place; guarded by the P-VERIFY-NRI-PHASE-ORDER invariant asserting Restoring is only
+	// reachable post-conditionVXLANFDBUpdated (a C3 regression firing this tail before OverlayHandoff
+	// would be caught by that contract test, since OverlayHandoff is NOT in the NRI accept-set under
+	// Option B). See ADR-0185 r1.
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoring)
 }
 
