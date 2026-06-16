@@ -239,21 +239,25 @@ func TestWatchdog_AutoDisarmFiresWhenDisarmWithheld(t *testing.T) {
 		t.Fatal("expected hold to be registered after ArmZeroWindow")
 	}
 
-	// Wait for watchdog to fire: budget(5ms) + zwWatchdogMargin(500ms) + 200ms headroom.
-	deadline := time.Now().Add(time.Duration(5)*time.Millisecond + zwWatchdogMargin + 200*time.Millisecond)
-	var cleared bool
+	// Wait for watchdog to set watchdogFired=true: budget(5ms) + zwWatchdogMargin(500ms) + 300ms.
+	// The watchdog (server.go:5048-5072) intentionally does NOT delete the hold when it fires —
+	// per ADR-0157 D3: cleanup is the controller's DisarmZeroWindow call. It sets watchdogFired=true.
+	// The test must poll for watchdogFired, not for hold-absence (Arch-C fix, ADR-0192 §13).
+	deadline := time.Now().Add(time.Duration(5)*time.Millisecond + zwWatchdogMargin + 300*time.Millisecond)
+	var fired bool
 	for time.Now().Before(deadline) {
 		s.zwHoldMu.Lock()
-		_, still := s.zwHolds["watchdog-test"]
+		st, present := s.zwHolds["watchdog-test"]
+		f := present && st.watchdogFired
 		s.zwHoldMu.Unlock()
-		if !still {
-			cleared = true
+		if f {
+			fired = true
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !cleared {
-		t.Errorf("watchdog did not auto-disarm within expected deadline; hold state still present")
+	if !fired {
+		t.Errorf("watchdog did not set watchdogFired within expected deadline")
 	}
 
 	// After watchdog fires, DisarmZeroWindow must report no active hold (connection survived —

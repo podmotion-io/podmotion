@@ -20,6 +20,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -94,23 +96,26 @@ var _ = AfterSuite(func() {
 	}, time.Minute, time.Second).Should(Succeed())
 })
 
-// getFirstFoundEnvTestBinaryDir locates the first binary in the specified path.
-// ENVTEST-based tests depend on specific binaries, usually located in paths set by
-// controller-runtime. When running tests directly (e.g., via an IDE) without using
-// Makefile targets, the 'BinaryAssetsDirectory' must be explicitly configured.
-//
-// This function streamlines the process by finding the required binaries, similar to
-// setting the 'KUBEBUILDER_ASSETS' environment variable. To ensure the binaries are
-// properly set up, run 'make setup-envtest' beforehand.
+// getFirstFoundEnvTestBinaryDir locates the envtest binary dir for the current platform.
+// When KUBEBUILDER_ASSETS is already set (e.g. by the Makefile via setup-envtest), this
+// function returns "" so the Makefile-provided assets are used (correct-platform guaranteed).
+// When running directly without the Makefile, it scans bin/k8s/ for a dir matching the
+// current OS and architecture (runtime.GOOS + "-" + runtime.GOARCH) to prevent selecting
+// a stale darwin-arm64 dir on a linux host (Arch-C fix, ADR-0192 §13).
+// Prerequisite: run 'make setup-envtest' before running tests without KUBEBUILDER_ASSETS.
 func getFirstFoundEnvTestBinaryDir() string {
+	if v := os.Getenv("KUBEBUILDER_ASSETS"); v != "" {
+		return "" // Makefile/CI already provisioned the correct-platform assets.
+	}
 	basePath := filepath.Join("..", "..", "bin", "k8s")
 	entries, err := os.ReadDir(basePath)
 	if err != nil {
 		logf.Log.Error(err, "Failed to read directory", "path", basePath)
 		return ""
 	}
+	suffix := "-" + runtime.GOOS + "-" + runtime.GOARCH
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if entry.IsDir() && strings.HasSuffix(entry.Name(), suffix) {
 			return filepath.Join(basePath, entry.Name())
 		}
 	}

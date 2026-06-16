@@ -153,7 +153,9 @@ func ExportConntrack(ctx context.Context, opts ConntrackExportOptions) ([]Conntr
 	}
 
 	// Filter by pod IP if specified.
-	var filtered []ConntrackEntry
+	// Initialize as non-nil so callers receive an empty slice (not nil) when no entries match.
+	// The test contract (conntrack_test.go) asserts non-nil; nil != empty in Go reflect comparisons.
+	filtered := make([]ConntrackEntry, 0, len(all))
 	for _, e := range all {
 		if opts.PodIP != "" && !entryMatchesPodIP(e, opts.PodIP) {
 			continue

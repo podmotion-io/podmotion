@@ -471,12 +471,23 @@ func (d *PodMigrationDefaulter) applyDefaults(ctx context.Context, pm *pmv1.PodM
 		}
 	}
 
-	// Rule 8: TCPPreservationMode downgrade — if Strict/BestEffort requested but CNI doesn't
-	// support IP mobility, downgrade to None silently and annotate.
-	if pm.Spec.TCPPreservationMode != pmv1.TCPPreservationModeNone && pm.Spec.TargetNodeName != "" {
+	// Rule 8: TCPPreservationMode downgrade — ADR-0192 R2 correction (option (a) chosen).
+	// IPMobilitySupported=false now means "no VXLAN FDB overlay device present", NOT "no IP
+	// mobility of any kind". BestEffort explicitly tolerates a degraded/host-routed handoff:
+	// the agent's fdbIf=="" skip-coherence returns Injected:true via the bridge+/32+gARP path,
+	// which is valid on host-routed CNIs (kind/kindnet). Downgrading BestEffort→None on
+	// IPMobilitySupported=false alone discards a working handoff and routes around InjectIPHandoff
+	// entirely (controller line 2880), making the agent's discovery/skip-coherence dead code.
+	//
+	// Rule 8 now only downgrades Strict mode on IPMobilitySupported=false (Strict requires
+	// full overlay-level guarantees; host-routed handoff is not sufficient). BestEffort is
+	// NOT downgraded — it is designed for exactly this graceful-degradation scenario.
+	// If a future capability genuinely signals "no IP mobility of any kind" (neither overlay
+	// nor host-routed), introduce a distinct capability field then (option (b) deferred).
+	if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict && pm.Spec.TargetNodeName != "" {
 		nmc, err := d.getNMC(ctx, pm.Spec.TargetNodeName)
 		if err == nil && !nmc.Spec.NetworkCapability.IPMobilitySupported {
-			webhookLog.Info("downgrading tcpPreservationMode to None: CNI does not support IP mobility",
+			webhookLog.Info("downgrading tcpPreservationMode Strict→None: CNI does not support overlay IP mobility (Strict requires full overlay guarantees)",
 				"migration", pm.Name, "targetNode", pm.Spec.TargetNodeName,
 				"cni", nmc.Spec.NetworkCapability.CNIPlugin)
 			pm.Spec.TCPPreservationMode = pmv1.TCPPreservationModeNone
@@ -484,7 +495,7 @@ func (d *PodMigrationDefaulter) applyDefaults(ctx context.Context, pm *pmv1.PodM
 				pm.Annotations = make(map[string]string)
 			}
 			pm.Annotations["podmotion.io/network-continuity-downgraded"] = fmt.Sprintf(
-				"CNI plugin %q on node %q does not support IP mobility; downgraded to cold migration mode",
+				"CNI plugin %q on node %q does not support overlay IP mobility; Strict mode downgraded to cold migration",
 				nmc.Spec.NetworkCapability.CNIPlugin, pm.Spec.TargetNodeName)
 		}
 	}

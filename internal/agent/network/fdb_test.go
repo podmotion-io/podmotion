@@ -13,6 +13,17 @@ import (
 	"testing"
 )
 
+// requireFDBInterface skips host-netlink-dependent tests when the VXLAN/overlay device
+// they operate on is absent (e.g. kindnet substrate, CI without flannel). Arch-C fix per
+// ADR-0192 §13: these are environment-dependent tests, not unit tests; skip (not fail)
+// so the test suite is green on kindnet substrates while still asserting on flannel nodes.
+func requireFDBInterface(t *testing.T, name string) {
+	t.Helper()
+	if _, err := net.InterfaceByName(name); err != nil {
+		t.Skipf("skipping: interface %q not present on host (%v)", name, err)
+	}
+}
+
 func validEntry() FDBEntry {
 	return FDBEntry{
 		IfName: "flannel.1",
@@ -23,6 +34,7 @@ func validEntry() FDBEntry {
 }
 
 func TestFDBManagerStub_AddFDBEntry(t *testing.T) {
+	requireFDBInterface(t, "flannel.1")
 	mgr := NewFDBManager()
 	ctx := context.Background()
 
@@ -32,6 +44,7 @@ func TestFDBManagerStub_AddFDBEntry(t *testing.T) {
 }
 
 func TestFDBManagerStub_RemoveFDBEntry(t *testing.T) {
+	requireFDBInterface(t, "flannel.1")
 	mgr := NewFDBManager()
 	ctx := context.Background()
 
@@ -41,6 +54,7 @@ func TestFDBManagerStub_RemoveFDBEntry(t *testing.T) {
 }
 
 func TestFDBManagerStub_ConfirmOverlayReady(t *testing.T) {
+	requireFDBInterface(t, "flannel.1")
 	mgr := NewFDBManager()
 	ctx := context.Background()
 
@@ -103,6 +117,11 @@ func TestValidateFDBEntry(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			if !tc.wantErr {
+				// The valid case calls ifaceIndex(entry.IfName) via the host netlink stack.
+				// Skip when the interface is not present (kindnet substrate, CI without flannel).
+				requireFDBInterface(t, tc.entry.IfName)
+			}
 			err := mgr.AddFDBEntry(ctx, tc.entry)
 			if (err != nil) != tc.wantErr {
 				t.Errorf("AddFDBEntry(%s): wantErr=%v, got err=%v", tc.name, tc.wantErr, err)

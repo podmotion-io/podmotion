@@ -902,13 +902,32 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 		}
 	}
 
-	// Decision 5: in-node reachability probe — ping the OLD pod IP from this node.
+	// Decision 5: in-node reachability probe — TCP L4 dial to the OLD pod IP.
+	// ADR-0192 R2: replaced exec ping (absent on kind nodes, requires CAP_NET_RAW) with
+	// net.DialTimeout (no binary dependency, no capability required). A TCP SYN-ACK or
+	// RST both confirm the IP is routable on this node; ECONNREFUSED is also a success
+	// (the kernel responded — the IP is live). Only a network-level timeout is a failure.
 	if req.Probe {
-		out, perr := exec.CommandContext(ctx, "ping", "-c", "1", "-W", "2", req.OldPodIp).CombinedOutput()
-		resp.ProbeOutput = strings.TrimSpace(string(out))
-		resp.ProbeOk = perr == nil
+		probeAddr := net.JoinHostPort(req.OldPodIp, "7") // port 7 (echo); RST confirms IP live
+		conn, perr := net.DialTimeout("tcp", probeAddr, 2*time.Second)
+		if conn != nil {
+			conn.Close()
+		}
+		// ECONNREFUSED = RST = IP is reachable (no listener, but the kernel responded).
+		// Any syscall.ECONNREFUSED (or its wrapped form) is a probe success.
+		probeOk := perr == nil
 		if perr != nil {
-			log.Info("InjectIPHandoff: reachability probe failed", "oldPodIP", req.OldPodIp, "err", perr, "output", resp.ProbeOutput)
+			if isConnRefused(perr) {
+				probeOk = true
+			}
+		}
+		resp.ProbeOutput = ""
+		if perr != nil {
+			resp.ProbeOutput = perr.Error()
+		}
+		resp.ProbeOk = probeOk
+		if !probeOk {
+			log.Info("InjectIPHandoff: reachability probe failed", "oldPodIP", req.OldPodIp, "err", perr)
 		} else {
 			log.Info("InjectIPHandoff: reachability probe OK", "oldPodIP", req.OldPodIp)
 		}
@@ -2124,6 +2143,12 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		"--ext-mount-map", "/etc/resolv.conf:/etc/resolv.conf",
 		"--ext-mount-map", "/etc/hostname:/etc/hostname",
 		"--ext-mount-map", "/etc/hosts:/etc/hosts",
+		// NetworkLock: the dump uses --network-lock skip unconditionally (criu_checkpointer.go:233),
+		// so the restore MUST also pass --network-lock skip to honor the dump/restore-pair invariant.
+		// A restore must not replay lock state the paired dump never captured (ADR-0192 Site A, R2).
+		// This builder covers all three live restore entry points (NRI JoinNsRestore server.go:325,
+		// gRPC Restore config.json branch server.go:4174, gRPC raw branch server.go:4335).
+		"--network-lock", "skip",
 		"-v4",
 		"-o", restoreLogPath,
 	}
@@ -2569,73 +2594,82 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 		return 0, fmt.Errorf("criu restore start: %w", err)
 	}
 
-	// ADR-0127 (revised Sprint 22): restore.log content is the PRIMARY success signal — and on the
-	// cold --join-ns net:<path> path CRIU does NOT self-exit. Without --restore-detached (forbidden
-	// by standing constraint) and without --leave-stopped (that flag is only on the TCP-stateful
-	// branch), CRIU restores the process tree, writes "Restore finished successfully. Tasks
-	// resumed." to restore.log, and then stays in the foreground as the parent of the restored
-	// workload, blocking in wait4() for the lifetime of the workload (confirmed Sprint 22: criu
-	// in do_wait, redis-server alive as its child, restore.log marker present, 57 KiB written).
+	// ADR-0192 R2 (supersedes ADR-0127 §3h): liveness detection via cgroup-PID signal.
 	//
-	// Therefore we must NOT call criuCmd.Wait() synchronously here — it would never return and the
-	// NRI StartContainer handler would hang until containerd kills the container (the Sprint 22
-	// failure: replacement pod entered Failed). Instead we poll restore.log for the success marker
-	// while CRIU keeps running; once the marker appears the process tree is live and we proceed.
-	// A background goroutine performs the single Wait() to reap CRIU if/when it eventually exits,
-	// so there is no zombie and Wait() is still called exactly once (Arch-A double-Wait guard).
+	// On the cold --join-ns net:<path> path CRIU does NOT self-exit: after restore it stays as
+	// the foreground workload parent (blocking in wait4 for the lifetime of the workload). A
+	// synchronous criuCmd.Wait() would hang until the workload exits — the Sprint 22 failure.
+	// --restore-detached is forbidden (CLAUDE.md Standing Rule 6). --leave-stopped is only on
+	// the TCP-stateful branch.
+	//
+	// The ADR-0127 log-marker scaffold (removed here per §3h) detected success via
+	// "Restore finished successfully" in restore.log — a brittle log-format dependency that
+	// masked the still-firing Site A iptables-restore failure. With the --network-lock skip
+	// fix landed (buildCRIURestoreArgs), CRIU now exits 0 on failure and the workload PIDs
+	// appear in the agent cgroup upon successful restore. The replacement liveness mechanism
+	// uses the CGROUP-PID SIGNAL: poll until new PIDs appear in the agent cgroup (proof that
+	// CRIU launched the workload tree) OR CRIU exits with a non-zero code (fail). A background
+	// goroutine reaps CRIU when it eventually exits (no zombie; Wait called exactly once).
 	criuReaped := make(chan error, 1)
 	go func() { criuReaped <- criuCmd.Wait() }()
 
 	const (
-		markerPollInterval = 100 * time.Millisecond
-		markerPollTimeout  = 60 * time.Second
+		cgroupPollInterval = 50 * time.Millisecond
+		cgroupPollTimeout  = 60 * time.Second
 	)
-	markerSeen := false
-	deadline := time.Now().Add(markerPollTimeout)
-	for time.Now().Before(deadline) {
-		if logBytes, rerr := os.ReadFile(restoreLogPath); rerr == nil &&
-			strings.Contains(string(logBytes), "Restore finished successfully") {
-			markerSeen = true
-			break
-		}
-		// If CRIU exited before writing the marker, stop polling and inspect the exit.
+	var workloadLive bool
+	cgroupDeadline := time.Now().Add(cgroupPollTimeout)
+	for time.Now().Before(cgroupDeadline) {
+		// Check if CRIU exited before we saw new PIDs.
 		select {
 		case waitErr := <-criuReaped:
 			exitCode := -1
 			if criuCmd.ProcessState != nil {
 				exitCode = criuCmd.ProcessState.ExitCode()
 			}
-			// Re-read once: CRIU may have flushed the marker right before exiting.
-			if logBytes, rerr := os.ReadFile(restoreLogPath); rerr == nil &&
-				strings.Contains(string(logBytes), "Restore finished successfully") {
-				markerSeen = true
-			}
-			if !markerSeen {
+			if exitCode != 0 {
 				stderrTail := strings.TrimSpace(criuStderr.String())
 				if len(stderrTail) > 4096 {
 					stderrTail = stderrTail[len(stderrTail)-4096:]
 				}
-				return 0, fmt.Errorf("criu restore exited (exit code %d) without 'Restore finished successfully' in restore.log: %w\ncriu stderr:\n%s\nrestore.log tail:\n%s",
-					exitCode, waitErr, stderrTail, readLogTail(restoreLogPath, 4096))
+				return 0, fmt.Errorf("criu restore exited (exit code %d): %w\ncriu stderr:\n%s",
+					exitCode, waitErr, stderrTail)
 			}
+			// Exit 0 means restore succeeded and CRIU is done (detached-like path or early exit).
+			workloadLive = true
 		default:
 		}
-		if markerSeen {
+		if workloadLive {
 			break
 		}
-		time.Sleep(markerPollInterval)
+		// On the cold path, new workload PIDs appear in the agent cgroup once CRIU has
+		// successfully forked the process tree. The pre-CRIU snapshot is in beforeAgentPIDs.
+		if agentPIDsErr == nil {
+			if afterPIDs, scanErr := getAgentCgroupPIDs(); scanErr == nil {
+				for pid := range afterPIDs {
+					if !beforeAgentPIDs[pid] {
+						workloadLive = true
+						break
+					}
+				}
+			}
+		}
+		if workloadLive {
+			break
+		}
+		time.Sleep(cgroupPollInterval)
 	}
 
-	if !markerSeen {
+	if !workloadLive {
 		stderrTail := strings.TrimSpace(criuStderr.String())
 		if len(stderrTail) > 4096 {
 			stderrTail = stderrTail[len(stderrTail)-4096:]
 		}
-		return 0, fmt.Errorf("criu restore did not write 'Restore finished successfully' to restore.log within %s (ADR-0127): \ncriu stderr:\n%s\nrestore.log tail:\n%s",
-			markerPollTimeout, stderrTail, readLogTail(restoreLogPath, 4096))
+		return 0, fmt.Errorf("criu restore did not produce workload PIDs in agent cgroup within %s: criu stderr:\n%s",
+			cgroupPollTimeout, stderrTail)
 	}
 
-	// Copy restore.log to checkpointDir so GC-17 gate check can find it under
+	// Copy restore.log to checkpointDir so gate checks can find it under
 	// /run/podmotion/checkpoints/ (the agent container sees this path; restore.log was
 	// written to /var/lib/podmotion/restore/<name>/data/restore.log by CRIU running
 	// via nsenter in the host mount namespace).
@@ -2643,12 +2677,8 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 		_ = os.WriteFile(filepath.Join(checkpointDir, "restore.log"), logBytes, 0o644)
 	}
 
-	// PRIMARY success: restore.log confirms the process tree was restored and resumed. CRIU remains
-	// running in the foreground as the workload parent; that is expected on this path and is NOT a
-	// zombie (the background goroutine above reaps it when the workload exits). Proceed to PID scan.
-	log.Info("joinNsRestore: restore.log confirms 'Restore finished successfully' (ADR-0127); "+
-		"CRIU remains as foreground workload parent — proceeding to PID resolution",
-		"restoreLogPath", restoreLogPath)
+	log.Info("joinNsRestore: cgroup-PID signal confirmed workload live — proceeding to PID resolution",
+		"migration", migrationName)
 
 	// Step 5: ADR-0123 D2 — locate the restored application PID via the replacement pod's
 	// cgroup, NOT by process name. CRIU has exited (D1), so its PID can no longer be confused
@@ -2709,41 +2739,21 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	return pid, nil
 }
 
-// readLogTail returns at most maxBytes of the tail of the file at path, prefixed with a marker
-// when truncated. Best-effort: returns a short diagnostic string on read error rather than
-// failing, so it is safe to embed in an error message. The bound (Security note 2) prevents a
-// hostile/huge restore.log from blowing up the error string.
-func readLogTail(path string, maxBytes int64) string {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Sprintf("(restore.log unavailable: %v)", err)
+// readLogTail was removed: ADR-0127 scaffold (restore.log success-signal) removed per ADR-0192 §3h.
+// The liveness signal is now the cgroup-PID diff (see joinNsRestore above).
+
+// isConnRefused reports whether err is a connection-refused error (TCP RST). ECONNREFUSED
+// means the kernel responded — the IP is routable on this node — which is sufficient for the
+// ADR-0192 Decision 5 reachability probe. Used by InjectIPHandoff.
+func isConnRefused(err error) bool {
+	if err == nil {
+		return false
 	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return fmt.Sprintf("(restore.log stat failed: %v)", err)
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return errors.Is(opErr.Err, syscall.ECONNREFUSED)
 	}
-	size := fi.Size()
-	if size == 0 {
-		return "(restore.log empty)"
-	}
-	start := int64(0)
-	truncated := false
-	if size > maxBytes {
-		start = size - maxBytes
-		truncated = true
-	}
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
-		return fmt.Sprintf("(restore.log seek failed: %v)", err)
-	}
-	buf, err := io.ReadAll(f)
-	if err != nil {
-		return fmt.Sprintf("(restore.log read failed: %v)", err)
-	}
-	if truncated {
-		return "...(truncated to last 4 KiB)...\n" + string(buf)
-	}
-	return string(buf)
+	return false
 }
 
 // findRestoredPIDByCgroup implements ADR-0123 Decision 2: resolve the restored application PID
