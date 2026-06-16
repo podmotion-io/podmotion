@@ -2434,12 +2434,16 @@ type InjectIPHandoffResponse struct {
 
 	Injected       bool   `protobuf:"varint,1,opt,name=injected,proto3" json:"injected,omitempty"`
 	BlockingReason string `protobuf:"bytes,2,opt,name=blocking_reason,json=blockingReason,proto3" json:"blocking_reason,omitempty"`
-	// dest_vtep_mac is this node's flannel.1 VTEP MAC, returned so the operator can pass it
+	// dest_vtep_mac is this node's VTEP MAC, returned so the operator can pass it
 	// to the source agent for FDB cleanup (ADR-0133 Decision 3/4).
 	DestVtepMac string `protobuf:"bytes,3,opt,name=dest_vtep_mac,json=destVtepMac,proto3" json:"dest_vtep_mac,omitempty"`
 	// probe_ok is the result of the in-node `ping -c1 -W2 old_pod_ip` reachability probe.
 	ProbeOk     bool   `protobuf:"varint,4,opt,name=probe_ok,json=probeOk,proto3" json:"probe_ok,omitempty"`
 	ProbeOutput string `protobuf:"bytes,5,opt,name=probe_output,json=probeOutput,proto3" json:"probe_output,omitempty"`
+	// resolved_fdb_if is the FDB overlay device resolved by the agent (ADR-0192 VERIFY-11).
+	// Set to the interface name when a VXLAN device was found, "none:substrate-not-applicable"
+	// when the substrate has no VXLAN overlay, or "" when operator supplied an explicit override.
+	ResolvedFdbIf string `protobuf:"bytes,6,opt,name=resolved_fdb_if,json=resolvedFdbIf,proto3" json:"resolved_fdb_if,omitempty"`
 }
 
 func (x *InjectIPHandoffResponse) Reset() {
@@ -2505,6 +2509,13 @@ func (x *InjectIPHandoffResponse) GetProbeOk() bool {
 func (x *InjectIPHandoffResponse) GetProbeOutput() string {
 	if x != nil {
 		return x.ProbeOutput
+	}
+	return ""
+}
+
+func (x *InjectIPHandoffResponse) GetResolvedFdbIf() string {
+	if x != nil {
+		return x.ResolvedFdbIf
 	}
 	return ""
 }

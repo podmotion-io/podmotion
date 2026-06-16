@@ -369,12 +369,17 @@ message InjectIPHandoffRequest {
 message InjectIPHandoffResponse {
   bool   injected         = 1;
   string blocking_reason  = 2;
-  // dest_vtep_mac is this node's flannel.1 VTEP MAC, returned so the operator can pass it
+  // dest_vtep_mac is this node's VTEP MAC, returned so the operator can pass it
   // to the source agent for FDB cleanup (ADR-0133 Decision 3/4).
   string dest_vtep_mac    = 3;
   // probe_ok is the result of the in-node `ping -c1 -W2 old_pod_ip` reachability probe.
   bool   probe_ok         = 4;
   string probe_output     = 5;
+  // resolved_fdb_if is the FDB overlay device resolved by the agent (ADR-0192 VERIFY-11).
+  // Set to the interface name when a VXLAN device was found, or "none:substrate-not-applicable"
+  // when the substrate has no VXLAN overlay (kind/kindnet). Empty string means resolution
+  // was not attempted (legacy path) or operator supplied an explicit fdb_ifname override.
+  string resolved_fdb_if  = 6;
 }
 
 // CleanupSourceIPHandoffRequest carries the inputs for ADR-0133 D4 source-side cleanup.

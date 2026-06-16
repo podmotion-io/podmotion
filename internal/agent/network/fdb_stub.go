@@ -37,6 +37,12 @@ func DiscoverVTEPMAC(_ context.Context, _ string, ifName string) (net.HardwareAd
 	return iface.HardwareAddr, nil
 }
 
+// DiscoverFdbInterface returns "" on non-Linux builds — VXLAN link-type discovery
+// requires RTM_GETLINK which is Linux-only (ADR-0192 Site B stub).
+func DiscoverFdbInterface() (string, error) {
+	return "", nil
+}
+
 // fdbManagerStub satisfies FDBManager for non-Linux builds (macOS dev, unit tests).
 type fdbManagerStub struct{}
 

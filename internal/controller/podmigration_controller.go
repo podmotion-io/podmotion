@@ -2783,10 +2783,25 @@ func (r *PodMigrationReconciler) injectIPHandoff(ctx context.Context, pm *pmv1.P
 			"migration", pm.Name, "reason", resp.BlockingReason)
 		setCondition(pm, conditionIPHandoffInjected, metav1.ConditionFalse, "NotInjected",
 			fmt.Sprintf("InjectIPHandoff: %s", resp.BlockingReason))
+		// ADR-0192 VERIFY-10: emit Warning event on PodMigration CR with verbatim BlockingReason.
+		r.Recorder.Eventf(pm, corev1.EventTypeWarning, "IPHandoffFailed", "%s", resp.BlockingReason)
 		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
 			return ctrl.Result{}, sErr, false
 		}
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
+	}
+
+	// ADR-0192 VERIFY-11: write resolved fdbIf to PodMigration annotation for structured
+	// observability. ResolvedFdbIf is set by the agent when auto-discovery was used.
+	if resp.ResolvedFdbIf != "" {
+		if pm.Annotations == nil {
+			pm.Annotations = make(map[string]string)
+		}
+		pm.Annotations["podmotion.io/resolved-fdb-if"] = resp.ResolvedFdbIf
+		if aErr := r.Update(ctx, pm); aErr != nil {
+			log.Error(aErr, "injectIPHandoff: failed to set resolved-fdb-if annotation (non-fatal)",
+				"migration", pm.Name, "resolvedFdbIf", resp.ResolvedFdbIf)
+		}
 	}
 
 	// Cache the destination VTEP MAC for diagnostics / forensic replay (ADR-0133 R8 nit).
