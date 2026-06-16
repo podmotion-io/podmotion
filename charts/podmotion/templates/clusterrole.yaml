@@ -95,3 +95,9 @@ rules:
   - apiGroups: [migration.podmotion.io]
     resources: [podmigrations/status]
     verbs: [get, patch, update]
+  # ADR-0195 C-SEC-1: agent emits corev1.Events (CRIUImageInconsistency, ExternalMountDropped,
+  # ExternalMountUnresolved) via server.go:5735/5786/5836. Without this rule, Create(event)
+  # fails with "events is forbidden: User system:serviceaccount:... cannot create resource events".
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch, update]

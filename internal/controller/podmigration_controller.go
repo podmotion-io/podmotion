@@ -3740,36 +3740,93 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	spec.SchedulerName = ""    // webhook injects podmotion-scheduler
 	spec.SchedulingGates = nil // webhook injects the gate
 
-	// ADR-0130: the replacement pod's container init must NOT run the real workload
-	// command. The NRI StartContainer hook fires CRIU restore as a side-effect AFTER
-	// containerd has already started the container's real init, so the CRIU-restored
-	// tree (ADR-0125 joins the pod netns; ADR-0128 places it in the pod cgroup) runs
-	// alongside containerd's init — not as it. If containerd's init runs the real
-	// command (e.g. redis-server), it collides with the restored process on the
-	// workload port in the shared pod netns, exits, and trips the operator's
-	// PodFailed rollback (reconcileRestoring). Override every container to a benign
-	// long-lived holder so containerd's init is a stable, never-exiting, no-contention
-	// process; the real workload is supplied solely by the CRIU-restored tree. Pod
-	// readiness is only a precondition here — the authoritative restore signal is
-	// status.criuRestoreConfirmed (ADR-0120 D1/D4).
-	// ADR-0176: derive the holder command from the workload image's own entrypoint.
-	// The replacement pod must NOT run the real workload (ADR-0130), but the holder
-	// binary must exist in the container rootfs so runc create succeeds and the NRI
-	// StartContainer hook fires (a failed runc create silently swallows the hook and
-	// CRIU restore is never reached). Hardcoding /bin/sh breaks FROM scratch images.
-	// Instead, preserve the original container Command/Args from the deep-copied source
-	// pod spec and append --podmotion-holder, which makes the workload binary park
-	// itself (no port bind, SIGTERM-clean) rather than run the real workload.
-	// The holder binary is guaranteed to exist in the rootfs because it IS the image
-	// entrypoint. See ADR-0176 for the full rationale and timing contract.
+	// ADR-0195 Rule A (universal injected holder — replaces ADR-0176 --podmotion-holder append).
+	//
+	// ADR-0130: the replacement pod's container init must NOT run the real workload command.
+	// ADR-0176 originally solved this by appending --podmotion-holder to the workload binary's
+	// args, relying on the workload binary to implement a park-first/no-bind branch. This is SILENT
+	// for arbitrary third-party images (e.g. stock redis:7-alpine rejects --podmotion-holder as an
+	// unknown config directive and exits non-zero before binding, causing sk-inet.c:1059 EADDRINUSE
+	// when CRIU tries to restore the TCP_LISTEN socket — ADR-0195 §P-MECHANISM M6).
+	//
+	// ADR-0195 Rule A replaces the workload-entrypoint-dependent approach with a universal injected
+	// no-op holder binary that:
+	//   1. Lives in the agent image at /podmotion/holder (static binary, no dependencies).
+	//   2. Is side-loaded into the replacement pod via an init-container + emptyDir volume.
+	//   3. Replaces the container Command so the holder — not the workload binary — is the
+	//      container init that CRIU restores OVER.
+	//   4. Never binds any port, writes /run/podmotion/holder-ready, prints "podmotion-holder ready"
+	//      to stdout, and is SIGTERM-clean (ADR-0176 C2 readiness-sentinel contract).
+	//
+	// §3h-SYM removal-symmetry: hack/gate-workload/main.go retains --podmotion-holder for
+	// standalone testing; the operator no longer passes it. validateNoEmptyDir is scoped to the
+	// SOURCE pod (see below); the holder emptyDir is on the REPLACEMENT pod (different lifecycle).
+
+	// holderVolumeName is the emptyDir that the init-container writes the holder binary into
+	// and the main container mounts read-only. The name must not collide with source-pod volumes.
+	const holderVolumeName = "podmotion-holder-bin"
+	const holderMountPath = "/podmotion"
+	const holderBinPath = "/podmotion/holder"
+
+	// agentImage is the agent image from which the holder binary is sourced. The init-container
+	// uses the same image as the agent DaemonSet pod running on the destination node (always
+	// present in the node's image store after ImagePullPolicy=Never kind-load or registry pull).
+	// Engineering C1 (quorum): init-container source image is the agent DaemonSet image;
+	// exact holder binary path is /podmotion/holder (built by make build-linux → Dockerfile COPY).
+	// We derive the image from the operator's own image by convention; in a production deployment
+	// this would be set from the Helm agent.image values. For now the init-container image is
+	// set to the same string the Helm chart injects via the AGENT_IMAGE env var if present,
+	// falling back to a well-known default so the operator does not need a flag.
+	agentImage := os.Getenv("AGENT_IMAGE")
+	if agentImage == "" {
+		agentImage = "podmotion-agent:latest"
+	}
+
+	// Inject the holder emptyDir volume onto the replacement pod spec.
+	spec.Volumes = append(spec.Volumes, corev1.Volume{
+		Name: holderVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
+		},
+	})
+
+	// Init-container: copy the holder binary from the agent image into the emptyDir.
+	// The copy runs as root (required for chmod +x); the emptyDir is then mounted
+	// read-only by the main container — no non-holder process can write to it after init.
+	spec.InitContainers = append(spec.InitContainers, corev1.Container{
+		Name:  "podmotion-inject-holder",
+		Image: agentImage,
+		// cp + chmod is portable across debian-slim and does not require shell builtins beyond
+		// what debian:12-slim provides.  We use sh -c because the agent image has /bin/sh.
+		Command: []string{"/bin/sh", "-c",
+			"cp /podmotion/holder /holder-bin/holder && chmod 755 /holder-bin/holder",
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      holderVolumeName,
+				MountPath: "/holder-bin",
+			},
+		},
+	})
+
+	// Override every main container: replace Command/Args with the injected holder binary.
+	// The workload command (e.g. redis-server) is restored BY CRIU from the checkpoint image;
+	// the holder is the container init that CRIU restores OVER.
 	for i := range spec.Containers {
-		// Preserve original Command/Args from the deep-copied source pod spec.
-		// Append --podmotion-holder so the workload binary enters holder mode.
-		spec.Containers[i].Args = append(spec.Containers[i].Args, "--podmotion-holder")
-		// Strip probes: a probe against the holder (no real workload in that
-		// process tree) would fail, and a probe that hit the restored process on
-		// the pod IP would couple container readiness to a process containerd
-		// does not own. Readiness is gated by criuRestoreConfirmed + TrafficVerified.
+		// ADR-0195 Rule A: set Command to the injected holder; clear Args (the holder takes none).
+		// §3h-SYM: --podmotion-holder is NO LONGER appended here. The flag-append path is REMOVED.
+		spec.Containers[i].Command = []string{holderBinPath}
+		spec.Containers[i].Args = nil
+		// Mount the holder emptyDir so the binary resolves at holderBinPath inside the container.
+		spec.Containers[i].VolumeMounts = append(spec.Containers[i].VolumeMounts, corev1.VolumeMount{
+			Name:      holderVolumeName,
+			MountPath: holderMountPath,
+			ReadOnly:  true,
+		})
+		// Strip probes: a probe against the holder (no real workload in that process tree)
+		// would fail, and a probe that hit the restored process on the pod IP would couple
+		// container readiness to a process containerd does not own.
+		// Readiness is gated by criuRestoreConfirmed + TrafficVerified.
 		spec.Containers[i].LivenessProbe = nil
 		spec.Containers[i].ReadinessProbe = nil
 		spec.Containers[i].StartupProbe = nil

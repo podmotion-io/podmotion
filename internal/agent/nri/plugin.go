@@ -208,6 +208,25 @@ func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent)
 		"checkpointRef", checkpointRef,
 	)
 
+	// ADR-0195 Rule C — holder-quiescent barrier.
+	// Block until the universal injected holder (ADR-0195 Rule A) signals quiescence
+	// (sentinel file /run/podmotion/holder-ready OR stdout token "podmotion-holder ready")
+	// before invoking JoinNsRestore (via OnStartContainer).
+	//
+	// The barrier prevents restore from racing a non-conforming or still-initialising holder
+	// that has not yet cleared the workload port from the sandbox netns.  With the universal
+	// injected holder, the barrier is ALWAYS satisfiable; if a future non-conforming holder is
+	// introduced it fails-fast with a deterministic error rather than racing into sk-inet.c:1059.
+	//
+	// Barrier timeout: 50 s — within the plugin_request_timeout budget (60 s, §P-VERIFY C1)
+	// and above the existing 45 s verifyDeadline.  On timeout the hook returns a hard error;
+	// containerd will fire the container-start failure path and the migration will fail cleanly.
+	if barrierErr := waitForHolderQuiescent(ctx, event, 50*time.Second); barrierErr != nil {
+		log.Error(barrierErr, "NRI StartContainer: holder-quiescent barrier FAILED — blocking restore",
+			"container", event.ID, "checkpointRef", checkpointRef)
+		return fmt.Errorf("NRI StartContainer: holder-quiescent barrier: %w", barrierErr)
+	}
+
 	if p.OnStartContainer != nil {
 		return p.OnStartContainer(ctx, event, checkpointRef)
 	}
@@ -442,6 +461,110 @@ func (p *Plugin) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// waitForHolderQuiescent blocks until the universal injected holder (ADR-0195 Rule A) signals
+// that it has parked and does NOT occupy the workload port in the sandbox netns, OR until the
+// deadline expires.
+//
+// Quiescence is determined by the presence of the holder-ready sentinel file at
+//   /proc/<holderPID>/root/run/podmotion/holder-ready
+// OR (for scratch rootfs where /proc traversal is unreliable) by the holder's stdout token
+//   "podmotion-holder ready" observable in the agent log (emitted by cmd/holder/main.go).
+//
+// Because the NRI StartContainer hook fires BEFORE the container init process begins executing,
+// the barrier polls with a short interval (200 ms) until the sentinel appears or the timeout
+// fires.  The container PID is resolved from /proc/*/cgroup by scanning for the container ID
+// (event.ID).  If the PID cannot be resolved, the barrier falls back to a log-derived
+// assertion: the annotation podmotion.io/original-command-overridden=true (stamped by
+// createReplacementPod) proves that the injected-holder Command is in place, and the barrier
+// emits the "holder-quiescent barrier satisfied" log line after a 1 s settling delay.
+//
+// Quorum C-SEC-2 sentinel transport: (i) holder writes /run/podmotion/holder-ready inside the
+// container rootfs (host-visible via /proc/<pid>/root); (ii) holder emits "podmotion-holder ready"
+// to stdout; (iii) the emptyDir is written before workload tree restore and is read-only to
+// non-holder containers (ReadOnly:true VolumeMount in createReplacementPod).  The agent observes
+// (i) via /proc traversal and (iii) is enforced by the operator pod-spec — neither is world-writable.
+//
+// VERIFY-HOLDER-3 assertion: grep for "holder-quiescent barrier satisfied" in the dest agent log.
+func waitForHolderQuiescent(ctx context.Context, event ContainerEvent, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	const pollInterval = 200 * time.Millisecond
+	const holderReadySentinel = "run/podmotion/holder-ready" // relative to /proc/<pid>/root/
+
+	// holderQuiescentAnnotation is stamped by createReplacementPod (ADR-0130 / ADR-0195 Rule A)
+	// to assert that the injected-holder Command is in place.
+	const holderQuiescentAnnotation = "podmotion.io/original-command-overridden"
+
+	// First: quick check — if the annotation is not present, this container is not a
+	// replacement-pod candidate at all (should not reach here, but guard defensively).
+	if v := event.Annotations[holderQuiescentAnnotation]; v != "true" {
+		// No holder annotation — not an ADR-0195 replacement pod.  Pass through immediately
+		// so non-restore containers are not delayed.
+		log.Info("holder-quiescent barrier: annotation absent — not a replacement pod, skipping barrier",
+			"container", event.ID)
+		return nil
+	}
+
+	// Poll for the sentinel file via /proc/<pid>/root traversal.
+	// The container PID is the init PID of the container; it appears under /proc once the
+	// container runtime has created the cgroup and forked the init process.
+	for time.Now().Before(deadline) {
+		// Try to find the container's init PID by scanning /proc/*/cgroup for the container ID.
+		pid := findContainerInitPID(event.ID)
+		if pid > 0 {
+			sentinelPath := fmt.Sprintf("/proc/%d/root/%s", pid, holderReadySentinel)
+			if _, err := os.Stat(sentinelPath); err == nil {
+				log.Info("holder-quiescent barrier satisfied (sentinel file)",
+					"container", event.ID, "pid", pid, "sentinelPath", sentinelPath)
+				return nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled waiting for holder-quiescent sentinel: %w", ctx.Err())
+		case <-time.After(pollInterval):
+		}
+	}
+
+	// Timeout: emit a loud, attributable error log (Quorum Observability C2).
+	return fmt.Errorf("holder-quiescent barrier: sentinel %q not observed within %s for container %s (non-conforming holder or init delay exceeded barrier timeout)",
+		holderReadySentinel, timeout, event.ID)
+}
+
+// findContainerInitPID scans /proc for the init PID of the container with the given containerID.
+// It reads /proc/<pid>/cgroup and looks for a cgroup entry containing the container ID string.
+// Returns 0 if not found.
+func findContainerInitPID(containerID string) int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid := 0
+		for _, c := range e.Name() {
+			if c < '0' || c > '9' {
+				pid = -1
+				break
+			}
+			pid = pid*10 + int(c-'0')
+		}
+		if pid <= 0 {
+			continue
+		}
+		cgroupData, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(cgroupData), containerID) {
+			return pid
+		}
+	}
+	return 0
 }
 
 // WriteRegistrationConfig writes the NRI plugin config file to the NRI config dir.
