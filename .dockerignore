@@ -13,6 +13,8 @@
 # Re-include operator and agent binaries
 !bin/manager-linux-amd64
 !bin/agent-linux-amd64
+# Re-include criu-wrapper binary (ADR-0181 — installed onto kind node image)
+!bin/criu-wrapper-linux-amd64
 
 # Re-include pycriu Python package (required by agent Dockerfile)
 !pycriu/
