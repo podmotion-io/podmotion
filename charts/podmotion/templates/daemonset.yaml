@@ -64,6 +64,28 @@ spec:
           volumeMounts:
             - name: host-run
               mountPath: /host-run
+        # ADR-0183 r1: install podmotion-criu-wrapper onto the host node filesystem.
+        # nsenterCmd (internal/agent/server/server.go) joins the host mount namespace
+        # (--mount=/proc/1/ns/mnt, with hostPID: true above) and execve's the wrapper by
+        # absolute path. That path resolves against the HOST rootfs, NOT this container's
+        # overlay — so the wrapper MUST be copied onto the host. The agent image is its own
+        # installer (in-image binary == exec'd binary, no version skew). Authenticity comes
+        # from the OCI image digest verified by the runtime on pull; there is no co-located
+        # .sha256 checksum (security theater per ADR-0183 S1/C1). Install target is the
+        # PodMotion-owned, non-PATH dir /opt/podmotion/bin (ADR-0183 S2), NOT host system PATH.
+        - name: install-criu-wrapper
+          image: "{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"
+          imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          command:
+            - sh
+            - -c
+            - "mkdir -p /host-opt-podmotion-bin && install -m 0755 /usr/local/bin/podmotion-criu-wrapper /host-opt-podmotion-bin/podmotion-criu-wrapper"
+          volumeMounts:
+            - name: host-opt-podmotion-bin
+              mountPath: /host-opt-podmotion-bin
       containers:
         - name: agent
           image: "{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"
@@ -156,4 +178,11 @@ spec:
         - name: host-var-run-netns
           hostPath:
             path: /var/run/netns
+            type: DirectoryOrCreate
+        # ADR-0183 r1: PodMotion-owned host dir for the criu-wrapper binary install.
+        # Mounted writable ONLY by the install-criu-wrapper init container; the main agent
+        # container does not mount it (least host-writable surface).
+        - name: host-opt-podmotion-bin
+          hostPath:
+            path: /opt/podmotion/bin
             type: DirectoryOrCreate
