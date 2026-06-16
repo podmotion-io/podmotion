@@ -39,6 +39,13 @@ spec:
               value: "{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"
             - name: AGENT_IMAGE_PULL_POLICY
               value: {{ .Values.agent.image.pullPolicy | quote }}
+            # ADR-SEC-C (GC-B7) M2: the operator derives the expected agent SPIFFE ID
+            # (spiffe://podmotion.io/ns/<ns>/sa/podmotion-agent) from its runtime namespace so the
+            # operator→agent peer pin is correct on non-default-namespace installs (never hardcoded).
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           args:
             - --leader-elect
             - --metrics-bind-address=:8080
