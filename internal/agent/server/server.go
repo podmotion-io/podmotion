@@ -1777,7 +1777,7 @@ var containerdMaskedPaths = []string{
 var standardPodMounts = []string{
 	"/data",
 	"/dev/termination-log",
-	"/run/secrets/kubernetes.io/serviceaccount",
+	"/var/run/secrets/kubernetes.io/serviceaccount",
 	"/dev/shm",
 	"/etc/resolv.conf",
 	"/etc/hostname",
@@ -1960,7 +1960,7 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		// by the destination kubelet for the replacement pod, and the migrated workload
 		// (redis) does not depend on the SA token. Mirrors the SkipMnt policy already used on
 		// the go-criu restore path. (ADR-0131 restore path.)
-		"--skip-mnt", "/run/secrets/kubernetes.io/serviceaccount",
+		"--skip-mnt", "/var/run/secrets/kubernetes.io/serviceaccount",
 		// dmi sysfs absent on kind control-plane nodes — bind-mount restore fails with
 		// "No such file or directory". Not needed for checkpoint/restore correctness.
 		"--skip-mnt", "/sys/devices/virtual/dmi/id/product_name",
@@ -2202,7 +2202,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 		"sys/devices/virtual/dmi/id",
 		"sys/devices/virtual/powercap",
 		"tmp", "data",
-		"run", "run/secrets/kubernetes.io/serviceaccount",
+		"run", "var/run/secrets/kubernetes.io/serviceaccount",
 	}
 	for _, d := range dirsToCreate {
 		if out, err := nsenterCmd("mkdir", "-p", filepath.Join(rootfsDir, d)).CombinedOutput(); err != nil {
@@ -2871,7 +2871,7 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     # the CRIU restore mntns, so CRIU fails with "Can't bind-mount at .../<path>: No such file
     # or directory" (mount.c:2511). Strip them at dump time (ADR-0131 restore path).
     drop_mnts = {
-        '/run/secrets/kubernetes.io/serviceaccount',
+        '/var/run/secrets/kubernetes.io/serviceaccount',
         '/etc/hosts',
         '/etc/hostname',
         '/etc/resolv.conf',
