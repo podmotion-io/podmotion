@@ -90,10 +90,17 @@ make install
 
 **Deploy the Manager to the cluster with the image specified by `IMG`:**
 
-> ⚠️ The kustomize path (config/default/) passes flags that crash the current operator binary. Use the Helm deploy path in CLAUDE.md for working installation.
+> ⚠️ The kustomize path (`config/default/`) is for CRD generation only — do not deploy from it. Use the Helm path documented in [CONTRIBUTING.md](CONTRIBUTING.md#helm-deploy-kinddev).
 
 ```sh
-make deploy IMG=ghcr.io/podmotion-io/podmotion:tag
+helm upgrade --install podmotion charts/podmotion/ \
+  --namespace podmotion-system --create-namespace \
+  --set operator.image.repository=<your-registry>/podmotion-operator \
+  --set operator.image.tag=<tag> \
+  --set agent.image.repository=<your-registry>/podmotion-agent \
+  --set agent.image.tag=<tag> \
+  --set webhook.certManager.enabled=false \
+  --set installCRDs=false
 ```
 
 > **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin

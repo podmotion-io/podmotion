@@ -98,9 +98,7 @@ func main() {
 	flag.StringVar(&featureGates, "feature-gates", "",
 		"Comma-separated list of <Gate>=true|false pairs enabling experimental features "+
 			"(e.g. TCPPreservation=true,GPUMigration=false). No gate is enabled by default.")
-	opts := zap.Options{
-		Development: true,
-	}
+	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
