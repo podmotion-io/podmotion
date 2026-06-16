@@ -29,6 +29,11 @@ spec:
           image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
           imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
           command: [/manager]
+          env:
+            - name: AGENT_IMAGE
+              value: "{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"
+            - name: AGENT_IMAGE_PULL_POLICY
+              value: {{ .Values.agent.image.pullPolicy | quote }}
           args:
             - --leader-elect
             - --metrics-bind-address=:8080

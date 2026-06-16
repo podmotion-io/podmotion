@@ -39,8 +39,6 @@ import (
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	agentclient "github.com/podmotion-io/podmotion/internal/agent/client"
-	"github.com/podmotion-io/podmotion/internal/gitops"
-	pmmetrics "github.com/podmotion-io/podmotion/internal/metrics"
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
 	gpuagent "github.com/podmotion-io/podmotion/internal/agent/gpu"
 	"github.com/podmotion-io/podmotion/internal/agent/replication"
@@ -48,6 +46,8 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/traffic"
 	"github.com/podmotion-io/podmotion/internal/estimation"
 	"github.com/podmotion-io/podmotion/internal/featuregate"
+	"github.com/podmotion-io/podmotion/internal/gitops"
+	pmmetrics "github.com/podmotion-io/podmotion/internal/metrics"
 	"github.com/podmotion-io/podmotion/internal/orchestration"
 	"github.com/podmotion-io/podmotion/internal/rollback"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
@@ -59,28 +59,28 @@ const (
 	finalizerName = "migration.podmotion.io/finalizer"
 
 	// Condition types used on PodMigration status.
-	conditionValidated               = "Validated"
-	conditionCheckpointed            = "Checkpointed"
-	conditionRestored                = "Restored"
-	conditionTrafficVerified         = "TrafficVerified"
-	conditionMemorySynced            = "MemorySynced"
-	conditionStorageReady            = "StorageReadyForFreeze"
-	conditionNetworkBridgeArmed      = "NetworkBridgeArmed"
-	conditionPDBToken                = "PDBTokenAcquired"
-	conditionSourcePodDeleted        = "SourcePodDeleted"
-	conditionCapacityReserved        = "CapacityReserved"
-	conditionDestinationVolumeReady  = "DestinationVolumeReady"
-	conditionSchedulingGateRemoved   = "SchedulingGateRemoved"
-	conditionSecurityContextVerified = "SecurityContextVerified"
-	conditionDataplaneReconciled     = "DataplaneReconciled"
-	conditionGitOpsSuspended              = "GitOpsSuspended"
-	conditionEndpointSliceCleanVerified   = "EndpointSliceCleanupVerified"
+	conditionValidated                  = "Validated"
+	conditionCheckpointed               = "Checkpointed"
+	conditionRestored                   = "Restored"
+	conditionTrafficVerified            = "TrafficVerified"
+	conditionMemorySynced               = "MemorySynced"
+	conditionStorageReady               = "StorageReadyForFreeze"
+	conditionNetworkBridgeArmed         = "NetworkBridgeArmed"
+	conditionPDBToken                   = "PDBTokenAcquired"
+	conditionSourcePodDeleted           = "SourcePodDeleted"
+	conditionCapacityReserved           = "CapacityReserved"
+	conditionDestinationVolumeReady     = "DestinationVolumeReady"
+	conditionSchedulingGateRemoved      = "SchedulingGateRemoved"
+	conditionSecurityContextVerified    = "SecurityContextVerified"
+	conditionDataplaneReconciled        = "DataplaneReconciled"
+	conditionGitOpsSuspended            = "GitOpsSuspended"
+	conditionEndpointSliceCleanVerified = "EndpointSliceCleanupVerified"
 	// conditionIPHandoffInjected records that the ADR-0133 destination-side neighbor/FDB
 	// handoff for the OLD pod IP has been installed and the reachability probe passed.
-	conditionIPHandoffInjected            = "IPHandoffInjected"
+	conditionIPHandoffInjected = "IPHandoffInjected"
 	// conditionRestoreTimedOut is set when the restore deadline elapses, driving
 	// the migration to RollingBack (ADR-0157 D3/GC-32). Reason: RestoreDeadlineExceeded.
-	conditionRestoreTimedOut              = "RestoreTimedOut"
+	conditionRestoreTimedOut = "RestoreTimedOut"
 )
 
 // macWritebackDeadline tracks the first time injectIPHandoff observed
@@ -747,11 +747,11 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 		"migration", pm.Name, "node", destNode, "fdbIfname", fdbIfname,
 		"seqXlatSeeded", seqXlatSeeded, "tcpSeqSnapshotCount", len(pm.Status.TCPSeqSnapshots))
 	confirmResp, confirmErr := destAgent.ConfirmOverlayReady(ctx, &agentpb.ConfirmOverlayReadyRequest{
-		MigrationName:        pm.Name,
-		SeqXlatSeeded:        seqXlatSeeded,
-		FdbIfname:            fdbIfname,
-		PodIp:                pm.Spec.SourcePodIP,
-		PodMac:               pm.Status.SourcePodMac,
+		MigrationName: pm.Name,
+		SeqXlatSeeded: seqXlatSeeded,
+		FdbIfname:     fdbIfname,
+		PodIp:         pm.Spec.SourcePodIP,
+		PodMac:        pm.Status.SourcePodMac,
 		// VtepIp intentionally omitted: the destination agent resolves its local
 		// VTEP IP from FdbIfname at call time (avoids conflating MAC with IP).
 		SourceConntrackArmed: pm.Status.SourceConntrackArmed,
@@ -868,11 +868,11 @@ func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm 
 		log.Info("DisengageHold: calling ConfirmOverlayReady on destination agent (post-restore, all 6 predicates)",
 			"migration", pm.Name, "node", destNode)
 		overlayResp, overlayErr := destAgentForConfirm.ConfirmOverlayReady(ctx, &agentpb.ConfirmOverlayReadyRequest{
-			MigrationName:        pm.Name,
-			SeqXlatSeeded:        seqXlatSeeded,
-			FdbIfname:            fdbIfname,
-			PodIp:                pm.Spec.SourcePodIP,
-			PodMac:               pm.Status.SourcePodMac,
+			MigrationName: pm.Name,
+			SeqXlatSeeded: seqXlatSeeded,
+			FdbIfname:     fdbIfname,
+			PodIp:         pm.Spec.SourcePodIP,
+			PodMac:        pm.Status.SourcePodMac,
 			// VtepIp intentionally omitted: the destination agent resolves its local
 			// VTEP IP from FdbIfname at call time (avoids conflating MAC with IP).
 			SourceConntrackArmed: pm.Status.SourceConntrackArmed,
@@ -2636,7 +2636,6 @@ func (r *PodMigrationReconciler) reconcileRestoringNRI(ctx context.Context, pm *
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseVerifying)
 }
 
-
 // nodeInternalIP returns the InternalIP address of the named Node (the flannel VXLAN
 // underlay endpoint on this single-NIC PoC). Used by ADR-0136 to tell the source agent
 // which underlay IP to encapsulate the relocated OLD pod IP toward.
@@ -3777,9 +3776,23 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	// this would be set from the Helm agent.image values. For now the init-container image is
 	// set to the same string the Helm chart injects via the AGENT_IMAGE env var if present,
 	// falling back to a well-known default so the operator does not need a flag.
+	// ADR-0196: holder init-container image == the agent image, injected by the Helm chart
+	// from agent.image.* via AGENT_IMAGE (byte-identical to the agent DaemonSet image, which
+	// is the only podmotion-agent image proven present in the destination node's store). A
+	// missing AGENT_IMAGE is a deployment defect, not a recoverable default — the old
+	// "podmotion-agent:latest" fallback was unschedulable on the gate substrate (pullPolicy
+	// Never, sprint-tagged images) and silently masked the misconfiguration as ImagePullBackOff.
 	agentImage := os.Getenv("AGENT_IMAGE")
 	if agentImage == "" {
-		agentImage = "podmotion-agent:latest"
+		// fail loudly — never fabricate an image string (see ADR-0196 §3h-SYM).
+		return fmt.Errorf("AGENT_IMAGE env not set on operator Deployment: cannot resolve holder init-container image (ADR-0195 Rule A / ADR-0196); set agent.image via Helm")
+	}
+	// Init-container pull policy must match how the agent image reached the node: Never on
+	// kind (kind-load), IfNotPresent in production (registry). Sourced from
+	// AGENT_IMAGE_PULL_POLICY (Helm: agent.image.pullPolicy) so one binary is correct on both.
+	holderPullPolicy := corev1.PullPolicy(os.Getenv("AGENT_IMAGE_PULL_POLICY"))
+	if holderPullPolicy == "" {
+		holderPullPolicy = corev1.PullIfNotPresent
 	}
 
 	// Inject the holder emptyDir volume onto the replacement pod spec.
@@ -3794,8 +3807,9 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	// The copy runs as root (required for chmod +x); the emptyDir is then mounted
 	// read-only by the main container — no non-holder process can write to it after init.
 	spec.InitContainers = append(spec.InitContainers, corev1.Container{
-		Name:  "podmotion-inject-holder",
-		Image: agentImage,
+		Name:            "podmotion-inject-holder",
+		Image:           agentImage,
+		ImagePullPolicy: holderPullPolicy,
 		// cp + chmod is portable across debian-slim and does not require shell builtins beyond
 		// what debian:12-slim provides.  We use sh -c because the agent image has /bin/sh.
 		Command: []string{"/bin/sh", "-c",
@@ -3940,7 +3954,6 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 		return r.Status().Update(ctx, fresh)
 	})
 }
-
 
 // statusUpdate persists pm.Status via a fresh re-fetch + retry.RetryOnConflict loop so that
 // concurrent controller reconcile loops (or the status verifier goroutine) do not cause stale
@@ -4256,8 +4269,8 @@ func preCopyTCPGatePassed(pm *pmv1.PodMigration) bool {
 	}
 
 	const (
-		minDirtyConvergence    = 0.9
-		maxRetransmitHeadroom  = 0.5
+		minDirtyConvergence   = 0.9
+		maxRetransmitHeadroom = 0.5
 	)
 
 	convergence := preCopyDirtyConvergence(pm)
