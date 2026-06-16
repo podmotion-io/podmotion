@@ -49,6 +49,8 @@ fleetctl
 
 # Claude Code project files
 .claude/settings.local.json
+CLAUDE.md
+AGENTS.md
 
 # Compiled binaries directory
 bin/
