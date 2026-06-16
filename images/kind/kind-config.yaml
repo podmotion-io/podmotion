@@ -23,6 +23,15 @@ nodes:
         containerPath: /sys/fs/bpf
         propagation: Bidirectional
 networking:
+  # disableDefaultCNI: kind's default CNI is kindnet. `make kind-create` separately
+  # applies flannel (kube-flannel v0.25.4). Without this flag BOTH kindnet and flannel
+  # install on the same podSubnet (10.244.0.0/16): kindnet authors plain-L3 routes
+  # (10.244.1.3 via <node> dev eth0) while flannel brings up flannel.1 vxlan devices —
+  # the forwarding plane and device plane contradict, cross-node pod packets are dropped,
+  # and the agent's substrate detection (internal/agent/nmcregistrar/registrar.go) is
+  # ambiguous. Disabling the default CNI makes flannel the single coherent plane.
+  # ADR-MAP: ADR-0202 (Sprint 35 Phase C §P-SUBSTRATE dual-CNI fix).
+  disableDefaultCNI: true
   podSubnet: "10.244.0.0/16"
   serviceSubnet: "10.96.0.0/12"
 featureGates:
