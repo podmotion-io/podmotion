@@ -55,7 +55,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -96,9 +99,9 @@ var migrationUIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,127}$`)
 
 // Request is the JSON wire request accepted on the broker socket.
 type Request struct {
-	Op string `json:"op"` // "create" | "teardown" | "exec"
+	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal"
 	// MigrationUID names the per-migration netns dir. Validated by migrationUIDRe.
-	// Required on create/teardown; ignored on exec.
+	// Required on create/teardown; ignored on exec*.
 	MigrationUID string `json:"migrationUID"`
 	// SrcPID, when > 0 on a create, selects /proc/<srcPID>/ns/net as the netns to
 	// bind (the pod-in-migration's netns). When 0, the broker unshares a FRESH
@@ -116,6 +119,21 @@ type Request struct {
 	// against execAllowlist; the broker never runs an arbitrary client-supplied
 	// binary (SC-1-EXEC).
 	Argv []string `json:"argv,omitempty"`
+
+	// ADR-0234: ASYNC exec ops (exec_start / exec_poll / exec_signal) for the
+	// LONG-RUNNING CRIU restore wrapper. The synchronous "exec" op runs the
+	// command to completion (cmd.Run) and is unsuitable for the CRIU wrapper,
+	// which on the cold --join-ns path never self-exits: it stays as the
+	// foreground workload parent for the lifetime of the workload (ADR-0192).
+	// The agent must launch it, then poll a cgroup-PID liveness signal while the
+	// wrapper still runs, then reap it asynchronously. exec_start spawns the
+	// wrapper DETACHED in the host mount namespace and returns its host PID;
+	// exec_poll reports whether it has exited (+ exit code + stderr tail + the
+	// broker-cgroup PID set so the agent can run the ADR-0128 new-entrant diff);
+	// exec_signal delivers a signal (Abort). WrapperPID identifies the spawned
+	// process on poll/signal. Signal is the signal number for exec_signal.
+	WrapperPID int `json:"wrapperPID,omitempty"`
+	Signal     int `json:"signal,omitempty"`
 }
 
 // Response is the JSON wire response. Error is "" on success.
@@ -137,6 +155,19 @@ type Response struct {
 	Stdout   []byte `json:"stdout,omitempty"`
 	Stderr   []byte `json:"stderr,omitempty"`
 	Combined []byte `json:"combined,omitempty"`
+
+	// ADR-0234 (async exec ops only).
+	// WrapperPID: on exec_start, the host PID of the detached CRIU wrapper.
+	WrapperPID int `json:"wrapperPID,omitempty"`
+	// Running: on exec_poll, true while the wrapper is still alive; false once it
+	// has exited (and been reaped). When false, ExitCode/Stderr carry the result.
+	Running bool `json:"running,omitempty"`
+	// CgroupPIDs: on exec_poll, the PIDs currently resident in the BROKER's own
+	// cgroup. Because the wrapper is the broker's child, --manage-cgroups=ignore
+	// lands the CRIU-restored tree in the broker cgroup; the agent diffs this set
+	// against the exec_start snapshot to detect the restored workload (ADR-0128
+	// new-entrant liveness signal, relocated to the broker cgroup).
+	CgroupPIDs []int `json:"cgroupPIDs,omitempty"`
 }
 
 // netnsPathFor returns the broker-computed bind target for a migrationUID.
@@ -192,8 +223,17 @@ func Handle(req Request) Response {
 	case "exec":
 		// ADR-0231: run an allowlisted host-mount-ns command on the agent's behalf.
 		return doExec(req.Argv)
+	case "exec_start":
+		// ADR-0234: spawn the long-running CRIU wrapper detached, return its host PID.
+		return doExecStart(req.Argv)
+	case "exec_poll":
+		// ADR-0234: report wrapper liveness/exit + broker-cgroup PID set.
+		return doExecPoll(req.WrapperPID)
+	case "exec_signal":
+		// ADR-0234: signal the wrapper (Abort path).
+		return doExecSignal(req.WrapperPID, req.Signal)
 	default:
-		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec)", req.Op))
+		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal)", req.Op))
 	}
 }
 
@@ -269,6 +309,260 @@ func toResponse(path string, err error) Response {
 		return Response{Error: err.Error()}
 	}
 	return Response{Path: path}
+}
+
+// ADR-0234: async exec registry for the long-running CRIU restore wrapper.
+//
+// The synchronous "exec" op (doExec) runs to completion; the CRIU wrapper on the
+// cold --join-ns path does not self-exit, so it is launched DETACHED here and
+// reaped via exec_poll. entry holds the spawned *exec.Cmd, a bounded stderr
+// buffer (CRIU diagnostics when it fails before opening its -o logfile), the
+// PID-set snapshot of the BROKER cgroup at spawn time (the new-entrant baseline
+// for the ADR-0128 liveness diff, relocated to the broker cgroup because the
+// wrapper is now the broker's child), and the once-only reap result.
+type asyncExecEntry struct {
+	cmd        *exec.Cmd
+	stderr     *bytes.Buffer
+	reaped     bool
+	exitCode   int
+	beforePIDs map[int]bool
+}
+
+var (
+	asyncExecMu  sync.Mutex
+	asyncExecReg = map[int]*asyncExecEntry{}
+)
+
+// asyncExecStderrCap bounds the stderr buffer for a detached wrapper. CRIU's
+// pre-logfile diagnostics are short; 64 KiB is ample and caps broker memory.
+const asyncExecStderrCap = 64 << 10
+
+// validateCriuWrapperArgv is the SC-1-EXEC security gate for the ASYNC path. The
+// async ops exist ONLY to launch the CRIU restore wrapper, so the gate is
+// TIGHTER than doExec's binary allowlist: argv[0] MUST be exactly the
+// PodMotion-owned wrapper binary (ADR-0181/0183), not any allowlisted binary.
+// This keeps the detached-spawn surface from becoming a general async-exec proxy:
+// the only thing the agent can start-and-leave-running via the broker is the CRIU
+// wrapper. The wrapper itself validates its --cgroup-fd=N:path args and execs
+// /usr/sbin/criu; the broker does not re-parse criu's flags here (the wrapper is
+// the trusted PodMotion-built launcher), but it DOES pin argv[0] so no other
+// binary can be detached. (§3h-SYM: this mirrors ADR-0231's execAllowlist binary
+// gate; the async path narrows it to a single binary.)
+const criuWrapperBin = "/opt/podmotion/bin/podmotion-criu-wrapper"
+
+func validateCriuWrapperArgv(argv []string) error {
+	if len(argv) == 0 {
+		return fmt.Errorf("exec_start: empty argv")
+	}
+	if argv[0] != criuWrapperBin {
+		// Do not leak which binary is permitted; mirror SC-1-EXEC's opacity.
+		return fmt.Errorf("exec_start: binary %q not permitted on the async path", argv[0])
+	}
+	return nil
+}
+
+// brokerCgroupPIDs returns the PIDs resident in the BROKER's own cgroup v2. The
+// wrapper is spawned as a broker child, so with --manage-cgroups=ignore the
+// CRIU-restored process tree lands here, not in the agent cgroup. The agent
+// diffs this set (via exec_poll) against the exec_start snapshot to detect the
+// new workload entrant (ADR-0128 liveness signal).
+func brokerCgroupPIDs() (map[int]bool, error) {
+	selfCgroup, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return nil, fmt.Errorf("read broker /proc/self/cgroup: %w", err)
+	}
+	var rel string
+	for _, line := range strings.Split(string(selfCgroup), "\n") {
+		// cgroup v2 unified line: "0::<path>".
+		if strings.HasPrefix(line, "0::") {
+			rel = strings.TrimPrefix(line, "0::")
+			break
+		}
+	}
+	if rel == "" {
+		return nil, fmt.Errorf("broker has no cgroup v2 unified entry")
+	}
+	procsPath := filepath.Join("/sys/fs/cgroup", rel, "cgroup.procs")
+	data, err := os.ReadFile(procsPath)
+	if err != nil {
+		return nil, fmt.Errorf("read broker cgroup.procs (%s): %w", procsPath, err)
+	}
+	pids := make(map[int]bool)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if pid, convErr := strconv.Atoi(line); convErr == nil {
+			pids[pid] = true
+		}
+	}
+	return pids, nil
+}
+
+// doExecStart spawns the CRIU restore wrapper DETACHED in the host mount
+// namespace and returns its host PID. It does NOT wait — the agent polls via
+// exec_poll. The pre-spawn broker-cgroup PID snapshot is recorded so exec_poll
+// can return the new-entrant baseline diff context.
+func doExecStart(argv []string) Response {
+	if err := validateCriuWrapperArgv(argv); err != nil {
+		return Response{Error: err.Error()}
+	}
+
+	// Snapshot the broker cgroup BEFORE the wrapper forks so the agent's ADR-0128
+	// diff sees the restored tree as the new entrant. Best-effort: a snapshot error
+	// is non-fatal (the agent's exit-code path still detects failure); record an
+	// empty baseline so every later PID reads as "new".
+	beforePIDs, _ := brokerCgroupPIDs()
+	if beforePIDs == nil {
+		beforePIDs = map[int]bool{}
+	}
+
+	cmd := nsenterHostMnt(argv...)
+	stderr := &bytes.Buffer{}
+	cmd.Stderr = &capWriter{buf: stderr, cap: asyncExecStderrCap}
+
+	if err := cmd.Start(); err != nil {
+		return Response{Error: fmt.Sprintf("exec_start: spawn wrapper: %v", err)}
+	}
+	pid := cmd.Process.Pid
+
+	asyncExecMu.Lock()
+	asyncExecReg[pid] = &asyncExecEntry{cmd: cmd, stderr: stderr, beforePIDs: beforePIDs}
+	asyncExecMu.Unlock()
+
+	return Response{WrapperPID: pid}
+}
+
+// doExecPoll reports whether the wrapper PID is still running. It performs a
+// NON-BLOCKING reap: if the process has exited it Wait()s once, records the exit
+// code + stderr, and reports Running:false; otherwise Running:true. Either way it
+// returns the current broker-cgroup PID set (and the spawn baseline implicitly via
+// the agent's own snapshot) so the agent can run the new-entrant liveness diff.
+func doExecPoll(pid int) Response {
+	asyncExecMu.Lock()
+	entry, ok := asyncExecReg[pid]
+	asyncExecMu.Unlock()
+	if !ok {
+		return Response{Error: fmt.Sprintf("exec_poll: unknown wrapper PID %d", pid)}
+	}
+
+	cgPIDs, _ := brokerCgroupPIDs()
+	cgList := make([]int, 0, len(cgPIDs))
+	for p := range cgPIDs {
+		cgList = append(cgList, p)
+	}
+
+	asyncExecMu.Lock()
+	defer asyncExecMu.Unlock()
+	if entry.reaped {
+		ec := entry.exitCode
+		return Response{
+			Running:    false,
+			ExitCode:   &ec,
+			Stderr:     entry.stderr.Bytes(),
+			CgroupPIDs: cgList,
+		}
+	}
+
+	// Non-blocking liveness probe: signal 0 reports whether the PID is still alive
+	// without delivering a signal. The wrapper is a broker child, so once it exits
+	// it is a zombie until we Wait() it — signal 0 still succeeds on a zombie, so we
+	// additionally test the ProcessState after a non-blocking wait.
+	if alive := processAlive(pid); alive {
+		// Still running (or zombie not yet reaped). Try a non-blocking reap: if the
+		// process has become a zombie, Wait returns immediately; if still running,
+		// we must NOT block the broker, so we only reap when /proc shows it dead.
+		if !processZombieOrDead(pid) {
+			return Response{Running: true, CgroupPIDs: cgList}
+		}
+	}
+
+	// Process has exited (dead or zombie) — reap it exactly once.
+	waitErr := entry.cmd.Wait()
+	exitCode := 0
+	if entry.cmd.ProcessState != nil {
+		exitCode = entry.cmd.ProcessState.ExitCode()
+	} else if waitErr != nil {
+		exitCode = -1
+	}
+	entry.reaped = true
+	entry.exitCode = exitCode
+	ec := exitCode
+	return Response{
+		Running:    false,
+		ExitCode:   &ec,
+		Stderr:     entry.stderr.Bytes(),
+		CgroupPIDs: cgList,
+	}
+}
+
+// doExecSignal delivers a signal to the wrapper PID (Abort path). It does not
+// reap — the next exec_poll reaps. An unknown PID is reported as an error.
+func doExecSignal(pid, signal int) Response {
+	asyncExecMu.Lock()
+	entry, ok := asyncExecReg[pid]
+	asyncExecMu.Unlock()
+	if !ok {
+		return Response{Error: fmt.Sprintf("exec_signal: unknown wrapper PID %d", pid)}
+	}
+	sig := syscall.Signal(signal)
+	if signal == 0 {
+		sig = syscall.SIGKILL
+	}
+	if err := entry.cmd.Process.Signal(sig); err != nil {
+		return Response{Error: fmt.Sprintf("exec_signal: signal %d to PID %d: %v", signal, pid, err)}
+	}
+	return Response{}
+}
+
+// processAlive reports whether /proc/<pid> still exists (the process has not been
+// fully reaped). A zombie still has a /proc entry, so this is necessary but not
+// sufficient for "running".
+func processAlive(pid int) bool {
+	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
+	return err == nil
+}
+
+// processZombieOrDead reports whether the process is a zombie (exited, awaiting
+// reap) or already gone. It reads the State field of /proc/<pid>/stat. A 'Z'
+// state (or a missing /proc entry) means the process has exited and Wait() will
+// not block.
+func processZombieOrDead(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return true // gone
+	}
+	// /proc/<pid>/stat: "pid (comm) State ...". comm may contain spaces/parens, so
+	// find the last ')' and read the field after it.
+	s := string(data)
+	close := strings.LastIndex(s, ")")
+	if close < 0 || close+2 >= len(s) {
+		return false
+	}
+	state := s[close+2]
+	return state == 'Z' || state == 'X' || state == 'x'
+}
+
+// capWriter is a bounded io.Writer: it appends to buf until cap bytes, then drops
+// further writes (keeping the HEAD — CRIU's earliest diagnostics are the most
+// useful and arrive first). It bounds broker memory for a detached wrapper whose
+// stderr the broker accumulates across the wrapper's lifetime.
+type capWriter struct {
+	buf *bytes.Buffer
+	cap int
+}
+
+func (w *capWriter) Write(p []byte) (int, error) {
+	if w.buf.Len() >= w.cap {
+		return len(p), nil // silently drop past the cap; report full write
+	}
+	room := w.cap - w.buf.Len()
+	if len(p) > room {
+		w.buf.Write(p[:room])
+		return len(p), nil
+	}
+	return w.buf.Write(p)
 }
 
 // doCreate creates /run/podmotion/netns/<uid>/ and bind-mounts the selected
