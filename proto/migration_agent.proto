@@ -348,16 +348,25 @@ message ArmZeroWindowRequest {
   // Required for ADR-0049 Amendment D fail-closed enforcement: armZeroWindowBPF returns a
   // typed error (rather than nil) on arm failure or ifindex==0 when mode=="Strict".
   string tcp_preservation_mode  = 4;
+  // source_pod_ip is pm.Spec.SourcePodIP — the source pod IP the conntrack NOTRACK
+  // rule is installed for (ADR-0224). Empty on legacy/cold path → NOTRACK arm skipped.
+  string source_pod_ip          = 5;
 }
 message ArmZeroWindowResponse {
   bool   armed          = 1;
   string blocking_reason = 2; // set if armed=false
   int64  armed_at_ns    = 3; // CLOCK_REALTIME ns when TC filter was attached
+  // source_conntrack_armed is true when the source-side NOTRACK rule is confirmed
+  // installed (ADR-0224 predicate E). Read by the controller into Status.SourceConntrackArmed.
+  bool   source_conntrack_armed = 4;
 }
 
 message DisarmZeroWindowRequest {
   string migration_name = 1;
   string pod_uid        = 2;
+  // source_pod_ip is pm.Spec.SourcePodIP — used to remove the conntrack NOTRACK rule
+  // installed at arm time (ADR-0224 3h-SYM). Empty → NOTRACK disarm skipped.
+  string source_pod_ip  = 3;
 }
 message DisarmZeroWindowResponse {
   bool   disarmed        = 1;
