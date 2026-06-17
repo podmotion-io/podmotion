@@ -1,0 +1,35 @@
+name: Disclosure Check
+
+# Tripwire that fails CI if internal delivery-process vocabulary leaks into any
+# git-tracked file. Scans the tracked tree (git ls-files), so it covers source,
+# manifests, and docs — not just Markdown. Locally-ignored internal records
+# (.internal/, gitignored process dirs) are never tracked and so never scanned.
+
+on: [push, pull_request]
+
+jobs:
+  disclose-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for internal-process vocabulary leakage
+        run: |
+          set -euo pipefail
+          # Word-boundary lexicon. Keep in sync with the disclosure policy.
+          LEXICON='thrix|frixel|murven|nultrix|ospen|brivex|belmid|feln|torge|drex|vorn|volm|14-reviewer|ADR-Firewall|scrum-master|Nav-Point|tessera|spetha|spethb'
+          # Exclude this workflow itself — it is the one file that must name the
+          # lexicon in order to enforce it.
+          hits="$(git ls-files \
+            | grep -v '^\.internal/' \
+            | grep -v '^\.github/workflows/disclose-check.yaml$' \
+            | tr '\n' '\0' \
+            | xargs -0 grep -IilwE "$LEXICON" 2>/dev/null || true)"
+          if [ -n "$hits" ]; then
+            echo "FAIL: internal-process vocabulary found in git-tracked files:"
+            echo "$hits"
+            echo ""
+            echo "These terms must not appear in any published artifact."
+            echo "Scrub the prose, or relocate the file under .internal/ (local only)."
+            exit 1
+          fi
+          echo "PASS: no internal-process vocabulary in tracked files."

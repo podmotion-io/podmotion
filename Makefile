@@ -97,7 +97,7 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # Optional env vars:
 #   CERT_MANAGER_INSTALL_SKIP=true  — skip cert-manager installation (default: skip on kubeadm)
 #   KUBECONFIG                      — path to kubeconfig (default: ~/.kube/config)
-#   E2E_LABEL_FILTER                — Ginkgo label filter (e.g. "feln" for NS#3 only)
+#   E2E_LABEL_FILTER                — Ginkgo label filter (e.g. "proof" for the proof milestone only)
 
 E2E_TIMEOUT ?= 30m
 E2E_LABEL_FILTER ?=
@@ -121,12 +121,12 @@ test-e2e: setup-test-e2e ## Run the e2e tests against the kubeadm cluster.
 		-timeout $(E2E_TIMEOUT) \
 		$(if $(E2E_LABEL_FILTER),--ginkgo.label-filter=$(E2E_LABEL_FILTER),)
 
-.PHONY: test-e2e-feln
-test-e2e-feln: setup-test-e2e ## Run only the NS#3 Feln stateless migration test.
+.PHONY: test-e2e-proof
+test-e2e-proof: setup-test-e2e ## Run only the stateless live-migration proof test.
 	CERT_MANAGER_INSTALL_SKIP=true \
 	go test -tags=e2e ./test/e2e/ -v -ginkgo.v \
 		-timeout 15m \
-		--ginkgo.label-filter=feln
+		--ginkgo.label-filter=proof
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## No-op on kubeadm — cluster is persistent; test namespaces are cleaned by AfterAll.
@@ -140,7 +140,7 @@ cleanup-test-e2e: ## No-op on kubeadm — cluster is persistent; test namespaces
 .PHONY: pre-deploy
 pre-deploy: ## Run e2e gate tests — exit non-zero if any test fails (required before deploy).
 	@echo "==> Running pre-deploy test gate..."
-	@$(MAKE) test-e2e-feln || { \
+	@$(MAKE) test-e2e-proof || { \
 		echo ""; \
 		echo "ERROR: pre-deploy gate FAILED — do NOT deploy to production nodes."; \
 		echo "       Fix the failing tests before running scripts/deploy-node.sh"; \

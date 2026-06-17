@@ -349,7 +349,7 @@ func main() {
 	}()
 
 	// Start NRI plugin. OnStartContainer triggers CRIU restore when a replacement pod
-	// bearing podmotion.io/checkpoint-ref starts on this node (Feln #2 path).
+	// bearing podmotion.io/checkpoint-ref starts on this node (live restore path #2).
 	nriPlugin := nri.New(
 		nil, // OnStopping: pre-dump trigger wired in M5
 		func(ctx context.Context, event nri.ContainerEvent, checkpointRef string) error {
