@@ -353,7 +353,7 @@ These require an explicit leadership / review ruling before scope is frozen.
   Calico/Cilium/AWS/Azure are tracked v2.0 providers.
 - **ADR-0154 — CNI abstraction amendment (Proposed, full review):** adds `kindnetProvider`
   + `NoOpCNI` to the ADR-0143 v1.0 set and removes the residual `cni0` hardcoding from the
-  agent IP-handoff datapath. **Entry-gate for Sprint 32 (NP-TCP-FULL-STRICT)** — Full-mode
+  agent IP-handoff datapath. **Entry-gate for Sprint 32 (TCP-FULL-STRICT baseline)** — Full-mode
   handoff on the kind substrate (ADR-0145) is blocked until this lands. See
   [`docs/sprints/SPRINT32-PLAN.md`](./sprints/SPRINT32-PLAN.md) §3.
 

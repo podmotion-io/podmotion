@@ -42,6 +42,8 @@ docs/sprints/SPRINT*-VM-*.md
 local_gate
 pm-cni
 fleetctl
+agent
+hack/gate-workload/gate-server
 
 # macOS artifacts
 .DS_Store
@@ -52,12 +54,12 @@ fleetctl
 CLAUDE.md
 AGENTS.md
 
-# IP-protected tessera methodology — lives locally only, never committed or pushed
+# Internal strategy docs — live locally only, never committed or pushed
 docs/AGENTIC_STRATEGY.md
 docs/AGENTIC_STRATEGY_*.md
 
-# Tessera methodology corpus — sprint plans, quorum logs, personas, process docs
-# These document the AI delivery methodology and must never be published
+# Internal delivery-process corpus — sprint plans, review logs, personas, process docs
+# These document the internal delivery process and must never be published
 docs/sprints/
 docs/personas/
 docs/review/
@@ -66,10 +68,28 @@ docs/process/
 docs/chaos/
 docs/cncf/
 docs/compliance/
+docs/memory/
+
+# Internal resumption state file (process engine, never public)
+docs/proof/*-STATE.yaml
+
+# All internal process records (relocated out of the public tree — local only)
+.internal/
+
+# Stray sprint-gate / proposal scratch artifacts (never publish)
+SPRINT*-PHASE-*-GATE-*.md
+docs/adr/PROOF_NS5_BETA_SPRINT_GATE.md
+
+# Internal process/governance ADRs — local only, never public
+docs/adr/0205-principal-architect-agent.md
+docs/adr/0206-*.md
+docs/adr/0207-grounding-obligation-constitutional.md
+docs/adr/ADR-0226-*.md
 
 # Top-level methodology and strategy docs
 docs/STRATEGY-REVIEW-*.md
 docs/NORTH_STAR_SPRINT_PLAN.md
+docs/FELN_SPRINT_PLAN.md
 docs/SPRINT_PLAN.md
 docs/SPRINT_PLAN_M19_M25.md
 docs/ns4-revolutionary-plan.md
