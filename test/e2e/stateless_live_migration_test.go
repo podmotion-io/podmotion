@@ -179,7 +179,7 @@ var _ = Describe("NS#3 — Stateless Live Migration (Operator-Driven)", Ordered,
 				"pm.Status.ReplacementPodName should be set by operator after Checkpointing")
 
 			// Verify it is in Status, not Spec. The Spec type has no ReplacementPodName field
-			// by design (quorum requirement: controller-derived state lives in Status only).
+			// by design (controller-derived state lives in Status only).
 			// We assert the field is populated in Status — the absence from Spec is enforced
 			// at compile time by the type definition.
 			Expect(pm.Status.ReplacementPodName).NotTo(BeEmpty(),

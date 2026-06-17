@@ -20,8 +20,8 @@ import (
 // HandleStartContainer waits (treating OverlayHandoff/FinalFreezeStateCapture as transient) until
 // the operator advances into an accepted restore phase.
 //
-// A red result here is a §3d HARD STOP: the gate does not run and the churn counter does not
-// increment.
+// A red result here is a hard stop: the verification contract is violated and the dependent
+// restore path must not run.
 func TestVerifyPodMigrationAcceptSet(t *testing.T) {
 	acceptedPhases := []string{
 		"Restoring", "RestoreSocketReattach", "DisengageHold",

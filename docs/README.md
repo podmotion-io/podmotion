@@ -6,7 +6,7 @@ Architectural Decision Records capturing every significant design choice in PodM
 
 ## Sprint plans (`docs/sprints/`)
 
-Per-sprint execution plans, gate criteria, and outcome summaries used by the agentic tessera. Each sprint plan records the scope, proof targets, and acceptance conditions for that iteration.
+Per-sprint execution plans, criteria, and outcome summaries used by the development process. Each sprint plan records the scope, proof targets, and acceptance conditions for that iteration.
 
 ## Proof artifacts (`docs/proof/`)
 

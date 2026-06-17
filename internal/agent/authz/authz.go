@@ -31,9 +31,32 @@ import (
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 )
 
-// adrSecAMarker forces the ADR-SEC-A marker string into the agent binary's string table for
-// §P-VERIFY-MULTI deployed-provenance grep (`strings /agent | grep -c 'ADR-SEC-A'`).
+// adrSecAMarker forces the ADR-SEC-A marker string into the agent binary's string table so the
+// deployed binary can be verified to contain the expected marker (`strings /agent | grep -c 'ADR-SEC-A'`).
 const adrSecAMarker = "ADR-SEC-A"
+
+// SPIFFEPrefix is the trust-domain prefix every PodMotion SPIFFE ID must carry. Centralized here
+// so both the agent authz interceptor (suffix-routing in classify) and the operator client
+// callback (exact-equality pinning in the tls package) consult one source of truth (M3).
+const SPIFFEPrefix = "spiffe://podmotion.io/"
+
+// CanonicalSPIFFEID returns the single canonical SPIFFE ID of a VERIFIED leaf certificate.
+//
+// ADR-SEC-C / ADR-SEC-A §2.2: a SPIFFE SVID carries EXACTLY ONE URI SAN. This is the shared
+// single-source-of-truth extractor (M3) consumed by BOTH:
+//   - the agent authz interceptor (verifiedSPIFFEID → classify, which SUFFIX-routes to a role), and
+//   - the operator→agent client callback (which EXACT-equality pins one specific agent ID).
+//
+// The exact-equality pin is the CLIENT caller's contract — this helper only enforces the
+// exactly-one-URI invariant and reads the ID from the leaf. It does NOT itself decide the role or
+// the expected ID. ok=false means the cert is not a well-formed single-URI SVID (zero or >1 URI
+// SANs) and MUST be rejected by callers that require SPIFFE identity.
+func CanonicalSPIFFEID(leaf *x509.Certificate) (id string, ok bool) {
+	if leaf == nil || len(leaf.URIs) != 1 {
+		return "", false
+	}
+	return leaf.URIs[0].String(), true
+}
 
 var log = logf.Log.WithName("agent-authz")
 
@@ -161,8 +184,11 @@ func verifiedSPIFFEID(ctx context.Context) (string, error) {
 		return "", status.Error(codes.Unauthenticated, "ADR-SEC-A: no verified client certificate")
 	}
 	leaf := chains[0][0]
-	if len(leaf.URIs) > 0 {
-		return leaf.URIs[0].String(), nil
+	// Read the canonical single SPIFFE URI from the verified leaf via the shared M3 helper so the
+	// agent and operator sides cannot skew on what "the leaf's SPIFFE ID" means. Fall back to CN
+	// only when the leaf is not a single-URI SVID (legacy belt-and-braces).
+	if id, ok := CanonicalSPIFFEID(leaf); ok {
+		return id, nil
 	}
 	return cnOf(leaf), nil
 }
@@ -171,7 +197,7 @@ func cnOf(c *x509.Certificate) string { return c.Subject.CommonName }
 
 // classify maps a SPIFFE ID to a role. The trailing path segment .../sa/<name> determines role.
 func classify(spiffeID string) Role {
-	if !strings.HasPrefix(spiffeID, "spiffe://podmotion.io/") {
+	if !strings.HasPrefix(spiffeID, SPIFFEPrefix) {
 		return RoleUnknown
 	}
 	switch {

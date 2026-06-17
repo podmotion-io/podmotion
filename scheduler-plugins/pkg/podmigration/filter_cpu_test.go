@@ -9,7 +9,7 @@ you may not use this file except in compliance with the License.
 
 package podmigration_test
 
-// filter_cpu_test.go is the §14b exit-criterion test for ADR-0153
+// filter_cpu_test.go is the exit-criterion test for ADR-0153
 // (CPU Feature Migration Compatibility Gate).
 //
 // It encodes the compatibility predicate defined in ADR-0153 §2:
@@ -25,7 +25,7 @@ package podmigration_test
 // instruction. Skylake is modeled at v4 (Skylake-SP/Server class with AVX-512);
 // Haswell tops out at AVX2 (v3).
 //
-// When Sprint 32 lands the production cpuFeatureCompatible predicate on the
+// When the production cpuFeatureCompatible predicate lands on the
 // scheduler filter, the local helper below is replaced by a call into that
 // implementation; the assertions are the normative contract and must not change.
 
@@ -111,7 +111,7 @@ func haswellProfile() cpuProfile {
 	return cpuProfile{baseline: "x86-64-v3", fingerprint: "sha256-haswell0001", flags: flags}
 }
 
-// TestCPUCompat_SkylakeSourceToHaswellDest_Rejected is the headline §14b assertion.
+// TestCPUCompat_SkylakeSourceToHaswellDest_Rejected is the headline assertion.
 func TestCPUCompat_SkylakeSourceToHaswellDest_Rejected(t *testing.T) {
 	source := skylakeProfile()
 	dest := haswellProfile()
