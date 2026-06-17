@@ -1,4 +1,4 @@
-{{- if .Values.webhook.certManager.enabled }}
+{{- if include "podmotion.execBlockEnabled" . }}
 # ADR-0039 SD-6 / ADR-0148 (agent privilege containment):
 # Deny interactive access (exec/attach/ephemeralcontainers) to the privileged
 # podmotion-agent pods, and deny nodes/proxy from the agent ServiceAccount.
@@ -7,12 +7,30 @@
 # privileged agent pod is DENIED, never fail-open. A fail-open here would reopen
 # exactly the kubectl-exec privilege-escalation vector the control exists to close
 # (contrast the eviction webhook, which fails open to avoid blocking cluster ops).
+#
+# HOLD-B (ADR-0039 SD-6 ungate): this VWC is gated on webhook.agentExecBlock.enabled
+# (default true), NOT on cert-manager. On the cert-manager path the caBundle is injected
+# by the cert-manager CA injector annotation. On the non-cert-manager path (kind/dev) the
+# chart mints a self-signed serving cert (_webhook-certs.tpl + webhook-selfsigned-secret.yaml)
+# and the matching CA is inlined into clientConfig.caBundle below. Either way the operator
+# is wired with --webhook-cert-path so its webhook server is actually serving — a
+# failurePolicy:Fail VWC must never point at a non-serving backend.
+{{- $selfSigned := and (include "podmotion.execBlockEnabled" .) (not .Values.webhook.certManager.enabled) }}
+{{- if $selfSigned }}
+{{- include "podmotion.webhookSelfSignedCert" . -}}
+{{- end }}
+{{- $caBundle := "" }}
+{{- if $selfSigned }}
+{{- $caBundle = ((index . "podmotionWebhookCert").CA | b64enc) }}
+{{- end }}
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
   name: podmotion-agent-exec-block
+  {{- if .Values.webhook.certManager.enabled }}
   annotations:
     cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/podmotion-serving-cert
+  {{- end }}
   labels:
     app.kubernetes.io/name: podmotion
     app.kubernetes.io/component: security
@@ -20,10 +38,24 @@ metadata:
 webhooks:
   # Rule 1 — pods/exec, pods/attach, pods/ephemeralcontainers on agent pods.
   # CONNECT covers exec/attach (subresource streaming connects); CREATE covers
-  # the ephemeralcontainers subresource write. objectSelector scopes to agent pods.
+  # the ephemeralcontainers subresource write.
+  #
+  # HOLD-B scoping fix: objectSelector does NOT work for pods/exec and pods/attach.
+  # On a CONNECT admission review for those subresources the admitted object is the
+  # PodExecOptions / PodAttachOptions (which carries NO labels), not the Pod — so an
+  # objectSelector matchLabels{app: podmotion-agent} never matches and the API server
+  # silently SKIPS the webhook (exec ALLOWED with no handler invocation — the exact
+  # HOLD-B symptom). Scope by namespaceSelector on the operator namespace instead
+  # (immutable kubernetes.io/metadata.name label); the handler then DENIES the
+  # interactive subresources on any pod it is invoked for. podmotion-system holds only
+  # PodMotion components (privileged agent + operator), so namespace-scoping the
+  # interactive-block is correct and strictly wider-safe than the agent-only intent.
   - name: vagentexecblock.podmotion.io
     admissionReviewVersions: ["v1"]
     clientConfig:
+      {{- if $caBundle }}
+      caBundle: {{ $caBundle }}
+      {{- end }}
       service:
         name: podmotion-webhook-service
         namespace: {{ .Release.Namespace }}
@@ -36,9 +68,9 @@ webhooks:
         operations: ["CONNECT", "CREATE"]
         resources: ["pods/exec", "pods/attach", "pods/ephemeralcontainers"]
         scope: Namespaced
-    objectSelector:
+    namespaceSelector:
       matchLabels:
-        app: podmotion-agent
+        kubernetes.io/metadata.name: {{ .Release.Namespace }}
     sideEffects: None
   # Rule 2 — nodes/proxy. A node object carries no agent-component label to select
   # on, so this rule admits all nodes/proxy CONNECTs and the handler scopes the
@@ -46,6 +78,9 @@ webhooks:
   - name: vagentnodeproxyblock.podmotion.io
     admissionReviewVersions: ["v1"]
     clientConfig:
+      {{- if $caBundle }}
+      caBundle: {{ $caBundle }}
+      {{- end }}
       service:
         name: podmotion-webhook-service
         namespace: {{ .Release.Namespace }}
