@@ -31,6 +31,10 @@ agent:
     pullPolicy: IfNotPresent
   grpcPort: 9090
   metricsPort: 9091
+  # ADR-0148 D2: gate CAP_BPF/CAP_PERFMON behind kernel >= 5.8. On kernels < 5.8 these
+  # capability names do not exist and the kubelet/runtime rejects them; set false on such
+  # nodes and BPF/perf rights fall back to CAP_SYS_ADMIN (as they always did pre-5.8).
+  kernelGE58: true
   resources:
     requests:
       cpu: 50m
