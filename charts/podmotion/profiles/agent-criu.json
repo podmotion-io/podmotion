@@ -1,5 +1,5 @@
 {
-  "_comment": "PodMotion agent CRIU-scoped seccomp profile (ADR-0039 SD-5, ADR-0148). Default-deny (SCMP_ACT_ERRNO, errno EPERM=1). Allows the CRIU checkpoint/restore syscall surface plus the Go runtime; denies privilege-escalation, kernel-image-load, keyring, NUMA-policy, perf, and io_uring syscalls outright (they fall through to the default ERRNO action). ptrace(2) is arg-filtered on index 0 (the request) to exactly the request values CRIU issues: PTRACE_SEIZE=0x4206(16902), PTRACE_INTERRUPT=0x4207(16903), PTRACE_DETACH=17, PTRACE_GETREGSET=0x4204(16900), PTRACE_SETREGSET=0x4205(16901). Injection-capable requests (PTRACE_ATTACH=16, PTRACE_POKETEXT=4, PTRACE_POKEDATA=5, PTRACE_POKEUSR=6) are intentionally omitted and denied by default. Meaningful only after privileged:true is dropped (SD-1). Validate against an actual CRIU strace before production.",
+  "_comment": "PodMotion agent CRIU-scoped seccomp profile (ADR-0039 SD-5, ADR-0148). Default-deny (SCMP_ACT_ERRNO, errno EPERM=1). Allows the CRIU checkpoint/restore syscall surface plus the Go runtime; denies privilege-escalation, kernel-image-load, keyring, NUMA-policy, perf, and io_uring syscalls outright (they fall through to the default ERRNO action). ptrace(2) is arg-filtered on index 0 (the request) to exactly the request values CRIU issues: PTRACE_SEIZE=0x4206(16902), PTRACE_INTERRUPT=0x4207(16903), PTRACE_DETACH=17, PTRACE_GETREGSET=0x4204(16900), PTRACE_SETREGSET=0x4205(16901). Injection-capable requests (PTRACE_ATTACH=16, PTRACE_POKETEXT=4, PTRACE_POKEDATA=5, PTRACE_POKEUSR=6) are intentionally omitted and denied by default. Meaningful only after privileged:true is dropped (SD-1). The new-mount-API syscalls (move_mount, open_tree, fsopen, fsmount, fsconfig, fspick) are allowed for CRIU 4.x kerndat init: kerndat.c:1129 issues move_mount to probe MOVE_MOUNT_SET_GROUP support; under default-deny these EPERM and abort kerndat. CAP_CHECKPOINT_RESTORE (cap 40) must also be present on the agent for that probe (see daemonset.yaml). Validate against an actual CRIU strace before production.",
   "defaultAction": "SCMP_ACT_ERRNO",
   "defaultErrnoRet": 1,
   "archMap": [
@@ -55,6 +55,12 @@
         "process_vm_writev",
         "mount",
         "umount2",
+        "move_mount",
+        "open_tree",
+        "fsopen",
+        "fsmount",
+        "fsconfig",
+        "fspick",
         "clone",
         "clone3",
         "unshare",
