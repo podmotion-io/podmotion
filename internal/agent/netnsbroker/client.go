@@ -57,6 +57,53 @@ func (c *Client) Create(ctx context.Context, migrationUID string, srcPID int) (s
 	return resp.Path, nil
 }
 
+// ExecResult is the outcome of a broker host-mount-ns exec. It mirrors what the
+// agent would have gotten from running `nsenter --mount=/proc/1/ns/mnt -- <argv>`
+// itself: ExitCode is the command's exit status, Stdout/Stderr/Combined are the
+// captured streams. SpawnErr is non-nil ONLY when the broker could not run the
+// command at all (validation reject, nsenter spawn failure) — a non-zero ExitCode
+// is NOT a SpawnErr.
+type ExecResult struct {
+	ExitCode int
+	Stdout   []byte
+	Stderr   []byte
+	Combined []byte
+	SpawnErr error
+}
+
+// Exec asks the privileged broker to run an allowlisted command in the HOST mount
+// namespace (ADR-0231). The de-privileged SD-1 agent cannot itself enter the host
+// mount namespace (setns(CLONE_NEWNS) needs CAP_SYS_ADMIN in the host init userns,
+// which only privileged:true confers), so the restore-path host-mount-ns work
+// (ctr image pull, the CRIU wrapper, rootfs scaffolding) is delegated here.
+//
+// opTimeout overrides the client's default per-request timeout: CRIU restore can
+// run far longer than the 30s netns-bind default. Pass 0 to use the default.
+func (c *Client) Exec(ctx context.Context, opTimeout time.Duration, argv ...string) ExecResult {
+	prev := c.opTimeout
+	if opTimeout > 0 {
+		c.opTimeout = opTimeout
+	}
+	resp, err := c.do(ctx, Request{Op: "exec", Argv: argv})
+	c.opTimeout = prev
+	if err != nil {
+		return ExecResult{ExitCode: -1, SpawnErr: fmt.Errorf("netns-broker exec %v: %w", argv, err)}
+	}
+	if resp.Error != "" {
+		return ExecResult{ExitCode: -1, SpawnErr: fmt.Errorf("netns-broker exec %v: %s", argv, resp.Error)}
+	}
+	exit := 0
+	if resp.ExitCode != nil {
+		exit = *resp.ExitCode
+	}
+	return ExecResult{
+		ExitCode: exit,
+		Stdout:   resp.Stdout,
+		Stderr:   resp.Stderr,
+		Combined: resp.Combined,
+	}
+}
+
 // Teardown requests unmount+removal of the per-migration netns. Idempotent broker-side.
 func (c *Client) Teardown(ctx context.Context, migrationUID string) error {
 	resp, err := c.do(ctx, Request{Op: "teardown", MigrationUID: migrationUID})
