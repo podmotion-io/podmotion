@@ -97,7 +97,7 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # Optional env vars:
 #   CERT_MANAGER_INSTALL_SKIP=true  — skip cert-manager installation (default: skip on kubeadm)
 #   KUBECONFIG                      — path to kubeconfig (default: ~/.kube/config)
-#   E2E_LABEL_FILTER                — Ginkgo label filter (e.g. "northstar" for NS#3 only)
+#   E2E_LABEL_FILTER                — Ginkgo label filter (e.g. "feln" for NS#3 only)
 
 E2E_TIMEOUT ?= 30m
 E2E_LABEL_FILTER ?=
@@ -121,12 +121,12 @@ test-e2e: setup-test-e2e ## Run the e2e tests against the kubeadm cluster.
 		-timeout $(E2E_TIMEOUT) \
 		$(if $(E2E_LABEL_FILTER),--ginkgo.label-filter=$(E2E_LABEL_FILTER),)
 
-.PHONY: test-e2e-northstar
-test-e2e-northstar: setup-test-e2e ## Run only the NS#3 North Star stateless migration test.
+.PHONY: test-e2e-feln
+test-e2e-feln: setup-test-e2e ## Run only the NS#3 Feln stateless migration test.
 	CERT_MANAGER_INSTALL_SKIP=true \
 	go test -tags=e2e ./test/e2e/ -v -ginkgo.v \
 		-timeout 15m \
-		--ginkgo.label-filter=northstar
+		--ginkgo.label-filter=feln
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## No-op on kubeadm — cluster is persistent; test namespaces are cleaned by AfterAll.
@@ -140,7 +140,7 @@ cleanup-test-e2e: ## No-op on kubeadm — cluster is persistent; test namespaces
 .PHONY: pre-deploy
 pre-deploy: ## Run e2e gate tests — exit non-zero if any test fails (required before deploy).
 	@echo "==> Running pre-deploy test gate..."
-	@$(MAKE) test-e2e-northstar || { \
+	@$(MAKE) test-e2e-feln || { \
 		echo ""; \
 		echo "ERROR: pre-deploy gate FAILED — do NOT deploy to production nodes."; \
 		echo "       Fix the failing tests before running scripts/deploy-node.sh"; \
@@ -482,6 +482,56 @@ bundle-build:
 bundle-push:
 	$(CONTAINER_TOOL) push $(BUNDLE_IMG)
 
+##@ Supply Chain
+
+# ── Supply chain security (ADR-0077) ─────────────────────────────────────────
+# `make sbom` generates a CycloneDX JSON SBOM for every image and the Helm chart.
+# `make security-scan` Grype-scans every SBOM and FAILs on a fixable CRITICAL/HIGH.
+# `release-gate` gains a `security-scan` prerequisite so no tag is published with a
+# fixable HIGH/CRITICAL CVE (ADR-0077 §1.5 + §7.5 checklist item 5).
+
+SYFT          ?= $(LOCALBIN)/syft
+GRYPE         ?= $(LOCALBIN)/grype
+SYFT_VERSION  ?= v1.18.1
+GRYPE_VERSION ?= v0.85.0
+SBOM_DIR      ?= dist/sbom
+SBOM_SEVERITY ?= high     # grype fail-cutoff: critical|high|medium|low
+
+# Image short names — the four container images in scope (ADR-0077 §1).
+SC_IMAGES     ?= operator agent scheduler checkpoint-gc
+
+.PHONY: syft
+syft: $(SYFT) ## Download syft (CycloneDX SBOM generator) locally if necessary.
+$(SYFT): $(LOCALBIN)
+	$(call go-install-tool,$(SYFT),github.com/anchore/syft/cmd/syft,$(SYFT_VERSION))
+
+.PHONY: grype
+grype: $(GRYPE) ## Download grype (vulnerability scanner) locally if necessary.
+$(GRYPE): $(LOCALBIN)
+	$(call go-install-tool,$(GRYPE),github.com/anchore/grype/cmd/grype,$(GRYPE_VERSION))
+
+.PHONY: sbom
+sbom: $(SYFT) ## Generate a CycloneDX JSON SBOM for every image and the Helm chart (ADR-0077 §1.5).
+	@mkdir -p $(SBOM_DIR)
+	@for b in $(SC_IMAGES); do \
+	  echo "==> SBOM: ghcr.io/podmotion-io/podmotion-$$b:$(VERSION)"; \
+	  "$(SYFT)" "ghcr.io/podmotion-io/podmotion-$$b:$(VERSION)" \
+	    -o cyclonedx-json > "$(SBOM_DIR)/podmotion-$$b.cdx.json" || exit 1; \
+	done
+	"$(SYFT)" dir:charts/podmotion/ -o cyclonedx-json > "$(SBOM_DIR)/chart.cdx.json"
+	@echo "==> SBOMs written to $(SBOM_DIR)/"
+
+.PHONY: security-scan
+security-scan: $(GRYPE) sbom ## Grype-scan every SBOM; FAIL on a fixable CRITICAL/HIGH finding (ADR-0077 §1.5).
+	@fail=0; for f in $(SBOM_DIR)/*.cdx.json; do \
+	  echo "==> scan: $$f"; \
+	  "$(GRYPE)" "sbom:$$f" --fail-on $(SBOM_SEVERITY) --only-fixed || fail=1; \
+	done; \
+	if [ $$fail -ne 0 ]; then \
+	  echo "ERROR: security-scan FAILED — fixable CRITICAL/HIGH CVE present."; exit 1; \
+	fi; \
+	echo "==> security-scan PASSED."
+
 ##@ Release Hygiene
 
 .PHONY: deploy-crds
@@ -518,7 +568,7 @@ crd-upgrade-check: manifests ## Diff live CRDs against generated manifests; exit
 	echo "==> crd-upgrade-check PASSED."
 
 .PHONY: release-gate
-release-gate: crd-upgrade-check ## Run all release gate checks (scripts + CRD check + release-tagged tests).
+release-gate: crd-upgrade-check security-scan ## Run all release gate checks (CRD check + supply-chain scan + scripts + release-tagged tests).
 	@echo "==> Running release gate..."
 	@if [ -f scripts/check-release-gate.sh ]; then \
 	  bash scripts/check-release-gate.sh || { echo "ERROR: check-release-gate.sh FAILED"; exit 1; }; \
