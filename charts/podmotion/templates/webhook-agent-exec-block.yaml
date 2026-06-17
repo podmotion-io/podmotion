@@ -1,0 +1,62 @@
+{{- if .Values.webhook.certManager.enabled }}
+# ADR-0039 SD-6 / ADR-0148 (agent privilege containment):
+# Deny interactive access (exec/attach/ephemeralcontainers) to the privileged
+# podmotion-agent pods, and deny nodes/proxy from the agent ServiceAccount.
+#
+# failurePolicy: Fail — if this webhook is unreachable, interactive access to a
+# privileged agent pod is DENIED, never fail-open. A fail-open here would reopen
+# exactly the kubectl-exec privilege-escalation vector the control exists to close
+# (contrast the eviction webhook, which fails open to avoid blocking cluster ops).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: podmotion-agent-exec-block
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/podmotion-serving-cert
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: security
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+webhooks:
+  # Rule 1 — pods/exec, pods/attach, pods/ephemeralcontainers on agent pods.
+  # CONNECT covers exec/attach (subresource streaming connects); CREATE covers
+  # the ephemeralcontainers subresource write. objectSelector scopes to agent pods.
+  - name: vagentexecblock.podmotion.io
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: podmotion-webhook-service
+        namespace: {{ .Release.Namespace }}
+        path: /validate-core-v1-pod-exec-block
+    failurePolicy: Fail
+    matchPolicy: Equivalent
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CONNECT", "CREATE"]
+        resources: ["pods/exec", "pods/attach", "pods/ephemeralcontainers"]
+        scope: Namespaced
+    objectSelector:
+      matchLabels:
+        app: podmotion-agent
+    sideEffects: None
+  # Rule 2 — nodes/proxy. A node object carries no agent-component label to select
+  # on, so this rule admits all nodes/proxy CONNECTs and the handler scopes the
+  # denial to the agent ServiceAccount by request UserInfo.
+  - name: vagentnodeproxyblock.podmotion.io
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: podmotion-webhook-service
+        namespace: {{ .Release.Namespace }}
+        path: /validate-core-v1-pod-exec-block
+    failurePolicy: Fail
+    matchPolicy: Equivalent
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CONNECT"]
+        resources: ["nodes/proxy"]
+        scope: Cluster
+    sideEffects: None
+{{- end }}
