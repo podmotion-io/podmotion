@@ -2,8 +2,8 @@
 
 **Author:** Agent 0A (Lead Architect, K8s OSS Security)
 **Date:** 2026-06-14
-**Status:** Draft for architecture quorum (tier per milestone below)
-**Governing directive (Chad):** "Solid remediation designs OR better primitives that mitigate risk." Every open finding below carries a concrete design or a lower-level primitive, not generic advice.
+**Status:** Draft for architecture review
+**Design principle:** Solid remediation designs OR better primitives that mitigate risk. Every open finding below carries a concrete design or a lower-level primitive, not generic advice.
 
 ---
 
@@ -11,12 +11,12 @@
 
 The submitted report is **directionally correct but materially out of date on the parts the codebase has already addressed, and materially understated on the parts it has not.** The single most important finding is this:
 
-> **ADR-0106 ("Security Hardening Baseline") — the ADR that specifies the discrete-capability agent, the custom seccomp profile, fail-closed webhooks, node-pool taints, and the supply-chain gates — was REJECTED by the CNCF quorum (`docs/adr/CNCF_AUDIT_REJECTED.md`) and is NOT implemented.** The shipping Helm chart still runs the agent with blanket `privileged: true` (`charts/podmotion/templates/daemonset.yaml:65`), no seccomp profile, no dropped capabilities, and `hostPID: true`. The security design exists on paper, was found non-viable (the `SeccompGuard.Engage()` model is architecturally wrong — see below), and the rejection was never followed by a corrected, accepted ADR. **This is the central gap and the spine of the milestone plan.**
+> **ADR-0106 ("Security Hardening Baseline") — the ADR that specifies the discrete-capability agent, the custom seccomp profile, fail-closed webhooks, node-pool taints, and the supply-chain gates — was REJECTED in security audit review (`docs/adr/CNCF_AUDIT_REJECTED.md`) and is NOT implemented.** The shipping Helm chart still runs the agent with blanket `privileged: true` (`charts/podmotion/templates/daemonset.yaml:65`), no seccomp profile, no dropped capabilities, and `hostPID: true`. The security design exists on paper, was found non-viable (the `SeccompGuard.Engage()` model is architecturally wrong — see below), and the rejection was never followed by a corrected, accepted ADR. **This is the central gap and the spine of the remediation plan.**
 
 Two further "implemented-on-paper, absent-in-code" gaps compound it:
 
 1. **Checkpoint encryption is dead code.** `internal/agent/encryption/encrypt.go` exists, but `grep` for `agent/encryption` across the whole tree returns **only the package's own test file**. It is wired into nothing — not the CRIU writer, not the P2P transfer, not the registry push. ADR-0029 ("encryption on by default") is unimplemented. Full process-memory checkpoints are written and transferred **in plaintext** today.
-2. **mTLS silently fails open.** `internal/agent/tls/tls.go:33-38` returns `nil, nil` (insecure) when cert files are absent, and `cmd/agent/main.go:144` passes that straight to `ListenAndServe`, which logs "without TLS" and serves the **unauthenticated checkpoint/restore gRPC API** (`server.go:1179-1181`). There is no production guard preventing this — exactly the failure ADR-0106 §2b was meant to close, and that guard is unimplemented because ADR-0106 was rejected.
+2. **mTLS silently fails open.** `internal/agent/tls/tls.go:33-38` returns `nil, nil` (insecure) when cert files are absent, and `cmd/agent/main.go:144` passes that straight to `ListenAndServe`, which logs "without TLS" and serves the **unauthenticated checkpoint/restore gRPC API** (`server.go:1179-1181`). There is no production guard preventing this — exactly the failure ADR-0106 [process rule] was meant to close, and that guard is unimplemented because ADR-0106 was rejected.
 
 The good news: several report claims are **already mitigated**. `failurePolicy: Fail` is set on both webhooks in the chart (`webhook.yaml:67,94`); NetworkPolicy templates exist and isolate agent/operator (`networkpolicy.yaml`); the validating webhook has real, substantial admission logic (`podmigration_webhook.go`); RBAC is reasonably scoped (no wildcards, no cluster-admin); checkpoint dirs are `0700` on tmpfs-intent paths; the agent gRPC server *supports* `RequireAndVerifyClientCert` + TLS 1.3 when certs are present.
 
@@ -49,7 +49,7 @@ The good news: several report claims are **already mitigated**. `failurePolicy: 
 
 **Genuinely open:**
 - **Checkpoints are plaintext.** ADR-0029's encryption is unimplemented (see Exec Summary). Full process memory — secrets, JWTs, TLS session keys, KMS creds — lands on disk and on the wire unencrypted.
-- "Zeroize" is `RemoveAll`, which on a journaling/overlay fs or a non-tmpfs fallback leaves recoverable blocks. ADR-0106 §1d mandates a **tmpfs** mount so removal is RAM-backed, but the chart does not mount a tmpfs `emptyDir` for the checkpoint path — it relies on the host `/run` being tmpfs, which is not guaranteed and not asserted.
+- "Zeroize" is `RemoveAll`, which on a journaling/overlay fs or a non-tmpfs fallback leaves recoverable blocks. ADR-0106 [process rule] mandates a **tmpfs** mount so removal is RAM-backed, but the chart does not mount a tmpfs `emptyDir` for the checkpoint path — it relies on the host `/run` being tmpfs, which is not guaranteed and not asserted.
 - No replay/clone defense: a checkpoint archive is a complete, restorable workload identity. Nothing binds an archive to a single restore (no nonce, no one-time token), so a captured archive can be cloned to an attacker node.
 
 **Severity: CRITICAL** (plaintext secrets at rest + in transit) / **HIGH** (replay-clone).
@@ -103,7 +103,7 @@ The good news: several report claims are **already mitigated**. `failurePolicy: 
 
 ### R-1 — Replace `privileged: true` with a discrete capability + seccomp + node-isolation contract
 
-This is the corrected, *viable* version of rejected ADR-0106 §1 and §6. The rejection (`CNCF_AUDIT_REJECTED.md` ADR-0106 crit #2/#3) found the `SeccompGuard.Engage()` model wrong and the `allowPrivilegeEscalation` value disputed. Resolve both:
+This is the corrected, *viable* version of rejected ADR-0106 §1 and §6. The rejection (`CNCF_AUDIT_REJECTED.md` ADR-0106 crit #2/#3) found the `SeccompGuard.Engage()` model wrong and the `allowPrivilegeEscalation` value disputed (citations to the rejection record retained for traceability). Resolve both:
 
 **Capability set (agent container `securityContext`, replacing `privileged: true`):**
 ```yaml
@@ -125,7 +125,7 @@ securityContext:
 ```
 On kernel ≥5.8, `CAP_BPF`+`CAP_PERFMON` split out the eBPF load/perf rights from the `CAP_SYS_ADMIN` blanket; keep `SYS_ADMIN` only for CRIU's `mount(CLONE_NEWNS)` + tmpfs. This is strictly narrower than `privileged`.
 
-**Seccomp profile** (`charts/podmotion/profiles/podmotion-agent.json`): ship the ADR-0106 §1b allowlist **with the corrections from CNCF crit #4** — the prose/JSON `pivot_root` contradiction must be resolved by *removing* `pivot_root`, `kexec_load`, `init_module`/`finit_module`, `delete_module`, `chroot` from the allow list (default `SCMP_ACT_ERRNO`). Validate the allowlist against a real CRIU dump+restore syscall trace (`strace -f criu dump`) in CI rather than hand-curating.
+**Seccomp profile** (`charts/podmotion/profiles/podmotion-agent.json`): ship the ADR-0106 [process rule] allowlist **with the corrections from CNCF crit #4** — the prose/JSON `pivot_root` contradiction must be resolved by *removing* `pivot_root`, `kexec_load`, `init_module`/`finit_module`, `delete_module`, `chroot` from the allow list (default `SCMP_ACT_ERRNO`). Validate the allowlist against a real CRIU dump+restore syscall trace (`strace -f criu dump`) in CI rather than hand-curating.
 
 **Node isolation:** replace the catch-all tolerations (`daemonset.yaml:32-36`) with a dedicated taint contract:
 ```yaml
@@ -139,14 +139,14 @@ tolerations:
 The agent runs **only** on labeled migration nodes, not control-plane, not every tenant node. This shrinks the blast radius of surface 1 from "whole cluster" to "the migration node pool."
 
 - **ADR:** new **ADR-0148** ("Agent Privilege Containment — supersedes the rejected ADR-0106 §1/§6"). Must explicitly supersede, not re-decide (the rejection reason was corpus conflict).
-- **Blast radius:** every node, every workload → **quorum tier 14**.
+- **Blast radius:** every node, every workload — high-impact change requiring full architecture review.
 - **Files:** `charts/podmotion/templates/daemonset.yaml`, `charts/podmotion/profiles/podmotion-agent.json`, `charts/podmotion/values.yaml`.
 
 ### R-2 — Isolate the containerd socket to a restore-only path
 
 Implement ADR-0013 mitigation #1/#3 concretely: mount the containerd socket **read-only** for the steady-state agent container; move task `Create/Start` (the only write ops) behind a separate, short-lived restore invocation that the NRI plugin already mediates. Ship the AppArmor profile that already exists at `images/ubuntu-22.04/apparmor/podmotion-agent` *as a chart-applied annotation* (`container.apparmor.security.beta.kubernetes.io/agent`) so the containerd gRPC method allowlist in ADR-0013 mitigation #2 is actually enforced, not just documented.
 
-- **ADR:** amend **ADR-0013** (move from "accepted risk" to "mitigated"). **Tier 10.** Files: `daemonset.yaml`, chart AppArmor wiring.
+- **ADR:** amend **ADR-0013** (move from "accepted risk" to "mitigated"). Files: `daemonset.yaml`, chart AppArmor wiring.
 
 ### R-3 — Wire checkpoint encryption into the CRIU write + transfer path (close the plaintext gap)
 
@@ -159,11 +159,11 @@ Design:
 4. **Bind the archive to one restore (anti-replay):** the GCM AAD includes `migrationUID || destNodeName || monotonic-nonce`. A captured archive cannot be decrypted on any other node or reused for a second restore — the AAD won't match.
 5. Zeroize the GCM key on every exit path (success/error/panic) via `defer` + explicit buffer wipe; the existing `zeroizeCheckpoints` becomes correct-by-construction because the on-disk bytes are ciphertext.
 
-- **ADR:** implement **ADR-0029** (status moves to Implemented); new **ADR-0149** for the AAD anti-replay binding. **Tier 14** (touches the freeze-window critical path + key handling). Files: `internal/agent/criu/criu_checkpointer.go`, new `encwriter.go`, `internal/agent/transfer/*`, operator threading in `internal/controller/podmigration_controller.go`.
+- **ADR:** implement **ADR-0029** (status moves to Implemented); new **ADR-0149** for the AAD anti-replay binding. High-impact (touches the freeze-window critical path + key handling). Files: `internal/agent/criu/criu_checkpointer.go`, new `encwriter.go`, `internal/agent/transfer/*`, operator threading in `internal/controller/podmigration_controller.go`.
 
 ### R-4 — Make mTLS fail-closed in production
 
-Implement rejected-ADR-0106 §2b as a standalone, accepted decision:
+Implement rejected-ADR-0106 [process rule] as a standalone, accepted decision:
 ```go
 // internal/agent/tls/tls.go — add a production guard
 func LoadServerConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
@@ -180,7 +180,7 @@ func LoadServerConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 ```
 `cmd/agent/main.go` must `os.Exit(1)` (not warn-and-serve) when prod + no TLS. Forbid `InsecureSkipVerify` in the WAN transfer path (`wan.go:36`) on production via the same guard.
 
-- **ADR:** new **ADR-0150** ("mTLS default-secure, no insecure fallback in production"). **Tier 10.** Files: `internal/agent/tls/tls.go`, `cmd/agent/main.go`, `internal/agent/transfer/wan.go`.
+- **ADR:** new **ADR-0150** ("mTLS default-secure, no insecure fallback in production"). Files: `internal/agent/tls/tls.go`, `cmd/agent/main.go`, `internal/agent/transfer/wan.go`.
 
 ### R-5 — eBPF integrity: pin to bpffs with mode 0600 + load-time SHA-256 self-check
 
@@ -189,7 +189,7 @@ func LoadServerConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 2. **Pin maps/programs to a restricted bpffs path** (`/sys/fs/bpf/podmotion/`, dir mode `0700`) so no other CAP_BPF process can `bpf_obj_get` the seq-translation map. cilium/ebpf supports `LoadAndAssignOpts{Maps: ebpf.MapOptions{PinPath: ...}}`.
 3. On kernel ≥5.15 with `CONFIG_BPF_LSM`, optionally attach a thin `BPF_PROG_TYPE_LSM` hook on `bpf` that denies program load by any cgroup other than the agent's — eliminating the "competing program attach" class entirely.
 
-- **ADR:** new **ADR-0151** ("eBPF load-time integrity + bpffs pinning"). **Tier 10.** Files: `internal/agent/network/bpfloader/*`, `bpf/Makefile` (emit per-object hashes), `internal/agent/network/ebpf_linux.go`.
+- **ADR:** new **ADR-0151** ("eBPF load-time integrity + bpffs pinning"). Files: `internal/agent/network/bpfloader/*`, `bpf/Makefile` (emit per-object hashes), `internal/agent/network/ebpf_linux.go`.
 
 ### R-6 — Admission: node-trust gate + migration authorization
 
@@ -209,19 +209,19 @@ if pm.Spec.TargetNodeName != "" {
 ```
 And a **SubjectAccessReview** check: because creating a PodMigration is equivalent in power to dumping a pod's memory, the webhook performs an SSAR for `get pods/exec` (or a new `podmotion.io/migrate` virtual verb) on the source pod by `req.UserInfo`, denying if the subject lacks it. This makes "who can migrate X" equal to "who can already read X's memory" — closing the privilege-laundering path.
 
-- **ADR:** new **ADR-0152** ("Migration authorization = pod-memory-read equivalence; trusted-node gate"). **Tier 10.** File: `internal/webhook/podmigration_webhook.go`.
+- **ADR:** new **ADR-0152** ("Migration authorization = pod-memory-read equivalence; trusted-node gate"). File: `internal/webhook/podmigration_webhook.go`.
 
 ### R-7 — Checkpoint tmpfs enforcement + registry TTL/auto-delete
 
-Mount the checkpoint staging path as a **chart-declared `emptyDir{ medium: Memory, sizeLimit }`** rather than relying on host `/run` being tmpfs; if the medium is not Memory, fail the migration (ADR-0106 §1d, "no host-dir fallback"). For registry-staged checkpoints (ADR-0034), set an OCI annotation TTL and have `pm-checkpoint-gc` delete the registry artifact when the owning `MigrationCheckpoint` reaches `Consumed`/`Failed` — binding artifact lifetime to migration lifetime.
+Mount the checkpoint staging path as a **chart-declared `emptyDir{ medium: Memory, sizeLimit }`** rather than relying on host `/run` being tmpfs; if the medium is not Memory, fail the migration (ADR-0106 [process rule], "no host-dir fallback"). For registry-staged checkpoints (ADR-0034), set an OCI annotation TTL and have `pm-checkpoint-gc` delete the registry artifact when the owning `MigrationCheckpoint` reaches `Consumed`/`Failed` — binding artifact lifetime to migration lifetime.
 
-- **ADR:** amend **ADR-0029**/**ADR-0053**. **Tier 5.** Files: `daemonset.yaml`, `internal/agent/criu/staging.go` (new), GC binary.
+- **ADR:** amend **ADR-0029**/**ADR-0053**. Files: `daemonset.yaml`, `internal/agent/criu/staging.go` (new), GC binary.
 
 ### R-8 — Audit logging of migration events
 
 `internal/agent/audit/` is an **empty directory**. Implement structured, tamper-evident audit events for every migration lifecycle transition (PrepareSource, seccomp-weaken, checkpoint, transfer, restore, source-delete) as Kubernetes Events **and** a structured JSON audit log, including subject (`req.UserInfo`), source/dest node, and outcome. ADR-0009 already requires `SeccompWeakened`/`SeccompRestored` Warning events — implement them (currently the seccomp manager is an M11 stub, `manager.go:64-72`, that hardcodes `profile := "runtime/default"` and does not actually swap or emit events).
 
-- **ADR:** amend **ADR-0009**. **Tier 5.** Files: `internal/agent/audit/*` (new), `internal/agent/seccomp/manager.go`.
+- **ADR:** amend **ADR-0009**. Files: `internal/agent/audit/*` (new), `internal/agent/seccomp/manager.go`.
 
 ---
 
@@ -234,29 +234,29 @@ Mount the checkpoint staging path as a **chart-declared `emptyDir{ medium: Memor
 | eBPF tampering/stealth tap | "Sign + periodic external manifest check" | **Build-time per-object SHA-256 verified pre-load + bpffs 0700 pin + optional BPF-LSM load gate** (R-5) | Load-time check has no TOCTOU window the periodic checker has; BPF-LSM denies competing loads in-kernel — the tap can't be installed at all. |
 | Unauthenticated/MITM gRPC | "Enable mTLS" | **Fail-closed guard keyed on `podmotion.io/env=production` node label; binary exits rather than serving plaintext** (R-4) | Removes the silent-insecure state entirely; you cannot accidentally run the memory-dump API open in prod. |
 | Forced-migration-as-dump | "RBAC on PodMigration create" | **SubjectAccessReview equating migrate-rights to pods/exec-rights at admission** (R-6) | Migration power can never exceed existing memory-read power for the subject — laundering is structurally impossible, not policy-dependent. |
-| Memory-encryption residual | (not in report) | **Confidential-computing: AMD SME/SEV-SNP or Intel TDX migration nodes** so even a host-root attacker on the migration node cannot read CRIU's plaintext working set in RAM during dump/restore | Future Nav Point: protects the one window R-3 can't (plaintext in agent RAM mid-dump). Document as a deployment option, not a hard dependency. |
+| Memory-encryption residual | (not in report) | **Confidential-computing: AMD SME/SEV-SNP or Intel TDX migration nodes** so even a host-root attacker on the migration node cannot read CRIU's plaintext working set in RAM during dump/restore | Future project milestone: protects the one window R-3 can't (plaintext in agent RAM mid-dump). Document as a deployment option, not a hard dependency. |
 
 ---
 
 ## Part 4 — Milestone Plan (risk-adjusted priority order)
 
-| Milestone | Title | Surfaces | Deliverables | ADR(s) | Tier | Depends | Size | Gate |
-|---|---|---|---|---|---|---|---|---|
-| **M-SEC-1** | Agent privilege containment | 1 | Drop `privileged:true` → discrete caps; seccomp profile (CRIU-strace-validated, pivot_root/module-load denied); node taint+label isolation; readOnlyRootFs | **ADR-0148** (supersedes rejected 0106 §1/§6) | 14 | — | L | **CNCF incubating gate + Beta gate** |
-| **M-SEC-2** | mTLS fail-closed + checkpoint plaintext closure | 6,2,3-wire | Prod guard in `tls.go`+`main.go`; forbid `InsecureSkipVerify` in WAN; **wire encryption package into CRIU writer + transfer** (encrypt-on-write) | **ADR-0150**, implement **ADR-0029** | 14 | M-SEC-1 | L | **CNCF incubating + Beta** |
-| **M-SEC-3** | Anti-replay archive binding + tmpfs hardening | 2 | GCM AAD = migrationUID‖destNode‖nonce; key in mlock'd buffer, zeroized; checkpoint path = `emptyDir{Memory}` no host fallback | **ADR-0149**, amend 0029 | 10 | M-SEC-2 | M | Beta |
-| **M-SEC-4** | Migration authorization + node-trust gate | 5 | Webhook rule: `targetNode` must be `trusted-node=true`; SSAR equating migrate↔pods/exec; restrict NMC read (topology leak) | **ADR-0152** | 10 | — | M | **CNCF incubating** |
-| **M-SEC-5** | containerd socket isolation | 1 | RO socket steady-state; write only on restore path; apply existing AppArmor profile via chart; containerd method allowlist | amend **ADR-0013** | 10 | M-SEC-1 | M | CNCF incubating |
-| **M-SEC-6** | eBPF load-time integrity + bpffs pinning | 3 | Per-`.o` SHA-256 verified pre-load; bpffs 0700 pin; optional BPF-LSM load gate (k≥5.15) | **ADR-0151** | 10 | — | M | CNCF incubating |
-| **M-SEC-7** | Audit logging + real seccomp swap | all | Implement empty `internal/agent/audit/`; structured JSON + K8s Events per transition w/ subject; replace M11 seccomp stub w/ real swap + `SeccompWeakened`/`Restored` events | amend **ADR-0009** | 5 | M-SEC-1 | M | Beta |
-| **M-SEC-8** | Supply chain gates | (xchain) | SBOM (CycloneDX per ADR-0077), cosign keyless signing, Trivy/Grype HIGH/CRITICAL release gate, RBAC CI lint (kube-linter+allowlist) | **ADR-0077/0103** (impl) | 5 | — | M | **CNCF sandbox→incubating** |
-| **M-SEC-9** | Registry checkpoint TTL/GC + per-workload isolation | 6 | OCI TTL annotation; GC binds artifact delete to MigrationCheckpoint terminal state | amend **ADR-0034/0053** | 5 | M-SEC-2 | S | GA |
+| Milestone | Title | Surfaces | Deliverables | ADR(s) | Depends | Size | Target release/audit stage |
+|---|---|---|---|---|---|---|---|
+| **M-SEC-1** | Agent privilege containment | 1 | Drop `privileged:true` → discrete caps; seccomp profile (CRIU-strace-validated, pivot_root/module-load denied); node taint+label isolation; readOnlyRootFs | **ADR-0148** (supersedes rejected 0106 §1/§6) | — | L | **CNCF incubating + Beta** |
+| **M-SEC-2** | mTLS fail-closed + checkpoint plaintext closure | 6,2,3-wire | Prod guard in `tls.go`+`main.go`; forbid `InsecureSkipVerify` in WAN; **wire encryption package into CRIU writer + transfer** (encrypt-on-write) | **ADR-0150**, implement **ADR-0029** | M-SEC-1 | L | **CNCF incubating + Beta** |
+| **M-SEC-3** | Anti-replay archive binding + tmpfs hardening | 2 | GCM AAD = migrationUID‖destNode‖nonce; key in mlock'd buffer, zeroized; checkpoint path = `emptyDir{Memory}` no host fallback | **ADR-0149**, amend 0029 | M-SEC-2 | M | Beta |
+| **M-SEC-4** | Migration authorization + node-trust gate | 5 | Webhook rule: `targetNode` must be `trusted-node=true`; SSAR equating migrate↔pods/exec; restrict NMC read (topology leak) | **ADR-0152** | — | M | **CNCF incubating** |
+| **M-SEC-5** | containerd socket isolation | 1 | RO socket steady-state; write only on restore path; apply existing AppArmor profile via chart; containerd method allowlist | amend **ADR-0013** | M-SEC-1 | M | CNCF incubating |
+| **M-SEC-6** | eBPF load-time integrity + bpffs pinning | 3 | Per-`.o` SHA-256 verified pre-load; bpffs 0700 pin; optional BPF-LSM load gate (k≥5.15) | **ADR-0151** | — | M | CNCF incubating |
+| **M-SEC-7** | Audit logging + real seccomp swap | all | Implement empty `internal/agent/audit/`; structured JSON + K8s Events per transition w/ subject; replace M11 seccomp stub w/ real swap + `SeccompWeakened`/`Restored` events | amend **ADR-0009** | M-SEC-1 | M | Beta |
+| **M-SEC-8** | Supply chain gates | (xchain) | SBOM (CycloneDX per ADR-0077), cosign keyless signing, Trivy/Grype HIGH/CRITICAL release gate, RBAC CI lint (kube-linter+allowlist) | **ADR-0077/0103** (impl) | — | M | **CNCF sandbox→incubating** |
+| **M-SEC-9** | Registry checkpoint TTL/GC + per-workload isolation | 6 | OCI TTL annotation; GC binds artifact delete to MigrationCheckpoint terminal state | amend **ADR-0034/0053** | M-SEC-2 | S | GA |
 
 Ordering rationale: M-SEC-1/2 are CRITICAL **and** CNCF-blocking → first. M-SEC-4 is the highest-leverage confidentiality fix that is cheap and standalone. M-SEC-8 (supply chain) is the cheapest CNCF-graduation lever and has no code deps, so it can run in parallel from day one.
 
 ---
 
-## Part 5 — CNCF TAG-Security Posture Gap (sandbox → incubating)
+## Part 5 — TAG-stripped Security Posture Gap (sandbox → incubating)
 
 CNCF graduation requires a completed **Security Self-Assessment** and (for incubating) a clean or remediated **third-party security audit**. Delta against current state:
 

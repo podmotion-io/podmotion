@@ -107,7 +107,7 @@ roadmap.
 
 Tier-0 prerequisites: **M22 and M23 must both land before any north-star gate run.**
 
-**Pre-production hardening note (2026-06-12 CNCF quorum):** 6 pre-production gap ADRs
+**Pre-production hardening note (2026-06-12 CNCF review):** 6 pre-production gap ADRs
 reviewed. 1 accepted (ADR-0079 — E2E CI Matrix). 5 rejected and require revision.
 Hardening tasks have been folded into M22 (scope matrix, security baseline), M23
 (controller test gate), M26 (CI matrix implementation, release hygiene), and M27
@@ -196,8 +196,8 @@ storage fd / lock state preserved.
 WireGuard-encrypted overlay cluster.
 
 **Open scope conflict:** the PM scopes both as post-v1.0 epics; the architect scopes
-both as north-star-blocking. **UNRESOLVED — flagged for quorum** (see
-[Section 7](#7-open-questions-requiring-quorum)).
+both as north-star-blocking. **UNRESOLVED — flagged for review** (see
+[Section 7](#7-open-questions-requiring-review)).
 
 ### M27 — First True-North-Star AWS Gate Run `NEW · M`
 
@@ -302,7 +302,7 @@ archive ship publicly on day one (M29).
 
 ## 7. Open Questions Requiring Quorum
 
-These require an explicit leadership / quorum ruling before scope is frozen.
+These require an explicit leadership / review ruling before scope is frozen.
 
 1. **GPU sidecars.** Does the literal phrase "every container" include GPU /
    device-attached sidecars? If yes, GPU migration (ADR-0032) re-enters scope and adds
@@ -351,7 +351,7 @@ These require an explicit leadership / quorum ruling before scope is frozen.
 - **ADR-0143 — NetworkProvider abstraction (Accepted, GATE_PASS 14/14):** the CNI-agnostic
   six-operation IP-preservation interface. v1.0 ships FlannelProvider + BlockingProvider;
   Calico/Cilium/AWS/Azure are tracked v2.0 providers.
-- **ADR-0154 — CNI abstraction amendment (Proposed, HIGH quorum):** adds `kindnetProvider`
+- **ADR-0154 — CNI abstraction amendment (Proposed, full review):** adds `kindnetProvider`
   + `NoOpCNI` to the ADR-0143 v1.0 set and removes the residual `cni0` hardcoding from the
   agent IP-handoff datapath. **Entry-gate for Sprint 32 (NP-TCP-FULL-STRICT)** — Full-mode
   handoff on the kind substrate (ADR-0145) is blocked until this lands. See
@@ -363,5 +363,5 @@ These require an explicit leadership / quorum ruling before scope is frozen.
 
 - **Implementation detail for M19–M25:** [`docs/SPRINT_PLAN_M19_M25.md`](./SPRINT_PLAN_M19_M25.md).
 - **This document** is the overview: north star, foundation, milestone map, and open
-  questions. Update it when a milestone lands or a quorum ruling resolves an open
+  questions. Update it when a milestone lands or a review ruling resolves an open
   question.

@@ -10,21 +10,20 @@ Current version: **v0.1.0-alpha**
 | ✅ Complete | All deliverables merged and testable |
 | 🔨 In Progress | Active implementation underway |
 | 🔲 Planned | Scoped but not started |
-| 💡 For Consideration | Research complete; not yet scoped into a Nav Point; requires human Nav Point approval before sprints begin |
+| 💡 For Consideration | Research complete; not yet scoped into a milestone; requires approval before sprints begin |
 
 ---
 
 ## 💡 For Consideration — Workload-Facing Identity Transparency
 
 **Research doc:** [`docs/research/POD-IDENTITY-PRESERVATION-RESEARCH.md`](research/POD-IDENTITY-PRESERVATION-RESEARCH.md)  
-**Research date:** 2026-06-14  
-**Quorum:** 8 Opus agents (7 domain experts + lead architect synthesizer)
+**Research date:** 2026-06-14
 
 ### What this is
 
 The question: can PodMotion be developed so that `kubectl watch pod <name>` shows **only the node field changing** during a live migration — same name, same IP, same everything?
 
-The answer from the quorum: **not UID** (Kubernetes API invariant, requires upstream KEP), but **everything else is achievable** on stock clusters today.
+The answer from the research: **not UID** (Kubernetes API invariant, requires upstream KEP), but **everything else is achievable** on stock clusters today.
 
 ### Summary verdict
 
@@ -36,7 +35,7 @@ The answer from the quorum: **not UID** (Kubernetes API invariant, requires upst
 | StatefulSet: name + ordinal + PVC + DNS + IP | Yes via SchedulingGate path |
 | Pod UID | No — requires `pods/relocation` KEP |
 
-### Candidate deliverables if approved as a Nav Point
+### Candidate deliverables if approved as a milestone
 
 1. **`podmotion-ipam` chainable CNI meta-plugin** — suppress IP release on source DEL; adopt pinned IP on dest ADD. Closes IPAM-store consistency gap (Calico-first).
 2. **`IPAMOwnershipTransferred` condition** — proves the IP is recorded in Calico WorkloadEndpoint / Cilium CiliumEndpoint, not just reachable on wire.
@@ -50,7 +49,7 @@ The answer from the quorum: **not UID** (Kubernetes API invariant, requires upst
 2. **Kubelet ownership-handoff + CRI `RestoreContainer`** — symmetric restore half of KEP-2008 (Forensic Checkpointing). PodMotion's NRI handoff is the reference implementation.
 3. **CNI `MIGRATE` verb** — paired `ADD --reserve-from` + `DEL --no-release` for atomic IP transfer across nodes. PodMotion meta-plugin is the prototype; standardize at cni.dev.
 
-### Gate criterion (when this Nav Point closes)
+### Acceptance criterion (when this milestone closes)
 
 ```
 kubectl get pod <name> -o wide --watch
@@ -59,7 +58,7 @@ During migration: a single transition line where **only the NODE column changes*
 
 ### Relation to existing ADRs
 
-ADR-0048, ADR-0082, ADR-0085, ADR-0033, ADR-0119, and `docs/kep/kep-XXXX-kubelet-restore-api.md` are all directly load-bearing for this Nav Point. Read before scoping sprints.
+ADR-0048, ADR-0082, ADR-0085, ADR-0033, ADR-0119, and `docs/kep/kep-XXXX-kubelet-restore-api.md` are all directly load-bearing for this milestone. Read before scoping sprints.
 
 ---
 
@@ -496,7 +495,7 @@ approach, security context harness).
 
 **Purpose:** As each OS, Kubernetes distribution, CNI, and CSI type is certified for beta, it is
 enrolled in a living certification matrix that drives fully automated validation whenever upstream
-versions change — with agentic quorum testing, signoff, and publication requiring zero human
+versions change — with agentic review testing, signoff, and publication requiring zero human
 intervention for routine version bumps.
 
 **Deliverables:**
@@ -517,16 +516,16 @@ intervention for routine version bumps.
 - PR body includes: release notes URL, changelog diff, whether the version falls within existing bounds (no-op) or requires re-certification
 - Only re-certification cases advance to the agentic testing pipeline
 
-### Agentic Quorum Testing Pipeline (`.github/workflows/cert-quorum.yml`)
+### Agentic Quorum Testing Pipeline (`.github/workflows/cert-review.yml`)
 - Triggered by: version-bump PR label `needs-certification`
 - Fan-out: one Claude agent per affected matrix row (OS × k8s × CNI × CSI combination to re-test)
 - Each agent:
   1. Provisions a kind cluster with the new component version (via `make kind-create VERSION=...`)
   2. Runs the relevant E2E test suite (`make test-e2e SUITE=<test_suite>`)
   3. Reports PASS/FAIL/FLAKY with log artifacts
-- Synthesis agent collects all agent reports, determines quorum (≥ 2/3 PASS), writes structured signoff JSON
-- On quorum PASS: auto-merges the version-bump PR, updates `certification-matrix.yaml` bounds, creates a GitHub Release note entry
-- On quorum FAIL: opens a GitHub Issue tagged `cert-regression/<component>-<version>`, assigns to maintainers, blocks the version bump
+- Synthesis agent collects all agent reports, determines review (≥ 2/3 PASS), writes structured signoff JSON
+- On review PASS: auto-merges the version-bump PR, updates `certification-matrix.yaml` bounds, creates a GitHub Release note entry
+- On review FAIL: opens a GitHub Issue tagged `cert-regression/<component>-<version>`, assigns to maintainers, blocks the version bump
 
 ### Signoff & Publication
 - Quorum signoff artifact signed with cosign (keyless, Sigstore OIDC) and attached to the PR
@@ -541,7 +540,7 @@ intervention for routine version bumps.
 **Architecture notes:**
 - The matrix schema uses semver range notation (`>=1.2.0 <2.0.0`) so minor bumps within a certified range are auto-approved without re-running full E2E
 - Agentic test agents use `isolation: worktree` so parallel kind cluster provisioning does not share filesystem state
-- Test result artifacts stored in GitHub Actions cache keyed by `<component>-<version>-<sha>` — cache hit = instant quorum on re-run
+- Test result artifacts stored in GitHub Actions cache keyed by `<component>-<version>-<sha>` — cache hit = instant review on re-run
 - The pipeline itself is agent-reviewed on each structural change (meta-certification: the CI system certifies itself)
 
 ### Pre-Beta Chaos & Fidelity Testing (Required Gate)
