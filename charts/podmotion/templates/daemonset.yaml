@@ -205,6 +205,12 @@ spec:
                 - SYS_PTRACE
                 - SYS_ADMIN
                 - CHECKPOINT_RESTORE
+                # SD-1-DAC (ADR-0148): CRIU pre-dump opens /proc/<pid>/map_files to collect
+                # the target's memory mappings (proc_parse.c:829). Under privileged:false the
+                # DAC owner-only restriction on map_files denies that open ("Permission
+                # denied") for any process the agent does not own. DAC_READ_SEARCH bypasses
+                # file read/search DAC checks, restoring map_files access without privileged.
+                - DAC_READ_SEARCH
                 - NET_ADMIN
                 {{- if .Values.agent.kernelGE58 }}
                 - BPF
