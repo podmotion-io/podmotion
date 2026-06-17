@@ -417,6 +417,24 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 				"migration", migrationName, "image", imageName)
 		}
 	}
+	// ADR-0217 D2: THIRD fallback. If both prior sources are empty — NRI ContainerEvent
+	// carried no image AND the PrepareDestinationNetns cache is empty (e.g. the controller's
+	// phase-order bug left WorkloadImage unset, or the agent restarted and lost the cache) —
+	// self-resolve from the replacement pod's OWN container spec via the Kubernetes API.
+	// This is the last resort before fail-close: the replacement pod created by the operator
+	// carries the correct workload image in its spec, so we read it directly.
+	if imageName == "" && s.k8sClient != nil {
+		if resolved := s.resolveImageFromReplacementPod(migrationName); resolved != "" {
+			imageName = resolved
+			log.Info("ADR-0217 D2: resolved workload image from replacement pod spec",
+				"migration", migrationName, "image", imageName)
+		}
+	}
+	if imageName == "" {
+		// All three sources exhausted (NRI event, PrepareDestinationNetns cache, replacement
+		// pod spec). Fail-close rather than substitute a wrong image (gate-11 lesson, ADR-0215).
+		return 0, "", fmt.Errorf("ADR-0217: restore image unresolved — NRI event, PrepareDestinationNetns cache, and replacement pod spec all empty for migration %s", migrationName)
+	}
 	pid, droppedMounts, err := joinNsRestoreFn(migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode)
 	if err != nil {
 		// ADR-0193 P-0193-4 / S1: emit a Warning CRIUImageInconsistency Kubernetes Event on the
@@ -480,6 +498,62 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 		return 0, "", frErr
 	}
 	return pid, fr.mac, nil
+}
+
+// resolveImageFromReplacementPod is the ADR-0217 D2 third fallback for restore image
+// resolution. When the NRI event image and the PrepareDestinationNetns cache are both empty,
+// it reads the replacement pod's own container[0].Image from the Kubernetes API. The
+// replacement pod name lives on PodMigration.Status.ReplacementPodName and is carried in the
+// workload namespace (pm.Spec.PodNamespace). Returns "" on any failure (caller fail-closes).
+func (s *AgentServer) resolveImageFromReplacementPod(migrationName string) string {
+	if s.k8sClient == nil || migrationName == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// The PodMigration CR lives in the workload namespace; probe POD_NAMESPACE then default.
+	ns := os.Getenv("POD_NAMESPACE")
+	if ns == "" {
+		ns = "podmotion-system"
+	}
+	pm := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: migrationName, Namespace: ns}, pm); err != nil {
+		// Fall back to a List across namespaces (the CR may live in the workload namespace,
+		// e.g. "default", not the agent's POD_NAMESPACE).
+		pmList := &pmv1.PodMigrationList{}
+		if listErr := s.k8sClient.List(ctx, pmList); listErr != nil {
+			return ""
+		}
+		found := false
+		for i := range pmList.Items {
+			if pmList.Items[i].Name == migrationName {
+				*pm = pmList.Items[i]
+				found = true
+				break
+			}
+		}
+		if !found {
+			return ""
+		}
+	}
+
+	replName := pm.Status.ReplacementPodName
+	if replName == "" {
+		return ""
+	}
+	podNs := pm.Spec.PodNamespace
+	if podNs == "" {
+		podNs = pm.Namespace
+	}
+	pod := &corev1.Pod{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: replName, Namespace: podNs}, pod); err != nil {
+		return ""
+	}
+	if len(pod.Spec.Containers) == 0 {
+		return ""
+	}
+	return pod.Spec.Containers[0].Image
 }
 
 // ReportRestoreConfirmed patches the PodMigration CR status to record that CRIU
