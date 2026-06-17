@@ -630,7 +630,7 @@ func CleanupMigrationHostRoute(podIP net.IP, wgInterface string) error {
 //
 // Uses positive ifindex match — not a negative interface-type filter — to avoid false
 // positives from the default route, the source-side redirect, or unrelated veths
-// (ADR-0102 §4, architect quorum requirement).
+// (ADR-0102 §4).
 //
 // podVethIfindex comes from the PrepareDestinationNetns gRPC response.
 func ConfirmLocalDeliveryRoute(podIP net.IP, podVethIfindex int) (bool, error) {
