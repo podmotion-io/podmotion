@@ -30,6 +30,7 @@ import (
 	"net"
 	"net/http"
 
+	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -75,10 +76,60 @@ func (v *PodMigrationValidator) Handle(ctx context.Context, req admission.Reques
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
+	// ADR-0212: lifecycle-UPDATE bypass — the spec-admission rules below (Rule 1 pod
+	// existence in particular) are CREATE-time premigration gates. They must NOT run on a
+	// deletion-path or terminal-phase UPDATE.
+	//
+	// Mechanism (§P-MECHANISM map, Sprint 35 gate-8): a Complete PodMigration has, by
+	// ADR-0012, already had its source pod deleted (source pod is removed only after
+	// TrafficVerified=True). When the CR is then deleted, the controller issues an UPDATE
+	// to RemoveFinalizer (podmigration_controller.go:3586). That UPDATE is intercepted by
+	// vpodmigration.kb.io [CREATE,UPDATE], Rule 1 calls getPod, gets IsNotFound, and DENIES
+	// the UPDATE ("pod <ns>/<name> not found"). The finalizer can never be removed → the CR
+	// wedges with a deletionTimestamp forever (§P-SUBSTRATE probe-2 stuck-finalizer HARD STOP).
+	//
+	// Fix: short-circuit ALLOW for any request where the object is being deleted
+	// (DeletionTimestamp set) or is already in a terminal phase. Spec is immutable in those
+	// states; there is nothing to re-validate, and the source pod is legitimately absent.
+	if isLifecycleOnlyRequest(req, pm) {
+		return admission.Allowed("lifecycle/finalizer UPDATE on deleting or terminal-phase PodMigration — spec admission rules skipped (ADR-0212)")
+	}
+
 	if errs := v.validate(ctx, pm); len(errs) > 0 {
 		return admission.Denied(errs.ToAggregate().Error())
 	}
 	return admission.Allowed("")
+}
+
+// isLifecycleOnlyRequest reports whether req is a delete-path or terminal-phase mutation
+// that carries no new migration intent and therefore must bypass CREATE-time spec admission
+// rules (notably Rule 1 source-pod existence). See ADR-0212.
+//
+// A request qualifies when EITHER:
+//   - the object is being deleted (metadata.deletionTimestamp != nil) — this is the
+//     finalizer-removal UPDATE the controller issues; OR
+//   - the operation is UPDATE and the object is already in a terminal phase
+//     (Complete / Failed / RollingBack / DryRunComplete), for which the source pod may
+//     legitimately no longer exist and the spec is no longer actionable.
+//
+// CREATE is never treated as lifecycle-only: a fresh migration must always be fully validated.
+func isLifecycleOnlyRequest(req admission.Request, pm *pmv1.PodMigration) bool {
+	if req.Operation == admissionv1.Create {
+		return false
+	}
+	if pm.DeletionTimestamp != nil {
+		return true
+	}
+	if req.Operation == admissionv1.Update {
+		switch pm.Status.Phase {
+		case pmv1.MigrationPhaseComplete,
+			pmv1.MigrationPhaseFailed,
+			pmv1.MigrationPhaseRollingBack,
+			pmv1.MigrationPhaseDryRunComplete:
+			return true
+		}
+	}
+	return false
 }
 
 // validate runs all admission rules and returns any field errors.
