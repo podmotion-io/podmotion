@@ -57,22 +57,36 @@ spec:
               mountPath: /run/podmotion
         - name: init-checkpoint-tmpfs
           image: busybox:1.36
-          # ADR-0148 SD-1 (Amendment SD-1-INIT-A): drop privileged. This init opens the
-          # host PID 1 mount-namespace handle (/proc/1/ns/mnt), then nsenters it
-          # (setns(CLONE_NEWNS)) and mounts a tmpfs at /run/podmotion/checkpoints.
-          # Two distinct kernel gates, two distinct capabilities:
-          #   - Opening /proc/<pid>/ns/mnt for a process in a DIFFERENT mount namespace is
-          #     gated by ptrace_may_access() (kernel/ptrace.c), which requires CAP_SYS_PTRACE
-          #     in the caller's user namespace. CAP_SYS_ADMIN alone does NOT satisfy it —
-          #     nsenter fails with "can't open '/proc/1/ns/mnt': Permission denied" without it.
-          #   - The subsequent setns(CLONE_NEWNS) + mount()/umount2() are gated by CAP_SYS_ADMIN.
-          # hostPID stays true at the pod level so /proc/1 resolves to the host init.
+          # ADR-0148 SD-1 (Amendment SD-1-INIT-B): init-ONLY privilege for host
+          # mount-namespace tmpfs setup. This init opens the host PID 1 mount-namespace
+          # handle (/proc/1/ns/mnt), setns(CLONE_NEWNS) into it, then mounts a tmpfs at
+          # /run/podmotion/checkpoints. The owning user namespace of that mount namespace
+          # is the HOST (init) user namespace.
+          #
+          # Why privileged:true here and ONLY here (HOLD-A resolution):
+          #   - setns(CLONE_NEWNS) into a mount namespace requires CAP_SYS_ADMIN effective
+          #     in the user namespace that OWNS the target mount ns — i.e. the HOST init
+          #     user namespace, NOT this container's capability set. A non-privileged
+          #     container with capabilities.add:[SYS_ADMIN,SYS_PTRACE] holds those caps only
+          #     against namespaces it owns; the kernel ns_capable() check against the
+          #     host-owned mount ns fails (EPERM on setns / mount), even though the handle
+          #     open (a ptrace_may_access gate) succeeded. privileged:true is the only
+          #     securityContext that places this container in the host user namespace with
+          #     the full host capability bounding+effective set, so the host-owned-ns
+          #     ns_capable() checks pass.
+          #   - SD-1-INIT-A added SYS_PTRACE for the /proc/1/ns/mnt handle open and assumed
+          #     SYS_ADMIN would carry the setns+mount; under privileged:false it does not,
+          #     because those operations are evaluated against the HOST user namespace.
+          #
+          # Scope of this exception: this is the SOLE privileged container in the pod. The
+          # main agent and the other two init containers are de-privileged under SD-1 — the
+          # main agent (which holds the broad, long-lived attack surface) is the primary
+          # de-privileging win. This one short-lived init container, which exits before the
+          # agent serves any gRPC, carries narrowly-scoped "init-only privilege for tmpfs
+          # host-mount-ns setup." hostPID stays true at the pod level so /proc/1 resolves to
+          # the host init.
           securityContext:
-            privileged: false
-            capabilities:
-              drop: ["ALL"]
-              add: ["SYS_ADMIN", "SYS_PTRACE"]
-            allowPrivilegeEscalation: false
+            privileged: true
           command:
             - sh
             - -c
