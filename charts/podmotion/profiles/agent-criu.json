@@ -1,5 +1,5 @@
 {
-  "_comment": "PodMotion agent CRIU-scoped seccomp profile (ADR-0039 SD-5, ADR-0148). Default-deny (SCMP_ACT_ERRNO, errno EPERM=1). Allows the CRIU checkpoint/restore syscall surface plus the Go runtime; denies privilege-escalation, kernel-image-load, keyring, NUMA-policy, perf, and io_uring syscalls outright (they fall through to the default ERRNO action). ptrace(2) is arg-filtered on index 0 (the request) to exactly the request values CRIU issues: PTRACE_SEIZE=0x4206(16902), PTRACE_INTERRUPT=0x4207(16903), PTRACE_DETACH=17, PTRACE_GETREGSET=0x4204(16900), PTRACE_SETREGSET=0x4205(16901). Injection-capable requests (PTRACE_ATTACH=16, PTRACE_POKETEXT=4, PTRACE_POKEDATA=5, PTRACE_POKEUSR=6) are intentionally omitted and denied by default. Meaningful only after privileged:true is dropped (SD-1). The new-mount-API syscalls (move_mount, open_tree, fsopen, fsmount, fsconfig, fspick) are allowed for CRIU 4.x kerndat init: kerndat.c:1129 issues move_mount to probe MOVE_MOUNT_SET_GROUP support; under default-deny these EPERM and abort kerndat. CAP_CHECKPOINT_RESTORE (cap 40) must also be present on the agent for that probe (see daemonset.yaml). Validate against an actual CRIU strace before production.",
+  "_comment": "PodMotion agent CRIU-scoped seccomp profile (ADR-0039 SD-5, ADR-0148; ptrace model corrected Sprint 37 M22). Default-deny (SCMP_ACT_ERRNO, errno EPERM=1). Allows the CRIU checkpoint/restore syscall surface plus the Go runtime; denies privilege-escalation, kernel-image-load, keyring, NUMA-policy, perf, and io_uring syscalls outright (they fall through to the default ERRNO action). ptrace(2) is filtered ordered-first-match: the PEEK/POKE memory-injection request family (PTRACE_PEEKTEXT=1, PEEKDATA=2, PEEKUSR=3, POKETEXT=4, POKEDATA=5, POKEUSR=6) is DENIED (ERRNO EPERM) by explicit rules placed BEFORE a final blanket ptrace ALLOW. First-matching rule wins in OCI/runc seccomp (rules processed in syscalls-array order), so injection requests EPERM while every other ptrace request \u2014 including the control requests CRIU needs (PTRACE_SEIZE/INTERRUPT/ATTACH/DETACH/GET*REGSET) \u2014 passes to the kernel. PTRACE_ATTACH(16) MUST be allowed: CRIU's kerndat probe kerndat_has_ptrace_get_rseq_conf() -> fork_and_ptrace_attach() (criu/util.c:740) uses the legacy ptrace(PTRACE_ATTACH) at startup, not PTRACE_SEIZE; the prior per-value allowlist omitted 16 and EPERM'd that probe (kerndat.c:2098). ATTACH only stops the tracee and establishes the trace relationship \u2014 it does not read or write tracee memory; the injection surface is the PEEK/POKE family, which remains denied. CRIU reads/writes target memory via process_vm_readv/process_vm_writev (separately allowlisted), not via ptrace PEEK/POKE. The agent's ptrace reach is additionally bounded by capability scope and hostPID:false (ADR-0148 D5) \u2014 this arg-filter is defense-in-depth on top of that. The new-mount-API syscalls (move_mount, open_tree, fsopen, fsmount, fsconfig, fspick) are allowed for CRIU 4.x kerndat init. CAP_CHECKPOINT_RESTORE (cap 40) must also be present on the agent. Validate against an actual CRIU strace before production.",
   "defaultAction": "SCMP_ACT_ERRNO",
   "defaultErrnoRet": 1,
   "archMap": [
@@ -264,11 +264,12 @@
       "names": [
         "ptrace"
       ],
-      "action": "SCMP_ACT_ALLOW",
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
       "args": [
         {
           "index": 0,
-          "value": 0,
+          "value": 1,
           "op": "SCMP_CMP_EQ"
         }
       ]
@@ -277,11 +278,12 @@
       "names": [
         "ptrace"
       ],
-      "action": "SCMP_ACT_ALLOW",
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
       "args": [
         {
           "index": 0,
-          "value": 7,
+          "value": 2,
           "op": "SCMP_CMP_EQ"
         }
       ]
@@ -290,11 +292,12 @@
       "names": [
         "ptrace"
       ],
-      "action": "SCMP_ACT_ALLOW",
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
       "args": [
         {
           "index": 0,
-          "value": 9,
+          "value": 3,
           "op": "SCMP_CMP_EQ"
         }
       ]
@@ -303,11 +306,12 @@
       "names": [
         "ptrace"
       ],
-      "action": "SCMP_ACT_ALLOW",
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
       "args": [
         {
           "index": 0,
-          "value": 17,
+          "value": 4,
           "op": "SCMP_CMP_EQ"
         }
       ]
@@ -316,11 +320,12 @@
       "names": [
         "ptrace"
       ],
-      "action": "SCMP_ACT_ALLOW",
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
       "args": [
         {
           "index": 0,
-          "value": 16898,
+          "value": 5,
           "op": "SCMP_CMP_EQ"
         }
       ]
@@ -329,11 +334,12 @@
       "names": [
         "ptrace"
       ],
-      "action": "SCMP_ACT_ALLOW",
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
       "args": [
         {
           "index": 0,
-          "value": 16899,
+          "value": 6,
           "op": "SCMP_CMP_EQ"
         }
       ]
@@ -342,144 +348,7 @@
       "names": [
         "ptrace"
       ],
-      "action": "SCMP_ACT_ALLOW",
-      "args": [
-        {
-          "index": 0,
-          "value": 16900,
-          "op": "SCMP_CMP_EQ"
-        }
-      ]
-    },
-    {
-      "names": [
-        "ptrace"
-      ],
-      "action": "SCMP_ACT_ALLOW",
-      "args": [
-        {
-          "index": 0,
-          "value": 16901,
-          "op": "SCMP_CMP_EQ"
-        }
-      ]
-    },
-    {
-      "names": [
-        "ptrace"
-      ],
-      "action": "SCMP_ACT_ALLOW",
-      "args": [
-        {
-          "index": 0,
-          "value": 16902,
-          "op": "SCMP_CMP_EQ"
-        }
-      ]
-    },
-    {
-      "names": [
-        "ptrace"
-      ],
-      "action": "SCMP_ACT_ALLOW",
-      "args": [
-        {
-          "index": 0,
-          "value": 16903,
-          "op": "SCMP_CMP_EQ"
-        }
-      ]
-    },
-    {
-      "names": [
-        "ptrace"
-      ],
-      "action": "SCMP_ACT_ALLOW",
-      "args": [
-        {
-          "index": 0,
-          "value": 16905,
-          "op": "SCMP_CMP_EQ"
-        }
-      ]
-    },
-    {
-      "names": [
-        "ptrace"
-      ],
-      "action": "SCMP_ACT_ALLOW",
-      "args": [
-        {
-          "index": 0,
-          "value": 16906,
-          "op": "SCMP_CMP_EQ"
-        }
-      ]
-    },
-    {
-      "names": [
-        "ptrace"
-      ],
-      "action": "SCMP_ACT_ALLOW",
-      "args": [
-        {
-          "index": 0,
-          "value": 16907,
-          "op": "SCMP_CMP_EQ"
-        }
-      ]
-    },
-    {
-      "names": [
-        "ptrace"
-      ],
-      "action": "SCMP_ACT_ALLOW",
-      "args": [
-        {
-          "index": 0,
-          "value": 16908,
-          "op": "SCMP_CMP_EQ"
-        }
-      ]
-    },
-    {
-      "names": [
-        "ptrace"
-      ],
-      "action": "SCMP_ACT_ALLOW",
-      "args": [
-        {
-          "index": 0,
-          "value": 16909,
-          "op": "SCMP_CMP_EQ"
-        }
-      ]
-    },
-    {
-      "names": [
-        "ptrace"
-      ],
-      "action": "SCMP_ACT_ALLOW",
-      "args": [
-        {
-          "index": 0,
-          "value": 16910,
-          "op": "SCMP_CMP_EQ"
-        }
-      ]
-    },
-    {
-      "names": [
-        "ptrace"
-      ],
-      "action": "SCMP_ACT_ALLOW",
-      "args": [
-        {
-          "index": 0,
-          "value": 16911,
-          "op": "SCMP_CMP_EQ"
-        }
-      ]
+      "action": "SCMP_ACT_ALLOW"
     }
   ]
 }
