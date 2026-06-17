@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0.
 
 package server
 
-// pycriu_corpus_test.go — Q2 blocking corpus test (DEFECT-2026-06-15 quorum condition Q2).
+// pycriu_corpus_test.go — Q2 blocking corpus test (DEFECT-2026-06-15 condition Q2).
 //
 // Exercises both pycriu call sites:
 //   - patchCheckpointImages (server.go ~2645): patch script (pm-patch-ckpt.py)

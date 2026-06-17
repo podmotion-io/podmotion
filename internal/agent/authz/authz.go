@@ -31,8 +31,8 @@ import (
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 )
 
-// adrSecAMarker forces the ADR-SEC-A marker string into the agent binary's string table for
-// §P-VERIFY-MULTI deployed-provenance grep (`strings /agent | grep -c 'ADR-SEC-A'`).
+// adrSecAMarker forces the ADR-SEC-A marker string into the agent binary's string table so the
+// deployed binary can be verified to contain the expected marker (`strings /agent | grep -c 'ADR-SEC-A'`).
 const adrSecAMarker = "ADR-SEC-A"
 
 // SPIFFEPrefix is the trust-domain prefix every PodMotion SPIFFE ID must carry. Centralized here

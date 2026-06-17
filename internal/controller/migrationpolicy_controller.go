@@ -249,7 +249,8 @@ func (r *MigrationPolicyReconciler) buildPodMigration(policy *pmv1.MigrationPoli
 
 // reconcileStatefulSet handles migration for policies that target a StatefulSet directly.
 // It builds a migration plan via StatefulSetMigrationOrchestrator, then creates PodMigration
-// CRs for ordinals that are safe to migrate given current quorum and parallelism settings.
+// CRs for ordinals that are safe to migrate given the current StatefulSet quorum floor
+// (ceil(replicas/2)+1 running members) and parallelism settings.
 func (r *MigrationPolicyReconciler) reconcileStatefulSet(
 	ctx context.Context,
 	policy *pmv1.MigrationPolicy,

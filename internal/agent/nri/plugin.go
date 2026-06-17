@@ -170,7 +170,7 @@ func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent)
 	// is in Restoring phase targeting this node. Prevents annotation spoofing.
 	//
 	// ADR-0185 r1: bounded retry to tolerate operator phase advance at NRI hook fire time.
-	// Controller is NOT changed. Accept-set is NOT widened (Option B per quorum C3 resolution).
+	// Controller is NOT changed. Accept-set is NOT widened (Option B per ADR-0185 C3 resolution).
 	// The operator advances phase asynchronously via requeues while NRI fires synchronously at
 	// container start; we retry until the operator naturally advances past OverlayHandoff (at
 	// which point the ADR-0048/0049 FDB barrier is confirmed) into an accepted restore phase, or
@@ -178,7 +178,7 @@ func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent)
 	// hard-blocks on timeout with the same blocking error.
 	if p.k8sClient != nil {
 		// verifyTimeout(45s) + verifyInterval(1s) must sit under containerd
-		// plugin_request_timeout (60s — §P-VERIFY C1 asserts this on all nodes; default 30s FAILS).
+		// plugin_request_timeout (60s required on all nodes; default 30s fails the retry budget).
 		verifyDeadline := time.Now().Add(45 * time.Second)
 		var verifyErr error
 		for time.Now().Before(verifyDeadline) {
@@ -311,7 +311,7 @@ func (p *Plugin) HandlePostStartContainer(ctx context.Context, event ContainerEv
 	// the stdout token, ADR-0197 Rule D/E dual transport). The holder entrypoint is now running, so
 	// one of the two transports fires and the barrier is satisfied.
 	//
-	// Barrier timeout: 50 s — within the plugin_request_timeout budget (60 s, §P-VERIFY C1). NRI
+	// Barrier timeout: 50 s — within the plugin_request_timeout budget (60 s). NRI
 	// applies one request timeout to all plugin event handlers, so this governs PostStartContainer
 	// identically to StartContainer. On timeout the handler returns a hard error which surfaces as a
 	// container post-start failure rather than silently proceeding.
@@ -623,13 +623,13 @@ func (p *Plugin) Run(ctx context.Context) error {
 // createReplacementPod) proves that the injected-holder Command is in place, and the barrier
 // emits the "holder-quiescent barrier satisfied" log line after a 1 s settling delay.
 //
-// Quorum C-SEC-2 sentinel transport: (i) holder writes /run/podmotion/holder-ready inside the
+// Sentinel transport: (i) holder writes /run/podmotion/holder-ready inside the
 // container rootfs (host-visible via /proc/<pid>/root); (ii) holder emits "podmotion-holder ready"
 // to stdout; (iii) the emptyDir is written before workload tree restore and is read-only to
 // non-holder containers (ReadOnly:true VolumeMount in createReplacementPod).  The agent observes
 // (i) via /proc traversal and (iii) is enforced by the operator pod-spec — neither is world-writable.
 //
-// VERIFY-HOLDER-3 assertion: grep for "holder-quiescent barrier satisfied" in the dest agent log.
+// On success the barrier logs "holder-quiescent barrier satisfied" to the dest agent log.
 func waitForHolderQuiescent(ctx context.Context, event ContainerEvent, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	const pollInterval = 200 * time.Millisecond
@@ -649,7 +649,7 @@ func waitForHolderQuiescent(ctx context.Context, event ContainerEvent, timeout t
 		return nil
 	}
 
-	// ADR-0197 Rule E (§3h co-located) — dual quiescence transport.
+	// ADR-0197 Rule E — dual quiescence transport.
 	// The barrier is satisfied by EITHER:
 	//   (i)  the holder-ready sentinel file at /proc/<pid>/root/run/podmotion/holder-ready, OR
 	//   (ii) the holder's stdout token "podmotion-holder ready" in the container CRI log.
@@ -659,7 +659,7 @@ func waitForHolderQuiescent(ctx context.Context, event ContainerEvent, timeout t
 	// advertised this dual transport, but only the file stat was implemented. Implementing the
 	// stdout token (OR-ed with the file) prevents Rule D from merely moving the timeout from the
 	// init container to the main container. The satisfied-transport is attributed in the log so
-	// §P-VERIFY can tell which one fired.
+	// the operator can tell which one fired.
 	const holderStdoutToken = "podmotion-holder ready"
 
 	// Poll for the sentinel file via /proc/<pid>/root traversal.
@@ -693,7 +693,7 @@ func waitForHolderQuiescent(ctx context.Context, event ContainerEvent, timeout t
 		}
 	}
 
-	// Timeout: emit a loud, attributable error log (Quorum Observability C2).
+	// Timeout: emit a loud, attributable error log.
 	return fmt.Errorf("holder-quiescent barrier: sentinel %q / stdout token %q not observed within %s for container %s (non-conforming holder or init delay exceeded barrier timeout)",
 		holderReadySentinel, holderStdoutToken, timeout, event.ID)
 }
