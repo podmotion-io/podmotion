@@ -1080,9 +1080,28 @@ func (r *PodMigrationReconciler) reconcileTCPVerifying(ctx context.Context, pm *
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
+	// ADR-0225: VerifyTCP runs on the DESTINATION agent and resolves the container PID to
+	// inspect from req.PodUid via FindContainerPID's cgroup walk. The restored process lives
+	// under the REPLACEMENT pod's UID on the destination node — NOT the source pod's UID. Using
+	// pm.Spec.SourcePodUID here made FindContainerPID search the destination /proc for a pod
+	// that does not exist on that node ("container PID not found for pod UID <source>"),
+	// aborting before the snd_nxt/rcv_nxt comparison (GC-C2 seqDelta NOT MEASURED). Resolve the
+	// replacement pod's UID and pass that. Never fall back to the source UID for PID resolution:
+	// the source pod has no live process on the destination node, so a fallback can only
+	// fail-closed. Requeue if the replacement pod is not yet visible (it is guaranteed named by
+	// the time TCPVerifying is reached, but its object may lag the cache).
+	replForVerify := &corev1.Pod{}
+	if getErr := r.Get(ctx, types.NamespacedName{
+		Namespace: pm.Spec.PodNamespace,
+		Name:      pm.Status.ReplacementPodName,
+	}, replForVerify); getErr != nil || replForVerify.UID == "" {
+		log.Info("ADR-0225: TCPVerifying: replacement pod not yet visible for dest PID resolution — requeuing",
+			"migration", pm.Name, "replacementPod", pm.Status.ReplacementPodName)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
 	vtcpReq := &agentpb.VerifyTCPRequest{
 		MigrationName: pm.Name,
-		PodUid:        pm.Spec.SourcePodUID,
+		PodUid:        string(replForVerify.UID),
 	}
 	if pm.Spec.ApplicationProbe != nil {
 		vtcpReq.AppProbeProtocol = string(pm.Spec.ApplicationProbe.Protocol)
