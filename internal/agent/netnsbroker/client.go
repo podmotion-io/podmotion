@@ -104,6 +104,77 @@ func (c *Client) Exec(ctx context.Context, opTimeout time.Duration, argv ...stri
 	}
 }
 
+// ExecStart asks the privileged broker to spawn the long-running CRIU restore
+// wrapper DETACHED in the host mount namespace and returns its host PID (ADR-0234).
+// Unlike Exec (run-to-completion), this returns as soon as the wrapper has forked:
+// the wrapper on the cold --join-ns path never self-exits, so the agent must poll
+// liveness (ExecPoll) while it still runs and reap it asynchronously. argv[0] must
+// be the PodMotion CRIU wrapper binary — the broker rejects any other binary on
+// the async path (tighter than Exec's allowlist).
+func (c *Client) ExecStart(ctx context.Context, argv ...string) (int, error) {
+	resp, err := c.do(ctx, Request{Op: "exec_start", Argv: argv})
+	if err != nil {
+		return 0, fmt.Errorf("netns-broker exec_start %v: %w", argv, err)
+	}
+	if resp.Error != "" {
+		return 0, fmt.Errorf("netns-broker exec_start %v: %s", argv, resp.Error)
+	}
+	if resp.WrapperPID <= 0 {
+		return 0, fmt.Errorf("netns-broker exec_start %v: broker returned no wrapper PID", argv)
+	}
+	return resp.WrapperPID, nil
+}
+
+// PollResult is the outcome of an ExecPoll. Running is true while the wrapper is
+// still alive; once it exits, ExitCode/Stderr carry the result. CgroupPIDs is the
+// PID set currently resident in the BROKER's cgroup — the wrapper is a broker
+// child, so the CRIU-restored tree (--manage-cgroups=ignore) lands there; the
+// agent diffs this against its pre-start snapshot to detect the new workload
+// entrant (ADR-0128 liveness signal, relocated to the broker cgroup).
+type PollResult struct {
+	Running    bool
+	ExitCode   int
+	Stderr     []byte
+	CgroupPIDs []int
+}
+
+// ExecPoll asks the broker whether the wrapper PID is still running and returns
+// the broker-cgroup PID set for the new-entrant liveness diff (ADR-0234). When the
+// wrapper has exited, the broker reaps it once and reports Running:false with the
+// exit code and stderr tail.
+func (c *Client) ExecPoll(ctx context.Context, wrapperPID int) (PollResult, error) {
+	resp, err := c.do(ctx, Request{Op: "exec_poll", WrapperPID: wrapperPID})
+	if err != nil {
+		return PollResult{}, fmt.Errorf("netns-broker exec_poll %d: %w", wrapperPID, err)
+	}
+	if resp.Error != "" {
+		return PollResult{}, fmt.Errorf("netns-broker exec_poll %d: %s", wrapperPID, resp.Error)
+	}
+	exit := 0
+	if resp.ExitCode != nil {
+		exit = *resp.ExitCode
+	}
+	return PollResult{
+		Running:    resp.Running,
+		ExitCode:   exit,
+		Stderr:     resp.Stderr,
+		CgroupPIDs: resp.CgroupPIDs,
+	}, nil
+}
+
+// ExecSignal asks the broker to deliver a signal to the wrapper PID (Abort path,
+// ADR-0234). signal 0 is mapped to SIGKILL broker-side.
+func (c *Client) ExecSignal(ctx context.Context, wrapperPID, signal int) error {
+	resp, err := c.do(ctx, Request{Op: "exec_signal", WrapperPID: wrapperPID, Signal: signal})
+	if err != nil {
+		return fmt.Errorf("netns-broker exec_signal %d: %w", wrapperPID, err)
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("netns-broker exec_signal %d: %s", wrapperPID, resp.Error)
+	}
+	return nil
+}
+
 // Teardown requests unmount+removal of the per-migration netns. Idempotent broker-side.
 func (c *Client) Teardown(ctx context.Context, migrationUID string) error {
 	resp, err := c.do(ctx, Request{Op: "teardown", MigrationUID: migrationUID})
