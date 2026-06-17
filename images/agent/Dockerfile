@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     iproute2 \
     iptables \
+    util-linux \
     python3 \
     python3-protobuf \
   && rm -rf /var/lib/apt/lists/*

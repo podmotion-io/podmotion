@@ -18,10 +18,22 @@
 // into this narrow-surface sidecar that does ONLY these two mount operations
 // and speaks no gRPC.
 //
-// The broker replaces the prior nsenter --mount=/proc/1/ns/mnt subprocess
-// chain in internal/agent/network/migrationnetns.go. It performs the bind via
-// syscall (unix.Mount / unix.Unmount) after setns(CLONE_NEWNS) into the host
-// mount namespace — no nsenter subprocess.
+// Host-mount-ns entry mechanism (ADR-0148 Amendment SD-1-NETNS-BROKER, revised):
+// the bind/umount that must be visible host-wide is performed by an nsenter
+// subprocess (`nsenter --mount=/proc/1/ns/mnt -- <op>`), NOT by an in-process
+// unix.Setns(CLONE_NEWNS). The Linux kernel forbids setns(CLONE_NEWNS) from a
+// multithreaded process (EINVAL), and the Go runtime is irreducibly
+// multithreaded — runtime.LockOSThread pins a goroutine to a thread but does
+// NOT make the process single-threaded, so the kernel's "is this process
+// multithreaded?" check (more than one task sharing the mm/files) still trips.
+// privileged:true gives the broker CAP_SYS_ADMIN in the host init userns so
+// ns_capable() passes, but that does not lift the multithreaded restriction.
+// A forked nsenter is single-threaded at the moment it calls setns, so it
+// succeeds. This is the same nsenter chain migrationnetns.go used before the
+// SD-1 broker refactor; SD-1 keeps that mechanism and relocates the privilege
+// into the sidecar. The fresh-netns UNSHARE for the srcPID=0 destination-prewarm
+// path is still done in-process on a locked OS thread — unshare(CLONE_NEWNET) is
+// NOT subject to the multithreaded restriction; only setns(CLONE_NEWNS) is.
 //
 // SC-1 (Security Reviewer condition): socket mode 0600 authenticates the
 // filesystem caller, NOT the request. Every op therefore validates
@@ -36,6 +48,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -56,9 +69,20 @@ const (
 
 	// hostMountNs is the host init mount-namespace handle. The agent pod runs
 	// hostPID:true, so /proc/1 resolves to the host init process and
-	// /proc/1/ns/mnt is the host mount namespace. setns(CLONE_NEWNS) into it
-	// makes the bind-mount visible host-wide (CRIU runs there).
+	// /proc/1/ns/mnt is the host mount namespace. nsenter --mount=<this> runs a
+	// subprocess in that namespace so the bind-mount is visible host-wide (CRIU
+	// runs there). We use the path form (`--mount=/proc/1/ns/mnt`) rather than an
+	// fd because nsenter resolves it itself in a single-threaded child.
 	hostMountNs = "/proc/1/ns/mnt"
+
+	// hostMountNsArg is the nsenter flag selecting the host init mount namespace.
+	hostMountNsArg = "--mount=" + hostMountNs
+
+	// hostMountInfo is host init's mountinfo, visible because the agent pod runs
+	// hostPID:true. Idempotency (is the bind already a live nsfs mount?) reads
+	// this — it reflects the HOST mount namespace, where the broker's nsenter
+	// binds land. /proc/self/mountinfo would show only the container's view.
+	hostMountInfo = "/proc/1/mountinfo"
 )
 
 // migrationUIDRe constrains migrationUID to the safe token set used by the
@@ -152,6 +176,10 @@ func toResponse(path string, err error) Response {
 // doCreate creates /run/podmotion/netns/<uid>/ and bind-mounts the selected
 // netns to .../<uid>/bind in the HOST mount namespace, returning the bind path.
 //
+// All host-mount-ns mutations (mkdir, touch, bind) are performed by nsenter
+// subprocesses entering /proc/1/ns/mnt — single-threaded children that may call
+// setns(CLONE_NEWNS), which an in-process multithreaded Go goroutine may not.
+//
 // Idempotent: if the bind path is already an nsfs mount, it is returned as-is.
 func doCreate(migrationUID string, srcPID int) (string, error) {
 	if err := validateUID(migrationUID); err != nil {
@@ -164,30 +192,25 @@ func doCreate(migrationUID string, srcPID int) (string, error) {
 	bindPath := netnsPathFor(migrationUID)
 	dir := filepath.Dir(bindPath)
 
+	// Idempotency fast-path: if the bind target is already a live nsfs mount in the
+	// HOST mount namespace, the netns is already prepared — reuse it. Reads host
+	// init's mountinfo (hostPID:true), which reflects the namespace nsenter binds into.
+	if isNsfsMounted(bindPath) {
+		return bindPath, nil
+	}
+
 	// Create the per-migration dir + bind target file in the HOST mount namespace.
-	// We are already running in the host mount namespace context for the syscall
-	// bind below (via the locked-thread setns), but the dir/file must also exist
-	// host-side. mkBindScaffolding performs both inside the host mount ns.
-	if err := withHostMountNs(func() error {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return fmt.Errorf("mkdir %s: %w", dir, err)
-		}
-		// Idempotency: already a live nsfs mount -> reuse.
-		if isNsfsMounted(bindPath) {
-			return errAlreadyMounted
-		}
-		// Create the bind target file if absent.
-		f, err := os.OpenFile(bindPath, os.O_CREATE, 0o600)
-		if err != nil {
-			return fmt.Errorf("create bind target %s: %w", bindPath, err)
-		}
-		_ = f.Close()
-		return nil
-	}); err != nil {
-		if err == errAlreadyMounted {
-			return bindPath, nil
-		}
-		return "", err
+	// These must exist host-side for the subsequent host-ns bind; os.MkdirAll here
+	// would create them only in the broker container's private mount namespace, so
+	// we create them via nsenter in the host mount namespace (matches the prior
+	// createBindMountedNetns mkdir/touch chain).
+	if out, err := nsenterHostMnt("mkdir", "-p", dir).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("mkdir %s in host mount ns: %w\n%s", dir, err, out)
+	}
+	if out, err := nsenterHostMnt("sh", "-c",
+		fmt.Sprintf("[ -e %q ] || touch %q", bindPath, bindPath),
+	).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("create bind target %s in host mount ns: %w\n%s", bindPath, err, out)
 	}
 
 	if srcPID > 0 {
@@ -208,11 +231,10 @@ func doCreate(migrationUID string, srcPID int) (string, error) {
 	return bindPath, nil
 }
 
-// errAlreadyMounted is an internal sentinel for the idempotent create fast-path.
-var errAlreadyMounted = fmt.Errorf("netns already bind-mounted")
-
-// doTeardown unmounts and removes /run/podmotion/netns/<uid>/. ENOENT/EINVAL
-// (not mounted / absent) is treated as success (idempotent).
+// doTeardown unmounts and removes /run/podmotion/netns/<uid>/. "Not mounted" /
+// absent is treated as success (idempotent). The unmount and removals run in the
+// HOST mount namespace via nsenter because the bind-mount and bind-target file
+// were created there by doCreate.
 func doTeardown(migrationUID string) error {
 	if err := validateUID(migrationUID); err != nil {
 		return err
@@ -220,29 +242,36 @@ func doTeardown(migrationUID string) error {
 	bindPath := netnsPathFor(migrationUID)
 	dir := filepath.Dir(bindPath)
 
-	return withHostMountNs(func() error {
-		// Lazy detach unmount — tolerate "not mounted".
-		if err := unix.Unmount(bindPath, unix.MNT_DETACH); err != nil && err != unix.EINVAL && err != unix.ENOENT {
-			return fmt.Errorf("unmount %s: %w", bindPath, err)
+	// Lazy detach unmount in the host mount namespace — tolerate "not mounted".
+	if out, err := nsenterHostMnt("umount", "-l", bindPath).CombinedOutput(); err != nil {
+		if !isNotMountedOutput(out) {
+			return fmt.Errorf("unmount %s in host mount ns: %w\n%s", bindPath, err, out)
 		}
-		if err := os.Remove(bindPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove %s: %w", bindPath, err)
+	}
+	// Remove the bind-target file in the host mount namespace.
+	if out, err := nsenterHostMnt("rm", "-f", bindPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("remove %s in host mount ns: %w\n%s", bindPath, err, out)
+	}
+	// Remove the now-empty per-migration dir in the host mount namespace.
+	// `rmdir` on a non-empty dir is non-fatal (idempotent teardown).
+	if out, err := nsenterHostMnt("rmdir", dir).CombinedOutput(); err != nil {
+		if !strings.Contains(string(out), "not empty") &&
+			!strings.Contains(string(out), "No such file") {
+			return fmt.Errorf("remove dir %s in host mount ns: %w\n%s", dir, err, out)
 		}
-		if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
-			// dir non-empty is non-fatal (idempotent teardown); only report unexpected errors.
-			if !strings.Contains(err.Error(), "directory not empty") {
-				return fmt.Errorf("remove dir %s: %w", dir, err)
-			}
-		}
-		return nil
-	})
+	}
+	return nil
 }
 
 // unshareAndBind runs on a dedicated locked OS thread: it saves the current
 // netns, unshares CLONE_NEWNET (creating a fresh netns on this thread), binds
-// the thread's netns into the host mount namespace at bindPath, then restores.
+// the thread's netns into the host mount namespace via nsenter, then restores.
 // The thread is intentionally NOT unlocked so the Go runtime recycles it rather
 // than returning a thread with a swapped netns to the pool.
+//
+// NOTE: unshare(CLONE_NEWNET) is performed in-process here on purpose — it is
+// NOT subject to the multithreaded-process restriction that forbids in-process
+// setns(CLONE_NEWNS). Only the host-mount-ns BIND is delegated to nsenter.
 func unshareAndBind(bindPath string) error {
 	done := make(chan error, 1)
 	go func() {
@@ -280,73 +309,56 @@ func unshareAndBind(bindPath string) error {
 }
 
 // bindInHostMountNs performs `mount --bind src target` inside the HOST mount
-// namespace using unix.Mount (no nsenter subprocess). It runs on a locked thread
-// that setns()es into /proc/1/ns/mnt for the duration of the bind.
+// namespace via an nsenter subprocess (`nsenter --mount=/proc/1/ns/mnt -- mount
+// --bind src target`). nsenter forks a single-threaded child that may legally
+// call setns(CLONE_NEWNS) — an in-process Go goroutine may not (EINVAL from a
+// multithreaded process even under privileged:true / CAP_SYS_ADMIN).
 //
-// IMPORTANT: the src path (e.g. /proc/<tid>/ns/net) is resolved in the CALLER's
-// mount/pid context. /proc is the same procfs across the host mount ns on a
-// hostPID:true pod, so the path resolves identically after setns(CLONE_NEWNS).
+// IMPORTANT: the src path (e.g. /proc/<tid>/ns/net) is resolved by nsenter's
+// child AFTER it has joined the host mount namespace. /proc is the same procfs
+// across the host mount ns on a hostPID:true pod, so /proc/<tid>/ns/net and
+// /proc/<srcPID>/ns/net resolve to the intended netns from the host mount ns.
 func bindInHostMountNs(src, target string) error {
-	return withHostMountNs(func() error {
-		if err := unix.Mount(src, target, "", unix.MS_BIND, ""); err != nil {
-			return fmt.Errorf("bind mount %s -> %s in host mount ns: %w", src, target, err)
-		}
-		return nil
-	})
+	if out, err := nsenterHostMnt("mount", "--bind", src, target).CombinedOutput(); err != nil {
+		return fmt.Errorf("bind mount %s -> %s in host mount ns: %w\n%s", src, target, err, out)
+	}
+	return nil
 }
 
-// withHostMountNs runs fn on a locked OS thread that has setns()'d into the host
-// init mount namespace (/proc/1/ns/mnt), restoring the original mount namespace
-// afterward. This is the syscall replacement for `nsenter --mount=/proc/1/ns/mnt`.
-func withHostMountNs(fn func() error) error {
-	done := make(chan error, 1)
-	go func() {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
+// nsenterHostMnt builds an *exec.Cmd that runs `nsenter --mount=/proc/1/ns/mnt --
+// <args...>` — the command executes in the HOST mount namespace as a fresh
+// single-threaded process. This is the syscall-free replacement for the prior
+// in-process unix.Setns(CLONE_NEWNS) host-mount-ns entry, which returns EINVAL
+// from the multithreaded Go runtime regardless of CAP_SYS_ADMIN.
+func nsenterHostMnt(args ...string) *exec.Cmd {
+	full := append([]string{hostMountNsArg, "--"}, args...)
+	return exec.Command("nsenter", full...)
+}
 
-		origMnt, err := os.Open("/proc/self/ns/mnt")
-		if err != nil {
-			done <- fmt.Errorf("open current mount ns: %w", err)
-			return
-		}
-		defer origMnt.Close()
-
-		hostMnt, err := os.Open(hostMountNs)
-		if err != nil {
-			done <- fmt.Errorf("open host mount ns %s: %w", hostMountNs, err)
-			return
-		}
-		defer hostMnt.Close()
-
-		if err := unix.Setns(int(hostMnt.Fd()), unix.CLONE_NEWNS); err != nil {
-			done <- fmt.Errorf("setns into host mount ns: %w", err)
-			return
-		}
-		fnErr := fn()
-		// Restore the original mount namespace. If this fails we deliberately do
-		// NOT unlock the thread (let the runtime discard it) by panicking-safe:
-		// returning the restore error; the thread stays locked because UnlockOSThread
-		// is deferred — acceptable, it is one thread.
-		if rerr := unix.Setns(int(origMnt.Fd()), unix.CLONE_NEWNS); rerr != nil {
-			if fnErr != nil {
-				done <- fmt.Errorf("%v; additionally failed to restore mount ns: %w", fnErr, rerr)
-				return
-			}
-			done <- fmt.Errorf("restore mount ns: %w", rerr)
-			return
-		}
-		done <- fnErr
-	}()
-	return <-done
+// isNotMountedOutput reports whether umount's stderr indicates the target was
+// not a mount point (idempotent teardown success). umount(8) phrasing varies by
+// util-linux version: "not mounted", "not currently mounted", "not found".
+func isNotMountedOutput(out []byte) bool {
+	s := string(out)
+	return strings.Contains(s, "not mounted") ||
+		strings.Contains(s, "not currently mounted") ||
+		strings.Contains(s, "not found") ||
+		strings.Contains(s, "No such file")
 }
 
 // isNsfsMounted reports whether path is a live nsfs (network-namespace) bind
-// mount in the current mount namespace. Called from inside withHostMountNs so
-// self/mountinfo reflects the host mount namespace.
+// mount in the HOST mount namespace. Reads /proc/1/mountinfo (host init's
+// mountinfo, visible with hostPID:true) so the binds nsenter creates in the host
+// mount namespace are visible — the broker container's own /proc/self/mountinfo
+// would not show them.
 func isNsfsMounted(path string) bool {
-	data, err := os.ReadFile("/proc/self/mountinfo")
+	data, err := os.ReadFile(hostMountInfo)
 	if err != nil {
-		return false
+		// Fall back to self mountinfo if host mountinfo is inaccessible.
+		data, err = os.ReadFile("/proc/self/mountinfo")
+		if err != nil {
+			return false
+		}
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
