@@ -6259,6 +6259,14 @@ func (s *AgentServer) registerFrozenSource(migrationName string, pid int32) {
 	s.frozenSourcePIDsMu.Lock()
 	defer s.frozenSourcePIDsMu.Unlock()
 	s.frozenSourcePIDs[migrationName] = pid
+	// ADR-0216: mirror the registration to a durable on-disk record so an agent
+	// restart between this freeze and the matching SIGCONT cannot orphan the source.
+	// The in-memory map only thaws within THIS agent process; the durable record is
+	// what ReconcileOrphanedFrozenSources() uses to thaw across a restart.
+	if persistErr := persistFrozenSource(migrationName, pid); persistErr != nil {
+		log.Error(persistErr, "registerFrozenSource (ADR-0216): durable record write failed — cross-restart thaw not guaranteed for this migration",
+			"migration", migrationName, "sourcePID", pid)
+	}
 	log.Info("registerFrozenSource: source process frozen",
 		"migration", migrationName, "sourcePID", pid)
 }
@@ -6267,8 +6275,11 @@ func (s *AgentServer) registerFrozenSource(migrationName string, pid int32) {
 // Called after thawing or on successful migration completion.
 func (s *AgentServer) clearFrozenSource(migrationName string) {
 	s.frozenSourcePIDsMu.Lock()
-	defer s.frozenSourcePIDsMu.Unlock()
 	delete(s.frozenSourcePIDs, migrationName)
+	s.frozenSourcePIDsMu.Unlock()
+	// ADR-0216: drop the durable record in lockstep with the in-memory entry so a
+	// completed/thawed migration leaves no stale record for startup reconcile.
+	removeFrozenSourceRecord(migrationName)
 }
 
 // thawFrozenSource thaws the recorded frozen source PID for migrationName (if any)
@@ -6280,6 +6291,11 @@ func (s *AgentServer) thawFrozenSource(migrationName string) {
 		delete(s.frozenSourcePIDs, migrationName)
 	}
 	s.frozenSourcePIDsMu.Unlock()
+	// ADR-0216: remove the durable record whether or not an in-memory entry was
+	// present. After an agent restart the in-memory map is empty but a durable
+	// record may still exist; an explicit Abort/rollback for that migration must
+	// clear it so startup reconcile does not later act on an already-handled entry.
+	removeFrozenSourceRecord(migrationName)
 	if ok {
 		thawSourcePID(pid, migrationName)
 	}

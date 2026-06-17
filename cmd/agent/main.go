@@ -302,6 +302,18 @@ func main() {
 
 	agentSrv := server.New(nodeName, checkpointer, k8sClient)
 
+	// ADR-0216: thaw any source workload left in SIGSTOP by a prior agent instance.
+	// LeaveStopped=true (Strict TCP-stateful) dumps leave the source in State T until
+	// the matching SIGCONT (Abort/rollback/InjectIPHandoff). If THIS agent's predecessor
+	// died after the freeze but before that SIGCONT, the in-memory thaw registry was lost
+	// and the source would stay frozen forever. The durable on-disk registry lets us thaw
+	// those orphans at startup (PID+start-time guarded, never signals a reused PID).
+	// Gate-12 origin: gate-redis-s35 was left in State T, listening but never PONGing.
+	if n := server.ReconcileOrphanedFrozenSources(); n > 0 {
+		log.Info("ReconcileOrphanedFrozenSources (ADR-0216): thawed orphaned frozen source process(es) at startup",
+			"thawedCount", n)
+	}
+
 	// Start gRPC server on :9090.
 	go func() {
 		// ADR-0118 Blocking Item 1: do not accept Checkpoint RPCs until the informer cache
