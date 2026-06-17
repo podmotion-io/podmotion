@@ -40,6 +40,7 @@ import (
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
+	"github.com/podmotion-io/podmotion/internal/agent/netnsbroker"
 	"github.com/podmotion-io/podmotion/internal/agent/nmcregistrar"
 	"github.com/podmotion-io/podmotion/internal/agent/nri"
 	"github.com/podmotion-io/podmotion/internal/agent/seccomp"
@@ -212,6 +213,23 @@ func main() {
 	// cross-node reachability round-trip). Same early-dispatch discipline as __inetns_probe.
 	if len(os.Args) > 1 && os.Args[1] == "__inetns_echo" {
 		runInetnsEcho(os.Args[2:])
+		return
+	}
+
+	// SD-1-NETNS-BROKER (ADR-0148 Amendment): netns-broker subcommand dispatch.
+	// When the agent image is invoked as `/agent netns-broker` (the privileged
+	// sidecar container's args), serve the netns-broker socket and nothing else —
+	// no gRPC, no NMC, no NRI, no k8s client. Same binary/image as the main agent
+	// (no version skew), distinct narrow-surface entrypoint. MUST dispatch before
+	// any agent setup runs.
+	if len(os.Args) > 1 && os.Args[1] == "netns-broker" {
+		blog := zap.New().WithName("netns-broker")
+		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+		defer cancel()
+		if err := netnsbroker.Run(ctx, blog); err != nil {
+			blog.Error(err, "netns-broker exited with error")
+			os.Exit(1)
+		}
 		return
 	}
 
