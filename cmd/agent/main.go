@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cilium/ebpf/rlimit"
 	"github.com/go-logr/logr"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -238,6 +239,23 @@ func main() {
 	// (e.g. internal/agent/server, internal/agent/nri) produce structured output instead
 	// of panicking with "log.SetLogger(...) was never called".
 	ctrl.SetLogger(log)
+
+	// ADR-0148 / ADR-0039: lift the RLIMIT_MEMLOCK ceiling before any BPF object is
+	// loaded. BPF map creation charges locked memory against RLIMIT_MEMLOCK on kernels
+	// < 5.11 (which lack memcg-based BPF memory accounting); the process inherits the
+	// low default (often 64KB) and map create() fails EPERM ("operation not permitted /
+	// MEMLOCK may be too low"). This is independent of CAP_BPF — the capability lets the
+	// bpf() syscall run, but the rlimit still caps the locked pages. RemoveMemlock raises
+	// it to RLIM_INFINITY (and is a harmless no-op on >= 5.11). MUST run before
+	// server.New → EnsureXDPBridgeLoaded (PM_BRIDGE_MAP) and any ArmZeroWindowHold
+	// (PM_ACTIVE_HOLDS) load. The netns-broker subcommand dispatched above does not load
+	// XDP/zero_window BPF, so this placement covers every in-process BPF load site.
+	if err := rlimit.RemoveMemlock(); err != nil {
+		// Non-fatal: on kernels >= 5.11 BPF uses memcg accounting and the rlimit is
+		// irrelevant; on older kernels a failure here will surface as the original
+		// EPERM at map-create with an actionable error. Log and continue.
+		log.Error(err, "rlimit.RemoveMemlock failed — BPF map creation may EPERM on kernels < 5.11")
+	}
 
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
