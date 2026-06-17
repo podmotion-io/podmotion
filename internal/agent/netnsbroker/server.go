@@ -99,10 +99,15 @@ func serveConn(ctx context.Context, conn net.Conn) {
 		writeResp(conn, Response{Error: fmt.Sprintf("decode request: %v", err)})
 		return
 	}
-	log.Info("netns-broker op", "op", req.Op, "migrationUID", req.MigrationUID, "srcPID", req.SrcPID)
+	// ADR-0231: exec carries no migrationUID/srcPID; log argv[0] for that op instead.
+	var execArgv0 string
+	if req.Op == "exec" && len(req.Argv) > 0 {
+		execArgv0 = req.Argv[0]
+	}
+	log.Info("netns-broker op", "op", req.Op, "migrationUID", req.MigrationUID, "srcPID", req.SrcPID, "execArgv0", execArgv0)
 	resp := Handle(req)
 	if resp.Error != "" {
-		log.Error(fmt.Errorf("%s", resp.Error), "netns-broker op failed", "op", req.Op, "migrationUID", req.MigrationUID)
+		log.Error(fmt.Errorf("%s", resp.Error), "netns-broker op failed", "op", req.Op, "migrationUID", req.MigrationUID, "execArgv0", execArgv0)
 	}
 	writeResp(conn, resp)
 }

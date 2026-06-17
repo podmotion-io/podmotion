@@ -44,6 +44,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/authz"
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
 	"github.com/podmotion-io/podmotion/internal/agent/grpclimits"
+	"github.com/podmotion-io/podmotion/internal/agent/netnsbroker"
 	"github.com/podmotion-io/podmotion/internal/agent/network"
 	"github.com/podmotion-io/podmotion/internal/agent/provenance"
 	"github.com/podmotion-io/podmotion/internal/agent/seccomp"
@@ -2917,7 +2918,11 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	wrapperArgs := append([]string{"/opt/podmotion/bin/podmotion-criu-wrapper"}, cgroupFdMapArgs...)
 	wrapperArgs = append(wrapperArgs, "--", "/usr/sbin/criu")
 	wrapperArgs = append(wrapperArgs, criuArgs...)
-	criuCmd := nsenterCmd(wrapperArgs...)
+	// ADR-0231: the CRIU wrapper is launched via the LOCAL nsenter *exec.Cmd (not the
+	// broker shim) because it needs .Start()/.Wait()/.Process.Pid/.ProcessState +
+	// streaming stderr while the agent polls the cgroup-PID liveness signal. See
+	// nsenterLocalCmd — this is the KNOWN NEXT WALL after the image-pull frontier fix.
+	criuCmd := nsenterLocalCmd(wrapperArgs...)
 	// ADR-0125: netns is joined by path (--join-ns net:<path>), not by an inherited fd.
 	// ADR-0181: no ExtraFiles — the wrapper owns fd delivery; the agent holds no cgroup fds.
 	// Capture CRIU's stderr: when CRIU fails before opening its -o logfile (e.g. arg/ext-mount
@@ -4146,9 +4151,91 @@ else:
 // hostMntNS returns the path to the host's mount namespace via PID 1 (requires hostPID: true).
 const hostMntNS = "/proc/1/ns/mnt"
 
-// nsenterCmd wraps a command to run inside the host mount namespace using nsenter.
-// The agent pod runs with hostPID:true so /proc/1/ns/mnt is the host init's mount namespace.
-func nsenterCmd(args ...string) *exec.Cmd {
+// brokerExecTimeout bounds a single broker host-mount-ns exec. ctr image pull on
+// a cold node can take tens of seconds; CRIU restore is launched ASYNC (see the
+// criu wrapper path) and is NOT subject to this timeout.
+const brokerExecTimeout = 5 * time.Minute
+
+// brokerCmd is the run-to-completion shim returned by nsenterCmd. ADR-0231: the
+// SD-1 main agent cannot itself enter the host mount namespace (setns(CLONE_NEWNS)
+// requires CAP_SYS_ADMIN effective in the HOST init userns — only the privileged
+// netns-broker sidecar has it; the de-privileged agent's nsenter returns
+// "reassociate to namespace 'ns/mnt' failed: Operation not permitted"). So every
+// host-mount-ns command on the RESTORE path is delegated to the broker over its
+// root-owned Unix socket, the same channel HOLD-C used for netns binds. brokerCmd
+// emulates the *exec.Cmd subset the restore-path call sites actually use:
+// Output(), CombinedOutput(), Run(). The long-running CRIU wrapper is NOT routed
+// here (it needs a detached spawn + host PID) — see nsenterCriuWrapperStart.
+type brokerCmd struct {
+	argv []string
+}
+
+func (b *brokerCmd) result() netnsbroker.ExecResult {
+	ctx, cancel := context.WithTimeout(context.Background(), brokerExecTimeout)
+	defer cancel()
+	return netnsbroker.NewClient().Exec(ctx, brokerExecTimeout, b.argv...)
+}
+
+// Output returns stdout and, on non-zero exit, an error carrying the exit code —
+// matching exec.Cmd.Output semantics closely enough for the restore-path callers.
+func (b *brokerCmd) Output() ([]byte, error) {
+	r := b.result()
+	if r.SpawnErr != nil {
+		return r.Stdout, r.SpawnErr
+	}
+	if r.ExitCode != 0 {
+		return r.Stdout, fmt.Errorf("host-mount-ns exec %v: exit status %d: %s", b.argv, r.ExitCode, strings.TrimSpace(string(r.Stderr)))
+	}
+	return r.Stdout, nil
+}
+
+// CombinedOutput returns interleaved stdout+stderr and an error on non-zero exit.
+func (b *brokerCmd) CombinedOutput() ([]byte, error) {
+	r := b.result()
+	if r.SpawnErr != nil {
+		return r.Combined, r.SpawnErr
+	}
+	if r.ExitCode != 0 {
+		return r.Combined, fmt.Errorf("exit status %d", r.ExitCode)
+	}
+	return r.Combined, nil
+}
+
+// Run executes the command and returns an error only on broker failure or non-zero exit.
+func (b *brokerCmd) Run() error {
+	r := b.result()
+	if r.SpawnErr != nil {
+		return r.SpawnErr
+	}
+	if r.ExitCode != 0 {
+		return fmt.Errorf("exit status %d", r.ExitCode)
+	}
+	return nil
+}
+
+// nsenterCmd returns a brokerCmd that runs the command inside the HOST mount
+// namespace VIA THE PRIVILEGED netns-broker sidecar (ADR-0231). It previously
+// built a local `nsenter --mount=/proc/1/ns/mnt` *exec.Cmd, which the SD-1
+// de-privileged agent cannot execute (EPERM on setns). The call sites are
+// unchanged — they invoke .Output()/.CombinedOutput()/.Run() on the result.
+func nsenterCmd(args ...string) *brokerCmd {
+	return &brokerCmd{argv: args}
+}
+
+// nsenterLocalCmd builds a real `nsenter --mount=/proc/1/ns/mnt -- <args>`
+// *exec.Cmd. ADR-0231 scope note (KNOWN NEXT WALL): this is retained ONLY for the
+// long-running CRIU wrapper launch (joinNsRestore step 4), which needs the full
+// *exec.Cmd lifecycle the broker run-to-completion shim does not expose —
+// .Start()/.Wait()/.Process.Pid/.ProcessState/streaming .Stderr — because CRIU on
+// the cold --join-ns path never self-exits and the agent reaps it asynchronously
+// while polling the agent-cgroup PID signal (ADR-0192). Under SD-1 this LOCAL
+// nsenter will itself EPERM on setns(CLONE_NEWNS) exactly as the run-to-completion
+// path did; routing the wrapper through the broker requires a detached-spawn +
+// host-PID-return + cross-process-reap broker mechanism (execAsync/execWait), which
+// is a distinct privileged-surface change deliberately NOT bundled into this
+// frontier fix. ADR-0231 fixes the PROVEN-LIVE image-pull wall (server.go:2617);
+// the CRIU-wrapper wall is the next, new-signature frontier (healthy descent).
+func nsenterLocalCmd(args ...string) *exec.Cmd {
 	nsArgs := append([]string{"--mount=" + hostMntNS, "--"}, args...)
 	return exec.Command("nsenter", nsArgs...)
 }
