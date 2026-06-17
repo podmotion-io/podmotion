@@ -280,7 +280,14 @@
         "flistxattr",
         "removexattr",
         "lremovexattr",
-        "fremovexattr"
+        "fremovexattr",
+        "bpf",
+        "perf_event_open",
+        "prlimit64",
+        "setrlimit",
+        "getrlimit",
+        "getpriority",
+        "setpriority"
       ],
       "action": "SCMP_ACT_ALLOW"
     }
