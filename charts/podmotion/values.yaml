@@ -81,6 +81,14 @@ descheduler:
 webhook:
   certManager:
     enabled: true
+  # ADR-0039 SD-6 / HOLD-B: the agent exec-block ValidatingWebhookConfiguration (deny
+  # exec/attach/ephemeralcontainers + nodes/proxy against the privileged agent). Default true
+  # and INDEPENDENT of cert-manager — on substrates without cert-manager (kind/dev) the chart
+  # mints a self-signed serving cert and inlines the matching caBundle, and the operator is
+  # wired with --webhook-cert-path so its webhook server actually serves the handler.
+  # Set false ONLY to deliberately disable the SD-6 exec-block control.
+  agentExecBlock:
+    enabled: true
 
 networkPolicy:
   enabled: false
