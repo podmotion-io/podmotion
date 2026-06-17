@@ -401,6 +401,22 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 	s.destHostVethMu.RLock()
 	storedVeth := s.destHostVeth[migrationName]
 	s.destHostVethMu.RUnlock()
+	// ADR-0215: when the NRI ContainerEvent carries no image name (fetchContainerImage on the
+	// placeholder/replacement container returned empty), resolve the AUTHORITATIVE source-pod
+	// image cached by PrepareDestinationNetns (ADR-0168 B2 chain: source pod image →
+	// MCP.Spec.WorkloadImage → PrepareDestinationNetnsRequest.workload_image →
+	// destWorkloadImage[migrationName]). This replaces the prior hardcoded "docker.io/library/redis:7"
+	// fallback in joinNsRestore, which silently substituted the wrong image (gate-11: pod runs
+	// redis:7-alpine; hardcoded fallback requested redis:7 → "image not found").
+	if imageName == "" {
+		s.destWorkloadImageMu.RLock()
+		imageName = s.destWorkloadImage[migrationName]
+		s.destWorkloadImageMu.RUnlock()
+		if imageName != "" {
+			log.Info("ADR-0215: NRI image name empty — using authoritative cached workload image from PrepareDestinationNetns",
+				"migration", migrationName, "image", imageName)
+		}
+	}
 	pid, droppedMounts, err := joinNsRestoreFn(migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode)
 	if err != nil {
 		// ADR-0193 P-0193-4 / S1: emit a Warning CRIUImageInconsistency Kubernetes Event on the
@@ -2500,10 +2516,18 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 		}
 	}
 	// Use the image name passed in from the NRI ContainerEvent (fetched via ctr containers
-	// info). The checkpoint dir is a CRIU dump dir and never contains an OCI bundle
-	// config.json, so we no longer attempt to read it here.
+	// info) or, when that is empty, the authoritative source-pod image resolved by the caller
+	// from destWorkloadImage[migrationName] (ADR-0168 B2 chain). The checkpoint dir is a CRIU
+	// dump dir and never contains an OCI bundle config.json, so we do not read it here.
+	//
+	// ADR-0215: there is NO hardcoded image fallback. A hardcoded "docker.io/library/redis:7"
+	// previously masked an empty image name and silently substituted the wrong image — gate-11
+	// failed because the pod ran redis:7-alpine but the placeholder requested redis:7 (absent on
+	// the node). If the image is still unresolved here, every upstream authoritative source has
+	// failed; fail loudly so the controller rolls back, rather than starting a placeholder with a
+	// guessed image that does not match the checkpointed mapped-VMA file sizes.
 	if imageName == "" {
-		imageName = "docker.io/library/redis:7"
+		return 0, nil, fmt.Errorf("restore image unresolved (ADR-0215): no image from NRI ContainerEvent and no cached workload image for migration %q — controller must plumb MCP.Spec.WorkloadImage via PrepareDestinationNetns workload_image", migrationName)
 	}
 	if strings.Count(imageName, "/") == 0 {
 		imageName = "docker.io/library/" + imageName
