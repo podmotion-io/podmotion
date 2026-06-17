@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
@@ -41,6 +42,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
 	"github.com/podmotion-io/podmotion/internal/agent/nmcregistrar"
 	"github.com/podmotion-io/podmotion/internal/agent/nri"
+	"github.com/podmotion-io/podmotion/internal/agent/seccomp"
 	"github.com/podmotion-io/podmotion/internal/agent/server"
 	agenttls "github.com/podmotion-io/podmotion/internal/agent/tls"
 )
@@ -286,12 +288,16 @@ func main() {
 	// The cache is required for the ADR-0118 podUID-from-CR fallback: Checkpoint reads the
 	// PodMigration CR, and a cold (un-synced) cache would return spurious not-found errors.
 	var k8sClient client.Client
+	var seccompRecorder record.EventRecorder
 	cl, clErr := cluster.New(cfg, func(o *cluster.Options) { o.Scheme = scheme })
 	if clErr != nil {
 		log.Error(clErr, "Failed to build k8s cluster client — MigrationCheckpoint CR updates will be skipped")
 		k8sClient = nil
 	} else {
 		k8sClient = cl.GetClient()
+		// ADR-0009 §3/§4: the seccomp manager emits SeccompWeakened/SeccompRestored events
+		// against the migrated Pod. Source the recorder from the cluster's event provider.
+		seccompRecorder = cl.GetEventRecorderFor("podmotion-seccomp")
 		// Run the cluster (starts the informer cache) for the agent's lifetime.
 		go func() {
 			if err := cl.Start(ctx); err != nil {
@@ -301,6 +307,19 @@ func main() {
 	}
 
 	agentSrv := server.New(nodeName, checkpointer, k8sClient)
+
+	// SD-3 (ADR-0009 §2): crash-recovery for the seccomp Unconfined window. If a prior agent
+	// instance died inside the checkpoint window after SwapToUnconfined but before
+	// RestoreSeccomp, the container is still Unconfined and a real-profile record is on disk
+	// at /run/podmotion/seccomp-restore/. Restore each one at startup (Kill+Create mutation is
+	// the partial M13 seam) and emit a SeccompRestoreAfterRestart event per recovered container.
+	seccompMgr := &seccomp.ContainerdSeccompManager{KubeClient: k8sClient, Recorder: seccompRecorder}
+	if n, recErr := seccompMgr.RecoverOrphanedProfiles(ctx); recErr != nil {
+		log.Error(recErr, "seccomp crash-recovery scan failed (ADR-0009 §2)")
+	} else if n > 0 {
+		log.Info("seccomp crash-recovery (SD-3, ADR-0009 §2): restored orphaned Unconfined container(s) at startup",
+			"restoredCount", n)
+	}
 
 	// ADR-0216: thaw any source workload left in SIGSTOP by a prior agent instance.
 	// LeaveStopped=true (Strict TCP-stateful) dumps leave the source in State T until
@@ -330,7 +349,7 @@ func main() {
 	}()
 
 	// Start NRI plugin. OnStartContainer triggers CRIU restore when a replacement pod
-	// bearing podmotion.io/checkpoint-ref starts on this node (North Star #2 path).
+	// bearing podmotion.io/checkpoint-ref starts on this node (Feln #2 path).
 	nriPlugin := nri.New(
 		nil, // OnStopping: pre-dump trigger wired in M5
 		func(ctx context.Context, event nri.ContainerEvent, checkpointRef string) error {
