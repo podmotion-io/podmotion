@@ -45,8 +45,11 @@
 package netnsbroker
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -93,14 +96,26 @@ var migrationUIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,127}$`)
 
 // Request is the JSON wire request accepted on the broker socket.
 type Request struct {
-	Op string `json:"op"` // "create" | "teardown"
+	Op string `json:"op"` // "create" | "teardown" | "exec"
 	// MigrationUID names the per-migration netns dir. Validated by migrationUIDRe.
+	// Required on create/teardown; ignored on exec.
 	MigrationUID string `json:"migrationUID"`
 	// SrcPID, when > 0 on a create, selects /proc/<srcPID>/ns/net as the netns to
 	// bind (the pod-in-migration's netns). When 0, the broker unshares a FRESH
 	// network namespace on a locked thread and binds that — the destination-prewarm
 	// behavior PrepareDestinationNetns relied on (createBindMountedNetns).
 	SrcPID int `json:"srcPID,omitempty"`
+
+	// ADR-0231: Argv is the host-mount-namespace command for the "exec" op. The
+	// broker runs `nsenter --mount=/proc/1/ns/mnt -- <Argv...>` on the agent's
+	// behalf — the restore-path host-mount-ns work (ctr image pull/snapshot, the
+	// CRIU wrapper, rootfs mkdir/touch/mount) that the de-privileged main agent
+	// cannot itself perform because setns(CLONE_NEWNS) into the host mount ns needs
+	// CAP_SYS_ADMIN effective in the HOST init userns (which only privileged:true
+	// confers — the broker has it, the SD-1 agent does not). Argv[0] is validated
+	// against execAllowlist; the broker never runs an arbitrary client-supplied
+	// binary (SC-1-EXEC).
+	Argv []string `json:"argv,omitempty"`
 }
 
 // Response is the JSON wire response. Error is "" on success.
@@ -108,7 +123,20 @@ type Response struct {
 	// Path is the bind-mount path on success (create only). Empty on teardown.
 	Path string `json:"path,omitempty"`
 	// Error is a human-readable error string, or "" on success. JSON null<->"".
+	// For the exec op, Error is set ONLY on a broker-side failure (validation,
+	// nsenter spawn failure). A non-zero EXIT of the executed command is NOT a
+	// broker error — it is reported via ExitCode + Stdout/Stderr so the agent
+	// reconstructs the subprocess result exactly as if it had run nsenter itself.
 	Error string `json:"error,omitempty"`
+
+	// ADR-0231 (exec op only): the host-mount-ns command result. ExitCode is the
+	// executed command's exit status (0 on success; -1 if it could not be spawned).
+	// Stdout/Stderr are the captured streams. Combined is stdout+stderr interleaved
+	// (CombinedOutput semantics) for callers that used .CombinedOutput().
+	ExitCode *int   `json:"exitCode,omitempty"`
+	Stdout   []byte `json:"stdout,omitempty"`
+	Stderr   []byte `json:"stderr,omitempty"`
+	Combined []byte `json:"combined,omitempty"`
 }
 
 // netnsPathFor returns the broker-computed bind target for a migrationUID.
@@ -161,8 +189,78 @@ func Handle(req Request) Response {
 	case "teardown":
 		err := doTeardown(req.MigrationUID)
 		return toResponse("", err)
+	case "exec":
+		// ADR-0231: run an allowlisted host-mount-ns command on the agent's behalf.
+		return doExec(req.Argv)
 	default:
-		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown)", req.Op))
+		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec)", req.Op))
+	}
+}
+
+// execAllowlist is the SC-1-EXEC binary allowlist for the "exec" op. The broker
+// runs ONLY these binaries (matched on Argv[0], absolute or bare) in the host
+// mount namespace. This is the security boundary that keeps the "exec" op from
+// becoming an arbitrary-command proxy: a compromised de-privileged agent cannot
+// direct the privileged broker to run anything outside the CRIU restore path's
+// known host-mount-ns command set. The set is exactly the binaries the restore
+// path (server.go joinNsRestore / setupRestoreOverlayfs) invokes via nsenterCmd:
+//   - ctr / /usr/local/bin/ctr — containerd image pull, snapshot, task lifecycle
+//   - /opt/podmotion/bin/podmotion-criu-wrapper — the CRIU launcher (ADR-0181/0183)
+//   - mkdir / touch / rm / mount / umount / sh — rootfs scaffolding + ext-mount setup
+// Adding a new restore-path host-mount-ns command requires adding it here AND a
+// §P-VERIFY assertion (the binary must exist on the node) — same discipline as any
+// other ADR runtime-dependency (§3i).
+var execAllowlist = map[string]struct{}{
+	"ctr":                                       {},
+	"/usr/local/bin/ctr":                        {},
+	"/opt/podmotion/bin/podmotion-criu-wrapper": {},
+	"mkdir":  {},
+	"touch":  {},
+	"rm":     {},
+	"mount":  {},
+	"umount": {},
+	"sh":     {},
+	"ls":     {},
+}
+
+// doExec runs an allowlisted host-mount-namespace command via nsenterHostMnt and
+// returns its exit code + captured output. A non-zero command exit is reported in
+// the Response (ExitCode/Stderr), NOT as a broker Error — the agent reconstructs
+// the subprocess result exactly as if it had run nsenter locally. Only a broker-
+// side failure (empty/forbidden argv, nsenter spawn failure) sets Response.Error.
+func doExec(argv []string) Response {
+	if len(argv) == 0 {
+		return Response{Error: "exec: empty argv"}
+	}
+	if _, ok := execAllowlist[argv[0]]; !ok {
+		// SC-1-EXEC: hard reject. Do not run, do not leak which binaries are allowed.
+		return Response{Error: fmt.Sprintf("exec: binary %q not in broker allowlist", argv[0])}
+	}
+
+	cmd := nsenterHostMnt(argv...)
+	var stdout, stderr, combined bytes.Buffer
+	// Tee both streams into a combined buffer so we satisfy both .Output() and
+	// .CombinedOutput() call sites with one round-trip.
+	cmd.Stdout = io.MultiWriter(&stdout, &combined)
+	cmd.Stderr = io.MultiWriter(&stderr, &combined)
+
+	runErr := cmd.Run()
+	exitCode := 0
+	if runErr != nil {
+		var ee *exec.ExitError
+		if errors.As(runErr, &ee) {
+			exitCode = ee.ExitCode()
+		} else {
+			// Could not spawn nsenter at all (binary missing, fork failure). This is
+			// a broker-side failure distinct from a non-zero command exit.
+			return Response{Error: fmt.Sprintf("exec: spawn nsenter for %q: %v", argv[0], runErr)}
+		}
+	}
+	return Response{
+		ExitCode: &exitCode,
+		Stdout:   stdout.Bytes(),
+		Stderr:   stderr.Bytes(),
+		Combined: combined.Bytes(),
 	}
 }
 
