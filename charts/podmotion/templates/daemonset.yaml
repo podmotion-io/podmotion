@@ -37,8 +37,15 @@ spec:
       initContainers:
         - name: netns-mount-prep
           image: busybox:1.36
+          # ADR-0148 SD-1: drop privileged; this init only performs bind + make-shared
+          # mounts on /run/podmotion, which require CAP_SYS_ADMIN (mount/umount2). No
+          # netlink/route work happens here, so NET_ADMIN is not added.
           securityContext:
-            privileged: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["SYS_ADMIN"]
+            allowPrivilegeEscalation: false
           command: ["/bin/sh", "-c"]
           args:
             - |
@@ -50,8 +57,16 @@ spec:
               mountPath: /run/podmotion
         - name: init-checkpoint-tmpfs
           image: busybox:1.36
+          # ADR-0148 SD-1: drop privileged. This init nsenters the host mount namespace
+          # (setns(CLONE_NEWNS)) and mounts a tmpfs at /run/podmotion/checkpoints — both
+          # gated by CAP_SYS_ADMIN. It needs to see host PID 1's mount ns, which is why
+          # hostPID stays true at the pod level; the capability set here is the minimum.
           securityContext:
-            privileged: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["SYS_ADMIN"]
+            allowPrivilegeEscalation: false
           command:
             - sh
             - -c
@@ -76,9 +91,17 @@ spec:
         - name: install-criu-wrapper
           image: "{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"
           imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          # ADR-0148 SD-1: drop privileged. This init only copies the criu-wrapper binary
+          # onto the host (mkdir + install -m 0755) into the PodMotion-owned hostPath dir.
+          # As uid 0, DAC_OVERRIDE is the minimum needed to write/chmod regardless of the
+          # host dir's perms; no ptrace, mount, or netlink work happens here.
           securityContext:
-            privileged: true
+            privileged: false
             runAsUser: 0
+            capabilities:
+              drop: ["ALL"]
+              add: ["DAC_OVERRIDE"]
+            allowPrivilegeEscalation: false
           command:
             - sh
             - -c
@@ -114,7 +137,28 @@ spec:
           resources:
             {{- toYaml .Values.agent.resources | nindent 12 }}
           securityContext:
-            privileged: true
+            # ADR-0148 D2/D3 SD-1: drop privileged:true (~18 caps) in favour of the
+            # trace-derived minimum set. drop ALL, add only what CRIU + eBPF need:
+            #   SYS_PTRACE — CRIU dump (PTRACE_SEIZE, process_vm_readv/writev)
+            #   SYS_ADMIN  — CRIU mount-ns/setns/mount/umount2/userfaultfd (irreducible)
+            #   NET_ADMIN  — eBPF TC/XDP attach, veth/neigh/route/FDB, zero-window hold
+            #   BPF        — bpf() program load + map ops (k>=5.8 split out of SYS_ADMIN)
+            #   PERFMON    — perf_event_open for perf/tracepoint-anchored programs (k>=5.8)
+            # BPF/PERFMON gated on agent.kernelGE58 — pre-5.8 nodes get these via SYS_ADMIN.
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+              add:
+                - SYS_PTRACE
+                - SYS_ADMIN
+                - NET_ADMIN
+                {{- if .Values.agent.kernelGE58 }}
+                - BPF
+                - PERFMON
+                {{- end }}
+            # ADR-0148 D3: CRIU PTRACE_SEIZE + parasite-code injection requires no_new_privs
+            # CLEAR on the tracer. Does not widen surface (uid 0, no setuid binary in image).
+            allowPrivilegeEscalation: true
             {{- if .Values.agent.seccompProfile.enabled }}
             # ADR-0039 SD-5 / ADR-0148: CRIU-scoped seccomp profile (arg-filtered ptrace,
             # default-deny). Only meaningful once privileged:true is dropped (SD-1).
