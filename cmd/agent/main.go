@@ -321,6 +321,14 @@ func main() {
 			"restoredCount", n)
 	}
 
+	// SD-4 (ADR-0039, ADR-0148): start the ptrace-window stale sweeper. The CRIU dump/restore
+	// handlers open a window marker around each CRIU invocation and close it (deferred + explicit)
+	// when CRIU returns; this sweeper is the third line of defense — it closes any window left
+	// stuck open by an agent that crashed inside the CRIU window before its deferred close fired,
+	// so ptrace is never treated as in-window indefinitely (the in-window hint for the future SD-5
+	// seccomp-BPF ptrace arg-filter). Bound = 2x freeze budget; runs until ctx is cancelled.
+	seccomp.StartStaleWindowSweeper(ctx.Done(), 0)
+
 	// ADR-0216: thaw any source workload left in SIGSTOP by a prior agent instance.
 	// LeaveStopped=true (Strict TCP-stateful) dumps leave the source in State T until
 	// the matching SIGCONT (Abort/rollback/InjectIPHandoff). If THIS agent's predecessor

@@ -46,6 +46,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/grpclimits"
 	"github.com/podmotion-io/podmotion/internal/agent/network"
 	"github.com/podmotion-io/podmotion/internal/agent/provenance"
+	"github.com/podmotion-io/podmotion/internal/agent/seccomp"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 )
 
@@ -4693,6 +4694,19 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		}
 	}
 
+	// SD-4 (ADR-0039, ADR-0148): open the ptrace window precisely around the CRIU dump.
+	// CAP_SYS_PTRACE is held continuously by SD-1's discrete cap set, but it is only
+	// LEGITIMATELY exercised inside this dump window — CRIU's PTRACE_SEIZE/INTERRUPT of the
+	// source process tree. The window marker is the in-window hint a future SD-5 seccomp-BPF
+	// ptrace arg-filter consults; opening/closing it here bounds "ptrace is expected" to the
+	// freeze boundary, never steady state. Deferred close is the panic/early-return fallback;
+	// the explicit close immediately after Dump is the happy path. The stale-window sweeper
+	// (StartStaleWindowSweeper, agent init) is the third line of defense against a stuck window.
+	if owErr := seccomp.PtraceWindowOpen(req.MigrationName); owErr != nil {
+		log.Error(owErr, "SD-4: failed to open ptrace window before CRIU dump — continuing (sweeper backstop)", "migration", req.MigrationName)
+	}
+	defer func() { _ = seccomp.PtraceWindowClose(req.MigrationName) }()
+
 	freezeStart := time.Now()
 	result, err := s.checkpointer.Dump(context.Background(), criu.DumpOptions{
 		ImagesDir:      imagesDir,
@@ -4706,6 +4720,10 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		// frozen. registerFrozenSource is called immediately after a successful dump.
 		LeaveStopped: tcpEstablished,
 	})
+
+	// SD-4: ptrace is no longer expected once Dump returns (success or failure) — close the
+	// window immediately on the happy path. The deferred close above is the fallback only.
+	_ = seccomp.PtraceWindowClose(req.MigrationName)
 
 	// freezeTimestampNs is CLOCK_REALTIME ns captured immediately after CRIU dump
 	// returns. When LeaveStopped=true the process is in SIGSTOP at this point.
@@ -5064,6 +5082,18 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		return &agentpb.RestoreResponse{Success: false, ErrorMessage: msg}, nil
 	}
 
+	// SD-4 (ADR-0039, ADR-0148): open the ptrace window around the CRIU restore. Restore is
+	// the second window in which the agent legitimately exercises CAP_SYS_PTRACE (CRIU
+	// PTRACE_SEIZE/INTERRUPT of the restored process tree on the destination). The Restore
+	// handler has multiple CRIU-invoking paths and many return points, so the window is opened
+	// once here — immediately before the first CRIU restore invocation — and closed via the
+	// deferred fallback covering every return path; the explicit happy-path close fires right
+	// after the join-ns restore returns. The stale-window sweeper backstops a crash mid-restore.
+	if owErr := seccomp.PtraceWindowOpen(req.MigrationName); owErr != nil {
+		log.Error(owErr, "SD-4: failed to open ptrace window before CRIU restore — continuing (sweeper backstop)", "migration", req.MigrationName)
+	}
+	defer func() { _ = seccomp.PtraceWindowClose(req.MigrationName) }()
+
 	// Check if we have a config.json (produced by ctr checkpoint) — use join-ns restore:
 	// launch a fresh placeholder container then restore checkpoint state into its namespaces.
 	cfgPath := filepath.Join(imagesDir, "config.json")
@@ -5084,6 +5114,9 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		s.destHostVethMu.RUnlock()
 		// ADR-0168 B2: pass storedWorkloadImage so the placeholder uses the correct image.
 		pid, droppedMnts, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, "", storedVeth, false)
+		// SD-4: CRIU restore has returned — ptrace is no longer expected. Close the window on
+		// the happy path immediately (the deferred close above is the fallback for early returns).
+		_ = seccomp.PtraceWindowClose(req.MigrationName)
 		for _, d := range droppedMnts {
 			s.emitExternalMountDroppedEvent(context.Background(), req.MigrationName, d)
 		}
