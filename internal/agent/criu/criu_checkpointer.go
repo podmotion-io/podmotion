@@ -207,6 +207,64 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		"/sys/devices/virtual/dmi/id/sys_vendor",
 		"/sys/devices/virtual/powercap",
 		"/sys/firmware",
+		// ADR-0228: container-runtime masking tmpfs mounts over /proc/*.
+		//
+		// containerd/runc inject small read-only tmpfs mounts (type tmpfs, source tmpfs,
+		// mode=755, size=65536k) over these /proc paths to hide host kernel internals from
+		// the container (the CRI "maskedPaths" default set). They appear in the dump-side
+		// mount table as e.g.:
+		//   type tmpfs source tmpfs mnt_id 12198 s_dev 0x38d / @ ./proc/scsi flags ... mode=755
+		//
+		// CRIU's mountpoint dump pass (criu/filesystems.c dump_tmpfs) tar-serializes the
+		// CONTENT of every tmpfs mount it does not skip. For these masking mounts it shells
+		// out to `tar` (via /bin/sh) to capture the (empty) tmpfs content. In the constrained
+		// agent container that fork is denied:
+		//   mnt: Dumping mountpoints
+		//   mnt: 	12198: 38d:/ @ ./proc/scsi
+		//   /bin/sh: 1: Cannot fork
+		//   tar: Child returned status 2
+		//   tar: Error is not recoverable: exiting now
+		//   Error (criu/util.c:657): exited, status=2
+		//   Error (criu/filesystems.c:426): Can't dump tmpfs content
+		//   Error (criu/cr-dump.c:2128): Dumping FAILED.
+		// This is the t=15s frontier that surfaced once ADR-0227 (--manage-cgroups=ignore)
+		// cleared the earlier cgroup-walk wall: the dump advanced from the cgroup stage into
+		// the mountpoint stage and hit the FIRST masking tmpfs it tried to tar.
+		//
+		// These masking mounts carry NO workload state — they are empty tmpfs the runtime
+		// re-provides from its own bundle on restore. The restore-side SkipMnt list (below)
+		// ALREADY skips this exact set; the dump side did not, so the dump tried to tar them.
+		// §3h-SYM removal/skip-symmetry: skip them at dump time too so CRIU never tar-dumps
+		// their content. Skipping the content does not lose state (tmpfs is empty) and keeps
+		// the dump/restore skip sets symmetric. No `tar` fork is attempted for a skipped mount.
+		"/proc/acpi",
+		"/proc/asound",
+		"/proc/kcore",
+		"/proc/keys",
+		"/proc/latency_stats",
+		"/proc/scsi",
+		"/proc/timer_list",
+		// ADR-0228: Kubernetes projected service-account token tmpfs.
+		//
+		// The kubelet mounts the projected SA token as its own tmpfs:
+		//   type tmpfs source tmpfs mnt_id 12345 s_dev 0x32b / @ ./run/secrets/kubernetes.io/serviceaccount
+		//   flags 0x200001 options size=32548448k,inode64,noswap
+		// It is the SAME failure class as the /proc/* masking mounts above: CRIU's
+		// mountpoint dump pass tar-serializes its content and the `tar`/`/bin/sh` fork
+		// is denied in the constrained agent container, producing the identical
+		// filesystems.c:426 "Can't dump tmpfs content" abort — just one mount later in
+		// the dump order once the /proc/* masking mounts are skipped (healthy-descent
+		// frontier advance, §19f). The projected token is NOT migrated state: it is
+		// re-provided by the DESTINATION kubelet's own projected-volume plumbing on
+		// restore, which is exactly why the restore-side SkipMnt list below already
+		// skips /var/run/secrets/kubernetes.io/serviceaccount. Skip it at dump too to
+		// keep the dump/restore skip sets symmetric (§3h-SYM). Both /run and /var/run
+		// spellings are listed because the path appears as /run/... in this pod's mount
+		// table while the restore side carries the canonical /var/run/... form
+		// (/var/run is conventionally a symlink to /run); --skip-mnt matches the path
+		// literally, so list both to be robust across runtimes.
+		"/run/secrets/kubernetes.io/serviceaccount",
+		"/var/run/secrets/kubernetes.io/serviceaccount",
 	}
 
 	// Build CLI args. We use exec (not swrk RPC) for the final dump because CRIU 4.2
