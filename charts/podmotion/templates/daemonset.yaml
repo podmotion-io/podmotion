@@ -57,15 +57,21 @@ spec:
               mountPath: /run/podmotion
         - name: init-checkpoint-tmpfs
           image: busybox:1.36
-          # ADR-0148 SD-1: drop privileged. This init nsenters the host mount namespace
-          # (setns(CLONE_NEWNS)) and mounts a tmpfs at /run/podmotion/checkpoints — both
-          # gated by CAP_SYS_ADMIN. It needs to see host PID 1's mount ns, which is why
-          # hostPID stays true at the pod level; the capability set here is the minimum.
+          # ADR-0148 SD-1 (Amendment SD-1-INIT-A): drop privileged. This init opens the
+          # host PID 1 mount-namespace handle (/proc/1/ns/mnt), then nsenters it
+          # (setns(CLONE_NEWNS)) and mounts a tmpfs at /run/podmotion/checkpoints.
+          # Two distinct kernel gates, two distinct capabilities:
+          #   - Opening /proc/<pid>/ns/mnt for a process in a DIFFERENT mount namespace is
+          #     gated by ptrace_may_access() (kernel/ptrace.c), which requires CAP_SYS_PTRACE
+          #     in the caller's user namespace. CAP_SYS_ADMIN alone does NOT satisfy it —
+          #     nsenter fails with "can't open '/proc/1/ns/mnt': Permission denied" without it.
+          #   - The subsequent setns(CLONE_NEWNS) + mount()/umount2() are gated by CAP_SYS_ADMIN.
+          # hostPID stays true at the pod level so /proc/1 resolves to the host init.
           securityContext:
             privileged: false
             capabilities:
               drop: ["ALL"]
-              add: ["SYS_ADMIN"]
+              add: ["SYS_ADMIN", "SYS_PTRACE"]
             allowPrivilegeEscalation: false
           command:
             - sh
