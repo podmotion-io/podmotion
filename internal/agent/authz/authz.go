@@ -107,6 +107,13 @@ var methodPolicy = map[string]map[Role]bool{
 	agentpb.MigrationAgentService_VerifyTCP_FullMethodName:               {RoleOperator: true},
 	agentpb.MigrationAgentService_PreDumpRound_FullMethodName:            {RoleOperator: true},
 	agentpb.MigrationAgentService_EstimateCheckpoint_FullMethodName:      {RoleOperator: true},
+	// ADR-0236: ADR-0210 cross-node reachability nonce round-trip. Both halves are
+	// controller-driven (operator → dest agent StartReachabilityEcho; operator → source
+	// agent ProbeDataplaneReachability) and were ABSENT from this map, so deny-by-default
+	// (§2.2.3) denied the operator and DataplaneReachabilityVerified never fired — migration
+	// stalled in Verifying indefinitely. Both are RoleOperator only.
+	agentpb.MigrationAgentService_StartReachabilityEcho_FullMethodName:      {RoleOperator: true},
+	agentpb.MigrationAgentService_ProbeDataplaneReachability_FullMethodName: {RoleOperator: true},
 	// Transfer RPCs: operator-driven push AND peer-agent transfer both permitted.
 	agentpb.MigrationAgentService_PutCheckpointTar_FullMethodName: {RoleOperator: true, RolePeerAgent: true},
 	agentpb.MigrationAgentService_GetCheckpointTar_FullMethodName: {RoleOperator: true, RolePeerAgent: true},
