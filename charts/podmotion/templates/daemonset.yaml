@@ -221,6 +221,15 @@ spec:
                 # not a seccomp denial.) Not kernel-gated — CAP_SYS_RESOURCE predates 5.8.
                 - SYS_RESOURCE
                 - NET_ADMIN
+                # ADR-0236 / ADR-0148: ADR-0158 InjectIPHandoff sends a gratuitous ARP to
+                # flush stale neighbor caches at IP handoff. SendGratuitousARP opens an
+                # AF_PACKET socket (socket(AF_PACKET, SOCK_RAW/SOCK_DGRAM)), which the kernel
+                # gates on CAP_NET_RAW in packet_create() (net/packet/af_packet.c) — NOT
+                # CAP_NET_ADMIN. Under drop:ALL the AF_PACKET socket() returned EPERM
+                # ("operation not permitted") and the gratuitous ARP silently no-op'd
+                # (non-fatal per ADR-0158, but it leaves neighbor caches stale at cutover).
+                # The seccomp profile already allows socket(); this was a capability denial.
+                - NET_RAW
                 {{- if .Values.agent.kernelGE58 }}
                 - BPF
                 - PERFMON
