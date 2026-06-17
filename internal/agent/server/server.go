@@ -4830,6 +4830,15 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 
 	log.Info("Checkpoint complete", "path", checkpointPath, "sha256", sha256sum, "fallback", fallbackNote)
 
+	// SD-2 (ADR-0029, ADR-0160): encrypt the checkpoint layer set AT REST in final/ before the
+	// transfer phase reads it — encrypt-on-write at its source so ciphertext, never plaintext,
+	// survives on tmpfs. No-op when no per-migration checkpoint-key Secret is present (ADR-0029
+	// opt-in default). HB-1 AAD binds each layer to migrationUID:layerIndex:epoch; HB-3 zeroizes
+	// derived key material. Failure here is FATAL: a half-encrypted final/ must not transfer.
+	if encErr := s.encryptCheckpointDir(context.Background(), req.MigrationName, imagesDir); encErr != nil {
+		return nil, fmt.Errorf("SD-2: encrypt checkpoint layer set at rest: %w", encErr)
+	}
+
 	// Success (raw-CRIU path): disarm the deferred abort-zeroize sweep. The completed
 	// checkpoint in final/ is consumed by the transfer phase; round-N dirs are released
 	// later by ReleaseCheckpoint (ADR-0179). ADR-0182 Issue 2.
@@ -5012,6 +5021,18 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	s.destWorkloadImageMu.RLock()
 	storedWorkloadImage := s.destWorkloadImage[req.MigrationName]
 	s.destWorkloadImageMu.RUnlock()
+
+	// SD-2 (ADR-0029, ADR-0160): decrypt the checkpoint layer set in place before CRIU reads it.
+	// No-op when the encrypted-set marker is absent (encryption was off, or a prior restore
+	// attempt already decrypted — idempotent). Fail closed: a marked-encrypted final/ with no
+	// available key, a wrong key, an AAD mismatch (wrong migration/layer/epoch), or a tampered
+	// layer all abort the restore here rather than handing ciphertext to CRIU. HB-3: the derived
+	// shared key is zeroized inside decryptCheckpointDir.
+	if decErr := s.decryptCheckpointDir(ctx, req.MigrationName, imagesDir); decErr != nil {
+		msg := fmt.Sprintf("Restore: SD-2 decrypt checkpoint layer set: %v", decErr)
+		log.Error(decErr, msg, "migration", req.MigrationName)
+		return &agentpb.RestoreResponse{Success: false, ErrorMessage: msg}, nil
+	}
 
 	// Pre-restore sanity: inventory.img must exist and be non-empty. If absent, CRIU
 	// fails immediately with "No inventory.img image / Unexpected EOF on (empty-image)".
