@@ -903,7 +903,7 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 	// ADR-0199 D1: the OLD-IP destination datapath-wiring leg (D2.2 neigh where applicable,
 	// ADR-0139 tc-redirect, ADR-0140 FORWARD-ACCEPT, ADR-0141 NOTRACK) is substrate-portable —
 	// it does NOT require a VXLAN device. Previously this entire leg was gated behind
-	// `fdbIf != ""` and SILENT on kindnet (the M3 active-but-silent mechanism, §P-MECHANISM),
+	// `fdbIf != ""` and SILENT on kindnet (the M3 active-but-silent mechanism — silent on non-VXLAN substrates),
 	// which made the in-node OLD-IP dial blackhole (`i/o timeout`) and wedged the handoff.
 	//
 	// The redirect needs a SOURCE interface on which OLD-IP frames arrive and a TARGET veth
@@ -1838,6 +1838,51 @@ func sandboxNetnsPath(_ context.Context, sandboxID string) (string, error) {
 // Returns the task ID of the application container (not the pause/sandbox container).
 // Falls back to scanning /run/containerd/io.containerd.runtime.v2.task/k8s.io/ directly
 // when the ctr binary is not available (e.g. inside the agent container on kind clusters).
+// hostBundleDir returns the containerd task bundle directory for a given task ID, resolved
+// through the agent-visible host mount.
+//
+// ADR-0213 D1 (§3h-SYM): `ctr`/runc/criu run in the HOST mount namespace via nsenterCmd, but
+// any native Go os.ReadFile in the agent runs in the AGENT container's mount namespace. The
+// daemonset mounts host /run at /host-run (charts/podmotion/templates/daemonset.yaml:65-66,
+// 180-182); the host bundle dir is therefore reachable at /host-run/containerd/...task...,
+// NOT at the bare /run/containerd/...task... path (which does not exist in the agent ns —
+// only the containerd SOCKET is mounted natively). Reading the bare path returns ENOENT, the
+// error is swallowed, and the established-TCP-socket classifier goes silent. Every consumer of
+// the host bundle path MUST go through this helper.
+func hostBundleDir(taskID string) string {
+	return fmt.Sprintf("/host-run/containerd/io.containerd.runtime.v2.task/k8s.io/%s", taskID)
+}
+
+// ctrReportedDumpLogPath extracts the criu-dump.log path that ctr reports in its own combined
+// output (`... path= /run/containerd/.../<fullID>/criu-dump.log ...`) and translates it to the
+// agent-visible host mount.
+//
+// ADR-0213 D2: FindContainerTaskID may return the abbreviated `ctr tasks list` column-0 ID while
+// the on-disk bundle directory uses the full 64-char container ID, so deriving the path from the
+// task ID alone can point at the wrong directory. ctr's own error names the exact file — prefer
+// it. Returns "" if no host bundle path is present in the output.
+func ctrReportedDumpLogPath(out string) string {
+	const marker = "/run/containerd/io.containerd.runtime.v2.task/"
+	idx := strings.Index(out, marker)
+	if idx < 0 {
+		return ""
+	}
+	rest := out[idx:]
+	// The path token ends at the first whitespace, colon-space, or end of line.
+	end := strings.IndexFunc(rest, func(r rune) bool {
+		return r == ' ' || r == '\n' || r == '\t' || r == '\r'
+	})
+	if end >= 0 {
+		rest = rest[:end]
+	}
+	rest = strings.TrimRight(rest, ":")
+	if !strings.HasSuffix(rest, "criu-dump.log") {
+		return ""
+	}
+	// Re-root the bare host path onto the agent-visible host mount.
+	return "/host-run" + strings.TrimPrefix(rest, "/run")
+}
+
 func FindContainerTaskID(podUID string) (string, error) {
 	out, err := nsenterCmd("/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "list").Output()
 	if err == nil {
@@ -1868,9 +1913,12 @@ func FindContainerTaskID(podUID string) (string, error) {
 	}
 
 	// Fallback: scan containerd bundle dirs on host (available via hostPath /run mount).
-	// Each bundle is at /run/containerd/io.containerd.runtime.v2.task/k8s.io/<taskID>/config.json.
+	// ADR-0213 D1: the host bundle dirs are reachable in the agent mount namespace only at
+	// /host-run/containerd/... (host /run is mounted at /host-run; the bare /run/containerd
+	// task path does not exist in the agent ns). Each bundle is at
+	// /host-run/containerd/io.containerd.runtime.v2.task/k8s.io/<taskID>/config.json.
 	// The pod UID appears in the cgroup path encoded in config.json's linux.cgroupsPath field.
-	const bundleBase = "/run/containerd/io.containerd.runtime.v2.task/k8s.io"
+	const bundleBase = "/host-run/containerd/io.containerd.runtime.v2.task/k8s.io"
 	entries, dirErr := os.ReadDir(bundleBase)
 	if dirErr == nil {
 		// Normalize pod UID for cgroup path matching (hyphens → underscores).
@@ -1903,7 +1951,7 @@ func FindContainerTaskID(podUID string) (string, error) {
 // ctrCheckpoint calls `ctr --namespace k8s.io tasks checkpoint` for the given task,
 // writing CRIU images to imagesDir. Also copies config.json from the containerd
 // bundle directory into imagesDir so the destination can set up an OCI bundle for restore.
-func ctrCheckpoint(taskID, imagesDir string) (int64, error) {
+func ctrCheckpoint(taskID, imagesDir string, tcpEstablished bool) (int64, error) {
 	// 0700: checkpoint images contain verbatim process memory and must be root-only.
 	if err := os.MkdirAll(imagesDir, 0o700); err != nil {
 		return 0, fmt.Errorf("mkdir %s: %w", imagesDir, err)
@@ -1921,9 +1969,25 @@ func ctrCheckpoint(taskID, imagesDir string) (int64, error) {
 		// established-socket case is misclassified as fatal and the raw-CRIU fallback never
 		// fires, hard-failing every TCP-stateful checkpoint (ADR-0131).
 		outStr := string(out)
-		bundleDir := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s", taskID)
-		if dumpLog, readErr := os.ReadFile(filepath.Join(bundleDir, "criu-dump.log")); readErr == nil {
+		// ADR-0213 D1/D2: read the dump log through the agent-visible host mount (/host-run),
+		// NOT the bare /run host path (which does not exist in the agent mount namespace). Prefer
+		// the exact log path ctr itself reports in its output (`path= .../criu-dump.log`) so a
+		// short-vs-full task-ID mismatch (FindContainerTaskID may return the abbreviated ctr-list
+		// ID while the on-disk bundle uses the full container ID) cannot point us at the wrong dir.
+		dumpLogPath := ctrReportedDumpLogPath(outStr)
+		if dumpLogPath == "" {
+			dumpLogPath = filepath.Join(hostBundleDir(taskID), "criu-dump.log")
+		}
+		dumpLogRead := false
+		if dumpLog, readErr := os.ReadFile(dumpLogPath); readErr == nil {
 			outStr += "\n--- criu-dump.log ---\n" + string(dumpLog)
+			dumpLogRead = true
+		} else {
+			// ADR-0213 D3: make a silent classifier failure observable. Without this log the
+			// established-socket case is misclassified as fatal and the raw-CRIU fallback never
+			// fires (the gate-9 wall).
+			log.Info("Checkpoint: ctr criu-dump.log unreadable — classifying fail-safe (ADR-0213 D2/D3)",
+				"dumpLogPath", dumpLogPath, "readErr", readErr.Error(), "tcpEstablished", tcpEstablished)
 		}
 		if strings.Contains(outStr, "In-flight") ||
 			strings.Contains(outStr, "in-flight") ||
@@ -1933,11 +1997,20 @@ func ctrCheckpoint(taskID, imagesDir string) (int64, error) {
 			strings.Contains(outStr, "inet") {
 			return 0, fmt.Errorf("ctr tasks checkpoint: %w\noutput: %s", ErrCtrInFlightTCP, outStr)
 		}
+		// ADR-0213 D2 fail-safe: if the dump log was unreadable AND TCP preservation is requested,
+		// a correctness-preserving migration must not hard-fail on a missing best-effort diagnostic.
+		// Default to the established-TCP classification so the caller falls back to raw go-criu with
+		// --tcp-established rather than aborting the migration.
+		if !dumpLogRead && tcpEstablished {
+			return 0, fmt.Errorf("ctr tasks checkpoint (dump log unreadable, fail-safe TCP classification): %w\noutput: %s", ErrCtrInFlightTCP, outStr)
+		}
 		return 0, fmt.Errorf("ctr tasks checkpoint: %w\noutput: %s", err, out)
 	}
 
 	// Copy config.json from the containerd bundle into the checkpoint dir.
-	bundleDir := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s", taskID)
+	// ADR-0213 D1 (§3h-SYM): same host-mount translation as the dump-log read — the bundle is
+	// reachable in the agent ns only via /host-run.
+	bundleDir := hostBundleDir(taskID)
 	srcCfg := filepath.Join(bundleDir, "config.json")
 	dstCfg := filepath.Join(imagesDir, "config.json")
 	if data, readErr := os.ReadFile(srcCfg); readErr == nil {
@@ -4411,7 +4484,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 			resolvedTaskID = taskID
 			log.Info("Checkpoint: using containerd-native ctr checkpoint", "taskID", taskID)
 			freezeStart := time.Now()
-			sizeBytes, ctrErr := ctrCheckpoint(taskID, imagesDir)
+			sizeBytes, ctrErr := ctrCheckpoint(taskID, imagesDir, tcpEstablished)
 			freezeDurationMs := time.Since(freezeStart).Milliseconds()
 			if ctrErr != nil {
 				// Fall through to raw CRIU only for in-flight/established TCP socket failures —
