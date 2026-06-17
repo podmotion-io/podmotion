@@ -56,6 +56,13 @@ spec:
             {{- if .Values.operator.featureGates }}
             - --feature-gates={{ .Values.operator.featureGates }}
             {{- end }}
+            {{- /* HOLD-B (ADR-0039 SD-6): the operator only builds its webhook server and
+                   registers the exec-block handler when --webhook-cert-path is set (cmd/main.go
+                   webhooksEnabled gate). Pass it on EITHER cert path so the SD-6 VWC has a live,
+                   serving backend. Without this a failurePolicy:Fail VWC points at a dead :9443. */}}
+            {{- if or .Values.webhook.certManager.enabled (include "podmotion.execBlockEnabled" .) }}
+            - --webhook-cert-path=/tmp/k8s-webhook-server/serving-certs
+            {{- end }}
           ports:
             - name: metrics
               containerPort: 8080
@@ -87,8 +94,11 @@ spec:
           volumeMounts:
             {{- /* ADR-0222 (3h-SYM): gate the webhook-certs mount on the same flag as the
                    webhook.yaml resources. Mounting a non-existent secret when certManager is
-                   disabled crashes the pod; the operator also skips webhook wiring without a cert. */}}
-            {{- if .Values.webhook.certManager.enabled }}
+                   disabled crashes the pod; the operator also skips webhook wiring without a cert.
+                   HOLD-B (ADR-0039 SD-6): the non-cert-manager exec-block path mints its own
+                   podmotion-webhook-tls secret (webhook-selfsigned-secret.yaml), so mount on that
+                   path too — the secret name is identical on both paths. */}}
+            {{- if or .Values.webhook.certManager.enabled (include "podmotion.execBlockEnabled" .) }}
             - name: webhook-certs
               mountPath: /tmp/k8s-webhook-server/serving-certs
               readOnly: true
@@ -102,11 +112,13 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
-        {{- /* ADR-0222 (3h-SYM): symmetric with the volumeMount above. */}}
-        {{- if .Values.webhook.certManager.enabled }}
+        {{- /* ADR-0222 (3h-SYM): symmetric with the volumeMount above. HOLD-B: same
+               secret name on the cert-manager and self-signed exec-block paths. */}}
+        {{- if or .Values.webhook.certManager.enabled (include "podmotion.execBlockEnabled" .) }}
         - name: webhook-certs
           secret:
             secretName: podmotion-webhook-tls
+            defaultMode: 0440
         {{- end }}
         {{- if .Values.operator.tls.agentClient.enabled }}
         - name: operator-agent-client-tls
