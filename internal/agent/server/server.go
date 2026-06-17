@@ -5264,6 +5264,29 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	storedWorkloadImage := s.destWorkloadImage[req.MigrationName]
 	s.destWorkloadImageMu.RUnlock()
 
+	// ADR-0235: gRPC-Restore-path workload-image self-resolve fallback (ADR-0217 D2 parity).
+	// The controller's NRI fallback (reconcileRestoringNRI, controller:2724) invokes THIS gRPC
+	// Restore RPC ~60s after the NRI confirm window times out. Unlike the NRI hook path
+	// ((*AgentServer).JoinNsRestore, server.go:401-440 — which carries the ADR-0217 D2 third
+	// fallback), this gRPC path passed ONLY destWorkloadImage[migration] straight into
+	// joinNsRestoreFn (line below). When the B2 cache is empty — observed live on
+	// sprint37-hardened-e2e: the deployed MigrationCheckpoint CRD lacked spec.workloadImage so
+	// the controller's D1/B2 MCP write was dropped server-side ("unknown field spec.workloadImage")
+	// and PrepareDestinationNetns received workloadImage="" → cache never populated — the gRPC
+	// path fell straight through to the ADR-0215 fail-close at server.go:2606 ("restore image
+	// unresolved (ADR-0215) ... controller must plumb ..."), EVEN THOUGH the NRI path had already
+	// self-resolved the same image ("ADR-0217 D2: resolved workload image from replacement pod
+	// spec"). Apply the identical D2 self-resolve here so both live restore entry points behave
+	// the same. No hardcoded image is reintroduced — D2 reads the operator-created replacement
+	// pod's real container[0].Image; ADR-0215's fail-closed-rather-than-guess intent is preserved.
+	if storedWorkloadImage == "" && s.k8sClient != nil {
+		if resolved := s.resolveImageFromReplacementPod(req.MigrationName); resolved != "" {
+			storedWorkloadImage = resolved
+			log.Info("ADR-0235: gRPC Restore — B2 cache empty, resolved workload image from replacement pod spec (ADR-0217 D2 parity)",
+				"migration", req.MigrationName, "image", storedWorkloadImage)
+		}
+	}
+
 	// SD-2 (ADR-0029, ADR-0160): decrypt the checkpoint layer set in place before CRIU reads it.
 	// No-op when the encrypted-set marker is absent (encryption was off, or a prior restore
 	// attempt already decrypted — idempotent). Fail closed: a marked-encrypted final/ with no
