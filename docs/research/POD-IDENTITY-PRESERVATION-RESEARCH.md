@@ -1,6 +1,6 @@
-# Pod Identity Preservation — Opus Research Quorum Findings
+# Pod Identity Preservation — Research Findings
 **Date:** 2026-06-14  
-**Quorum:** 7 Opus domain experts + 1 Opus lead architect synthesizer  
+**Scope:** Multi-domain technical research across KVM/QEMU, etcd/API server, CNI/IPAM, kubelet, CRI/container runtime, scheduler/admission, and StatefulSet  
 **Question:** Can PodMotion be developed to the point where `kubectl watch pod <name>` shows ONLY `spec.nodeName` changing during a live migration — same pod UID, same pod name, same pod IP, same everything?
 
 ---
@@ -88,13 +88,13 @@ Paired `ADD --reserve-from` + `DEL --no-release` so an endpoint's IPAM allocatio
 
 ---
 
-## Recommended Nav Point for Consideration
+## Recommended Project Milestone for Consideration
 
 **"Workload-Facing Identity Transparency"**
 
 Scope: prove that from the perspective of every peer, client, and dependent — network, TCP connections, DNS, storage — a migrated pod is indistinguishable from the original. The control-plane UID difference becomes an implementation detail visible only to tooling that inspects UIDs directly.
 
-Candidate sprint work:
+Candidate work items:
 - `podmotion-ipam` meta-plugin: IP release suppression on source DEL, IP adoption on dest ADD (Calico-first)
 - `IPAMOwnershipTransferred` condition: proves IPAM store consistency, not just datapath reachability
 - Kubelet container-adoption via NRI: eliminate `restartCount` bump, achieve no-op SyncPod adopt
@@ -102,7 +102,7 @@ Candidate sprint work:
 - Predecessor lineage annotations: ownerRef + predecessor-uid stamped before source delete
 - Calico /32 BGP convergence proof artifact: `kubectl watch` shows only node field transition; seq_delta=0 on all TCP connections through the migration; IP unchanged in `kubectl get pod -o wide`
 
-**Gate criterion (provable):**
+**Acceptance criterion (provable):**
 ```
 kubectl get pod <name> -o wide --watch
 ```
@@ -123,4 +123,4 @@ Output during migration: a single line where only the NODE column changes. IP co
 
 ---
 
-*Generated from an 8-agent Opus research quorum on 2026-06-14. All seven domain experts (KVM/QEMU, etcd/API server, CNI/IPAM, kubelet, CRI/container runtime, scheduler/admission, StatefulSet) reached unanimous consensus on the UID preservation verdict. IP preservation and the three upstream KEPs represent the synthesis architect's recommended path forward.*
+*Synthesized from multi-domain technical research on 2026-06-14 spanning KVM/QEMU, etcd/API server, CNI/IPAM, kubelet, CRI/container runtime, scheduler/admission, and StatefulSet. All domains converged on the UID preservation verdict. IP preservation and the three upstream KEPs represent the recommended path forward.*

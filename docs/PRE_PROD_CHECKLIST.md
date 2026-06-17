@@ -1,7 +1,7 @@
 # PodMotion Pre-Production Checklist
 
-**Source**: PREPROD_GAP_ANALYSIS.md + CNCF quorum review 2026-06-12
-**Owner**: OSS Product Manager + Architecture quorum
+**Source**: PREPROD_GAP_ANALYSIS.md + CNCF review review 2026-06-12
+**Owner**: OSS Product Manager + Architecture review
 **Gate**: ALL items in every section must be PASSED before beta promotion (M28).
 
 Legend: `[ ]` Not Started · `[~]` In Progress · `[x]` PASSED · `[!]` BLOCKED
@@ -174,7 +174,7 @@ least-privilege verified; cert rotation tested; SBOM/signing/vuln-scan gate in C
       Owner: Security Agent · M22
 - [ ] Resolve `allowPrivilegeEscalation` contradiction with ADR-0078: one
       authoritative decision with kernel-level evidence for CRIU parasite/ptrace path ·
-      Owner: Security Agent + Opus quorum · M22
+      Owner: Security Agent + Opus review · M22
 - [ ] Fix `pivot_root` seccomp contradiction: JSON allows it, prose denies it — pick
       one and document the rationale · Owner: Security Agent · M22
 - [ ] Rescope §3 RBAC to defer to ADR-0078; rescope §4 webhook topology to defer to
@@ -269,7 +269,7 @@ promotion pipeline with 30-day staging burn-in for minor releases.
       Owner: [TBD] · M26
 - [ ] Fix all chaos gate cross-references from `ADR-0081` → `ADR-0094` ·
       Owner: [TBD] · M26
-- [ ] Add `deploy-crds` to canonical Makefile target table (§1a) with
+- [ ] Add `deploy-crds` to canonical Makefile target table ([process rule]) with
       "rollback-only internal helper" note; or rename it outside the deploy namespace ·
       Owner: [TBD] · M26
 - [ ] Replace `envtest.Environment` with real kind cluster handle in
@@ -298,10 +298,10 @@ promotion pipeline with 30-day staging burn-in for minor releases.
 - [ ] SLSA L2 provenance attestation present; `cosign verify-attestation --type
       slsaprovenance` passes · Owner: [TBD] · M26
 - [ ] 30-day staging burn-in completed (minor release) or 72-hour burn-in (patch
-      release with explicit quorum classification) **[manual gate]** ·
+      release with explicit review classification) **[manual gate]** ·
       Owner: Release Manager · Per-release
 - [ ] `scripts/promote-staging.sh` and `release.yml` CODEOWNERS-protected (requires
-      2 quorum approvers) · Owner: [TBD] · M26
+      2 review approvers) · Owner: [TBD] · M26
 - [ ] `docs/compatibility-matrix.md` updated; `MaxKubernetesMinor` Go constant and
       matrix K8s-max column are in sync · Owner: [TBD] · Per-release
 

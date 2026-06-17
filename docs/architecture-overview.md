@@ -3,7 +3,7 @@
 > **Start here.** This document is the narrative entry point for the 49+ ADR corpus,
 > the 18-milestone roadmap, and the SIG/upstream engagement record. It does not replace
 > individual ADRs — it tells you which ones to read first and how they fit together.
-> Approved as prerequisite for SIG credibility by QUORUM_SIGNOFF_OSS_PM.md (recommendation #7).
+> Approved as a prerequisite for SIG credibility by the open-source readiness review (recommendation #7).
 
 ---
 
@@ -159,7 +159,7 @@ For `NetworkContinuityMode=None`, TCP conditions are not required — the standa
 ## Decision Audit Trail
 
 - **Full ADR index** (all 50 ADRs, grouped and linked): [docs/adr/README.md](adr/README.md)
-- **M19 quorum approval** (architecture sign-off, 10-agent quorum): [docs/adr/QUORUM_SIGNOFF_M19.md](adr/QUORUM_SIGNOFF_M19.md)
-- **OSS PM quorum approval** (open-source readiness gate, recommendation #7 that required this document): [docs/adr/QUORUM_SIGNOFF_OSS_PM.md](adr/QUORUM_SIGNOFF_OSS_PM.md)
+- **M19 architecture review** — architecture sign-off recorded in the ADR corpus.
+- **Open-source readiness review** — readiness gate, recommendation #7 that required this document.
 
 For the milestone delivery record and dependency chain, see [MILESTONES.md](../MILESTONES.md).

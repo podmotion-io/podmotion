@@ -155,4 +155,4 @@ A namespace-scoping story materially strengthens the submission, *if framed hone
   2. NMC and Node access remain **cluster-scoped** (node data is not tenant data).
   3. Agent-side namespace check is **defense-in-depth (anti-accident), explicitly NOT a security boundary**.
   4. Default OFF for backward compatibility.
-- **Chaos assessment (per tessera §14c — never optional):** must cover (a) operator behavior when a `MigrationScope`-listed namespace is deleted mid-migration, (b) RBAC RoleBinding prune race vs. in-flight reconcile, (c) webhook `namespaceSelector` label removed from a namespace with an active PodMigration.
+- **Chaos assessment (required):** must cover (a) operator behavior when a `MigrationScope`-listed namespace is deleted mid-migration, (b) RBAC RoleBinding prune race vs. in-flight reconcile, (c) webhook `namespaceSelector` label removed from a namespace with an active PodMigration.
