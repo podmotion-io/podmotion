@@ -44,6 +44,18 @@ agent:
   tls:
     enabled: true
     secretName: podmotion-agent-tls
+  # ADR-0039 SD-5 / ADR-0148: CRIU-scoped seccomp profile for the agent container.
+  # type=Localhost references a profile on the node's kubelet seccomp root
+  # (<kubelet-root>/seccomp/podmotion/agent-criu.json). The profile ships in
+  # charts/podmotion/profiles/agent-criu.json and must be installed onto each node's
+  # seccomp dir out-of-band (DaemonSet installer / node image). This control is only
+  # MEANINGFUL once agent privileged:true is dropped (SD-1); until then a privileged
+  # container can issue any syscall regardless of the filter. Set enabled=true to wire
+  # securityContext.seccompProfile on the agent container.
+  seccompProfile:
+    enabled: false
+    type: Localhost
+    localhostProfile: podmotion/agent-criu.json
 
 checkpoint:
   # registry: use an in-cluster OCI registry for checkpoint staging (cross-AZ / cross-cluster)
