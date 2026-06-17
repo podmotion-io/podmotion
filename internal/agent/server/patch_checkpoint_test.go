@@ -5,10 +5,10 @@ Licensed under the Apache License, Version 2.0.
 
 package server
 
-// patch_checkpoint_test.go — Sprint 32 §14g Arch-C regression guard for the
-// patchCheckpointImages mountpoints drop logic.
+// patch_checkpoint_test.go — regression guard for the patchCheckpointImages
+// mountpoints drop logic.
 //
-// Origin (gate Attempt 3 VERBATIM_ERROR):
+// Origin (observed error):
 //
 //	Error (criu/mount.c:381): mnt: No parent found for mountpoint 7730
 //	    (@/sys/devices/virtual/dmi/id/product_name)
@@ -53,7 +53,7 @@ type mountEntry struct {
 	ExtKey      string // empty == null/absent ext_key
 }
 
-// dropPrefixes mirrors the production `drop_prefixes` list (server.go, Arch-B
+// dropPrefixes mirrors the production `drop_prefixes` list (server.go,
 // ADR-0190 fix): an entry is dropped if its mountpoint EQUALS a prefix or is
 // nested under "<prefix>/". This is what guarantees the no-orphan invariant for
 // /sys: dropping /sys necessarily drops every /sys/* child, so no surviving
@@ -157,7 +157,7 @@ func mountpoints(kept []mountEntry) map[string]bool {
 }
 
 // ---------------------------------------------------------------------------
-// 1. The headline regression: the exact Attempt-3 topology must not orphan.
+// 1. The headline regression: the exact failing topology must not orphan.
 // ---------------------------------------------------------------------------
 
 func TestPatchCheckpointImages_NoOrphanParents(t *testing.T) {
@@ -347,7 +347,7 @@ func TestPatchScript_DropLogicInSyncWithProduction(t *testing.T) {
 	// implementation — Arch-A spec, commit d6b57fe):
 	//   - DROP_ROOT_FSTYPES must include 'sysfs' so both sysfs instances in kind are seeded
 	//   - drop_ids must be computed via parent_mnt_id graph closure so every descendant of a
-	//     dropped root is also dropped (the Attempt-3 mount.c:381 fix: dropping /sys alone
+	//     dropped root is also dropped (the mount.c:381 fix: dropping /sys alone
 	//     orphaned children 7730/8591/9117/9119)
 	if !strings.Contains(src, "DROP_ROOT_FSTYPES") {
 		t.Errorf("production script no longer defines DROP_ROOT_FSTYPES — the sysfs-by-type seed (Arch-A spec) is missing; mount.c:381 can regress")
@@ -373,12 +373,12 @@ func TestPatchScript_DropLogicInSyncWithProduction(t *testing.T) {
 //       ext-drop code tokens (ext_drop_mnt_ids, CRIU_EXTERNAL_MOUNT_DROPPED, P-0194-1c).
 //
 // Items (c)–(e) (files.img rebind, atomic-commit ordering, P-0194-1c re-entry guard)
-// require live pycriu execution and are asserted at gate time via the P-0194-3 decode
-// artifact (SPRINT33-GATE-ATTEMPT-6-DECODE.md).
+// require live pycriu execution and are validated end-to-end against a live
+// checkpoint decode (see the P-0194-3 decode artifact).
 // ---------------------------------------------------------------------------
 
 // gc21ColdBETopology returns the 6-entry kept set from the gc21-cold-be checkpoint
-// (decode §2a — the live checkpoint that produced mount.c:3141 on ADR-0193 binary).
+// (decoded from the live checkpoint that produced mount.c:3141 on ADR-0193 binary).
 // MntID 2951 (/data, ext_key="/data") is the external entry that B-2 drops.
 func gc21ColdBETopology() []mountEntry {
 	return []mountEntry{
@@ -455,7 +455,7 @@ func TestADR0194_B2_ExternalEntryDropped(t *testing.T) {
 // TestADR0194_B2_LeafVerification asserts that /data (2951) is a leaf in the gc21-cold-be
 // kept set — i.e. no kept entry has parent_mnt_id=2951 — so the B-2 drop cannot create an
 // orphan. This is the ADR-0194 §4.1/H2 precondition check (D1 correction: leaf formulation,
-// not "only entry with parent 2943", which was wrong per decode §2a).
+// not "only entry with parent 2943", which was wrong per the checkpoint decode).
 func TestADR0194_B2_LeafVerification(t *testing.T) {
 	entries := gc21ColdBETopology()
 	for _, e := range entries {
@@ -485,7 +485,7 @@ func TestADR0194_B2_SharedMasterIDZero(t *testing.T) {
 
 // TestADR0194_B2_SourceSyncAnchors asserts that the production Python script contains the
 // load-bearing B-2 implementation tokens. A missing token means the fix was not applied or
-// was removed, and the mount.c:3141 wall would return on the next gate.
+// was removed, and the mount.c:3141 failure would return.
 func TestADR0194_B2_SourceSyncAnchors(t *testing.T) {
 	src := readServerGoSource(t)
 

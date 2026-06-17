@@ -44,6 +44,7 @@ spec:
       targetPort: 9443
   selector:
     app: podmotion-operator
+{{- if .Values.webhook.certManager.enabled }}
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
@@ -71,6 +72,8 @@ webhooks:
         operations: [CREATE, UPDATE]
         resources: [podmigrations]
     sideEffects: None
+{{- end }}
+{{- if .Values.webhook.certManager.enabled }}
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
@@ -98,3 +101,4 @@ webhooks:
         operations: [CREATE, UPDATE]
         resources: [podmigrations]
     sideEffects: None
+{{- end }}

@@ -25,7 +25,7 @@ was exercised with real gRPC calls to the agent on each node.
 
 North Star not yet achieved. Sprint 11 fixed the CheckpointRef path divergence identified in Sprint 10: `pm.Status.CheckpointRef.Name` is now set to the full filesystem path `/var/lib/podmotion/checkpoints/{pm.Name}/final` so that `reconcileRestoring` reads the same directory that `reconcileCheckpointing` wrote. Build passes cleanly (operator + agent). However, during the Sprint 11 validation run the operator entered the crash-safe restart path ("pod was frozen but not restored — issuing restore") before the gRPC Checkpoint call to pm-worker was ever made — leaving `/var/lib/podmotion/checkpoints/sprint11-redis/final/` empty on pm-worker. CRIU restore on pm-control then failed with "No inventory.img image (Unexpected EOF on empty-image)".
 
-**Sprint 11 quorum findings:**
+**Sprint 11 review findings:**
 - CRIU Agent: dumpPath="/var/lib/podmotion/checkpoints/sprint11-redis/final" — path fix confirmed.
 - Controller Agent: divergence confirmed and fixed — CheckpointRef now carries full filesystem path. The crash-safe restart path fires before Checkpoint RPC executes, skipping the dump entirely.
 - gRPC Agent: pathMismatch confirmed resolved; checkpoint gRPC call to pm-worker did not execute in this run.
@@ -45,7 +45,7 @@ North Star not yet achieved. Sprint 11 fixed the CheckpointRef path divergence i
 
 North Star not yet achieved. Sprint 10 fixed the controller reconcile race (line 435-436 in podmigration_controller.go), installed containerd+runc, lowered ptrace_scope/perf_event_paranoid, and installed CNI binaries. Real CRIU (go-criu/v7 CRIUCheckpointer) executed a full dump on pm-worker: 13 artifacts confirmed including inventory.img in /tmp/criu-sprint10/. The gRPC Checkpoint call succeeded. However, restore failed with "No inventory.img image" because CRIU restore was invoked against a different, empty directory — the checkpoint directory path was not correctly handed off from dump to restore.
 
-**Sprint 10 quorum findings:**
+**Sprint 10 review findings:**
 - CRIU Agent: CheckpointResponse fields are freeze_duration_ms, checkpoint_sha256, checkpoint_size_bytes only. Operator must gate on resp.CheckpointSizeBytes > 0 AND resp.CheckpointSha256 != "" before advancing to Transferring.
 - Controller Agent: race confirmed at podmigration_controller.go:435-436 (fixed this sprint).
 - gRPC Agent: DaemonSet running; agent resolves; PrepareSource prepResp.Compatible=false or BlockingReason may short-circuit before Checkpoint RPC fires.

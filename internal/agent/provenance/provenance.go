@@ -14,7 +14,7 @@ Licensed under the Apache License, Version 2.0.
 // (ca.crt) — no new secret. HMAC is rejected (§6): a shared key would let any agent forge.
 //
 // Marker: this package carries the ADR-SEC-B deployed-provenance marker on BOTH binaries
-// (operator signs, agent verifies).
+// (operator signs, agent verifies) so the deployed binary can be confirmed to contain the fix.
 package provenance
 
 import (
@@ -32,7 +32,8 @@ import (
 )
 
 // ADRSecBMarker forces the ADR-SEC-B marker string into every binary that imports this package
-// (operator: sign path; agent: verify path) for §P-VERIFY-MULTI deployed-provenance grep.
+// (operator: sign path; agent: verify path) so each deployed binary can be grepped to confirm it
+// contains the expected provenance fix.
 const ADRSecBMarker = "ADR-SEC-B"
 
 // ManifestSchema is the canonical schema identifier for checkpoint-manifest/v1.

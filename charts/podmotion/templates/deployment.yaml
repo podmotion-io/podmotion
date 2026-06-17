@@ -39,6 +39,13 @@ spec:
               value: "{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"
             - name: AGENT_IMAGE_PULL_POLICY
               value: {{ .Values.agent.image.pullPolicy | quote }}
+            # ADR-SEC-C (GC-B7) M2: the operator derives the expected agent SPIFFE ID
+            # (spiffe://podmotion.io/ns/<ns>/sa/podmotion-agent) from its runtime namespace so the
+            # operator→agent peer pin is correct on non-default-namespace installs (never hardcoded).
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           args:
             - --leader-elect
             - --metrics-bind-address=:8080
@@ -78,9 +85,14 @@ spec:
             capabilities:
               drop: [ALL]
           volumeMounts:
+            {{- /* ADR-0222 (3h-SYM): gate the webhook-certs mount on the same flag as the
+                   webhook.yaml resources. Mounting a non-existent secret when certManager is
+                   disabled crashes the pod; the operator also skips webhook wiring without a cert. */}}
+            {{- if .Values.webhook.certManager.enabled }}
             - name: webhook-certs
               mountPath: /tmp/k8s-webhook-server/serving-certs
               readOnly: true
+            {{- end }}
             {{- if .Values.operator.tls.agentClient.enabled }}
             # ADR-SEC-A §2.1 (C-330/N-340) + ADR-SEC-B §2.1: the operator mTLS client cert. The
             # operator REFUSES to dial agents without it (fail-closed), and ADR-SEC-B uses this
@@ -90,9 +102,12 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
+        {{- /* ADR-0222 (3h-SYM): symmetric with the volumeMount above. */}}
+        {{- if .Values.webhook.certManager.enabled }}
         - name: webhook-certs
           secret:
             secretName: podmotion-webhook-tls
+        {{- end }}
         {{- if .Values.operator.tls.agentClient.enabled }}
         - name: operator-agent-client-tls
           secret:

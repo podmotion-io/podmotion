@@ -82,6 +82,22 @@ service MigrationAgentService {
   // ±MSS (1448 bytes). Also issues the ApplicationProbe (SQL/TCP) when configured.
   // Called by the controller during TCPVerifying phase per ADR-0019 Amendment A.
   rpc VerifyTCP(VerifyTCPRequest) returns (VerifyTCPResponse);
+  // ProbeDataplaneReachability is called by the CONTROLLER on the SOURCE-NODE agent
+  // (a node != destination) to dial the preserved pod IP cross-node and confirm the
+  // real overlay/host-route datapath is live. ADR-0210: this replaces the ADR-0200/0201
+  // in-netns self-probe tautology. The dial originates from the source node's HOST netns
+  // (NOT a pod netns) so its SYN traverses the real overlay (VXLAN/VTEP), not a local
+  // lo/32 alias. The destination must echo back the controller-issued correlation nonce
+  // (round-tripped through the dialed listener) — the source agent cannot synthesize
+  // success alone. The controller is the authority that flips DataplaneReachabilityVerified.
+  rpc ProbeDataplaneReachability(ProbeDataplaneReachabilityRequest) returns (ProbeDataplaneReachabilityResponse);
+  // StartReachabilityEcho is called by the controller on the DESTINATION-node agent to
+  // open a short-lived TCP listener INSIDE the replacement pod netns, bound to the
+  // preserved pod IP, that echoes back the controller-issued nonce to any connecting
+  // client and then closes. This is the destination half of the ADR-0210 nonce round-trip:
+  // it proves a SYN that reached the preserved IP traversed the real cross-node datapath
+  // (the listener owns the IP only inside the replacement pod netns on THIS node).
+  rpc StartReachabilityEcho(StartReachabilityEchoRequest) returns (StartReachabilityEchoResponse);
 }
 
 message PrepareSourceRequest {
@@ -332,16 +348,25 @@ message ArmZeroWindowRequest {
   // Required for ADR-0049 Amendment D fail-closed enforcement: armZeroWindowBPF returns a
   // typed error (rather than nil) on arm failure or ifindex==0 when mode=="Strict".
   string tcp_preservation_mode  = 4;
+  // source_pod_ip is pm.Spec.SourcePodIP — the source pod IP the conntrack NOTRACK
+  // rule is installed for (ADR-0224). Empty on legacy/cold path → NOTRACK arm skipped.
+  string source_pod_ip          = 5;
 }
 message ArmZeroWindowResponse {
   bool   armed          = 1;
   string blocking_reason = 2; // set if armed=false
   int64  armed_at_ns    = 3; // CLOCK_REALTIME ns when TC filter was attached
+  // source_conntrack_armed is true when the source-side NOTRACK rule is confirmed
+  // installed (ADR-0224 predicate E). Read by the controller into Status.SourceConntrackArmed.
+  bool   source_conntrack_armed = 4;
 }
 
 message DisarmZeroWindowRequest {
   string migration_name = 1;
   string pod_uid        = 2;
+  // source_pod_ip is pm.Spec.SourcePodIP — used to remove the conntrack NOTRACK rule
+  // installed at arm time (ADR-0224 3h-SYM). Empty → NOTRACK disarm skipped.
+  string source_pod_ip  = 3;
 }
 message DisarmZeroWindowResponse {
   bool   disarmed        = 1;
@@ -461,4 +486,55 @@ message VerifyTCPResponse {
   int32  connections_expected  = 4;
   bool   app_probe_ok          = 5;
   string app_probe_error       = 6;
+  // ADR-0210: measured MAXIMUM per-direction TCP sequence delta (in bytes) observed
+  // across all verified connections — snd_nxt and rcv_nxt distance between the source
+  // freeze snapshot and the destination post-restore read. These are the ACTUAL measured
+  // values; the controller MUST populate its seq_delta gauge and North Star assertion
+  // from these, never from a hard-coded literal 0. Under Strict mode a non-zero value
+  // FAILS verification. Zero only when continuity is genuinely byte-exact.
+  uint32 snd_seq_delta_max      = 7;
+  uint32 rcv_seq_delta_max      = 8;
+}
+
+// ProbeDataplaneReachabilityRequest is sent by the controller to the SOURCE-node agent.
+// ADR-0210 cross-node dataplane probe.
+message ProbeDataplaneReachabilityRequest {
+  string migration_name   = 1;
+  // target_ip is the preserved (OLD) pod IP that must be reachable cross-node.
+  string target_ip        = 2;
+  // target_port is the listener port the destination opened for the nonce echo.
+  int32  target_port      = 3;
+  // expected_nonce is the controller-issued correlation token the destination listener
+  // must echo back. A positive result REQUIRES this nonce to round-trip — the source
+  // agent cannot synthesize success (Security-C3).
+  string expected_nonce   = 4;
+  // timeout_s bounds the dial+read. Default 5s when zero.
+  int32  timeout_s        = 5;
+}
+message ProbeDataplaneReachabilityResponse {
+  // reachable is true ONLY when the dial completed AND the echoed nonce matched
+  // expected_nonce. RST/timeout/EHOSTUNREACH/nonce-mismatch => false.
+  bool   reachable        = 1;
+  // egress_dev is the host interface the SYN actually left on (e.g. "flannel.1"/VTEP).
+  // On a 2-node fallback this is the mandatory non-waivable VTEP-egress assertion.
+  string egress_dev       = 2;
+  string detail           = 3;
+}
+
+// StartReachabilityEchoRequest is sent by the controller to the DESTINATION-node agent.
+message StartReachabilityEchoRequest {
+  string migration_name   = 1;
+  // listen_ip is the preserved (OLD) pod IP the echo listener binds to inside the
+  // replacement pod netns.
+  string listen_ip        = 2;
+  // listen_port is the port the echo listener binds.
+  int32  listen_port      = 3;
+  // nonce is echoed back to any client that connects, then the listener closes.
+  string nonce            = 4;
+  // ttl_s bounds how long the listener stays open (default 15s).
+  int32  ttl_s            = 5;
+}
+message StartReachabilityEchoResponse {
+  bool   started          = 1;
+  string detail           = 2;
 }

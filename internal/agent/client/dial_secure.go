@@ -14,8 +14,8 @@ import (
 )
 
 // adrSecADialNoTLS is the DEFAULT-BUILD (production) behavior: the operator REFUSES to dial an
-// agent without a TLS config (ADR-SEC-A §2.1, C-330/N-340). The "ADR-SEC-A" marker string lands
-// in the operator binary string table here for §P-VERIFY-MULTI deployed-provenance grep.
+// agent without a TLS config (ADR-SEC-A). The "ADR-SEC-A" marker string lands in the operator
+// binary string table here so the deployed binary can be verified to contain this fix.
 func adrSecADialNoTLS(opts []grpc.DialOption) ([]grpc.DialOption, error) {
 	return nil, fmt.Errorf("ADR-SEC-A: operator agent client has no TLS config — refusing to dial plaintext (fail-closed mTLS required)")
 }

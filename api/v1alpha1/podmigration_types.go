@@ -314,7 +314,7 @@ const (
 	ConditionTCPVerified = "TCPVerified"
 	// ConditionStrictCapabilitySatisfied is False when tcpPreservationMode=Strict cannot
 	// be honored because the resolved destination node does not support TC clsact
-	// (tcClsactSupported=false). Set by the pre-prewarm controller re-check (ADR-0169 §3b).
+	// (tcClsactSupported=false). Set by the pre-prewarm controller re-check (ADR-0169).
 	ConditionStrictCapabilitySatisfied = "StrictCapabilitySatisfied"
 	// ConditionServiceVerified is True when the application-level probe configured in
 	// spec.applicationProbe returns healthy from the destination pod post-restore.
@@ -329,6 +329,16 @@ const (
 	// LastTransitionTime must be strictly after the SocketsLive LastTransitionTime
 	// (M23 ordering invariant: no process resumption before sockets are live).
 	ConditionProcessResumedAfterSocketsLive = "ProcessResumedAfterSocketsLive"
+	// ConditionDataplaneReachabilityVerified is set True when a CROSS-NODE probe
+	// (originated by the SOURCE-node agent — a node ≠ destination) confirms the
+	// preserved pod IP is reachable via the real overlay/host-route datapath, and
+	// the destination echoes back a controller-issued correlation nonce. This is the
+	// ADR-0210 gate for source-pod deletion under tcpPreservationMode=Strict. It
+	// replaces the ADR-0200/0201 in-netns self-probe (a tautology: the dial and the
+	// lo/32 alias lived in the same netns, so the local kernel always answered RST).
+	// The CONTROLLER is the authority that flips this condition, based on the nonce
+	// round-trip — never a self-asserted ProbeOk boolean from a single agent.
+	ConditionDataplaneReachabilityVerified = "DataplaneReachabilityVerified"
 )
 
 // PreCopyStats records metrics from the iterative pre-copy phase.

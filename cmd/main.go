@@ -128,22 +128,30 @@ func main() {
 		tlsOpts = append(tlsOpts, disableHTTP2)
 	}
 
-	// Initial webhook TLS options
-	webhookTLSOpts := tlsOpts
-	webhookServerOptions := webhook.Options{
-		TLSOpts: webhookTLSOpts,
-	}
+	// ADR-0222: gate webhook server construction on the presence of a serving cert.
+	// controller-runtime adds a webhook runnable that reads tls.crt at startup; under
+	// certManager.enabled=false no cert is provided, so building the server unconditionally
+	// crashes the operator (CrashLoopBackOff) before leader election. One decision variable
+	// drives both server construction (Gate A) and handler registration (Gate B).
+	webhooksEnabled := len(webhookCertPath) > 0
 
-	if len(webhookCertPath) > 0 {
+	// Gate A: build the webhook server and wire ctrl.Options.WebhookServer ONLY when a cert
+	// is present. Leave it nil otherwise so controller-runtime registers no webhook runnable.
+	var webhookServer webhook.Server
+	if webhooksEnabled {
 		setupLog.Info("Initializing webhook certificate watcher using provided certificates",
 			"webhook-cert-path", webhookCertPath, "webhook-cert-name", webhookCertName, "webhook-cert-key", webhookCertKey)
 
-		webhookServerOptions.CertDir = webhookCertPath
-		webhookServerOptions.CertName = webhookCertName
-		webhookServerOptions.KeyName = webhookCertKey
+		webhookServerOptions := webhook.Options{
+			TLSOpts:  tlsOpts,
+			CertDir:  webhookCertPath,
+			CertName: webhookCertName,
+			KeyName:  webhookCertKey,
+		}
+		webhookServer = webhook.NewServer(webhookServerOptions)
+	} else {
+		setupLog.Info("webhook server disabled (no --webhook-cert-path); admission webhooks not registered")
 	}
-
-	webhookServer := webhook.NewServer(webhookServerOptions)
 
 	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
 	// More info:
@@ -206,10 +214,20 @@ func main() {
 
 	// Build mTLS client config for operator→agent calls.
 	// Falls back to insecure when certs are absent (dev/kind environment).
+	// ADR-SEC-C (GC-B7): the operator verifies the agent peer by SPIFFE identity (custom
+	// VerifyPeerCertificate), pinning spiffe://podmotion.io/ns/<ns>/sa/podmotion-agent. The
+	// namespace is read from POD_NAMESPACE (downward API, deployment.yaml) — NOT hardcoded — so a
+	// non-default-namespace install pins the correct agent identity (M2).
+	operatorNamespace := os.Getenv("POD_NAMESPACE")
+	if operatorNamespace == "" {
+		operatorNamespace = "podmotion-system"
+		setupLog.Info("POD_NAMESPACE unset; defaulting operator namespace for agent SPIFFE pin (ADR-SEC-C M2)", "namespace", operatorNamespace)
+	}
 	agentTLSCfg, err := agenttls.LoadClientConfig(
 		agenttls.DefaultCertFile,
 		agenttls.DefaultKeyFile,
 		agenttls.DefaultCAFile,
+		operatorNamespace,
 	)
 	if err != nil {
 		setupLog.Error(err, "Failed to load agent client TLS config")
@@ -288,21 +306,28 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "migrationwebhookconfig")
 		os.Exit(1)
 	}
-	if err := (&pmwebhook.EvictionInterceptor{}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to register webhook", "webhook", "EvictionInterceptor")
-		os.Exit(1)
-	}
-	if err := (&pmwebhook.PodMigrationValidator{}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to register webhook", "webhook", "PodMigrationValidator")
-		os.Exit(1)
-	}
-	if err := (&pmwebhook.PodMigrationDefaulter{}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to register webhook", "webhook", "PodMigrationDefaulter")
-		os.Exit(1)
-	}
-	if err := pmwebhook.NewPodMutatingWebhook(mgr.GetClient(), mgr.GetScheme()).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to register webhook", "webhook", "PodMutatingWebhook")
-		os.Exit(1)
+	// Gate B (ADR-0222): register admission webhook handlers ONLY when the webhook server
+	// was built (webhooksEnabled). Registering handlers when WebhookServer is nil forces
+	// controller-runtime to add the webhook runnable that reads tls.crt and crashes.
+	if webhooksEnabled {
+		if err := (&pmwebhook.EvictionInterceptor{}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to register webhook", "webhook", "EvictionInterceptor")
+			os.Exit(1)
+		}
+		if err := (&pmwebhook.PodMigrationValidator{}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to register webhook", "webhook", "PodMigrationValidator")
+			os.Exit(1)
+		}
+		if err := (&pmwebhook.PodMigrationDefaulter{}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to register webhook", "webhook", "PodMigrationDefaulter")
+			os.Exit(1)
+		}
+		if err := pmwebhook.NewPodMutatingWebhook(mgr.GetClient(), mgr.GetScheme()).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to register webhook", "webhook", "PodMutatingWebhook")
+			os.Exit(1)
+		}
+	} else {
+		setupLog.Info("admission webhooks not registered (webhook server disabled)")
 	}
 	if enableSpotReclaim {
 		if err := (&spotreclaim.SpotReclaimReconciler{
