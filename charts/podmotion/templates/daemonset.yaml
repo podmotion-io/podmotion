@@ -191,6 +191,9 @@ spec:
             # trace-derived minimum set. drop ALL, add only what CRIU + eBPF need:
             #   SYS_PTRACE — CRIU dump (PTRACE_SEIZE, process_vm_readv/writev)
             #   SYS_ADMIN  — CRIU mount-ns/setns/mount/umount2/userfaultfd (irreducible)
+            #   CHECKPOINT_RESTORE — CRIU 4.x kerndat init (cap 40, Linux 5.9+); CAP_CHECKPOINT_RESTORE
+            #                gates the MOVE_MOUNT_SET_GROUP probe (criu/kerndat.c:1129) and
+            #                checkpoint/restore-privileged operations. Kernel here is 6.17.
             #   NET_ADMIN  — eBPF TC/XDP attach, veth/neigh/route/FDB, zero-window hold
             #   BPF        — bpf() program load + map ops (k>=5.8 split out of SYS_ADMIN)
             #   PERFMON    — perf_event_open for perf/tracepoint-anchored programs (k>=5.8)
@@ -201,6 +204,7 @@ spec:
               add:
                 - SYS_PTRACE
                 - SYS_ADMIN
+                - CHECKPOINT_RESTORE
                 - NET_ADMIN
                 {{- if .Values.agent.kernelGE58 }}
                 - BPF
