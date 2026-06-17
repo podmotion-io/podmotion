@@ -647,6 +647,7 @@ func (r *PodMigrationReconciler) reconcileZeroWindowArm(ctx context.Context, pm 
 		PodUid:               podUID,
 		FreezeWindowBudgetMs: budget,
 		TcpPreservationMode:  string(pm.Spec.TCPPreservationMode),
+		SourcePodIp:          pm.Spec.SourcePodIP, // ADR-0224: conntrack NOTRACK target
 	})
 	if err != nil {
 		log.Error(err, "ZeroWindowArm: ArmZeroWindow RPC failed — requeuing", "migration", pm.Name)
@@ -670,8 +671,15 @@ func (r *PodMigrationReconciler) reconcileZeroWindowArm(ctx context.Context, pm 
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	msg := fmt.Sprintf("TC-BPF zero-window hold armed on source veth; armed_at_ns=%d; tcpi_unacked drained (ADR-0049 predicate A)", resp.ArmedAtNs)
-	log.Info("ZeroWindowArm: hold armed", "migration", pm.Name, "armedAtNs", resp.ArmedAtNs)
+	// ADR-0224: record that the source-side conntrack NOTRACK rule is armed. This single
+	// write makes atomicity-barrier predicate E (read at the OverlayHandoff and DisengageHold
+	// ConfirmOverlayReady calls) non-zero on the source axis — without it, predicate E reads
+	// source=false permanently and DisengageHold never satisfies the barrier (ADR-0049).
+	pm.Status.SourceConntrackArmed = resp.SourceConntrackArmed
+
+	msg := fmt.Sprintf("TC-BPF zero-window hold armed on source veth; armed_at_ns=%d; tcpi_unacked drained (ADR-0049 predicate A); sourceConntrackArmed=%t (ADR-0224 predicate E)", resp.ArmedAtNs, resp.SourceConntrackArmed)
+	log.Info("ZeroWindowArm: hold armed", "migration", pm.Name, "armedAtNs", resp.ArmedAtNs,
+		"sourceConntrackArmed", resp.SourceConntrackArmed)
 	setCondition(pm, pmv1.ConditionZeroWindowArmed, metav1.ConditionTrue, "Armed", msg)
 	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
@@ -953,6 +961,7 @@ func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm 
 		disarmResp, err := agentClient.DisarmZeroWindow(ctx, &agentpb.DisarmZeroWindowRequest{
 			MigrationName: pm.Name,
 			PodUid:        podUID,
+			SourcePodIp:   pm.Spec.SourcePodIP, // ADR-0224 3h-SYM: remove NOTRACK rule
 		})
 		if err != nil {
 			// RPC error on the happy path: the watchdog backstop will auto-disarm.
@@ -3510,6 +3519,7 @@ func (r *PodMigrationReconciler) disarmZeroWindowOnFailurePath(ctx context.Conte
 	disarmResp, rpcErr := agentClient.DisarmZeroWindow(ctx, &agentpb.DisarmZeroWindowRequest{
 		MigrationName: pm.Name,
 		PodUid:        pm.Spec.SourcePodUID,
+		SourcePodIp:   pm.Spec.SourcePodIP, // ADR-0224 3h-SYM: remove NOTRACK rule
 	})
 	if rpcErr != nil {
 		log.Error(rpcErr, "disarmZeroWindowOnFailurePath: DisarmZeroWindow RPC error (ADR-0157 D2/D3)",

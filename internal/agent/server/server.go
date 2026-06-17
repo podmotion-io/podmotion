@@ -6108,6 +6108,38 @@ func (s *AgentServer) ArmZeroWindow(ctx context.Context, req *agentpb.ArmZeroWin
 		}, nil
 	}
 
+	// ADR-0224: arm the source-side conntrack NOTRACK rule so the kernel never resets
+	// the migrated TCP connection on out-of-window segments during the overlay handoff
+	// (ADR-0048 predicate E). Fail-closed: same disposition as the BPF arm path above —
+	// if the NOTRACK rule cannot be installed we MUST NOT report Armed=true, otherwise
+	// the atomicity barrier predicate E reads source=false at DisengageHold.
+	sourceConntrackArmed := false
+	if req.SourcePodIp != "" {
+		log.Info("ArmZeroWindow: arming source conntrack NOTRACK (ADR-0224)",
+			"migration", req.MigrationName, "sourcePodIP", req.SourcePodIp)
+		if err := network.ArmConntrackNotrack(ctx, network.ConntrackNotrackRule{
+			PodIP:   req.SourcePodIp,
+			Comment: "pm-notrack-" + req.MigrationName,
+		}); err != nil {
+			log.Error(err, "ArmZeroWindow: conntrack NOTRACK arm failed — failing closed (ADR-0224)",
+				"migration", req.MigrationName, "sourcePodIP", req.SourcePodIp)
+			// Roll back the BPF hold we just armed so we do not leave a half-armed state.
+			disarmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if dErr := disarmZeroWindowBPF(disarmCtx, ifindex); dErr != nil {
+				log.Info("ArmZeroWindow: BPF rollback after NOTRACK arm failure errored", "migration", req.MigrationName, "err", dErr)
+			}
+			cancel()
+			return &agentpb.ArmZeroWindowResponse{
+				Armed:          false,
+				BlockingReason: fmt.Sprintf("conntrack NOTRACK arm failed (ADR-0224): %v", err),
+			}, nil
+		}
+		sourceConntrackArmed = true
+	} else {
+		log.Info("ArmZeroWindow: SourcePodIp empty — skipping conntrack NOTRACK arm (ADR-0224 legacy/cold path)",
+			"migration", req.MigrationName)
+	}
+
 	// Poll tcpi_unacked==0 on all TCP sockets reachable via the pod's network namespace
 	// (ADR-0049 predicate A). On non-Linux or when the pod PID is not found, returns immediately.
 	if err := pollUnackedZero(ctx, podUID); err != nil {
@@ -6153,10 +6185,12 @@ func (s *AgentServer) ArmZeroWindow(ctx context.Context, req *agentpb.ArmZeroWin
 		}
 	}()
 
-	log.Info("ArmZeroWindow: hold armed", "migration", req.MigrationName, "armedAtNs", armedAtNs)
+	log.Info("ArmZeroWindow: hold armed", "migration", req.MigrationName, "armedAtNs", armedAtNs,
+		"sourceConntrackArmed", sourceConntrackArmed)
 	return &agentpb.ArmZeroWindowResponse{
-		Armed:     true,
-		ArmedAtNs: armedAtNs,
+		Armed:                true,
+		ArmedAtNs:            armedAtNs,
+		SourceConntrackArmed: sourceConntrackArmed,
 	}, nil
 }
 
@@ -6214,6 +6248,22 @@ func (s *AgentServer) DisarmZeroWindow(_ context.Context, req *agentpb.DisarmZer
 	defer cancel()
 	if err := disarmZeroWindowBPF(disarmCtx, ifindex); err != nil {
 		log.Info("DisarmZeroWindow: BPF disarm error", "migration", req.MigrationName, "err", err)
+	}
+
+	// ADR-0224 3h-SYM: remove the conntrack NOTRACK rule installed at arm time so it does
+	// not leak. Warn-only — a partial disarm (BPF down, NOTRACK rule lingering) is a better
+	// state than a stuck-disarmed response that blocks migration completion. The rule is
+	// idempotent on delete (ENOENT treated as success).
+	if req.SourcePodIp != "" {
+		log.Info("DisarmZeroWindow: disarming source conntrack NOTRACK (ADR-0224 3h-SYM)",
+			"migration", req.MigrationName, "sourcePodIP", req.SourcePodIp)
+		if err := network.DisarmConntrackNotrack(disarmCtx, network.ConntrackNotrackRule{
+			PodIP:   req.SourcePodIp,
+			Comment: "pm-notrack-" + req.MigrationName,
+		}); err != nil {
+			log.Info("DisarmZeroWindow: conntrack NOTRACK disarm failed (warn-only, ADR-0224 3h-SYM)",
+				"migration", req.MigrationName, "sourcePodIP", req.SourcePodIp, "err", err)
+		}
 	}
 
 	disarmedAtNs := time.Now().UnixNano()
