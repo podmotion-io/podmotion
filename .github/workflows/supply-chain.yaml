@@ -1,0 +1,240 @@
+# Supply Chain Security — ADR-0077
+#
+# CycloneDX SBOM generation, Grype vulnerability scan, cosign keyless signing,
+# cosign verification, and SBOM attestation for all four PodMotion images plus
+# the Helm chart.
+#
+#   sbom         — generate a CycloneDX JSON SBOM per image + chart (always)
+#   vuln-scan    — Grype-scan every SBOM; fail on a fixable CRITICAL/HIGH (always)
+#   cosign-sign  — keyless-sign every image by digest                 (release only)
+#   sbom-attest  — attach the CycloneDX SBOM as a cosign attestation  (release only)
+#   cosign-verify— verify the signatures + attestations published above (release only)
+#
+# On PR / push to a feature branch this workflow runs sbom + vuln-scan only
+# (it scans the locally generated SBOMs — no registry write, no signing).
+# On a release tag (v*.*.*) the signing/attest/verify jobs additionally run.
+
+name: Supply Chain
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: podmotion-io
+  VERSION: "0.1.0"
+
+jobs:
+  # ── SBOM: CycloneDX JSON per image and for the Helm chart (ADR-0077 §1) ──────
+  sbom:
+    name: Generate SBOMs (CycloneDX)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [operator, agent, scheduler, checkpoint-gc]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@55dc4ee22412511ee8c3142cbea40418e6cec693 # v0.17.8
+
+      - name: Generate image SBOM (CycloneDX)
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/podmotion-${{ matrix.image }}:${{ github.ref_type == 'tag' && github.ref_name || env.VERSION }}
+        run: |
+          mkdir -p dist/sbom
+          syft "${IMAGE_REF}" -o cyclonedx-json > "dist/sbom/podmotion-${{ matrix.image }}.cdx.json"
+
+      - name: Upload image SBOM
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: cdx-sbom-podmotion-${{ matrix.image }}
+          path: dist/sbom/podmotion-${{ matrix.image }}.cdx.json
+          retention-days: 30
+
+  sbom-chart:
+    name: Generate Chart SBOM (CycloneDX)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@55dc4ee22412511ee8c3142cbea40418e6cec693 # v0.17.8
+
+      - name: Generate chart SBOM (CycloneDX)
+        run: |
+          mkdir -p dist/sbom
+          syft dir:charts/podmotion/ -o cyclonedx-json > "dist/sbom/chart.cdx.json"
+
+      - name: Upload chart SBOM
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: cdx-sbom-chart
+          path: dist/sbom/chart.cdx.json
+          retention-days: 30
+
+  # ── Vulnerability scan: Grype over every SBOM (ADR-0077 §1.4 + §1.5) ─────────
+  vuln-scan:
+    name: Vulnerability Scan (Grype)
+    needs: [sbom, sbom-chart]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Download all CycloneDX SBOMs
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: cdx-sbom-*
+          path: dist/sbom
+          merge-multiple: true
+
+      - name: Install grype
+        uses: anchore/scan-action/download-grype@5ed5d5e83e9f0c2c20f00e58e6d10a356dd9a30c # v6.0.0
+        id: grype
+
+      - name: Scan every SBOM (fail on fixable CRITICAL/HIGH)
+        run: |
+          fail=0
+          for f in dist/sbom/*.cdx.json; do
+            echo "==> scan: ${f}"
+            "${{ steps.grype.outputs.cmd }}" "sbom:${f}" \
+              --fail-on high --only-fixed || fail=1
+          done
+          if [ "${fail}" -ne 0 ]; then
+            echo "::error::vuln-scan FAILED — fixable CRITICAL/HIGH CVE present."
+            exit 1
+          fi
+          echo "vuln-scan PASSED — no fixable CRITICAL/HIGH findings."
+
+  # ── Sign images by digest, keyless (ADR-0077 §2) — release only ─────────────
+  cosign-sign:
+    name: Sign Images (cosign keyless)
+    if: github.ref_type == 'tag'
+    needs: [vuln-scan]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [operator, agent, scheduler, checkpoint-gc]
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve digest and sign
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/podmotion-${{ matrix.image }}:${{ github.ref_name }}
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          digest=$(cosign triangulate --type digest "${IMAGE_REF}" 2>/dev/null || true)
+          ref="${REGISTRY}/${IMAGE_NAMESPACE}/podmotion-${{ matrix.image }}"
+          if [ -z "${digest}" ]; then
+            digest=$(crane digest "${IMAGE_REF}")
+          fi
+          cosign sign --yes "${ref}@${digest}"
+
+  # ── Attach the CycloneDX SBOM as a cosign attestation (ADR-0077 §1) ─────────
+  sbom-attest:
+    name: Attest SBOMs (cosign --type cyclonedx)
+    if: github.ref_type == 'tag'
+    needs: [cosign-sign]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [operator, agent, scheduler, checkpoint-gc]
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download CycloneDX SBOM for this image
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: cdx-sbom-podmotion-${{ matrix.image }}
+          path: dist/sbom
+
+      - name: Attest SBOM (cyclonedx)
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/podmotion-${{ matrix.image }}:${{ github.ref_name }}
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          digest=$(crane digest "${IMAGE_REF}")
+          ref="${REGISTRY}/${IMAGE_NAMESPACE}/podmotion-${{ matrix.image }}"
+          cosign attest --yes \
+            --predicate "dist/sbom/podmotion-${{ matrix.image }}.cdx.json" \
+            --type cyclonedx \
+            "${ref}@${digest}"
+
+  # ── Verify signatures + SBOM attestations (ADR-0077 §2) — release only ──────
+  cosign-verify:
+    name: Verify Signatures & Attestations
+    if: github.ref_type == 'tag'
+    needs: [sbom-attest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [operator, agent, scheduler, checkpoint-gc]
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+
+      - name: Verify image signature (keyless)
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/podmotion-${{ matrix.image }}:${{ github.ref_name }}
+        run: |
+          cosign verify \
+            --certificate-identity-regexp="https://github.com/podmotion-io/podmotion/.github/workflows/supply-chain.yaml@.*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            "${IMAGE_REF}"
+
+      - name: Verify SBOM attestation (cyclonedx)
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/podmotion-${{ matrix.image }}:${{ github.ref_name }}
+        run: |
+          cosign verify-attestation \
+            --type cyclonedx \
+            --certificate-identity-regexp="https://github.com/podmotion-io/podmotion/.github/workflows/supply-chain.yaml@.*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            "${IMAGE_REF}"
