@@ -409,8 +409,17 @@ func (r *PodMigrationReconciler) reconcileDestinationPrewarm(ctx context.Context
 	mcpForPrep := &pmv1.MigrationCheckpoint{}
 	if mcpFetchErr := r.Get(ctx, types.NamespacedName{Name: pm.Name, Namespace: pm.Namespace}, mcpForPrep); mcpFetchErr == nil {
 		workloadImageForPrep = mcpForPrep.Spec.WorkloadImage
+		// ADR-0217 D3: warn (not info) when the consumer reads an empty WorkloadImage. Pre-0217
+		// this was the silent failure mode — the producer ran in Checkpointing (after this phase),
+		// so the consumer always saw empty and the agent never cached the image, aborting restore.
+		if workloadImageForPrep == "" {
+			log.Info("WARNING ADR-0217 D3: DestinationPrewarm read EMPTY WorkloadImage from MCP — "+
+				"D1 producer (Validating) should have populated it; relying on agent self-resolve (D2)",
+				"migration", pm.Name)
+		}
 	} else {
-		log.Info("DestinationPrewarm: MCP not found for WorkloadImage (warn-only, fallback to agent default)",
+		log.Info("WARNING ADR-0217 D3: DestinationPrewarm could not fetch MCP for WorkloadImage — "+
+			"relying on agent self-resolve (D2)",
 			"migration", pm.Name, "err", mcpFetchErr)
 	}
 
@@ -1519,6 +1528,52 @@ func (r *PodMigrationReconciler) reconcileValidating(ctx context.Context, pm *pm
 		}
 	}
 
+	// ADR-0217 D1: persist the workload image to the MigrationCheckpoint CR HERE — in
+	// Validating, BEFORE the transition to DestinationPrewarm. The prior producer ran in
+	// Checkpointing (controller:~2016), which is AFTER DestinationPrewarm's consumer
+	// (controller:~411). The consumer therefore always read an empty WorkloadImage, the
+	// agent never cached the image, and restore aborted with "restore image unresolved".
+	// Producing here closes the phase-order gap. The MCP CR is normally created by the
+	// agent at checkpoint time and does not yet exist at Validating, so we create-or-update.
+	// Warn-only (ADR-0012): a failure here is recoverable by the Checkpointing re-assert and
+	// the D2 agent self-resolve fallback.
+	if len(pod.Spec.Containers) > 0 {
+		workloadImage := pod.Spec.Containers[0].Image
+		mcpKey := types.NamespacedName{Name: pm.Name, Namespace: pm.Namespace}
+		mcpRef := &pmv1.MigrationCheckpoint{}
+		if mcpGetErr := r.Get(ctx, mcpKey, mcpRef); mcpGetErr == nil {
+			if mcpRef.Spec.WorkloadImage != workloadImage {
+				mcpRef.Spec.WorkloadImage = workloadImage
+				if mcpUpdateErr := r.Update(ctx, mcpRef); mcpUpdateErr != nil {
+					log.Error(mcpUpdateErr, "ADR-0217 D1: failed to update MCP WorkloadImage in Validating (warn-only)", "migration", pm.Name, "image", workloadImage)
+				} else {
+					log.Info("ADR-0217 D1: MCP WorkloadImage set in Validating (before DestinationPrewarm consumer)", "migration", pm.Name, "image", workloadImage)
+				}
+			}
+		} else if apierrors.IsNotFound(mcpGetErr) {
+			// MCP not yet created by the agent — create it now carrying the WorkloadImage so
+			// the DestinationPrewarm consumer can read it. The agent's later upsert is idempotent.
+			newMCP := &pmv1.MigrationCheckpoint{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      pm.Name,
+					Namespace: pm.Namespace,
+					Labels:    map[string]string{"podmotion.io/migration": pm.Name},
+				},
+				Spec: pmv1.MigrationCheckpointSpec{
+					PodMigrationRef: pm.Name,
+					WorkloadImage:   workloadImage,
+				},
+			}
+			if mcpCreateErr := r.Create(ctx, newMCP); mcpCreateErr != nil {
+				log.Error(mcpCreateErr, "ADR-0217 D1: failed to create MCP with WorkloadImage in Validating (warn-only)", "migration", pm.Name, "image", workloadImage)
+			} else {
+				log.Info("ADR-0217 D1: created MCP with WorkloadImage in Validating (before DestinationPrewarm consumer)", "migration", pm.Name, "image", workloadImage)
+			}
+		} else {
+			log.Error(mcpGetErr, "ADR-0217 D1: failed to fetch MCP for WorkloadImage in Validating (warn-only)", "migration", pm.Name)
+		}
+	}
+
 	setCondition(pm, conditionValidated, metav1.ConditionTrue, "Validated", "Pod and node checks passed")
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseDestinationPrewarm)
 }
@@ -2009,10 +2064,11 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		return ctrl.Result{}, fmt.Errorf("persisting Checkpointed=True: %w", err)
 	}
 
-	// ADR-0168 B2: write the workload image to the MigrationCheckpoint CR so the
+	// ADR-0168 B2 / ADR-0217 D1: write the workload image to the MigrationCheckpoint CR so the
 	// destination agent can use the correct image for the restore placeholder container.
-	// The MCP CR is created by the agent at checkpoint time; we update it here with
-	// the workload image from pod.Spec.Containers[0].Image. Warn-only (ADR-0012).
+	// As of ADR-0217 the AUTHORITATIVE producer is reconcileValidating (runs BEFORE the
+	// DestinationPrewarm consumer); this Checkpointing write is now an IDEMPOTENT RE-ASSERT
+	// retained for defense-in-depth and the legacy 8-phase pipeline. Warn-only (ADR-0012).
 	if len(sourcePod.Spec.Containers) > 0 {
 		workloadImage := sourcePod.Spec.Containers[0].Image
 		mcpRef := &pmv1.MigrationCheckpoint{}
