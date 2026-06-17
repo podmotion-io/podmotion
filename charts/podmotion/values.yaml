@@ -42,6 +42,18 @@ agent:
     limits:
       cpu: 500m
       memory: 256Mi
+  # SD-1-NETNS-BROKER (ADR-0148 Amendment): the privileged netns-broker sidecar.
+  # Same image as the agent, invoked via args: ["netns-broker"]. It serves only the
+  # netns-broker Unix socket and does per-migration netns bind/teardown — a tiny,
+  # mostly-idle workload, so its limits are deliberately small.
+  netnsBroker:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi
   # ADR-SEC-A §2.1 (C-330): agent mTLS material. Default true — fail-closed. Mounted at
   # /etc/podmotion/tls/{tls.crt,tls.key,ca.crt}. Without it the agent refuses to start (default
   # build) rather than serving plaintext on the privileged host-network :9090.

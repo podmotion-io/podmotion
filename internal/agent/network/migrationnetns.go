@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -22,23 +21,33 @@ import (
 
 	"golang.org/x/sys/unix"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/podmotion-io/podmotion/internal/agent/netnsbroker"
 )
 
 const (
-	// migrationNetnsDir is the base directory for migration network namespaces.
-	// Bind-mounted so the netns fd persists after the creating goroutine exits.
-	migrationNetnsDir = "/run/podmotion/netns"
-
-	// migrationVethPrefix is the host-side veth name prefix inside the migration netns.
+	// migrationVethPeer is the host-side veth name prefix inside the migration netns.
 	migrationVethPeer = "pmdst0"
 )
 
 // MigrationNetns holds the state of a prepared destination network namespace.
 type MigrationNetns struct {
-	// NetnsPath is the bind-mount path of the netns (e.g. /run/podmotion/netns/pm-mig-<uid>).
+	// NetnsPath is the bind-mount path of the netns. Under SD-1-NETNS-BROKER this
+	// is the broker-computed path /run/podmotion/netns/<migrationUID>/bind.
 	NetnsPath string
 	// HostVethName is the veth end on the host bridge (e.g. pmh-<uid>).
 	HostVethName string
+	// MigrationUID is the per-migration token the broker keys the bind-mount by.
+	// Required for TeardownMigrationNetns to address the right broker entry.
+	MigrationUID string
+}
+
+// brokerUID maps a raw migration uid to the broker's accepted token shape. The
+// broker validates against ^[A-Za-z0-9][A-Za-z0-9-]{0,127}$; migration uids are
+// already in that set, but we prefix with "pm-mig-" to namespace broker entries
+// and stay stable with the historical netns naming (pm-mig-<uid>).
+func brokerUID(uid string) string {
+	return "pm-mig-" + strings.ReplaceAll(uid, "-", "")
 }
 
 // PrepareDestinationNetns creates a migration netns on the destination node with:
@@ -57,42 +66,29 @@ type MigrationNetns struct {
 func PrepareDestinationNetns(ctx context.Context, provider NetworkProvider, uid, podIP, podCIDR, bridgeName, migrationName string) (*MigrationNetns, error) {
 	log := logf.FromContext(ctx)
 
-	if err := os.MkdirAll(migrationNetnsDir, 0o700); err != nil {
-		return nil, fmt.Errorf("PrepareDestinationNetns: mkdir %s: %w", migrationNetnsDir, err)
-	}
-
-	netnsPath := filepath.Join(migrationNetnsDir, "pm-mig-"+uid)
 	hostVeth := "pmh-" + truncUID(uid, 8)
+	muid := brokerUID(uid)
 
 	ip := net.ParseIP(podIP)
 	if ip == nil {
 		return nil, fmt.Errorf("PrepareDestinationNetns: invalid podIP %q", podIP)
 	}
 
+	// SD-1-NETNS-BROKER (ADR-0148 Amendment): the irreducible host-mount-namespace
+	// bind privilege now lives in the privileged netns-broker sidecar. The main
+	// agent is privileged:false and no longer runs nsenter+mount itself. We ask the
+	// broker to create a FRESH netns (srcPID=0 — destination prewarm) bind-mounted
+	// in the host mount namespace, and it returns the host path.
+	//
 	// Idempotency (M22/M24 freeze-go): the controller calls this RPC on every
-	// DestinationPrewarm reconcile until DestinationNetnsReady=True. A prior
-	// reconcile may have already created the netns and its veth. If a live nsfs
-	// bind mount already exists at netnsPath, the netns is prepared — return it
-	// rather than failing with "already exists", which would livelock the phase.
-	// A leftover empty file with NO backing mount is stale; tear it down and recreate.
-	if _, statErr := os.Stat(netnsPath); statErr == nil {
-		if isNsfsMounted(netnsPath) {
-			log.Info("migration netns already prepared — reusing (idempotent)",
-				"netnsPath", netnsPath, "hostVeth", hostVeth, "podIP", podIP)
-			return &MigrationNetns{
-				NetnsPath:    netnsPath,
-				HostVethName: hostVeth,
-			}, nil
-		}
-		log.Info("stale migration netns file with no backing mount — cleaning up before recreate",
-			"netnsPath", netnsPath)
-		_ = removeVeth(hostVeth)
-		_ = unix.Unmount(netnsPath, unix.MNT_DETACH)
-		_ = os.Remove(netnsPath)
-	}
-
-	if err := createBindMountedNetns(netnsPath); err != nil {
-		return nil, fmt.Errorf("PrepareDestinationNetns: %w", err)
+	// DestinationPrewarm reconcile until DestinationNetnsReady=True. The broker's
+	// create is idempotent — an already-present nsfs bind for this migrationUID is
+	// returned as-is rather than failing, so the phase does not livelock. A stale
+	// no-backing file is cleaned and recreated broker-side.
+	broker := netnsbroker.NewClient()
+	netnsPath, err := broker.Create(ctx, muid, 0)
+	if err != nil {
+		return nil, fmt.Errorf("PrepareDestinationNetns: broker create: %w", err)
 	}
 
 	// SP-5: bounded propagation barrier — wait up to 500 ms for the host-ns bind-mount
@@ -114,7 +110,7 @@ func PrepareDestinationNetns(ctx context.Context, provider NetworkProvider, uid,
 	f.Close()
 
 	if err := createVethPair(hostVeth, migrationVethPeer, netnsPath); err != nil {
-		_ = os.Remove(netnsPath)
+		_ = broker.Teardown(ctx, muid) // SD-1: unmount+remove is broker-owned now
 		return nil, fmt.Errorf("PrepareDestinationNetns: create veth: %w", err)
 	}
 
@@ -124,8 +120,7 @@ func PrepareDestinationNetns(ctx context.Context, provider NetworkProvider, uid,
 	// are orthogonal), so hoisting bringUpInterface before WireDestinationVeth is safe for both paths.
 	if err := bringUpInterface(hostVeth); err != nil {
 		_ = removeVeth(hostVeth)
-		_ = unix.Unmount(netnsPath, unix.MNT_DETACH) // SD-2: unmount before remove
-		_ = os.Remove(netnsPath)
+		_ = broker.Teardown(ctx, muid) // SD-1: broker unmounts in host mount ns
 		return nil, fmt.Errorf("PrepareDestinationNetns: bring up host veth: %w", err)
 	}
 
@@ -135,15 +130,13 @@ func PrepareDestinationNetns(ctx context.Context, provider NetworkProvider, uid,
 	// migrationNetns.go never branches on raw errno — that is the provider's responsibility.
 	if err := provider.WireDestinationVeth(ctx, hostVeth, bridgeName, podIP, migrationName); err != nil {
 		_ = removeVeth(hostVeth)
-		_ = unix.Unmount(netnsPath, unix.MNT_DETACH) // SD-2: unmount before remove
-		_ = os.Remove(netnsPath)
+		_ = broker.Teardown(ctx, muid) // SD-1: broker unmounts in host mount ns
 		return nil, fmt.Errorf("PrepareDestinationNetns: wire destination veth (bridge=%s): %w", bridgeName, err)
 	}
 
 	if err := configureNetnsInterfaces(netnsPath, ip); err != nil {
 		_ = removeVeth(hostVeth)
-		_ = unix.Unmount(netnsPath, unix.MNT_DETACH) // SD-2: unmount before remove
-		_ = os.Remove(netnsPath)
+		_ = broker.Teardown(ctx, muid) // SD-1: broker unmounts in host mount ns
 		return nil, fmt.Errorf("PrepareDestinationNetns: configure netns: %w", err)
 	}
 
@@ -155,13 +148,19 @@ func PrepareDestinationNetns(ctx context.Context, provider NetworkProvider, uid,
 	return &MigrationNetns{
 		NetnsPath:    netnsPath,
 		HostVethName: hostVeth,
+		MigrationUID: muid,
 	}, nil
 }
 
 // TeardownMigrationNetns removes the veth pair and bind-mount for the migration netns.
 // ENOENT on any step is treated as success (idempotent).
-// The unmount is performed in the HOST mount namespace (via nsenter) because the
-// bind-mount was created there by createBindMountedNetns.
+//
+// SD-1-NETNS-BROKER (ADR-0148 Amendment): the unmount+remove of the bind-mount —
+// which must happen in the HOST mount namespace — is delegated to the privileged
+// netns-broker sidecar (the main agent is privileged:false and cannot unmount in
+// the host mount ns). The broker teardown is idempotent (treats not-mounted /
+// absent as success). The veth removal stays in-process: it is a netlink
+// operation the de-privileged agent still holds CAP_NET_ADMIN for.
 func TeardownMigrationNetns(ctx context.Context, ns *MigrationNetns) error {
 	log := logf.FromContext(ctx)
 	var errs []error
@@ -169,154 +168,25 @@ func TeardownMigrationNetns(ctx context.Context, ns *MigrationNetns) error {
 	if err := removeVeth(ns.HostVethName); err != nil && !isEnoent(err) {
 		errs = append(errs, fmt.Errorf("remove veth %s: %w", ns.HostVethName, err))
 	}
-	// Unmount in host mount namespace — the bind-mount was created there.
-	if out, err := exec.Command("nsenter", "--mount=/proc/1/ns/mnt", "--",
-		"umount", "-l", ns.NetnsPath,
-	).CombinedOutput(); err != nil {
-		// EINVAL / not mounted: treat as success (idempotent).
-		if !strings.Contains(string(out), "not mounted") && !strings.Contains(err.Error(), "exit status") {
-			errs = append(errs, fmt.Errorf("unmount netns %s in host ns: %w\n%s", ns.NetnsPath, err, out))
-		} else {
-			// non-fatal: already unmounted or never mounted
-			log.Info("TeardownMigrationNetns: umount returned non-zero (may be already unmounted)",
-				"netnsPath", ns.NetnsPath, "err", err, "out", string(out))
-		}
+
+	// Resolve the broker token. Newer MigrationNetns values carry MigrationUID
+	// directly; for legacy values (e.g. a map entry restored without it) fall back
+	// to deriving the token from the bind path's parent dir name.
+	muid := ns.MigrationUID
+	if muid == "" {
+		muid = filepath.Base(filepath.Dir(ns.NetnsPath))
 	}
-	// Remove the file in the host mount namespace.
-	if out, err := exec.Command("nsenter", "--mount=/proc/1/ns/mnt", "--",
-		"rm", "-f", ns.NetnsPath,
-	).CombinedOutput(); err != nil {
-		errs = append(errs, fmt.Errorf("remove netns file %s in host ns: %w\n%s", ns.NetnsPath, err, out))
+
+	// Delegate unmount+remove in the host mount namespace to the broker (idempotent).
+	if err := netnsbroker.NewClient().Teardown(ctx, muid); err != nil {
+		errs = append(errs, fmt.Errorf("broker teardown netns %s: %w", muid, err))
 	}
 
 	if len(errs) > 0 {
 		return fmt.Errorf("TeardownMigrationNetns: %v", errs)
 	}
-	log.Info("migration netns torn down", "netnsPath", ns.NetnsPath)
+	log.Info("migration netns torn down", "netnsPath", ns.NetnsPath, "migrationUID", muid)
 	return nil
-}
-
-// isNsfsMounted reports whether path is a live network-namespace bind mount
-// (filesystem type "nsfs"). Used to distinguish an already-prepared migration
-// netns (reuse, idempotent) from a stale empty backing file (recreate).
-// Reads /proc/1/mountinfo (host init's mountinfo, visible because the agent pod
-// runs with hostPID:true) so that bind-mounts created in the host mount namespace
-// by createBindMountedNetns are visible. The agent container's own /proc/self/mountinfo
-// would not show host-namespace mounts.
-func isNsfsMounted(path string) bool {
-	// Read host mountinfo via PID 1 (host init process, visible with hostPID:true).
-	data, err := os.ReadFile("/proc/1/mountinfo")
-	if err != nil {
-		// Fall back to self mountinfo if /proc/1/mountinfo is inaccessible.
-		data, err = os.ReadFile("/proc/self/mountinfo")
-		if err != nil {
-			return false
-		}
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		// mountinfo format: ... <mount-point> ... - <fstype> <source> <opts>
-		// The mount point is field 5 (1-indexed); fstype follows the " - " separator.
-		fields := strings.Fields(line)
-		if len(fields) < 5 {
-			continue
-		}
-		if fields[4] != path {
-			continue
-		}
-		sep := -1
-		for i, f := range fields {
-			if f == "-" {
-				sep = i
-				break
-			}
-		}
-		if sep >= 0 && sep+1 < len(fields) && fields[sep+1] == "nsfs" {
-			return true
-		}
-	}
-	return false
-}
-
-// createBindMountedNetns creates a new network namespace and bind-mounts it
-// to path in the HOST mount namespace so it persists and is accessible to CRIU,
-// which runs in the host mount namespace via nsenter.
-//
-// The bind-mount is performed via nsenter --mount=/proc/1/ns/mnt so that the
-// resulting mount entry is visible from the host mount namespace — not only from
-// the agent container's private mount namespace. CRIU receives the path via
-// --join-ns net:<path> and must be able to open it from the host mount namespace.
-func createBindMountedNetns(path string) error {
-	// Ensure the parent directory exists in the HOST mount namespace.
-	// os.MkdirAll above creates it only in the agent container's private mount namespace;
-	// the host mount namespace has a separate view and may lack /run/podmotion/netns/.
-	// Without this, the touch below fails with ENOENT (Sprint 32 cold-gate-attempt-2 root cause).
-	dir := filepath.Dir(path)
-	if out, err := exec.Command("nsenter", "--mount=/proc/1/ns/mnt", "--",
-		"mkdir", "-p", dir,
-	).CombinedOutput(); err != nil {
-		return fmt.Errorf("create netns dir in host mount namespace: %w\n%s", err, out)
-	}
-
-	// Create the bind-mount target file in the HOST mount namespace so CRIU
-	// (running in the host mount namespace via nsenter) can open it.
-	// We use nsenter to create the file on the host rather than os.OpenFile which
-	// would create it only in the agent container's mount namespace.
-	if out, err := exec.Command("nsenter", "--mount=/proc/1/ns/mnt", "--",
-		"sh", "-c", fmt.Sprintf("[ -e %q ] || touch %q", path, path),
-	).CombinedOutput(); err != nil {
-		return fmt.Errorf("create netns bind-mount target on host: %w\n%s", err, out)
-	}
-
-	// We must lock the OS thread for unshare to work correctly.
-	// The goroutine creates a new network namespace, then bind-mounts it into
-	// the HOST mount namespace via nsenter so the path is visible to CRIU.
-	done := make(chan error, 1)
-	go func() {
-		runtime.LockOSThread()
-		// LockOSThread is intentionally not unlocked — the goroutine exits after
-		// the work is done so Go runtime recycles the locked thread.
-
-		// Save current netns fd so we can restore after creating the new one.
-		origNS, err := os.Open("/proc/self/ns/net")
-		if err != nil {
-			done <- fmt.Errorf("open current netns: %w", err)
-			return
-		}
-		defer origNS.Close()
-
-		if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
-			done <- fmt.Errorf("unshare CLONE_NEWNET: %w", err)
-			return
-		}
-
-		// Get the current thread ID so we can reference its netns via /proc/<tid>/ns/net.
-		// After Unshare, /proc/self/ns/net (which resolves to /proc/<tid>/ns/net on Linux)
-		// refers to the newly-created network namespace on this locked OS thread.
-		tid := unix.Gettid()
-		threadNetnsPath := fmt.Sprintf("/proc/%d/ns/net", tid)
-
-		// Bind-mount the new netns into the HOST mount namespace via nsenter.
-		// This makes the netns file visible to CRIU which runs in the host mount
-		// namespace (nsenter --mount=/proc/1/ns/mnt). Without this, the bind-mount
-		// would only appear in the agent container's private mount namespace and CRIU
-		// would get ENOENT on --join-ns net:<path> (Sprint 32 cold-gate-attempt-1 root cause).
-		if out, err := exec.Command("nsenter", "--mount=/proc/1/ns/mnt", "--",
-			"mount", "--bind", threadNetnsPath, path,
-		).CombinedOutput(); err != nil {
-			// Restore original netns before returning the error.
-			_ = unix.Setns(int(origNS.Fd()), unix.CLONE_NEWNET)
-			done <- fmt.Errorf("bind mount netns in host mount namespace: %w\n%s", err, out)
-			return
-		}
-
-		// Return to the original netns.
-		if err := unix.Setns(int(origNS.Fd()), unix.CLONE_NEWNET); err != nil {
-			done <- fmt.Errorf("restore original netns: %w", err)
-			return
-		}
-		done <- nil
-	}()
-	return <-done
 }
 
 // createVethPair creates a veth pair with hostVeth on the host and peerVeth

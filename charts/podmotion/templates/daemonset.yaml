@@ -130,6 +130,36 @@ spec:
             - name: host-opt-podmotion-bin
               mountPath: /host-opt-podmotion-bin
       containers:
+        # SD-1-NETNS-BROKER (ADR-0148 Amendment): the SOLE long-lived privileged:true
+        # container in the pod. It serves ONLY the netns-broker Unix socket
+        # (/run/podmotion/netns-broker.sock, mode 0600) and does ONLY per-migration
+        # netns bind/teardown in the HOST mount namespace. It speaks no gRPC. The
+        # irreducible host-mount-ns bind privilege (CAP_SYS_ADMIN mount/umount2)
+        # lives here so the main agent below can run privileged:false. Same image as
+        # the agent (no version skew) — different entrypoint via args: ["netns-broker"]
+        # (cmd/agent/main.go subcommand dispatch). Mirrors the SD-1-INIT-B precedent.
+        - name: netns-broker
+          image: "{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"
+          imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          command: [/agent]
+          args: ["netns-broker"]
+          securityContext:
+            # Irreducible: setns(CLONE_NEWNS) into the HOST init mount namespace
+            # (/proc/1/ns/mnt) to mount/umount2 the per-migration netns bind requires
+            # CAP_SYS_ADMIN effective in the user namespace that OWNS that mount ns —
+            # the HOST init user namespace. privileged:true is the only securityContext
+            # that places this container there with the full host capability set (same
+            # reasoning as the SD-1-INIT-B init-checkpoint-tmpfs container above).
+            privileged: true
+          volumeMounts:
+            - name: run-podmotion
+              mountPath: /run/podmotion
+              # Bidirectional: the broker creates netns bind-mounts in the host mount
+              # namespace; the agent consumes them via HostToContainer. The shared
+              # /run/podmotion mount carries both the socket and the netns dir.
+              mountPropagation: Bidirectional
+          resources:
+            {{- toYaml .Values.agent.netnsBroker.resources | nindent 12 }}
         - name: agent
           image: "{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"
           imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
