@@ -231,6 +231,19 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		// /sys is in skipMnts — no external declaration needed for /sys.
 		// compat-mode umount is prevented via SkipMnt on restore side.
 		"--network-lock", "skip",
+		// ADR-0227: --manage-cgroups=ignore. CRIU's default cgroup mode walks and
+		// serializes the source pod's full cgroup membership. On a cgroup-v2 kind node
+		// the BestEffort QoS scope lives at
+		// kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-besteffort.slice and is
+		// NOT visible from the agent container's mount namespace, so the walk fails at
+		// cgroup.c:742 ("failed walking ... for the besteffort kubepods cgroup scope:
+		// No such file or directory") -> cr-dump.c:1737 Dump core failed -> Dumping FAILED.
+		// The container runtime (kubelet/containerd) owns cgroup lifecycle, not CRIU:
+		// CRIU must not try to serialize/restore it. This is symmetric with the restore
+		// path, which already passes --manage-cgroups=ignore (ADR-0128, server.go:2435).
+		// In go-criu RPC terms this is rpc.CriuCgMode_IGNORE; the dump path is CLI-exec
+		// (see comment above on swrk AutoExtMnt limitations), so it is passed as a flag.
+		"--manage-cgroups=ignore",
 	}
 	if opts.LeaveRunning {
 		dumpArgs = append(dumpArgs, "--leave-running")
