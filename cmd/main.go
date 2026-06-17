@@ -326,6 +326,12 @@ func main() {
 			setupLog.Error(err, "Failed to register webhook", "webhook", "PodMutatingWebhook")
 			os.Exit(1)
 		}
+		// ADR-0039 SD-6 / ADR-0148: block exec/attach/ephemeralcontainers into
+		// privileged podmotion-agent pods (and nodes/proxy from the agent SA).
+		if err := (&pmwebhook.AgentExecBlockWebhook{}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to register webhook", "webhook", "AgentExecBlockWebhook")
+			os.Exit(1)
+		}
 	} else {
 		setupLog.Info("admission webhooks not registered (webhook server disabled)")
 	}
