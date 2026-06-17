@@ -115,6 +115,15 @@ spec:
             {{- toYaml .Values.agent.resources | nindent 12 }}
           securityContext:
             privileged: true
+            {{- if .Values.agent.seccompProfile.enabled }}
+            # ADR-0039 SD-5 / ADR-0148: CRIU-scoped seccomp profile (arg-filtered ptrace,
+            # default-deny). Only meaningful once privileged:true is dropped (SD-1).
+            seccompProfile:
+              type: {{ .Values.agent.seccompProfile.type }}
+              {{- if eq .Values.agent.seccompProfile.type "Localhost" }}
+              localhostProfile: {{ .Values.agent.seccompProfile.localhostProfile }}
+              {{- end }}
+            {{- end }}
           volumeMounts:
             - name: criu-socket
               mountPath: /var/run/criu
