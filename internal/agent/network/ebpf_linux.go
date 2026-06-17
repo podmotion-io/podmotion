@@ -644,13 +644,25 @@ const (
 	tcaOptions = 2
 	tcaFdArray = 22
 
-	// BPF filter attribute types
-	tcaBpfFd       = 1
-	tcaBpfName     = 2
-	tcaBpfFlags    = 3
-	tcaBpfFlagsGen = 4
-	tcaBpfTag      = 5
-	tcaBpfId       = 6
+	// BPF filter attribute types — ADR-0209.
+	// These MUST match the kernel enum tca_bpf_unspec in
+	// include/uapi/linux/pkt_cls.h:
+	//   TCA_BPF_UNSPEC=0, TCA_BPF_ACT=1, TCA_BPF_POLICE=2, TCA_BPF_CLASSID=3,
+	//   TCA_BPF_OPS_LEN=4, TCA_BPF_OPS=5, TCA_BPF_FD=6, TCA_BPF_NAME=7,
+	//   TCA_BPF_FLAGS=8, TCA_BPF_FLAGS_GEN=9, TCA_BPF_TAG=10, TCA_BPF_ID=11
+	// The prior values (Fd=1, Name=2, Flags=3, …) were off-by-five for every
+	// attribute: the prog FD was sent under TCA_BPF_ACT(1), so cls_bpf saw
+	// neither TCA_BPF_FD nor TCA_BPF_OPS and rejected the RTM_NEWTFILTER with
+	// -EINVAL (Sprint 35 gate-5 ZeroWindowArm wall). Verified against the
+	// kernel's own canonical layout via RTM_GETTFILTER dump of a tc-attached
+	// cls_bpf filter (TCA_BPF_NAME=7, TCA_BPF_FLAGS=8, TCA_BPF_FLAGS_GEN=9,
+	// TCA_BPF_TAG=10, TCA_BPF_ID=11). ADR-0209 marker.
+	tcaBpfFd       = 6
+	tcaBpfName     = 7
+	tcaBpfFlags    = 8
+	tcaBpfFlagsGen = 9
+	tcaBpfTag      = 10
+	tcaBpfId       = 11
 
 	tcBpfFlagActDirect = 1 << 0 // TCA_BPF_FLAG_ACT_DIRECT
 
@@ -713,10 +725,17 @@ func ensureClsactQdisc(ifindex int) error {
 		Parent  uint32
 		Info    uint32
 	}
+	// ADR-0204 fix: clsact qdisc MUST be installed with parent TC_H_CLSACT
+	// (0xFFFFFFF1, == tcHandleIngress), NOT TC_H_ROOT (0xFFFFFFFF). The kernel
+	// sch_clsact ops reject any parent != TC_H_CLSACT with -EOPNOTSUPP (errno -95).
+	// The prior TC_H_ROOT value is precisely what produced the false-negative
+	// "kernel clsact not supported" probe result on a kernel that fully supports
+	// clsact (`tc qdisc add ... clsact` succeeds). Verified: `tc qdisc show` reports
+	// `qdisc clsact ffff: parent ffff:fff1`.
 	tc := tcmsg{
 		Ifindex: int32(ifindex),
 		Handle:  tcHandleClsact,
-		Parent:  tcHandleRoot,
+		Parent:  tcHandleIngress,
 	}
 	tcBytes := (*[unsafe.Sizeof(tc)]byte)(unsafe.Pointer(&tc))[:]
 	kind := tcAttrStr(tcaKind, "clsact")
@@ -780,10 +799,15 @@ func attachTCEgress(ifindex int, prog *ebpf.Program) (uint32, error) {
 		Ifindex int32
 		Handle  uint32
 		Parent  uint32
-		Info    uint32 // prio<<16 | proto (htons(ETH_P_ALL)=0x0003)
+		Info    uint32 // prio<<16 | proto (htons(ETH_P_ALL)=0x0300)
 	}
 	const prioDefault = 1
-	const ethPAll = 0x0003 // htons(ETH_P_ALL)
+	// ADR-0209: tcm_info carries the protocol in network byte order. ETH_P_ALL
+	// is 0x0003; htons(0x0003) on a little-endian host is 0x0300. The prior
+	// literal 0x0003 placed the protocol in host order — latent under the
+	// off-by-five TCA_BPF type bug (the message never reached protocol
+	// matching), surfaced once the FD attribute was honoured.
+	const ethPAll = 0x0300 // htons(ETH_P_ALL)
 	tc := tcmsg{
 		Ifindex: int32(ifindex),
 		Handle:  0,
@@ -834,6 +858,8 @@ func attachTCEgress(ifindex int, prog *ebpf.Program) (uint32, error) {
 		return 0, fmt.Errorf("RTM_NEWTFILTER: %w", err)
 	}
 
+	logf.Log.Info("ADR-0209: cls_bpf TC egress filter attached (TCA_BPF_FD=6/NAME=7/FLAGS=8, proto=htons(ETH_P_ALL))",
+		"ifindex", ifindex, "handle", filterHandle)
 	return filterHandle, nil
 }
 
@@ -932,7 +958,7 @@ func attachTCIngress(ifindex int, prog *ebpf.Program) (uint32, error) {
 		Info    uint32
 	}
 	const prioDefault = 1
-	const ethPAll = 0x0003
+	const ethPAll = 0x0300 // ADR-0209: htons(ETH_P_ALL); tcm_info protocol is network byte order
 	const tcParentIngress = 0xFFFFFFF2 // TC_H_MIN_INGRESS
 	filterHandle := uint32(0xFFFF0002)
 	tc := tcmsg{
