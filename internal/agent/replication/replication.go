@@ -169,14 +169,34 @@ func (r *ReplicationManager) patchMemorySynced(
 			return fmt.Errorf("get PodMigration for patch: %w", err)
 		}
 		meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
-			Type:               conditionMemorySynced,
-			Status:             status,
-			Reason:             reason,
-			Message:            message,
+			Type:   conditionMemorySynced,
+			Status: status,
+			Reason: reason,
+			// ADR-0226: bound the message below the CRD apiserver limit
+			// (status.conditions[].message maxLength=32768). The ForceFreeze path
+			// embeds the raw CRIU/gRPC error via %v, which can exceed 32768 bytes;
+			// an over-limit message is REJECTED by the apiserver, so the condition
+			// never persists, memoryCond stays nil, and the controller relaunches
+			// the pre-copy goroutine every reconcile (round-0 livelock). The full
+			// error remains in the operator log; only the persisted message is
+			// capped. Mirrors the controller-side setCondition truncation contract.
+			Message:            truncateConditionMsg(message, 1024),
 			LastTransitionTime: metav1.Now(),
 		})
 		return r.Client.Status().Update(ctx, fresh)
 	})
+}
+
+// truncateConditionMsg bounds a condition message so it never exceeds the CRD
+// apiserver limit (status.conditions[].message must be <= 32768 bytes). CRIU dump
+// log output and gRPC error strings can be far larger; we cap well under the limit
+// at a human-readable length. (ADR-0226 — agent-side dual of the controller's
+// setCondition truncation; restores symmetry with the Sprint 31 controller fix.)
+func truncateConditionMsg(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max-3] + "..."
 }
 
 // updatePreCopyStats persists pre-copy metrics to pm.Status.PreCopyStats.
