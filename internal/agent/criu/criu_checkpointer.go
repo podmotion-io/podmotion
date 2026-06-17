@@ -265,6 +265,48 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		// literally, so list both to be robust across runtimes.
 		"/run/secrets/kubernetes.io/serviceaccount",
 		"/var/run/secrets/kubernetes.io/serviceaccount",
+		// ADR-0230: container /dev tmpfs + its overmounting tmpfs children.
+		//
+		// runc/containerd mounts the container's /dev as a fresh tmpfs (mode=755,
+		// size=65536k) and then OVERMOUNTS it with /dev/shm, /dev/mqueue, /dev/pts and
+		// the /dev/termination-log bind. Those child mounts obscure the parent /dev
+		// tmpfs, so CRIU's per-mount dump pass (criu/mount.c dump_one_mountpoint ->
+		// mnt_is_fully_visible) classifies /dev as NOT fully visible:
+		//   mnt: 	12334: 384:/ @ ./dev
+		//   mnt: Mount is not fully visible ./dev(12334)
+		// For an obscured tmpfs CRIU cannot read the real content through the agent's
+		// view, so it falls back to entering the SOURCE mount namespace directly to
+		// read it — criu/namespaces.c restore_ns()/switch_ns_by_fd() issues
+		// setns(<mnt-ns-fd>, CLONE_NEWNS). In the constrained agent container that
+		// setns is denied:
+		//   Error (criu/namespaces.c:258): Can't setns 12/mnt: Operation not permitted
+		//   Error (criu/mount.c:1809): mnt: Unable to dump a file system for 12334:./dev
+		//   Error (criu/cr-dump.c:2128): Dumping FAILED.
+		// EPERM here is NOT a missing capability (the agent holds CAP_SYS_ADMIN, and
+		// setns is seccomp-allowed): setns(CLONE_NEWNS) is gated by CAP_SYS_ADMIN
+		// EFFECTIVE in the USER NAMESPACE THAT OWNS the target mount namespace. The
+		// workload pod's mount ns is owned by its own user namespace, not the agent's,
+		// so the agent's host-userns CAP_SYS_ADMIN does not carry into it — exactly the
+		// constraint the daemonset HOLD-A comment documents for the netns-broker. We do
+		// NOT escalate the agent to privileged to win that setns; instead we eliminate
+		// the need for it. ADR-0227's --manage-cgroups=ignore and ADR-0228's masked-tmpfs
+		// skips advanced the dump frontier into the mountpoint pass; /dev is the FIRST
+		// obscured-parent tmpfs CRIU tries to read via setns (healthy-descent frontier
+		// advance, §19f).
+		//
+		// The container /dev tmpfs carries NO migratable workload state: it is the
+		// standard device-node set (/dev/null, /dev/zero, /dev/urandom, /dev/console,
+		// ...) that the DESTINATION runtime re-provides verbatim from the OCI spec on
+		// restore, and its tmpfs children (shm/mqueue/pts) are likewise runtime-provided.
+		// Redis opens none of /dev as persistent state. Skip /dev (and its overmounting
+		// tmpfs children, for §3h-SYM removal symmetry so no child is dumped without its
+		// parent) at dump time. --skip-mnt short-circuits dump_one_mountpoint BEFORE the
+		// visibility check fires, so CRIU never attempts the setns. The restore-side
+		// SkipMnt below mirrors this exact set (§3h-SYM dump/restore skip symmetry).
+		"/dev",
+		"/dev/shm",
+		"/dev/mqueue",
+		"/dev/pts",
 	}
 
 	// Build CLI args. We use exec (not swrk RPC) for the final dump because CRIU 4.2
@@ -619,6 +661,15 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 			// root in container mnt ns) and re-attached by the destination storage tier on
 			// restore. Mirror the dump-side skip so CRIU does not try to restore it.
 			"/data",
+			// ADR-0230 (§3h-SYM): mirror the dump-side /dev skip set. The /dev tmpfs and
+			// its tmpfs children (shm/mqueue/pts) are not in the dump image (skipped at
+			// dump to avoid the obscured-parent setns), so the restore must not expect to
+			// recreate them — the destination runtime re-provides /dev from the OCI spec.
+			// Keeping the dump and restore skip sets identical preserves removal symmetry.
+			"/dev",
+			"/dev/shm",
+			"/dev/mqueue",
+			"/dev/pts",
 		},
 		// pm-sys reverse-maps the dump-side --external mnt[/sys]:pm-sys declaration. Without this,
 		// compat-mode treats /sys as a stale mount and umounts it; the host-bind-mounted sysfs
