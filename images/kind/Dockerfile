@@ -38,6 +38,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN criu --version && criu --version | grep -qE "^Version: [4-9]\." || \
     { echo "ERROR: CRIU < 4.0 installed. go-criu v7.2 requires CRIU 4.x RPC protocol."; exit 1; }
 
+# ADR-0221: bundle upstream standard CNI plugins into /opt/cni/bin.
+# kind-config.yaml sets disableDefaultCNI:true (ADR-0202), removing kindnet — which was the
+# only source of the `bridge` plugin in the kindest/node base image. Flannel's vxlan backend
+# delegates veth/bridge sandbox setup to `bridge`, so its absence makes every CNI ADD fail
+# ("failed to find plugin \"bridge\" in path [/opt/cni/bin]") and the whole gate cascades:
+# no sandbox net -> CoreDNS ContainerCreating -> SUT NotFound -> operator/agent never created.
+# The flannel DaemonSet installs only the `flannel` meta-plugin, not its delegated plugins.
+# Make the node image self-contained: install + checksum-verify the standard plugin set,
+# then assert bridge/host-local are present (fail the build loudly if they regress).
+ARG CNI_PLUGINS_VERSION=v1.5.1
+ARG TARGETARCH=amd64
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) CNI_SHA=77baa2f669980a82255ffa2f2717de823992480271ee778aa51a9c60ae89ff9b ;; \
+      arm64) CNI_SHA=c2a292714d0fad98a3491ae43df8ad58354b3c0bdf5d5a3e281777967c70fcff ;; \
+      *) echo "ERROR: unsupported TARGETARCH=${TARGETARCH} for CNI plugins (ADR-0221)" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p /opt/cni/bin; \
+    curl -fsSL -o /tmp/cni-plugins.tgz \
+      "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-${TARGETARCH}-${CNI_PLUGINS_VERSION}.tgz"; \
+    echo "${CNI_SHA}  /tmp/cni-plugins.tgz" | sha256sum -c -; \
+    tar -C /opt/cni/bin -xzf /tmp/cni-plugins.tgz; \
+    rm -f /tmp/cni-plugins.tgz; \
+    test -x /opt/cni/bin/bridge || { echo "ERROR: /opt/cni/bin/bridge missing after CNI install (ADR-0221)" >&2; exit 1; }; \
+    test -x /opt/cni/bin/host-local || { echo "ERROR: /opt/cni/bin/host-local missing after CNI install (ADR-0221)" >&2; exit 1; }
+
 # Create required directories
 RUN mkdir -p /etc/containerd/conf.d /usr/local/lib/nri
 
