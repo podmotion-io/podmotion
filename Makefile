@@ -330,7 +330,11 @@ endef
 
 # ── PodMotion custom targets ──────────────────────────────────────────────────
 
-IMG_OPERATOR  ?= ghcr.io/podmotion-io/operator:dev
+# Sprint 37 PreCopyMemory livelock fix (ADR-0226): operator image tag carrying the
+# patchMemorySynced condition-message truncation fix. The fix is in the operator
+# binary (ReplicationManager, wired in cmd/main.go); the agent binary is unaffected.
+SPRINT37_PRECOPY_FIX_TAG ?= sprint37-precopy-fix
+IMG_OPERATOR  ?= podmotion-manager:$(SPRINT37_PRECOPY_FIX_TAG)
 IMG_AGENT     ?= ghcr.io/podmotion-io/agent:dev
 KIND_NODE_IMG ?= ghcr.io/podmotion-io/kind-node:dev
 KIND_CLUSTER  ?= podmotion-dev
