@@ -3589,7 +3589,16 @@ _raw_inherit = json.loads(sys.argv[3]); inherit_fd_names = set(_raw_inherit) if 
 def backup(path):
     orig = path + '.orig'
     if not os.path.exists(orig):
-        shutil.copy2(path, orig)
+        # ADR-0233: content-only copy (copyfile), NOT copy2. copy2 calls copystat,
+        # which invokes utimensat to clone mtime/atime onto the .orig backup. Under
+        # the M22 hardened seccomp posture (charts/podmotion/profiles/agent-criu.json,
+        # defaultAction=SCMP_ACT_ERRNO) utimensat is NOT allowlisted, so copystat
+        # raised PermissionError: [Errno 1] Operation not permitted — aborting the
+        # patch step BEFORE the CRIU restore launch (upstream of go-criu RPC). These
+        # .orig files are throwaway backups of binary CRIU image blobs; timestamps,
+        # mode, owner, and xattrs are irrelevant to restore correctness — only the
+        # bytes matter. copyfile copies content with zero metadata syscalls.
+        shutil.copyfile(path, orig)
     return orig
 
 def load_image(image_file, fail_on_magic_error=True):
@@ -3890,7 +3899,9 @@ for route_file in ['route-10.img', 'route6-10.img']:
         orig = route_path + '.orig'
         if not os.path.exists(orig):
             import shutil
-            shutil.copy2(route_path, orig)
+            # ADR-0233: copyfile, not copy2 — see backup() above. copy2's copystat
+            # step calls utimensat (not in the M22 seccomp allowlist) and EPERMs.
+            shutil.copyfile(route_path, orig)
         os.remove(route_path)
         print('route: deleted', route_file, '(CRIU skip-route-restore; dest routes via host-route injection or pre-staged)')
 
