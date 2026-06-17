@@ -211,6 +211,15 @@ spec:
                 # denied") for any process the agent does not own. DAC_READ_SEARCH bypasses
                 # file read/search DAC checks, restoring map_files access without privileged.
                 - DAC_READ_SEARCH
+                # ADR-0227: CRIU dump_task_rlimits() (criu/cr-dump.c:388) reads the target's
+                # rlimits via prlimit64(target_pid). Reading another task's limits across a
+                # user-namespace/credential boundary is gated by the kernel
+                # check_prlimit_permission() — satisfied only by exact-uid match OR
+                # CAP_SYS_RESOURCE in the target's userns. The agent runs in the host init
+                # userns; the workload pod has its own creds, so CAP_SYS_RESOURCE is required.
+                # (prlimit64 is already seccomp-allowed; this EPERM was a capability denial,
+                # not a seccomp denial.) Not kernel-gated — CAP_SYS_RESOURCE predates 5.8.
+                - SYS_RESOURCE
                 - NET_ADMIN
                 {{- if .Values.agent.kernelGE58 }}
                 - BPF
