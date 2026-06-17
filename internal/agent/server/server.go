@@ -2918,87 +2918,94 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	wrapperArgs := append([]string{"/opt/podmotion/bin/podmotion-criu-wrapper"}, cgroupFdMapArgs...)
 	wrapperArgs = append(wrapperArgs, "--", "/usr/sbin/criu")
 	wrapperArgs = append(wrapperArgs, criuArgs...)
-	// ADR-0231: the CRIU wrapper is launched via the LOCAL nsenter *exec.Cmd (not the
-	// broker shim) because it needs .Start()/.Wait()/.Process.Pid/.ProcessState +
-	// streaming stderr while the agent polls the cgroup-PID liveness signal. See
-	// nsenterLocalCmd — this is the KNOWN NEXT WALL after the image-pull frontier fix.
-	criuCmd := nsenterLocalCmd(wrapperArgs...)
+	// ADR-0234: the CRIU wrapper is launched via the BROKER async exec ops
+	// (exec_start / exec_poll / exec_signal), not a LOCAL nsenter *exec.Cmd. Under
+	// SD-1 (main agent privileged:false) a local nsenter EPERMs on setns(CLONE_NEWNS)
+	// into the host mount namespace — only the privileged broker holds CAP_SYS_ADMIN
+	// in the host init userns. ADR-0231 broker-delegated the SHORT host-mount-ns
+	// commands and left THIS long-running wrapper launch as the named next wall;
+	// ADR-0234 extends the broker with a detached-spawn + host-PID + cross-process-reap
+	// mechanism so the wrapper runs broker-side while the agent keeps the same async
+	// lifecycle it had with the local *exec.Cmd. brokerCriuCmd emulates the exact
+	// .Start()/poll()/.Pid() subset joinNsRestore used.
+	criuCmd := newBrokerCriuCmd(wrapperArgs...)
 	// ADR-0125: netns is joined by path (--join-ns net:<path>), not by an inherited fd.
 	// ADR-0181: no ExtraFiles — the wrapper owns fd delivery; the agent holds no cgroup fds.
 	// Capture CRIU's stderr: when CRIU fails before opening its -o logfile (e.g. arg/ext-mount
-	// resolution errors), the only diagnostic is on stderr. A bounded buffer keeps it cheap.
-	var criuStderr bytes.Buffer
-	criuCmd.Stderr = &criuStderr
-
-	// ADR-0128: snapshot the agent's own cgroup PID set BEFORE launching CRIU. With
-	// --manage-cgroups=ignore the restored process tree inherits the launcher's (agent's)
-	// cgroup; we diff this snapshot after restore to find the new workload PID, then move
-	// it into the pod's sandbox cgroup. Best-effort: only used on the cold (sandboxID!="")
-	// path; a snapshot error there is fatal and surfaced at resolution time.
-	beforeAgentPIDs, agentPIDsErr := getAgentCgroupPIDs()
+	// resolution errors), the only diagnostic is on stderr. The broker captures the detached
+	// wrapper's stderr and returns it on each exec_poll; criuCmd.Stderr mirrors it.
+	criuStderr := criuCmd.Stderr
 
 	if err := criuCmd.Start(); err != nil {
 		return 0, nil, fmt.Errorf("criu restore start: %w", err)
 	}
 
 	// ADR-0192 R2 (supersedes ADR-0127): liveness detection via cgroup-PID signal.
+	// ADR-0234: the cgroup observed is the BROKER cgroup (the wrapper is now a broker
+	// child, so --manage-cgroups=ignore lands the restored tree there, not in the agent
+	// cgroup). The broker returns its cgroup PID set on every exec_poll; the agent diffs
+	// it against a baseline captured on the FIRST poll right after exec_start (the wrapper
+	// has forked but the workload tree has not yet been restored).
 	//
 	// On the cold --join-ns net:<path> path CRIU does NOT self-exit: after restore it stays as
 	// the foreground workload parent (blocking in wait4 for the lifetime of the workload). A
-	// synchronous criuCmd.Wait() would hang until the workload exits — the Sprint 22 failure.
+	// synchronous Wait would hang until the workload exits — the Sprint 22 failure.
 	// --restore-detached is forbidden (CLAUDE.md Standing Rule 6). --leave-stopped is only on
-	// the TCP-stateful branch.
-	//
-	// The ADR-0127 log-marker scaffold (removed here) detected success via
-	// "Restore finished successfully" in restore.log — a brittle log-format dependency that
-	// masked the still-firing Site A iptables-restore failure. With the --network-lock skip
-	// fix landed (buildCRIURestoreArgs), CRIU now exits 0 on failure and the workload PIDs
-	// appear in the agent cgroup upon successful restore. The replacement liveness mechanism
-	// uses the CGROUP-PID SIGNAL: poll until new PIDs appear in the agent cgroup (proof that
-	// CRIU launched the workload tree) OR CRIU exits with a non-zero code (fail). A background
-	// goroutine reaps CRIU when it eventually exits (no zombie; Wait called exactly once).
-	criuReaped := make(chan error, 1)
-	go func() { criuReaped <- criuCmd.Wait() }()
-
+	// the TCP-stateful branch. The broker reaps the wrapper exactly once when it eventually
+	// exits (no zombie); the agent polls liveness via exec_poll until either new PIDs appear in
+	// the broker cgroup (proof CRIU launched the workload tree) OR the wrapper exits non-zero.
 	const (
-		cgroupPollInterval = 50 * time.Millisecond
+		cgroupPollInterval = brokerCriuWrapperPollInterval
 		cgroupPollTimeout  = 60 * time.Second
 	)
+	// Baseline broker-cgroup PID set: captured on the first poll. beforeAgentPIDs holds
+	// it (the variable name is retained — it is now the BROKER cgroup baseline — so the
+	// downstream ADR-0128 resolution path is unchanged). criuWrapperPID is excluded from
+	// the diff exactly as the local CRIU PID was.
+	var beforeAgentPIDs map[int]bool
+	var agentPIDsErr error
+	criuWrapperPID := criuCmd.Pid()
 	var workloadLive bool
 	cgroupDeadline := time.Now().Add(cgroupPollTimeout)
 	for time.Now().Before(cgroupDeadline) {
-		// Check if CRIU exited before we saw new PIDs.
-		select {
-		case waitErr := <-criuReaped:
-			exitCode := -1
-			if criuCmd.ProcessState != nil {
-				exitCode = criuCmd.ProcessState.ExitCode()
-			}
+		exited, exitCode, brokerCgroupPIDs, pollErr := criuCmd.poll()
+		if pollErr != nil {
+			// Broker round-trip failure is transient relative to the wrapper; retry on the
+			// next tick. Record it so a persistent failure surfaces in the no-liveness error.
+			agentPIDsErr = pollErr
+			time.Sleep(cgroupPollInterval)
+			continue
+		}
+		if exited {
 			if exitCode != 0 {
 				stderrTail := strings.TrimSpace(criuStderr.String())
 				if len(stderrTail) > 4096 {
 					stderrTail = stderrTail[len(stderrTail)-4096:]
 				}
-				return 0, nil, fmt.Errorf("criu restore exited (exit code %d): %w\ncriu stderr:\n%s",
-					exitCode, waitErr, stderrTail)
+				return 0, nil, fmt.Errorf("criu restore exited (exit code %d): broker-delegated wrapper\ncriu stderr:\n%s",
+					exitCode, stderrTail)
 			}
 			// Exit 0 means restore succeeded and CRIU is done (detached-like path or early exit).
 			workloadLive = true
-		default:
-		}
-		if workloadLive {
 			break
 		}
-		// On the cold path, new workload PIDs appear in the agent cgroup once CRIU has
-		// successfully forked the process tree. The pre-CRIU snapshot is in beforeAgentPIDs.
-		if agentPIDsErr == nil {
-			if afterPIDs, scanErr := getAgentCgroupPIDs(); scanErr == nil {
-				for pid := range afterPIDs {
-					if !beforeAgentPIDs[pid] {
-						workloadLive = true
-						break
-					}
-				}
+		// Establish the baseline on the first successful poll (wrapper forked, workload not
+		// yet restored), then diff every subsequent poll against it.
+		if beforeAgentPIDs == nil {
+			beforeAgentPIDs = make(map[int]bool, len(brokerCgroupPIDs))
+			for _, p := range brokerCgroupPIDs {
+				beforeAgentPIDs[p] = true
+			}
+			agentPIDsErr = nil
+			time.Sleep(cgroupPollInterval)
+			continue
+		}
+		// New workload PIDs appear in the broker cgroup once CRIU has successfully forked the
+		// process tree. Exclude the wrapper PID itself (it is a broker-cgroup resident too).
+		for _, pid := range brokerCgroupPIDs {
+			if !beforeAgentPIDs[pid] && pid != criuWrapperPID {
+				workloadLive = true
+				break
 			}
 		}
 		if workloadLive {
@@ -3035,14 +3042,20 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// and retains the legacy name/cgroup scan.
 	var pid int
 	if sandboxID != "" {
-		// ADR-0128: --manage-cgroups=ignore leaves the restored tree in the AGENT's cgroup, not
-		// the pod cgroup, so the ADR-0123 D2 pod-cgroup scan finds nothing. Instead diff the agent
-		// cgroup against the pre-CRIU snapshot to find the new workload PID, then move it into the
-		// pod's sandbox cgroup so containerd/k8s can manage it.
+		// ADR-0128: --manage-cgroups=ignore leaves the restored tree in the launcher's cgroup, not
+		// the pod cgroup, so the ADR-0123 D2 pod-cgroup scan finds nothing. Instead diff the
+		// launcher cgroup against the pre-CRIU snapshot to find the new workload PID, then move it
+		// into the pod's sandbox cgroup so containerd/k8s can manage it.
+		// ADR-0234: the launcher is now the BROKER (the wrapper is a broker child), so the diff is
+		// against the BROKER cgroup — the PID set the broker returns on exec_poll. beforeAgentPIDs
+		// is the broker-cgroup baseline captured in the liveness loop above.
 		if agentPIDsErr != nil {
-			return 0, nil, fmt.Errorf("ADR-0128: snapshot agent cgroup PIDs before restore: %w", agentPIDsErr)
+			return 0, nil, fmt.Errorf("ADR-0128: snapshot broker cgroup PIDs before restore: %w", agentPIDsErr)
 		}
-		pid, err = findRestoredPIDInAgentCgroup(beforeAgentPIDs, criuCmd.Process.Pid)
+		if beforeAgentPIDs == nil {
+			return 0, nil, fmt.Errorf("ADR-0128: broker cgroup baseline was never captured (wrapper never polled live)")
+		}
+		pid, err = findRestoredPIDInBrokerCgroup(beforeAgentPIDs, criuWrapperPID, criuCmd)
 		if err != nil {
 			// Fail loud — never fall back to comm-scan on the cold path (D2 step 5 / AC5).
 			return 0, nil, err
@@ -3365,6 +3378,46 @@ func getAgentCgroupPIDs() (map[int]bool, error) {
 // that were NOT present in beforePIDs (the pre-CRIU snapshot) and are NOT the CRIU process itself,
 // returning the LOWEST such PID — the restored tree root (the leader starts first; children get
 // higher PIDs). Retries for up to 10s at 200ms intervals to allow the restored tree to appear.
+// findRestoredPIDInBrokerCgroup is the ADR-0234 broker-cgroup analogue of
+// findRestoredPIDInAgentCgroup. Because the CRIU wrapper is launched as a child of
+// the privileged broker (ADR-0234), --manage-cgroups=ignore lands the restored tree
+// in the BROKER cgroup, not the agent cgroup. This polls the broker cgroup PID set
+// (returned by exec_poll) and applies the identical new-entrant selection: the
+// lowest PID that was NOT in beforePIDs, is NOT the wrapper PID, and whose comm is
+// not "criu" (defensive). Retries for up to 10s at 200ms, same as the agent-cgroup
+// path. /proc/<pid>/comm is readable agent-side under hostPID:true even though the
+// PID is a broker-cgroup resident.
+func findRestoredPIDInBrokerCgroup(beforePIDs map[int]bool, wrapperPID int, criuCmd *brokerCriuCmd) (int, error) {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		_, _, brokerCgroupPIDs, pollErr := criuCmd.poll()
+		if pollErr == nil {
+			bestPID := 0
+			for _, pid := range brokerCgroupPIDs {
+				if beforePIDs[pid] || pid == wrapperPID {
+					continue
+				}
+				comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+				if strings.TrimSpace(string(comm)) == "criu" {
+					continue
+				}
+				if bestPID == 0 || pid < bestPID {
+					bestPID = pid
+				}
+			}
+			if bestPID != 0 {
+				log.Info("findRestoredPIDInBrokerCgroup: resolved restored PID via broker cgroup diff (ADR-0234/ADR-0128)",
+					"pid", bestPID, "wrapperPID", wrapperPID)
+				return bestPID, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("%w (broker-cgroup diff, wrapperPID %d, 10s timeout)", ErrRestoredPIDNotFound, wrapperPID)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 func findRestoredPIDInAgentCgroup(beforePIDs map[int]bool, criuPID int) (int, error) {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -4233,22 +4286,95 @@ func nsenterCmd(args ...string) *brokerCmd {
 	return &brokerCmd{argv: args}
 }
 
-// nsenterLocalCmd builds a real `nsenter --mount=/proc/1/ns/mnt -- <args>`
-// *exec.Cmd. ADR-0231 scope note (KNOWN NEXT WALL): this is retained ONLY for the
-// long-running CRIU wrapper launch (joinNsRestore step 4), which needs the full
-// *exec.Cmd lifecycle the broker run-to-completion shim does not expose —
-// .Start()/.Wait()/.Process.Pid/.ProcessState/streaming .Stderr — because CRIU on
-// the cold --join-ns path never self-exits and the agent reaps it asynchronously
-// while polling the agent-cgroup PID signal (ADR-0192). Under SD-1 this LOCAL
-// nsenter will itself EPERM on setns(CLONE_NEWNS) exactly as the run-to-completion
-// path did; routing the wrapper through the broker requires a detached-spawn +
-// host-PID-return + cross-process-reap broker mechanism (execAsync/execWait), which
-// is a distinct privileged-surface change deliberately NOT bundled into this
-// frontier fix. ADR-0231 fixes the PROVEN-LIVE image-pull wall (server.go:2617);
-// the CRIU-wrapper wall is the next, new-signature frontier (healthy descent).
-func nsenterLocalCmd(args ...string) *exec.Cmd {
-	nsArgs := append([]string{"--mount=" + hostMntNS, "--"}, args...)
-	return exec.Command("nsenter", nsArgs...)
+// ADR-0234: the CRIU restore wrapper launch is now broker-delegated.
+//
+// nsenterLocalCmd (the LOCAL `nsenter --mount=/proc/1/ns/mnt` *exec.Cmd) was the
+// ADR-0231 "KNOWN NEXT WALL": under SD-1 (main agent privileged:false) the agent's
+// own nsenter EPERMs on setns(CLONE_NEWNS) into the host mount namespace —
+// "reassociate to namespace 'ns/mnt' failed: Operation not permitted" — because
+// CAP_SYS_ADMIN in the host init userns is held only by the privileged netns-broker
+// sidecar. ADR-0231 broker-delegated the SHORT host-mount-ns commands (ctr pull,
+// rootfs scaffolding) via the run-to-completion exec op, and EXPLICITLY left the
+// long-running CRIU wrapper launch on local nsenter as the named next wall, because
+// the wrapper needs the full *exec.Cmd async lifecycle (.Start()/.Wait()/.Process.Pid/
+// .ProcessState/streaming .Stderr) the run-to-completion shim does not expose: on the
+// cold --join-ns path CRIU never self-exits, so the agent must launch it, poll a
+// cgroup-PID liveness signal while it still runs, and reap it asynchronously (ADR-0192).
+//
+// ADR-0234 closes that wall by EXTENDING the broker with async exec ops
+// (exec_start / exec_poll / exec_signal) — a detached-spawn + host-PID-return +
+// cross-process-reap mechanism — and routing the wrapper launch through them. The
+// brokerCriuCmd type below emulates the exact *exec.Cmd subset the joinNsRestore
+// call site uses, backed by the broker. nsenterLocalCmd is REMOVED (§3h-SYM: its
+// sole consumer, the wrapper launch, is converted in the same commit). The main
+// agent stays privileged:false (SD-1); the broker (privileged:true) does the setns.
+
+// brokerCriuWrapperPollInterval is the broker exec_poll cadence. It matches the
+// prior local-nsenter cgroupPollInterval so the liveness-signal latency is unchanged.
+const brokerCriuWrapperPollInterval = 50 * time.Millisecond
+
+// brokerCriuCmd is the ADR-0234 broker-backed replacement for the local-nsenter
+// CRIU wrapper *exec.Cmd. It emulates exactly the subset joinNsRestore consumed:
+//   - Stderr: a *bytes.Buffer the poll loop reads CRIU's pre-logfile diagnostics from
+//     (filled from the broker-side stderr capture returned by exec_poll);
+//   - Start(): broker exec_start (detached host-mount-ns spawn), records the wrapper PID;
+//   - poll():  broker exec_poll — returns (exited, exitCode, brokerCgroupPIDs);
+//   - Pid():   the host PID of the wrapper (for the ADR-0128 diff exclusion);
+//   - Signal(): broker exec_signal (Abort).
+//
+// The liveness diff that previously read the AGENT cgroup (getAgentCgroupPIDs) now
+// reads the BROKER cgroup PIDs returned by exec_poll: the wrapper is a broker child,
+// so --manage-cgroups=ignore lands the restored tree in the broker cgroup, not the
+// agent cgroup. The diff logic (new entrant != pre-spawn snapshot, != wrapper PID,
+// != "criu" comm) is otherwise unchanged.
+type brokerCriuCmd struct {
+	argv       []string
+	wrapperPID int
+	Stderr     *bytes.Buffer
+}
+
+func (c *brokerCriuCmd) Pid() int { return c.wrapperPID }
+
+// Start spawns the wrapper detached via the broker and records its host PID.
+func (c *brokerCriuCmd) Start() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pid, err := netnsbroker.NewClient().ExecStart(ctx, c.argv...)
+	if err != nil {
+		return err
+	}
+	c.wrapperPID = pid
+	return nil
+}
+
+// poll returns whether the wrapper has exited, its exit code (valid only when
+// exited), and the broker-cgroup PID set for the liveness diff. It also refreshes
+// the Stderr buffer from the broker-side capture so the failure path can surface
+// CRIU's stderr exactly as the local-nsenter path did.
+func (c *brokerCriuCmd) poll() (exited bool, exitCode int, cgroupPIDs []int, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pr, perr := netnsbroker.NewClient().ExecPoll(ctx, c.wrapperPID)
+	if perr != nil {
+		return false, 0, nil, perr
+	}
+	if len(pr.Stderr) > 0 {
+		c.Stderr.Reset()
+		c.Stderr.Write(pr.Stderr)
+	}
+	return !pr.Running, pr.ExitCode, pr.CgroupPIDs, nil
+}
+
+// Signal asks the broker to deliver sig to the wrapper (Abort path).
+func (c *brokerCriuCmd) Signal(sig int) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return netnsbroker.NewClient().ExecSignal(ctx, c.wrapperPID, sig)
+}
+
+// newBrokerCriuCmd builds a broker-backed CRIU wrapper command for the given argv.
+func newBrokerCriuCmd(args ...string) *brokerCriuCmd {
+	return &brokerCriuCmd{argv: args, Stderr: &bytes.Buffer{}}
 }
 
 // setupRestoreOverlayfs launches a temporary placeholder container (via nsenter in the host
