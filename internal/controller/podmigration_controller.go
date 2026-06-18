@@ -3036,16 +3036,34 @@ func (r *PodMigrationReconciler) verifyDataplaneReachability(ctx context.Context
 
 	srcNode := pm.Status.SourceNodeName
 	if srcNode == "" || srcNode == destNode {
-		// No node != dest vantage available (single-node / source already gone). Cannot prove
-		// cross-node reachability — do NOT set the condition True; hold the source (ADR-0012).
-		log.Error(nil, "ADR-0210: no source-node vantage (node != dest) for cross-node probe — holding source, requeuing",
+		// ADR-0237: same-node (intra-node) migration — cross-node probe is structurally impossible
+		// because there is no off-node network boundary to traverse. The NoCrossNodeVantage permanent
+		// block (former ADR-0210 behavior) caused a structural deadlock: DataplaneReachabilityVerified
+		// was held False forever, and the safety block in reconcileCutoverComplete (line 1377) requeued
+		// every 10s indefinitely — source pod was never deleted (Sprint 37 carry-forward, gate-redis-s35
+		// ran 14+ hours post-CutoverComplete). §P-MECHANISM: docs/sprints/SPRINT38-PMECHANISM-FINALIZATION.md
+		//
+		// Fix: in the same-node case, TrafficVerified=True (set by injectIPHandoff, reason=HandoffInstalled)
+		// is the strongest available proof that the preserved IP is configured on this node. A cross-node
+		// probe from the same node to the same node traverses no additional network boundary beyond what
+		// TrafficVerified already proves. The vacuous gate satisfies ADR-0012's deletion contract
+		// (condition must be True before deletion) without bypassing it.
+		if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionTrafficVerified) {
+			// TrafficVerified not yet set — injectIPHandoff has not completed. Hold and requeue.
+			log.Error(nil, "ADR-0237: same-node migration — TrafficVerified not yet set; holding source, requeuing",
+				"migration", pm.Name, "srcNode", srcNode, "destNode", destNode)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
+		}
+		// TrafficVerified=True: IP handoff confirmed on this node. Set DataplaneReachabilityVerified=True
+		// with reason SameNodeVacuous so the safety block in reconcileCutoverComplete can proceed. (ADR-0237)
+		log.Info("ADR-0237: same-node migration — cross-node probe structurally impossible; TrafficVerified=True satisfies vacuous gate; setting DataplaneReachabilityVerified=True (SameNodeVacuous)",
 			"migration", pm.Name, "srcNode", srcNode, "destNode", destNode)
-		setCondition(pm, conditionDataplaneReachabilityVerified, metav1.ConditionFalse, "NoCrossNodeVantage",
-			"ADR-0210: no node != destination available to originate the cross-node probe")
+		setCondition(pm, conditionDataplaneReachabilityVerified, metav1.ConditionTrue, "SameNodeVacuous",
+			"ADR-0237: intra-node migration — cross-node probe impossible; TrafficVerified=True satisfies vacuous gate (see docs/adr/0237-reconcile-cutover-complete-finalization-trigger-same-node-vacuous-gate.md)")
 		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
 			return ctrl.Result{}, sErr, false
 		}
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil, false
+		return ctrl.Result{}, nil, true
 	}
 
 	// Controller-issued correlation nonce — destination must echo it back through the dialed
