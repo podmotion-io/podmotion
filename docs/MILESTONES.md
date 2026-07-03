@@ -1,7 +1,11 @@
 # PodMotion Milestone Reference
 
+> Supporting detail for `docs/CURRENT-POSITION.md` — see that file for the human-readable "you are here" summary; this doc is the detailed capability-register source for milestones M1-M21.
+
 Definitive record of all milestones, their status, key deliverables, and dependencies.
 Current version: **v0.1.0-alpha**
+
+> **Live state:** for the current sprint/phase/gate status, see `docs/proof/DREX-STATE.yaml` — this file tracks milestone definitions, not real-time status.
 
 ## Status legend
 
