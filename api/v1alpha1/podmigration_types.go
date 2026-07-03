@@ -339,6 +339,24 @@ const (
 	// The CONTROLLER is the authority that flips this condition, based on the nonce
 	// round-trip — never a self-asserted ProbeOk boolean from a single agent.
 	ConditionDataplaneReachabilityVerified = "DataplaneReachabilityVerified"
+	// ConditionCni0CleanupVerified is set by reconcileVerifying after CleanupSourceIPHandoff
+	// (ADR-0241 item 1 / NR-BLOCK-1 CUTOVER_COMPLETE scope). True once VerifyCleanup confirms
+	// the cni0 neigh and cni0 host route for the OLD pod IP are both absent, within the
+	// 3-attempt/2s-4s-8s retry budget. False (reason CleanupLeakExhausted) if the retry budget
+	// is exhausted with an object still present — a fail-open, non-blocking outcome; the
+	// migration still completes, and pmmetrics.DatapathCleanupLeakTotal plus a
+	// DatapathCleanupLeak Kubernetes Event are also emitted on that branch. Scoped only to the
+	// two cutover-complete objects — it does NOT cover the dest tc/FORWARD-ACCEPT/NOTRACK or
+	// source flannel.1/NOTRACK objects, which remain unaddressed pending NR-BLOCK-2.
+	ConditionCni0CleanupVerified = "Cni0CleanupVerified"
+	// ConditionZeroWindowRuleFlushDetected is set by the agent-owned idempotent reconcile
+	// loop (ADR-0240 / R4) when it observes the FORWARD ACCEPT or NOTRACK rules backing an
+	// active zero-window hold missing (flushed by an external actor) and self-heals by
+	// reasserting them. Purely observational — never blocks reconcileDisengageHold or any
+	// phase transition (self-heal already prevents the outage). Once set, it persists on the
+	// PodMigration status after disarm and is never cleared (ADR-0240 D4/D4a), matching the
+	// existing WatchdogFired-style permanent-record convention.
+	ConditionZeroWindowRuleFlushDetected = "ZeroWindowRuleFlushDetected"
 )
 
 // PreCopyStats records metrics from the iterative pre-copy phase.

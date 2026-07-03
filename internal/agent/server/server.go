@@ -48,6 +48,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/network"
 	"github.com/podmotion-io/podmotion/internal/agent/provenance"
 	"github.com/podmotion-io/podmotion/internal/agent/seccomp"
+	pmmetrics "github.com/podmotion-io/podmotion/internal/metrics"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 )
 
@@ -159,6 +160,285 @@ type zwHoldState struct {
 	watchdogFired bool
 }
 
+// ADR-0240 / R4: agent-owned idempotent reconcile loop that watches the ADR-0140 FORWARD
+// ACCEPT + ADR-0141 NOTRACK rules backing an active zero-window hold and self-heals any
+// external flush. See Decisions D1-D5 in docs/adr/0240-zero-window-hold-flush-detection.md.
+const (
+	// zwFlushPollInterval is the fixed 100ms poll interval (D3), independent of any given
+	// migration's FreezeWindowBudgetMs, bounding worst-case flush-to-self-heal latency to
+	// <=100ms + apply time (well under the existing 500ms zwWatchdogMargin tolerance).
+	zwFlushPollInterval = 100 * time.Millisecond
+	// zwFlushTokenBucketBurst / zwFlushTokenBucketRefill implement the D1a per-migration
+	// reassert-rate limiter: capacity 5 reasserts, refill 1 token per 2s (steady-state
+	// sustained-flush rate capped at 0.5 reassert/sec/migration after the first 5 bursts).
+	zwFlushTokenBucketBurst  = 5
+	zwFlushTokenBucketRefill = 2 * time.Second
+)
+
+// zwRuleFamily is one watched rule family within an R4 flush-detection loop: either the
+// ADR-0140 FORWARD ACCEPT pair or the ADR-0141 NOTRACK rule set (D5 scope: iptables only).
+// metricLabel is the "rule" label value on pmmetrics.ZeroWindowHoldRuleReassertTotal (D4).
+type zwRuleFamily struct {
+	metricLabel string
+	present     func(ctx context.Context) bool
+	reassert    func(ctx context.Context) error
+}
+
+// zwFlushWatchState is the per-migration control block for an active R4 reconcile loop.
+type zwFlushWatchState struct {
+	cancel context.CancelFunc
+	// done is closed by the loop goroutine on exit. DisarmTCRedirect (D2a stop-ordering)
+	// blocks on this channel after calling cancel() so no in-flight probe tick can observe
+	// the intentional removeOldIP* teardown and misreport it as a flush.
+	done chan struct{}
+
+	// tbMu guards tokens/lastRefill (D1a token-bucket reassert limiter).
+	tbMu       sync.Mutex
+	tokens     float64
+	lastRefill time.Time
+
+	// countMu guards counts (cumulative per-rule flush-detected count, surfaced in the
+	// ConditionZeroWindowRuleFlushDetected message per D4's "True/timestamp/count" shape).
+	countMu sync.Mutex
+	counts  map[string]int
+}
+
+// takeToken applies the D1a token-bucket limiter: capacity zwFlushTokenBucketBurst, refill
+// 1 token per zwFlushTokenBucketRefill. Returns true (consuming one token) if a reassert
+// write is currently allowed; false if the bucket is empty. The caller must still probe
+// (detect) on every tick regardless of the return value — only the reapply WRITE is ever
+// suppressed, never detection (D1a: "probing is never suppressed").
+func (w *zwFlushWatchState) takeToken(now time.Time) bool {
+	w.tbMu.Lock()
+	defer w.tbMu.Unlock()
+	if w.lastRefill.IsZero() {
+		w.lastRefill = now
+		w.tokens = zwFlushTokenBucketBurst
+	} else if elapsed := now.Sub(w.lastRefill); elapsed > 0 {
+		if refill := elapsed.Seconds() / zwFlushTokenBucketRefill.Seconds(); refill > 0 {
+			w.tokens += refill
+			if w.tokens > zwFlushTokenBucketBurst {
+				w.tokens = zwFlushTokenBucketBurst
+			}
+			w.lastRefill = now
+		}
+	}
+	if w.tokens >= 1 {
+		w.tokens--
+		return true
+	}
+	return false
+}
+
+// startZeroWindowFlushWatch starts the R4 reconcile loop for migrationName, watching the
+// given rule families. D2a start-ordering: callers must only invoke this from the success
+// branch of the install call(s) that installed those families, passing only families whose
+// OWN install succeeded — never speculatively, and never on an install error-return path (a
+// rule whose initial install failed is a pre-existing absence, not a flush, and must not be
+// watched on tick 1). Idempotent: if a loop is already running for this migration the
+// existing loop is left in place.
+func (s *AgentServer) startZeroWindowFlushWatch(migrationName string, families []zwRuleFamily) {
+	if len(families) == 0 || migrationName == "" {
+		return
+	}
+	s.zwFlushWatchMu.Lock()
+	defer s.zwFlushWatchMu.Unlock()
+	if _, exists := s.zwFlushWatch[migrationName]; exists {
+		return
+	}
+	loopCtx, cancel := context.WithCancel(context.Background())
+	state := &zwFlushWatchState{
+		cancel: cancel,
+		done:   make(chan struct{}),
+		counts: make(map[string]int),
+	}
+	s.zwFlushWatch[migrationName] = state
+	go s.runZeroWindowFlushWatch(loopCtx, migrationName, families, state)
+	log.Info("R4: zero-window hold rule flush-detection loop started (ADR-0240)",
+		"migration", migrationName, "watchedFamilies", len(families))
+}
+
+// stopZeroWindowFlushWatch cancels and synchronously awaits exit of the R4 loop for
+// migrationName, if one is running. D2a stop-ordering: DisarmTCRedirect calls this as its
+// FIRST action, before removeOldIPForwardAccept/removeOldIPNotrack run — the blocking
+// receive on state.done guarantees the loop goroutine has fully exited (no tick in flight)
+// before the intentional teardown proceeds.
+func (s *AgentServer) stopZeroWindowFlushWatch(migrationName string) {
+	s.zwFlushWatchMu.Lock()
+	state, exists := s.zwFlushWatch[migrationName]
+	if exists {
+		delete(s.zwFlushWatch, migrationName)
+	}
+	s.zwFlushWatchMu.Unlock()
+	if !exists {
+		return
+	}
+	state.cancel()
+	<-state.done
+}
+
+// runZeroWindowFlushWatch is the D3 100ms-fixed-interval poll loop. For each watched family
+// it probes presence every tick; on absence it is a detected flush (D4): the
+// ConditionZeroWindowRuleFlushDetected condition is set/refreshed on every detected-absent
+// probe regardless of whether the reapply write was suppressed by the D1a limiter, and the
+// reapply itself is attempted only if a token is available. Runs until ctx is cancelled,
+// then closes state.done (see stopZeroWindowFlushWatch).
+func (s *AgentServer) runZeroWindowFlushWatch(ctx context.Context, migrationName string, families []zwRuleFamily, state *zwFlushWatchState) {
+	defer close(state.done)
+	ticker := time.NewTicker(zwFlushPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, fam := range families {
+				if fam.present(ctx) {
+					continue
+				}
+				state.countMu.Lock()
+				state.counts[fam.metricLabel]++
+				count := state.counts[fam.metricLabel]
+				state.countMu.Unlock()
+				log.Info("R4: zero-window hold rule flush detected — self-healing (ADR-0240)",
+					"migration", migrationName, "rule", fam.metricLabel, "count", count)
+				s.setZeroWindowRuleFlushDetectedCondition(migrationName, fam.metricLabel, count)
+				if state.takeToken(time.Now()) {
+					if err := fam.reassert(ctx); err != nil {
+						log.Error(err, "R4: rule reassert failed (will retry next tick, ADR-0240)",
+							"migration", migrationName, "rule", fam.metricLabel)
+					} else {
+						pmmetrics.ZeroWindowHoldRuleReassertTotal.WithLabelValues(migrationName, fam.metricLabel).Inc()
+					}
+				} else {
+					pmmetrics.ZeroWindowHoldRuleReassertSuppressedTotal.WithLabelValues(migrationName).Inc()
+					log.Info("R4: reassert suppressed by token-bucket limiter (ADR-0240 D1a)",
+						"migration", migrationName, "rule", fam.metricLabel)
+				}
+			}
+		}
+	}
+}
+
+// setZeroWindowRuleFlushDetectedCondition sets ConditionZeroWindowRuleFlushDetected=True on
+// the named PodMigration (D4). Purely observational: a k8sClient/lookup failure is logged
+// and swallowed rather than propagated, so a control-plane hiccup can never stall the
+// self-heal loop itself (D4 "visibility only, no blocking"). Per D4a the condition persists
+// on the CR after disarm and is never cleared by this loop or by DisarmTCRedirect.
+func (s *AgentServer) setZeroWindowRuleFlushDetectedCondition(migrationName, rule string, count int) {
+	if s.k8sClient == nil || migrationName == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ns := s.resolveNamespaceForMigration(ctx, migrationName)
+	if ns == "" {
+		ns = "default"
+	}
+	pm := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: migrationName}, pm); err != nil {
+		log.Info("R4: could not fetch PodMigration to set ConditionZeroWindowRuleFlushDetected (non-fatal, ADR-0240 D4)",
+			"migration", migrationName, "err", err)
+		return
+	}
+	msg := fmt.Sprintf("external flush detected and self-healed for rule=%s; reassert_count=%d (ADR-0240 R4)", rule, count)
+	setConditionAt(pm, pmv1.ConditionZeroWindowRuleFlushDetected, metav1.ConditionTrue, "RuleReasserted", msg, metav1.Now())
+	if err := s.k8sClient.Status().Update(ctx, pm); err != nil {
+		log.Info("R4: failed to persist ConditionZeroWindowRuleFlushDetected (non-fatal, ADR-0240 D4)",
+			"migration", migrationName, "err", err)
+	}
+}
+
+// oldIPForwardAcceptPresent probes (iptables -C, -w 1) whether the ADR-0140 OLD-IP/32
+// FORWARD ACCEPT pair is present. Used by the R4 flush-detection loop (D2/D5).
+func oldIPForwardAcceptPresent(ctx context.Context, oldIP net.IP) bool {
+	cidr := oldIP.String() + "/32"
+	for _, spec := range [][]string{
+		{"-d", cidr},
+		{"-s", cidr},
+	} {
+		args := append([]string{"-w", "1", "-C", "FORWARD"}, spec...)
+		args = append(args, "-j", "ACCEPT", "-m", "comment", "--comment", "podmotion ADR-0140 oldIP fwd")
+		if err := exec.CommandContext(ctx, "iptables", args...).Run(); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// oldIPNotrackPresent probes (iptables -t raw -C, -w 1) whether the ADR-0141 NOTRACK rule
+// set for the given mode ("both" dest-node, "source" source-node) is present. Used by the
+// R4 flush-detection loop (D2/D5).
+func oldIPNotrackPresent(ctx context.Context, oldIP net.IP, mode string) bool {
+	cidr := oldIP.String() + "/32"
+	type rule struct {
+		chain string
+		dir   string
+	}
+	var rules []rule
+	switch mode {
+	case "both":
+		rules = []rule{
+			{"PREROUTING", "-d"}, {"PREROUTING", "-s"}, {"OUTPUT", "-d"},
+		}
+	default:
+		rules = []rule{
+			{"PREROUTING", "-s"}, {"OUTPUT", "-d"},
+		}
+	}
+	comment := "podmotion ADR-0141 oldIP notrack"
+	for _, r := range rules {
+		args := []string{"-w", "1", "-t", "raw", "-C", r.chain, r.dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
+		if err := exec.CommandContext(ctx, "iptables", args...).Run(); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// zwDestFamiliesForInject returns the R4 flush-watch rule families to start on the
+// DESTINATION node after InjectIPHandoff's FORWARD ACCEPT + NOTRACK("both") install calls
+// return, or nil if either install failed. D2a: destination-side start-ordering is
+// all-or-nothing — the loop is only started inside the success branch of BOTH installs,
+// never speculatively and never on an error-return path (a family whose initial install
+// failed is a pre-existing absence, not a flush, and must not be watched on tick 1). Kept as
+// a pure function (no I/O of its own) so the start-ordering decision is unit-testable
+// without invoking a real iptables/netlink call.
+func zwDestFamiliesForInject(fwErr, ntErr error, oldIP net.IP) []zwRuleFamily {
+	if fwErr != nil || ntErr != nil {
+		return nil
+	}
+	return []zwRuleFamily{
+		{
+			metricLabel: "forward_accept",
+			present:     func(ctx context.Context) bool { return oldIPForwardAcceptPresent(ctx, oldIP) },
+			reassert:    func(ctx context.Context) error { return installOldIPForwardAccept(ctx, oldIP) },
+		},
+		{
+			metricLabel: "notrack",
+			present:     func(ctx context.Context) bool { return oldIPNotrackPresent(ctx, oldIP, "both") },
+			reassert:    func(ctx context.Context) error { return installOldIPNotrack(ctx, oldIP, "both") },
+		},
+	}
+}
+
+// zwSourceFamiliesForInject returns the R4 flush-watch rule family to start on the SOURCE
+// node after InjectSourceRedirect's NOTRACK("source") install call, or nil if that install
+// failed. Unlike the destination side, InjectSourceRedirect's own RPC treats a NOTRACK
+// failure as non-fatal (Injected: true is still returned) — D2a requires the loop to track
+// per-rule install success independently of the RPC's own success, so this only starts
+// watching when the rule itself installed cleanly.
+func zwSourceFamiliesForInject(ntErr error, oldIP net.IP) []zwRuleFamily {
+	if ntErr != nil {
+		return nil
+	}
+	return []zwRuleFamily{{
+		metricLabel: "notrack",
+		present:     func(ctx context.Context) bool { return oldIPNotrackPresent(ctx, oldIP, "source") },
+		reassert:    func(ctx context.Context) error { return installOldIPNotrack(ctx, oldIP, "source") },
+	}}
+}
+
 // AgentServer implements agentpb.MigrationAgentServiceServer.
 // One instance runs per node agent process.
 type AgentServer struct {
@@ -186,6 +466,12 @@ type AgentServer struct {
 	zwHoldMu sync.Mutex
 	// zwHolds tracks active zero-window holds keyed by migration name.
 	zwHolds map[string]*zwHoldState
+
+	// zwFlushWatchMu guards zwFlushWatch.
+	zwFlushWatchMu sync.Mutex
+	// zwFlushWatch tracks active R4 zero-window-hold rule flush-detection reconcile loops
+	// (ADR-0240), keyed by migration name.
+	zwFlushWatch map[string]*zwFlushWatchState
 
 	// frozenSourcePIDsMu guards frozenSourcePIDs.
 	frozenSourcePIDsMu sync.Mutex
@@ -244,6 +530,7 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 		migrationPodUID:       make(map[string]string),
 		migrationSeqSnapshots: make(map[string][]*agentpb.SeqSnapshot),
 		zwHolds:               make(map[string]*zwHoldState),
+		zwFlushWatch:          make(map[string]*zwFlushWatchState),
 		frozenSourcePIDs:      make(map[string]int32),
 		pendingResumePIDs:     make(map[string]int),
 		destHostVeth:          make(map[string]string),
@@ -1041,7 +1328,8 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 				// KUBE-FORWARD `ctstate INVALID -j DROP` rule drops it. Insert a narrow OLD-IP/32
 				// FORWARD ACCEPT pair at the head of FORWARD (before KUBE-FORWARD). These rules match
 				// on OLD-IP, not on the overlay device, so they are interface-independent. Non-fatal.
-				if fwErr := installOldIPForwardAccept(ctx, oldIP); fwErr != nil {
+				fwErr := installOldIPForwardAccept(ctx, oldIP)
+				if fwErr != nil {
 					log.Error(fwErr, "InjectIPHandoff: ADR-0140 FORWARD ACCEPT install failed (non-fatal)",
 						"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 				} else {
@@ -1052,13 +1340,19 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 				// segment is still conntrack-INVALID (the tc mirred redirect made the forward leg
 				// conntrack-invisible), so the kernel RSTs it (B10). NOTRACK the OLD-IP flow in the
 				// raw table (pre-conntrack) on this destination node, both directions. Non-fatal.
-				if ntErr := installOldIPNotrack(ctx, oldIP, "both"); ntErr != nil {
+				ntErr := installOldIPNotrack(ctx, oldIP, "both")
+				if ntErr != nil {
 					log.Error(ntErr, "InjectIPHandoff: ADR-0141 NOTRACK install failed (non-fatal)",
 						"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 				} else {
 					log.Info("InjectIPHandoff: ADR-0141 OLD-IP NOTRACK installed (reverse data path B10)",
 						"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 				}
+
+				// ADR-0240 D2a start-ordering: destination side is all-or-nothing — the loop
+				// is only started inside this same success branch when BOTH installs
+				// succeeded, never speculatively and never on an error-return path.
+				s.startZeroWindowFlushWatch(req.MigrationName, zwDestFamiliesForInject(fwErr, ntErr, oldIP))
 			}
 		} else {
 			log.Info("InjectIPHandoff: ADR-0139 RestoredPID not yet in CR status — tc redirect deferred to requeue (non-fatal)",
@@ -1238,6 +1532,79 @@ func (s *AgentServer) CleanupSourceIPHandoff(ctx context.Context, req *agentpb.C
 	return &agentpb.CleanupSourceIPHandoffResponse{Cleaned: true}, nil
 }
 
+// VerifyCleanup probes whether the datapath cleanup objects for the given scope are still
+// present (ADR-0241 / NR-BLOCK-1 item 1). CUTOVER_COMPLETE is the only implemented scope:
+// it re-checks the cni0 neigh + cni0 host route that CleanupSourceIPHandoff removes, via a
+// cheap local `ip neigh show`/`ip route show` query on this (source) node — no cross-node
+// call, consistent with ADR-0241's rationale for choosing blocking bounded retry (the check
+// is a sub-millisecond local probe, not a network round trip). IP_RECLAIM is defined here
+// for R4/NR-BLOCK-2 forward compatibility (ADR-0241 Decision 1's reusable-primitive intent)
+// but returns Unimplemented: there is no cleanup code path for those objects to verify yet
+// (disarmTCRedirect has zero controller call sites today — ADR-0241 item 2).
+func (s *AgentServer) VerifyCleanup(ctx context.Context, req *agentpb.VerifyCleanupRequest) (*agentpb.VerifyCleanupResponse, error) {
+	switch req.Scope {
+	case agentpb.CleanupScope_CUTOVER_COMPLETE:
+		oldIP := net.ParseIP(req.OldPodIp)
+		if oldIP == nil || oldIP.To4() == nil {
+			return nil, status.Errorf(codes.InvalidArgument, "VerifyCleanup: old_pod_ip %q is not a valid IPv4", req.OldPodIp)
+		}
+		bridgeIf := req.BridgeIfname
+		if bridgeIf == "" {
+			if discovered, discErr := discoverHostInterface(ctx); discErr == nil && discovered != "" {
+				bridgeIf = discovered
+			}
+		}
+		var present []string
+		for _, obj := range req.Objects {
+			switch obj {
+			case "cni0_neigh":
+				if cni0NeighPresent(ctx, bridgeIf, oldIP) {
+					present = append(present, obj)
+				}
+			case "cni0_host_route":
+				if cni0HostRoutePresent(ctx, bridgeIf, oldIP) {
+					present = append(present, obj)
+				}
+			default:
+				log.Info("VerifyCleanup: unknown object in request (ignored)", "migration", req.MigrationName, "object", obj)
+			}
+		}
+		log.Info("VerifyCleanup: CUTOVER_COMPLETE probe complete (ADR-0241)",
+			"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "presentObjects", present)
+		return &agentpb.VerifyCleanupResponse{Clean: len(present) == 0, PresentObjects: present}, nil
+	case agentpb.CleanupScope_IP_RECLAIM:
+		return nil, status.Errorf(codes.Unimplemented,
+			"VerifyCleanup: IP_RECLAIM scope has no cleanup trigger yet (NR-BLOCK-2, ADR-0241 item 2)")
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "VerifyCleanup: unknown scope %v", req.Scope)
+	}
+}
+
+// cni0NeighPresent reports whether an AF_INET neighbor entry for oldIP still exists on
+// ifName, via a local `ip neigh show` query (ADR-0241 item 1).
+func cni0NeighPresent(ctx context.Context, ifName string, oldIP net.IP) bool {
+	if ifName == "" || oldIP == nil {
+		return false
+	}
+	out, err := exec.CommandContext(ctx, "ip", "neigh", "show", "dev", ifName, oldIP.String()).CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), oldIP.String())
+}
+
+// cni0HostRoutePresent reports whether the /32 host route for oldIP still exists on ifName.
+func cni0HostRoutePresent(ctx context.Context, ifName string, oldIP net.IP) bool {
+	if ifName == "" || oldIP == nil {
+		return false
+	}
+	out, err := exec.CommandContext(ctx, "ip", "route", "show", "dev", ifName, oldIP.String()+"/32").CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), oldIP.String())
+}
+
 // restoredPIDForMigration fetches the PodMigration CR and returns Status.RestoredPID (the root
 // PID of the restored container, set by this agent at ReportRestoreConfirmed). Returns 0 if the
 // CR/PID is unavailable. Used by ADR-0139 to resolve the replacement pod's veth peer without a
@@ -1403,11 +1770,14 @@ func installOldIPForwardAccept(ctx context.Context, oldIP net.IP) error {
 		{"-s", cidr},
 	} {
 		// Delete any existing copy first (idempotent; ignore "does not exist").
-		delArgs := append([]string{"-D", "FORWARD"}, spec...)
+		// ADR-0240 D3a: -w 1 so a lost xtables-lock race under R4's added polling
+		// contention degrades to a bounded stall, not a hard "resource unavailable" failure
+		// misread as "rule absent, reassert now".
+		delArgs := append([]string{"-w", "1", "-D", "FORWARD"}, spec...)
 		delArgs = append(delArgs, "-j", "ACCEPT", "-m", "comment", "--comment", "podmotion ADR-0140 oldIP fwd")
 		_, _ = exec.CommandContext(ctx, "iptables", delArgs...).CombinedOutput()
 		// Insert at the head, before KUBE-FORWARD.
-		insArgs := append([]string{"-I", "FORWARD", "1"}, spec...)
+		insArgs := append([]string{"-w", "1", "-I", "FORWARD", "1"}, spec...)
 		insArgs = append(insArgs, "-j", "ACCEPT", "-m", "comment", "--comment", "podmotion ADR-0140 oldIP fwd")
 		if out, err := exec.CommandContext(ctx, "iptables", insArgs...).CombinedOutput(); err != nil {
 			return fmt.Errorf("iptables -I FORWARD %v: %w (%s)", spec, err, strings.TrimSpace(string(out)))
@@ -1444,9 +1814,11 @@ func installOldIPNotrack(ctx context.Context, oldIP net.IP, mode string) error {
 	}
 	comment := "podmotion ADR-0141 oldIP notrack"
 	for _, r := range rules {
-		del := []string{"-t", "raw", "-D", r.chain, r.dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
+		// ADR-0240 D3a: -w 1 on install too, for the same lock-contention reason as the
+		// probe/reassert calls this rule family feeds into R4.
+		del := []string{"-w", "1", "-t", "raw", "-D", r.chain, r.dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
 		_, _ = exec.CommandContext(ctx, "iptables", del...).CombinedOutput()
-		ins := []string{"-t", "raw", "-I", r.chain, "1", r.dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
+		ins := []string{"-w", "1", "-t", "raw", "-I", r.chain, "1", r.dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
 		if out, err := exec.CommandContext(ctx, "iptables", ins...).CombinedOutput(); err != nil {
 			return fmt.Errorf("iptables -t raw -I %s %s %s NOTRACK: %w (%s)", r.chain, r.dir, cidr, err, strings.TrimSpace(string(out)))
 		}
@@ -1461,7 +1833,9 @@ func removeOldIPNotrack(ctx context.Context, oldIP net.IP) {
 	comment := "podmotion ADR-0141 oldIP notrack"
 	for _, chain := range []string{"PREROUTING", "OUTPUT"} {
 		for _, dir := range []string{"-d", "-s"} {
-			args := []string{"-t", "raw", "-D", chain, dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
+			// ADR-0240 D3a: -w 1 so removal (which now races the R4 loop's own probes/
+			// reasserts on the same lock) degrades to a bounded stall, not a hard failure.
+			args := []string{"-w", "1", "-t", "raw", "-D", chain, dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
 			for i := 0; i < 4; i++ {
 				if _, err := exec.CommandContext(ctx, "iptables", args...).CombinedOutput(); err != nil {
 					break
@@ -1479,7 +1853,8 @@ func removeOldIPForwardAccept(ctx context.Context, oldIP net.IP) {
 		{"-d", cidr},
 		{"-s", cidr},
 	} {
-		args := append([]string{"-D", "FORWARD"}, spec...)
+		// ADR-0240 D3a: -w 1, same lock-contention rationale as removeOldIPNotrack above.
+		args := append([]string{"-w", "1", "-D", "FORWARD"}, spec...)
 		args = append(args, "-j", "ACCEPT", "-m", "comment", "--comment", "podmotion ADR-0140 oldIP fwd")
 		// Remove up to a few duplicates defensively.
 		for i := 0; i < 4; i++ {
@@ -1493,6 +1868,13 @@ func removeOldIPForwardAccept(ctx context.Context, oldIP net.IP) {
 // DisarmTCRedirect removes the ADR-0139 tc-ingress filter + qdisc from the overlay interface
 // after TrafficVerified=True (Decision 3 disarm order). Idempotent: tolerates ENOENT.
 func (s *AgentServer) DisarmTCRedirect(ctx context.Context, req *agentpb.DisarmTCRedirectRequest) (*agentpb.DisarmTCRedirectResponse, error) {
+	// ADR-0240 D2a stop-ordering: cancel and synchronously await exit of the R4 flush-
+	// detection loop for this migration BEFORE any removeOldIP* call below runs. This must
+	// be the FIRST action in this function so no in-flight 100ms probe tick can observe the
+	// intentional teardown that follows and misreport it as a flush (a false-positive
+	// reassert masquerading as a real flush-detection event).
+	s.stopZeroWindowFlushWatch(req.MigrationName)
+
 	// ADR-0199 (removal symmetry, item 4): the forward install (InjectIPHandoff)
 	// now installs the tc-ingress redirect on `bridgeIf` when the substrate has no VXLAN
 	// device (kindnet), NOT on `flannel.1`. The teardown MUST remove the filter from the
@@ -1606,13 +1988,19 @@ func (s *AgentServer) InjectSourceRedirect(ctx context.Context, req *agentpb.Inj
 	// ADR-0141 (blocker B10): NOTRACK the OLD-IP flow on the SOURCE node too, so the reply
 	// arriving from the relocated pod (and the client SYN/GET egressing) is never conntrack-
 	// tracked → never INVALID → no RST on the source side. Symmetric to the destination NOTRACK.
-	if ntErr := installOldIPNotrack(ctx, oldIP, "source"); ntErr != nil {
+	ntErr := installOldIPNotrack(ctx, oldIP, "source")
+	if ntErr != nil {
 		log.Error(ntErr, "InjectSourceRedirect: ADR-0141 source NOTRACK install failed (non-fatal)",
 			"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 	} else {
 		log.Info("InjectSourceRedirect: ADR-0141 source NOTRACK installed (B10)",
 			"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 	}
+
+	// ADR-0240 D2a: on the source node NOTRACK install is non-fatal (RPC still returns
+	// Injected: true on failure), so the loop tracks per-rule install success independently
+	// of the RPC's own success — only start watching a family that installed cleanly.
+	s.startZeroWindowFlushWatch(req.MigrationName, zwSourceFamiliesForInject(ntErr, oldIP))
 
 	log.Info("InjectSourceRedirect: source VXLAN redirect installed (ADR-0136)",
 		"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "replVethMAC", req.ReplVethMac,
