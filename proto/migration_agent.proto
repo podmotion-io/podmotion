@@ -119,6 +119,16 @@ service MigrationAgentService {
   // NoLiveConntrackForIP conjunct (ADR-0244 R6 / NR-BLOCK-2): a non-empty result on EITHER
   // the source or destination agent defers the entire IP-reclaim sweep pass.
   rpc ProbeConntrackForIP(ProbeConntrackForIPRequest) returns (ProbeConntrackForIPResponse);
+  // ProbeDestSocketForIP reports whether the DESTINATION agent's restored-pod network
+  // namespace has an ESTABLISHED TCP socket bound to old_pod_ip, read directly from
+  // /proc/<restoredPID>/net/tcp[6] inside that netns. This observes the class of flow
+  // ADR-0141's NOTRACK rules deliberately make invisible to ProbeConntrackForIP/conntrack
+  // (ADR-0244 C1 correction, Sprint 40): a live pinned/source-CIDR connection carried over
+  // the NOTRACK'd tc-redirect path never appears in conntrack by construction, so it must
+  // be observed at the socket-table layer instead. Called only against the destination
+  // agent (the restored pod owns old_pod_ip post-migration); the source node has no
+  // socket bound to old_pod_ip to inspect.
+  rpc ProbeDestSocketForIP(ProbeDestSocketForIPRequest) returns (ProbeDestSocketForIPResponse);
 }
 
 message PrepareSourceRequest {
@@ -549,6 +559,20 @@ message ProbeConntrackForIPRequest {
 }
 message ProbeConntrackForIPResponse {
   // present is true if at least one conntrack entry matching old_pod_ip was found.
+  bool present  = 1;
+  int32 count   = 2;
+}
+
+// ProbeDestSocketForIPRequest asks the DESTINATION agent whether the restored pod's
+// network namespace (resolved via Status.RestoredPID for migration_name) has an
+// ESTABLISHED TCP socket bound to old_pod_ip (ADR-0244 R7 / C1 correction).
+message ProbeDestSocketForIPRequest {
+  string migration_name = 1;
+  string old_pod_ip     = 2;
+}
+message ProbeDestSocketForIPResponse {
+  // present is true if at least one ESTABLISHED socket bound to old_pod_ip was found in
+  // the restored pod's netns.
   bool present  = 1;
   int32 count   = 2;
 }

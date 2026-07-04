@@ -44,6 +44,7 @@ const (
 	MigrationAgentService_VerifyCleanup_FullMethodName              = "/podmotion.agent.v1.MigrationAgentService/VerifyCleanup"
 	MigrationAgentService_TeardownSourceRedirect_FullMethodName     = "/podmotion.agent.v1.MigrationAgentService/TeardownSourceRedirect"
 	MigrationAgentService_ProbeConntrackForIP_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/ProbeConntrackForIP"
+	MigrationAgentService_ProbeDestSocketForIP_FullMethodName       = "/podmotion.agent.v1.MigrationAgentService/ProbeDestSocketForIP"
 )
 
 // MigrationAgentServiceClient is the client API for MigrationAgentService service.
@@ -166,6 +167,16 @@ type MigrationAgentServiceClient interface {
 	// NoLiveConntrackForIP conjunct (ADR-0244 R6 / NR-BLOCK-2): a non-empty result on EITHER
 	// the source or destination agent defers the entire IP-reclaim sweep pass.
 	ProbeConntrackForIP(ctx context.Context, in *ProbeConntrackForIPRequest, opts ...grpc.CallOption) (*ProbeConntrackForIPResponse, error)
+	// ProbeDestSocketForIP reports whether the DESTINATION agent's restored-pod network
+	// namespace has an ESTABLISHED TCP socket bound to old_pod_ip, read directly from
+	// /proc/<restoredPID>/net/tcp[6] inside that netns. This observes the class of flow
+	// ADR-0141's NOTRACK rules deliberately make invisible to ProbeConntrackForIP/conntrack
+	// (ADR-0244 C1 correction, Sprint 40): a live pinned/source-CIDR connection carried over
+	// the NOTRACK'd tc-redirect path never appears in conntrack by construction, so it must
+	// be observed at the socket-table layer instead. Called only against the destination
+	// agent (the restored pod owns old_pod_ip post-migration); the source node has no
+	// socket bound to old_pod_ip to inspect.
+	ProbeDestSocketForIP(ctx context.Context, in *ProbeDestSocketForIPRequest, opts ...grpc.CallOption) (*ProbeDestSocketForIPResponse, error)
 }
 
 type migrationAgentServiceClient struct {
@@ -426,6 +437,16 @@ func (c *migrationAgentServiceClient) ProbeConntrackForIP(ctx context.Context, i
 	return out, nil
 }
 
+func (c *migrationAgentServiceClient) ProbeDestSocketForIP(ctx context.Context, in *ProbeDestSocketForIPRequest, opts ...grpc.CallOption) (*ProbeDestSocketForIPResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ProbeDestSocketForIPResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_ProbeDestSocketForIP_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MigrationAgentServiceServer is the server API for MigrationAgentService service.
 // All implementations must embed UnimplementedMigrationAgentServiceServer
 // for forward compatibility.
@@ -546,6 +567,16 @@ type MigrationAgentServiceServer interface {
 	// NoLiveConntrackForIP conjunct (ADR-0244 R6 / NR-BLOCK-2): a non-empty result on EITHER
 	// the source or destination agent defers the entire IP-reclaim sweep pass.
 	ProbeConntrackForIP(context.Context, *ProbeConntrackForIPRequest) (*ProbeConntrackForIPResponse, error)
+	// ProbeDestSocketForIP reports whether the DESTINATION agent's restored-pod network
+	// namespace has an ESTABLISHED TCP socket bound to old_pod_ip, read directly from
+	// /proc/<restoredPID>/net/tcp[6] inside that netns. This observes the class of flow
+	// ADR-0141's NOTRACK rules deliberately make invisible to ProbeConntrackForIP/conntrack
+	// (ADR-0244 C1 correction, Sprint 40): a live pinned/source-CIDR connection carried over
+	// the NOTRACK'd tc-redirect path never appears in conntrack by construction, so it must
+	// be observed at the socket-table layer instead. Called only against the destination
+	// agent (the restored pod owns old_pod_ip post-migration); the source node has no
+	// socket bound to old_pod_ip to inspect.
+	ProbeDestSocketForIP(context.Context, *ProbeDestSocketForIPRequest) (*ProbeDestSocketForIPResponse, error)
 	mustEmbedUnimplementedMigrationAgentServiceServer()
 }
 
@@ -630,6 +661,9 @@ func (UnimplementedMigrationAgentServiceServer) TeardownSourceRedirect(context.C
 }
 func (UnimplementedMigrationAgentServiceServer) ProbeConntrackForIP(context.Context, *ProbeConntrackForIPRequest) (*ProbeConntrackForIPResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ProbeConntrackForIP not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) ProbeDestSocketForIP(context.Context, *ProbeDestSocketForIPRequest) (*ProbeDestSocketForIPResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ProbeDestSocketForIP not implemented")
 }
 func (UnimplementedMigrationAgentServiceServer) mustEmbedUnimplementedMigrationAgentServiceServer() {}
 func (UnimplementedMigrationAgentServiceServer) testEmbeddedByValue()                               {}
@@ -1102,6 +1136,24 @@ func _MigrationAgentService_ProbeConntrackForIP_Handler(srv interface{}, ctx con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MigrationAgentService_ProbeDestSocketForIP_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProbeDestSocketForIPRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).ProbeDestSocketForIP(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_ProbeDestSocketForIP_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).ProbeDestSocketForIP(ctx, req.(*ProbeDestSocketForIPRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // MigrationAgentService_ServiceDesc is the grpc.ServiceDesc for MigrationAgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1208,6 +1260,10 @@ var MigrationAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ProbeConntrackForIP",
 			Handler:    _MigrationAgentService_ProbeConntrackForIP_Handler,
+		},
+		{
+			MethodName: "ProbeDestSocketForIP",
+			Handler:    _MigrationAgentService_ProbeDestSocketForIP_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

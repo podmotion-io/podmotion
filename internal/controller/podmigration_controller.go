@@ -2958,6 +2958,13 @@ func isTerminalMigrationPhase(phase pmv1.MigrationPhase) bool {
 // (which repurposes network.ExportConntrack). A non-empty result on EITHER side, or an RPC
 // error on either side, is treated as "cannot prove no client can still reach it" and defers
 // the entire sweep pass rather than force-closing a flow.
+//
+// NOTE (ADR-0244 C1 correction, Sprint 40): this conjunct is structurally blind to the
+// NOTRACK'd OLD-IP flow class it was originally cited to cover in full — the tc mirred
+// redirect + raw-table NOTRACK installed by InjectIPHandoff/InjectSourceRedirect make that
+// forward leg conntrack-invisible by construction, so a live pinned/source-CIDR connection
+// carried over it never appears here. It is retained because it still covers non-NOTRACK'd
+// flows; noLiveDestSocketForIP (R7, below) is the conjunct that covers the NOTRACK'd class.
 func (r *PodMigrationReconciler) noLiveConntrackForIP(ctx context.Context, pm *pmv1.PodMigration) (bool, error) {
 	if r.AgentPool == nil || pm.Spec.SourcePodIP == "" {
 		return false, fmt.Errorf("noLiveConntrackForIP: AgentPool nil or SourcePodIP empty")
@@ -2995,11 +3002,47 @@ func (r *PodMigrationReconciler) noLiveConntrackForIP(ctx context.Context, pm *p
 	return true, nil
 }
 
-// ipReclaimEligible evaluates the ADR-0244 six-conjunct IP-Reclaim-Eligible predicate. All
-// six must hold before any teardown RPC fires; any one false defers the sweep (no partial
-// teardown on a stale read). Returns (eligible, humanReason, error). An error means the
-// predicate could not be evaluated this pass (treated the same as not-yet-eligible by the
-// caller — retry next tick).
+// noLiveDestSocketForIP implements ADR-0244 R7 (C1 correction, Sprint 40): asks the
+// DESTINATION agent whether the restored pod's netns has an ESTABLISHED TCP socket bound to
+// the relocated OLD IP, via the ProbeDestSocketForIP RPC (network.SocketInventory reading
+// /proc/<restoredPID>/net/tcp[6] directly inside that netns). This is the conjunct that
+// observes the NOTRACK'd flow class R6/noLiveConntrackForIP cannot: NOTRACK suppresses the
+// raw table's conntrack hook on the host forwarding path, but it does not remove or hide the
+// application-level socket bound in the destination pod's own netns, so a live pinned or
+// source-CIDR connection carried over the tc-redirect + NOTRACK path is still directly
+// observable here. An RPC error, or Present=true, is treated as "cannot prove no client can
+// still reach it" and defers the entire sweep pass — same disposition as R6.
+func (r *PodMigrationReconciler) noLiveDestSocketForIP(ctx context.Context, pm *pmv1.PodMigration) (bool, error) {
+	if r.AgentPool == nil || pm.Spec.SourcePodIP == "" {
+		return false, fmt.Errorf("noLiveDestSocketForIP: AgentPool nil or SourcePodIP empty")
+	}
+	destNode := pm.Status.DestinationNodeName
+	if destNode == "" {
+		destNode = pm.Spec.TargetNodeName
+	}
+	if destNode == "" {
+		return false, fmt.Errorf("noLiveDestSocketForIP: no destination node known")
+	}
+	agent, err := r.AgentPool.ForNode(ctx, destNode)
+	if err != nil {
+		return false, fmt.Errorf("noLiveDestSocketForIP: destination agent (%s): %w", destNode, err)
+	}
+	resp, err := agent.ProbeDestSocketForIP(ctx, &agentpb.ProbeDestSocketForIPRequest{
+		MigrationName: pm.Name,
+		OldPodIp:      pm.Spec.SourcePodIP,
+	})
+	if err != nil {
+		return false, fmt.Errorf("noLiveDestSocketForIP: destination agent (%s) probe: %w", destNode, err)
+	}
+	return !resp.Present, nil
+}
+
+// ipReclaimEligible evaluates the ADR-0244 seven-conjunct IP-Reclaim-Eligible predicate (R1-R5
+// unchanged; R6 retained scope-limited to non-NOTRACK'd flows; R7 added per the C1 correction
+// to cover the NOTRACK'd flow class R6 cannot see). All seven must hold before any teardown RPC
+// fires; any one false defers the sweep (no partial teardown on a stale read). Returns
+// (eligible, humanReason, error). An error means the predicate could not be evaluated this pass
+// (treated the same as not-yet-eligible by the caller — retry next tick).
 func (r *PodMigrationReconciler) ipReclaimEligible(ctx context.Context, pm *pmv1.PodMigration) (bool, string, error) {
 	// R1: CR reached a terminal outcome. Guaranteed by the caller (only invoked from the
 	// Complete/Failed reconcile branch), restated here for self-documentation.
@@ -3047,6 +3090,15 @@ func (r *PodMigrationReconciler) ipReclaimEligible(ctx context.Context, pm *pmv1
 	}
 	if !ctOK {
 		return false, "R6: live conntrack entry still present for the OLD IP", nil
+	}
+	// R7: no live ESTABLISHED socket in the destination pod's netns for the OLD IP — the
+	// conjunct that observes the NOTRACK'd flow class R6 cannot (ADR-0244 C1 correction).
+	sockOK, err := r.noLiveDestSocketForIP(ctx, pm)
+	if err != nil {
+		return false, "R7: destination socket-table probe failed", err
+	}
+	if !sockOK {
+		return false, "R7: live ESTABLISHED socket still present for the OLD IP in the destination pod's netns", nil
 	}
 	return true, "", nil
 }
