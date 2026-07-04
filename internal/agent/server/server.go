@@ -2172,6 +2172,56 @@ func (s *AgentServer) ProbeConntrackForIP(ctx context.Context, req *agentpb.Prob
 	return &agentpb.ProbeConntrackForIPResponse{Present: len(entries) > 0, Count: int32(len(entries))}, nil
 }
 
+// ProbeDestSocketForIP reports whether the restored pod's network namespace has an
+// ESTABLISHED TCP socket bound to req.OldPodIp (ADR-0244 R7, C1 correction: the reviewer
+// found ProbeConntrackForIP/R6 structurally blind to the NOTRACK'd OLD-IP flow class it was
+// cited to protect — the tc mirred redirect + raw-table NOTRACK installed by InjectIPHandoff
+// make that forward leg conntrack-invisible by construction, so a live pinned/source-CIDR
+// connection carried over it is silently absent from conntrack).
+//
+// This probe instead reads /proc/<restoredPID>/net/tcp[6] directly inside the restored
+// pod's netns (network.SocketInventory — already shipped for ADR-0049/ADR-... TCP_REPAIR
+// export) and reports present=true if any ESTABLISHED entry's local address equals
+// req.OldPodIp. The restored pod owns req.OldPodIp post-migration (overlay-native L3 IP
+// identity, ADR-0048), so this is read against the DESTINATION agent only — the source
+// node has no socket bound to the OLD IP to inspect. Unlike a conntrack dump, a socket
+// bound in the pod's own netns is unaffected by NOTRACK (NOTRACK only suppresses the raw
+// table's connection-tracking hook on the host forwarding path; it does not remove the
+// application socket in the destination netns), so this observes exactly the flow class
+// R6 cannot see. Best-effort: if RestoredPID is unknown or the proc files are gone (pod
+// deleted), present=false (nothing left to protect) rather than an error.
+func (s *AgentServer) ProbeDestSocketForIP(ctx context.Context, req *agentpb.ProbeDestSocketForIPRequest) (*agentpb.ProbeDestSocketForIPResponse, error) {
+	if req.OldPodIp == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "ProbeDestSocketForIP: old_pod_ip is required")
+	}
+	replPID := s.restoredPIDForMigration(ctx, req.MigrationName)
+	if replPID <= 0 {
+		// No known restored PID (CR gone, pod gone, or never restored on this node) —
+		// nothing to observe, so nothing to protect. Not an error: this is the expected
+		// steady state well after the migration's RestoredPID has been GC'd along with the CR.
+		return &agentpb.ProbeDestSocketForIPResponse{Present: false, Count: 0}, nil
+	}
+	oldIP := net.ParseIP(req.OldPodIp)
+	if oldIP == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "ProbeDestSocketForIP: old_pod_ip %q does not parse", req.OldPodIp)
+	}
+	entries, err := network.SocketInventory(int32(replPID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Restored process is gone (pod deleted/restarted) — no socket to protect.
+			return &agentpb.ProbeDestSocketForIPResponse{Present: false, Count: 0}, nil
+		}
+		return nil, status.Errorf(codes.Internal, "ProbeDestSocketForIP: %v", err)
+	}
+	count := 0
+	for _, e := range entries {
+		if e.SrcIP.Equal(oldIP) {
+			count++
+		}
+	}
+	return &agentpb.ProbeDestSocketForIPResponse{Present: count > 0, Count: int32(count)}, nil
+}
+
 // ListenAndServe starts the gRPC server on addr (default ":9090").
 // tlsCfg may be nil for insecure mode (dev/test only).
 // Blocks until ctx is cancelled.
