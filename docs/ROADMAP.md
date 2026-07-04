@@ -17,6 +17,6 @@ client-side reconnect logic required.
 
 - **Current sprint plan (M22–M30):** [`docs/FELN_SPRINT_PLAN.md`](./FELN_SPRINT_PLAN.md)
 - **Milestone ledger (M1–M21):** [`docs/MILESTONES.md`](./MILESTONES.md)
-- **Live "where are we right now" state:** [`docs/proof/DREX-STATE.yaml`](./proof/DREX-STATE.yaml)
+- **Live "where are we right now" state:** [`docs/proof/RESUME-STATE.yaml`](./proof/RESUME-STATE.yaml)
 
 This document is not updated milestone-by-milestone; update the files above instead.
