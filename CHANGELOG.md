@@ -1,5 +1,7 @@
 # Changelog
 
+> **Note:** this changelog is not maintained past early PoC sprints. For current status see `HANDOFF-LOG.md` and `docs/proof/DREX-STATE.yaml`.
+
 All notable changes to PodMotion are documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
