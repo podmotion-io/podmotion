@@ -78,7 +78,7 @@ rescheduled Redis with no in-memory state. sprint9_key was not preserved.
 conditions (StorageReadyForFreeze, etc.) without the actual CRIU dump completing first, so the
 state machine transitioned to Restoring with an empty checkpoint directory.
 
-**Quorum findings (Sprint 9 agents):**
+**Review panel findings (Sprint 9 agents):**
 - CRIU Agent: BLOCKED on CONFIG_MEM_SOFT_DIRTY absent from Ubuntu 6.8.0-117-generic HWE kernel
 - Network Agent: NEEDS_TUNING — ptrace_scope=1 must be lowered to 0; AppArmor profile needed once containerd is installed
 - Node Agent: NEEDS_PACKAGES — containerd+runc absent; criu from checkpoint-restore PPA; veth module availability TBD; perf_event_paranoid=4 must be lowered

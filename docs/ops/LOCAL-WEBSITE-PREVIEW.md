@@ -60,9 +60,9 @@ some point, but that's a separate task.
 ## Known incomplete: Corveth.tsx placeholder
 
 `website/app/page.tsx` imports a `<Corveth />` component for a planned
-"built by the drex" methodology section (references `corveth.ai`). That
+"built by the orchestrator" methodology section (references `corveth.ai`). That
 component did not exist and blocked the `npm run build` step above. A
 minimal, honest placeholder was written to
 `website/app/components/Corveth.tsx` to unblock the build — it is not real
-content. Designing the actual Corveth/drex section is still an open item
+content. Designing the actual Corveth/orchestrator section is still an open item
 for Chad; do not treat the placeholder as final copy.

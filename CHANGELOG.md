@@ -1,6 +1,6 @@
 # Changelog
 
-> **Note:** this changelog is not maintained past early PoC sprints. For current status see `HANDOFF-LOG.md` and `docs/proof/DREX-STATE.yaml`.
+> **Note:** this changelog is not maintained past early PoC sprints. For current status see `HANDOFF-LOG.md` and `docs/proof/RESUME-STATE.yaml`.
 
 All notable changes to PodMotion are documented in this file.
 
