@@ -162,4 +162,4 @@ For `NetworkContinuityMode=None`, TCP conditions are not required — the standa
 - **M19 architecture review** — architecture sign-off recorded in the ADR corpus.
 - **Open-source readiness review** — readiness gate, recommendation #7 that required this document.
 
-For the milestone delivery record and dependency chain, see [MILESTONES.md](../MILESTONES.md).
+For the milestone delivery record and dependency chain, see [MILESTONES.md](MILESTONES.md).

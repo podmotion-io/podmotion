@@ -8,7 +8,11 @@ package server
 
 import (
 	"context"
+	"errors"
+	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -360,5 +364,151 @@ func TestCidr24ForIP_ADR0139(t *testing.T) {
 	}
 	if got := cidr24ForIP("not-an-ip"); got != "" {
 		t.Errorf("cidr24ForIP(bad) = %q, want empty", got)
+	}
+}
+
+
+// TestZeroWindowFlushWatch_StartOrdering_ADR0240D2a covers ADR-0240 D2a's required
+// start-ordering unit test: the R4 loop's internal "watching" set stays empty until
+// InjectIPHandoff's FORWARD ACCEPT + NOTRACK("both") install calls BOTH return success, and
+// a forced installOldIPNotrack failure in the "both" (destination) path leaves the loop
+// unstarted for that migration — never partially started, never speculatively.
+func TestZeroWindowFlushWatch_StartOrdering_ADR0240D2a(t *testing.T) {
+	oldIP := net.ParseIP("10.244.1.7")
+
+	t.Run("both installs succeed: loop starts and watches both families", func(t *testing.T) {
+		s := New("test-node", &criu.StubCheckpointer{}, nil)
+		families := zwDestFamiliesForInject(nil, nil, oldIP)
+		if len(families) != 2 {
+			t.Fatalf("expected 2 watched families when both installs succeed, got %d", len(families))
+		}
+		s.startZeroWindowFlushWatch("mig-both-ok", families)
+		s.zwFlushWatchMu.Lock()
+		_, watching := s.zwFlushWatch["mig-both-ok"]
+		s.zwFlushWatchMu.Unlock()
+		if !watching {
+			t.Errorf("expected the loop's watching set to contain mig-both-ok after both installs succeeded")
+		}
+		s.stopZeroWindowFlushWatch("mig-both-ok")
+	})
+
+	t.Run("forced NOTRACK install failure on the both/destination path: loop stays unstarted", func(t *testing.T) {
+		s := New("test-node", &criu.StubCheckpointer{}, nil)
+		// FORWARD ACCEPT succeeded (fwErr == nil) but NOTRACK("both") failed (ntErr != nil) —
+		// D2a requires this to leave the loop unstarted for the migration, not partially
+		// started watching only forward_accept.
+		families := zwDestFamiliesForInject(nil, errors.New("simulated NOTRACK install failure"), oldIP)
+		if families != nil {
+			t.Fatalf("expected zero watched families on a forced NOTRACK install failure, got %d", len(families))
+		}
+		s.startZeroWindowFlushWatch("mig-notrack-failed", families)
+		s.zwFlushWatchMu.Lock()
+		_, watching := s.zwFlushWatch["mig-notrack-failed"]
+		s.zwFlushWatchMu.Unlock()
+		if watching {
+			t.Errorf("expected the loop's watching set to remain empty for mig-notrack-failed after a forced NOTRACK install failure")
+		}
+	})
+
+	t.Run("forced FORWARD ACCEPT install failure on the both/destination path: loop stays unstarted", func(t *testing.T) {
+		s := New("test-node", &criu.StubCheckpointer{}, nil)
+		families := zwDestFamiliesForInject(errors.New("simulated FORWARD ACCEPT install failure"), nil, oldIP)
+		if families != nil {
+			t.Fatalf("expected zero watched families on a forced FORWARD ACCEPT install failure, got %d", len(families))
+		}
+		s.startZeroWindowFlushWatch("mig-fwaccept-failed", families)
+		s.zwFlushWatchMu.Lock()
+		_, watching := s.zwFlushWatch["mig-fwaccept-failed"]
+		s.zwFlushWatchMu.Unlock()
+		if watching {
+			t.Errorf("expected the loop's watching set to remain empty for mig-fwaccept-failed after a forced FORWARD ACCEPT install failure")
+		}
+	})
+
+	t.Run("source path: NOTRACK install failure independently leaves the loop unstarted", func(t *testing.T) {
+		s := New("test-node", &criu.StubCheckpointer{}, nil)
+		families := zwSourceFamiliesForInject(errors.New("simulated source NOTRACK install failure"), oldIP)
+		if families != nil {
+			t.Fatalf("expected zero watched families on the source path when NOTRACK install fails, got %d", len(families))
+		}
+		s.startZeroWindowFlushWatch("mig-source-notrack-failed", families)
+		s.zwFlushWatchMu.Lock()
+		_, watching := s.zwFlushWatch["mig-source-notrack-failed"]
+		s.zwFlushWatchMu.Unlock()
+		if watching {
+			t.Errorf("expected the loop's watching set to remain empty for mig-source-notrack-failed")
+		}
+	})
+}
+
+// TestZeroWindowFlushWatch_StopOrdering_ADR0240D2a covers ADR-0240 D2a's required
+// stop-ordering unit test: stopZeroWindowFlushWatch (called by DisarmTCRedirect as its
+// first action, before removeOldIPForwardAccept/removeOldIPNotrack run) must synchronously
+// await the loop goroutine's exit such that a legitimate disarm produces ZERO
+// pm_zero_window_hold_rule_reassert_total increments and no
+// ConditionZeroWindowRuleFlushDetected transition, even when a probe tick is placed
+// immediately adjacent to the stop call (a synchronization hook is used here instead of a
+// sleep to deterministically land a tick right at the boundary, per the ADR's own
+// no-sleep-reliance instruction).
+func TestZeroWindowFlushWatch_StopOrdering_ADR0240D2a(t *testing.T) {
+	s := New("test-node", &criu.StubCheckpointer{}, nil)
+
+	var presentCalls int64
+	var reassertCalls int64
+	// tickSeen is closed once the probe has run at least once, giving the test a
+	// deterministic synchronization point to call stop from (no sleep-based timing).
+	tickSeen := make(chan struct{})
+	var tickSeenOnce sync.Once
+
+	families := []zwRuleFamily{{
+		metricLabel: "forward_accept",
+		present: func(ctx context.Context) bool {
+			atomic.AddInt64(&presentCalls, 1)
+			tickSeenOnce.Do(func() { close(tickSeen) })
+			return true // rule is present: DisarmTCRedirect has not run yet.
+		},
+		reassert: func(ctx context.Context) error {
+			atomic.AddInt64(&reassertCalls, 1)
+			return nil
+		},
+	}}
+
+	s.startZeroWindowFlushWatch("mig-stop-ordering", families)
+
+	// Wait deterministically for at least one probe tick to have run (the loop is live and
+	// polling), then immediately stop it — placing the stop call adjacent to a real tick
+	// rather than relying on a sleep to "probably" race it.
+	select {
+	case <-tickSeen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the flush-watch loop's first probe tick")
+	}
+
+	// Simulate DisarmTCRedirect's D2a contract: stop is the FIRST action, before any
+	// removeOldIP* call. stopZeroWindowFlushWatch must block until the goroutine has fully
+	// exited.
+	s.stopZeroWindowFlushWatch("mig-stop-ordering")
+
+	s.zwFlushWatchMu.Lock()
+	_, stillWatching := s.zwFlushWatch["mig-stop-ordering"]
+	s.zwFlushWatchMu.Unlock()
+	if stillWatching {
+		t.Errorf("expected stopZeroWindowFlushWatch to remove the migration from the watching set")
+	}
+
+	// Because the watched rule always reported present==true, the legitimate "disarm" in
+	// this test must never have triggered a reassert or a flush-detected condition — this is
+	// the false-positive-reassert failure mode D2a exists to prevent.
+	if got := atomic.LoadInt64(&reassertCalls); got != 0 {
+		t.Errorf("expected zero reassert calls from a legitimate stop (no flush ever occurred), got %d", got)
+	}
+
+	// Record the tick count at the moment stop returned, then confirm no further ticks land
+	// after stop — proving the goroutine is truly gone (synchronous exit), not merely
+	// "about to stop soon".
+	postStopCalls := atomic.LoadInt64(&presentCalls)
+	time.Sleep(3 * zwFlushPollInterval)
+	if got := atomic.LoadInt64(&presentCalls); got != postStopCalls {
+		t.Errorf("expected no further probe ticks after stopZeroWindowFlushWatch returned (synchronous stop), presentCalls went from %d to %d", postStopCalls, got)
 	}
 }
