@@ -83,7 +83,7 @@ func TestRestoreBranch1_MACFlowsToReportRestoreConfirmed(t *testing.T) {
 	// Track that joinNsRestoreFn was called.
 	joinNsCalled := false
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error) {
+	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, holderPIDOut *int, podCgroupOut *string) (int, []ExternalMountDroppedInfo, error) {
 		joinNsCalled = true
 		return 99999, nil, nil
 	}
@@ -129,7 +129,7 @@ func TestRestoreBranch2_MACFlowsToReportRestoreConfirmed(t *testing.T) {
 	// Track that joinNsRestoreFn was called.
 	joinNsCalled := false
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error) {
+	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, holderPIDOut *int, podCgroupOut *string) (int, []ExternalMountDroppedInfo, error) {
 		joinNsCalled = true
 		return 99999, nil, nil
 	}
@@ -167,7 +167,7 @@ func TestJoinNsRestore_ReturnsMACToCaller(t *testing.T) {
 
 	// Stub joinNsRestoreFn — avoids real CRIU subprocess.
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error) {
+	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, holderPIDOut *int, podCgroupOut *string) (int, []ExternalMountDroppedInfo, error) {
 		return 99999, nil, nil
 	}
 	defer func() { joinNsRestoreFn = origJoin }()
@@ -181,7 +181,7 @@ func TestJoinNsRestore_ReturnsMACToCaller(t *testing.T) {
 
 	s := New("test-node", &criu.StubCheckpointer{}, nil)
 	// JoinNsRestore signature: (migrationName, checkpointDir, imageName, containerID, sandboxID, tcpPreservationMode)
-	_, gotMAC, err := s.JoinNsRestore("test-nri-migration", "/tmp/fake-checkpoint", "", "", "", "None")
+	_, gotMAC, _, _, err := s.JoinNsRestore("test-nri-migration", "/tmp/fake-checkpoint", "", "", "", "None")
 	if err != nil {
 		t.Fatalf("JoinNsRestore returned unexpected error: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestRestoreBranch1_StrictFailsWhenNoK8sClient(t *testing.T) {
 	defer func() { readReplVethMACFn = orig }()
 
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error) {
+	joinNsRestoreFn = func(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, holderPIDOut *int, podCgroupOut *string) (int, []ExternalMountDroppedInfo, error) {
 		return 12345, nil, nil
 	}
 	defer func() { joinNsRestoreFn = origJoin }()

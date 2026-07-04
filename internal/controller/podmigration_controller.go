@@ -3501,6 +3501,21 @@ func (r *PodMigrationReconciler) verifyDataplaneReachability(ctx context.Context
 		Nonce:         nonce,
 		TtlS:          15,
 	})
+	if echoResp != nil && echoResp.ProcessDied {
+		// ADR-0228 Invariant 3: the agent-side fail-fast pre-check found RestoredPID already
+		// dead. This is a legitimate post-recording failure (the restored application crashed
+		// after handoff), not the opaque multi-minute reachability timeout Arch-A identified —
+		// surface it as a specific, correctly-attributed condition/reason instead of requeuing
+		// into a probe that can never succeed.
+		log.Error(nil, "ADR-0228: RestoredProcessDied — destination agent's fail-fast pre-check found RestoredPID dead before starting the reachability echo",
+			"migration", pm.Name, "destNode", destNode, "detail", echoResp.Detail)
+		setCondition(pm, conditionDataplaneReachabilityVerified, metav1.ConditionFalse, "RestoredProcessDied",
+			fmt.Sprintf("ADR-0228: restored process died after RestoredPID was recorded (agent detail: %s)", echoResp.Detail))
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr, false
+		}
+		return ctrl.Result{}, nil, false
+	}
 	if echoErr != nil || echoResp == nil || !echoResp.Started {
 		detail := ""
 		if echoResp != nil {

@@ -946,8 +946,17 @@ type RestoreRequest struct {
 	// failure is a hard abort when mode=="Strict" (explicit field replaces the SeqSnapshots>0
 	// proxy, closing the narrow fail-open where Strict with zero TCP connections would degrade).
 	TcpPreservationMode string `protobuf:"bytes,9,opt,name=tcp_preservation_mode,json=tcpPreservationMode,proto3" json:"tcp_preservation_mode,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// sandbox_id (ADR-0228 NRI/gRPC symmetry) is the replacement pod's containerd sandbox
+	// (pause container) ID — the same ID the NRI path receives from pod.GetId(). Required so
+	// the gRPC Restore path can resolve RestoredPID via the same cgroup-anchored mechanism
+	// (findRestoredPIDInBrokerCgroup + moveProcessToPodCgroup) as the NRI path, instead of the
+	// retired comm-scan fallback. If empty, the agent attempts to self-resolve it from the
+	// replacement pod (mirrors the ADR-0217 D2 workload-image self-resolve); if that also fails,
+	// the restore fails closed with ErrSandboxRequiredForVerifiedRestore rather than falling back
+	// to a weaker resolver that could report a false success.
+	SandboxId     string `protobuf:"bytes,10,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RestoreRequest) Reset() {
@@ -1032,6 +1041,13 @@ func (x *RestoreRequest) GetRelayIfname() string {
 func (x *RestoreRequest) GetTcpPreservationMode() string {
 	if x != nil {
 		return x.TcpPreservationMode
+	}
+	return ""
+}
+
+func (x *RestoreRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
 	}
 	return ""
 }
@@ -3865,9 +3881,15 @@ func (x *StartReachabilityEchoRequest) GetTtlS() int32 {
 }
 
 type StartReachabilityEchoResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Started       bool                   `protobuf:"varint,1,opt,name=started,proto3" json:"started,omitempty"`
-	Detail        string                 `protobuf:"bytes,2,opt,name=detail,proto3" json:"detail,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Started bool                   `protobuf:"varint,1,opt,name=started,proto3" json:"started,omitempty"`
+	Detail  string                 `protobuf:"bytes,2,opt,name=detail,proto3" json:"detail,omitempty"`
+	// process_died (ADR-0228 Invariant 3) is set true when the agent-side liveness pre-check
+	// found RestoredPID already dead before attempting to start the echo listener — a
+	// legitimate post-recording failure (e.g. the restored application crashed after handoff).
+	// The controller surfaces this as a distinct RestoredProcessDied condition/reason instead of
+	// a generic reachability timeout.
+	ProcessDied   bool `protobuf:"varint,3,opt,name=process_died,json=processDied,proto3" json:"process_died,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3914,6 +3936,13 @@ func (x *StartReachabilityEchoResponse) GetDetail() string {
 		return x.Detail
 	}
 	return ""
+}
+
+func (x *StartReachabilityEchoResponse) GetProcessDied() bool {
+	if x != nil {
+		return x.ProcessDied
+	}
+	return false
 }
 
 var File_migration_agent_proto protoreflect.FileDescriptor
@@ -3984,7 +4013,7 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\x05ready\x18\x01 \x01(\bR\x05ready\x12'\n" +
 	"\x0fblocking_reason\x18\x02 \x01(\tR\x0eblockingReason\x12\"\n" +
 	"\rdest_netns_fd\x18\x03 \x01(\tR\vdestNetnsFd\x12\"\n" +
-	"\rdest_vtep_mac\x18\x04 \x01(\tR\vdestVtepMac\"\xa0\x03\n" +
+	"\rdest_vtep_mac\x18\x04 \x01(\tR\vdestVtepMac\"\xbf\x03\n" +
 	"\x0eRestoreRequest\x12%\n" +
 	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12%\n" +
 	"\x0echeckpoint_ref\x18\x02 \x01(\tR\rcheckpointRef\x12(\n" +
@@ -3993,7 +4022,10 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\x1asource_freeze_timestamp_ns\x18\x06 \x01(\x03R\x17sourceFreezeTimestampNs\x12D\n" +
 	"\rseq_snapshots\x18\a \x03(\v2\x1f.podmotion.agent.v1.SeqSnapshotR\fseqSnapshots\x12!\n" +
 	"\frelay_ifname\x18\b \x01(\tR\vrelayIfname\x122\n" +
-	"\x15tcp_preservation_mode\x18\t \x01(\tR\x13tcpPreservationModeJ\x04\b\x04\x10\x05R\x12network_continuity\"\x80\x01\n" +
+	"\x15tcp_preservation_mode\x18\t \x01(\tR\x13tcpPreservationMode\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\n" +
+	" \x01(\tR\tsandboxIdJ\x04\b\x04\x10\x05R\x12network_continuity\"\x80\x01\n" +
 	"\x0fRestoreResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12.\n" +
@@ -4218,10 +4250,11 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\vlisten_port\x18\x03 \x01(\x05R\n" +
 	"listenPort\x12\x14\n" +
 	"\x05nonce\x18\x04 \x01(\tR\x05nonce\x12\x13\n" +
-	"\x05ttl_s\x18\x05 \x01(\x05R\x04ttlS\"Q\n" +
+	"\x05ttl_s\x18\x05 \x01(\x05R\x04ttlS\"t\n" +
 	"\x1dStartReachabilityEchoResponse\x12\x18\n" +
 	"\astarted\x18\x01 \x01(\bR\astarted\x12\x16\n" +
-	"\x06detail\x18\x02 \x01(\tR\x06detail*S\n" +
+	"\x06detail\x18\x02 \x01(\tR\x06detail\x12!\n" +
+	"\fprocess_died\x18\x03 \x01(\bR\vprocessDied*S\n" +
 	"\fCleanupScope\x12\x1d\n" +
 	"\x19CLEANUP_SCOPE_UNSPECIFIED\x10\x00\x12\x14\n" +
 	"\x10CUTOVER_COMPLETE\x10\x01\x12\x0e\n" +
