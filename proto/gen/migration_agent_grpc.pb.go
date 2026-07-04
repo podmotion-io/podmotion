@@ -42,6 +42,8 @@ const (
 	MigrationAgentService_ProbeDataplaneReachability_FullMethodName = "/podmotion.agent.v1.MigrationAgentService/ProbeDataplaneReachability"
 	MigrationAgentService_StartReachabilityEcho_FullMethodName      = "/podmotion.agent.v1.MigrationAgentService/StartReachabilityEcho"
 	MigrationAgentService_VerifyCleanup_FullMethodName              = "/podmotion.agent.v1.MigrationAgentService/VerifyCleanup"
+	MigrationAgentService_TeardownSourceRedirect_FullMethodName     = "/podmotion.agent.v1.MigrationAgentService/TeardownSourceRedirect"
+	MigrationAgentService_ProbeConntrackForIP_FullMethodName        = "/podmotion.agent.v1.MigrationAgentService/ProbeConntrackForIP"
 )
 
 // MigrationAgentServiceClient is the client API for MigrationAgentService service.
@@ -152,6 +154,18 @@ type MigrationAgentServiceClient interface {
 	// verify the absence of yet. The explicit objects list lets a future ADR change what is
 	// checked without a new RPC signature (ADR-0241 Decision 1).
 	VerifyCleanup(ctx context.Context, in *VerifyCleanupRequest, opts ...grpc.CallOption) (*VerifyCleanupResponse, error)
+	// TeardownSourceRedirect removes the ADR-0136 SOURCE-node flannel.1 VXLAN redirect
+	// (host route + AF_INET neigh + AF_BRIDGE FDB) and the ADR-0141 source-mode NOTRACK
+	// rules for the relocated OLD pod IP. Symmetric to DisarmTCRedirect on the destination
+	// side. Called only once the controller's IP-Reclaim-Eligible predicate holds
+	// (ADR-0244 / NR-BLOCK-2). Idempotent: ENOENT is treated as success.
+	TeardownSourceRedirect(ctx context.Context, in *TeardownSourceRedirectRequest, opts ...grpc.CallOption) (*TeardownSourceRedirectResponse, error)
+	// ProbeConntrackForIP reports whether the calling node's conntrack table has any entry
+	// matching old_pod_ip (source or destination address), via network.ExportConntrack — a
+	// read-only presence probe, not an export-for-migration call. Used by the controller's
+	// NoLiveConntrackForIP conjunct (ADR-0244 R6 / NR-BLOCK-2): a non-empty result on EITHER
+	// the source or destination agent defers the entire IP-reclaim sweep pass.
+	ProbeConntrackForIP(ctx context.Context, in *ProbeConntrackForIPRequest, opts ...grpc.CallOption) (*ProbeConntrackForIPResponse, error)
 }
 
 type migrationAgentServiceClient struct {
@@ -392,6 +406,26 @@ func (c *migrationAgentServiceClient) VerifyCleanup(ctx context.Context, in *Ver
 	return out, nil
 }
 
+func (c *migrationAgentServiceClient) TeardownSourceRedirect(ctx context.Context, in *TeardownSourceRedirectRequest, opts ...grpc.CallOption) (*TeardownSourceRedirectResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TeardownSourceRedirectResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_TeardownSourceRedirect_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *migrationAgentServiceClient) ProbeConntrackForIP(ctx context.Context, in *ProbeConntrackForIPRequest, opts ...grpc.CallOption) (*ProbeConntrackForIPResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ProbeConntrackForIPResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_ProbeConntrackForIP_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MigrationAgentServiceServer is the server API for MigrationAgentService service.
 // All implementations must embed UnimplementedMigrationAgentServiceServer
 // for forward compatibility.
@@ -500,6 +534,18 @@ type MigrationAgentServiceServer interface {
 	// verify the absence of yet. The explicit objects list lets a future ADR change what is
 	// checked without a new RPC signature (ADR-0241 Decision 1).
 	VerifyCleanup(context.Context, *VerifyCleanupRequest) (*VerifyCleanupResponse, error)
+	// TeardownSourceRedirect removes the ADR-0136 SOURCE-node flannel.1 VXLAN redirect
+	// (host route + AF_INET neigh + AF_BRIDGE FDB) and the ADR-0141 source-mode NOTRACK
+	// rules for the relocated OLD pod IP. Symmetric to DisarmTCRedirect on the destination
+	// side. Called only once the controller's IP-Reclaim-Eligible predicate holds
+	// (ADR-0244 / NR-BLOCK-2). Idempotent: ENOENT is treated as success.
+	TeardownSourceRedirect(context.Context, *TeardownSourceRedirectRequest) (*TeardownSourceRedirectResponse, error)
+	// ProbeConntrackForIP reports whether the calling node's conntrack table has any entry
+	// matching old_pod_ip (source or destination address), via network.ExportConntrack — a
+	// read-only presence probe, not an export-for-migration call. Used by the controller's
+	// NoLiveConntrackForIP conjunct (ADR-0244 R6 / NR-BLOCK-2): a non-empty result on EITHER
+	// the source or destination agent defers the entire IP-reclaim sweep pass.
+	ProbeConntrackForIP(context.Context, *ProbeConntrackForIPRequest) (*ProbeConntrackForIPResponse, error)
 	mustEmbedUnimplementedMigrationAgentServiceServer()
 }
 
@@ -578,6 +624,12 @@ func (UnimplementedMigrationAgentServiceServer) StartReachabilityEcho(context.Co
 }
 func (UnimplementedMigrationAgentServiceServer) VerifyCleanup(context.Context, *VerifyCleanupRequest) (*VerifyCleanupResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method VerifyCleanup not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) TeardownSourceRedirect(context.Context, *TeardownSourceRedirectRequest) (*TeardownSourceRedirectResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method TeardownSourceRedirect not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) ProbeConntrackForIP(context.Context, *ProbeConntrackForIPRequest) (*ProbeConntrackForIPResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ProbeConntrackForIP not implemented")
 }
 func (UnimplementedMigrationAgentServiceServer) mustEmbedUnimplementedMigrationAgentServiceServer() {}
 func (UnimplementedMigrationAgentServiceServer) testEmbeddedByValue()                               {}
@@ -1014,6 +1066,42 @@ func _MigrationAgentService_VerifyCleanup_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MigrationAgentService_TeardownSourceRedirect_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TeardownSourceRedirectRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).TeardownSourceRedirect(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_TeardownSourceRedirect_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).TeardownSourceRedirect(ctx, req.(*TeardownSourceRedirectRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MigrationAgentService_ProbeConntrackForIP_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProbeConntrackForIPRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).ProbeConntrackForIP(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_ProbeConntrackForIP_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).ProbeConntrackForIP(ctx, req.(*ProbeConntrackForIPRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // MigrationAgentService_ServiceDesc is the grpc.ServiceDesc for MigrationAgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1112,6 +1200,14 @@ var MigrationAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "VerifyCleanup",
 			Handler:    _MigrationAgentService_VerifyCleanup_Handler,
+		},
+		{
+			MethodName: "TeardownSourceRedirect",
+			Handler:    _MigrationAgentService_TeardownSourceRedirect_Handler,
+		},
+		{
+			MethodName: "ProbeConntrackForIP",
+			Handler:    _MigrationAgentService_ProbeConntrackForIP_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
