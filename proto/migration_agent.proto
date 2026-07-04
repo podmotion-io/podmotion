@@ -246,6 +246,15 @@ message RestoreRequest {
   // failure is a hard abort when mode=="Strict" (explicit field replaces the SeqSnapshots>0
   // proxy, closing the narrow fail-open where Strict with zero TCP connections would degrade).
   string tcp_preservation_mode       = 9;
+  // sandbox_id (ADR-0228 NRI/gRPC symmetry) is the replacement pod's containerd sandbox
+  // (pause container) ID — the same ID the NRI path receives from pod.GetId(). Required so
+  // the gRPC Restore path can resolve RestoredPID via the same cgroup-anchored mechanism
+  // (findRestoredPIDInBrokerCgroup + moveProcessToPodCgroup) as the NRI path, instead of the
+  // retired comm-scan fallback. If empty, the agent attempts to self-resolve it from the
+  // replacement pod (mirrors the ADR-0217 D2 workload-image self-resolve); if that also fails,
+  // the restore fails closed with ErrSandboxRequiredForVerifiedRestore rather than falling back
+  // to a weaker resolver that could report a false success.
+  string sandbox_id                  = 10;
 }
 message RestoreResponse {
   bool   success           = 1;
@@ -655,4 +664,10 @@ message StartReachabilityEchoRequest {
 message StartReachabilityEchoResponse {
   bool   started          = 1;
   string detail           = 2;
+  // process_died (ADR-0228 Invariant 3) is set true when the agent-side liveness pre-check
+  // found RestoredPID already dead before attempting to start the echo listener — a
+  // legitimate post-recording failure (e.g. the restored application crashed after handoff).
+  // The controller surfaces this as a distinct RestoredProcessDied condition/reason instead of
+  // a generic reachability timeout.
+  bool   process_died     = 3;
 }

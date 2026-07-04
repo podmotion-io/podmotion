@@ -68,7 +68,9 @@ const (
 
 // adr0195Provenance is printed at server startup so the marker string is retained in the
 // binary and is observable in agent logs. Deploy verification:
-//   grep -a -c 'P-0195-1' bin/agent-linux-amd64  # must be >= 1
+//
+//	grep -a -c 'P-0195-1' bin/agent-linux-amd64  # must be >= 1
+//
 // The log.Info call below forces the string into the binary's string table and into the
 // agent's startup log, confirming the ADR-0195 holder-contract change is deployed.
 const adr0195Marker = "P-0195-1"
@@ -97,6 +99,40 @@ var ErrCRIUCapability = criu.ErrCRIUCapability
 // criuRestoreConfirmed (ADR-0123 D2 step 5 / AC5).
 var ErrRestoredPIDNotFound = errors.New("restored process PID not found in replacement pod cgroup")
 
+// ADR-0228 (Invariant 1 / NRI-gRPC symmetry): sentinel errors for the restored-PID
+// liveness/identity gate that runs immediately before ReportRestoreConfirmed ever records
+// RestoredPID/CRIURestoreConfirmed. Each is classified transient-retry or terminal-rollback in
+// the callers below (per the ADR's "Transient-retry vs. terminal-rollback classification"
+// subsection) so the checkpoint-images zeroize contract (CLAUDE.md rule 7) is honored on every
+// new exit path this gate introduces.
+var (
+	// ErrSandboxRequiredForVerifiedRestore is returned when no containerd sandbox ID could be
+	// obtained (from the caller, or via agent-side self-resolution from the replacement pod) to
+	// anchor PID resolution to the pod/broker cgroup. Terminal-rollback: the retired comm-scan
+	// resolver is not used as a fallback (a weaker-but-reporting-success fallback is the load-
+	// bearing defect this ADR closes), so there is nothing to retry without operator/controller
+	// intervention.
+	ErrSandboxRequiredForVerifiedRestore = errors.New("ADR-0228: sandboxID required for verified restore — cgroup-anchored resolution unavailable, refusing weaker fallback")
+
+	// ErrRestoredPIDDead is returned when the resolved PID fails the Invariant-1 liveness check
+	// (no /proc/<pid>, or reaped/zombie on the settle re-read). Transient-retry: this can
+	// legitimately fire because the check ran too early in a settle race the controller's
+	// retry/requeue loop is designed to recover from.
+	ErrRestoredPIDDead = errors.New("ADR-0228: resolved restored PID is not live (liveness check failed)")
+
+	// ErrRestoredPIDIsHolder is returned when the resolved PID is identical to, or a live
+	// descendant of, the holder's own recorded PID — i.e. the check caught the CRIU-restore
+	// holder stub rather than the handed-off restored application. Terminal-rollback: this is a
+	// positive identity determination, not a transient absence.
+	ErrRestoredPIDIsHolder = errors.New("ADR-0228: resolved restored PID is the holder stub, not the restored application")
+
+	// ErrRestoredPIDReparented is returned when the resolved PID's parent is itself a resident
+	// of the same cgroup — the PID is not the tree root the resolver selected, or was reparented
+	// since resolution. Transient-retry: a benign resolution-timing artifact the retry loop can
+	// resolve on the next attempt.
+	ErrRestoredPIDReparented = errors.New("ADR-0228: resolved restored PID is not the cgroup tree root (reparented since resolution)")
+)
+
 // CRIUImageInconsistencyError is returned by patchCheckpointImages (ADR-0193 P-0193-1) when a
 // PLAIN-REG fd (not inherited, not external, not remap) carries a positive mnt_id with no kept
 // mountpoints counterpart — the image inconsistency that causes mount.c:3953 BUG_ON. The error
@@ -104,8 +140,8 @@ var ErrRestoredPIDNotFound = errors.New("restored process PID not found in repla
 // NameLeaf is filepath.Base(name) — never the full path — so it is safe to surface in a
 // world-readable Kubernetes Event (SEC-EVENT-1).
 type CRIUImageInconsistencyError struct {
-	FdID        int
-	NameLeaf    string // filepath.Base(name) — e.g. "data" for "/data"
+	FdID         int
+	NameLeaf     string // filepath.Base(name) — e.g. "data" for "/data"
 	BackingMntID int
 }
 
@@ -523,10 +559,10 @@ type AgentServer struct {
 // k8sClient may be nil; when set the Checkpoint handler will update MigrationCheckpoint CRs.
 func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentServer {
 	return &AgentServer{
-		checkpointer:    cp,
-		nodeName:        nodeName,
-		k8sClient:       k8sClient,
-		ebpfMgr:         network.NewEBPFManager(context.Background()),
+		checkpointer:          cp,
+		nodeName:              nodeName,
+		k8sClient:             k8sClient,
+		ebpfMgr:               network.NewEBPFManager(context.Background()),
 		migrationPodUID:       make(map[string]string),
 		migrationSeqSnapshots: make(map[string][]*agentpb.SeqSnapshot),
 		zwHolds:               make(map[string]*zwHoldState),
@@ -685,7 +721,11 @@ func setConditionOnPM(pm *pmv1.PodMigration, condType string, status metav1.Cond
 // Returns (pid, mac, error) where mac is the replacement pod's eth0 MAC (E1 Condition 1).
 // The NRI caller must pass mac directly to ReportRestoreConfirmed; it must NOT call
 // ReadReplVethMAC independently.
-func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, containerID, sandboxID, tcpPreservationMode string) (int, string, error) {
+// Returns (pid, mac, holderPID, podCgroup, error). holderPID and podCgroup (ADR-0228) are the
+// values joinNsRestore resolved while finding pid; the caller (cmd/agent/main.go's NRI
+// StartContainer closure) MUST pass them through to ReportRestoreConfirmed unchanged so the
+// Invariant-1 liveness/identity gate has the context it needs.
+func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, containerID, sandboxID, tcpPreservationMode string) (int, string, int, string, error) {
 	strictMode := tcpPreservationMode == string(pmv1.TCPPreservationModeStrict)
 	s.destHostVethMu.RLock()
 	storedVeth := s.destHostVeth[migrationName]
@@ -722,9 +762,11 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 	if imageName == "" {
 		// All three sources exhausted (NRI event, PrepareDestinationNetns cache, replacement
 		// pod spec). Fail-close rather than substitute a wrong image (gate-11 lesson, ADR-0215).
-		return 0, "", fmt.Errorf("ADR-0217: restore image unresolved — NRI event, PrepareDestinationNetns cache, and replacement pod spec all empty for migration %s", migrationName)
+		return 0, "", 0, "", fmt.Errorf("ADR-0217: restore image unresolved — NRI event, PrepareDestinationNetns cache, and replacement pod spec all empty for migration %s", migrationName)
 	}
-	pid, droppedMounts, err := joinNsRestoreFn(migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode)
+	var holderPID int
+	var podCgroup string
+	pid, droppedMounts, err := joinNsRestoreFn(migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode, &holderPID, &podCgroup)
 	if err != nil {
 		// ADR-0193 P-0193-4 / S1: emit a Warning CRIUImageInconsistency Kubernetes Event on the
 		// PodMigration CR when the P-0193-1 hard-stop fires. The event message carries only
@@ -738,7 +780,7 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 		if errors.As(err, &extErr) {
 			s.emitExternalMountUnresolvedEvent(context.Background(), migrationName, extErr)
 		}
-		return 0, "", err
+		return 0, "", 0, "", err
 	}
 	// ADR-0194 B-2 H4: emit CRIUExternalMountDropped Normal event for each B-2 drop.
 	for _, d := range droppedMounts {
@@ -764,7 +806,7 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 			log.Error(orderErr, "JoinNsRestore: ordering invariant FAILED — SIGCONT withheld; "+
 				"NRI callback will return error → containerd marks container failed → operator requeues (ADR-0144 NB-2)",
 				"migration", migrationName, "pid", pid)
-			return 0, "", fmt.Errorf("JoinNsRestore: ordering invariant: %w", orderErr)
+			return 0, "", 0, "", fmt.Errorf("JoinNsRestore: ordering invariant: %w", orderErr)
 		}
 		if resumedAt.IsZero() {
 			// SocketsLive confirmed; SIGCONT deferred — record PID for InjectIPHandoff.
@@ -784,9 +826,9 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 	fr, frErr := s.finalizeRestore(context.Background(), pid, netnsPath, migrationName, "", tcpPreservationMode)
 	if frErr != nil {
 		// Strict/Full fail-closed: propagate.
-		return 0, "", frErr
+		return 0, "", 0, "", frErr
 	}
-	return pid, fr.mac, nil
+	return pid, fr.mac, holderPID, podCgroup, nil
 }
 
 // resolveImageFromReplacementPod is the ADR-0217 D2 third fallback for restore image
@@ -845,6 +887,70 @@ func (s *AgentServer) resolveImageFromReplacementPod(migrationName string) strin
 	return pod.Spec.Containers[0].Image
 }
 
+// resolveSandboxIDForMigration (ADR-0228 NRI/gRPC symmetry) is the gRPC-path analog of
+// resolveImageFromReplacementPod: it resolves the replacement pod's containerd sandbox (pause
+// container) ID by looking up the same PodMigration.Status.ReplacementPodName the image
+// self-resolve uses, then asking crictl (run in the host mount namespace via nsenterCmd, same
+// idiom as every other host-state query in this file) for the pod sandbox whose name/namespace
+// match. Returns "" on any failure — the caller fails closed (ErrSandboxRequiredForVerifiedRestore)
+// rather than substituting a wrong or stale sandbox ID.
+func (s *AgentServer) resolveSandboxIDForMigration(migrationName string) string {
+	if s.k8sClient == nil || migrationName == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ns := os.Getenv("POD_NAMESPACE")
+	if ns == "" {
+		ns = "podmotion-system"
+	}
+	pm := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: migrationName, Namespace: ns}, pm); err != nil {
+		pmList := &pmv1.PodMigrationList{}
+		if listErr := s.k8sClient.List(ctx, pmList); listErr != nil {
+			return ""
+		}
+		found := false
+		for i := range pmList.Items {
+			if pmList.Items[i].Name == migrationName {
+				*pm = pmList.Items[i]
+				found = true
+				break
+			}
+		}
+		if !found {
+			return ""
+		}
+	}
+
+	replName := pm.Status.ReplacementPodName
+	if replName == "" {
+		return ""
+	}
+	podNs := pm.Spec.PodNamespace
+	if podNs == "" {
+		podNs = pm.Namespace
+	}
+
+	out, err := nsenterCmd("crictl", "pods", "-q", "--name", replName, "--namespace", podNs).Output()
+	if err != nil {
+		log.Info("resolveSandboxIDForMigration: crictl pods lookup failed", "migration", migrationName, "replacementPod", replName, "err", err)
+		return ""
+	}
+	id := strings.TrimSpace(string(out))
+	if id == "" {
+		return ""
+	}
+	// crictl -q can return multiple matching IDs (one per line) if the name filter is not exact;
+	// take the first — same "lowest/first entrant wins" tie-break philosophy already used
+	// elsewhere in this file for ambiguous multi-candidate resolution.
+	if idx := strings.IndexByte(id, '\n'); idx >= 0 {
+		id = id[:idx]
+	}
+	return id
+}
+
 // ReportRestoreConfirmed patches the PodMigration CR status to record that CRIU
 // restore completed successfully (ADR-0120 D3). It sets criuRestoreConfirmed=true
 // and restoredPID on the named migration's status subresource. migrationName is the
@@ -853,12 +959,30 @@ func (s *AgentServer) resolveImageFromReplacementPod(migrationName string) strin
 // collected by the NRI plugin at restore time so the operator can install the destination
 // neighbor/FDB handoff for the OLD pod IP. May be empty if MAC collection failed; the
 // operator falls back to a diagnostic exec in that case.
-func (s *AgentServer) ReportRestoreConfirmed(ctx context.Context, migrationName, namespace string, pid int32, replVethMAC string) error {
+//
+// holderPID and podCgroup (ADR-0228) are the values joinNsRestore resolved alongside pid:
+// holderPID is the CRIU-restore subprocess/wrapper PID (the holder stub), podCgroup is the
+// resolved pod cgroup path pid was moved into. ReportRestoreConfirmed is the single enforcement
+// point for Invariant 1 — it runs verifyRestoredPIDLiveAndIdentity, on every call path (NRI and
+// both gRPC branches), IMMEDIATELY BEFORE the status patch below, and refuses to set
+// RestoredPID/CRIURestoreConfirmed on failure (Invariant 2: this synchronous gate IS the
+// enforced holder→restored-application handoff-complete condition — ReportRestoreConfirmed is
+// unreachable past this point while the check has not passed). holderPID<=0/podCgroup=="" are
+// tolerated as a degraded (logged, non-fatal) skip of the corresponding sub-check only when a
+// caller genuinely cannot supply them; every current caller in this codebase supplies both.
+func (s *AgentServer) ReportRestoreConfirmed(ctx context.Context, migrationName, namespace string, pid int32, replVethMAC string, holderPID int, podCgroup string) error {
 	if s.k8sClient == nil {
 		return fmt.Errorf("ReportRestoreConfirmed: no k8s client available on agent server")
 	}
 	if migrationName == "" || namespace == "" {
 		return fmt.Errorf("ReportRestoreConfirmed: migrationName and namespace are required (got %q/%q)", namespace, migrationName)
+	}
+
+	// ADR-0228 Invariant 1/2 gate — runs before anything else in this function touches the CR.
+	if verErr := verifyRestoredPIDLiveAndIdentity(int(pid), holderPID, podCgroup); verErr != nil {
+		log.Error(verErr, "ReportRestoreConfirmed: ADR-0228 liveness/identity gate FAILED — refusing to record RestoredPID/CRIURestoreConfirmed",
+			"migration", migrationName, "namespace", namespace, "pid", pid, "holderPID", holderPID, "podCgroup", podCgroup)
+		return fmt.Errorf("ReportRestoreConfirmed: ADR-0228 liveness/identity gate: %w", verErr)
 	}
 
 	pm := &pmv1.PodMigration{}
@@ -880,6 +1004,34 @@ func (s *AgentServer) ReportRestoreConfirmed(ctx context.Context, migrationName,
 	log.Info("ReportRestoreConfirmed: criuRestoreConfirmed set true",
 		"migration", migrationName, "namespace", namespace, "restoredPID", pid, "replVethMAC", replVethMAC)
 	return nil
+}
+
+// classifyReportRestoreConfirmedFailure implements the ADR-0228 "Transient-retry vs.
+// terminal-rollback classification" for the new error returns Invariant 1's gate introduces at
+// the ReportRestoreConfirmed call sites in the gRPC Restore handler. It is only responsible for
+// errors ORIGINATING from the Invariant-1 gate (wrapped ErrRestoredPIDDead/IsHolder/Reparented);
+// any other ReportRestoreConfirmed error (e.g. a k8s API transient) is left to the caller's
+// existing non-fatal logging — handled=false signals "not one of mine."
+//
+//   - ErrRestoredPIDIsHolder: terminal-rollback. A positive identity determination (the
+//     resolved PID IS the holder, not a transient absence) — zeroize and fail closed.
+//   - ErrRestoredPIDDead / ErrRestoredPIDReparented: transient-retry. Legitimate settle-race or
+//     resolution-timing outcomes the controller's retry/requeue loop is designed to recover
+//     from — checkpoint images MUST be preserved (no zeroize), matching the existing
+//     restoreConfirmed-gated defer behavior for every other transient failure on this path.
+func (s *AgentServer) classifyReportRestoreConfirmedFailure(rcErr error, migrationName, imagesDir string, restoreConfirmed *bool) (*agentpb.RestoreResponse, bool) {
+	switch {
+	case errors.Is(rcErr, ErrRestoredPIDIsHolder):
+		log.Error(rcErr, "ADR-0228: ReportRestoreConfirmed gate — terminal-rollback (resolved PID is the holder stub)", "migration", migrationName)
+		*restoreConfirmed = false
+		_ = zeroizeDir(imagesDir)
+		return &agentpb.RestoreResponse{Success: false, ErrorMessage: fmt.Sprintf("restore aborted (terminal, ADR-0228): %v", rcErr)}, true
+	case errors.Is(rcErr, ErrRestoredPIDDead), errors.Is(rcErr, ErrRestoredPIDReparented):
+		log.Error(rcErr, "ADR-0228: ReportRestoreConfirmed gate — transient-retry (checkpoint images preserved)", "migration", migrationName)
+		return &agentpb.RestoreResponse{Success: false, ErrorMessage: fmt.Sprintf("restore incomplete, will retry (ADR-0228): %v", rcErr)}, true
+	default:
+		return nil, false
+	}
 }
 
 // SingleHomeRestoredPod implements ADR-0137 (single-home variant): after CRIU restore and the
@@ -1177,7 +1329,6 @@ func parseLinkEther(out string) string {
 	}
 	return ""
 }
-
 
 // resolvedNetnsPaths caches the netns path CRIU joined per migration (ADR-0133), so the NRI
 // restore callback can read eth0's MAC from the exact pod netns rather than the restored
@@ -1859,6 +2010,7 @@ func installOldIPForwardAccept(ctx context.Context, oldIP net.IP) error {
 // per node, so callers pass the directions relevant to their node:
 //   - "both": PREROUTING -d and -s, plus OUTPUT -d (destination node, ADR-0139)
 //   - "source": PREROUTING -s, plus OUTPUT -d (source node, ADR-0136)
+//
 // Idempotent: delete-then-insert. Best-effort: returns the first insert error.
 func installOldIPNotrack(ctx context.Context, oldIP net.IP, mode string) error {
 	cidr := oldIP.String() + "/32"
@@ -2776,7 +2928,7 @@ var standardPodMounts = []string{
 	"/dev/termination-log",
 	"/var/run/secrets/kubernetes.io/serviceaccount",
 	"/run/secrets/kubernetes.io/serviceaccount", // /var/run is a symlink to /run on modern Linux; ctr checkpoint records the canonical form; handled by --skip-mnt in buildCRIURestoreArgs (ADR-0190)
-	"/sys",                                      // captured by ctr checkpoint as an external mount; handled by --ext-mount-map auto in buildCRIURestoreArgs (ADR-0190)
+	"/sys", // captured by ctr checkpoint as an external mount; handled by --ext-mount-map auto in buildCRIURestoreArgs (ADR-0190)
 	"/dev/shm",
 	"/etc/resolv.conf",
 	"/etc/hostname",
@@ -3208,7 +3360,16 @@ func copyFile(src, dst string) error {
 //
 // Returns the host PID of the restored process.
 // storedHostVeth is the host-side veth peer name stored by PrepareDestinationNetns (Gate30).
-func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error) {
+// holderPIDOut and podCgroupOut (ADR-0228) are out-parameters, always non-nil, that joinNsRestore
+// populates on the success path so the caller can thread them into
+// verifyRestoredPIDLiveAndIdentity via ReportRestoreConfirmed: *holderPIDOut is set to the CRIU
+// restore subprocess/wrapper PID (the holder, per ADR-0198's holder-over-running-restore model —
+// the process the resolver diffs the broker cgroup against and explicitly excludes as a match)
+// and *podCgroupOut is set to the resolved pod cgroup path used for residency anchoring. Using
+// out-parameters here (rather than widening the function's main return tuple across all ~17
+// existing early-return sites in this function) keeps this ADR's diff scoped to the sites that
+// actually produce these values.
+func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, holderPIDOut *int, podCgroupOut *string) (int, []ExternalMountDroppedInfo, error) {
 	// Gate30: use the host-side veth name stored during PrepareDestinationNetns rather than
 	// re-deriving from migrationName.  Re-derivation diverges when the controller passes a
 	// pod UID to PrepareDestinationNetns and a migration name to Restore.
@@ -3667,51 +3828,65 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 
 	// Step 5: ADR-0123 D2 — locate the restored application PID via the replacement pod's
 	// cgroup, NOT by process name. CRIU has exited (D1), so its PID can no longer be confused
-	// with the application and there is no zombie to match. On the cold (--join-ns net:<path>) path the
-	// sandboxID anchors the pod cgroup; the comm-based findRestoredProcessPID is never used as a
-	// fallback (D2 step 5). The --join-ns Restore (TCP-stateful) path (no sandboxID) is out of Sprint-18 scope
-	// and retains the legacy name/cgroup scan.
+	// with the application and there is no zombie to match.
+	//
+	// ADR-0228 NRI/gRPC symmetry: findRestoredProcessPID's comm-scan is retired as a resolution
+	// mechanism on every live restore path, not just the cold NRI path. If sandboxID is empty,
+	// this is now ALWAYS a hard fail-closed (ErrSandboxRequiredForVerifiedRestore) rather than a
+	// silent degrade to the weaker name-based scan — a weaker-but-reporting-success fallback is
+	// the load-bearing defect the ADR closes. Every caller of joinNsRestoreFn is required to
+	// supply a real sandboxID (agent-side self-resolution on the gRPC path — see the Restore RPC
+	// handler — mirrors the existing ADR-0217 D2 workload-image self-resolve pattern).
+	if sandboxID == "" {
+		return 0, nil, fmt.Errorf("%w (migration %s)", ErrSandboxRequiredForVerifiedRestore, migrationName)
+	}
+
 	var pid int
-	if sandboxID != "" {
-		// ADR-0128: --manage-cgroups=ignore leaves the restored tree in the launcher's cgroup, not
-		// the pod cgroup, so the ADR-0123 D2 pod-cgroup scan finds nothing. Instead diff the
-		// launcher cgroup against the pre-CRIU snapshot to find the new workload PID, then move it
-		// into the pod's sandbox cgroup so containerd/k8s can manage it.
-		// ADR-0234: the launcher is now the BROKER (the wrapper is a broker child), so the diff is
-		// against the BROKER cgroup — the PID set the broker returns on exec_poll. beforeAgentPIDs
-		// is the broker-cgroup baseline captured in the liveness loop above.
-		if agentPIDsErr != nil {
-			return 0, nil, fmt.Errorf("ADR-0128: snapshot broker cgroup PIDs before restore: %w", agentPIDsErr)
-		}
-		if beforeAgentPIDs == nil {
-			return 0, nil, fmt.Errorf("ADR-0128: broker cgroup baseline was never captured (wrapper never polled live)")
-		}
-		pid, err = findRestoredPIDInBrokerCgroup(beforeAgentPIDs, criuWrapperPID, criuCmd)
-		if err != nil {
-			// Fail loud — never fall back to comm-scan on the cold path (D2 step 5 / AC5).
-			return 0, nil, err
-		}
-		// Resolve the pod's sandbox cgroup path from the pause PID (same anchor as ADR-0123 D2).
-		pausePID, perr := sandboxPausePID(sandboxID)
-		if perr != nil {
-			return 0, nil, fmt.Errorf("ADR-0128: resolve pause PID for sandbox %s: %w", sandboxID, perr)
-		}
-		podCgroup, cerr := cgroupV2Path(pausePID)
-		if cerr != nil {
-			return 0, nil, fmt.Errorf("ADR-0128: read pod cgroup from pause PID %d (sandbox %s): %w",
-				pausePID, sandboxID, cerr)
-		}
-		// Move the restored tree root into the pod cgroup (single cgroup.procs write moves the group).
-		if merr := moveProcessToPodCgroup(pid, podCgroup); merr != nil {
-			return 0, nil, fmt.Errorf("ADR-0128: move restored PID %d into pod cgroup %s: %w", pid, podCgroup, merr)
-		}
-		log.Info("joinNsRestore: moved restored process into pod cgroup (ADR-0128)",
-			"pid", pid, "podCgroup", podCgroup, "sandboxID", sandboxID)
-	} else {
-		pid, err = findRestoredProcessPID(checkpointDir)
-		if err != nil {
-			return 0, nil, err
-		}
+	// ADR-0128: --manage-cgroups=ignore leaves the restored tree in the launcher's cgroup, not
+	// the pod cgroup, so the ADR-0123 D2 pod-cgroup scan finds nothing. Instead diff the
+	// launcher cgroup against the pre-CRIU snapshot to find the new workload PID, then move it
+	// into the pod's sandbox cgroup so containerd/k8s can manage it.
+	// ADR-0234: the launcher is now the BROKER (the wrapper is a broker child), so the diff is
+	// against the BROKER cgroup — the PID set the broker returns on exec_poll. beforeAgentPIDs
+	// is the broker-cgroup baseline captured in the liveness loop above.
+	if agentPIDsErr != nil {
+		return 0, nil, fmt.Errorf("ADR-0128: snapshot broker cgroup PIDs before restore: %w", agentPIDsErr)
+	}
+	if beforeAgentPIDs == nil {
+		return 0, nil, fmt.Errorf("ADR-0128: broker cgroup baseline was never captured (wrapper never polled live)")
+	}
+	pid, err = findRestoredPIDInBrokerCgroup(beforeAgentPIDs, criuWrapperPID, criuCmd)
+	if err != nil {
+		// Fail loud — never fall back to comm-scan on the cold path (D2 step 5 / AC5).
+		return 0, nil, err
+	}
+	// Resolve the pod's sandbox cgroup path from the pause PID (same anchor as ADR-0123 D2).
+	pausePID, perr := sandboxPausePID(sandboxID)
+	if perr != nil {
+		return 0, nil, fmt.Errorf("ADR-0128: resolve pause PID for sandbox %s: %w", sandboxID, perr)
+	}
+	podCgroup, cerr := cgroupV2Path(pausePID)
+	if cerr != nil {
+		return 0, nil, fmt.Errorf("ADR-0128: read pod cgroup from pause PID %d (sandbox %s): %w",
+			pausePID, sandboxID, cerr)
+	}
+	// Move the restored tree root into the pod cgroup (single cgroup.procs write moves the group).
+	if merr := moveProcessToPodCgroup(pid, podCgroup, pausePID); merr != nil {
+		return 0, nil, fmt.Errorf("ADR-0128: move restored PID %d into pod cgroup %s: %w", pid, podCgroup, merr)
+	}
+	log.Info("joinNsRestore: moved restored process into pod cgroup (ADR-0128)",
+		"pid", pid, "podCgroup", podCgroup, "sandboxID", sandboxID)
+
+	// ADR-0228 Invariant 1/2: hand the holder PID (the CRIU restore subprocess/wrapper — the
+	// process this resolution step explicitly excludes as a match, i.e. the holder-over-
+	// running-restore stub) and the resolved pod cgroup back to the caller, so
+	// ReportRestoreConfirmed can run the liveness/identity gate before ever recording
+	// RestoredPID/CRIURestoreConfirmed.
+	if holderPIDOut != nil {
+		*holderPIDOut = criuWrapperPID
+	}
+	if podCgroupOut != nil {
+		*podCgroupOut = podCgroup
 	}
 	log.Info("joinNsRestore: found restored process", "pid", pid)
 
@@ -3739,10 +3914,10 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 // the exact isConnRefused() semantics (error-classification preservation
 // across the host-netns→pod-netns relocation, same commit).
 const (
-	inetnsProbeExitSuccess   = 0 // SYN-ACK: a listener answered — IP live
-	inetnsProbeExitRefused   = 64 // RST (ECONNREFUSED): kernel answered, no listener — IP live (success)
-	inetnsProbeExitTimeout   = 65 // i/o timeout: no kernel on the path owns the IP — failure
-	inetnsProbeExitOtherErr  = 66 // any other dial error — failure
+	inetnsProbeExitSuccess  = 0  // SYN-ACK: a listener answered — IP live
+	inetnsProbeExitRefused  = 64 // RST (ECONNREFUSED): kernel answered, no listener — IP live (success)
+	inetnsProbeExitTimeout  = 65 // i/o timeout: no kernel on the path owns the IP — failure
+	inetnsProbeExitOtherErr = 66 // any other dial error — failure
 )
 
 // probeOldIPInPodNetns performs the ADR-0200 D1 reachability probe by re-executing this same
@@ -3895,6 +4070,29 @@ func (s *AgentServer) StartReachabilityEcho(ctx context.Context, req *agentpb.St
 	if replPID <= 0 {
 		resp.Started = false
 		resp.Detail = "ADR-0210: replacement PID not yet resolvable — echo deferred to requeue"
+		return resp, nil
+	}
+	// ADR-0228 Invariant 3 fail-fast pre-check: re-check RestoredPID liveness ONE time,
+	// agent-side, before starting the (potentially long) cross-node nonce round-trip. This runs
+	// agent-side over the existing authenticated mTLS channel — never controller-local /proc
+	// access, which would require granting the operator hostPID or a node /proc hostPath mount
+	// (explicitly prohibited; Security Reviewer round-1 C2). Invariant 1 already prevents a
+	// dead/wrong PID from ever being recorded; this is defense-in-depth for the legitimate case
+	// of a live-at-recording-time PID dying later (e.g. app crash after handoff).
+	if _, statErr := os.Stat(fmt.Sprintf("/proc/%d", replPID)); statErr != nil {
+		resp.Started = false
+		resp.ProcessDied = true
+		resp.Detail = fmt.Sprintf("ADR-0228: RestoredProcessDied — /proc/%d absent at reachability pre-check", replPID)
+		log.Info("StartReachabilityEcho: ADR-0228 fail-fast pre-check found RestoredPID dead — returning RestoredProcessDied instead of starting echo",
+			"migration", req.MigrationName, "restoredPID", replPID)
+		return resp, nil
+	}
+	if procIsZombie(replPID) {
+		resp.Started = false
+		resp.ProcessDied = true
+		resp.Detail = fmt.Sprintf("ADR-0228: RestoredProcessDied — pid %d is a zombie at reachability pre-check", replPID)
+		log.Info("StartReachabilityEcho: ADR-0228 fail-fast pre-check found RestoredPID zombied — returning RestoredProcessDied instead of starting echo",
+			"migration", req.MigrationName, "restoredPID", replPID)
 		return resp, nil
 	}
 	ttl := req.TtlS
@@ -4087,16 +4285,106 @@ func findRestoredPIDInAgentCgroup(beforePIDs map[int]bool, criuPID int) (int, er
 	}
 }
 
-// moveProcessToPodCgroup implements ADR-0128: moves pid into the pod's sandbox cgroup by writing
-// it to <podCgroupPath>/cgroup.procs under /sys/fs/cgroup. A single cgroup.procs write moves the
-// whole thread group of the leader; the CRIU-restored tree shares one cgroup, so moving the root
-// migrates the group. podCgroupPath is the cgroup v2 path (e.g. "/kubepods.slice/.../...scope").
-func moveProcessToPodCgroup(pid int, podCgroupPath string) error {
-	procsPath := filepath.Join("/sys/fs/cgroup", podCgroupPath, "cgroup.procs")
-	if err := os.WriteFile(procsPath, []byte(strconv.Itoa(pid)), 0o644); err != nil {
-		return fmt.Errorf("write PID %d to %s: %w", pid, procsPath, err)
+// moveProcessToPodCgroupProbe implements the ADR-0228 mandatory one-shot read-only diagnostic
+// probe that MUST run before moveProcessToPodCgroup's fix shape is chosen (CLAUDE.md rule 3l /
+// §P-PREMISE — no data-state/runtime-behavior premise without a decode/probe). It records:
+//
+//	(a) whether procsPath exists in the agent's OWN mount/cgroup namespace view;
+//	(b) the agent's own cgroup-namespace identity (/proc/self/ns/cgroup, /proc/self/cgroup)
+//	    versus the same for pausePID;
+//	(c) a tight retry-with-backoff over a few hundred ms to see whether the path appears.
+//
+// Static-code-reading disposition for this ADR's implementation pass (no live cluster available
+// to re-run the probe against real containerd state): every OTHER host-side operation this file
+// performs against containerd/cgroup/mount state — sandboxPausePID, the ctr image pull/tasks/
+// containers calls, the /sys lazy-umount fix, ReadReplVethMAC, SingleHomeRestoredPod — routes
+// through nsenterCmd/exec("nsenter", "--net="/"--mnt="...) specifically because the agent runs
+// inside its OWN container with its OWN mount/cgroup namespace, distinct from the host's. The
+// ONE outlier was moveProcessToPodCgroup's direct os.WriteFile against
+// "/sys/fs/cgroup"+podCgroupPath evaluated in the agent's own namespace — every other write/read
+// of a host cgroup or mount path in this file deliberately avoids that same mistake. That
+// pattern is strong static evidence for hypothesis (b) (cgroup-namespace path-visibility
+// mismatch), not (a) (pure timing race): a race would have to be extremely persistent to explain
+// a "no such file or directory" that every structurally-identical operation elsewhere in this
+// file avoids by never evaluating the host path from the agent's own namespace in the first
+// place. This probe still performs the retry-with-backoff live check (c) to rule out a
+// coincident timing component, and its output is embedded in moveProcessToPodCgroup's return
+// value/log line so a future implementer with live-cluster access has the actual recorded probe
+// output, not just this static inference, to confirm or override the fix-shape choice below.
+type moveProcessToPodCgroupProbeResult struct {
+	AgentNSVisible    bool   // (a) procsPath existed in the agent's own namespace view
+	AppearedAfterWait bool   // (c) procsPath appeared within the retry-with-backoff window
+	AgentCgroupNS     string // (b) agent's own /proc/self/ns/cgroup symlink target
+	PauseCgroupNS     string // (b) pausePID's /proc/<pausePID>/ns/cgroup symlink target
+	NSMismatch        bool   // (b) AgentCgroupNS != PauseCgroupNS (both resolved, non-empty)
+}
+
+func moveProcessToPodCgroupProbe(procsPath string, pausePID int) moveProcessToPodCgroupProbeResult {
+	var res moveProcessToPodCgroupProbeResult
+
+	if _, err := os.Stat(procsPath); err == nil {
+		res.AgentNSVisible = true
 	}
-	return nil
+
+	res.AgentCgroupNS, _ = os.Readlink("/proc/self/ns/cgroup")
+	if pausePID > 0 {
+		res.PauseCgroupNS, _ = os.Readlink(fmt.Sprintf("/proc/%d/ns/cgroup", pausePID))
+	}
+	if res.AgentCgroupNS != "" && res.PauseCgroupNS != "" && res.AgentCgroupNS != res.PauseCgroupNS {
+		res.NSMismatch = true
+	}
+
+	if !res.AgentNSVisible {
+		deadline := time.Now().Add(400 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+			if _, err := os.Stat(procsPath); err == nil {
+				res.AppearedAfterWait = true
+				break
+			}
+		}
+	}
+	return res
+}
+
+// moveProcessToPodCgroup implements ADR-0128 (moves pid into the pod's sandbox cgroup) with the
+// ADR-0228 fix: probe first (moveProcessToPodCgroupProbe), then apply the fix shape the probe's
+// recorded output selects. Per the static-reading disposition documented on the probe: this
+// implementation applies the namespace-invariant write (route the write through the host mount
+// namespace via nsenter, exactly like every other host cgroup/mount touch in this file) as the
+// primary fix for hypothesis (b), AND wraps it in a bounded retry-with-backoff as defense-in-
+// depth for hypothesis (a) in case a genuine race is also present. pausePID anchors the
+// namespace-identity comparison in the probe (the pod's own cgroup-namespace-invariant
+// reference point, same anchor ADR-0123 D2 already uses for cgroup path resolution).
+func moveProcessToPodCgroup(pid int, podCgroupPath string, pausePID int) error {
+	procsPath := filepath.Join("/sys/fs/cgroup", podCgroupPath, "cgroup.procs")
+
+	probe := moveProcessToPodCgroupProbe(procsPath, pausePID)
+	log.Info("moveProcessToPodCgroup: ADR-0228 pre-write diagnostic probe",
+		"pid", pid, "procsPath", procsPath,
+		"agentNSVisible", probe.AgentNSVisible, "appearedAfterWait", probe.AppearedAfterWait,
+		"agentCgroupNS", probe.AgentCgroupNS, "pauseCgroupNS", probe.PauseCgroupNS, "nsMismatch", probe.NSMismatch)
+
+	var lastErr error
+	deadline := time.Now().Add(1 * time.Second)
+	for attempt := 1; ; attempt++ {
+		// Namespace-invariant write: go via nsenter into the host mount namespace, mirroring
+		// every other host cgroup/mount-path touch in this file (sandboxPausePID, the ctr
+		// calls, the /sys lazy-umount fix) instead of evaluating procsPath in the agent's own
+		// mount/cgroup namespace, which is the path-visibility bug the probe's static evidence
+		// points to.
+		out, err := nsenterCmd("/bin/sh", "-c",
+			fmt.Sprintf("echo %d > %s", pid, procsPath)).CombinedOutput()
+		if err == nil {
+			return nil
+		}
+		lastErr = fmt.Errorf("write PID %d to %s (attempt %d): %w (%s)", pid, procsPath, attempt, err, strings.TrimSpace(string(out)))
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return lastErr
 }
 
 // scanCgroupForRestoredRoot performs one pass of the ADR-0123 D2 scan over /proc. It returns the
@@ -4190,6 +4478,114 @@ func procPPid(pid int) int {
 		}
 	}
 	return 0
+}
+
+// procIsZombie reports whether pid's /proc/<pid>/stat "state" field (the 3rd whitespace field,
+// after the parenthesized comm which may itself contain spaces) is 'Z'. Returns false (not a
+// zombie / not determinable) on any read error — callers combine this with an explicit
+// existence check, so a read error here is only reached after existence already passed.
+func procIsZombie(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return false
+	}
+	s := string(data)
+	close := strings.LastIndex(s, ")")
+	if close < 0 || close+2 >= len(s) {
+		return false
+	}
+	fields := strings.Fields(s[close+1:])
+	if len(fields) == 0 {
+		return false
+	}
+	return fields[0] == "Z"
+}
+
+// restoredPIDLivenessSettleWindow is the delay between the first and second /proc/<pid>
+// liveness read in verifyRestoredPIDLiveAndIdentity (ADR-0228 Invariant 1.1). This rejects a
+// PID that exited between resolution and the check (the "verified the holder, not the
+// post-handoff process" race) without materially slowing the happy path. Tuning detail per the
+// ADR's "Open questions for implementation" §2 — not a spec invariant.
+const restoredPIDLivenessSettleWindow = 50 * time.Millisecond
+
+// verifyRestoredPIDLiveAndIdentity implements ADR-0228 Invariant 1 and is the single
+// enforcement point Invariant 2 designates as the handoff-complete gate: ReportRestoreConfirmed
+// calls this immediately before it is allowed to set RestoredPID/CRIURestoreConfirmed, on every
+// call path (NRI and both gRPC branches) that can reach it.
+//
+//  1. Liveness: /proc/<pid> must exist, and a second read after a short settle window must show
+//     it still exists and is not a zombie (state != 'Z').
+//  2. Identity — not the holder: pid must not equal, and must not be a live descendant of,
+//     holderPID (the CRIU-restore subprocess/wrapper PID recorded at holder-start time and
+//     threaded through from joinNsRestore). This is the load-bearing identity signal (closes
+//     Security Reviewer round-1 C3) — comm is never consulted here.
+//  3. Identity — cgroup residency: when podCgroup is non-empty, pid must reside in that cgroup
+//     subtree (the same cgroup the cgroup-anchored resolver diffed against).
+//  4. Identity — not transient (tree root): pid's parent must not itself be resident in
+//     podCgroup — i.e. pid was not reparented under another cgroup-resident process since
+//     resolution.
+//
+// holderPID <= 0 or podCgroup == "" degrade the corresponding check to a logged skip rather than
+// a hard failure — this only occurs on call paths that could not supply that context (the
+// function is still called on every path; see per-caller notes at each call site for why a given
+// input may be unavailable).
+func verifyRestoredPIDLiveAndIdentity(pid, holderPID int, podCgroup string) error {
+	if pid <= 0 {
+		return fmt.Errorf("%w: invalid pid %d", ErrRestoredPIDDead, pid)
+	}
+
+	// 1. Liveness — first read.
+	if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); err != nil {
+		return fmt.Errorf("%w: /proc/%d absent: %v", ErrRestoredPIDDead, pid, err)
+	}
+	if procIsZombie(pid) {
+		return fmt.Errorf("%w: pid %d is a zombie (first read)", ErrRestoredPIDDead, pid)
+	}
+	// Settle window, then re-read — closes the exited-between-resolution-and-check race.
+	time.Sleep(restoredPIDLivenessSettleWindow)
+	if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); err != nil {
+		return fmt.Errorf("%w: /proc/%d absent after settle window: %v", ErrRestoredPIDDead, pid, err)
+	}
+	if procIsZombie(pid) {
+		return fmt.Errorf("%w: pid %d is a zombie after settle window", ErrRestoredPIDDead, pid)
+	}
+
+	// 2. Identity — not the holder. Numeric comparison against the holder's own recorded PID,
+	// and against the live ancestor chain (a descendant of the holder is still the holder's
+	// tree, not the handed-off application). comm is NOT consulted (Security Reviewer C3).
+	if holderPID > 0 {
+		if pid == holderPID {
+			return fmt.Errorf("%w: pid %d == holderPID", ErrRestoredPIDIsHolder, pid)
+		}
+		walk := pid
+		for depth := 0; depth < 64; depth++ {
+			ppid := procPPid(walk)
+			if ppid <= 1 || ppid == walk {
+				break
+			}
+			if ppid == holderPID {
+				return fmt.Errorf("%w: pid %d is a live descendant of holderPID %d", ErrRestoredPIDIsHolder, pid, holderPID)
+			}
+			walk = ppid
+		}
+	} else {
+		log.Info("verifyRestoredPIDLiveAndIdentity: holderPID unavailable — identity-not-holder check skipped (degraded)", "pid", pid)
+	}
+
+	// 3/4. Cgroup residency + tree-root re-confirmation.
+	if podCgroup != "" {
+		if !procInPodCgroup(pid, podCgroup) {
+			return fmt.Errorf("%w: pid %d not resident in expected cgroup %s", ErrRestoredPIDIsHolder, pid, podCgroup)
+		}
+		ppid := procPPid(pid)
+		if ppid > 0 && procInPodCgroup(ppid, podCgroup) {
+			return fmt.Errorf("%w: pid %d parent %d is itself cgroup-resident", ErrRestoredPIDReparented, pid, ppid)
+		}
+	} else {
+		log.Info("verifyRestoredPIDLiveAndIdentity: podCgroup unavailable — residency/tree-root check skipped (degraded)", "pid", pid)
+	}
+
+	return nil
 }
 
 // sandboxPausePID resolves the host PID of the pause/sandbox container identified by sandboxID
@@ -4808,14 +5204,14 @@ else:
 			if strings.HasPrefix(line, "CRIU_IMAGE_INCONSISTENCY:") {
 				payload := strings.TrimPrefix(line, "CRIU_IMAGE_INCONSISTENCY:")
 				var parsed struct {
-					FdID        int    `json:"fd_id"`
-					NameLeaf    string `json:"name_leaf"`
-					BackingMntID int   `json:"backing_mnt_id"`
+					FdID         int    `json:"fd_id"`
+					NameLeaf     string `json:"name_leaf"`
+					BackingMntID int    `json:"backing_mnt_id"`
 				}
 				if jsonErr := json.Unmarshal([]byte(payload), &parsed); jsonErr == nil {
 					return nil, &CRIUImageInconsistencyError{
-						FdID:        parsed.FdID,
-						NameLeaf:    parsed.NameLeaf,
+						FdID:         parsed.FdID,
+						NameLeaf:     parsed.NameLeaf,
 						BackingMntID: parsed.BackingMntID,
 					}
 				}
@@ -5152,6 +5548,15 @@ func setupRestoreOverlayfs(migrationName, checkpointDir, imageName, containerID 
 // findRestoredProcessPID scans /proc for the restored container process by reading the
 // expected comm name from config.json process.args[0] in checkpointDir.
 // Falls back to scanning for any recently-created non-pause process if config.json is absent.
+//
+// RETIRED as a resolution mechanism on every live restore path (ADR-0228 NRI/gRPC symmetry):
+// it is unconditionally weaker than findRestoredPIDInBrokerCgroup — zero cgroup anchoring, zero
+// exclusion of a still-running holder process that shares a name or starts late, zero liveness
+// re-verification — and comm is attacker-controlled by the restored workload via
+// prctl(PR_SET_NAME), which the ADR's Invariant 1 forbids as a load-bearing identity signal.
+// joinNsRestore now fails closed (ErrSandboxRequiredForVerifiedRestore) instead of calling this
+// function. Left in place only in case a future non-restore diagnostic tool wants a best-effort
+// name-based scan; it must not be reintroduced as a restore-path PID resolver.
 func findRestoredProcessPID(checkpointDir string) (int, error) {
 	// Determine the expected process name from config.json.
 	expectedComm := ""
@@ -5924,6 +6329,22 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		}
 	}
 
+	// ADR-0228 NRI/gRPC symmetry: resolve the replacement pod's containerd sandbox ID so this
+	// gRPC path resolves RestoredPID via the SAME cgroup-anchored mechanism as the NRI path
+	// (findRestoredPIDInBrokerCgroup + moveProcessToPodCgroup), instead of the retired comm-scan
+	// fallback. req.SandboxId is the controller-supplied value (when the controller can obtain
+	// it); when empty, self-resolve from the replacement pod exactly like the ADR-0217 D2
+	// workload-image self-resolve above. If both are empty, joinNsRestore fails closed with
+	// ErrSandboxRequiredForVerifiedRestore — no silent degrade to a weaker resolver.
+	resolvedSandboxID := req.SandboxId
+	if resolvedSandboxID == "" && s.k8sClient != nil {
+		if resolved := s.resolveSandboxIDForMigration(req.MigrationName); resolved != "" {
+			resolvedSandboxID = resolved
+			log.Info("ADR-0228: gRPC Restore — sandbox_id empty on request, self-resolved from replacement pod",
+				"migration", req.MigrationName, "sandboxID", resolvedSandboxID)
+		}
+	}
+
 	// SD-2 (ADR-0029, ADR-0160): decrypt the checkpoint layer set in place before CRIU reads it.
 	// No-op when the encrypted-set marker is absent (encryption was off, or a prior restore
 	// attempt already decrypted — idempotent). Fail closed: a marked-encrypted final/ with no
@@ -5997,12 +6418,31 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		storedVeth := s.destHostVeth[req.MigrationName]
 		s.destHostVethMu.RUnlock()
 		// ADR-0168 B2: pass storedWorkloadImage so the placeholder uses the correct image.
-		pid, droppedMnts, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, "", storedVeth, false)
+		// ADR-0228: pass resolvedSandboxID so this branch resolves RestoredPID via the same
+		// cgroup-anchored mechanism as the NRI path; holderPID/restoredPodCgroup feed the
+		// Invariant-1 gate in ReportRestoreConfirmed below.
+		var holderPID int
+		var restoredPodCgroup string
+		pid, droppedMnts, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, resolvedSandboxID, storedVeth, false, &holderPID, &restoredPodCgroup)
 		// SD-4: CRIU restore has returned — ptrace is no longer expected. Close the window on
 		// the happy path immediately (the deferred close above is the fallback for early returns).
 		_ = seccomp.PtraceWindowClose(req.MigrationName)
 		for _, d := range droppedMnts {
 			s.emitExternalMountDroppedEvent(context.Background(), req.MigrationName, d)
+		}
+		// ADR-0228 terminal-rollback classification: a fail-closed sandbox/identity resolution
+		// error from joinNsRestoreFn on the config.json branch is a new exit path this ADR
+		// introduces. joinErr is handled uniformly below (the existing "runc restore failed"
+		// return); see the raw-CRIU branch and the Invariant-1 gate failure path further down
+		// for the explicit zeroizeDir(imagesDir) wiring this ADR requires on terminal-rollback
+		// returns — errors.Is(joinErr, ErrSandboxRequiredForVerifiedRestore) is terminal (no
+		// retry can supply a sandbox ID the controller/agent could not resolve this attempt);
+		// all other joinNsRestoreFn errors on this branch remain transient-retry as today
+		// (unchanged behavior — preserved images, controller retries).
+		if joinErr != nil && errors.Is(joinErr, ErrSandboxRequiredForVerifiedRestore) {
+			restoreConfirmed = false
+			_ = zeroizeDir(imagesDir)
+			return &agentpb.RestoreResponse{Success: false, ErrorMessage: fmt.Sprintf("restore aborted (terminal): %v", joinErr)}, nil
 		}
 		restoreDurationMs := time.Since(restoreStart).Milliseconds()
 		if joinErr != nil {
@@ -6109,8 +6549,15 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		if s.k8sClient != nil {
 			ns := s.resolveNamespaceForMigration(ctx, req.MigrationName)
 			if ns != "" {
-				if rcErr := s.ReportRestoreConfirmed(ctx, req.MigrationName, ns, int32(pid), fr.mac); rcErr != nil {
-					log.Error(rcErr, "Restore: ReportRestoreConfirmed failed (non-fatal — GC-08 will not pass)", "migration", req.MigrationName, "namespace", ns)
+				if rcErr := s.ReportRestoreConfirmed(ctx, req.MigrationName, ns, int32(pid), fr.mac, holderPID, restoredPodCgroup); rcErr != nil {
+					// ADR-0228: an ADR-0228 gate failure here is NOT "non-fatal" — reporting
+					// Success=true while the CR was never updated with a verified RestoredPID
+					// is exactly the false-success regression this ADR closes. Classify and
+					// return accordingly instead of falling through to Success=true below.
+					if resp, handled := s.classifyReportRestoreConfirmedFailure(rcErr, req.MigrationName, imagesDir, &restoreConfirmed); handled {
+						return resp, nil
+					}
+					log.Error(rcErr, "Restore: ReportRestoreConfirmed failed (non-ADR-0228 error, non-fatal — GC-08 will not pass)", "migration", req.MigrationName, "namespace", ns)
 				}
 			} else {
 				log.Info("Restore: could not resolve namespace for migration — ReportRestoreConfirmed skipped", "migration", req.MigrationName)
@@ -6167,9 +6614,18 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	s.destHostVethMu.RLock()
 	storedVeth2 := s.destHostVeth[req.MigrationName]
 	s.destHostVethMu.RUnlock()
-	rawPID, droppedMnts2, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, "", storedVeth2, false)
+	var holderPID2 int
+	var restoredPodCgroup2 string
+	rawPID, droppedMnts2, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, resolvedSandboxID, storedVeth2, false, &holderPID2, &restoredPodCgroup2)
 	for _, d := range droppedMnts2 {
 		s.emitExternalMountDroppedEvent(context.Background(), req.MigrationName, d)
+	}
+	if joinErr != nil && errors.Is(joinErr, ErrSandboxRequiredForVerifiedRestore) {
+		// ADR-0228 terminal-rollback: no sandbox ID could be obtained on this attempt either;
+		// the retired comm-scan resolver is not used as a fallback.
+		restoreConfirmed = false
+		_ = zeroizeDir(imagesDir)
+		return &agentpb.RestoreResponse{Success: false, ErrorMessage: fmt.Sprintf("restore aborted (terminal): %v", joinErr)}, nil
 	}
 	if joinErr != nil {
 		log.Info("Restore: joinNsRestore failed", "err", joinErr)
@@ -6191,8 +6647,11 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	if s.k8sClient != nil {
 		ns := s.resolveNamespaceForMigration(ctx, req.MigrationName)
 		if ns != "" {
-			if rcErr := s.ReportRestoreConfirmed(ctx, req.MigrationName, ns, int32(result.PID), fr2.mac); rcErr != nil {
-				log.Error(rcErr, "Restore (raw CRIU path): ReportRestoreConfirmed failed (non-fatal)", "migration", req.MigrationName, "namespace", ns)
+			if rcErr := s.ReportRestoreConfirmed(ctx, req.MigrationName, ns, int32(result.PID), fr2.mac, holderPID2, restoredPodCgroup2); rcErr != nil {
+				if resp, handled := s.classifyReportRestoreConfirmedFailure(rcErr, req.MigrationName, imagesDir, &restoreConfirmed); handled {
+					return resp, nil
+				}
+				log.Error(rcErr, "Restore (raw CRIU path): ReportRestoreConfirmed failed (non-ADR-0228 error, non-fatal)", "migration", req.MigrationName, "namespace", ns)
 			}
 		} else {
 			log.Info("Restore (raw CRIU path): could not resolve namespace — ReportRestoreConfirmed skipped", "migration", req.MigrationName)
@@ -7404,7 +7863,7 @@ func (s *AgentServer) emitCRIUImageInconsistencyEvent(ctx context.Context, migra
 		FirstTimestamp: now,
 		LastTimestamp:  now,
 		Count:          1,
-		Source: corev1.EventSource{Component: "podmotion-agent"},
+		Source:         corev1.EventSource{Component: "podmotion-agent"},
 	}
 	if createErr := s.k8sClient.Create(ctx, event); createErr != nil {
 		log.Error(createErr, "emitCRIUImageInconsistencyEvent: failed to create Event",

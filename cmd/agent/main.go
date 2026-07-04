@@ -27,15 +27,15 @@ import (
 
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/go-logr/logr"
-	k8sruntime "k8s.io/apimachinery/pkg/runtime"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	corev1 "k8s.io/api/core/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -437,7 +437,7 @@ func main() {
 			// NOT call ReadReplVethMAC independently (path-independent contract, ADR-0133 D3).
 			// E1 Condition 2: SingleHomeRestoredPod is called inside finalizeRestore; do not
 			// call it independently here.
-			pid, replVethMAC, err := agentSrv.JoinNsRestore(checkpointRef, checkpointDir, event.ImageName, event.ID, event.SandboxID, tcpPreservationMode)
+			pid, replVethMAC, holderPID, restoredPodCgroup, err := agentSrv.JoinNsRestore(checkpointRef, checkpointDir, event.ImageName, event.ID, event.SandboxID, tcpPreservationMode)
 			if err != nil {
 				log.Error(err, "NRI CRIU restore failed", "container", event.ID)
 				return err
@@ -454,7 +454,7 @@ func main() {
 			reportCtx, reportCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer reportCancel()
 
-			if err := agentSrv.ReportRestoreConfirmed(reportCtx, checkpointRef, migrationNamespace, int32(pid), replVethMAC); err != nil {
+			if err := agentSrv.ReportRestoreConfirmed(reportCtx, checkpointRef, migrationNamespace, int32(pid), replVethMAC, holderPID, restoredPodCgroup); err != nil {
 				log.Error(err, "NRI CRIU restore: failed to report confirmation to CR — controller poll will time out",
 					"migration", checkpointRef, "namespace", migrationNamespace)
 				return err
