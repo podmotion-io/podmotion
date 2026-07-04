@@ -76,12 +76,25 @@ const (
 	conditionDataplaneReconciled        = "DataplaneReconciled"
 	conditionGitOpsSuspended            = "GitOpsSuspended"
 	conditionEndpointSliceCleanVerified = "EndpointSliceCleanupVerified"
+	// cni0CleanupVerifyAttemptsAnnotation stamps the current VerifyCleanup(CUTOVER_COMPLETE)
+	// retry attempt count on the PodMigration so the bounded 3-attempt/2s-4s-8s backoff
+	// (ADR-0241 item 1) survives across reconcile requeues without a blocking sleep.
+	cni0CleanupVerifyAttemptsAnnotation = "podmotion.io/cni0-cleanup-verify-attempts"
 	// conditionIPHandoffInjected records that the ADR-0133 destination-side neighbor/FDB
 	// handoff for the OLD pod IP has been installed and the reachability probe passed.
 	conditionIPHandoffInjected = "IPHandoffInjected"
 	// conditionRestoreTimedOut is set when the restore deadline elapses, driving
 	// the migration to RollingBack (ADR-0157 D3/GC-32). Reason: RestoreDeadlineExceeded.
 	conditionRestoreTimedOut = "RestoreTimedOut"
+)
+
+// cni0CleanupVerifyBackoff is the ADR-0241 item 1 bounded retry schedule for
+// VerifyCleanup(CUTOVER_COMPLETE): up to 3 attempts, 2s/4s/8s backoff, converging to a
+// fail-open (ConditionCni0CleanupVerified=False + DatapathCleanupLeakTotal + a
+// DatapathCleanupLeak Event) on exhaustion rather than a new blocking phase.
+var cni0CleanupVerifyBackoff = []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+const (
 	// conditionDataplaneReachabilityVerified (ADR-0210) is the authoritative cross-node
 	// reachability gate. The CONTROLLER sets it True only after a source-node agent
 	// (a node != destination) dials the preserved pod IP and reads back a controller-issued
@@ -3036,16 +3049,34 @@ func (r *PodMigrationReconciler) verifyDataplaneReachability(ctx context.Context
 
 	srcNode := pm.Status.SourceNodeName
 	if srcNode == "" || srcNode == destNode {
-		// No node != dest vantage available (single-node / source already gone). Cannot prove
-		// cross-node reachability — do NOT set the condition True; hold the source (ADR-0012).
-		log.Error(nil, "ADR-0210: no source-node vantage (node != dest) for cross-node probe — holding source, requeuing",
+		// ADR-0237: same-node (intra-node) migration — cross-node probe is structurally impossible
+		// because there is no off-node network boundary to traverse. The NoCrossNodeVantage permanent
+		// block (former ADR-0210 behavior) caused a structural deadlock: DataplaneReachabilityVerified
+		// was held False forever, and the safety block in reconcileCutoverComplete (line 1377) requeued
+		// every 10s indefinitely — source pod was never deleted (Sprint 37 carry-forward, gate-redis-s35
+		// ran 14+ hours post-CutoverComplete). §P-MECHANISM: docs/sprints/SPRINT38-PMECHANISM-FINALIZATION.md
+		//
+		// Fix: in the same-node case, TrafficVerified=True (set by injectIPHandoff, reason=HandoffInstalled)
+		// is the strongest available proof that the preserved IP is configured on this node. A cross-node
+		// probe from the same node to the same node traverses no additional network boundary beyond what
+		// TrafficVerified already proves. The vacuous gate satisfies ADR-0012's deletion contract
+		// (condition must be True before deletion) without bypassing it.
+		if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionTrafficVerified) {
+			// TrafficVerified not yet set — injectIPHandoff has not completed. Hold and requeue.
+			log.Error(nil, "ADR-0237: same-node migration — TrafficVerified not yet set; holding source, requeuing",
+				"migration", pm.Name, "srcNode", srcNode, "destNode", destNode)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
+		}
+		// TrafficVerified=True: IP handoff confirmed on this node. Set DataplaneReachabilityVerified=True
+		// with reason SameNodeVacuous so the safety block in reconcileCutoverComplete can proceed. (ADR-0237)
+		log.Info("ADR-0237: same-node migration — cross-node probe structurally impossible; TrafficVerified=True satisfies vacuous gate; setting DataplaneReachabilityVerified=True (SameNodeVacuous)",
 			"migration", pm.Name, "srcNode", srcNode, "destNode", destNode)
-		setCondition(pm, conditionDataplaneReachabilityVerified, metav1.ConditionFalse, "NoCrossNodeVantage",
-			"ADR-0210: no node != destination available to originate the cross-node probe")
+		setCondition(pm, conditionDataplaneReachabilityVerified, metav1.ConditionTrue, "SameNodeVacuous",
+			"ADR-0237: intra-node migration — cross-node probe impossible; TrafficVerified=True satisfies vacuous gate (see docs/adr/0237-reconcile-cutover-complete-finalization-trigger-same-node-vacuous-gate.md)")
 		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
 			return ctrl.Result{}, sErr, false
 		}
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil, false
+		return ctrl.Result{}, nil, true
 	}
 
 	// Controller-issued correlation nonce — destination must echo it back through the dialed
@@ -3321,6 +3352,90 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 				} else {
 					log.Info("ADR-0133 D4: source IP handoff cleaned on source node",
 						"migration", pm.Name, "node", srcNode, "oldPodIP", pm.Spec.SourcePodIP)
+				}
+			}
+		}
+	}
+
+	// ADR-0241 item 1 (NR-BLOCK-1 CUTOVER_COMPLETE scope): CleanupSourceIPHandoff above is
+	// best-effort/warn-only, so re-probe with VerifyCleanup and retry the cleanup with a
+	// bounded backoff (3 attempts, 2s/4s/8s) before accepting the result. This blocks
+	// completion of THIS reconcile pass for up to 14s in the worst case but never introduces
+	// a new phase — on retry-budget exhaustion it converges to a fail-open, non-blocking
+	// posture (ConditionCni0CleanupVerified=False + a DatapathCleanupLeakTotal increment per
+	// still-present object + a DatapathCleanupLeak Event), and the migration still completes.
+	if pm.Spec.SourcePodIP != "" && r.AgentPool != nil &&
+		!meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionCni0CleanupVerified) {
+		srcNode := pm.Status.SourceNodeName
+		if srcNode == "" {
+			log.Error(nil, "ADR-0241: SourceNodeName not set — skipping VerifyCleanup this pass (warn-only)", "migration", pm.Name)
+		} else if srcAgent, agErr := r.AgentPool.ForNode(ctx, srcNode); agErr != nil {
+			log.Error(agErr, "ADR-0241: cannot connect to source agent for VerifyCleanup (warn-only, will retry next pass)",
+				"migration", pm.Name, "node", srcNode)
+		} else {
+			vcResp, vcErr := srcAgent.VerifyCleanup(ctx, &agentpb.VerifyCleanupRequest{
+				MigrationName: pm.Name,
+				Scope:         agentpb.CleanupScope_CUTOVER_COMPLETE,
+				OldPodIp:      pm.Spec.SourcePodIP,
+				BridgeIfname:  "", // ADR-0158 D5: empty — agent discovers at runtime. No "cni0" literal.
+				Objects:       []string{"cni0_neigh", "cni0_host_route"},
+			})
+			switch {
+			case vcErr != nil:
+				log.Error(vcErr, "ADR-0241: VerifyCleanup RPC failed (warn-only, will retry next pass)", "migration", pm.Name)
+			case vcResp.Clean:
+				setCondition(pm, pmv1.ConditionCni0CleanupVerified, metav1.ConditionTrue, "Verified",
+					"cni0 neigh and host route confirmed absent after CleanupSourceIPHandoff (ADR-0241)")
+				if pm.Annotations != nil {
+					delete(pm.Annotations, cni0CleanupVerifyAttemptsAnnotation)
+				}
+				if err := r.statusUpdate(ctx, pm); err != nil {
+					return ctrl.Result{}, err
+				}
+			default:
+				attempts := readCni0CleanupVerifyAttempts(pm)
+				if attempts < len(cni0CleanupVerifyBackoff) {
+					// Retry CleanupSourceIPHandoff, then re-verify on the next reconcile pass
+					// (ctrl.Result{RequeueAfter: ...}, not a blocking sleep — ADR-0241 item 1).
+					if _, retryErr := srcAgent.CleanupSourceIPHandoff(ctx, &agentpb.CleanupSourceIPHandoffRequest{
+						MigrationName: pm.Name,
+						OldPodIp:      pm.Spec.SourcePodIP,
+						FdbIfname:     pm.Status.OverlayFdbIfname,
+						BridgeIfname:  "",
+					}); retryErr != nil {
+						log.Error(retryErr, "ADR-0241: retry CleanupSourceIPHandoff RPC failed (warn-only)", "migration", pm.Name)
+					}
+					backoff := cni0CleanupVerifyBackoff[attempts]
+					if pm.Annotations == nil {
+						pm.Annotations = make(map[string]string)
+					}
+					pm.Annotations[cni0CleanupVerifyAttemptsAnnotation] = strconv.Itoa(attempts + 1)
+					if err := r.Update(ctx, pm); err != nil {
+						return ctrl.Result{}, err
+					}
+					log.Info("ADR-0241: cni0 cleanup not yet verified — retrying with backoff",
+						"migration", pm.Name, "attempt", attempts+1, "backoff", backoff, "presentObjects", vcResp.PresentObjects)
+					return ctrl.Result{RequeueAfter: backoff}, nil
+				}
+				// Retry budget exhausted: fail open (ADR-0241 item 1) rather than a new
+				// blocking CleanupFailed phase — disproportionate for a two-object, node-local,
+				// non-security-critical leak per the ADR's own proportionality argument.
+				setCondition(pm, pmv1.ConditionCni0CleanupVerified, metav1.ConditionFalse, "CleanupLeakExhausted",
+					fmt.Sprintf("cni0 cleanup not confirmed after %d retries: objects still present: %v (ADR-0241, fail-open)",
+						len(cni0CleanupVerifyBackoff), vcResp.PresentObjects))
+				for _, obj := range vcResp.PresentObjects {
+					pmmetrics.DatapathCleanupLeakTotal.WithLabelValues(pm.Name, pm.Namespace, obj).Inc()
+				}
+				if r.Recorder != nil {
+					r.Recorder.Eventf(pm, corev1.EventTypeWarning, "DatapathCleanupLeak",
+						"cni0 cleanup verification exhausted its retry budget for migration %s; objects still present: %v (ADR-0241)",
+						pm.Name, vcResp.PresentObjects)
+				}
+				if pm.Annotations != nil {
+					delete(pm.Annotations, cni0CleanupVerifyAttemptsAnnotation)
+				}
+				if err := r.statusUpdate(ctx, pm); err != nil {
+					return ctrl.Result{}, err
 				}
 			}
 		}
@@ -3844,6 +3959,24 @@ func setCondition(pm *pmv1.PodMigration, condType string, status metav1.Conditio
 		Message:            truncateConditionMsg(message, 1024),
 		LastTransitionTime: metav1.Now(),
 	})
+}
+
+// readCni0CleanupVerifyAttempts returns the current VerifyCleanup(CUTOVER_COMPLETE) retry
+// attempt count stamped on pm by cni0CleanupVerifyAttemptsAnnotation (ADR-0241 item 1),
+// or 0 if absent/unparseable (first attempt).
+func readCni0CleanupVerifyAttempts(pm *pmv1.PodMigration) int {
+	if pm.Annotations == nil {
+		return 0
+	}
+	v, ok := pm.Annotations[cni0CleanupVerifyAttemptsAnnotation]
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // SetupWithManager sets up the controller with the Manager.

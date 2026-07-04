@@ -98,6 +98,15 @@ service MigrationAgentService {
   // it proves a SYN that reached the preserved IP traversed the real cross-node datapath
   // (the listener owns the IP only inside the replacement pod netns on THIS node).
   rpc StartReachabilityEcho(StartReachabilityEchoRequest) returns (StartReachabilityEchoResponse);
+  // VerifyCleanup probes whether the datapath objects for a given cleanup scope are still
+  // present on the calling node (ADR-0241 / NR-BLOCK-1). CUTOVER_COMPLETE scope (the only
+  // scope implemented today) checks the cni0 neigh + cni0 host route removed by
+  // CleanupSourceIPHandoff. IP_RECLAIM scope is defined for forward-compatibility with
+  // NR-BLOCK-2 (the dest tc/FORWARD-ACCEPT/NOTRACK + source flannel.1/NOTRACK objects) but
+  // returns Unimplemented until that follow-on ADR lands — there is no cleanup path to
+  // verify the absence of yet. The explicit objects list lets a future ADR change what is
+  // checked without a new RPC signature (ADR-0241 Decision 1).
+  rpc VerifyCleanup(VerifyCleanupRequest) returns (VerifyCleanupResponse);
 }
 
 message PrepareSourceRequest {
@@ -457,6 +466,43 @@ message InjectSourceRedirectRequest {
 message InjectSourceRedirectResponse {
   bool   injected         = 1;
   string blocking_reason  = 2;
+}
+
+// CleanupScope selects which family of datapath cleanup objects VerifyCleanup checks
+// (ADR-0241 Decision 1: single RPC, scoped by enum + explicit object list, not one RPC
+// per primitive).
+enum CleanupScope {
+  CLEANUP_SCOPE_UNSPECIFIED = 0;
+  // CUTOVER_COMPLETE checks the SOURCE-node cni0 neigh + cni0 host route removed by
+  // CleanupSourceIPHandoff at reconcileVerifying (ADR-0241 item 1).
+  CUTOVER_COMPLETE          = 1;
+  // IP_RECLAIM checks the DESTINATION tc redirect/FORWARD-ACCEPT/NOTRACK plus the SOURCE
+  // flannel.1 redirect/NOTRACK removed by DisarmTCRedirect on IPAM reclaim. Deferred to
+  // NR-BLOCK-2 (ADR-0241 item 2) — no reclaim trigger exists yet, so this scope is defined
+  // but returns Unimplemented.
+  IP_RECLAIM                = 2;
+}
+
+// VerifyCleanupRequest asks the calling node's agent whether the named cleanup-scope
+// objects are still present. objects is an explicit list (not implicit from scope) so a
+// future ADR that changes what is installed can update the object list as data (ADR-0241).
+message VerifyCleanupRequest {
+  string        migration_name = 1;
+  CleanupScope  scope          = 2;
+  // old_pod_ip is the relocated OLD pod IP whose datapath objects are being probed.
+  string        old_pod_ip     = 3;
+  // bridge_ifname is the local CNI bridge name (default "cni0"), used by CUTOVER_COMPLETE.
+  string        bridge_ifname  = 4;
+  // objects is the explicit list of object identifiers to check, e.g. "cni0_neigh",
+  // "cni0_host_route" for CUTOVER_COMPLETE scope.
+  repeated string objects      = 5;
+}
+message VerifyCleanupResponse {
+  // clean is true only when none of the requested objects are present.
+  bool   clean            = 1;
+  // present_objects lists the subset of the requested objects still found present.
+  repeated string present_objects = 2;
+  string blocking_reason  = 3;
 }
 
 enum MigrationMode {

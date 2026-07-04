@@ -65,6 +65,50 @@ var (
 		},
 		[]string{"migration_name", "namespace", "container_name", "result"},
 	)
+
+	// DatapathCleanupLeakTotal counts VerifyCleanup(CUTOVER_COMPLETE) retry-budget exhaustion
+	// events (ADR-0241 item 1 / NR-BLOCK-1). Incremented once per still-present object on the
+	// exhausted-retry branch of reconcileVerifying's cni0 cleanup verification, so a leak of
+	// only the neigh entry versus only the host route (or both) is distinguishable without
+	// parsing the ConditionCni0CleanupVerified message string.
+	// Labels: migration_name, namespace, object ("cni0_neigh" | "cni0_host_route")
+	DatapathCleanupLeakTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "podmotion",
+			Name:      "datapath_cleanup_leak_total",
+			Help:      "Per-object cni0 cleanup verification leaks after the ADR-0241 3-attempt retry budget is exhausted.",
+		},
+		[]string{"migration_name", "namespace", "object"},
+	)
+
+	// ZeroWindowHoldRuleReassertTotal counts FORWARD ACCEPT / NOTRACK rule reassertions
+	// performed by the agent-side idempotent reconcile loop when it detects an external flush
+	// during an active zero-window hold (ADR-0240 D1/D4). Named with the "pm_" prefix (not
+	// "podmotion_") per ADR-0240 D4/D4a's literal metric name.
+	// Labels: migration ("migration=" per ADR-0240 D1a/D4a), rule ("forward_accept" | "notrack")
+	ZeroWindowHoldRuleReassertTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "pm",
+			Name:      "zero_window_hold_rule_reassert_total",
+			Help:      "Count of FORWARD ACCEPT / NOTRACK rule reassertions by the zero-window hold flush-detection loop.",
+		},
+		[]string{"migration", "rule"},
+	)
+
+	// ZeroWindowHoldRuleReassertSuppressedTotal counts reassert attempts skipped because the
+	// per-migration token-bucket reassert limiter (burst 5, refill 1/2s) was empty (ADR-0240
+	// D1a). Detection (the iptables -C probe) is never suppressed — only the reapply write is
+	// — so a runaway-flush condition remains observable via this counter even while writes are
+	// capped.
+	// Labels: migration
+	ZeroWindowHoldRuleReassertSuppressedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "pm",
+			Name:      "zero_window_hold_rule_reassert_suppressed_total",
+			Help:      "Count of rule reassert attempts suppressed by the per-migration token-bucket limiter (ADR-0240 D1a).",
+		},
+		[]string{"migration"},
+	)
 )
 
 func init() {
@@ -73,5 +117,8 @@ func init() {
 		MigrationFlowLossTotal,
 		MigrationBlackoutDurationSeconds,
 		ContainerConsistencyTotal,
+		DatapathCleanupLeakTotal,
+		ZeroWindowHoldRuleReassertTotal,
+		ZeroWindowHoldRuleReassertSuppressedTotal,
 	)
 }
