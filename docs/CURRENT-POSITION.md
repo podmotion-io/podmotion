@@ -20,7 +20,7 @@
    VORN-40B-2 (KVM certification, spike-gated) — each declares `serves_milestone` in its
    own header (see those docs). This hardens the substrate M22's future proof will run on;
    it does not itself close M22.
-4. **Current global sprint: Sprint 40**, Step 2, closed `GATE_PASS` (commit `28f5f8f`).
+4. **Current global sprint: Sprint 40**, Step 2, closed `GATE_PASS` (commit `cfc1450`).
 5. **Spine state:** `phase: C`, `phase_state: closed`, `next_action: RESUME`.
 6. **Next action:** resume Sprint 40 Step 3 across the three active Vorns (VORN-40A,
    VORN-40B-1 in parallel; VORN-40B-2 remains spike-gated pending its architecture spike).
@@ -29,9 +29,9 @@
 
 | Global Sprint | Milestone target | Vorn (work) | Vorn-local # | Status | Proof |
 |---|---|---|---|---|---|
-| S39 | — (IP protection / evidence engine, no Feln claim) | — | — | GATE_PASS | `docs/proof/sprint39-proof.md` (`6c9cb7e`) |
-| S40 Step 1 | pre-M22 hardening | VORN-40A / VORN-40B-1 (decision-only: ADR-0240, ADR-0241, ADR-0242 ratified) | #1 | GATE_PASS (decision-only, no code) | `docs/proof/SPRINT40-S1-PROOF.md` (`4ac832c`) |
-| S40 Step 2 | pre-M22 hardening | VORN-40A (NR-BLOCK-1 / R4 Go implementation) + VORN-40B-1 (FS-086 chaos design note) | #2 | GATE_PASS | `docs/proof/SPRINT40-S2-PROOF.md` (`28f5f8f`) |
+| S39 | — (IP protection / evidence engine, no Feln claim) | — | — | GATE_PASS | `docs/proof/sprint39-proof.md` (`a3edecb`) |
+| S40 Step 1 | pre-M22 hardening | VORN-40A / VORN-40B-1 (decision-only: ADR-0240, ADR-0241, ADR-0242 ratified) | #1 | GATE_PASS (decision-only, no code) | `docs/proof/SPRINT40-S1-PROOF.md` (`bef2690`) |
+| S40 Step 2 | pre-M22 hardening | VORN-40A (NR-BLOCK-1 / R4 Go implementation) + VORN-40B-1 (FS-086 chaos design note) | #2 | GATE_PASS | `docs/proof/SPRINT40-S2-PROOF.md` (`cfc1450`) |
 
 ## Notes on reading this table
 
