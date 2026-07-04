@@ -1310,7 +1310,10 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 		// pod's host-side veth peer, bypassing L3 local-input classification. Best-effort: a
 		// resolution/setup failure is non-fatal so an otherwise-good handoff is not blocked;
 		// the source is held until TrafficVerified so a requeue re-asserts it (idempotent).
-		if replPID := s.restoredPIDForMigration(ctx, req.MigrationName); replPID > 0 {
+		if replPID, pidErr := s.restoredPIDForMigration(ctx, req.MigrationName); pidErr != nil {
+			log.Error(pidErr, "InjectIPHandoff: ADR-0139 restoredPIDForMigration lookup failed — tc redirect NOT installed (non-fatal)",
+				"migration", req.MigrationName)
+		} else if replPID > 0 {
 			if vethPeer, vErr := resolveReplVethPeer(replPID); vErr != nil {
 				log.Error(vErr, "InjectIPHandoff: ADR-0139 could not resolve repl veth peer — tc redirect NOT installed (non-fatal)",
 					"migration", req.MigrationName, "replPID", replPID)
@@ -1420,8 +1423,13 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 		// agent), which flips DataplaneReachabilityVerified. PM-C4: the in-netns dial is DEMOTED
 		// to a fast LOCAL PRE-CHECK (not deleted) — its result is advisory ProbeOk only and no
 		// longer gates the deferred SIGCONT, source disarm, TrafficVerified, or deletion.
-		replPID := s.restoredPIDForMigration(ctx, req.MigrationName)
-		if replPID <= 0 {
+		replPID, pidErr := s.restoredPIDForMigration(ctx, req.MigrationName)
+		if pidErr != nil {
+			resp.ProbeOk = false
+			resp.ProbeOutput = "ADR-0210: RestoredPID lookup failed — local pre-check deferred (advisory only; cross-node gate is authoritative)"
+			log.Info("InjectIPHandoff: ADR-0210 local pre-check deferred — RestoredPID lookup errored (advisory, non-gating)",
+				"migration", req.MigrationName, "oldPodIp", req.OldPodIp, "err", pidErr)
+		} else if replPID <= 0 {
 			resp.ProbeOk = false
 			resp.ProbeOutput = "ADR-0210: RestoredPID not yet resolvable — local pre-check deferred (advisory only; cross-node gate is authoritative)"
 			log.Info("InjectIPHandoff: ADR-0210 local pre-check deferred — RestoredPID not yet in CR status (advisory, non-gating)",
@@ -1654,32 +1662,41 @@ func cni0HostRoutePresent(ctx context.Context, ifName string, oldIP net.IP) bool
 }
 
 // restoredPIDForMigration fetches the PodMigration CR and returns Status.RestoredPID (the root
-// PID of the restored container, set by this agent at ReportRestoreConfirmed). Returns 0 if the
-// CR/PID is unavailable. Used by ADR-0139 to resolve the replacement pod's veth peer without a
-// proto change (the agent already holds the k8s client and the migration name).
-func (s *AgentServer) restoredPIDForMigration(ctx context.Context, migrationName string) int {
+// PID of the restored container, set by this agent at ReportRestoreConfirmed). Used by ADR-0139
+// to resolve the replacement pod's veth peer without a proto change (the agent already holds the
+// k8s client and the migration name).
+//
+// ADR-0244 C-N1 correction (Sprint 40): the return value alone cannot distinguish "positively
+// resolved, CR says RestoredPID is 0/absent" (the expected steady state once the CR/PID has been
+// GC'd — nothing left to protect) from "the lookup itself errored" (unknown — a transient
+// apiserver hiccup must NOT be read as "gone"). The two are asymmetric in consequence for R7
+// (ProbeDestSocketForIP): the former means Present=false is correct, the latter must propagate as
+// an error so the caller fails closed exactly as R6 does on an RPC error. The error return carries
+// that distinction; a nil error with pid<=0 means positively-resolved-absent, a non-nil error
+// means the lookup could not be completed this pass.
+func (s *AgentServer) restoredPIDForMigration(ctx context.Context, migrationName string) (int, error) {
 	if s.k8sClient == nil || migrationName == "" {
-		return 0
+		return 0, nil
 	}
 	// Namespace is not carried on the InjectIPHandoff request; PodMigrations are namespaced.
 	// The PoC runs in "default". List across namespaces by name as a robust fallback so this
 	// is not hard-wired to one namespace if the operator is reconfigured.
 	pm := &pmv1.PodMigration{}
 	if err := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: migrationName}, pm); err == nil {
-		return int(pm.Status.RestoredPID)
+		return int(pm.Status.RestoredPID), nil
 	}
 	pmList := &pmv1.PodMigrationList{}
 	if err := s.k8sClient.List(ctx, pmList); err != nil {
-		log.Info("restoredPIDForMigration: list PodMigrations failed (non-fatal)",
+		log.Info("restoredPIDForMigration: list PodMigrations failed",
 			"migration", migrationName, "err", err)
-		return 0
+		return 0, fmt.Errorf("restoredPIDForMigration: list PodMigrations failed: %w", err)
 	}
 	for i := range pmList.Items {
 		if pmList.Items[i].Name == migrationName {
-			return int(pmList.Items[i].Status.RestoredPID)
+			return int(pmList.Items[i].Status.RestoredPID), nil
 		}
 	}
-	return 0
+	return 0, nil
 }
 
 // resolveNamespaceForMigration returns the Kubernetes namespace of the named PodMigration CR.
@@ -2194,11 +2211,23 @@ func (s *AgentServer) ProbeDestSocketForIP(ctx context.Context, req *agentpb.Pro
 	if req.OldPodIp == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "ProbeDestSocketForIP: old_pod_ip is required")
 	}
-	replPID := s.restoredPIDForMigration(ctx, req.MigrationName)
+	// ADR-0244 C-N1 correction (Sprint 40): restoredPIDForMigration now distinguishes a
+	// positively-resolved absence (nil error, pid<=0 — CR/PID confirmed gone, safe to treat
+	// as "nothing to protect") from a lookup ERROR (a transient CR Get/List failure against
+	// the apiserver). Before this fix both cases collapsed to Present=false, which fails OPEN
+	// on a transient error and could authorize teardown against a live pinned connection this
+	// probe was specifically added to see. A lookup error must instead propagate as an RPC
+	// error so noLiveDestSocketForIP defers the sweep — the same fail-closed disposition R6
+	// applies to its own agent RPC errors.
+	replPID, pidErr := s.restoredPIDForMigration(ctx, req.MigrationName)
+	if pidErr != nil {
+		return nil, status.Errorf(codes.Internal, "ProbeDestSocketForIP: restoredPIDForMigration lookup failed: %v", pidErr)
+	}
 	if replPID <= 0 {
-		// No known restored PID (CR gone, pod gone, or never restored on this node) —
-		// nothing to observe, so nothing to protect. Not an error: this is the expected
-		// steady state well after the migration's RestoredPID has been GC'd along with the CR.
+		// Positively resolved: CR/PID confirmed absent (pod gone, or never restored on this
+		// node) — nothing to observe, so nothing to protect. Not an error: this is the
+		// expected steady state well after the migration's RestoredPID has been GC'd along
+		// with the CR.
 		return &agentpb.ProbeDestSocketForIPResponse{Present: false, Count: 0}, nil
 	}
 	oldIP := net.ParseIP(req.OldPodIp)
@@ -3856,7 +3885,13 @@ func (s *AgentServer) StartReachabilityEcho(ctx context.Context, req *agentpb.St
 		resp.Detail = "ADR-0210: listen_ip/listen_port/nonce required"
 		return resp, nil
 	}
-	replPID := s.restoredPIDForMigration(ctx, req.MigrationName)
+	replPID, pidErr := s.restoredPIDForMigration(ctx, req.MigrationName)
+	if pidErr != nil {
+		resp.Started = false
+		resp.Detail = "ADR-0210: replacement PID lookup failed — echo deferred to requeue"
+		log.Info("StartReachabilityEcho: ADR-0210 replacement PID lookup errored — deferred", "migration", req.MigrationName, "err", pidErr)
+		return resp, nil
+	}
 	if replPID <= 0 {
 		resp.Started = false
 		resp.Detail = "ADR-0210: replacement PID not yet resolvable — echo deferred to requeue"
