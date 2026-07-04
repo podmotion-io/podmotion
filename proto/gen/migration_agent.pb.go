@@ -32,9 +32,8 @@ const (
 	// CleanupSourceIPHandoff at reconcileVerifying (ADR-0241 item 1).
 	CleanupScope_CUTOVER_COMPLETE CleanupScope = 1
 	// IP_RECLAIM checks the DESTINATION tc redirect/FORWARD-ACCEPT/NOTRACK plus the SOURCE
-	// flannel.1 redirect/NOTRACK removed by DisarmTCRedirect on IPAM reclaim. Deferred to
-	// NR-BLOCK-2 (ADR-0241 item 2) — no reclaim trigger exists yet, so this scope is defined
-	// but returns Unimplemented.
+	// flannel.1 redirect/NOTRACK removed by DisarmTCRedirect and TeardownSourceRedirect on
+	// IPAM reclaim (ADR-0244 / NR-BLOCK-2).
 	CleanupScope_IP_RECLAIM CleanupScope = 2
 )
 
@@ -2930,8 +2929,14 @@ type VerifyCleanupRequest struct {
 	// bridge_ifname is the local CNI bridge name (default "cni0"), used by CUTOVER_COMPLETE.
 	BridgeIfname string `protobuf:"bytes,4,opt,name=bridge_ifname,json=bridgeIfname,proto3" json:"bridge_ifname,omitempty"`
 	// objects is the explicit list of object identifiers to check, e.g. "cni0_neigh",
-	// "cni0_host_route" for CUTOVER_COMPLETE scope.
-	Objects       []string `protobuf:"bytes,5,rep,name=objects,proto3" json:"objects,omitempty"`
+	// "cni0_host_route" for CUTOVER_COMPLETE scope, or "tc_filter", "tc_qdisc",
+	// "dest_forward_accept", "dest_notrack", "source_notrack", "flannel1_route",
+	// "flannel1_neigh", "flannel1_fdb" for IP_RECLAIM scope (ADR-0244).
+	Objects []string `protobuf:"bytes,5,rep,name=objects,proto3" json:"objects,omitempty"`
+	// fdb_ifname is the overlay interface (default "flannel.1"), used by IP_RECLAIM scope.
+	FdbIfname string `protobuf:"bytes,6,opt,name=fdb_ifname,json=fdbIfname,proto3" json:"fdb_ifname,omitempty"`
+	// repl_veth_mac is required for the IP_RECLAIM "flannel1_fdb" probe (ADR-0244).
+	ReplVethMac   string `protobuf:"bytes,7,opt,name=repl_veth_mac,json=replVethMac,proto3" json:"repl_veth_mac,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3001,6 +3006,20 @@ func (x *VerifyCleanupRequest) GetObjects() []string {
 	return nil
 }
 
+func (x *VerifyCleanupRequest) GetFdbIfname() string {
+	if x != nil {
+		return x.FdbIfname
+	}
+	return ""
+}
+
+func (x *VerifyCleanupRequest) GetReplVethMac() string {
+	if x != nil {
+		return x.ReplVethMac
+	}
+	return ""
+}
+
 type VerifyCleanupResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// clean is true only when none of the requested objects are present.
@@ -3063,6 +3082,248 @@ func (x *VerifyCleanupResponse) GetBlockingReason() string {
 	return ""
 }
 
+// TeardownSourceRedirectRequest carries the inputs for the ADR-0244 (NR-BLOCK-2) source-side
+// flannel.1/NOTRACK reclaim teardown. Symmetric to DisarmTCRedirectRequest.
+type TeardownSourceRedirectRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MigrationName string                 `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`
+	// old_pod_ip is the relocated OLD pod IP whose source-side redirect is being torn down.
+	OldPodIp string `protobuf:"bytes,2,opt,name=old_pod_ip,json=oldPodIp,proto3" json:"old_pod_ip,omitempty"`
+	// fdb_ifname is the overlay interface the redirect was installed on (default "flannel.1").
+	FdbIfname string `protobuf:"bytes,3,opt,name=fdb_ifname,json=fdbIfname,proto3" json:"fdb_ifname,omitempty"`
+	// repl_veth_mac is the replacement pod's eth0 MAC the AF_BRIDGE FDB entry was keyed on
+	// (ADR-0136). Required to identify the exact FDB entry to remove.
+	ReplVethMac string `protobuf:"bytes,4,opt,name=repl_veth_mac,json=replVethMac,proto3" json:"repl_veth_mac,omitempty"`
+	// dst_node_ip is the destination node's underlay (VTEP) IP the FDB entry pointed at.
+	DstNodeIp     string `protobuf:"bytes,5,opt,name=dst_node_ip,json=dstNodeIp,proto3" json:"dst_node_ip,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TeardownSourceRedirectRequest) Reset() {
+	*x = TeardownSourceRedirectRequest{}
+	mi := &file_migration_agent_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TeardownSourceRedirectRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TeardownSourceRedirectRequest) ProtoMessage() {}
+
+func (x *TeardownSourceRedirectRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_migration_agent_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TeardownSourceRedirectRequest.ProtoReflect.Descriptor instead.
+func (*TeardownSourceRedirectRequest) Descriptor() ([]byte, []int) {
+	return file_migration_agent_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *TeardownSourceRedirectRequest) GetMigrationName() string {
+	if x != nil {
+		return x.MigrationName
+	}
+	return ""
+}
+
+func (x *TeardownSourceRedirectRequest) GetOldPodIp() string {
+	if x != nil {
+		return x.OldPodIp
+	}
+	return ""
+}
+
+func (x *TeardownSourceRedirectRequest) GetFdbIfname() string {
+	if x != nil {
+		return x.FdbIfname
+	}
+	return ""
+}
+
+func (x *TeardownSourceRedirectRequest) GetReplVethMac() string {
+	if x != nil {
+		return x.ReplVethMac
+	}
+	return ""
+}
+
+func (x *TeardownSourceRedirectRequest) GetDstNodeIp() string {
+	if x != nil {
+		return x.DstNodeIp
+	}
+	return ""
+}
+
+type TeardownSourceRedirectResponse struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	TornDown       bool                   `protobuf:"varint,1,opt,name=torn_down,json=tornDown,proto3" json:"torn_down,omitempty"`
+	BlockingReason string                 `protobuf:"bytes,2,opt,name=blocking_reason,json=blockingReason,proto3" json:"blocking_reason,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *TeardownSourceRedirectResponse) Reset() {
+	*x = TeardownSourceRedirectResponse{}
+	mi := &file_migration_agent_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TeardownSourceRedirectResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TeardownSourceRedirectResponse) ProtoMessage() {}
+
+func (x *TeardownSourceRedirectResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_migration_agent_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TeardownSourceRedirectResponse.ProtoReflect.Descriptor instead.
+func (*TeardownSourceRedirectResponse) Descriptor() ([]byte, []int) {
+	return file_migration_agent_proto_rawDescGZIP(), []int{42}
+}
+
+func (x *TeardownSourceRedirectResponse) GetTornDown() bool {
+	if x != nil {
+		return x.TornDown
+	}
+	return false
+}
+
+func (x *TeardownSourceRedirectResponse) GetBlockingReason() string {
+	if x != nil {
+		return x.BlockingReason
+	}
+	return ""
+}
+
+// ProbeConntrackForIPRequest asks the calling node's agent whether its local conntrack
+// table has any entry for old_pod_ip (ADR-0244 R6).
+type ProbeConntrackForIPRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MigrationName string                 `protobuf:"bytes,1,opt,name=migration_name,json=migrationName,proto3" json:"migration_name,omitempty"`
+	OldPodIp      string                 `protobuf:"bytes,2,opt,name=old_pod_ip,json=oldPodIp,proto3" json:"old_pod_ip,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProbeConntrackForIPRequest) Reset() {
+	*x = ProbeConntrackForIPRequest{}
+	mi := &file_migration_agent_proto_msgTypes[43]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProbeConntrackForIPRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProbeConntrackForIPRequest) ProtoMessage() {}
+
+func (x *ProbeConntrackForIPRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_migration_agent_proto_msgTypes[43]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProbeConntrackForIPRequest.ProtoReflect.Descriptor instead.
+func (*ProbeConntrackForIPRequest) Descriptor() ([]byte, []int) {
+	return file_migration_agent_proto_rawDescGZIP(), []int{43}
+}
+
+func (x *ProbeConntrackForIPRequest) GetMigrationName() string {
+	if x != nil {
+		return x.MigrationName
+	}
+	return ""
+}
+
+func (x *ProbeConntrackForIPRequest) GetOldPodIp() string {
+	if x != nil {
+		return x.OldPodIp
+	}
+	return ""
+}
+
+type ProbeConntrackForIPResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// present is true if at least one conntrack entry matching old_pod_ip was found.
+	Present       bool  `protobuf:"varint,1,opt,name=present,proto3" json:"present,omitempty"`
+	Count         int32 `protobuf:"varint,2,opt,name=count,proto3" json:"count,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProbeConntrackForIPResponse) Reset() {
+	*x = ProbeConntrackForIPResponse{}
+	mi := &file_migration_agent_proto_msgTypes[44]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProbeConntrackForIPResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProbeConntrackForIPResponse) ProtoMessage() {}
+
+func (x *ProbeConntrackForIPResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_migration_agent_proto_msgTypes[44]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProbeConntrackForIPResponse.ProtoReflect.Descriptor instead.
+func (*ProbeConntrackForIPResponse) Descriptor() ([]byte, []int) {
+	return file_migration_agent_proto_rawDescGZIP(), []int{44}
+}
+
+func (x *ProbeConntrackForIPResponse) GetPresent() bool {
+	if x != nil {
+		return x.Present
+	}
+	return false
+}
+
+func (x *ProbeConntrackForIPResponse) GetCount() int32 {
+	if x != nil {
+		return x.Count
+	}
+	return 0
+}
+
 // VerifyTCPRequest asks the destination agent to read /proc/<pid>/net/tcp[6]
 // and compare 4-tuples + snd_nxt/rcv_nxt against source_seq_snapshots.
 type VerifyTCPRequest struct {
@@ -3081,7 +3342,7 @@ type VerifyTCPRequest struct {
 
 func (x *VerifyTCPRequest) Reset() {
 	*x = VerifyTCPRequest{}
-	mi := &file_migration_agent_proto_msgTypes[41]
+	mi := &file_migration_agent_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3093,7 +3354,7 @@ func (x *VerifyTCPRequest) String() string {
 func (*VerifyTCPRequest) ProtoMessage() {}
 
 func (x *VerifyTCPRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_migration_agent_proto_msgTypes[41]
+	mi := &file_migration_agent_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3106,7 +3367,7 @@ func (x *VerifyTCPRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyTCPRequest.ProtoReflect.Descriptor instead.
 func (*VerifyTCPRequest) Descriptor() ([]byte, []int) {
-	return file_migration_agent_proto_rawDescGZIP(), []int{41}
+	return file_migration_agent_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *VerifyTCPRequest) GetMigrationName() string {
@@ -3180,7 +3441,7 @@ type VerifyTCPResponse struct {
 
 func (x *VerifyTCPResponse) Reset() {
 	*x = VerifyTCPResponse{}
-	mi := &file_migration_agent_proto_msgTypes[42]
+	mi := &file_migration_agent_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3192,7 +3453,7 @@ func (x *VerifyTCPResponse) String() string {
 func (*VerifyTCPResponse) ProtoMessage() {}
 
 func (x *VerifyTCPResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_migration_agent_proto_msgTypes[42]
+	mi := &file_migration_agent_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3205,7 +3466,7 @@ func (x *VerifyTCPResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyTCPResponse.ProtoReflect.Descriptor instead.
 func (*VerifyTCPResponse) Descriptor() ([]byte, []int) {
-	return file_migration_agent_proto_rawDescGZIP(), []int{42}
+	return file_migration_agent_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *VerifyTCPResponse) GetVerified() bool {
@@ -3285,7 +3546,7 @@ type ProbeDataplaneReachabilityRequest struct {
 
 func (x *ProbeDataplaneReachabilityRequest) Reset() {
 	*x = ProbeDataplaneReachabilityRequest{}
-	mi := &file_migration_agent_proto_msgTypes[43]
+	mi := &file_migration_agent_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3297,7 +3558,7 @@ func (x *ProbeDataplaneReachabilityRequest) String() string {
 func (*ProbeDataplaneReachabilityRequest) ProtoMessage() {}
 
 func (x *ProbeDataplaneReachabilityRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_migration_agent_proto_msgTypes[43]
+	mi := &file_migration_agent_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3310,7 +3571,7 @@ func (x *ProbeDataplaneReachabilityRequest) ProtoReflect() protoreflect.Message 
 
 // Deprecated: Use ProbeDataplaneReachabilityRequest.ProtoReflect.Descriptor instead.
 func (*ProbeDataplaneReachabilityRequest) Descriptor() ([]byte, []int) {
-	return file_migration_agent_proto_rawDescGZIP(), []int{43}
+	return file_migration_agent_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *ProbeDataplaneReachabilityRequest) GetMigrationName() string {
@@ -3363,7 +3624,7 @@ type ProbeDataplaneReachabilityResponse struct {
 
 func (x *ProbeDataplaneReachabilityResponse) Reset() {
 	*x = ProbeDataplaneReachabilityResponse{}
-	mi := &file_migration_agent_proto_msgTypes[44]
+	mi := &file_migration_agent_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3375,7 +3636,7 @@ func (x *ProbeDataplaneReachabilityResponse) String() string {
 func (*ProbeDataplaneReachabilityResponse) ProtoMessage() {}
 
 func (x *ProbeDataplaneReachabilityResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_migration_agent_proto_msgTypes[44]
+	mi := &file_migration_agent_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3388,7 +3649,7 @@ func (x *ProbeDataplaneReachabilityResponse) ProtoReflect() protoreflect.Message
 
 // Deprecated: Use ProbeDataplaneReachabilityResponse.ProtoReflect.Descriptor instead.
 func (*ProbeDataplaneReachabilityResponse) Descriptor() ([]byte, []int) {
-	return file_migration_agent_proto_rawDescGZIP(), []int{44}
+	return file_migration_agent_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *ProbeDataplaneReachabilityResponse) GetReachable() bool {
@@ -3431,7 +3692,7 @@ type StartReachabilityEchoRequest struct {
 
 func (x *StartReachabilityEchoRequest) Reset() {
 	*x = StartReachabilityEchoRequest{}
-	mi := &file_migration_agent_proto_msgTypes[45]
+	mi := &file_migration_agent_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3443,7 +3704,7 @@ func (x *StartReachabilityEchoRequest) String() string {
 func (*StartReachabilityEchoRequest) ProtoMessage() {}
 
 func (x *StartReachabilityEchoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_migration_agent_proto_msgTypes[45]
+	mi := &file_migration_agent_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3456,7 +3717,7 @@ func (x *StartReachabilityEchoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartReachabilityEchoRequest.ProtoReflect.Descriptor instead.
 func (*StartReachabilityEchoRequest) Descriptor() ([]byte, []int) {
-	return file_migration_agent_proto_rawDescGZIP(), []int{45}
+	return file_migration_agent_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *StartReachabilityEchoRequest) GetMigrationName() string {
@@ -3504,7 +3765,7 @@ type StartReachabilityEchoResponse struct {
 
 func (x *StartReachabilityEchoResponse) Reset() {
 	*x = StartReachabilityEchoResponse{}
-	mi := &file_migration_agent_proto_msgTypes[46]
+	mi := &file_migration_agent_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3516,7 +3777,7 @@ func (x *StartReachabilityEchoResponse) String() string {
 func (*StartReachabilityEchoResponse) ProtoMessage() {}
 
 func (x *StartReachabilityEchoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_migration_agent_proto_msgTypes[46]
+	mi := &file_migration_agent_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3529,7 +3790,7 @@ func (x *StartReachabilityEchoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartReachabilityEchoResponse.ProtoReflect.Descriptor instead.
 func (*StartReachabilityEchoResponse) Descriptor() ([]byte, []int) {
-	return file_migration_agent_proto_rawDescGZIP(), []int{46}
+	return file_migration_agent_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *StartReachabilityEchoResponse) GetStarted() bool {
@@ -3772,18 +4033,39 @@ const file_migration_agent_proto_rawDesc = "" +
 	"fdb_ifname\x18\x05 \x01(\tR\tfdbIfname\"c\n" +
 	"\x1cInjectSourceRedirectResponse\x12\x1a\n" +
 	"\binjected\x18\x01 \x01(\bR\binjected\x12'\n" +
-	"\x0fblocking_reason\x18\x02 \x01(\tR\x0eblockingReason\"\xd2\x01\n" +
+	"\x0fblocking_reason\x18\x02 \x01(\tR\x0eblockingReason\"\x95\x02\n" +
 	"\x14VerifyCleanupRequest\x12%\n" +
 	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x126\n" +
 	"\x05scope\x18\x02 \x01(\x0e2 .podmotion.agent.v1.CleanupScopeR\x05scope\x12\x1c\n" +
 	"\n" +
 	"old_pod_ip\x18\x03 \x01(\tR\boldPodIp\x12#\n" +
 	"\rbridge_ifname\x18\x04 \x01(\tR\fbridgeIfname\x12\x18\n" +
-	"\aobjects\x18\x05 \x03(\tR\aobjects\"\x7f\n" +
+	"\aobjects\x18\x05 \x03(\tR\aobjects\x12\x1d\n" +
+	"\n" +
+	"fdb_ifname\x18\x06 \x01(\tR\tfdbIfname\x12\"\n" +
+	"\rrepl_veth_mac\x18\a \x01(\tR\vreplVethMac\"\x7f\n" +
 	"\x15VerifyCleanupResponse\x12\x14\n" +
 	"\x05clean\x18\x01 \x01(\bR\x05clean\x12'\n" +
 	"\x0fpresent_objects\x18\x02 \x03(\tR\x0epresentObjects\x12'\n" +
-	"\x0fblocking_reason\x18\x03 \x01(\tR\x0eblockingReason\"\xd6\x02\n" +
+	"\x0fblocking_reason\x18\x03 \x01(\tR\x0eblockingReason\"\xc7\x01\n" +
+	"\x1dTeardownSourceRedirectRequest\x12%\n" +
+	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12\x1c\n" +
+	"\n" +
+	"old_pod_ip\x18\x02 \x01(\tR\boldPodIp\x12\x1d\n" +
+	"\n" +
+	"fdb_ifname\x18\x03 \x01(\tR\tfdbIfname\x12\"\n" +
+	"\rrepl_veth_mac\x18\x04 \x01(\tR\vreplVethMac\x12\x1e\n" +
+	"\vdst_node_ip\x18\x05 \x01(\tR\tdstNodeIp\"f\n" +
+	"\x1eTeardownSourceRedirectResponse\x12\x1b\n" +
+	"\ttorn_down\x18\x01 \x01(\bR\btornDown\x12'\n" +
+	"\x0fblocking_reason\x18\x02 \x01(\tR\x0eblockingReason\"a\n" +
+	"\x1aProbeConntrackForIPRequest\x12%\n" +
+	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12\x1c\n" +
+	"\n" +
+	"old_pod_ip\x18\x02 \x01(\tR\boldPodIp\"M\n" +
+	"\x1bProbeConntrackForIPResponse\x12\x18\n" +
+	"\apresent\x18\x01 \x01(\bR\apresent\x12\x14\n" +
+	"\x05count\x18\x02 \x01(\x05R\x05count\"\xd6\x02\n" +
 	"\x10VerifyTCPRequest\x12%\n" +
 	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12\x17\n" +
 	"\apod_uid\x18\x02 \x01(\tR\x06podUid\x12Q\n" +
@@ -3833,7 +4115,7 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\x1aMIGRATION_MODE_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17MIGRATION_MODE_PRE_COPY\x10\x01\x12\x1c\n" +
 	"\x18MIGRATION_MODE_POST_COPY\x10\x02\x12\x17\n" +
-	"\x13MIGRATION_MODE_COLD\x10\x032\xdf\x13\n" +
+	"\x13MIGRATION_MODE_COLD\x10\x032\xd8\x15\n" +
 	"\x15MigrationAgentService\x12d\n" +
 	"\rPrepareSource\x12(.podmotion.agent.v1.PrepareSourceRequest\x1a).podmotion.agent.v1.PrepareSourceResponse\x12a\n" +
 	"\fPreDumpRound\x12'.podmotion.agent.v1.PreDumpRoundRequest\x1a(.podmotion.agent.v1.PreDumpRoundResponse\x12[\n" +
@@ -3858,7 +4140,9 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\tVerifyTCP\x12$.podmotion.agent.v1.VerifyTCPRequest\x1a%.podmotion.agent.v1.VerifyTCPResponse\x12\x8b\x01\n" +
 	"\x1aProbeDataplaneReachability\x125.podmotion.agent.v1.ProbeDataplaneReachabilityRequest\x1a6.podmotion.agent.v1.ProbeDataplaneReachabilityResponse\x12|\n" +
 	"\x15StartReachabilityEcho\x120.podmotion.agent.v1.StartReachabilityEchoRequest\x1a1.podmotion.agent.v1.StartReachabilityEchoResponse\x12d\n" +
-	"\rVerifyCleanup\x12(.podmotion.agent.v1.VerifyCleanupRequest\x1a).podmotion.agent.v1.VerifyCleanupResponseB5Z3github.com/podmotion-io/podmotion/proto/gen;agentpbb\x06proto3"
+	"\rVerifyCleanup\x12(.podmotion.agent.v1.VerifyCleanupRequest\x1a).podmotion.agent.v1.VerifyCleanupResponse\x12\x7f\n" +
+	"\x16TeardownSourceRedirect\x121.podmotion.agent.v1.TeardownSourceRedirectRequest\x1a2.podmotion.agent.v1.TeardownSourceRedirectResponse\x12v\n" +
+	"\x13ProbeConntrackForIP\x12..podmotion.agent.v1.ProbeConntrackForIPRequest\x1a/.podmotion.agent.v1.ProbeConntrackForIPResponseB5Z3github.com/podmotion-io/podmotion/proto/gen;agentpbb\x06proto3"
 
 var (
 	file_migration_agent_proto_rawDescOnce sync.Once
@@ -3873,7 +4157,7 @@ func file_migration_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_migration_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_migration_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 47)
+var file_migration_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 51)
 var file_migration_agent_proto_goTypes = []any{
 	(CleanupScope)(0),                          // 0: podmotion.agent.v1.CleanupScope
 	(MigrationMode)(0),                         // 1: podmotion.agent.v1.MigrationMode
@@ -3918,12 +4202,16 @@ var file_migration_agent_proto_goTypes = []any{
 	(*InjectSourceRedirectResponse)(nil),       // 40: podmotion.agent.v1.InjectSourceRedirectResponse
 	(*VerifyCleanupRequest)(nil),               // 41: podmotion.agent.v1.VerifyCleanupRequest
 	(*VerifyCleanupResponse)(nil),              // 42: podmotion.agent.v1.VerifyCleanupResponse
-	(*VerifyTCPRequest)(nil),                   // 43: podmotion.agent.v1.VerifyTCPRequest
-	(*VerifyTCPResponse)(nil),                  // 44: podmotion.agent.v1.VerifyTCPResponse
-	(*ProbeDataplaneReachabilityRequest)(nil),  // 45: podmotion.agent.v1.ProbeDataplaneReachabilityRequest
-	(*ProbeDataplaneReachabilityResponse)(nil), // 46: podmotion.agent.v1.ProbeDataplaneReachabilityResponse
-	(*StartReachabilityEchoRequest)(nil),       // 47: podmotion.agent.v1.StartReachabilityEchoRequest
-	(*StartReachabilityEchoResponse)(nil),      // 48: podmotion.agent.v1.StartReachabilityEchoResponse
+	(*TeardownSourceRedirectRequest)(nil),      // 43: podmotion.agent.v1.TeardownSourceRedirectRequest
+	(*TeardownSourceRedirectResponse)(nil),     // 44: podmotion.agent.v1.TeardownSourceRedirectResponse
+	(*ProbeConntrackForIPRequest)(nil),         // 45: podmotion.agent.v1.ProbeConntrackForIPRequest
+	(*ProbeConntrackForIPResponse)(nil),        // 46: podmotion.agent.v1.ProbeConntrackForIPResponse
+	(*VerifyTCPRequest)(nil),                   // 47: podmotion.agent.v1.VerifyTCPRequest
+	(*VerifyTCPResponse)(nil),                  // 48: podmotion.agent.v1.VerifyTCPResponse
+	(*ProbeDataplaneReachabilityRequest)(nil),  // 49: podmotion.agent.v1.ProbeDataplaneReachabilityRequest
+	(*ProbeDataplaneReachabilityResponse)(nil), // 50: podmotion.agent.v1.ProbeDataplaneReachabilityResponse
+	(*StartReachabilityEchoRequest)(nil),       // 51: podmotion.agent.v1.StartReachabilityEchoRequest
+	(*StartReachabilityEchoResponse)(nil),      // 52: podmotion.agent.v1.StartReachabilityEchoResponse
 }
 var file_migration_agent_proto_depIdxs = []int32{
 	1,  // 0: podmotion.agent.v1.PrepareSourceRequest.mode:type_name -> podmotion.agent.v1.MigrationMode
@@ -3950,35 +4238,39 @@ var file_migration_agent_proto_depIdxs = []int32{
 	35, // 21: podmotion.agent.v1.MigrationAgentService.CleanupSourceIPHandoff:input_type -> podmotion.agent.v1.CleanupSourceIPHandoffRequest
 	39, // 22: podmotion.agent.v1.MigrationAgentService.InjectSourceRedirect:input_type -> podmotion.agent.v1.InjectSourceRedirectRequest
 	37, // 23: podmotion.agent.v1.MigrationAgentService.DisarmTCRedirect:input_type -> podmotion.agent.v1.DisarmTCRedirectRequest
-	43, // 24: podmotion.agent.v1.MigrationAgentService.VerifyTCP:input_type -> podmotion.agent.v1.VerifyTCPRequest
-	45, // 25: podmotion.agent.v1.MigrationAgentService.ProbeDataplaneReachability:input_type -> podmotion.agent.v1.ProbeDataplaneReachabilityRequest
-	47, // 26: podmotion.agent.v1.MigrationAgentService.StartReachabilityEcho:input_type -> podmotion.agent.v1.StartReachabilityEchoRequest
+	47, // 24: podmotion.agent.v1.MigrationAgentService.VerifyTCP:input_type -> podmotion.agent.v1.VerifyTCPRequest
+	49, // 25: podmotion.agent.v1.MigrationAgentService.ProbeDataplaneReachability:input_type -> podmotion.agent.v1.ProbeDataplaneReachabilityRequest
+	51, // 26: podmotion.agent.v1.MigrationAgentService.StartReachabilityEcho:input_type -> podmotion.agent.v1.StartReachabilityEchoRequest
 	41, // 27: podmotion.agent.v1.MigrationAgentService.VerifyCleanup:input_type -> podmotion.agent.v1.VerifyCleanupRequest
-	3,  // 28: podmotion.agent.v1.MigrationAgentService.PrepareSource:output_type -> podmotion.agent.v1.PrepareSourceResponse
-	5,  // 29: podmotion.agent.v1.MigrationAgentService.PreDumpRound:output_type -> podmotion.agent.v1.PreDumpRoundResponse
-	7,  // 30: podmotion.agent.v1.MigrationAgentService.Checkpoint:output_type -> podmotion.agent.v1.CheckpointResponse
-	10, // 31: podmotion.agent.v1.MigrationAgentService.PrepareDestination:output_type -> podmotion.agent.v1.PrepareDestinationResponse
-	14, // 32: podmotion.agent.v1.MigrationAgentService.Restore:output_type -> podmotion.agent.v1.RestoreResponse
-	16, // 33: podmotion.agent.v1.MigrationAgentService.Verify:output_type -> podmotion.agent.v1.VerifyResponse
-	12, // 34: podmotion.agent.v1.MigrationAgentService.PrepareDestinationNetns:output_type -> podmotion.agent.v1.PrepareDestinationNetnsResponse
-	28, // 35: podmotion.agent.v1.MigrationAgentService.ConfirmOverlayReady:output_type -> podmotion.agent.v1.ConfirmOverlayReadyResponse
-	30, // 36: podmotion.agent.v1.MigrationAgentService.ArmZeroWindow:output_type -> podmotion.agent.v1.ArmZeroWindowResponse
-	32, // 37: podmotion.agent.v1.MigrationAgentService.DisarmZeroWindow:output_type -> podmotion.agent.v1.DisarmZeroWindowResponse
-	18, // 38: podmotion.agent.v1.MigrationAgentService.Abort:output_type -> podmotion.agent.v1.AbortResponse
-	20, // 39: podmotion.agent.v1.MigrationAgentService.EstimateCheckpoint:output_type -> podmotion.agent.v1.EstimateCheckpointResponse
-	22, // 40: podmotion.agent.v1.MigrationAgentService.PutCheckpointTar:output_type -> podmotion.agent.v1.PutCheckpointTarResponse
-	24, // 41: podmotion.agent.v1.MigrationAgentService.GetCheckpointTar:output_type -> podmotion.agent.v1.GetCheckpointTarResponse
-	26, // 42: podmotion.agent.v1.MigrationAgentService.ReleaseCheckpoint:output_type -> podmotion.agent.v1.ReleaseCheckpointResponse
-	34, // 43: podmotion.agent.v1.MigrationAgentService.InjectIPHandoff:output_type -> podmotion.agent.v1.InjectIPHandoffResponse
-	36, // 44: podmotion.agent.v1.MigrationAgentService.CleanupSourceIPHandoff:output_type -> podmotion.agent.v1.CleanupSourceIPHandoffResponse
-	40, // 45: podmotion.agent.v1.MigrationAgentService.InjectSourceRedirect:output_type -> podmotion.agent.v1.InjectSourceRedirectResponse
-	38, // 46: podmotion.agent.v1.MigrationAgentService.DisarmTCRedirect:output_type -> podmotion.agent.v1.DisarmTCRedirectResponse
-	44, // 47: podmotion.agent.v1.MigrationAgentService.VerifyTCP:output_type -> podmotion.agent.v1.VerifyTCPResponse
-	46, // 48: podmotion.agent.v1.MigrationAgentService.ProbeDataplaneReachability:output_type -> podmotion.agent.v1.ProbeDataplaneReachabilityResponse
-	48, // 49: podmotion.agent.v1.MigrationAgentService.StartReachabilityEcho:output_type -> podmotion.agent.v1.StartReachabilityEchoResponse
-	42, // 50: podmotion.agent.v1.MigrationAgentService.VerifyCleanup:output_type -> podmotion.agent.v1.VerifyCleanupResponse
-	28, // [28:51] is the sub-list for method output_type
-	5,  // [5:28] is the sub-list for method input_type
+	43, // 28: podmotion.agent.v1.MigrationAgentService.TeardownSourceRedirect:input_type -> podmotion.agent.v1.TeardownSourceRedirectRequest
+	45, // 29: podmotion.agent.v1.MigrationAgentService.ProbeConntrackForIP:input_type -> podmotion.agent.v1.ProbeConntrackForIPRequest
+	3,  // 30: podmotion.agent.v1.MigrationAgentService.PrepareSource:output_type -> podmotion.agent.v1.PrepareSourceResponse
+	5,  // 31: podmotion.agent.v1.MigrationAgentService.PreDumpRound:output_type -> podmotion.agent.v1.PreDumpRoundResponse
+	7,  // 32: podmotion.agent.v1.MigrationAgentService.Checkpoint:output_type -> podmotion.agent.v1.CheckpointResponse
+	10, // 33: podmotion.agent.v1.MigrationAgentService.PrepareDestination:output_type -> podmotion.agent.v1.PrepareDestinationResponse
+	14, // 34: podmotion.agent.v1.MigrationAgentService.Restore:output_type -> podmotion.agent.v1.RestoreResponse
+	16, // 35: podmotion.agent.v1.MigrationAgentService.Verify:output_type -> podmotion.agent.v1.VerifyResponse
+	12, // 36: podmotion.agent.v1.MigrationAgentService.PrepareDestinationNetns:output_type -> podmotion.agent.v1.PrepareDestinationNetnsResponse
+	28, // 37: podmotion.agent.v1.MigrationAgentService.ConfirmOverlayReady:output_type -> podmotion.agent.v1.ConfirmOverlayReadyResponse
+	30, // 38: podmotion.agent.v1.MigrationAgentService.ArmZeroWindow:output_type -> podmotion.agent.v1.ArmZeroWindowResponse
+	32, // 39: podmotion.agent.v1.MigrationAgentService.DisarmZeroWindow:output_type -> podmotion.agent.v1.DisarmZeroWindowResponse
+	18, // 40: podmotion.agent.v1.MigrationAgentService.Abort:output_type -> podmotion.agent.v1.AbortResponse
+	20, // 41: podmotion.agent.v1.MigrationAgentService.EstimateCheckpoint:output_type -> podmotion.agent.v1.EstimateCheckpointResponse
+	22, // 42: podmotion.agent.v1.MigrationAgentService.PutCheckpointTar:output_type -> podmotion.agent.v1.PutCheckpointTarResponse
+	24, // 43: podmotion.agent.v1.MigrationAgentService.GetCheckpointTar:output_type -> podmotion.agent.v1.GetCheckpointTarResponse
+	26, // 44: podmotion.agent.v1.MigrationAgentService.ReleaseCheckpoint:output_type -> podmotion.agent.v1.ReleaseCheckpointResponse
+	34, // 45: podmotion.agent.v1.MigrationAgentService.InjectIPHandoff:output_type -> podmotion.agent.v1.InjectIPHandoffResponse
+	36, // 46: podmotion.agent.v1.MigrationAgentService.CleanupSourceIPHandoff:output_type -> podmotion.agent.v1.CleanupSourceIPHandoffResponse
+	40, // 47: podmotion.agent.v1.MigrationAgentService.InjectSourceRedirect:output_type -> podmotion.agent.v1.InjectSourceRedirectResponse
+	38, // 48: podmotion.agent.v1.MigrationAgentService.DisarmTCRedirect:output_type -> podmotion.agent.v1.DisarmTCRedirectResponse
+	48, // 49: podmotion.agent.v1.MigrationAgentService.VerifyTCP:output_type -> podmotion.agent.v1.VerifyTCPResponse
+	50, // 50: podmotion.agent.v1.MigrationAgentService.ProbeDataplaneReachability:output_type -> podmotion.agent.v1.ProbeDataplaneReachabilityResponse
+	52, // 51: podmotion.agent.v1.MigrationAgentService.StartReachabilityEcho:output_type -> podmotion.agent.v1.StartReachabilityEchoResponse
+	42, // 52: podmotion.agent.v1.MigrationAgentService.VerifyCleanup:output_type -> podmotion.agent.v1.VerifyCleanupResponse
+	44, // 53: podmotion.agent.v1.MigrationAgentService.TeardownSourceRedirect:output_type -> podmotion.agent.v1.TeardownSourceRedirectResponse
+	46, // 54: podmotion.agent.v1.MigrationAgentService.ProbeConntrackForIP:output_type -> podmotion.agent.v1.ProbeConntrackForIPResponse
+	30, // [30:55] is the sub-list for method output_type
+	5,  // [5:30] is the sub-list for method input_type
 	5,  // [5:5] is the sub-list for extension type_name
 	5,  // [5:5] is the sub-list for extension extendee
 	0,  // [0:5] is the sub-list for field type_name
@@ -3996,7 +4288,7 @@ func file_migration_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_migration_agent_proto_rawDesc), len(file_migration_agent_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   47,
+			NumMessages:   51,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

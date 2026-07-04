@@ -357,6 +357,24 @@ const (
 	// PodMigration status after disarm and is never cleared (ADR-0240 D4/D4a), matching the
 	// existing WatchdogFired-style permanent-record convention.
 	ConditionZeroWindowRuleFlushDetected = "ZeroWindowRuleFlushDetected"
+	// ConditionIPReclaimDestTornDown is True once the destination-side tc-ingress redirect,
+	// FORWARD ACCEPT pair, and NOTRACK rules for the relocated OLD pod IP have been removed
+	// via DisarmTCRedirect during the IP-reclaim sweep (ADR-0244 / NR-BLOCK-2).
+	ConditionIPReclaimDestTornDown = "IPReclaimDestTornDown"
+	// ConditionIPReclaimSourceTornDown is True once the source-side flannel.1 redirect
+	// (route/neigh/FDB) and NOTRACK rules for the relocated OLD pod IP have been removed
+	// via TeardownSourceRedirect during the IP-reclaim sweep (ADR-0244 / NR-BLOCK-2).
+	ConditionIPReclaimSourceTornDown = "IPReclaimSourceTornDown"
+	// ConditionIPReclaimComplete is True only once BOTH ConditionIPReclaimDestTornDown and
+	// ConditionIPReclaimSourceTornDown are True (ADR-0244 / NR-BLOCK-2). Distinct from
+	// ConditionCni0CleanupVerified, which is scoped only to CUTOVER_COMPLETE objects.
+	ConditionIPReclaimComplete = "IPReclaimComplete"
+	// ConditionIPReclaimVerified records the VerifyCleanup(IP_RECLAIM) bounded-retry outcome
+	// (3 attempts, 2s/4s/8s), same fail-open posture as ConditionCni0CleanupVerified
+	// (ADR-0241 item 1 precedent). False (reason CleanupLeakExhausted) on retry-budget
+	// exhaustion emits DatapathCleanupLeakTotal + a DatapathCleanupLeak Event but never
+	// blocks or reverts reclaim (ADR-0244 / NR-BLOCK-2).
+	ConditionIPReclaimVerified = "IPReclaimVerified"
 )
 
 // PreCopyStats records metrics from the iterative pre-copy phase.

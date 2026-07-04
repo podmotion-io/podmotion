@@ -1573,8 +1573,56 @@ func (s *AgentServer) VerifyCleanup(ctx context.Context, req *agentpb.VerifyClea
 			"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "presentObjects", present)
 		return &agentpb.VerifyCleanupResponse{Clean: len(present) == 0, PresentObjects: present}, nil
 	case agentpb.CleanupScope_IP_RECLAIM:
-		return nil, status.Errorf(codes.Unimplemented,
-			"VerifyCleanup: IP_RECLAIM scope has no cleanup trigger yet (NR-BLOCK-2, ADR-0241 item 2)")
+		oldIP := net.ParseIP(req.OldPodIp)
+		if oldIP == nil || oldIP.To4() == nil {
+			return nil, status.Errorf(codes.InvalidArgument, "VerifyCleanup: old_pod_ip %q is not a valid IPv4", req.OldPodIp)
+		}
+		fdbIf := req.FdbIfname
+		if fdbIf == "" {
+			if discovered, discErr := discoverHostInterface(ctx); discErr == nil && discovered != "" {
+				fdbIf = discovered
+			} else {
+				fdbIf = "flannel.1"
+			}
+		}
+		var present []string
+		for _, obj := range req.Objects {
+			switch obj {
+			case "tc_filter", "tc_qdisc":
+				if tcRedirectPresent(ctx, fdbIf) {
+					present = append(present, obj)
+				}
+			case "dest_forward_accept":
+				if oldIPForwardAcceptPresent(ctx, oldIP) {
+					present = append(present, obj)
+				}
+			case "dest_notrack":
+				if oldIPNotrackPresent(ctx, oldIP, "both") {
+					present = append(present, obj)
+				}
+			case "source_notrack":
+				if oldIPNotrackPresent(ctx, oldIP, "source") {
+					present = append(present, obj)
+				}
+			case "flannel1_route":
+				if cni0HostRoutePresent(ctx, fdbIf, oldIP) {
+					present = append(present, obj)
+				}
+			case "flannel1_neigh":
+				if cni0NeighPresent(ctx, fdbIf, oldIP) {
+					present = append(present, obj)
+				}
+			case "flannel1_fdb":
+				if flannel1FDBPresent(ctx, fdbIf, req.ReplVethMac) {
+					present = append(present, obj)
+				}
+			default:
+				log.Info("VerifyCleanup: unknown object in request (ignored)", "migration", req.MigrationName, "object", obj)
+			}
+		}
+		log.Info("VerifyCleanup: IP_RECLAIM probe complete (ADR-0244)",
+			"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "presentObjects", present)
+		return &agentpb.VerifyCleanupResponse{Clean: len(present) == 0, PresentObjects: present}, nil
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "VerifyCleanup: unknown scope %v", req.Scope)
 	}
@@ -2006,6 +2054,122 @@ func (s *AgentServer) InjectSourceRedirect(ctx context.Context, req *agentpb.Inj
 		"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "replVethMAC", req.ReplVethMac,
 		"dstNodeIP", req.DstNodeIp, "ifName", fdbIf)
 	return &agentpb.InjectSourceRedirectResponse{Injected: true}, nil
+}
+
+// TeardownSourceRedirect removes the ADR-0136 SOURCE-node flannel.1 VXLAN redirect (AF_BRIDGE
+// FDB, AF_INET neigh, /32 host route) plus the ADR-0141 source-mode NOTRACK rules for the
+// relocated OLD pod IP. Symmetric to DisarmTCRedirect on the destination side. Called only
+// once the controller's IP-Reclaim-Eligible predicate holds (ADR-0244 / NR-BLOCK-2). Idempotent
+// — every removal below already tolerates ENOENT (RemoveFDBEntry, DeletePodIPNeigh,
+// DeletePodIPHostRoute, removeOldIPNotrack), so a crash mid-teardown and a retry from the
+// controller both converge safely without erroring on an already-removed object.
+func (s *AgentServer) TeardownSourceRedirect(ctx context.Context, req *agentpb.TeardownSourceRedirectRequest) (*agentpb.TeardownSourceRedirectResponse, error) {
+	log.Info("TeardownSourceRedirect called (ADR-0244)", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+
+	if req.OldPodIp == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "TeardownSourceRedirect: old_pod_ip is required")
+	}
+	oldIP := net.ParseIP(req.OldPodIp)
+	if oldIP == nil || oldIP.To4() == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "TeardownSourceRedirect: old_pod_ip %q is not a valid IPv4", req.OldPodIp)
+	}
+
+	fdbIf := req.FdbIfname
+	if fdbIf == "" {
+		fdbIf = "flannel.1"
+	}
+
+	// (a) AF_BRIDGE FDB replVethMAC -> dstNodeIP. Only removable if we know the MAC/VTEP the
+	// entry was keyed on (ADR-0136); if either is missing (e.g. controller lost that status
+	// field across a restart), skip this sub-step rather than fail the whole teardown — the
+	// neigh/route removals below are the load-bearing half for reachability, and a stale FDB
+	// entry alone does not re-expose the OLD IP (nothing routes to flannel.1 for it anymore).
+	var firstErr error
+	if req.ReplVethMac != "" && req.DstNodeIp != "" {
+		if mac, macErr := net.ParseMAC(req.ReplVethMac); macErr == nil {
+			if dstNodeIP := net.ParseIP(req.DstNodeIp); dstNodeIP != nil {
+				if err := network.NewFDBManager().RemoveFDBEntry(ctx, network.FDBEntry{
+					IfName: fdbIf,
+					PodIP:  oldIP,
+					PodMAC: mac,
+					VTEPIP: dstNodeIP,
+				}); err != nil {
+					firstErr = fmt.Errorf("flannel.1 AF_BRIDGE FDB: %w", err)
+				}
+			}
+		}
+	} else {
+		log.Info("TeardownSourceRedirect: repl_veth_mac/dst_node_ip not supplied — skipping FDB entry removal (neigh/route still torn down)",
+			"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+	}
+
+	// (b) AF_INET neigh oldPodIP -> replVethMAC on flannel.1.
+	if err := network.DeletePodIPNeigh(ctx, fdbIf, oldIP); err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("flannel.1 neigh: %w", err)
+	}
+	// (c) /32 host route for oldPodIP via flannel.1.
+	if err := network.DeletePodIPHostRoute(ctx, fdbIf, oldIP); err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("flannel.1 /32 route: %w", err)
+	}
+	// (d) source NOTRACK rules (already generic — deletes both directions in both chains
+	// regardless of which installOldIPNotrack mode installed them; no change needed here).
+	removeOldIPNotrack(ctx, oldIP)
+
+	if firstErr != nil {
+		log.Error(firstErr, "TeardownSourceRedirect: partial failure (non-ENOENT)", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+		return &agentpb.TeardownSourceRedirectResponse{TornDown: false, BlockingReason: firstErr.Error()}, nil
+	}
+
+	log.Info("TeardownSourceRedirect: source flannel.1 redirect + NOTRACK torn down (ADR-0244)",
+		"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "ifName", fdbIf)
+	return &agentpb.TeardownSourceRedirectResponse{TornDown: true}, nil
+}
+
+// flannel1FDBPresent reports whether an AF_BRIDGE FDB entry keyed on replVethMAC still
+// exists on ifName (ADR-0244 VerifyCleanup(IP_RECLAIM) probe).
+func flannel1FDBPresent(ctx context.Context, ifName, replVethMAC string) bool {
+	if ifName == "" || replVethMAC == "" {
+		return false
+	}
+	out, err := exec.CommandContext(ctx, "bridge", "fdb", "show", "dev", ifName).CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(out)), strings.ToLower(replVethMAC))
+}
+
+// tcRedirectPresent reports whether the ADR-0139 tc-ingress filter or qdisc is still present
+// on ifName (ADR-0244 VerifyCleanup(IP_RECLAIM) probe).
+func tcRedirectPresent(ctx context.Context, ifName string) bool {
+	if ifName == "" {
+		return false
+	}
+	if out, err := exec.CommandContext(ctx, "tc", "filter", "show", "dev", ifName, "ingress").CombinedOutput(); err == nil && strings.TrimSpace(string(out)) != "" {
+		return true
+	}
+	if out, err := exec.CommandContext(ctx, "tc", "qdisc", "show", "dev", ifName, "ingress").CombinedOutput(); err == nil &&
+		strings.Contains(string(out), "ingress") {
+		return true
+	}
+	return false
+}
+
+// ProbeConntrackForIP reports whether this node's local conntrack table has any entry
+// matching req.OldPodIp (ADR-0244 R6 / NR-BLOCK-2). Read-only presence probe — repurposes
+// network.ExportConntrack (already shipped for ADR-0108 freeze-time state export) rather
+// than adding a new netlink dump path. NOTRACK'd flows are, by definition, invisible to
+// conntrack while NOTRACK is still armed, so this probe must be read BEFORE any teardown
+// step (while the datapath is still pre-teardown) — the controller is responsible for that
+// ordering; this RPC only reports what it observes right now.
+func (s *AgentServer) ProbeConntrackForIP(ctx context.Context, req *agentpb.ProbeConntrackForIPRequest) (*agentpb.ProbeConntrackForIPResponse, error) {
+	if req.OldPodIp == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "ProbeConntrackForIP: old_pod_ip is required")
+	}
+	entries, err := network.ExportConntrack(ctx, network.ConntrackExportOptions{PodIP: req.OldPodIp})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "ProbeConntrackForIP: %v", err)
+	}
+	return &agentpb.ProbeConntrackForIPResponse{Present: len(entries) > 0, Count: int32(len(entries))}, nil
 }
 
 // ListenAndServe starts the gRPC server on addr (default ":9090").
