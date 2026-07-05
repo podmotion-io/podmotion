@@ -39,11 +39,15 @@ docs/HANDOFF-*.md
 docs/sprints/SPRINT*-VM-*.md
 
 # Compiled binaries at repo root
-local_gate
-pm-cni
-fleetctl
-agent
-hack/gate-workload/gate-server
+# NOTE: these MUST be anchored with a leading '/'. A bare name like `agent` (unanchored)
+# matches every path component of that name anywhere in the tree — the bare `agent` pattern
+# was silently gitignoring the entire internal/agent/ package, which is why prior unit-test
+# files under internal/agent/server were "gitignored, never committed" (Workstream-40C).
+/local_gate
+/pm-cni
+/fleetctl
+/agent
+/hack/gate-workload/gate-server
 
 # macOS artifacts
 .DS_Store
