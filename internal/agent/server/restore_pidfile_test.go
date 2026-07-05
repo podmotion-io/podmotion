@@ -24,6 +24,7 @@ package server
 
 import (
 	"errors"
+	"os"
 	"testing"
 	"time"
 )
@@ -157,5 +158,85 @@ func TestReadRestoredPIDFromPidfile_PidfileWinsEvenIfProcessAlreadyExited(t *tes
 	}
 	if pid != 777 {
 		t.Fatalf("got pid=%d, want 777", pid)
+	}
+}
+
+// --- C1 stale-pidfile unlink regression coverage ---
+//
+// removeStalePidfile is the injectable decomposition of the C1 fix: os.Remove(stalePidfilePath)
+// runs immediately before every CRIU restore launch inside joinNsRestore, and must fail CLOSED on
+// any removal error other than "not present". The removeFn is injected (os.Remove in production)
+// exactly like readFn/pollFn above, so the fail-open-on-not-exist vs fail-closed-on-any-other-error
+// contract is proven here without a live CRIU/broker round-trip. This is the BLOCKING Security
+// Reviewer finding's regression test — before this, the fix had zero coverage.
+
+func TestRemoveStalePidfile_RemovesExistingStaleFile(t *testing.T) {
+	// (a) A pre-existing stale restored.pid IS removed before CRIU launch: removeFn is invoked
+	// with the exact pidfile path and, on success, the helper returns nil (launch proceeds).
+	const path = "/fake/data/restored.pid"
+	called := false
+	var gotPath string
+	removeFn := func(p string) error {
+		called = true
+		gotPath = p
+		return nil // simulate a real, present file being unlinked successfully
+	}
+
+	if err := removeStalePidfile(path, removeFn); err != nil {
+		t.Fatalf("removeStalePidfile returned unexpected error on successful unlink: %v", err)
+	}
+	if !called {
+		t.Fatal("removeFn was never called — the stale pidfile unlink did not run before CRIU launch")
+	}
+	if gotPath != path {
+		t.Fatalf("removeFn called with path=%q, want %q", gotPath, path)
+	}
+}
+
+func TestRemoveStalePidfile_FailOpenVsFailClosed(t *testing.T) {
+	otherErr := errors.New("read-only filesystem")
+	cases := []struct {
+		name      string
+		removeErr error
+		wantErr   bool // true = hard fail-closed; false = fail-open (proceed to launch)
+	}{
+		{
+			name:      "not-exist is fail-open (no stale file to remove)",
+			removeErr: os.ErrNotExist,
+			wantErr:   false,
+		},
+		{
+			name:      "success is fail-open (stale file removed)",
+			removeErr: nil,
+			wantErr:   false,
+		},
+		{
+			name:      "permission-denied is fail-closed (unremovable stale file must not be polled past)",
+			removeErr: os.ErrPermission,
+			wantErr:   true,
+		},
+		{
+			name:      "any other error is fail-closed",
+			removeErr: otherErr,
+			wantErr:   true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			removeFn := func(string) error { return tc.removeErr }
+			err := removeStalePidfile("/fake/data/restored.pid", removeFn)
+			if tc.wantErr && err == nil {
+				t.Fatalf("removeStalePidfile returned nil, want a hard fail-closed error (removeErr=%v)", tc.removeErr)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("removeStalePidfile returned error %v, want nil (fail-open on removeErr=%v)", err, tc.removeErr)
+			}
+			// On the fail-closed path the original removeFn error must be wrapped (not swallowed),
+			// so operators can see WHY the launch was blocked.
+			if tc.wantErr && !errors.Is(err, tc.removeErr) {
+				t.Fatalf("fail-closed error %v does not wrap the underlying removeFn error %v", err, tc.removeErr)
+			}
+		})
 	}
 }
