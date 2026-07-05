@@ -84,6 +84,7 @@ func TestClassifyRegFd_RealScript(t *testing.T) {
 		"inherit_fd_names": []string{"sys/fs/cgroup/cpu.max"},
 		"kept_mnt_ids":     []int{1, 100},
 		"ext_drop_mnt_ids": []int{500},
+		"root_mnt_id":      1, // ADR-0245 D2: sane rebind target (present + kept).
 	}
 	entries := []map[string]any{
 		// 0: non-REG entry → KEEP (out of scope).
@@ -128,6 +129,7 @@ func TestClassifyRegFd_RebindThenReCheckKeep(t *testing.T) {
 		"inherit_fd_names": []string{},
 		"kept_mnt_ids":     []int{rootMntID},
 		"ext_drop_mnt_ids": []int{500},
+		"root_mnt_id":      rootMntID,
 	}
 	orphanDir := reg(20, "/data", 500, modeDir, false)
 	if got := runClassifySelftest(t, ctx, []map[string]any{orphanDir}); got[0] != "REBIND_TO_ROOT" {
@@ -137,5 +139,92 @@ func TestClassifyRegFd_RebindThenReCheckKeep(t *testing.T) {
 	rebound := reg(20, "/data", rootMntID, modeDir, false)
 	if got := runClassifySelftest(t, ctx, []map[string]any{rebound}); got[0] != "KEEP" {
 		t.Fatalf("rebound dir: got %q, want KEEP (re-check must not false-positive)", got[0])
+	}
+}
+
+// TestClassifyRegFd_DirRebindTargetValidation covers the ADR-0245 D2 (Storage Architect)
+// fail-closed fix: an orphan directory fd is only rebound when the rebind target (root_mnt_id)
+// is itself sane — present AND a kept mountpoint. When the target is missing or absent from the
+// kept set, rebinding would just move the fd onto another mnt_id that is ALSO not in the restored
+// mount set (firing mount.c:3953 anyway), so the classifier fails loud (DECLINE) instead of
+// silently redirecting the directory handle to an unusable target.
+func TestClassifyRegFd_DirRebindTargetValidation(t *testing.T) {
+	orphanDir := reg(30, "/data", 500, modeDir, false)
+
+	cases := []struct {
+		name       string
+		rootMntID  any   // nil => key present but null; omitted below via missing flag
+		omitRoot   bool  // true => root_mnt_id key absent entirely
+		keptMntIDs []int
+		want       string
+	}{
+		{
+			// Safe scaffolding / ext-drop lockstep rebind: target present + kept => REBIND_TO_ROOT.
+			// (The production call site additionally emits a WARNING for this case.)
+			name:       "sane target rebinds",
+			rootMntID:  1,
+			keptMntIDs: []int{1},
+			want:       "REBIND_TO_ROOT",
+		},
+		{
+			// Ambiguous / unusable target: root_mnt_id set but NOT in the kept set. Rebinding
+			// would land on an absent mnt_id — fail loud instead of silently redirecting.
+			name:       "target not in kept set declines",
+			rootMntID:  7,
+			keptMntIDs: []int{1},
+			want:       "DECLINE",
+		},
+		{
+			// root_mnt_id explicitly null (e.g. no '/' entry survived) => no sane target => DECLINE.
+			name:       "null target declines",
+			rootMntID:  nil,
+			keptMntIDs: []int{1},
+			want:       "DECLINE",
+		},
+		{
+			// root_mnt_id key absent entirely (defensive: ctx.get returns None) => DECLINE.
+			name:       "missing target key declines",
+			omitRoot:   true,
+			keptMntIDs: []int{1},
+			want:       "DECLINE",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := map[string]any{
+				"remap_ids":        []int{},
+				"inherit_fd_names": []string{},
+				"kept_mnt_ids":     tc.keptMntIDs,
+				"ext_drop_mnt_ids": []int{500},
+			}
+			if !tc.omitRoot {
+				ctx["root_mnt_id"] = tc.rootMntID
+			}
+			got := runClassifySelftest(t, ctx, []map[string]any{orphanDir})
+			if got[0] != tc.want {
+				t.Errorf("orphan dir with %s: got %q, want %q", tc.name, got[0], tc.want)
+			}
+		})
+	}
+}
+
+// TestClassifyRegFd_GenericOrphanDirRebinds proves the "generic orphan" directory case (mnt_id
+// in NEITHER the kept set NOR the ext-drop set — a mount that simply vanished from the
+// mountpoints image, ADR-0193 §4) still classifies REBIND_TO_ROOT when the target is sane. This
+// is the higher-suspicion case the production call site flags with the 'generic-orphan' label;
+// the classifier keeps the rebind (visibility, not a hard block, is the fix) so the gate-proven
+// ADR-0193 §4 path is preserved rather than escalated to a restore-breaking DECLINE.
+func TestClassifyRegFd_GenericOrphanDirRebinds(t *testing.T) {
+	ctx := map[string]any{
+		"remap_ids":        []int{},
+		"inherit_fd_names": []string{},
+		"kept_mnt_ids":     []int{1},
+		"ext_drop_mnt_ids": []int{}, // empty — mnt_id 777 is a generic orphan, not an ext-drop.
+		"root_mnt_id":      1,
+	}
+	genericOrphanDir := reg(40, "/workload/pv-subdir", 777, modeDir, false)
+	if got := runClassifySelftest(t, ctx, []map[string]any{genericOrphanDir}); got[0] != "REBIND_TO_ROOT" {
+		t.Fatalf("generic orphan dir: got %q, want REBIND_TO_ROOT", got[0])
 	}
 }

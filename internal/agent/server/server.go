@@ -48,6 +48,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/network"
 	"github.com/podmotion-io/podmotion/internal/agent/provenance"
 	"github.com/podmotion-io/podmotion/internal/agent/seccomp"
+	"github.com/podmotion-io/podmotion/internal/metrics"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 )
 
@@ -92,8 +93,8 @@ var ErrCRIUCapability = criu.ErrCRIUCapability
 // ErrRestoredPIDNotFound is returned by the cgroup-anchored restored-PID scan (ADR-0123 D2)
 // when, after CRIU exits 0, no process resident in the replacement pod's cgroup can be found
 // within the scan timeout. On the cold (--join-ns net:<path>) path the caller MUST fail loud on this error
-// and MUST NOT fall back to the name-based findRestoredProcessPID scan, and MUST NOT set
-// criuRestoreConfirmed (ADR-0123 D2 step 5 / AC5).
+// and MUST NOT fall back to the retired name-based comm-scan resolver (deleted per ADR-0245), and
+// MUST NOT set criuRestoreConfirmed (ADR-0123 D2 step 5 / AC5).
 var ErrRestoredPIDNotFound = errors.New("restored process PID not found in replacement pod cgroup")
 
 // CRIUImageInconsistencyError is returned by patchCheckpointImages (ADR-0193 P-0193-1) when a
@@ -2711,7 +2712,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	dataDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/data", migrationName)
 	secretsDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/secrets", migrationName)
 	termlogFile := fmt.Sprintf("/var/lib/podmotion/restore/%s/termination-log", migrationName)
-	_ = os.MkdirAll(dataDir, 0o755)
+	_ = os.MkdirAll(dataDir, 0o700)
 	_ = os.MkdirAll(secretsDir, 0o700)
 	_ = os.WriteFile(termlogFile, nil, 0o644)
 
@@ -2947,7 +2948,22 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// wrapper's stderr and returns it on each exec_poll; criuCmd.Stderr mirrors it.
 	criuStderr := criuCmd.Stderr
 
+	// Remove any stale pidfile from a prior attempt of THIS SAME migration before launching
+	// CRIU. os.MkdirAll(dataDir) above does not clean the directory, and CRIU opens --pidfile
+	// with O_TRUNC (not O_EXCL), so a leftover restored.pid can be read by the pidfile poll
+	// below in its first iteration — before the new CRIU process rewrites it — and if that
+	// stale PID is still live (or recycled) the restore would report success for the WRONG
+	// process. That is exactly the report-success-on-wrong-PID failure class the --pidfile
+	// primitive exists to prevent. Fail CLOSED: any removal error other than "not present"
+	// is a hard stop (an unremovable stale file must never be silently polled past).
+	stalePidfilePath := filepath.Join(dataDir, restoredPidfileName)
+	if err := removeStalePidfile(stalePidfilePath, os.Remove); err != nil {
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_stale_pidfile_unlink").Inc()
+		return 0, nil, err
+	}
+
 	if err := criuCmd.Start(); err != nil {
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_criu_start").Inc()
 		return 0, nil, fmt.Errorf("criu restore start: %w", err)
 	}
 
@@ -3045,52 +3061,58 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	log.Info("joinNsRestore: cgroup-PID signal confirmed workload live — proceeding to PID resolution",
 		"migration", migrationName)
 
-	// Step 5: ADR-0123 D2 — locate the restored application PID via the replacement pod's
-	// cgroup, NOT by process name. CRIU has exited (D1), so its PID can no longer be confused
-	// with the application and there is no zombie to match. On the cold (--join-ns net:<path>) path the
-	// sandboxID anchors the pod cgroup; the comm-based findRestoredProcessPID is never used as a
-	// fallback (D2 step 5). The --join-ns Restore (TCP-stateful) path (no sandboxID) is out of Sprint-18 scope
-	// and retains the legacy name/cgroup scan.
+	// Step 5: resolve the restored application PID from CRIU's own --pidfile primitive on BOTH
+	// restore entry points (the NRI path and the gRPC Restore RPC path). CRIU writes the PID it
+	// restored to <dataDir>/restored.pid on every restore — buildCRIURestoreArgs appends --pidfile
+	// unconditionally, and dataDir is computed identically on both paths — so this is CRIU's own
+	// authoritative output and its resolution does NOT depend on having a sandboxID. Both prior
+	// resolvers are retired and MUST NOT be reintroduced on ANY path: the comm-scan
+	// findRestoredProcessPID (comm is attacker-controlled via prctl(PR_SET_NAME) — ADR-0245) and
+	// the broker-cgroup PID diff (poll-and-guess, non-atomic — ADR-0228 NRI/gRPC symmetry). The
+	// sandboxID gate that previously wrapped this resolution was a remnant of the old resolver
+	// chain (sandboxID was the anchor the cgroup-diff resolver needed); the --pidfile primitive
+	// needs only dataDir, so the gate is removed here and both paths converge on this resolver.
+	if agentPIDsErr != nil {
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_broker_cgroup_snapshot").Inc()
+		return 0, nil, fmt.Errorf("snapshot broker cgroup PIDs before restore: %w", agentPIDsErr)
+	}
+	if beforeAgentPIDs == nil {
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_broker_cgroup_baseline_missing").Inc()
+		return 0, nil, fmt.Errorf("broker cgroup baseline was never captured (wrapper never polled live)")
+	}
 	var pid int
+	pidfilePath := filepath.Join(dataDir, restoredPidfileName)
+	pidfilePoll := func() (bool, error) {
+		exited, _, _, perr := criuCmd.poll()
+		return exited, perr
+	}
+	pid, err = readRestoredPIDFromPidfile(pidfilePath, 30*time.Second, pidfilePoll)
+	if err != nil {
+		// Fail loud — never fall back to comm-scan or cgroup-diff (ADR-0228 NRI/gRPC symmetry).
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_pidfile_missing").Inc()
+		return 0, nil, fmt.Errorf("resolve restored PID via CRIU --pidfile: %w", err)
+	}
+	// ADR-0228 Invariant 1: identity is guaranteed by --pidfile (CRIU reports the PID it
+	// restored — never the wrapper/holder stub); the residual check is liveness. Defense in
+	// depth: reject the impossible case where the pidfile PID coincides with the wrapper PID.
+	if pid == criuWrapperPID {
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_pid_equals_wrapper").Inc()
+		return 0, nil, fmt.Errorf("pidfile-reported PID %d equals the CRIU wrapper (holder) PID — refusing to trust", pid)
+	}
+	if verr := verifyRestoredPIDAlive(pid, 100*time.Millisecond); verr != nil {
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_pid_dead").Inc()
+		return 0, nil, fmt.Errorf("ADR-0228 Invariant 1: %w", verr)
+	}
+	log.Info("joinNsRestore: resolved restored PID via CRIU --pidfile (authoritative primitive)",
+		"pid", pid, "pidfile", pidfilePath, "migration", migrationName)
+
+	// ADR-0128: cgroup placement requires a pod sandbox to anchor to, so it is the ONE step that
+	// still legitimately depends on sandboxID (it is NOT retired). On the NRI path (sandboxID set)
+	// --manage-cgroups=ignore leaves the restored tree in the broker/launcher cgroup, so move it
+	// into the pod's sandbox cgroup for containerd/k8s to manage. The gRPC/--join-ns path has no
+	// pod sandbox (sandboxID == "") and therefore no pod cgroup to move into — this step is
+	// skipped. PID resolution above is identical on both paths regardless.
 	if sandboxID != "" {
-		// ADR-0128: --manage-cgroups=ignore leaves the restored tree in the launcher's cgroup, not
-		// the pod cgroup, so the ADR-0123 D2 pod-cgroup scan finds nothing. Instead diff the
-		// launcher cgroup against the pre-CRIU snapshot to find the new workload PID, then move it
-		// into the pod's sandbox cgroup so containerd/k8s can manage it.
-		// ADR-0234: the launcher is now the BROKER (the wrapper is a broker child), so the diff is
-		// against the BROKER cgroup — the PID set the broker returns on exec_poll. beforeAgentPIDs
-		// is the broker-cgroup baseline captured in the liveness loop above.
-		if agentPIDsErr != nil {
-			return 0, nil, fmt.Errorf("ADR-0128: snapshot broker cgroup PIDs before restore: %w", agentPIDsErr)
-		}
-		if beforeAgentPIDs == nil {
-			return 0, nil, fmt.Errorf("ADR-0128: broker cgroup baseline was never captured (wrapper never polled live)")
-		}
-		// Resolve the restored PID from CRIU's own --pidfile (authoritative), replacing a
-		// fragile, non-atomic PID-inference chain: NOT the broker-cgroup PID diff (poll-and-guess).
-		// findRestoredPIDInBrokerCgroup is retired from the live path and MUST NOT be reintroduced
-		// as a resolver — CRIU is the source of truth for the PID it restored.
-		pidfilePath := filepath.Join(dataDir, restoredPidfileName)
-		pidfilePoll := func() (bool, error) {
-			exited, _, _, perr := criuCmd.poll()
-			return exited, perr
-		}
-		pid, err = readRestoredPIDFromPidfile(pidfilePath, 30*time.Second, pidfilePoll)
-		if err != nil {
-			// Fail loud — never fall back to comm-scan or cgroup-diff (ADR-0228 NRI/gRPC symmetry).
-			return 0, nil, fmt.Errorf("resolve restored PID via CRIU --pidfile: %w", err)
-		}
-		// ADR-0228 Invariant 1: identity is guaranteed by --pidfile (CRIU reports the PID it
-		// restored — never the wrapper/holder stub); the residual check is liveness. Defense in
-		// depth: reject the impossible case where the pidfile PID coincides with the wrapper PID.
-		if pid == criuWrapperPID {
-			return 0, nil, fmt.Errorf("pidfile-reported PID %d equals the CRIU wrapper (holder) PID — refusing to trust", pid)
-		}
-		if verr := verifyRestoredPIDAlive(pid, 100*time.Millisecond); verr != nil {
-			return 0, nil, fmt.Errorf("ADR-0228 Invariant 1: %w", verr)
-		}
-		log.Info("joinNsRestore: resolved restored PID via CRIU --pidfile (authoritative primitive)",
-			"pid", pid, "pidfile", pidfilePath, "migration", migrationName)
 		// Resolve the pod's sandbox cgroup path from the pause PID (same anchor as ADR-0123 D2).
 		pausePID, perr := sandboxPausePID(sandboxID)
 		if perr != nil {
@@ -3107,11 +3129,6 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 		}
 		log.Info("joinNsRestore: moved restored process into pod cgroup (ADR-0128)",
 			"pid", pid, "podCgroup", podCgroup, "sandboxID", sandboxID)
-	} else {
-		pid, err = findRestoredProcessPID(checkpointDir)
-		if err != nil {
-			return 0, nil, err
-		}
 	}
 	log.Info("joinNsRestore: found restored process", "pid", pid)
 
@@ -3334,153 +3351,6 @@ func isConnRefused(err error) bool {
 	return false
 }
 
-// findRestoredPIDByCgroup implements ADR-0123 Decision 2: resolve the restored application PID
-// by cgroup membership in the replacement pod, anchored on the pod's pause/sandbox container.
-//
-//  1. Resolve the pause PID for sandboxID (the ADR-0122 sandbox anchor) via `ctr tasks list`,
-//     then read /proc/<pausePID>/cgroup to obtain the pod cgroup path. If the pause PID has
-//     exited (TOCTOU), fail loud rather than scanning an empty cgroup (Security/Runtime note 3).
-//  2. Scan /proc/*/cgroup for processes whose cgroup path matches the pod-UID subtree exactly
-//     (not a prefix that could match a sibling pod), excluding the CRIU binary and the pause PID.
-//  3. Among survivors, select the restored tree's root/leader: a cgroup-resident process whose
-//     PPid is NOT itself in the pod cgroup (CRIU exited, so the tree was reparented to the agent
-//     subreaper / PID 1). Tie-break by LOWEST PID — the leader starts first; higher PIDs are its
-//     children. "Highest PID" is explicitly wrong (can pick a transient child).
-//  4. Retry for up to 10s at 200ms intervals to allow reparenting to become observable.
-//  5. On zero candidates after timeout, return ErrRestoredPIDNotFound (no comm-scan fallback).
-func findRestoredPIDByCgroup(sandboxID string) (int, error) {
-	pausePID, err := sandboxPausePID(sandboxID)
-	if err != nil {
-		return 0, fmt.Errorf("ADR-0123 D2: resolve pause PID for sandbox %s: %w", sandboxID, err)
-	}
-	// Read the pod cgroup path from the pause container. TOCTOU: if the pause PID has exited,
-	// /proc/<pid>/cgroup is gone — fail loud, never scan an empty cgroup (Security note 3).
-	podCgroup, err := cgroupV2Path(pausePID)
-	if err != nil {
-		return 0, fmt.Errorf("ADR-0123 D2: read pod cgroup from pause PID %d (sandbox %s): %w",
-			pausePID, sandboxID, err)
-	}
-
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		pid, found := scanCgroupForRestoredRoot(podCgroup, pausePID)
-		if found {
-			log.Info("findRestoredPIDByCgroup: resolved restored PID via pod cgroup (ADR-0123 D2)",
-				"pid", pid, "sandboxID", sandboxID, "pausePID", pausePID, "podCgroup", podCgroup)
-			return pid, nil
-		}
-		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("%w (sandbox %s, podCgroup %s, pausePID %d, 10s timeout)",
-				ErrRestoredPIDNotFound, sandboxID, podCgroup, pausePID)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-}
-
-// getAgentCgroupPIDs implements ADR-0128: returns the set of PIDs currently resident in the
-// agent's OWN cgroup. It reads /proc/self/cgroup to get the agent's cgroup v2 path, then reads
-// cgroup.procs for that path. Used to snapshot the agent cgroup before CRIU starts so the
-// restored workload PID can be identified as the new entrant afterwards.
-func getAgentCgroupPIDs() (map[int]bool, error) {
-	selfPath, err := cgroupV2Path(os.Getpid())
-	if err != nil {
-		return nil, fmt.Errorf("read agent cgroup path from /proc/self/cgroup: %w", err)
-	}
-	procsPath := filepath.Join("/sys/fs/cgroup", selfPath, "cgroup.procs")
-	data, err := os.ReadFile(procsPath)
-	if err != nil {
-		return nil, fmt.Errorf("read agent cgroup.procs (%s): %w", procsPath, err)
-	}
-	pids := make(map[int]bool)
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if pid, convErr := strconv.Atoi(line); convErr == nil {
-			pids[pid] = true
-		}
-	}
-	return pids, nil
-}
-
-// findRestoredPIDInAgentCgroup implements ADR-0128: with --manage-cgroups=ignore the CRIU-restored
-// process tree lands in the AGENT's cgroup (the launcher's). This scans the agent cgroup for PIDs
-// that were NOT present in beforePIDs (the pre-CRIU snapshot) and are NOT the CRIU process itself,
-// returning the LOWEST such PID — the restored tree root (the leader starts first; children get
-// higher PIDs). Retries for up to 10s at 200ms intervals to allow the restored tree to appear.
-// findRestoredPIDInBrokerCgroup is the ADR-0234 broker-cgroup analogue of
-// findRestoredPIDInAgentCgroup. Because the CRIU wrapper is launched as a child of
-// the privileged broker (ADR-0234), --manage-cgroups=ignore lands the restored tree
-// in the BROKER cgroup, not the agent cgroup. This polls the broker cgroup PID set
-// (returned by exec_poll) and applies the identical new-entrant selection: the
-// lowest PID that was NOT in beforePIDs, is NOT the wrapper PID, and whose comm is
-// not "criu" (defensive). Retries for up to 10s at 200ms, same as the agent-cgroup
-// path. /proc/<pid>/comm is readable agent-side under hostPID:true even though the
-// PID is a broker-cgroup resident.
-func findRestoredPIDInBrokerCgroup(beforePIDs map[int]bool, wrapperPID int, criuCmd *brokerCriuCmd) (int, error) {
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		_, _, brokerCgroupPIDs, pollErr := criuCmd.poll()
-		if pollErr == nil {
-			bestPID := 0
-			for _, pid := range brokerCgroupPIDs {
-				if beforePIDs[pid] || pid == wrapperPID {
-					continue
-				}
-				comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-				if strings.TrimSpace(string(comm)) == "criu" {
-					continue
-				}
-				if bestPID == 0 || pid < bestPID {
-					bestPID = pid
-				}
-			}
-			if bestPID != 0 {
-				log.Info("findRestoredPIDInBrokerCgroup: resolved restored PID via broker cgroup diff (ADR-0234/ADR-0128)",
-					"pid", bestPID, "wrapperPID", wrapperPID)
-				return bestPID, nil
-			}
-		}
-		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("%w (broker-cgroup diff, wrapperPID %d, 10s timeout)", ErrRestoredPIDNotFound, wrapperPID)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-}
-
-func findRestoredPIDInAgentCgroup(beforePIDs map[int]bool, criuPID int) (int, error) {
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		current, err := getAgentCgroupPIDs()
-		if err == nil {
-			bestPID := 0
-			for pid := range current {
-				if beforePIDs[pid] || pid == criuPID {
-					continue
-				}
-				// Defensive: never select the CRIU binary even if PID-reuse hides it.
-				comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-				if strings.TrimSpace(string(comm)) == "criu" {
-					continue
-				}
-				if bestPID == 0 || pid < bestPID {
-					bestPID = pid
-				}
-			}
-			if bestPID != 0 {
-				log.Info("findRestoredPIDInAgentCgroup: resolved restored PID via agent cgroup diff (ADR-0128)",
-					"pid", bestPID, "criuPID", criuPID)
-				return bestPID, nil
-			}
-		}
-		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("%w (agent-cgroup diff, criuPID %d, 10s timeout)", ErrRestoredPIDNotFound, criuPID)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-}
-
 // moveProcessToPodCgroup implements ADR-0128: moves pid into the pod's sandbox cgroup by writing
 // it to <podCgroupPath>/cgroup.procs under /sys/fs/cgroup. A single cgroup.procs write moves the
 // whole thread group of the leader; the CRIU-restored tree shares one cgroup, so moving the root
@@ -3489,6 +3359,22 @@ func moveProcessToPodCgroup(pid int, podCgroupPath string) error {
 	procsPath := filepath.Join("/sys/fs/cgroup", podCgroupPath, "cgroup.procs")
 	if err := os.WriteFile(procsPath, []byte(strconv.Itoa(pid)), 0o644); err != nil {
 		return fmt.Errorf("write PID %d to %s: %w", pid, procsPath, err)
+	}
+	return nil
+}
+
+// removeStalePidfile deletes a leftover restored-PID pidfile from a prior attempt of the same
+// migration before a CRIU restore launch (C1 fix). CRIU opens --pidfile with O_TRUNC (not O_EXCL),
+// so a leftover restored.pid could be read by the pidfile poll in its first iteration — before the
+// new CRIU process rewrites it — reporting success for the WRONG (stale/recycled) PID. removeFn is
+// injected (os.Remove in production) so the fail-open-on-not-exist vs fail-closed-on-any-other-error
+// behavior is unit-testable without a real filesystem — the same reader-injection pattern used by
+// readRestoredPIDFromPidfileWithReader. Returns nil when the file was removed OR was already absent;
+// returns a wrapped error for any other removeFn failure (an unremovable stale file must never be
+// silently polled past).
+func removeStalePidfile(path string, removeFn func(string) error) error {
+	if err := removeFn(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale restored-PID pidfile %s before CRIU launch: %w", path, err)
 	}
 	return nil
 }
@@ -3622,64 +3508,6 @@ func verifyRestoredPIDAlive(pid int, settle time.Duration) error {
 	return nil
 }
 
-// scanCgroupForRestoredRoot performs one pass of the ADR-0123 D2 scan over /proc. It returns the
-// lowest-PID cgroup-resident process whose parent is NOT in the pod cgroup (the reparented tree
-// root), excluding the pause PID and the CRIU binary. found is false when no candidate exists.
-func scanCgroupForRestoredRoot(podCgroup string, pausePID int) (int, bool) {
-	procs, err := os.ReadDir("/proc")
-	if err != nil {
-		return 0, false
-	}
-
-	// First collect the set of cgroup-resident PIDs so we can test parentage against it.
-	resident := make(map[int]bool)
-	for _, p := range procs {
-		if !p.IsDir() {
-			continue
-		}
-		pid, convErr := strconv.Atoi(p.Name())
-		if convErr != nil || pid == pausePID {
-			continue
-		}
-		if procInPodCgroup(pid, podCgroup) {
-			resident[pid] = true
-		}
-	}
-
-	bestPID := 0
-	for pid := range resident {
-		// Exclude the CRIU binary (it has exited on the cold path, but guard defensively).
-		comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-		if strings.TrimSpace(string(comm)) == "criu" {
-			continue
-		}
-		// Root/leader = a cgroup-resident process whose parent is NOT in the pod cgroup.
-		ppid := procPPid(pid)
-		if resident[ppid] {
-			continue // this is a child of another in-cgroup process, not the tree root
-		}
-		// Tie-break by LOWEST PID (the leader starts first).
-		if bestPID == 0 || pid < bestPID {
-			bestPID = pid
-		}
-	}
-	if bestPID == 0 {
-		return 0, false
-	}
-	return bestPID, true
-}
-
-// procInPodCgroup reports whether the cgroup v2 path of pid is within the podCgroup subtree
-// (exact subtree match, not a sibling-pod-matching prefix). A process is in the subtree when its
-// path equals podCgroup or is a descendant (podCgroup + "/...").
-func procInPodCgroup(pid int, podCgroup string) bool {
-	path, err := cgroupV2Path(pid)
-	if err != nil {
-		return false
-	}
-	return path == podCgroup || strings.HasPrefix(path, podCgroup+"/")
-}
-
 // cgroupV2Path returns the unified cgroup v2 path (the "0::<path>" entry) for pid from
 // /proc/<pid>/cgroup. Returns an error if the file cannot be read (e.g. the PID has exited) or
 // has no unified entry.
@@ -3694,25 +3522,6 @@ func cgroupV2Path(pid int) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no cgroup v2 (0::) entry in /proc/%d/cgroup", pid)
-}
-
-// procPPid returns the parent PID of pid by reading field 4 (PPid) of /proc/<pid>/status.
-// Returns 0 on any read/parse error.
-func procPPid(pid int) int {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
-	if err != nil {
-		return 0
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "PPid:") {
-			fields := strings.Fields(line)
-			if len(fields) == 2 {
-				ppid, _ := strconv.Atoi(fields[1])
-				return ppid
-			}
-		}
-	}
-	return 0
 }
 
 // sandboxPausePID resolves the host PID of the pause/sandbox container identified by sandboxID
@@ -3766,14 +3575,19 @@ var patchCheckpointImagesFn = func(checkpointDir string, inheritFdNames []string
 //
 //   - 'KEEP'            the fd is outside the PLAIN-REG hard-stop class (external / remap /
 //                       inherited / sentinel mnt_id) OR already consistent (mnt_id kept): no change.
-//   - 'REBIND_TO_ROOT'  a PLAIN-REG *directory* fd with an orphan mnt_id: rebind mnt_id → root
-//                       (covers both generic ADR-0193 §4 orphans and ADR-0194 B-2 ext-drop lockstep).
-//   - 'DECLINE'         a PLAIN-REG *non-directory* fd with an orphan mnt_id: hard-stop (cannot
-//                       be safely rebound — would still fire mount.c:3953 / P-0193-1).
+//   - 'REBIND_TO_ROOT'  a PLAIN-REG *directory* fd with an orphan mnt_id whose rebind target
+//                       (root_mnt_id) is sane: rebind mnt_id → root (covers both generic
+//                       ADR-0193 §4 orphans and ADR-0194 B-2 ext-drop lockstep). The production
+//                       call site emits a WARNING for every such rebind (ADR-0245 D2 visibility).
+//   - 'DECLINE'         a PLAIN-REG *non-directory* fd with an orphan mnt_id (cannot be safely
+//                       rebound — would still fire mount.c:3953 / P-0193-1), OR a *directory* fd
+//                       whose rebind target root_mnt_id is unusable (missing / not a kept
+//                       mountpoint): hard-stop rather than redirect the fd onto another absent
+//                       mnt_id (ADR-0245 D2 fail-closed target validation).
 //
 // ctx carries the cross-image sets the decision needs: remap_ids, inherit_fd_names,
-// kept_mnt_ids, ext_drop_mnt_ids. The mnt_id>0 / open_path() discriminants are the CRIU-4.2
-// source-proven predicate (files-reg.c:2191-2263, mount.c:3946-3953).
+// kept_mnt_ids, ext_drop_mnt_ids, root_mnt_id. The mnt_id>0 / open_path() discriminants are the
+// CRIU-4.2 source-proven predicate (files-reg.c:2191-2263, mount.c:3946-3953).
 //
 // This constant is prepended verbatim to the production patch script AND is exercised
 // directly (in --classify-selftest mode) by TestClassifyRegFd_RealScript — the test runs the
@@ -3809,6 +3623,19 @@ def classify_reg_fd(entry, ctx):
         return 'KEEP'
     # Positive orphan mnt_id — PLAIN-REG class that would fire mount.c:3953.
     if (reg.get('mode', 0) & _S_IFMT) == _S_IFDIR:
+        # ADR-0245 D2 (Storage Architect finding): an orphan *directory* fd is rebound to the
+        # container root instead of hard-stopping. That rebind is only safe if the rebind
+        # TARGET is itself sane — root_mnt_id must exist AND be a kept mountpoint, otherwise
+        # rebinding would just move the fd onto another mnt_id that is ALSO absent from the
+        # restored mount set and fire mount.c:3953 anyway. Previously this was assumed rather
+        # than checked, so a directory fd could be silently redirected to an unusable target.
+        # Validate the target here; if it is not sane, fail loud (DECLINE) — consistent with
+        # this redesign's fail-closed philosophy everywhere else (pidfile primitive, C1 guard).
+        # The visibility half of the fix (a WARNING on every directory rebind that DOES fire)
+        # lives at the production call site, which alone holds the fd path/label for diagnostics.
+        root_mnt_id = ctx.get('root_mnt_id')
+        if root_mnt_id is None or root_mnt_id not in ctx['kept_mnt_ids']:
+            return 'DECLINE'
         return 'REBIND_TO_ROOT'
     return 'DECLINE'
 
@@ -3823,6 +3650,7 @@ if len(sys.argv) >= 2 and sys.argv[1] == '--classify-selftest':
         'inherit_fd_names': set(_c.get('inherit_fd_names', [])),
         'kept_mnt_ids': set(_c.get('kept_mnt_ids', [])),
         'ext_drop_mnt_ids': set(_c.get('ext_drop_mnt_ids', [])),
+        'root_mnt_id': _c.get('root_mnt_id'),
     }
     print(json.dumps([classify_reg_fd(e, _ctx) for e in _p.get('entries', [])]))
     sys.exit(0)
@@ -4243,6 +4071,9 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
         'inherit_fd_names': inherit_fd_names,
         'kept_mnt_ids': kept_mnt_ids,
         'ext_drop_mnt_ids': set(ext_drop_mnt_ids),
+        # ADR-0245 D2: rebind-target for orphan directory fds. The classifier validates this is
+        # a sane (present + kept) target before authorizing REBIND_TO_ROOT; otherwise DECLINE.
+        'root_mnt_id': root_mnt_id,
     }
     modified = False
     for entry in files_img.get('entries', []):
@@ -4259,9 +4090,25 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
             # root mnt_id (drop-together). Covers both generic PLAIN-REG dir orphans (ADR-0193 §4)
             # and fds whose mnt_id was in ext_drop_mnt_ids (ADR-0194 B-2 lockstep). The label is
             # diagnostic only; the classifier's decision is identical for both.
-            label = 'b2-lockstep-ext-drop' if mnt_id in ext_drop_mnt_ids else 'rebind-to-root'
-            print('pm-image-consistency: reconcile fd_id=%d name=%s backing_mnt_id=%d action=%s new_mnt_id=%d' % (
+            label = 'b2-lockstep-ext-drop' if mnt_id in ext_drop_mnt_ids else 'generic-orphan'
+            # ADR-0245 D2 (Storage Architect finding): a directory-fd rebind is NOT silent
+            # success. Redirecting an open directory handle from its checkpoint-time backing
+            # mount to the container root is benign for PodMotion checkpoint scaffolding (the
+            # /podmotion holder mount, dropped externals that re-attach at the destination) but
+            # would be a data-visibility change if a live workload held an open directory handle
+            # inside an actively-managed persistent volume (Longhorn / Ceph RBD / RWX NFS
+            # subdirectory / snapshot-rsync target) at checkpoint time. The classifier cannot
+            # distinguish those two cases from the image alone (a PV mount handled as external
+            # lands in ext_drop_mnt_ids exactly like scaffolding does), so instead of silently
+            # picking one interpretation we make EVERY directory rebind LOUD and structured, so
+            # it is visible in restore logs/diagnostics and can be correlated against the
+            # workload's known volume set. The 'generic-orphan' label (mnt_id in neither the
+            # kept nor the ext-drop set) is the higher-suspicion case — an fd backed by a mount
+            # that simply vanished from the mountpoints image — and is called out explicitly.
+            print('WARNING pm-image-consistency: directory-fd rebind — fd_id=%d name=%s backing_mnt_id=%d label=%s new_mnt_id=%d (open directory handle redirected to container root; verify this is not a live persistent-volume directory)' % (
                 fd_id, name, mnt_id, label, root_mnt_id))
+            print('CRIU_IMAGE_DIR_FD_REBOUND:{"fd_id":%d,"name":"%s","backing_mnt_id":%d,"new_mnt_id":%d,"label":"%s"}' % (
+                fd_id, name.replace('"', '\\"'), mnt_id, root_mnt_id, label))
             reg['mnt_id'] = root_mnt_id
             modified = True
         elif action == 'DECLINE':
@@ -4715,104 +4562,6 @@ func setupRestoreOverlayfs(migrationName, checkpointDir, imageName, containerID 
 	}
 
 	return "", fmt.Errorf("placeholder container rootfs overlay not mounted after 5s (checked via /proc/1/mounts): %s", rootfsDir)
-}
-
-// findRestoredProcessPID scans /proc for the restored container process by reading the
-// expected comm name from config.json process.args[0] in checkpointDir.
-// Falls back to scanning for any recently-created non-pause process if config.json is absent.
-func findRestoredProcessPID(checkpointDir string) (int, error) {
-	// Determine the expected process name from config.json.
-	expectedComm := ""
-	cfgData, err := os.ReadFile(filepath.Join(checkpointDir, "config.json"))
-	if err == nil {
-		var cfg struct {
-			Process struct {
-				Args []string `json:"args"`
-			} `json:"process"`
-		}
-		if json.Unmarshal(cfgData, &cfg) == nil && len(cfg.Process.Args) > 0 {
-			expectedComm = filepath.Base(cfg.Process.Args[0])
-		}
-	}
-
-	procs, _ := os.ReadDir("/proc")
-
-	// First pass: look for an exact comm match.
-	if expectedComm != "" {
-		for _, p := range procs {
-			if !p.IsDir() {
-				continue
-			}
-			comm, _ := os.ReadFile(fmt.Sprintf("/proc/%s/comm", p.Name()))
-			commStr := strings.TrimSpace(string(comm))
-			if commStr != expectedComm {
-				continue
-			}
-			pid, err := strconv.Atoi(p.Name())
-			if err != nil {
-				continue
-			}
-			return pid, nil
-		}
-		// Exact match not found — the entrypoint may have exec'd into the real
-		// process (e.g. docker-entrypoint.sh → redis-server).  Fall through to
-		// the generic non-pause scan below rather than failing immediately.
-	}
-
-	// Second pass (fallback): find a process in the agent's own cgroup that is NOT
-	// the agent binary itself.  CRIU-restored processes inherit the cgroup of the
-	// CRIU subprocess (which runs under podmotion-agent-ctl.service), so filtering
-	// by cgroup reliably excludes kubepods containers and host system processes.
-	agentCgroup, _ := os.ReadFile("/proc/self/cgroup")
-	agentCgroupStr := strings.TrimSpace(string(agentCgroup))
-	// Extract the last path component from "0::<path>" to get the service unit name.
-	agentCgroupPath := ""
-	for _, line := range strings.Split(agentCgroupStr, "\n") {
-		if strings.HasPrefix(line, "0::") {
-			agentCgroupPath = strings.TrimPrefix(line, "0::")
-			break
-		}
-	}
-
-	agentPID := os.Getpid()
-	bestPID := 0
-	bestStartTicks := uint64(0)
-	for _, p := range procs {
-		if !p.IsDir() {
-			continue
-		}
-		pid, err := strconv.Atoi(p.Name())
-		if err != nil || pid == agentPID {
-			continue
-		}
-		comm, _ := os.ReadFile(fmt.Sprintf("/proc/%s/comm", p.Name()))
-		commStr := strings.TrimSpace(string(comm))
-		if commStr == "" || commStr == "pause" || commStr == "podmotion-agent" {
-			continue
-		}
-		if agentCgroupPath != "" {
-			procCgroup, _ := os.ReadFile(fmt.Sprintf("/proc/%s/cgroup", p.Name()))
-			if !strings.Contains(string(procCgroup), agentCgroupPath) {
-				continue
-			}
-		}
-		// Among matching processes, prefer the one with the highest start time
-		// (most recently created = the CRIU-restored process from this run).
-		statData, _ := os.ReadFile(fmt.Sprintf("/proc/%s/stat", p.Name()))
-		fields := strings.Fields(string(statData))
-		var startTicks uint64
-		if len(fields) >= 22 {
-			startTicks, _ = strconv.ParseUint(fields[21], 10, 64)
-		}
-		if startTicks > bestStartTicks {
-			bestStartTicks = startTicks
-			bestPID = pid
-		}
-	}
-	if bestPID != 0 {
-		return bestPID, nil
-	}
-	return 0, fmt.Errorf("findRestoredProcessPID: no CRIU-restored process found in agent cgroup after restore (expectedComm=%q)", expectedComm)
 }
 
 // buildMinimalOCIConfig strips pod-specific paths from config.json, leaving only
