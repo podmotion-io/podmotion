@@ -430,6 +430,75 @@ func TestDestinationNetnsReadyCondition(t *testing.T) {
 	}
 }
 
+// TestShmemPagemapMissingRoutesToRollingBack verifies the ADR-0246 stale-condition backstop
+// switch in reconcileCheckpointing: a PodMigration whose Checkpointed condition is already
+// False/Reason=ShmemPagemapMissing on entry (e.g. after a controller crash/restart between
+// the condition write and the initiateRollback call on the primary detect-and-route path)
+// must be routed to RollingBack by the real reconcile loop, not re-issue another Checkpoint
+// RPC against a deterministically-failing CRIU 4.2 anon-shmem dump. This exercises the
+// backstop switch (podmigration_controller.go, "case ... ShmemPagemapMissing:") directly
+// through Reconcile, distinct from existing RollingBack coverage that reaches it via other
+// trigger paths (see TestTCPPreservationModeGating above).
+func TestShmemPagemapMissingRoutesToRollingBack(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := pmv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme corev1: %v", err)
+	}
+
+	pm := &pmv1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-shmem-pagemap-missing", Namespace: "default"},
+		Spec: pmv1.PodMigrationSpec{
+			PodName:             "src-pod",
+			PodNamespace:        "default",
+			TCPPreservationMode: pmv1.TCPPreservationModeNone,
+			TargetNodeName:      "dst-node",
+		},
+		Status: pmv1.PodMigrationStatus{
+			Phase:               pmv1.MigrationPhaseCheckpointing,
+			SourceNodeName:      "src-node",
+			DestinationNodeName: "dst-node",
+			Conditions: []metav1.Condition{
+				{
+					Type:               conditionCheckpointed,
+					Status:             metav1.ConditionFalse,
+					Reason:             "ShmemPagemapMissing",
+					Message:            "anon-shmem segment(s) with no pagemap-shmem-<shmid>.img (CRIU 4.2 dump defect)",
+					LastTransitionTime: metav1.Now(),
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pm).
+		WithStatusSubresource(pm).
+		Build()
+
+	r := &PodMigrationReconciler{Client: fakeClient, Scheme: scheme}
+	ctx := context.Background()
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-shmem-pagemap-missing", Namespace: "default"}}
+
+	// Two passes: first adds the finalizer, second executes reconcileCheckpointing's
+	// stale-condition backstop switch and routes to RollingBack.
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile pass %d: %v", i, err)
+		}
+	}
+
+	fresh := &pmv1.PodMigration{}
+	if err := fakeClient.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if fresh.Status.Phase != pmv1.MigrationPhaseRollingBack {
+		t.Errorf("expected phase RollingBack after ShmemPagemapMissing backstop, got %s", fresh.Status.Phase)
+	}
+}
+
 // TestVXLANFDBUpdatedCondition verifies the correct behaviour of reconcileOverlayHandoff:
 //
 //   - TCPPreservationMode=None: fast-path, VXLANFDBUpdated set True immediately (no RPC needed).

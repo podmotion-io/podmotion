@@ -3168,6 +3168,21 @@ func (r *PodMigrationReconciler) reconcileIPReclaimSweep(ctx context.Context, pm
 		return ctrl.Result{}, nil
 	}
 
+	// ADR-0244 R2 short-circuit: a terminal CR (Complete/Failed) can never transition again, so
+	// if OverlayHandoff never ran (no reclaim objects were ever installed — e.g. this CR rolled
+	// back or failed before reaching OverlayHandoff, or TCPPreservationMode=None), R2 can never
+	// become true on a future pass either. Without this, reconcileIPReclaimSweep requeues such a
+	// CR every reclaimSweepInterval forever, logging "IP reclaim not yet eligible" indefinitely
+	// against a CR that will never need reclaim (same "nothing to sweep" posture already applied
+	// to MigrationPhaseDryRunComplete above). Treat it as already-reclaimed/verified and stop.
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
+		setCondition(pm, pmv1.ConditionIPReclaimComplete, metav1.ConditionTrue, "NothingToReclaim",
+			"OverlayHandoff never ran for this migration — no reclaim objects were installed (ADR-0244 R2)")
+		setCondition(pm, pmv1.ConditionIPReclaimVerified, metav1.ConditionTrue, "NothingToReclaim",
+			"OverlayHandoff never ran for this migration — no reclaim objects were installed (ADR-0244 R2)")
+		return ctrl.Result{}, r.statusUpdate(ctx, pm)
+	}
+
 	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionIPReclaimComplete) {
 		eligible, reason, err := r.ipReclaimEligible(ctx, pm)
 		if err != nil {
