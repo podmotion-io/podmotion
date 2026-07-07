@@ -66,6 +66,12 @@ Gate: **21/22** — GC-21 (Kubernetes Running phase) is EXPECTED FAIL per ADR-01
 
 Full proof artifact: [docs/proof/sprint32-proof.md](docs/proof/sprint32-proof.md)
 
+## Known Limitations
+
+PodMotion is `v0.1.0-alpha`. The restore path has a known correctness gap that operators must be aware of before relying on it:
+
+- **Workloads using anonymous shared-memory mappings cannot currently be restored.** CRIU 4.2 does not reliably serialize anonymous `shmem` (`SysV`/`mmap(MAP_ANONYMOUS|MAP_SHARED)`) memory content at checkpoint time — the required per-segment pagemap image is not written to the checkpoint, so restore on the destination node fails for any pod whose processes hold such a mapping. This was identified during the restore-path redesign recorded in **ADR-0245** (see [docs/adr/](docs/adr/)). It is an upstream CRIU 4.2 serialization defect, not caused by PodMotion's transfer or provenance layer (those were independently verified byte-identical and integrity-checked). The proof runs above use workloads without anonymous shared-memory mappings and are unaffected; a workload that does use them (many databases, some language runtimes, and processes using System V shared memory) will fail the restore step and roll back to the source pod, which is preserved intact. A fix depends on an upstream CRIU change and is tracked for a future release.
+
 ## Getting Started
 
 ### Prerequisites

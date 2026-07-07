@@ -15,7 +15,7 @@ client-side reconnect logic required.
 
 ## Where the authoritative detail lives
 
-- **Current sprint plan (M22–M30):** [`docs/FELN_SPRINT_PLAN.md`](./FELN_SPRINT_PLAN.md)
+- **Current sprint plan (M22–M30):** [`docs/CURRENT-POSITION.md`](./CURRENT-POSITION.md)
 - **Milestone ledger (M1–M21):** [`docs/MILESTONES.md`](./MILESTONES.md)
 - **Live "where are we right now" state:** [`docs/proof/RESUME-STATE.yaml`](./proof/RESUME-STATE.yaml)
 

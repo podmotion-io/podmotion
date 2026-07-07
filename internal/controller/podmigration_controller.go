@@ -145,7 +145,7 @@ type PodMigrationReconciler struct {
 	// AgentPool provides per-node gRPC connections to podmotion-agent DaemonSet pods.
 	// Nil in unit tests — phase handlers skip gRPC calls when nil.
 	AgentPool *agentclient.AgentClientPool
-	// ReplicationMgr drives the pre-copy dirty-page sync loop (Agent 11, M5).
+	// ReplicationMgr drives the pre-copy dirty-page sync loop (a reviewer, M5).
 	// Nil in unit tests — PreMigrating phase skips loop launch when nil.
 	ReplicationMgr *replication.ReplicationManager
 	// Checkpointer is the CRIU checkpointer used by the replication loop.
@@ -185,7 +185,7 @@ type PodMigrationReconciler struct {
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile implements the PodMigration state machine. It is called by controller-runtime whenever a PodMigration object is created, updated, or re-queued. Each call advances the migration by exactly one phase transition, persists status, and re-queues if further work remains. See CLAUDE.md §PodMigration state machine for the full phase diagram.
+// Reconcile implements the PodMigration state machine. It is called by controller-runtime whenever a PodMigration object is created, updated, or re-queued. Each call advances the migration by exactly one phase transition, persists status, and re-queues if further work remains. See the project conventions doc §PodMigration state machine for the full phase diagram.
 func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -1684,11 +1684,11 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 		}
 	}
 
-	// Agent 11 (replication), Agent 3 (storage), and Agent 2 (network) drive pre-migration
+	// the replication reviewer, the storage reviewer, and the network reviewer drive pre-migration
 	// work asynchronously.  All three keystone conditions must be True before advancing:
-	//   MemorySynced=True           (Agent 11 replication loop)
-	//   StorageReadyForFreeze=True  (Agent 3 storage pre-stage, ADR-0011)
-	//   NetworkBridgeArmed=True     (Agent 2 eBPF bridge OR v0.1 fast-path, ADR-0028)
+	//   MemorySynced=True           (a reviewer replication loop)
+	//   StorageReadyForFreeze=True  (a reviewer storage pre-stage, ADR-0011)
+	//   NetworkBridgeArmed=True     (a reviewer eBPF bridge OR v0.1 fast-path, ADR-0028)
 	//
 	// When all three are True, advance to Checkpointing (the freeze).
 	memorySynced := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionMemorySynced)
@@ -3570,7 +3570,7 @@ func (r *PodMigrationReconciler) verifyDataplaneReachability(ctx context.Context
 func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// Agent 12 (traffic) drives readiness + traffic verification. Watches TrafficVerified.
+	// the traffic reviewer drives readiness + traffic verification. Watches TrafficVerified.
 	// ADR-0019: if verification fails AFTER handoff, warn only — do not rollback.
 	trafficVerified := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionTrafficVerified)
 	if !trafficVerified {

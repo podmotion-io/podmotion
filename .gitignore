@@ -115,3 +115,16 @@ __pycache__/
 
 # Line-ending marker file (Windows artifact)
 LF
+
+# Internal gate-run / phase-review logs (process records, not publication proofs — never publish)
+docs/proof/*-GATE-CLOSURE-ATTEMPT-*.md
+docs/proof/*-GATE-ATTEMPT-*.md
+docs/proof/SPRINT40-S1-PROOF.md
+
+# Internal sprint/workstream planning + certification docs at docs/ top level (delivery process — never publish)
+docs/SPRINT*-PLAN.md
+docs/WORKSTREAM-*.md
+
+# Public-CI methodology-lexicon scanner — enumerates the internal codename lexicon in cleartext.
+# Republishing it announces the vocabulary it exists to hide; the local pre-commit hook enforces instead.
+.github/workflows/disclose-check.yaml
