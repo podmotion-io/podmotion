@@ -174,7 +174,7 @@ least-privilege verified; cert rotation tested; SBOM/signing/vuln-scan gate in C
       Owner: Security Agent · M22
 - [ ] Resolve `allowPrivilegeEscalation` contradiction with ADR-0078: one
       authoritative decision with kernel-level evidence for CRIU parasite/ptrace path ·
-      Owner: Security Agent + Opus review · M22
+      Owner: Security Agent + the architect review · M22
 - [ ] Fix `pivot_root` seccomp contradiction: JSON allows it, prose denies it — pick
       one and document the rationale · Owner: Security Agent · M22
 - [ ] Rescope §3 RBAC to defer to ADR-0078; rescope §4 webhook topology to defer to

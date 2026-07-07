@@ -2977,7 +2977,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// On the cold --join-ns net:<path> path CRIU does NOT self-exit: after restore it stays as
 	// the foreground workload parent (blocking in wait4 for the lifetime of the workload). A
 	// synchronous Wait would hang until the workload exits — the Sprint 22 failure.
-	// --restore-detached is forbidden (CLAUDE.md Standing Rule 6). --leave-stopped is only on
+	// --restore-detached is forbidden (the project conventions doc Standing Rule 6). --leave-stopped is only on
 	// the TCP-stateful branch. The broker reaps the wrapper exactly once when it eventually
 	// exits (no zombie); the agent polls liveness via exec_poll until either new PIDs appear in
 	// the broker cgroup (proof CRIU launched the workload tree) OR the wrapper exits non-zero.

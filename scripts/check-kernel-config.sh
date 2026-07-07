@@ -8,7 +8,7 @@
 # Exit 0 if all required configs are present.
 # Exit 1 if any are missing, with a list of missing options.
 #
-# Required configs (ADR-0098 / ADR-0093 §1.1 / CLAUDE.md):
+# Required configs (ADR-0098 / ADR-0093 §1.1 / the project conventions doc):
 #   CONFIG_CHECKPOINT_RESTORE — CRIU (mandatory)
 #   CONFIG_MEM_SOFT_DIRTY     — iterative pre-copy dirty-page tracking
 #   CONFIG_USERFAULTFD        — post-copy lazy page fault handling

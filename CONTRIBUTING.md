@@ -137,7 +137,7 @@ be rejected.
 
 ## Security Invariants (ADR-0009 / ADR-0012)
 
-Agent 9 holds veto power. These invariants are enforced in code and cannot be overridden
+The security reviewer holds veto power. These invariants are enforced in code and cannot be overridden
 by feature flags:
 
 1. Source pod is **never deleted** until `TrafficVerified=true` condition is set.

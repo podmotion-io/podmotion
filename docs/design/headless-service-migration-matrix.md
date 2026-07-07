@@ -2,7 +2,7 @@
 
 - Status: Research / Design recommendation
 - Date: 2026-06-13
-- Author: Network architecture sweep (Opus)
+- Author: Network architecture sweep
 - Supersedes parts of: ADR-0129 (Headless Service / direct pod IP migration)
 - Related: ADR-0125 (CRIU `--join-ns net:<path>` restore), ADR-0122 (restored-process pod network wiring), ADR-0046 (no mutation of workload objects), ADR-0001 (ValidatingAdmissionWebhook pre-flight gate)
 
@@ -369,7 +369,7 @@ Per-provider mechanics behind this interface:
 
 The core controller stays provider-agnostic: it calls `CanPreserveIP` during validation
 and `Preserve`/`Release` around the existing IP-handoff step (migration sequence step 9
-in CLAUDE.md), bracketing the ADR-0125 restore.
+in the project conventions doc), bracketing the ADR-0125 restore.
 
 ---
 

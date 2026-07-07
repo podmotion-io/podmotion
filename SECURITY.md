@@ -2,6 +2,43 @@
 
 PodMotion is a privileged Kubernetes operator that invokes CRIU as a subprocess, loads eBPF programs, manipulates kernel namespaces, and transfers checkpoint data across node boundaries. Security issues in this project can affect workload confidentiality, cluster integrity, and host kernel stability. We take security reports seriously and are committed to coordinated disclosure.
 
+## Security Posture (current)
+
+This section states what PodMotion enforces **today**, so a reviewer's expectations match the code.
+A fuller treatment — including the agent privilege/host-mount table and the residual trust boundary —
+is in [docs/security-model.md](docs/security-model.md).
+
+**What is enforced by default:**
+
+- **Fail-closed mTLS on the agent gRPC server.** In the default (production) build the agent refuses
+  to start if TLS material is absent — it never serves plaintext. A plaintext path exists only in a
+  dedicated developer build and only when `PODMOTION_INSECURE_GRPC=true` is explicitly set (ADR-SEC-A).
+- **Deny-by-default per-RPC authorization.** Caller identity is the verified mTLS leaf's SPIFFE ID;
+  an interceptor classifies it to an operator or peer-agent role, applies a per-method allow policy
+  (a method not in the policy is denied), and binds the caller to the named migration. The trusted
+  edge is operator → agent (ADR-SEC-A/C).
+- **Checkpoint provenance verified before extraction.** The destination agent verifies wire hash,
+  a signed manifest, anti-replay migration binding, and per-file digests before promoting a received
+  checkpoint — fail-closed, no bypass when a signature is absent (ADR-SEC-B).
+- **De-privileged main agent.** The long-lived agent container runs `privileged: false` with a
+  discrete capability set; only a single long-lived `netns-broker` container remains privileged for an
+  irreducible host mount-namespace operation (ADR-0148).
+- **Checkpoints on zeroized tmpfs.** Checkpoint images live on a size-capped `tmpfs` (mode 0700) and
+  are zeroized on every exit path.
+
+**Known gaps disclosed deliberately (alpha):**
+
+- **At-rest checkpoint encryption is off by default.** It exists and is opt-in per migration via a
+  Kubernetes secret (ECDH P-256 + AES-256-GCM, ADR-0029); absent that secret, checkpoints are
+  plaintext on tmpfs, protected by 0700 + zeroization + in-transit mTLS + signed integrity only.
+- **Migration has no per-subject / per-node authorization.** Anyone able to `create podmigrations` in
+  a namespace can force a full process-memory dump of any pod in that namespace and steer the restore
+  to any capable node. There is no `SubjectAccessReview` on migrate and no trusted-node gate on the
+  target node. Restrict `PodMigration` RBAC to trusted namespaces/subjects as a mitigation.
+- **Node-level surface remains.** The agent pod uses `hostPID` and `hostNetwork`, mounts the host
+  containerd socket **read-write** (root-equivalent on the node; an accepted `v0.1` risk, ADR-0013),
+  and tolerates all taints (no node-pool isolation). See docs/security-model.md for the full table.
+
 ## Supported Versions
 
 | Version | Supported |
@@ -102,12 +139,25 @@ We will not pursue legal action against researchers who discover and report vuln
 
 ## Security Hardening Notes
 
-For operators deploying PodMotion in production, the following mitigations are recommended while the project is pre-1.0:
+For operators deploying PodMotion while the project is pre-1.0, note first what is **already
+enforced by default** (see the Security Posture section above): fail-closed mTLS on the agent gRPC
+server, deny-by-default per-RPC authorization, checkpoint provenance verification on ingest, a
+de-privileged main agent, and checkpoint images on a zeroized, size-capped tmpfs. Those are not
+operator opt-ins — they are on by default.
 
-- Run the `pm-controller` and `pm-agent` pods with a dedicated ServiceAccount; do not reuse the `default` ServiceAccount.
-- Mount checkpoint staging directories on an encrypted, size-limited `emptyDir` or dedicated PersistentVolume, not on the host filesystem.
-- Restrict `PodMigration` create/update RBAC to trusted namespaces only.
-- Enable mTLS between `pm-controller` and `pm-agent` gRPC endpoints (mTLS configuration is tracked in ADR-0159 and ADR-0161).
-- Review eBPF program permissions; PodMotion should not require `CAP_SYS_ADMIN` beyond the specific `BPF` capability in kernels >= 5.8.
+The following are still operator responsibilities or off-by-default and are recommended:
 
-These recommendations will be enforced by default in a future release.
+- Run the operator and agent with dedicated ServiceAccounts; do not reuse the `default` ServiceAccount.
+- **Restrict `PodMigration` create/update RBAC to trusted namespaces and subjects.** This is the
+  primary mitigation for the un-gated migration-as-memory-dump surface (there is no per-subject
+  `SubjectAccessReview` or trusted-node gate yet — see the Security Posture section).
+- **Enable at-rest checkpoint encryption** by provisioning a per-migration key secret; it is off by
+  default (ADR-0029). Absent it, checkpoints rest as plaintext on tmpfs, protected by mode 0700 +
+  zeroization + in-transit mTLS + signed integrity only.
+- Treat the read-write host containerd socket mount as root-equivalent on the node (accepted `v0.1`
+  risk, ADR-0013) and isolate the node pool accordingly; the agent currently tolerates all taints.
+- The agent uses discrete Linux capabilities rather than blanket privilege (ADR-0148); it still
+  requires `CAP_SYS_ADMIN` for CRIU mount-namespace operations in addition to `BPF`/`PERFMON` on
+  kernels ≥ 5.8. Review these against your policy.
+
+Default-on at-rest encryption and node/socket isolation are targeted for a future release.
