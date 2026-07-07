@@ -4786,6 +4786,20 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 				sha := sha256OfDir(imagesDir)
 				log.Info("Checkpoint complete (ctr)", "migration", req.MigrationName,
 					"sizeBytes", sizeBytes, "sha256", sha, "freezeMs", freezeDurationMs)
+				// ADR-0246 D1/D4: fail closed before transfer if the checkpoint references an
+				// anon-shmem segment (mm-*.img) with no matching pagemap-shmem-<shmid>.img — the
+				// confirmed CRIU 4.2 anon-shmem dump defect. Runs unconditionally on both the
+				// ctr-native path (here) and the raw-CRIU fallback path below; not scoped to one
+				// entry point (D1 step 4).
+				if shmemErr := verifyShmemPagemapCompleteness(imagesDir); shmemErr != nil {
+					log.Error(shmemErr, "Checkpoint (ctr): incomplete shmem pagemap set — refusing to transfer (ADR-0246)",
+						"migration", req.MigrationName)
+					// ADR-0246 typed-status redesign: return codes.FailedPrecondition with a
+					// structured errdetails.ErrorInfo{Reason: ShmemPagemapMissingReason} payload
+					// so the controller classifies this via grpcStatus.Details(), not string
+					// matching (mirrors the ErrCRIUCapability pattern below).
+					return nil, newShmemPagemapMissingStatus(shmemErr)
+				}
 				// Capture socket inventory from the (now frozen) container via its PID.
 				// Non-fatal: ctr checkpoint already succeeded; SeqSnapshot is best-effort here.
 				var ctrSeqSnapshots []*agentpb.SeqSnapshot
@@ -5025,6 +5039,19 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 	}
 
 	log.Info("Checkpoint complete", "path", checkpointPath, "sha256", sha256sum, "fallback", fallbackNote)
+
+	// ADR-0246 D1/D4: fail closed before transfer if the checkpoint references an anon-shmem
+	// segment (mm-*.img) with no matching pagemap-shmem-<shmid>.img — the confirmed CRIU 4.2
+	// anon-shmem dump defect. Must run here, before encryptCheckpointDir below, since the guard
+	// needs to read plaintext mm-*.img/pagemap-shmem-*.img content. Runs unconditionally on both
+	// the raw-CRIU fallback path (here) and the ctr-native path above (D1 step 4).
+	if shmemErr := verifyShmemPagemapCompleteness(imagesDir); shmemErr != nil {
+		log.Error(shmemErr, "Checkpoint (raw CRIU): incomplete shmem pagemap set — refusing to transfer (ADR-0246)",
+			"migration", req.MigrationName)
+		// ADR-0246 typed-status redesign: see the ctr-native call site above for the full
+		// rationale — same treatment on this path, unconditionally, per D1 step 4.
+		return nil, newShmemPagemapMissingStatus(shmemErr)
+	}
 
 	// SD-2 (ADR-0029, ADR-0160): encrypt the checkpoint layer set AT REST in final/ before the
 	// transfer phase reads it — encrypt-on-write at its source so ciphertext, never plaintext,

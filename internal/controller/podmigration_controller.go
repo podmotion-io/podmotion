@@ -52,6 +52,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/orchestration"
 	"github.com/podmotion-io/podmotion/internal/rollback"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -1882,10 +1883,21 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Check for a prior CheckpointFailed signal before issuing a fresh call.
+	// Check for a prior terminal checkpoint-failure signal before issuing a fresh call.
+	// Backstop allow-list (bug fix, HIGH panel review of ADR-0246): ShmemPagemapMissing is a
+	// deterministic CRIU-version defect exactly like CheckpointFailed — it must route to
+	// rollback here too if it is ever observed stale on re-entry (e.g. after a controller
+	// restart between the condition write and the direct initiateRollback call below), rather
+	// than falling through to re-issue an identical, deterministically-failing Checkpoint RPC
+	// (unbounded retry storm). The primary path calls initiateRollback directly at the point
+	// ShmemPagemapMissing is first set (see below); this is defense in depth for the stale-read
+	// case only.
 	condFailed := meta.FindStatusCondition(pm.Status.Conditions, conditionCheckpointed)
-	if condFailed != nil && condFailed.Status == metav1.ConditionFalse && condFailed.Reason == "CheckpointFailed" {
-		return r.initiateRollback(ctx, pm, condFailed.Message)
+	if condFailed != nil && condFailed.Status == metav1.ConditionFalse {
+		switch condFailed.Reason {
+		case "CheckpointFailed", "ShmemPagemapMissing":
+			return r.initiateRollback(ctx, pm, condFailed.Message)
+		}
 	}
 
 	// Defence-in-depth (ADR-0031): the webhook should have blocked PostCopy when
@@ -2023,6 +2035,40 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 				r.AgentPool.InvalidateNode(sourceNode)
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			case codes.FailedPrecondition:
+				// ADR-0246 typed-status redesign: the agent
+				// attaches an errdetails.ErrorInfo{Reason: "SHMEM_PAGEMAP_MISSING"} status-details
+				// payload (internal/agent/server/shmem_pagemap_guard.go,
+				// newShmemPagemapMissingStatus) when the checkpoint-completeness guard fires.
+				// codes.FailedPrecondition alone is ambiguous — ErrCRIUCapability uses the same
+				// code — so the Reason on the details payload is the second axis that
+				// distinguishes the two, replacing the former error-string substring match. This
+				// is now the ONE code path that detects and routes this failure (previously
+				// three: this detect-and-route call, the stale-condition backstop switch below,
+				// and general condFailed handling all separately tried to reach RollingBack for
+				// the same logical failure).
+				if shmemPagemapMissingReasonFromStatus(grpcStatus) {
+					log.Error(err, "Checkpoint RPC failed: CRIU 4.2 anon-shmem dump defect (ADR-0246)", "migration", pm.Name)
+					setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "ShmemPagemapMissing", errStr)
+					if r.Recorder != nil {
+						r.Recorder.Eventf(pm, corev1.EventTypeWarning, "ShmemPagemapMissing",
+							"checkpoint completeness guard (ADR-0246) detected the CRIU 4.2 anon-shmem "+
+								"dump defect for migration %s — checkpoint is not restorable, routing to "+
+								"rollback: %s", pm.Name, errStr)
+					}
+					pmmetrics.ShmemPagemapGuardFiredTotal.WithLabelValues(pm.Name, pm.Namespace).Inc()
+					// Bug fix (HIGH panel, Scheduling Architect + Network Architect), preserved
+					// under the typed-status redesign: route directly to rollback here instead of
+					// only setting the condition and returning. This is a deterministic
+					// CRIU-version property, not a transient failure — falling through and
+					// letting the next reconcile tick re-issue Checkpoint would retry-storm
+					// identically forever. Calling initiateRollback directly also transitions to
+					// RollingBack, whose entry point (reconcileRollingBack) calls
+					// disarmZeroWindowOnFailurePath (ADR-0157 D2) immediately — releasing the
+					// zero-window hold on live TCP traffic on this same reconcile chain rather
+					// than leaving the source pod held until the ADR-0157 D3 watchdog backstop
+					// times out.
+					return r.initiateRollback(ctx, pm, errStr)
+				}
 				// Agent returned codes.FailedPrecondition for ErrCRIUCapability (missing
 				// CAP_SYS_PTRACE or blocking seccomp). Hard failure — do not retry.
 				// (M19.5 criterion 13: use grpcStatus.Code() not string matching.)
@@ -4367,6 +4413,37 @@ func truncateConditionMsg(s string, max int) string {
 		return s
 	}
 	return s[:max-3] + "..."
+}
+
+// shmemPagemapMissingReason is the stable, machine-readable errdetails.ErrorInfo.Reason value
+// (ADR-0246 typed-status redesign) set by the agent on the codes.FailedPrecondition status it
+// returns from the Checkpoint RPC when the shmem-pagemap completeness guard fires
+// (internal/agent/server/shmem_pagemap_guard.go: ShmemPagemapMissingReason,
+// newShmemPagemapMissingStatus). Kept as an independent local constant — not imported from
+// internal/agent/server — the same way codes.FailedPrecondition itself is a shared gRPC
+// convention rather than a cross-package Go symbol; a mismatch here would be caught immediately
+// by TestShmemPagemapMissingReason_AgentControllerAgree (shmem_pagemap_guard_test.go), which
+// compares this literal against server.ShmemPagemapMissingReason directly (both packages are
+// visible from a top-level _test.go in a different package via the exported symbol, so this is
+// checked in CI, not left to convention alone).
+const shmemPagemapMissingReason = "SHMEM_PAGEMAP_MISSING"
+
+// shmemPagemapMissingReasonFromStatus reports whether grpcStatus carries an
+// errdetails.ErrorInfo{Reason: shmemPagemapMissingReason} details entry (ADR-0246 typed-status
+// redesign). Used to distinguish the checkpoint-completeness-guard FailedPrecondition from the
+// CRIU-capability/ptrace FailedPrecondition (ErrCRIUCapability) that shares the same gRPC code —
+// replaces the former strings.Contains(errStr, "anon-shmem segment(s) with no pagemap-shmem")
+// prose match.
+func shmemPagemapMissingReasonFromStatus(grpcStatus *status.Status) bool {
+	if grpcStatus == nil {
+		return false
+	}
+	for _, d := range grpcStatus.Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetReason() == shmemPagemapMissingReason {
+			return true
+		}
+	}
+	return false
 }
 
 func setCondition(pm *pmv1.PodMigration, condType string, status metav1.ConditionStatus, reason, message string) {
