@@ -35,6 +35,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1024,7 +1025,7 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 		// pod's host-side veth peer, bypassing L3 local-input classification. Best-effort: a
 		// resolution/setup failure is non-fatal so an otherwise-good handoff is not blocked;
 		// the source is held until TrafficVerified so a requeue re-asserts it (idempotent).
-		if replPID := s.restoredPIDForMigration(ctx, req.MigrationName); replPID > 0 {
+		if replPID, pidErr := s.restoredPIDForMigration(ctx, req.MigrationName); pidErr == nil && replPID > 0 {
 			if vethPeer, vErr := resolveReplVethPeer(replPID); vErr != nil {
 				log.Error(vErr, "InjectIPHandoff: ADR-0139 could not resolve repl veth peer — tc redirect NOT installed (non-fatal)",
 					"migration", req.MigrationName, "replPID", replPID)
@@ -1127,8 +1128,8 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 		// agent), which flips DataplaneReachabilityVerified. PM-C4: the in-netns dial is DEMOTED
 		// to a fast LOCAL PRE-CHECK (not deleted) — its result is advisory ProbeOk only and no
 		// longer gates the deferred SIGCONT, source disarm, TrafficVerified, or deletion.
-		replPID := s.restoredPIDForMigration(ctx, req.MigrationName)
-		if replPID <= 0 {
+		replPID, pidErr := s.restoredPIDForMigration(ctx, req.MigrationName)
+		if pidErr != nil || replPID <= 0 {
 			resp.ProbeOk = false
 			resp.ProbeOutput = "ADR-0210: RestoredPID not yet resolvable — local pre-check deferred (advisory only; cross-node gate is authoritative)"
 			log.Info("InjectIPHandoff: ADR-0210 local pre-check deferred — RestoredPID not yet in CR status (advisory, non-gating)",
@@ -1240,32 +1241,61 @@ func (s *AgentServer) CleanupSourceIPHandoff(ctx context.Context, req *agentpb.C
 }
 
 // restoredPIDForMigration fetches the PodMigration CR and returns Status.RestoredPID (the root
-// PID of the restored container, set by this agent at ReportRestoreConfirmed). Returns 0 if the
-// CR/PID is unavailable. Used by ADR-0139 to resolve the replacement pod's veth peer without a
-// proto change (the agent already holds the k8s client and the migration name).
-func (s *AgentServer) restoredPIDForMigration(ctx context.Context, migrationName string) int {
-	if s.k8sClient == nil || migrationName == "" {
-		return 0
+// PID of the restored container, set by this agent at ReportRestoreConfirmed). Used by ADR-0139
+// to resolve the replacement pod's veth peer without a proto change (the agent already holds the
+// k8s client and the migration name).
+//
+// Return contract (ADR-0244 N1/N2 correction, Sprint 40): callers MUST distinguish two cases
+// that this function previously conflated into a single "0" return:
+//  1. The CR/PID is POSITIVELY resolved and RestoredPID is genuinely unset/zero (pod gone, or
+//     never restored on this node yet) — returns (0, nil). Nothing left to protect; not an error.
+//  2. The LOOKUP ITSELF fails (e.g. a transient List error against the apiserver, or no
+//     k8sClient configured) — returns (0, err). This is a genuine lookup failure, not a positive
+//     absence, and callers on the safety-critical R7 path (ProbeDestSocketForIP) MUST propagate
+//     it as an RPC error so the caller fails closed, exactly as NoLiveConntrackForIP (R6) already
+//     does on its own RPC errors. Before this correction, case (2) was silently folded into case
+//     (1) and returned "0, treat as absent", which failed OPEN on a transient error and could
+//     have authorized a reclaim teardown against a live pinned connection (the same harm class
+//     the R6/C1 finding identified, reached through R7 instead).
+//
+// Best-effort, non-safety-critical callers (e.g. the ADR-0139 tc-redirect install path, the
+// ADR-0210 in-netns pre-check) may continue to treat any error the same as "not yet resolvable"
+// (defer/skip), since those paths are already advisory-only and re-tried on the next requeue.
+func (s *AgentServer) restoredPIDForMigration(ctx context.Context, migrationName string) (int, error) {
+	if s.k8sClient == nil {
+		return 0, fmt.Errorf("restoredPIDForMigration: no k8s client configured")
+	}
+	if migrationName == "" {
+		return 0, fmt.Errorf("restoredPIDForMigration: migration_name is required")
 	}
 	// Namespace is not carried on the InjectIPHandoff request; PodMigrations are namespaced.
 	// The PoC runs in "default". List across namespaces by name as a robust fallback so this
 	// is not hard-wired to one namespace if the operator is reconfigured.
 	pm := &pmv1.PodMigration{}
-	if err := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: migrationName}, pm); err == nil {
-		return int(pm.Status.RestoredPID)
+	getErr := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: migrationName}, pm)
+	if getErr == nil {
+		return int(pm.Status.RestoredPID), nil
+	}
+	if !apierrors.IsNotFound(getErr) {
+		// A non-NotFound Get error (transient apiserver/network failure) is a genuine lookup
+		// failure — propagate it rather than falling through to the list-based fallback, which
+		// would otherwise mask it as "not found in default, try listing" and risk the same
+		// silent-absorption defect the List branch below is careful to avoid.
+		return 0, fmt.Errorf("restoredPIDForMigration: get PodMigration %q: %w", migrationName, getErr)
 	}
 	pmList := &pmv1.PodMigrationList{}
 	if err := s.k8sClient.List(ctx, pmList); err != nil {
-		log.Info("restoredPIDForMigration: list PodMigrations failed (non-fatal)",
-			"migration", migrationName, "err", err)
-		return 0
+		return 0, fmt.Errorf("restoredPIDForMigration: list PodMigrations failed for %q: %w", migrationName, err)
 	}
 	for i := range pmList.Items {
 		if pmList.Items[i].Name == migrationName {
-			return int(pmList.Items[i].Status.RestoredPID)
+			return int(pmList.Items[i].Status.RestoredPID), nil
 		}
 	}
-	return 0
+	// Positively enumerated every PodMigration and found none named migrationName: the CR
+	// genuinely does not exist (or has no RestoredPID yet). This is case (1) — a real absence,
+	// not a lookup failure.
+	return 0, nil
 }
 
 // resolveNamespaceForMigration returns the Kubernetes namespace of the named PodMigration CR.
@@ -1619,6 +1649,170 @@ func (s *AgentServer) InjectSourceRedirect(ctx context.Context, req *agentpb.Inj
 		"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "replVethMAC", req.ReplVethMac,
 		"dstNodeIP", req.DstNodeIp, "ifName", fdbIf)
 	return &agentpb.InjectSourceRedirectResponse{Injected: true}, nil
+}
+
+// TeardownSourceRedirect removes the ADR-0136 SOURCE-node flannel.1 VXLAN redirect and the
+// ADR-0141 source-mode NOTRACK rule for the relocated OLD pod IP (ADR-0244 / NR-BLOCK-2, GC-5
+// "Source-side teardown"). Symmetric to DisarmTCRedirect on the destination node: this is the
+// missing "net new" half of the reclaim sweep — InjectSourceRedirect has no existing caller-side
+// teardown, unlike the destination objects DisarmTCRedirect already removes.
+//
+// Removes, in order (ADR-0244 §5 item 2), tolerating ENOENT/already-absent at every step so a
+// crash mid-teardown or a re-invocation on an already-torn-down IP is always safe to retry:
+//
+//  1. AF_BRIDGE FDB entry (network.NewFDBManager().RemoveFDBEntry) — VXLAN encap mapping.
+//  2. AF_INET neigh (network.DeletePodIPNeigh) on the same interface — reused verbatim against
+//     flannel.1, the same function CleanupSourceIPHandoff already calls against cni0.
+//  3. The /32 host route (network.DeletePodIPHostRoute) that gave the OLD IP LPM priority over
+//     the local cni0 /24.
+//  4. The source-mode NOTRACK raw-table rule (removeOldIPNotrack) — already generic (deletes
+//     both -d/-s directions in both PREROUTING/OUTPUT chains regardless of which
+//     installOldIPNotrack mode installed them), so no change was needed there.
+//
+// This RPC does NOT itself decide reclaim eligibility — that is the controller-side
+// ReclaimEligible/R1-R7 predicate (ADR-0244 §2). By the time this fires, the controller has
+// already confirmed no live client can reach old_pod_ip; this handler's only job is to
+// mechanically remove the five now-provably-dead objects it owns on the source node.
+func (s *AgentServer) TeardownSourceRedirect(ctx context.Context, req *agentpb.TeardownSourceRedirectRequest) (*agentpb.TeardownSourceRedirectResponse, error) {
+	log.Info("TeardownSourceRedirect called (ADR-0244 GC-5)", "migration", req.MigrationName,
+		"oldPodIP", req.OldPodIp, "fdbIfname", req.FdbIfname, "replVethMAC", req.ReplVethMac, "dstNodeIP", req.DstNodeIp)
+
+	if req.OldPodIp == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "TeardownSourceRedirect: old_pod_ip is required")
+	}
+	oldIP := net.ParseIP(req.OldPodIp)
+	if oldIP == nil || oldIP.To4() == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "TeardownSourceRedirect: old_pod_ip %q is not a valid IPv4", req.OldPodIp)
+	}
+
+	fdbIf := req.FdbIfname
+	if fdbIf == "" {
+		fdbIf = "flannel.1"
+	}
+
+	// (a) AF_BRIDGE FDB entry. repl_veth_mac/dst_node_ip identify the exact entry that was
+	// installed by InjectSourceRedirect; both are required to key the delete (ADR-0136 keys the
+	// FDB on the replacement veth MAC, not a VTEP MAC — see InjectSourceRedirect's own comment).
+	// A missing MAC/dst IP is tolerated as a best-effort skip of this one step (not fatal to the
+	// remaining three, which do not need it) rather than failing the whole teardown — the FDB
+	// entry is harmless-if-orphaned relative to a live client (it is a forwarding hint, not a
+	// blocking rule) and VerifyCleanup(IP_RECLAIM)'s flannel1_fdb probe will surface any leak.
+	if req.ReplVethMac != "" && req.DstNodeIp != "" {
+		mac, macErr := net.ParseMAC(req.ReplVethMac)
+		dstNodeIP := net.ParseIP(req.DstNodeIp)
+		if macErr != nil || dstNodeIP == nil {
+			log.Info("TeardownSourceRedirect: repl_veth_mac/dst_node_ip invalid — skipping FDB removal (non-fatal)",
+				"migration", req.MigrationName, "replVethMAC", req.ReplVethMac, "dstNodeIP", req.DstNodeIp)
+		} else if err := network.NewFDBManager().RemoveFDBEntry(ctx, network.FDBEntry{
+			IfName: fdbIf,
+			PodIP:  oldIP,
+			PodMAC: mac,
+			VTEPIP: dstNodeIP,
+		}); err != nil {
+			return &agentpb.TeardownSourceRedirectResponse{TornDown: false,
+				BlockingReason: fmt.Sprintf("flannel.1 AF_BRIDGE FDB removal: %v", err)}, nil
+		}
+	} else {
+		log.Info("TeardownSourceRedirect: repl_veth_mac/dst_node_ip not supplied — skipping FDB removal (non-fatal)",
+			"migration", req.MigrationName)
+	}
+
+	// (b) AF_INET neigh on fdbIf. DeletePodIPNeigh already tolerates ENOENT/missing interface.
+	if err := network.DeletePodIPNeigh(ctx, fdbIf, oldIP); err != nil {
+		return &agentpb.TeardownSourceRedirectResponse{TornDown: false,
+			BlockingReason: fmt.Sprintf("flannel.1 neigh removal: %v", err)}, nil
+	}
+
+	// (c) /32 host route on fdbIf. DeletePodIPHostRoute already tolerates a missing interface.
+	if err := network.DeletePodIPHostRoute(ctx, fdbIf, oldIP); err != nil {
+		return &agentpb.TeardownSourceRedirectResponse{TornDown: false,
+			BlockingReason: fmt.Sprintf("flannel.1 /32 route removal: %v", err)}, nil
+	}
+
+	// (d) source-mode NOTRACK. removeOldIPNotrack is already generic/idempotent and returns no
+	// error (loops a bounded number of -D attempts, tolerating ENOENT at every step).
+	removeOldIPNotrack(ctx, oldIP)
+
+	log.Info("TeardownSourceRedirect: source flannel.1 redirect + NOTRACK torn down (ADR-0244 GC-5)",
+		"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "fdbIf", fdbIf)
+	return &agentpb.TeardownSourceRedirectResponse{TornDown: true}, nil
+}
+
+// ProbeDestSocketForIP reports whether the DESTINATION agent's restored-pod network namespace
+// has an ESTABLISHED TCP socket bound to old_pod_ip (ADR-0244 R7 / NoLiveDestSocketForIP,
+// added by the 2026-07-04 C1 amendment). This is the conjunct that observes the NOTRACK'd
+// tc-redirect flow class ProbeConntrackForIP/R6 structurally cannot see (see the ADR's NOTRACK
+// coverage discussion): a
+// live pinned/source-CIDR client connection carried over the ADR-0139/0136 tc-redirect + ADR-0141
+// NOTRACK path is, by construction, absent from conntrack, but its ESTABLISHED socket in the
+// restored pod's own netns is entirely unaffected by the raw-table NOTRACK rule sitting upstream
+// of it on the host — so it remains directly observable here.
+//
+// Only ESTABLISHED-state sockets are visible through this probe (network.SocketInventory filters
+// strictly on state=="01"); CLOSE_WAIT/FIN_WAIT/SYN_RECV flows on old_pod_ip are observed by
+// neither this probe nor ProbeConntrackForIP — a disclosed residual, not resolved by this RPC.
+//
+// Fail-closed contract (ADR-0244 N1/N2 correction): restoredPIDForMigration now distinguishes a
+// genuine lookup failure (propagated here as a gRPC error, so the controller's
+// noLiveDestSocketForIP conjunct defers the sweep) from a positive absence (CR/PID resolves and
+// is legitimately gone or never restored — present=false, not an error; nothing left to protect).
+func (s *AgentServer) ProbeDestSocketForIP(ctx context.Context, req *agentpb.ProbeDestSocketForIPRequest) (*agentpb.ProbeDestSocketForIPResponse, error) {
+	log.Info("ProbeDestSocketForIP called (ADR-0244 R7)", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+
+	if req.OldPodIp == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "ProbeDestSocketForIP: old_pod_ip is required")
+	}
+	oldIP := net.ParseIP(req.OldPodIp)
+	if oldIP == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "ProbeDestSocketForIP: old_pod_ip %q is not a valid IP", req.OldPodIp)
+	}
+	if req.MigrationName == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "ProbeDestSocketForIP: migration_name is required")
+	}
+
+	replPID, pidErr := s.restoredPIDForMigration(ctx, req.MigrationName)
+	if pidErr != nil {
+		// Case (2): the lookup itself failed (transient apiserver error, no k8s client, etc).
+		// Fail closed — propagate as an RPC error so the controller defers the sweep exactly as
+		// it already does on a ProbeConntrackForIP (R6) RPC error, rather than silently reading
+		// this as "positively absent" (the N1 defect this amendment fixes).
+		return nil, status.Errorf(codes.Unavailable,
+			"ProbeDestSocketForIP: restoredPIDForMigration lookup failed for migration %q: %v",
+			req.MigrationName, pidErr)
+	}
+	if replPID <= 0 {
+		// Case (1): the CR/PID was positively resolved and there is no restored process (pod
+		// gone, or never restored on this node). Nothing left to protect — present=false is a
+		// correct, non-error result, not a fail-open reading of an unresolved lookup.
+		log.Info("ProbeDestSocketForIP: no RestoredPID for migration — nothing to protect (present=false)",
+			"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+		return &agentpb.ProbeDestSocketForIPResponse{Present: false, Count: 0}, nil
+	}
+
+	entries, invErr := network.SocketInventory(int32(replPID))
+	if invErr != nil {
+		// A failure reading /proc/<pid>/net/tcp[6] (e.g. the process just exited between PID
+		// resolution and the read) is likewise a genuine observation failure, not a positive
+		// absence — fail closed rather than reporting present=false on an error.
+		return nil, status.Errorf(codes.Unavailable,
+			"ProbeDestSocketForIP: SocketInventory(pid=%d) failed for migration %q: %v",
+			replPID, req.MigrationName, invErr)
+	}
+
+	count := 0
+	for _, e := range entries {
+		if e.SrcIP != nil && e.SrcIP.Equal(oldIP) {
+			count++
+			continue
+		}
+		if e.DstIP != nil && e.DstIP.Equal(oldIP) {
+			count++
+		}
+	}
+
+	log.Info("ProbeDestSocketForIP: probe complete (ADR-0244 R7)", "migration", req.MigrationName,
+		"oldPodIP", req.OldPodIp, "replPID", replPID, "present", count > 0, "count", count)
+	return &agentpb.ProbeDestSocketForIPResponse{Present: count > 0, Count: int32(count)}, nil
 }
 
 // ListenAndServe starts the gRPC server on addr (default ":9090").
@@ -3302,8 +3496,8 @@ func (s *AgentServer) StartReachabilityEcho(ctx context.Context, req *agentpb.St
 		resp.Detail = "ADR-0210: listen_ip/listen_port/nonce required"
 		return resp, nil
 	}
-	replPID := s.restoredPIDForMigration(ctx, req.MigrationName)
-	if replPID <= 0 {
+	replPID, pidErr := s.restoredPIDForMigration(ctx, req.MigrationName)
+	if pidErr != nil || replPID <= 0 {
 		resp.Started = false
 		resp.Detail = "ADR-0210: replacement PID not yet resolvable — echo deferred to requeue"
 		return resp, nil
