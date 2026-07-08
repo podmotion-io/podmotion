@@ -8,11 +8,29 @@ package server
 // shmem_pagemap_guard.go — ADR-0246 D1/D3: post-checkpoint, pre-transfer completeness guard.
 //
 // CRIU 4.2 has a confirmed (§P-PREMISE-decoded, docs/sprints/SPRINT40C-SHMEM-PREMISE-EVIDENCE.md)
-// dump-time defect where an anon-shmem vma is recorded in mm-<pid>.img (with a non-zero shmid)
+// dump-time defect where a genuine anon-shmem vma (VMA_ANON_SHARED) is recorded in mm-<pid>.img
 // but the corresponding pagemap-shmem-<shmid>.img is never written. Restoring such a checkpoint
 // dies partway through with "criu/shmem.c:534: Can't restore shmem content". This guard detects
 // that reference-without-data pattern BEFORE transfer so a non-restorable checkpoint never ships
 // (ADR-0246 D1) — a pure detector, no retry, no repair.
+//
+// SPRINT41 NR-BLOCK-2 bugfix (docs/sprints/SPRINT41-NR-BLOCK-2-MECHANISM-INVESTIGATION.md,
+// panel-verified by two independent architect reviews): the original scan logic treated ANY
+// non-zero vma_entry.shmid field as an anon-shmem pagemap obligation. CRIU's mm-*.img overloads
+// that field as a generic per-checkpoint object index for multiple unrelated vma classes, which
+// produced a false positive on every checkpoint (the exact fixed small-integer signature
+// [1 2 3] seen across four failed gate attempts). The scan now classifies each vma by its
+// status bitmask (CRIU's mmap.status flags) before deciding whether a pagemap check applies:
+//   - VMA_FILE_PRIVATE (file-backed private mappings, e.g. ELF text/data): excluded entirely —
+//     backed by pages-*.img via file/pgoff, no pagemap-shmem-*.img is ever produced or needed.
+//   - VMA_ANON_SHARED (genuine shm_open/anon MAP_SHARED segments): checked exactly as before,
+//     directly by vma.shmid — this is the guard's original, load-bearing protection against the
+//     real historical defect (shmid 22685/11423).
+//   - VMA_AREA_MEMFD (memfd-backed MAP_SHARED, including CRIU's own CRIUMFD parasite-injection
+//     regions): NOT excluded — still checked, but the real pagemap key is resolved via
+//     memfd.img's memfd_inode_entry list (vma.shmid matches an entry's inode_id; that entry's
+//     own shmid field is the real, correctly-written pagemap-shmem-<shmid>.img key), since a
+//     memfd vma's own shmid field is a small sequential index, not the real kernel identifier.
 //
 // D3 (non-negotiable): this decode step is a least-privileged, host-mount-namespace-free,
 // in-process reader over the agent container's own tmpfs imagesDir. It follows the exact
@@ -91,9 +109,36 @@ const ShmemPagemapMissingReason = "SHMEM_PAGEMAP_MISSING"
 const ShmemPagemapMissingReasonDomain = "podmotion.io"
 
 // shmemScanScript is the embedded python3/pycriu script that decodes every mm-*.img in the
-// target directory (argv[1]) and prints the JSON-encoded sorted list of distinct non-zero
-// shmids referenced by any vma entry across all of them. It performs no filesystem writes and
-// touches nothing outside argv[1] — it is a pure read.
+// target directory (argv[1]) and prints the JSON-encoded sorted list of distinct real
+// pagemap-shmem keys that must have a matching pagemap-shmem-<key>.img.
+//
+// CRIU's mm-*.img vma_entry.shmid field is a generic, overloaded per-checkpoint object index —
+// NOT always a real anon-shmem/pagemap key (see docs/sprints/SPRINT41-NR-BLOCK-2-MECHANISM-
+// INVESTIGATION.md and ADR-0246's follow-up bugfix note). The vma_entry.status bitmask
+// (CRIU's mmap.status flags, pycriu/images/pb2dict.py mmap_status_map) distinguishes three
+// cases this scan must treat differently:
+//
+//   - VMA_FILE_PRIVATE (bit 6, 1<<6): a private file-backed mapping (e.g. ELF text/data). Its
+//     content is recovered from pages-*.img via file/pgoff, never from a pagemap-shmem-*.img.
+//     The vma's shmid field here is just a generic index, not a pagemap key — EXCLUDE entirely.
+//   - VMA_ANON_SHARED (bit 8, 1<<8): a genuine anon-shmem (shm_open/MAP_SHARED anon) mapping.
+//     This is the ONLY class the original ADR-0246 defect (shmid 22685/11423) applies to. Its
+//     vma.shmid IS the real pagemap key — KEEP the existing direct check unchanged.
+//   - VMA_AREA_MEMFD (bit 14, 1<<14): a memfd-backed MAP_SHARED mapping (including CRIU's own
+//     CRIUMFD parasite-injection regions). This DOES have a real on-disk pagemap — but keyed by
+//     the memfd's real kernel inode/shmid recorded in memfd.img, not by the vma's own (small,
+//     sequential, overloaded) shmid field. On a REAL CRIU 4.2 dump (verified live against the
+//     go-tcp-echo workload, docs/sprints/SPRINT41-NR-BLOCK-2-MECHANISM-INVESTIGATION.md), the
+//     vma's shmid field is actually a files.img file-object id, NOT memfd.img's inode_id
+//     directly — the correct resolution is a two-hop join: vma.shmid -> files.img entry (type
+//     MEMFD) with matching id -> that entry's memfd.inode_id -> memfd.img's
+//     memfd_inode_entry with matching inode_id -> that entry's own .shmid field, which is the
+//     real pagemap-shmem-<key>.img key to check. If either hop fails to resolve, fall back to
+//     the vma's own shmid (fail closed rather than silently skip — an unresolvable memfd
+//     reference is itself suspicious).
+//
+// Emits a JSON list of the real pagemap-shmem keys that must have a matching
+// pagemap-shmem-<key>.img.
 //
 // Kept in lockstep with the mirrored copy in shmem_pagemap_guard_test.go (buildShmemScanScript);
 // any divergence there is a test gap (same pattern as buildScanScript/buildPatchScript in
@@ -101,16 +146,84 @@ const ShmemPagemapMissingReasonDomain = "podmotion.io"
 const shmemScanScript = `
 import pycriu, glob, json, sys
 
-shmids = set()
+VMA_FILE_PRIVATE = 1 << 6
+VMA_ANON_SHARED = 1 << 8
+VMA_AREA_MEMFD = 1 << 14
+
+# Hop 1: files.img file-object id -> memfd.inode_id, for every FILES entry of type MEMFD. A
+# VMA_AREA_MEMFD vma's own shmid field is actually this files.img "id", not memfd.img's inode_id
+# directly (verified against a real CRIU 4.2 dump, not just the synthetic pycriu round-trip).
+memfd_inode_id_by_file_id = {}
+for img in glob.glob(sys.argv[1] + '/files.img'):
+    with open(img, 'rb') as f:
+        data = pycriu.images.load(f)
+    for entry in data.get('entries', []):
+        if entry.get('type') == 'MEMFD':
+            memfd = entry.get('memfd', {})
+            file_id = entry.get('id')
+            inode_id = memfd.get('inode_id')
+            if file_id is not None and inode_id is not None:
+                memfd_inode_id_by_file_id[file_id] = inode_id
+
+# Hop 2: memfd.img's memfd_inode_entry.inode_id -> that entry's own real shmid (the actual
+# kernel-assigned identifier pagemap-shmem-<shmid>.img is keyed by).
+real_shmid_by_inode_id = {}
+for img in glob.glob(sys.argv[1] + '/memfd.img') + glob.glob(sys.argv[1] + '/memfd-*.img'):
+    with open(img, 'rb') as f:
+        data = pycriu.images.load(f)
+    for entry in data.get('entries', []):
+        inode_id = entry.get('inode_id')
+        real_shmid = entry.get('shmid')
+        if inode_id is not None and real_shmid is not None:
+            real_shmid_by_inode_id[inode_id] = real_shmid
+
+def resolve_memfd_key(vma_shmid):
+    inode_id = memfd_inode_id_by_file_id.get(vma_shmid)
+    if inode_id is None:
+        return vma_shmid
+    return real_shmid_by_inode_id.get(inode_id, vma_shmid)
+
+keys = set()
 for img in glob.glob(sys.argv[1] + '/mm-*.img'):
     with open(img, 'rb') as f:
         data = pycriu.images.load(f)
     for entry in data.get('entries', []):
         for vma in entry.get('vmas', []):
             shmid = vma.get('shmid', 0)
-            if shmid:
-                shmids.add(shmid)
-print(json.dumps(sorted(shmids)))
+            if not shmid:
+                continue
+            status = vma.get('status', 0)
+            if isinstance(status, str):
+                # pretty/dict-mode may render flags as a "|"-joined name string; only the raw
+                # int form is relied upon in production (pycriu.images.load default), but guard
+                # defensively rather than crash on an unexpected representation.
+                status_int = 0
+                if 'VMA_FILE_PRIVATE' in status:
+                    status_int |= VMA_FILE_PRIVATE
+                if 'VMA_ANON_SHARED' in status:
+                    status_int |= VMA_ANON_SHARED
+                if 'VMA_AREA_MEMFD' in status:
+                    status_int |= VMA_AREA_MEMFD
+                status = status_int
+
+            if status & VMA_FILE_PRIVATE:
+                # File-backed private mapping: never needs a pagemap-shmem check, regardless of
+                # any other bit also set. Exclude entirely.
+                continue
+
+            if status & VMA_AREA_MEMFD:
+                keys.add(resolve_memfd_key(shmid))
+                continue
+
+            if status & VMA_ANON_SHARED:
+                keys.add(shmid)
+                continue
+
+            # Any other status combination (e.g. VMA_ANON_PRIVATE, VMA_AREA_SYSVIPC, etc.) does
+            # not carry a pagemap-shmem-<shmid>.img obligation under this convention — only
+            # VMA_ANON_SHARED and VMA_AREA_MEMFD do. Not flagged.
+
+print(json.dumps(sorted(keys)))
 `
 
 // verifyShmemPagemapCompleteness implements ADR-0246 D1/D3. It must be called after the final
@@ -118,9 +231,11 @@ print(json.dumps(sorted(shmids)))
 // defect is CRIU-internal, not caller-specific) and before that image set is considered ready
 // for GetCheckpointTar/transfer.
 //
-// It decodes every mm-*.img in imagesDir to collect every referenced anon-shmem shmid, then
-// confirms a non-empty pagemap-shmem-<shmid>.img exists in imagesDir for each one. Returns
-// ErrIncompleteShmemPagemap (wrapped with the missing shmid list) if any is absent or empty.
+// It decodes every mm-*.img in imagesDir to collect every real pagemap-shmem key referenced by
+// a VMA_ANON_SHARED or VMA_AREA_MEMFD vma (resolving the latter's real key via memfd.img;
+// VMA_FILE_PRIVATE vmas are excluded entirely — see the classification note above), then
+// confirms a non-empty pagemap-shmem-<key>.img exists in imagesDir for each one. Returns
+// ErrIncompleteShmemPagemap (wrapped with the missing key list) if any is absent or empty.
 //
 // D3: runs as a plain in-process reader over imagesDir — no nsenterCmd, no host mount
 // namespace, no hostPID/hostNetwork/containerd.sock reach. Mirrors buildMaskedPathExtMountArgs.

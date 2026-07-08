@@ -37,10 +37,26 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// VMA status bits, mirrored from pycriu/images/pb2dict.py's mmap_status_map (CRIU's mmap.status
+// flags) — same constants the guard's shmemScanScript classifies vmas by.
+const (
+	vmaFilePrivate = 1 << 6
+	vmaAnonShared  = 1 << 8
+	vmaAreaMemfd   = 1 << 14
+)
+
 // writeMMImageWithShmid builds a real CRIU mm-<pid>.img (via the vendored pycriu writer, not a
-// hand-rolled byte layout) containing one vma entry with the given shmid, plus a second,
-// non-shmem vma entry (shmid=0) to make sure the decode correctly ignores non-shmem vmas.
+// hand-rolled byte layout) containing one vma entry with the given shmid and status, plus a
+// second, non-shmem vma entry (shmid=0) to make sure the decode correctly ignores non-shmem
+// vmas. status=0 defaults to VMA_ANON_SHARED-equivalent legacy test behavior via the caller.
 func writeMMImageWithShmid(t *testing.T, pypath string, extraEnv []string, path string, shmid int) {
+	t.Helper()
+	writeMMImageWithShmidStatus(t, pypath, extraEnv, path, shmid, vmaAnonShared)
+}
+
+// writeMMImageWithShmidStatus is writeMMImageWithShmid but with an explicit vma status bitmask,
+// so tests can construct VMA_FILE_PRIVATE / VMA_AREA_MEMFD fixtures alongside VMA_ANON_SHARED.
+func writeMMImageWithShmidStatus(t *testing.T, pypath string, extraEnv []string, path string, shmid int, status int) {
 	t.Helper()
 	script := fmt.Sprintf(`
 import pycriu
@@ -50,18 +66,71 @@ entry = {
     'mm_arg_start': 0, 'mm_arg_end': 0, 'mm_env_start': 0, 'mm_env_end': 0,
     'exe_file_id': 1,
     'vmas': [
-        {'start': 0x1000, 'end': 0x2000, 'pgoff': 0, 'shmid': %d, 'prot': 3, 'flags': 0x2801, 'status': 0, 'fd': -1},
+        {'start': 0x1000, 'end': 0x2000, 'pgoff': 0, 'shmid': %d, 'prot': 3, 'flags': 0x2801, 'status': %d, 'fd': -1},
         {'start': 0x3000, 'end': 0x4000, 'pgoff': 0, 'shmid': 0, 'prot': 3, 'flags': 0x22, 'status': 0, 'fd': -1},
     ],
 }
 img = {'magic': 'MM', 'entries': [entry]}
 with open(%q, 'wb') as f:
     pycriu.images.dump(img, f)
-`, shmid, path)
+`, shmid, status, path)
 	cmd := exec.Command("python3", "-c", script)
 	cmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("writeMMImageWithShmid: %v\n%s", err, out)
+		t.Fatalf("writeMMImageWithShmidStatus: %v\n%s", err, out)
+	}
+}
+
+// writeMemfdImage builds a real CRIU memfd.img (via the vendored pycriu writer) containing one
+// memfd_inode_entry mapping the given local inodeID to the given realShmid (the actual
+// kernel-assigned identifier that pagemap-shmem-<realShmid>.img is keyed by) — mirroring the
+// memfd.img structure decoded in docs/sprints/SPRINT41-NR-BLOCK-2-MECHANISM-INVESTIGATION.md
+// (e.g. inode_id=1 -> shmid=13353). Pair with writeFilesImageMemfd to complete the two-hop join
+// a VMA_AREA_MEMFD vma's shmid field requires on a real CRIU dump (vma.shmid -> files.img id ->
+// this inodeID -> this realShmid).
+func writeMemfdImage(t *testing.T, pypath string, extraEnv []string, path string, inodeID, realShmid int) {
+	t.Helper()
+	script := fmt.Sprintf(`
+import pycriu
+entry = {
+    'name': 'CRIUMFD', 'uid': 0, 'gid': 0, 'size': 4096,
+    'shmid': %d, 'seals': 0, 'inode_id': %d,
+}
+img = {'magic': 'MEMFD_INODE', 'entries': [entry]}
+with open(%q, 'wb') as f:
+    pycriu.images.dump(img, f)
+`, realShmid, inodeID, path)
+	cmd := exec.Command("python3", "-c", script)
+	cmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("writeMemfdImage: %v\n%s", err, out)
+	}
+}
+
+// writeFilesImageMemfd builds a real CRIU files.img (via the vendored pycriu writer) containing
+// one FILES entry of type MEMFD whose id equals a VMA_AREA_MEMFD vma's own shmid field (fileID)
+// and whose nested memfd.inode_id equals the corresponding memfd.img memfd_inode_entry's
+// inode_id — reproducing the exact real-CRIU-dump indirection discovered during live
+// verification against the go-tcp-echo workload (a memfd vma's shmid is a files.img file-object
+// id, not memfd.img's inode_id directly).
+func writeFilesImageMemfd(t *testing.T, pypath string, extraEnv []string, path string, fileID, inodeID int) {
+	t.Helper()
+	script := fmt.Sprintf(`
+import pycriu
+entry = {
+    'type': 'MEMFD', 'id': %d,
+    'memfd': {'id': %d, 'flags': 0, 'pos': 0,
+              'fown': {'uid': 0, 'euid': 0, 'signum': 0, 'pid_type': 0, 'pid': 0},
+              'inode_id': %d},
+}
+img = {'magic': 'FILES', 'entries': [entry]}
+with open(%q, 'wb') as f:
+    pycriu.images.dump(img, f)
+`, fileID, fileID, inodeID, path)
+	cmd := exec.Command("python3", "-c", script)
+	cmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("writeFilesImageMemfd: %v\n%s", err, out)
 	}
 }
 
@@ -168,6 +237,98 @@ func TestVerifyShmemPagemapCompleteness_NoShmemVmas_Passes(t *testing.T) {
 
 	if err := verifyShmemPagemapCompleteness(dir); err != nil {
 		t.Fatalf("expected guard to pass with no shmem-backed vmas, got: %v", err)
+	}
+}
+
+// TestVerifyShmemPagemapCompleteness_AnonSharedMissing_StillCaught is SPRINT41 NR-BLOCK-2 bugfix
+// regression case (a): a genuine VMA_ANON_SHARED vma referencing a shmid with no matching
+// pagemap-shmem-<shmid>.img must STILL be caught — this is the guard's original, load-bearing
+// protection against the real historical ADR-0246 defect (shmid 22685/11423) and must not be
+// weakened by the false-positive fix.
+func TestVerifyShmemPagemapCompleteness_AnonSharedMissing_StillCaught(t *testing.T) {
+	withRepoPycriuPath(t)
+	dir := t.TempDir()
+	writeMMImageWithShmidStatus(t, pycriuPythonPath, append(os.Environ(), "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python"), filepath.Join(dir, "mm-42.img"), 22685, vmaAnonShared)
+	// Deliberately do NOT write pagemap-shmem-22685.img.
+
+	err := verifyShmemPagemapCompleteness(dir)
+	if err == nil {
+		t.Fatal("expected VMA_ANON_SHARED vma with missing pagemap-shmem-22685.img to still be caught, got nil")
+	}
+	if !errors.Is(err, ErrIncompleteShmemPagemap) {
+		t.Fatalf("expected errors.Is(err, ErrIncompleteShmemPagemap); got %v", err)
+	}
+	if !strings.Contains(err.Error(), "22685") {
+		t.Errorf("expected shmid 22685 named in error, got: %v", err)
+	}
+}
+
+// TestVerifyShmemPagemapCompleteness_FilePrivate_NotFlagged is SPRINT41 NR-BLOCK-2 bugfix case
+// (b) — the false-positive fix itself: a VMA_FILE_PRIVATE vma (e.g. an ELF text/data segment)
+// carries a generic, overloaded shmid field that is not a pagemap key at all. It must never be
+// flagged, even though no pagemap-shmem-<shmid>.img exists for it (none is expected to).
+func TestVerifyShmemPagemapCompleteness_FilePrivate_NotFlagged(t *testing.T) {
+	withRepoPycriuPath(t)
+	dir := t.TempDir()
+	// shmid=1 mirrors the real false-positive signature from
+	// docs/sprints/SPRINT41-NR-BLOCK-2-MECHANISM-INVESTIGATION.md (the /tcpecho binary's own
+	// text segment decoded as {"shmid": 1, "status": "VMA_AREA_REGULAR | VMA_FILE_PRIVATE"}).
+	writeMMImageWithShmidStatus(t, pycriuPythonPath, append(os.Environ(), "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python"), filepath.Join(dir, "mm-1.img"), 1, vmaFilePrivate)
+	// No pagemap-shmem-1.img written — and none should ever be required for VMA_FILE_PRIVATE.
+
+	if err := verifyShmemPagemapCompleteness(dir); err != nil {
+		t.Fatalf("expected VMA_FILE_PRIVATE vma to never be flagged (false-positive fix), got: %v", err)
+	}
+}
+
+// TestVerifyShmemPagemapCompleteness_MemfdPresentUnderRealKey_Passes is SPRINT41 NR-BLOCK-2
+// bugfix case (c): a VMA_AREA_MEMFD vma (e.g. CRIU's own CRIUMFD parasite-injection region)
+// whose real pagemap — correctly keyed by memfd.img's memfd_inode_entry.shmid, NOT the vma's
+// own small sequential shmid/inode-index field — IS present must pass cleanly.
+func TestVerifyShmemPagemapCompleteness_MemfdPresentUnderRealKey_Passes(t *testing.T) {
+	withRepoPycriuPath(t)
+	dir := t.TempDir()
+	env := append(os.Environ(), "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python")
+	// vma.shmid=2 is a files.img file-object id; files.img says that id -> inode_id=2;
+	// memfd.img says inode_id=2 -> real shmid=13350 (mirroring the investigation doc's exact
+	// decoded values and the two-hop join discovered during live verification).
+	writeMMImageWithShmidStatus(t, pycriuPythonPath, env, filepath.Join(dir, "mm-1.img"), 2, vmaAreaMemfd)
+	writeFilesImageMemfd(t, pycriuPythonPath, env, filepath.Join(dir, "files.img"), 2, 2)
+	writeMemfdImage(t, pycriuPythonPath, env, filepath.Join(dir, "memfd.img"), 2, 13350)
+	if err := os.WriteFile(filepath.Join(dir, "pagemap-shmem-13350.img"), []byte("real-memfd-pagemap-content"), 0o600); err != nil {
+		t.Fatalf("write fixture pagemap: %v", err)
+	}
+	// No pagemap-shmem-2.img exists (and correctly should not need to) — proves the guard
+	// checks the memfd.img-resolved real key, not the vma's own overloaded shmid field.
+
+	if err := verifyShmemPagemapCompleteness(dir); err != nil {
+		t.Fatalf("expected VMA_AREA_MEMFD vma with pagemap present under its real memfd.img key to pass, got: %v", err)
+	}
+}
+
+// TestVerifyShmemPagemapCompleteness_MemfdRealKeyMissing_StillCaught is SPRINT41 NR-BLOCK-2
+// bugfix case (d): a VMA_AREA_MEMFD vma whose real, correctly-resolved pagemap (under
+// memfd.img's key) is genuinely absent must STILL be caught — proving the fix resolves the
+// correct filename to check rather than whitelisting VMA_AREA_MEMFD wholesale.
+func TestVerifyShmemPagemapCompleteness_MemfdRealKeyMissing_StillCaught(t *testing.T) {
+	withRepoPycriuPath(t)
+	dir := t.TempDir()
+	env := append(os.Environ(), "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python")
+	writeMMImageWithShmidStatus(t, pycriuPythonPath, env, filepath.Join(dir, "mm-1.img"), 3, vmaAreaMemfd)
+	writeFilesImageMemfd(t, pycriuPythonPath, env, filepath.Join(dir, "files.img"), 3, 1)
+	writeMemfdImage(t, pycriuPythonPath, env, filepath.Join(dir, "memfd.img"), 1, 13353)
+	// Deliberately do NOT write pagemap-shmem-13353.img (nor pagemap-shmem-3.img — neither
+	// should make this pass; only the real, memfd.img-resolved key matters).
+
+	err := verifyShmemPagemapCompleteness(dir)
+	if err == nil {
+		t.Fatal("expected VMA_AREA_MEMFD vma with genuinely missing real-keyed pagemap to be caught, got nil")
+	}
+	if !errors.Is(err, ErrIncompleteShmemPagemap) {
+		t.Fatalf("expected errors.Is(err, ErrIncompleteShmemPagemap); got %v", err)
+	}
+	if !strings.Contains(err.Error(), "13353") {
+		t.Errorf("expected real resolved shmid 13353 named in error, got: %v", err)
 	}
 }
 
