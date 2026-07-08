@@ -103,6 +103,13 @@ var methodPolicy = map[string]map[Role]bool{
 	agentpb.MigrationAgentService_InjectIPHandoff_FullMethodName:         {RoleOperator: true},
 	agentpb.MigrationAgentService_CleanupSourceIPHandoff_FullMethodName:  {RoleOperator: true},
 	agentpb.MigrationAgentService_DisarmTCRedirect_FullMethodName:        {RoleOperator: true},
+	// ADR-0244 (NR-BLOCK-2) GC-5/R6/R7: source-side teardown and the two reclaim-eligibility
+	// probes. All three are controller (operator)-driven only, same as DisarmTCRedirect/
+	// InjectSourceRedirect above — absent from this map, deny-by-default (§2.2.3) would reject
+	// them even though the handlers exist in server.go.
+	agentpb.MigrationAgentService_TeardownSourceRedirect_FullMethodName: {RoleOperator: true},
+	agentpb.MigrationAgentService_ProbeConntrackForIP_FullMethodName:    {RoleOperator: true},
+	agentpb.MigrationAgentService_ProbeDestSocketForIP_FullMethodName:   {RoleOperator: true},
 	agentpb.MigrationAgentService_Verify_FullMethodName:                  {RoleOperator: true},
 	agentpb.MigrationAgentService_VerifyTCP_FullMethodName:               {RoleOperator: true},
 	agentpb.MigrationAgentService_PreDumpRound_FullMethodName:            {RoleOperator: true},
