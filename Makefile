@@ -89,26 +89,30 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
-# E2E tests target the real kubeadm cluster (pm-control: 192.168.252.7, pm-worker: 192.168.252.8).
-# Kind cluster creation is intentionally skipped.
-# The kubeadm cluster must be reachable via KUBECONFIG (default: ~/.kube/config).
-# Start the kubectl proxy tunnel first: ~/.local/bin/pm-kubectl-proxy.sh
+# E2E tests target the STANDING KVM/libvirt kubeadm cluster (VMs pm-cp1/pm-w1/pm-w2 on
+# the libvirt `default` NAT network, 192.168.122.0/24). Node IPs are DHCP — do NOT
+# hardcode them; discover via `sudo virsh net-dhcp-leases default` or the CP1/W1/W2
+# vars in /home/chad/podmotion-kvm/hosts.env. Kind cluster creation is intentionally
+# skipped. The cluster must be reachable via KUBECONFIG (default below points at the
+# standing cluster's admin kubeconfig). See CLAUDE.md "KVM kubeadm cluster — deploy
+# sequence" and hack/kvm-cluster.sh (verify | reset-cluster | deploy-podmotion | wipe).
 #
 # Optional env vars:
 #   CERT_MANAGER_INSTALL_SKIP=true  — skip cert-manager installation (default: skip on kubeadm)
-#   KUBECONFIG                      — path to kubeconfig (default: ~/.kube/config)
+#   KUBECONFIG                      — path to kubeconfig (default: /home/chad/podmotion-kvm/kubeconfig)
 #   E2E_LABEL_FILTER                — Ginkgo label filter (e.g. "proof" for the proof milestone only)
 
 E2E_TIMEOUT ?= 30m
 E2E_LABEL_FILTER ?=
+export KUBECONFIG ?= /home/chad/podmotion-kvm/kubeconfig
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Verify kubeadm cluster is reachable before running e2e tests
-	@echo "==> Verifying kubeadm cluster connectivity..."
+	@echo "==> Verifying kubeadm cluster connectivity (KUBECONFIG=$(KUBECONFIG))..."
 	@kubectl cluster-info 2>/dev/null || { \
-		echo "ERROR: kubectl cannot reach the cluster."; \
-		echo "       Start the proxy: ~/.local/bin/pm-kubectl-proxy.sh"; \
-		echo "       Then ensure KUBECONFIG points to a config using http://127.0.0.1:8001"; \
+		echo "ERROR: kubectl cannot reach the standing KVM kubeadm cluster."; \
+		echo "       Ensure KUBECONFIG points at the standing cluster (default /home/chad/podmotion-kvm/kubeconfig)"; \
+		echo "       and that it is healthy: bash hack/kvm-cluster.sh verify"; \
 		exit 1; \
 	}
 	@kubectl get nodes 2>/dev/null || { echo "ERROR: cannot list nodes"; exit 1; }
