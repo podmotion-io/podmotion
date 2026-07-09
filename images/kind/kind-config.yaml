@@ -1,11 +1,11 @@
-# PodMotion Sprint 31 cluster — 1 control-plane + 1 worker (amd64/kind)
-# Usage: kind create cluster --name podmotion-sprint31 --config images/kind/kind-config.yaml
+# PodMotion Sprint 42 cluster — 1 control-plane + 2 worker (amd64/kind)
+# Usage: kind create cluster --name podmotion-sprint42 --config images/kind/kind-config.yaml
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
-name: podmotion-sprint41
+name: podmotion-sprint42
 nodes:
   - role: control-plane
-    image: podmotion-node:sprint41-amd64
+    image: podmotion-node:sprint42-amd64
     kubeadmConfigPatches:
       - |
         kind: InitConfiguration
@@ -17,7 +17,13 @@ nodes:
         containerPath: /sys/fs/bpf
         propagation: Bidirectional
   - role: worker
-    image: podmotion-node:sprint41-amd64
+    image: podmotion-node:sprint42-amd64
+    extraMounts:
+      - hostPath: /sys/fs/bpf
+        containerPath: /sys/fs/bpf
+        propagation: Bidirectional
+  - role: worker
+    image: podmotion-node:sprint42-amd64
     extraMounts:
       - hostPath: /sys/fs/bpf
         containerPath: /sys/fs/bpf
