@@ -4958,30 +4958,6 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 			sizeBytes, ctrErr := ctrCheckpoint(taskID, imagesDir, tcpEstablished)
 			freezeDurationMs := time.Since(freezeStart).Milliseconds()
 
-			// Sprint 41 NR-BLOCK-2 investigation
-			// (docs/sprints/SPRINT41-NR-BLOCK-2-POD-SCOPE-INVESTIGATION.md): `ctr tasks
-			// checkpoint` invokes CRIU (via runc) against the still-alive workload PID,
-			// which injects a parasite "CRIUMFD" memfd mapping to help dump the process's
-			// own memory. On a successful dump CRIU's own cure step unmaps this; on a
-			// failed/aborted dump it can be left permanently mapped — and since rollback
-			// keeps the source process alive rather than restarting it, every
-			// failed/retried attempt against the same PID stacks one more leaked mapping
-			// (proven live: 5 retries -> 8 stacked leaked pairs). Run the cleanup
-			// unconditionally after EVERY attempt — success or failure — so a retried
-			// Checkpoint never accumulates parasite mappings in the workload process.
-			if ctrPIDForCleanup, cleanupPIDErr := FindContainerPID(podUID); cleanupPIDErr == nil {
-				if cleaned, cleanupErr := criu.CleanupLeakedParasiteMemfds(ctrPIDForCleanup); cleanupErr != nil {
-					log.Error(cleanupErr, "Checkpoint: leaked CRIU parasite memfd cleanup failed (best-effort, non-fatal)",
-						"migration", req.MigrationName, "pid", ctrPIDForCleanup)
-				} else if cleaned > 0 {
-					log.Info("Checkpoint: cleaned up leaked CRIU parasite memfd mapping(s) (SPRINT41-NR-BLOCK-2)",
-						"migration", req.MigrationName, "pid", ctrPIDForCleanup, "cleanedCount", cleaned)
-				}
-			} else {
-				log.Info("Checkpoint: skipping parasite memfd cleanup — container PID not resolvable (process likely gone)",
-					"migration", req.MigrationName, "err", cleanupPIDErr)
-			}
-
 			if ctrErr != nil {
 				// Fall through to raw CRIU only for in-flight/established TCP socket failures —
 				// ctr invokes CRIU without --tcp-established, so containers with active TCP
@@ -5135,22 +5111,6 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 	// SD-4: ptrace is no longer expected once Dump returns (success or failure) — close the
 	// window immediately on the happy path. The deferred close above is the fallback only.
 	_ = seccomp.PtraceWindowClose(req.MigrationName)
-
-	// Sprint 41 NR-BLOCK-2 investigation
-	// (docs/sprints/SPRINT41-NR-BLOCK-2-POD-SCOPE-INVESTIGATION.md): same leaked-parasite
-	// cleanup as the ctr-native path above, run here for the raw-CRIU (go-criu CLI-exec)
-	// fallback Dump path — CRIU injects the same "CRIUMFD" parasite regardless of whether
-	// it was invoked via `ctr tasks checkpoint` or directly, so both entry points must run
-	// the cleanup on every attempt (success or failure) against the still-alive containerPID.
-	if containerPID != 0 {
-		if cleaned, cleanupErr := criu.CleanupLeakedParasiteMemfds(containerPID); cleanupErr != nil {
-			log.Error(cleanupErr, "Checkpoint: leaked CRIU parasite memfd cleanup failed (raw-CRIU path, best-effort, non-fatal)",
-				"migration", req.MigrationName, "pid", containerPID)
-		} else if cleaned > 0 {
-			log.Info("Checkpoint: cleaned up leaked CRIU parasite memfd mapping(s) (raw-CRIU path, SPRINT41-NR-BLOCK-2)",
-				"migration", req.MigrationName, "pid", containerPID, "cleanedCount", cleaned)
-		}
-	}
 
 	// freezeTimestampNs is CLOCK_REALTIME ns captured immediately after CRIU dump
 	// returns. When LeaveStopped=true the process is in SIGSTOP at this point.
