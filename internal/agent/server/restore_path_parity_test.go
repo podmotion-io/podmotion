@@ -180,6 +180,18 @@ func TestJoinNsRestore_ReturnsMACToCaller(t *testing.T) {
 	defer func() { readReplVethMACFn = origMAC }()
 
 	s := New("test-node", &criu.StubCheckpointer{}, nil)
+	// ADR-0215/ADR-0217 fail-close: JoinNsRestore resolves the workload image from (1) the NRI
+	// event, (2) the PrepareDestinationNetns cache (destWorkloadImage), or (3) the replacement
+	// pod spec (needs a k8s client) BEFORE it will call joinNsRestoreFn. This test injects a nil
+	// k8s client and passes an empty NRI image, so on baseline all three sources are empty and
+	// JoinNsRestore fail-closes at the ADR-0217 guard — the pre-existing failure this test hit.
+	// In production the ADR-0168-B2 chain always populates the PrepareDestinationNetns cache
+	// (source 2) before restore; the test fixture simply never did. Populate the authoritative
+	// cache source the same way PrepareDestinationNetns does, so image resolution succeeds and
+	// the joinNsRestoreFn→finalizeRestore→readReplVethMACFn chain under test actually runs.
+	s.destWorkloadImageMu.Lock()
+	s.destWorkloadImage["test-nri-migration"] = "docker.io/library/redis:7-alpine"
+	s.destWorkloadImageMu.Unlock()
 	// JoinNsRestore signature: (migrationName, checkpointDir, imageName, containerID, sandboxID, tcpPreservationMode)
 	_, gotMAC, err := s.JoinNsRestore("test-nri-migration", "/tmp/fake-checkpoint", "", "", "", "None")
 	if err != nil {

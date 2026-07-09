@@ -1,7 +1,7 @@
 # PodMotion Namespace-Scoping — Feasibility Design Brief
 
 Status: Draft / feasibility design
-Author: Platform architecture (Opus)
+Author: Platform architecture
 Date: 2026-06-14
 Surface tag: `multitenancy / scoping`
 Related: ADR-0012 (TrafficVerified gate), ADR-0118 (agent cache), ADR-0146 (checkpoint tmpfs)

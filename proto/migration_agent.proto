@@ -107,6 +107,28 @@ service MigrationAgentService {
   // verify the absence of yet. The explicit objects list lets a future ADR change what is
   // checked without a new RPC signature (ADR-0241 Decision 1).
   rpc VerifyCleanup(VerifyCleanupRequest) returns (VerifyCleanupResponse);
+  // TeardownSourceRedirect removes the ADR-0136 SOURCE-node flannel.1 VXLAN redirect
+  // (host route + AF_INET neigh + AF_BRIDGE FDB) and the ADR-0141 source-mode NOTRACK
+  // rules for the relocated OLD pod IP. Symmetric to DisarmTCRedirect on the destination
+  // side. Called only once the controller's IP-Reclaim-Eligible predicate holds
+  // (ADR-0244 / NR-BLOCK-2). Idempotent: ENOENT is treated as success.
+  rpc TeardownSourceRedirect(TeardownSourceRedirectRequest) returns (TeardownSourceRedirectResponse);
+  // ProbeConntrackForIP reports whether the calling node's conntrack table has any entry
+  // matching old_pod_ip (source or destination address), via network.ExportConntrack — a
+  // read-only presence probe, not an export-for-migration call. Used by the controller's
+  // NoLiveConntrackForIP conjunct (ADR-0244 R6 / NR-BLOCK-2): a non-empty result on EITHER
+  // the source or destination agent defers the entire IP-reclaim sweep pass.
+  rpc ProbeConntrackForIP(ProbeConntrackForIPRequest) returns (ProbeConntrackForIPResponse);
+  // ProbeDestSocketForIP reports whether the DESTINATION agent's restored-pod network
+  // namespace has an ESTABLISHED TCP socket bound to old_pod_ip, read directly from
+  // /proc/<restoredPID>/net/tcp[6] inside that netns. This observes the class of flow
+  // ADR-0141's NOTRACK rules deliberately make invisible to ProbeConntrackForIP/conntrack
+  // (ADR-0244 C1 correction, Sprint 40): a live pinned/source-CIDR connection carried over
+  // the NOTRACK'd tc-redirect path never appears in conntrack by construction, so it must
+  // be observed at the socket-table layer instead. Called only against the destination
+  // agent (the restored pod owns old_pod_ip post-migration); the source node has no
+  // socket bound to old_pod_ip to inspect.
+  rpc ProbeDestSocketForIP(ProbeDestSocketForIPRequest) returns (ProbeDestSocketForIPResponse);
 }
 
 message PrepareSourceRequest {
@@ -224,6 +246,15 @@ message RestoreRequest {
   // failure is a hard abort when mode=="Strict" (explicit field replaces the SeqSnapshots>0
   // proxy, closing the narrow fail-open where Strict with zero TCP connections would degrade).
   string tcp_preservation_mode       = 9;
+  // sandbox_id (ADR-0228 NRI/gRPC symmetry) is the replacement pod's containerd sandbox
+  // (pause container) ID — the same ID the NRI path receives from pod.GetId(). Required so
+  // the gRPC Restore path can resolve RestoredPID via the same cgroup-anchored mechanism
+  // (findRestoredPIDInBrokerCgroup + moveProcessToPodCgroup) as the NRI path, instead of the
+  // retired comm-scan fallback. If empty, the agent attempts to self-resolve it from the
+  // replacement pod (mirrors the ADR-0217 D2 workload-image self-resolve); if that also fails,
+  // the restore fails closed with ErrSandboxRequiredForVerifiedRestore rather than falling back
+  // to a weaker resolver that could report a false success.
+  string sandbox_id                  = 10;
 }
 message RestoreResponse {
   bool   success           = 1;
@@ -477,9 +508,8 @@ enum CleanupScope {
   // CleanupSourceIPHandoff at reconcileVerifying (ADR-0241 item 1).
   CUTOVER_COMPLETE          = 1;
   // IP_RECLAIM checks the DESTINATION tc redirect/FORWARD-ACCEPT/NOTRACK plus the SOURCE
-  // flannel.1 redirect/NOTRACK removed by DisarmTCRedirect on IPAM reclaim. Deferred to
-  // NR-BLOCK-2 (ADR-0241 item 2) — no reclaim trigger exists yet, so this scope is defined
-  // but returns Unimplemented.
+  // flannel.1 redirect/NOTRACK removed by DisarmTCRedirect and TeardownSourceRedirect on
+  // IPAM reclaim (ADR-0244 / NR-BLOCK-2).
   IP_RECLAIM                = 2;
 }
 
@@ -494,8 +524,14 @@ message VerifyCleanupRequest {
   // bridge_ifname is the local CNI bridge name (default "cni0"), used by CUTOVER_COMPLETE.
   string        bridge_ifname  = 4;
   // objects is the explicit list of object identifiers to check, e.g. "cni0_neigh",
-  // "cni0_host_route" for CUTOVER_COMPLETE scope.
+  // "cni0_host_route" for CUTOVER_COMPLETE scope, or "tc_filter", "tc_qdisc",
+  // "dest_forward_accept", "dest_notrack", "source_notrack", "flannel1_route",
+  // "flannel1_neigh", "flannel1_fdb" for IP_RECLAIM scope (ADR-0244).
   repeated string objects      = 5;
+  // fdb_ifname is the overlay interface (default "flannel.1"), used by IP_RECLAIM scope.
+  string        fdb_ifname    = 6;
+  // repl_veth_mac is required for the IP_RECLAIM "flannel1_fdb" probe (ADR-0244).
+  string        repl_veth_mac = 7;
 }
 message VerifyCleanupResponse {
   // clean is true only when none of the requested objects are present.
@@ -503,6 +539,51 @@ message VerifyCleanupResponse {
   // present_objects lists the subset of the requested objects still found present.
   repeated string present_objects = 2;
   string blocking_reason  = 3;
+}
+
+// TeardownSourceRedirectRequest carries the inputs for the ADR-0244 (NR-BLOCK-2) source-side
+// flannel.1/NOTRACK reclaim teardown. Symmetric to DisarmTCRedirectRequest.
+message TeardownSourceRedirectRequest {
+  string migration_name  = 1;
+  // old_pod_ip is the relocated OLD pod IP whose source-side redirect is being torn down.
+  string old_pod_ip      = 2;
+  // fdb_ifname is the overlay interface the redirect was installed on (default "flannel.1").
+  string fdb_ifname      = 3;
+  // repl_veth_mac is the replacement pod's eth0 MAC the AF_BRIDGE FDB entry was keyed on
+  // (ADR-0136). Required to identify the exact FDB entry to remove.
+  string repl_veth_mac   = 4;
+  // dst_node_ip is the destination node's underlay (VTEP) IP the FDB entry pointed at.
+  string dst_node_ip     = 5;
+}
+message TeardownSourceRedirectResponse {
+  bool   torn_down        = 1;
+  string blocking_reason  = 2;
+}
+
+// ProbeConntrackForIPRequest asks the calling node's agent whether its local conntrack
+// table has any entry for old_pod_ip (ADR-0244 R6).
+message ProbeConntrackForIPRequest {
+  string migration_name = 1;
+  string old_pod_ip     = 2;
+}
+message ProbeConntrackForIPResponse {
+  // present is true if at least one conntrack entry matching old_pod_ip was found.
+  bool present  = 1;
+  int32 count   = 2;
+}
+
+// ProbeDestSocketForIPRequest asks the DESTINATION agent whether the restored pod's
+// network namespace (resolved via Status.RestoredPID for migration_name) has an
+// ESTABLISHED TCP socket bound to old_pod_ip (ADR-0244 R7 / C1 correction).
+message ProbeDestSocketForIPRequest {
+  string migration_name = 1;
+  string old_pod_ip     = 2;
+}
+message ProbeDestSocketForIPResponse {
+  // present is true if at least one ESTABLISHED socket bound to old_pod_ip was found in
+  // the restored pod's netns.
+  bool present  = 1;
+  int32 count   = 2;
 }
 
 enum MigrationMode {
@@ -583,4 +664,10 @@ message StartReachabilityEchoRequest {
 message StartReachabilityEchoResponse {
   bool   started          = 1;
   string detail           = 2;
+  // process_died (ADR-0228 Invariant 3) is set true when the agent-side liveness pre-check
+  // found RestoredPID already dead before attempting to start the echo listener — a
+  // legitimate post-recording failure (e.g. the restored application crashed after handoff).
+  // The controller surfaces this as a distinct RestoredProcessDied condition/reason instead of
+  // a generic reachability timeout.
+  bool   process_died     = 3;
 }

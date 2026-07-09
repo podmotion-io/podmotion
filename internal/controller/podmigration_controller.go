@@ -52,6 +52,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/orchestration"
 	"github.com/podmotion-io/podmotion/internal/rollback"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -86,7 +87,38 @@ const (
 	// conditionRestoreTimedOut is set when the restore deadline elapses, driving
 	// the migration to RollingBack (ADR-0157 D3/GC-32). Reason: RestoreDeadlineExceeded.
 	conditionRestoreTimedOut = "RestoreTimedOut"
+	// ipReclaimVerifyAttemptsAnnotation stamps the current VerifyCleanup(IP_RECLAIM) retry
+	// attempt count (ADR-0244 / NR-BLOCK-2), mirroring cni0CleanupVerifyAttemptsAnnotation.
+	ipReclaimVerifyAttemptsAnnotation = "podmotion.io/ip-reclaim-verify-attempts"
 )
+
+// reclaimSweepInterval is the ADR-0244 (NR-BLOCK-2) periodic pod-IP GC sweep requeue
+// interval, used from the terminal Complete/Failed reconcile branch while
+// ReclaimEligible(pm) is not yet true.
+const reclaimSweepInterval = 30 * time.Second
+
+// reclaimQuarantineSeconds is the ADR-0244 R3 floor: a migration must have been terminal
+// for at least this long before the IP-reclaim sweep is even considered eligible. Chosen as
+// ~10x the existing cni0CleanupVerifyBackoff total budget (14s) — an order-of-magnitude
+// margin over an already-reviewed bound, not an arbitrary constant.
+const reclaimQuarantineSeconds = 150 * time.Second
+
+// reclaimDeletionForceTimeout bounds how long handleDeletion holds a PodMigration's finalizer
+// waiting for the ADR-0244 IP-reclaim sweep to complete before force-removing it (fail-open).
+// It mirrors ADR-0241's bounded-retry-then-fail-open posture: the reclaim sweep MUST get a fair
+// chance to run — it cannot even begin until the R3 quarantine floor (reclaimQuarantineSeconds)
+// elapses, after which it needs a teardown pass plus the VerifyCleanup(IP_RECLAIM) retry budget
+// to converge — but a genuinely stuck reclaim (R6/R7 failing closed on a real live connection,
+// or a persistent teardown bug) must never be able to wedge CR deletion forever. Anchored to the
+// quarantine floor plus a generous margin for teardown + verify to complete, not an arbitrary
+// constant.
+const reclaimDeletionForceTimeout = reclaimQuarantineSeconds + 5*time.Minute
+
+// ipReclaimVerifyBackoff is the ADR-0244 VerifyCleanup(IP_RECLAIM) bounded retry schedule,
+// identical in shape to cni0CleanupVerifyBackoff (ADR-0241 item 1 precedent): 3 attempts,
+// 2s/4s/8s, converging to a fail-open (ConditionIPReclaimVerified=False +
+// DatapathCleanupLeakTotal + a DatapathCleanupLeak Event) on exhaustion.
+var ipReclaimVerifyBackoff = []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
 
 // cni0CleanupVerifyBackoff is the ADR-0241 item 1 bounded retry schedule for
 // VerifyCleanup(CUTOVER_COMPLETE): up to 3 attempts, 2s/4s/8s backoff, converging to a
@@ -125,7 +157,7 @@ type PodMigrationReconciler struct {
 	// AgentPool provides per-node gRPC connections to podmotion-agent DaemonSet pods.
 	// Nil in unit tests — phase handlers skip gRPC calls when nil.
 	AgentPool *agentclient.AgentClientPool
-	// ReplicationMgr drives the pre-copy dirty-page sync loop (Agent 11, M5).
+	// ReplicationMgr drives the pre-copy dirty-page sync loop (a reviewer, M5).
 	// Nil in unit tests — PreMigrating phase skips loop launch when nil.
 	ReplicationMgr *replication.ReplicationManager
 	// Checkpointer is the CRIU checkpointer used by the replication loop.
@@ -165,7 +197,7 @@ type PodMigrationReconciler struct {
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile implements the PodMigration state machine. It is called by controller-runtime whenever a PodMigration object is created, updated, or re-queued. Each call advances the migration by exactly one phase transition, persists status, and re-queues if further work remains. See CLAUDE.md §PodMigration state machine for the full phase diagram.
+// Reconcile implements the PodMigration state machine. It is called by controller-runtime whenever a PodMigration object is created, updated, or re-queued. Each call advances the migration by exactly one phase transition, persists status, and re-queues if further work remains. See the project conventions doc §PodMigration state machine for the full phase diagram.
 func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -268,10 +300,14 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.reconcileRestoring(deadline, pm)
 	case pmv1.MigrationPhaseVerifying:
 		return r.reconcileVerifying(deadline, pm)
-	case pmv1.MigrationPhaseComplete, pmv1.MigrationPhaseDryRunComplete:
+	case pmv1.MigrationPhaseDryRunComplete:
+		// Dry-run CRs never install any of the ADR-0244 reclaim objects — nothing to sweep.
 		return ctrl.Result{}, nil
-	case pmv1.MigrationPhaseFailed:
-		return ctrl.Result{}, nil
+	case pmv1.MigrationPhaseComplete, pmv1.MigrationPhaseFailed:
+		// ADR-0244 / NR-BLOCK-2: the terminal-outcome branch is no longer a dead end. Run the
+		// periodic pod-IP GC sweep until ReclaimEligible(pm) holds, then tear down and verify
+		// once, idempotently (crash-safe: independent per-side conditions resume correctly).
+		return r.reconcileIPReclaimSweep(ctx, pm)
 	case pmv1.MigrationPhaseRollingBack:
 		return r.reconcileRollingBack(deadline, pm)
 	default:
@@ -1660,11 +1696,11 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 		}
 	}
 
-	// Agent 11 (replication), Agent 3 (storage), and Agent 2 (network) drive pre-migration
+	// the replication reviewer, the storage reviewer, and the network reviewer drive pre-migration
 	// work asynchronously.  All three keystone conditions must be True before advancing:
-	//   MemorySynced=True           (Agent 11 replication loop)
-	//   StorageReadyForFreeze=True  (Agent 3 storage pre-stage, ADR-0011)
-	//   NetworkBridgeArmed=True     (Agent 2 eBPF bridge OR v0.1 fast-path, ADR-0028)
+	//   MemorySynced=True           (a reviewer replication loop)
+	//   StorageReadyForFreeze=True  (a reviewer storage pre-stage, ADR-0011)
+	//   NetworkBridgeArmed=True     (a reviewer eBPF bridge OR v0.1 fast-path, ADR-0028)
 	//
 	// When all three are True, advance to Checkpointing (the freeze).
 	memorySynced := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionMemorySynced)
@@ -1858,10 +1894,21 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Check for a prior CheckpointFailed signal before issuing a fresh call.
+	// Check for a prior terminal checkpoint-failure signal before issuing a fresh call.
+	// Backstop allow-list (bug fix, HIGH panel review of ADR-0246): ShmemPagemapMissing is a
+	// deterministic CRIU-version defect exactly like CheckpointFailed — it must route to
+	// rollback here too if it is ever observed stale on re-entry (e.g. after a controller
+	// restart between the condition write and the direct initiateRollback call below), rather
+	// than falling through to re-issue an identical, deterministically-failing Checkpoint RPC
+	// (unbounded retry storm). The primary path calls initiateRollback directly at the point
+	// ShmemPagemapMissing is first set (see below); this is defense in depth for the stale-read
+	// case only.
 	condFailed := meta.FindStatusCondition(pm.Status.Conditions, conditionCheckpointed)
-	if condFailed != nil && condFailed.Status == metav1.ConditionFalse && condFailed.Reason == "CheckpointFailed" {
-		return r.initiateRollback(ctx, pm, condFailed.Message)
+	if condFailed != nil && condFailed.Status == metav1.ConditionFalse {
+		switch condFailed.Reason {
+		case "CheckpointFailed", "ShmemPagemapMissing":
+			return r.initiateRollback(ctx, pm, condFailed.Message)
+		}
 	}
 
 	// Defence-in-depth (ADR-0031): the webhook should have blocked PostCopy when
@@ -1999,6 +2046,40 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 				r.AgentPool.InvalidateNode(sourceNode)
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			case codes.FailedPrecondition:
+				// ADR-0246 typed-status redesign: the agent
+				// attaches an errdetails.ErrorInfo{Reason: "SHMEM_PAGEMAP_MISSING"} status-details
+				// payload (internal/agent/server/shmem_pagemap_guard.go,
+				// newShmemPagemapMissingStatus) when the checkpoint-completeness guard fires.
+				// codes.FailedPrecondition alone is ambiguous — ErrCRIUCapability uses the same
+				// code — so the Reason on the details payload is the second axis that
+				// distinguishes the two, replacing the former error-string substring match. This
+				// is now the ONE code path that detects and routes this failure (previously
+				// three: this detect-and-route call, the stale-condition backstop switch below,
+				// and general condFailed handling all separately tried to reach RollingBack for
+				// the same logical failure).
+				if shmemPagemapMissingReasonFromStatus(grpcStatus) {
+					log.Error(err, "Checkpoint RPC failed: CRIU 4.2 anon-shmem dump defect (ADR-0246)", "migration", pm.Name)
+					setCondition(pm, conditionCheckpointed, metav1.ConditionFalse, "ShmemPagemapMissing", errStr)
+					if r.Recorder != nil {
+						r.Recorder.Eventf(pm, corev1.EventTypeWarning, "ShmemPagemapMissing",
+							"checkpoint completeness guard (ADR-0246) detected the CRIU 4.2 anon-shmem "+
+								"dump defect for migration %s — checkpoint is not restorable, routing to "+
+								"rollback: %s", pm.Name, errStr)
+					}
+					pmmetrics.ShmemPagemapGuardFiredTotal.WithLabelValues(pm.Name, pm.Namespace).Inc()
+					// Bug fix (HIGH panel, Scheduling Architect + Network Architect), preserved
+					// under the typed-status redesign: route directly to rollback here instead of
+					// only setting the condition and returning. This is a deterministic
+					// CRIU-version property, not a transient failure — falling through and
+					// letting the next reconcile tick re-issue Checkpoint would retry-storm
+					// identically forever. Calling initiateRollback directly also transitions to
+					// RollingBack, whose entry point (reconcileRollingBack) calls
+					// disarmZeroWindowOnFailurePath (ADR-0157 D2) immediately — releasing the
+					// zero-window hold on live TCP traffic on this same reconcile chain rather
+					// than leaving the source pod held until the ADR-0157 D3 watchdog backstop
+					// times out.
+					return r.initiateRollback(ctx, pm, errStr)
+				}
 				// Agent returned codes.FailedPrecondition for ErrCRIUCapability (missing
 				// CAP_SYS_PTRACE or blocking seccomp). Hard failure — do not retry.
 				// (M19.5 criterion 13: use grpcStatus.Code() not string matching.)
@@ -2852,6 +2933,400 @@ func (r *PodMigrationReconciler) disarmTCRedirect(ctx context.Context, pm *pmv1.
 	return err
 }
 
+// teardownSourceRedirect calls TeardownSourceRedirect on the SOURCE agent (ADR-0244 /
+// NR-BLOCK-2) to remove the ADR-0136 flannel.1 redirect and ADR-0141 source NOTRACK rules
+// for the relocated OLD pod IP. Idempotent / best-effort, symmetric to disarmTCRedirect.
+func (r *PodMigrationReconciler) teardownSourceRedirect(ctx context.Context, pm *pmv1.PodMigration) error {
+	if r.AgentPool == nil {
+		return nil
+	}
+	srcNode := pm.Status.SourceNodeName
+	if srcNode == "" {
+		return nil
+	}
+	srcAgent, err := r.AgentPool.ForNode(ctx, srcNode)
+	if err != nil {
+		return err
+	}
+	dstNodeIP := ""
+	destNode := pm.Status.DestinationNodeName
+	if destNode == "" {
+		destNode = pm.Spec.TargetNodeName
+	}
+	if destNode != "" {
+		if ip, ipErr := r.nodeInternalIP(ctx, destNode); ipErr == nil {
+			dstNodeIP = ip
+		}
+	}
+	_, err = srcAgent.TeardownSourceRedirect(ctx, &agentpb.TeardownSourceRedirectRequest{
+		MigrationName: pm.Name,
+		OldPodIp:      pm.Spec.SourcePodIP,
+		FdbIfname:     pm.Status.OverlayFdbIfname,
+		ReplVethMac:   pm.Status.ReplVethMAC,
+		DstNodeIp:     dstNodeIP,
+	})
+	return err
+}
+
+// noSiblingMigration implements ADR-0244 §3's NoSiblingMigration guard — the controller-side
+// dual of pm-cni's isMigrationActive predicate (cmd/pm-cni/main.go), evaluated directly
+// against the API server instead of shelling out. It lists PodMigration objects in the same
+// namespace matching this pm's SourcePodUID or PodName (excluding pm itself) and returns true
+// only if none of them are in a non-terminal phase. Fires the query on every sweep tick —
+// never cached — so it cannot go stale across the sweep interval (ADR-0244 R5).
+func (r *PodMigrationReconciler) noSiblingMigration(ctx context.Context, pm *pmv1.PodMigration) (bool, error) {
+	list := &pmv1.PodMigrationList{}
+	if err := r.List(ctx, list, client.InNamespace(pm.Namespace)); err != nil {
+		return false, err
+	}
+	for i := range list.Items {
+		sib := &list.Items[i]
+		if sib.Name == pm.Name {
+			continue
+		}
+		sameUID := pm.Spec.SourcePodUID != "" && sib.Spec.SourcePodUID == pm.Spec.SourcePodUID
+		sameName := sib.Spec.PodName == pm.Spec.PodName
+		if !sameUID && !sameName {
+			continue
+		}
+		if !isTerminalMigrationPhase(sib.Status.Phase) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// isTerminalMigrationPhase reports whether phase is a terminal outcome for the purposes of
+// the ADR-0244 sibling-migration guard (Complete, Failed, DryRunComplete). RollingBack is
+// NOT terminal here — it still transitions to Failed via reconcileRollingBack/failMigration
+// and may still be actively re-arming the very objects a sibling's reclaim would tear down.
+func isTerminalMigrationPhase(phase pmv1.MigrationPhase) bool {
+	switch phase {
+	case pmv1.MigrationPhaseComplete, pmv1.MigrationPhaseFailed, pmv1.MigrationPhaseDryRunComplete:
+		return true
+	default:
+		return false
+	}
+}
+
+// noLiveConntrackForIP implements ADR-0244 §4's NoLiveConntrackForIP conjunct — asks BOTH the
+// source and destination agents (already reachable via r.AgentPool) whether their local
+// conntrack table has any entry for the relocated OLD IP, via the ProbeConntrackForIP RPC
+// (which repurposes network.ExportConntrack). A non-empty result on EITHER side, or an RPC
+// error on either side, is treated as "cannot prove no client can still reach it" and defers
+// the entire sweep pass rather than force-closing a flow.
+//
+// NOTE (ADR-0244 C1 correction, Sprint 40): this conjunct is structurally blind to the
+// NOTRACK'd OLD-IP flow class it was originally cited to cover in full — the tc mirred
+// redirect + raw-table NOTRACK installed by InjectIPHandoff/InjectSourceRedirect make that
+// forward leg conntrack-invisible by construction, so a live pinned/source-CIDR connection
+// carried over it never appears here. It is retained because it still covers non-NOTRACK'd
+// flows; noLiveDestSocketForIP (R7, below) is the conjunct that covers the NOTRACK'd class.
+func (r *PodMigrationReconciler) noLiveConntrackForIP(ctx context.Context, pm *pmv1.PodMigration) (bool, error) {
+	if r.AgentPool == nil || pm.Spec.SourcePodIP == "" {
+		return false, fmt.Errorf("noLiveConntrackForIP: AgentPool nil or SourcePodIP empty")
+	}
+	nodes := map[string]string{}
+	if pm.Status.SourceNodeName != "" {
+		nodes["source"] = pm.Status.SourceNodeName
+	}
+	destNode := pm.Status.DestinationNodeName
+	if destNode == "" {
+		destNode = pm.Spec.TargetNodeName
+	}
+	if destNode != "" {
+		nodes["destination"] = destNode
+	}
+	if len(nodes) == 0 {
+		return false, fmt.Errorf("noLiveConntrackForIP: no source or destination node known")
+	}
+	for role, node := range nodes {
+		agent, err := r.AgentPool.ForNode(ctx, node)
+		if err != nil {
+			return false, fmt.Errorf("noLiveConntrackForIP: %s agent (%s): %w", role, node, err)
+		}
+		resp, err := agent.ProbeConntrackForIP(ctx, &agentpb.ProbeConntrackForIPRequest{
+			MigrationName: pm.Name,
+			OldPodIp:      pm.Spec.SourcePodIP,
+		})
+		if err != nil {
+			return false, fmt.Errorf("noLiveConntrackForIP: %s agent (%s) probe: %w", role, node, err)
+		}
+		if resp.Present {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// noLiveDestSocketForIP implements ADR-0244 R7 (C1 correction, Sprint 40): asks the
+// DESTINATION agent whether the restored pod's netns has an ESTABLISHED TCP socket bound to
+// the relocated OLD IP, via the ProbeDestSocketForIP RPC (network.SocketInventory reading
+// /proc/<restoredPID>/net/tcp[6] directly inside that netns). This is the conjunct that
+// observes the NOTRACK'd flow class R6/noLiveConntrackForIP cannot: NOTRACK suppresses the
+// raw table's conntrack hook on the host forwarding path, but it does not remove or hide the
+// application-level socket bound in the destination pod's own netns, so a live pinned or
+// source-CIDR connection carried over the tc-redirect + NOTRACK path is still directly
+// observable here. An RPC error, or Present=true, is treated as "cannot prove no client can
+// still reach it" and defers the entire sweep pass — same disposition as R6.
+func (r *PodMigrationReconciler) noLiveDestSocketForIP(ctx context.Context, pm *pmv1.PodMigration) (bool, error) {
+	if r.AgentPool == nil || pm.Spec.SourcePodIP == "" {
+		return false, fmt.Errorf("noLiveDestSocketForIP: AgentPool nil or SourcePodIP empty")
+	}
+	destNode := pm.Status.DestinationNodeName
+	if destNode == "" {
+		destNode = pm.Spec.TargetNodeName
+	}
+	if destNode == "" {
+		return false, fmt.Errorf("noLiveDestSocketForIP: no destination node known")
+	}
+	agent, err := r.AgentPool.ForNode(ctx, destNode)
+	if err != nil {
+		return false, fmt.Errorf("noLiveDestSocketForIP: destination agent (%s): %w", destNode, err)
+	}
+	resp, err := agent.ProbeDestSocketForIP(ctx, &agentpb.ProbeDestSocketForIPRequest{
+		MigrationName: pm.Name,
+		OldPodIp:      pm.Spec.SourcePodIP,
+	})
+	if err != nil {
+		return false, fmt.Errorf("noLiveDestSocketForIP: destination agent (%s) probe: %w", destNode, err)
+	}
+	return !resp.Present, nil
+}
+
+// ipReclaimEligible evaluates the ADR-0244 seven-conjunct IP-Reclaim-Eligible predicate (R1-R5
+// unchanged; R6 retained scope-limited to non-NOTRACK'd flows; R7 added per the C1 correction
+// to cover the NOTRACK'd flow class R6 cannot see). All seven must hold before any teardown RPC
+// fires; any one false defers the sweep (no partial teardown on a stale read). Returns
+// (eligible, humanReason, error). An error means the predicate could not be evaluated this pass
+// (treated the same as not-yet-eligible by the caller — retry next tick).
+func (r *PodMigrationReconciler) ipReclaimEligible(ctx context.Context, pm *pmv1.PodMigration) (bool, string, error) {
+	// R1: CR reached a terminal outcome. Guaranteed by the caller (only invoked from the
+	// Complete/Failed reconcile branch), restated here for self-documentation.
+	if pm.Status.Phase != pmv1.MigrationPhaseComplete && pm.Status.Phase != pmv1.MigrationPhaseFailed {
+		return false, "R1: not terminal", nil
+	}
+	// R2: TCPPreservationMode != None AND OverlayHandoff actually ran. TCPPreservationMode=None
+	// CRs never install any of the five reclaim objects (server.go InjectIPHandoff early-return),
+	// so IPHandoffInjected never gets set True for them — this conjunct is naturally satisfied
+	// by checking that condition rather than adding a redundant mode check.
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
+		return false, "R2: OverlayHandoff did not run (no reclaim objects installed)", nil
+	}
+	// R3: quarantine floor.
+	if pm.Status.CompletionTime == nil {
+		return false, "R3: CompletionTime not set", nil
+	}
+	if time.Since(pm.Status.CompletionTime.Time) < reclaimQuarantineSeconds {
+		return false, "R3: quarantine floor not yet elapsed", nil
+	}
+	// R4: EndpointSlice-routed staleness (retained as ONE conjunct, never sole authority).
+	if pm.Spec.SourcePodIP != "" {
+		esMgr := traffic.NewEndpointSliceManager(r.Client)
+		still, err := esMgr.HasEndpointForIP(ctx, pm.Spec.PodNamespace, pm.Spec.SourcePodIP)
+		if err != nil {
+			return false, "R4: EndpointSlice check failed", err
+		}
+		if still {
+			return false, "R4: OLD IP still present in an EndpointSlice", nil
+		}
+	}
+	// R5: no sibling migration for the same pod is non-terminal.
+	sibOK, err := r.noSiblingMigration(ctx, pm)
+	if err != nil {
+		return false, "R5: sibling-migration query failed", err
+	}
+	if !sibOK {
+		return false, "R5: a sibling migration for this pod is still non-terminal", nil
+	}
+	// R6: no live conntrack for the OLD IP on either node — the actual "no client can still
+	// reach it" proof for the source-CIDR/pinned-connection class R4 cannot see.
+	ctOK, err := r.noLiveConntrackForIP(ctx, pm)
+	if err != nil {
+		return false, "R6: conntrack probe failed", err
+	}
+	if !ctOK {
+		return false, "R6: live conntrack entry still present for the OLD IP", nil
+	}
+	// R7: no live ESTABLISHED socket in the destination pod's netns for the OLD IP — the
+	// conjunct that observes the NOTRACK'd flow class R6 cannot (ADR-0244 C1 correction).
+	sockOK, err := r.noLiveDestSocketForIP(ctx, pm)
+	if err != nil {
+		return false, "R7: destination socket-table probe failed", err
+	}
+	if !sockOK {
+		return false, "R7: live ESTABLISHED socket still present for the OLD IP in the destination pod's netns", nil
+	}
+	return true, "", nil
+}
+
+// reconcileIPReclaimSweep is the ADR-0244 / NR-BLOCK-2 trigger event: a periodic pod-IP GC
+// sweep run from the terminal MigrationPhaseComplete/MigrationPhaseFailed reconcile branch,
+// which previously returned ctrl.Result{}, nil unconditionally (a dead end — no requeue, no
+// further reconciliation ever happened for a completed CR). While ReclaimEligible(pm) is not
+// yet true, this returns a bounded requeue instead. Once true, it runs both teardown RPCs
+// once (guarded by independent per-side idempotency conditions, so a crash mid-sweep resumes
+// correctly on the next reconcile rather than looping or skipping), then verifies via
+// VerifyCleanup(IP_RECLAIM, ...) with the same bounded-retry/fail-open posture as ADR-0241.
+func (r *PodMigrationReconciler) reconcileIPReclaimSweep(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	// Already fully reclaimed and verified (or verification exhausted its budget, which is
+	// itself a terminal fail-open outcome) — nothing left to do. No separate sweep controller
+	// is needed; this is the same reconcile loop, just no longer terminating unconditionally.
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionIPReclaimComplete) &&
+		meta.FindStatusCondition(pm.Status.Conditions, pmv1.ConditionIPReclaimVerified) != nil {
+		return ctrl.Result{}, nil
+	}
+
+	// ADR-0244 R2 short-circuit: a terminal CR (Complete/Failed) can never transition again, so
+	// if OverlayHandoff never ran (no reclaim objects were ever installed — e.g. this CR rolled
+	// back or failed before reaching OverlayHandoff, or TCPPreservationMode=None), R2 can never
+	// become true on a future pass either. Without this, reconcileIPReclaimSweep requeues such a
+	// CR every reclaimSweepInterval forever, logging "IP reclaim not yet eligible" indefinitely
+	// against a CR that will never need reclaim (same "nothing to sweep" posture already applied
+	// to MigrationPhaseDryRunComplete above). Treat it as already-reclaimed/verified and stop.
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
+		setCondition(pm, pmv1.ConditionIPReclaimComplete, metav1.ConditionTrue, "NothingToReclaim",
+			"OverlayHandoff never ran for this migration — no reclaim objects were installed (ADR-0244 R2)")
+		setCondition(pm, pmv1.ConditionIPReclaimVerified, metav1.ConditionTrue, "NothingToReclaim",
+			"OverlayHandoff never ran for this migration — no reclaim objects were installed (ADR-0244 R2)")
+		return ctrl.Result{}, r.statusUpdate(ctx, pm)
+	}
+
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionIPReclaimComplete) {
+		eligible, reason, err := r.ipReclaimEligible(ctx, pm)
+		if err != nil {
+			log.Error(err, "ADR-0244: ReclaimEligible evaluation failed — retrying next sweep tick",
+				"migration", pm.Name, "reason", reason)
+			return ctrl.Result{RequeueAfter: reclaimSweepInterval}, nil
+		}
+		if !eligible {
+			log.Info("ADR-0244: IP reclaim not yet eligible — requeuing", "migration", pm.Name, "reason", reason)
+			return ctrl.Result{RequeueAfter: reclaimSweepInterval}, nil
+		}
+
+		// Dest-side teardown (GC-4 — wires the existing dead code).
+		if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionIPReclaimDestTornDown) {
+			if err := r.disarmTCRedirect(ctx, pm); err != nil {
+				log.Error(err, "ADR-0244: dest-side IP reclaim teardown (disarmTCRedirect) failed — retrying next sweep tick", "migration", pm.Name)
+				return ctrl.Result{RequeueAfter: reclaimSweepInterval}, nil
+			}
+			setCondition(pm, pmv1.ConditionIPReclaimDestTornDown, metav1.ConditionTrue, "TornDown",
+				"destination tc-ingress redirect, FORWARD ACCEPT, and NOTRACK removed (ADR-0244)")
+			if err := r.statusUpdate(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
+		// Source-side teardown (GC-5 — net new).
+		if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionIPReclaimSourceTornDown) {
+			if err := r.teardownSourceRedirect(ctx, pm); err != nil {
+				log.Error(err, "ADR-0244: source-side IP reclaim teardown (TeardownSourceRedirect) failed — retrying next sweep tick", "migration", pm.Name)
+				return ctrl.Result{RequeueAfter: reclaimSweepInterval}, nil
+			}
+			setCondition(pm, pmv1.ConditionIPReclaimSourceTornDown, metav1.ConditionTrue, "TornDown",
+				"source flannel.1 redirect and NOTRACK removed (ADR-0244)")
+			if err := r.statusUpdate(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
+		setCondition(pm, pmv1.ConditionIPReclaimComplete, metav1.ConditionTrue, "Reclaimed",
+			"both destination and source IP-reclaim teardown RPCs succeeded (ADR-0244)")
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// VerifyCleanup(IP_RECLAIM, ...) (GC-6): bounded-retry-then-fail-open, same shape as
+	// ADR-0241 item 1's VerifyCleanup(CUTOVER_COMPLETE).
+	if r.AgentPool == nil || pm.Spec.SourcePodIP == "" {
+		return ctrl.Result{}, nil
+	}
+	srcNode := pm.Status.SourceNodeName
+	if srcNode == "" {
+		log.Error(nil, "ADR-0244: SourceNodeName not set — skipping VerifyCleanup(IP_RECLAIM) this pass", "migration", pm.Name)
+		return ctrl.Result{}, nil
+	}
+	srcAgent, agErr := r.AgentPool.ForNode(ctx, srcNode)
+	if agErr != nil {
+		log.Error(agErr, "ADR-0244: cannot connect to source agent for VerifyCleanup(IP_RECLAIM) (will retry next pass)", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: reclaimSweepInterval}, nil
+	}
+	vcResp, vcErr := srcAgent.VerifyCleanup(ctx, &agentpb.VerifyCleanupRequest{
+		MigrationName: pm.Name,
+		Scope:         agentpb.CleanupScope_IP_RECLAIM,
+		OldPodIp:      pm.Spec.SourcePodIP,
+		FdbIfname:     pm.Status.OverlayFdbIfname,
+		ReplVethMac:   pm.Status.ReplVethMAC,
+		Objects: []string{
+			"tc_filter", "tc_qdisc", "dest_forward_accept", "dest_notrack",
+			"source_notrack", "flannel1_route", "flannel1_neigh", "flannel1_fdb",
+		},
+	})
+	switch {
+	case vcErr != nil:
+		log.Error(vcErr, "ADR-0244: VerifyCleanup(IP_RECLAIM) RPC failed (will retry next pass)", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: reclaimSweepInterval}, nil
+	case vcResp.Clean:
+		setCondition(pm, pmv1.ConditionIPReclaimVerified, metav1.ConditionTrue, "Verified",
+			"all IP-reclaim datapath objects confirmed absent (ADR-0244)")
+		if pm.Annotations != nil {
+			delete(pm.Annotations, ipReclaimVerifyAttemptsAnnotation)
+		}
+		return ctrl.Result{}, r.statusUpdate(ctx, pm)
+	default:
+		attempts := readIPReclaimVerifyAttempts(pm)
+		if attempts < len(ipReclaimVerifyBackoff) {
+			backoff := ipReclaimVerifyBackoff[attempts]
+			if pm.Annotations == nil {
+				pm.Annotations = make(map[string]string)
+			}
+			pm.Annotations[ipReclaimVerifyAttemptsAnnotation] = strconv.Itoa(attempts + 1)
+			if err := r.Update(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+			log.Info("ADR-0244: IP-reclaim cleanup not yet verified — retrying with backoff",
+				"migration", pm.Name, "attempt", attempts+1, "backoff", backoff, "presentObjects", vcResp.PresentObjects)
+			return ctrl.Result{RequeueAfter: backoff}, nil
+		}
+		// Retry budget exhausted: fail open (same proportionality argument as ADR-0241 item 1).
+		setCondition(pm, pmv1.ConditionIPReclaimVerified, metav1.ConditionFalse, "CleanupLeakExhausted",
+			fmt.Sprintf("IP-reclaim cleanup not confirmed after %d retries: objects still present: %v (ADR-0244, fail-open)",
+				len(ipReclaimVerifyBackoff), vcResp.PresentObjects))
+		for _, obj := range vcResp.PresentObjects {
+			pmmetrics.DatapathCleanupLeakTotal.WithLabelValues(pm.Name, pm.Namespace, obj).Inc()
+		}
+		if r.Recorder != nil {
+			r.Recorder.Eventf(pm, corev1.EventTypeWarning, "DatapathCleanupLeak",
+				"IP-reclaim cleanup verification exhausted its retry budget for migration %s; objects still present: %v (ADR-0244)",
+				pm.Name, vcResp.PresentObjects)
+		}
+		if pm.Annotations != nil {
+			delete(pm.Annotations, ipReclaimVerifyAttemptsAnnotation)
+		}
+		return ctrl.Result{}, r.statusUpdate(ctx, pm)
+	}
+}
+
+// readIPReclaimVerifyAttempts reads the current VerifyCleanup(IP_RECLAIM) retry attempt
+// count from the ADR-0244 annotation, mirroring readCni0CleanupVerifyAttempts.
+func readIPReclaimVerifyAttempts(pm *pmv1.PodMigration) int {
+	if pm.Annotations == nil {
+		return 0
+	}
+	v, ok := pm.Annotations[ipReclaimVerifyAttemptsAnnotation]
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 // injectIPHandoff calls InjectIPHandoff on the DESTINATION agent (ADR-0133 D1/D2) to make
 // the OLD pod IP reachable at the replacement pod, then gates on the in-node reachability
 // probe (D5). On success it sets conditionIPHandoffInjected=True (and TrafficVerified=True
@@ -3098,6 +3573,21 @@ func (r *PodMigrationReconciler) verifyDataplaneReachability(ctx context.Context
 		Nonce:         nonce,
 		TtlS:          15,
 	})
+	if echoResp != nil && echoResp.ProcessDied {
+		// ADR-0228 Invariant 3: the agent-side fail-fast pre-check found RestoredPID already
+		// dead. This is a legitimate post-recording failure (the restored application crashed
+		// after handoff), not the opaque multi-minute reachability timeout Arch-A identified —
+		// surface it as a specific, correctly-attributed condition/reason instead of requeuing
+		// into a probe that can never succeed.
+		log.Error(nil, "ADR-0228: RestoredProcessDied — destination agent's fail-fast pre-check found RestoredPID dead before starting the reachability echo",
+			"migration", pm.Name, "destNode", destNode, "detail", echoResp.Detail)
+		setCondition(pm, conditionDataplaneReachabilityVerified, metav1.ConditionFalse, "RestoredProcessDied",
+			fmt.Sprintf("ADR-0228: restored process died after RestoredPID was recorded (agent detail: %s)", echoResp.Detail))
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr, false
+		}
+		return ctrl.Result{}, nil, false
+	}
 	if echoErr != nil || echoResp == nil || !echoResp.Started {
 		detail := ""
 		if echoResp != nil {
@@ -3152,7 +3642,7 @@ func (r *PodMigrationReconciler) verifyDataplaneReachability(ctx context.Context
 func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// Agent 12 (traffic) drives readiness + traffic verification. Watches TrafficVerified.
+	// the traffic reviewer drives readiness + traffic verification. Watches TrafficVerified.
 	// ADR-0019: if verification fails AFTER handoff, warn only — do not rollback.
 	trafficVerified := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionTrafficVerified)
 	if !trafficVerified {
@@ -3771,22 +4261,87 @@ func (r *PodMigrationReconciler) isFrozenWithoutRestore(pm *pmv1.PodMigration) b
 }
 
 func (r *PodMigrationReconciler) handleDeletion(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
-	if controllerutil.ContainsFinalizer(pm, finalizerName) {
-		// Clean up checkpoint artifact if it exists.
-		if pm.Status.CheckpointRef != nil {
-			mcp := &pmv1.MigrationCheckpoint{}
-			err := r.Get(ctx, types.NamespacedName{
-				Namespace: pm.Namespace,
-				Name:      pm.Status.CheckpointRef.Name,
-			}, mcp)
-			if err == nil {
-				_ = r.Delete(ctx, mcp)
-			}
-		}
-		controllerutil.RemoveFinalizer(pm, finalizerName)
-		return ctrl.Result{}, r.Update(ctx, pm)
+	log := logf.FromContext(ctx)
+
+	if !controllerutil.ContainsFinalizer(pm, finalizerName) {
+		return ctrl.Result{}, nil
 	}
-	return ctrl.Result{}, nil
+
+	// ADR-0244 finalizer-race guard (NR-BLOCK-2). A terminal TCP-preserving migration installs
+	// five IP-reclaim datapath objects (dest tc filter/qdisc + FORWARD ACCEPT + NOTRACK, and
+	// source flannel.1 /32 route + AF_INET neigh + AF_BRIDGE FDB + NOTRACK). These are torn down
+	// ONLY by the periodic reclaim sweep (reconcileIPReclaimSweep), which runs from the terminal
+	// phase branch of Reconcile — a branch that stops firing the moment the CR enters deletion
+	// (Reconcile then routes here, not to the phase switch). If we remove the finalizer and let
+	// the CR be garbage-collected before that sweep has set ConditionIPReclaimComplete, the sweep
+	// never runs again and every reclaim object is permanently stranded: it fails safe (no live
+	// connection is blackholed) but silently defeats NR-BLOCK-2's entire purpose. So gate the
+	// finalizer removal on reclaim completion, driving the sweep forward in-line, with a bounded
+	// timeout + force-path fallback that mirrors ADR-0241's bounded-retry-then-fail-open posture
+	// so a genuinely stuck reclaim cannot wedge deletion forever.
+	if r.reclaimObjectsOutstanding(pm) {
+		// Drive the reclaim sweep forward in-line: deletion actively progresses reclaim rather
+		// than passively waiting for a terminal-branch requeue that no longer fires under
+		// deletion. reconcileIPReclaimSweep is idempotent and crash-safe (independent per-side
+		// conditions), so re-invoking it here resumes exactly where the last pass left off.
+		if _, err := r.reconcileIPReclaimSweep(ctx, pm); err != nil {
+			log.Error(err, "ADR-0244: IP-reclaim sweep during deletion failed — retrying", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: reclaimSweepInterval}, nil
+		}
+
+		if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionIPReclaimComplete) {
+			// Bounded timeout. Within the force window, hold the finalizer and requeue so the
+			// sweep gets a fair chance (it cannot even start until the R3 quarantine floor
+			// elapses, then needs teardown + verify to converge).
+			elapsed := time.Since(pm.DeletionTimestamp.Time)
+			if elapsed < reclaimDeletionForceTimeout {
+				log.Info("ADR-0244: IP reclaim not yet complete for a CR under deletion — holding finalizer until reclaim converges or the force window elapses",
+					"migration", pm.Name, "elapsed", elapsed, "forceTimeout", reclaimDeletionForceTimeout)
+				return ctrl.Result{RequeueAfter: reclaimSweepInterval}, nil
+			}
+			// Force path (fail-open). Reclaim did not converge within the bounded window — a
+			// genuinely stuck reclaim (R6/R7 failing closed on a real live connection, or a
+			// persistent teardown bug) must not wedge deletion forever. Release the finalizer,
+			// but make the stranded objects visible exactly as ADR-0241 does on VerifyCleanup
+			// exhaustion: a leak metric increment plus a queryable warning Event.
+			log.Error(nil, "ADR-0244: IP reclaim did not complete within the force-delete window — force-removing finalizer; reclaim datapath objects may be stranded",
+				"migration", pm.Name, "elapsed", elapsed, "forceTimeout", reclaimDeletionForceTimeout)
+			pmmetrics.DatapathCleanupLeakTotal.WithLabelValues(pm.Name, pm.Namespace, "ip_reclaim_forced_delete").Inc()
+			if r.Recorder != nil {
+				r.Recorder.Eventf(pm, corev1.EventTypeWarning, "DatapathCleanupLeak",
+					"PodMigration %s deleted before IP-reclaim completed (held %s past the force-delete window); reclaim datapath objects (dest tc redirect/FORWARD ACCEPT/NOTRACK, source flannel.1 route/neigh/FDB, both-side NOTRACK) may be stranded on the source/destination nodes (ADR-0244, fail-open)",
+					pm.Name, reclaimDeletionForceTimeout)
+			}
+			// fall through to finalizer removal
+		}
+	}
+
+	// Clean up checkpoint artifact if it exists.
+	if pm.Status.CheckpointRef != nil {
+		mcp := &pmv1.MigrationCheckpoint{}
+		err := r.Get(ctx, types.NamespacedName{
+			Namespace: pm.Namespace,
+			Name:      pm.Status.CheckpointRef.Name,
+		}, mcp)
+		if err == nil {
+			_ = r.Delete(ctx, mcp)
+		}
+	}
+	controllerutil.RemoveFinalizer(pm, finalizerName)
+	return ctrl.Result{}, r.Update(ctx, pm)
+}
+
+// reclaimObjectsOutstanding reports whether this PodMigration has ADR-0244 IP-reclaim datapath
+// objects still installed and not yet torn down — i.e. OverlayHandoff ran (conditionIPHandoffInjected
+// is True, the same signal ipReclaimEligible R2 and reconcileIPReclaimSweep use to decide there is
+// anything to reclaim) but the reclaim sweep has not yet set ConditionIPReclaimComplete. Used by
+// handleDeletion to decide whether the finalizer-race guard must engage. TCPPreservationMode=None
+// and pre-handoff CRs never install these objects, so they return false and delete immediately.
+func (r *PodMigrationReconciler) reclaimObjectsOutstanding(pm *pmv1.PodMigration) bool {
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
+		return false
+	}
+	return !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionIPReclaimComplete)
 }
 
 func (r *PodMigrationReconciler) getPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
@@ -3949,6 +4504,37 @@ func truncateConditionMsg(s string, max int) string {
 		return s
 	}
 	return s[:max-3] + "..."
+}
+
+// shmemPagemapMissingReason is the stable, machine-readable errdetails.ErrorInfo.Reason value
+// (ADR-0246 typed-status redesign) set by the agent on the codes.FailedPrecondition status it
+// returns from the Checkpoint RPC when the shmem-pagemap completeness guard fires
+// (internal/agent/server/shmem_pagemap_guard.go: ShmemPagemapMissingReason,
+// newShmemPagemapMissingStatus). Kept as an independent local constant — not imported from
+// internal/agent/server — the same way codes.FailedPrecondition itself is a shared gRPC
+// convention rather than a cross-package Go symbol; a mismatch here would be caught immediately
+// by TestShmemPagemapMissingReason_AgentControllerAgree (shmem_pagemap_guard_test.go), which
+// compares this literal against server.ShmemPagemapMissingReason directly (both packages are
+// visible from a top-level _test.go in a different package via the exported symbol, so this is
+// checked in CI, not left to convention alone).
+const shmemPagemapMissingReason = "SHMEM_PAGEMAP_MISSING"
+
+// shmemPagemapMissingReasonFromStatus reports whether grpcStatus carries an
+// errdetails.ErrorInfo{Reason: shmemPagemapMissingReason} details entry (ADR-0246 typed-status
+// redesign). Used to distinguish the checkpoint-completeness-guard FailedPrecondition from the
+// CRIU-capability/ptrace FailedPrecondition (ErrCRIUCapability) that shares the same gRPC code —
+// replaces the former strings.Contains(errStr, "anon-shmem segment(s) with no pagemap-shmem")
+// prose match.
+func shmemPagemapMissingReasonFromStatus(grpcStatus *status.Status) bool {
+	if grpcStatus == nil {
+		return false
+	}
+	for _, d := range grpcStatus.Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetReason() == shmemPagemapMissingReason {
+			return true
+		}
+	}
+	return false
 }
 
 func setCondition(pm *pmv1.PodMigration, condType string, status metav1.ConditionStatus, reason, message string) {
