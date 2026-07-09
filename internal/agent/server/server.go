@@ -3702,6 +3702,40 @@ func verifyRestoredPIDAlive(pid int, settle time.Duration) error {
 	return nil
 }
 
+// priorRestoredPIDIfAlive implements the ADR-0228 restore-idempotency contract used by the
+// gRPC Restore fallback. CRIU writes the restored root task's PID to
+// <dataDir>/restored.pid as an authoritative side effect of a SUCCEEDING restore
+// (buildCRIURestoreArgs appends --pidfile unconditionally, and dataDir is derived
+// deterministically per migration). When the controller's NRI-confirm timeout re-invokes the
+// gRPC Restore RPC for a migration whose NRI-hook restore already SUCCEEDED, that pidfile is
+// present and its PID is alive.
+//
+// This is the source-of-truth idempotency check: rather than blindly re-running CRIU restore a
+// second time (which, on the cold --join-ns path, would spawn a second CRIU that stays the
+// foreground parent in do_wait forever while the already-restored workload holds the netns —
+// hanging the Restore RPC between the ptrace-window open and its deferred close, a brittle
+// poll-and-hope-on-subprocess-exit failure), we ask the on-disk pidfile whether a prior
+// restore already produced a LIVE workload. Returns (pid, true) only when the pidfile exists,
+// holds a well-formed positive PID, and that PID passes the ADR-0228 liveness gate. Any missing
+// file / unparseable content / dead PID returns (0, false) so the caller proceeds to a real
+// restore. It NEVER re-runs CRIU and NEVER blocks (single-shot reads, no poll loop).
+func priorRestoredPIDIfAlive(dataDir string) (int, bool) {
+	data, err := os.ReadFile(filepath.Join(dataDir, restoredPidfileName))
+	if err != nil {
+		return 0, false
+	}
+	pid, ok := parsePidfileContent(data)
+	if !ok {
+		return 0, false
+	}
+	// Liveness-only (settle=0): identity is guaranteed by CRIU's --pidfile primitive; a live PID
+	// at this deterministic path means a prior restore for THIS migration already succeeded.
+	if err := verifyRestoredPIDAlive(pid, 0); err != nil {
+		return 0, false
+	}
+	return pid, true
+}
+
 // cgroupV2Path returns the unified cgroup v2 path (the "0::<path>" entry) for pid from
 // /proc/<pid>/cgroup. Returns an error if the file cannot be read (e.g. the PID has exited) or
 // has no unified entry.
@@ -5503,6 +5537,59 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		msg := fmt.Sprintf("Restore: Strict migration %s refused: DestNetnsFd empty; DestinationNetnsReady stage did not plumb netns fd — refusing None cold path fallthrough to prevent post-checkpoint brick", req.MigrationName)
 		log.Info(msg, "migration", req.MigrationName)
 		return &agentpb.RestoreResponse{Success: false, ErrorMessage: msg}, nil
+	}
+
+	// ADR-0228 restore idempotency (gRPC-fallback path): the controller re-invokes this gRPC
+	// Restore RPC after its NRI-confirm window times out (reconcileRestoringNRI, controller
+	// "NRI confirm timeout — falling back to agent Restore RPC"). On the live NRI path CRIU
+	// restore already ran and SUCCEEDED in the NRI StartContainer hook, leaving the workload
+	// alive and its PID recorded at the deterministic pidfile path. Blindly re-running CRIU
+	// restore here would spawn a SECOND CRIU that, on the cold --join-ns path, stays the
+	// foreground parent in do_wait forever (rule 6: no --restore-detached) while the
+	// already-restored workload holds the netns — hanging THIS RPC between the ptrace-window
+	// open below and its deferred close (observed live: the seccomp sweeper firing
+	// "deferred close did not fire — likely agent crash inside CRIU window", the CR stuck at
+	// RestoreSocketReattach). Consult the SOURCE OF TRUTH first: if a prior restore already
+	// produced a LIVE workload PID for this migration, confirm-and-advance instead of
+	// re-restoring. This never opens a ptrace window and never blocks on a subprocess.
+	{
+		dataDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/data", req.MigrationName)
+		if priorPID, alive := priorRestoredPIDIfAlive(dataDir); alive {
+			log.Info("Restore: prior restore already produced a live workload PID — confirming idempotently without re-running CRIU (ADR-0228)",
+				"migration", req.MigrationName, "restoredPID", priorPID)
+
+			// Parity with the terminal success path: populate MAC + SingleHomeRestoredPod.
+			netnsPath := s.ResolvedNetnsPath(req.MigrationName)
+			fr, frErr := s.finalizeRestore(ctx, priorPID, netnsPath, req.MigrationName, "", req.TcpPreservationMode)
+			if frErr != nil {
+				log.Error(frErr, "Restore: finalizeRestore failed on idempotent confirm path (Strict/Full fail-closed)", "migration", req.MigrationName)
+				return &agentpb.RestoreResponse{Success: false, ErrorMessage: frErr.Error()}, nil
+			}
+			// Report restore confirmed — this sets status.criuRestoreConfirmed, the exact
+			// signal reconcileRestoringNRI polls for to advance the phase (closes the loop
+			// the double-restore hang left open).
+			if s.k8sClient != nil {
+				ns := s.resolveNamespaceForMigration(ctx, req.MigrationName)
+				if ns != "" {
+					if rcErr := s.ReportRestoreConfirmed(ctx, req.MigrationName, ns, int32(priorPID), fr.mac); rcErr != nil {
+						log.Error(rcErr, "Restore: ReportRestoreConfirmed failed on idempotent confirm path (non-fatal — GC-08 will not pass)", "migration", req.MigrationName, "namespace", ns)
+					}
+				} else {
+					log.Info("Restore: could not resolve namespace for migration — ReportRestoreConfirmed skipped (idempotent confirm path)", "migration", req.MigrationName)
+				}
+			}
+
+			// Map cleanup mirrors the terminal success return.
+			s.destMigrationNetnsMu.Lock()
+			delete(s.destMigrationNetns, req.MigrationName)
+			s.destMigrationNetnsMu.Unlock()
+			s.destWorkloadImageMu.Lock()
+			delete(s.destWorkloadImage, req.MigrationName)
+			s.destWorkloadImageMu.Unlock()
+
+			restoreConfirmed = true
+			return &agentpb.RestoreResponse{Success: true}, nil
+		}
 	}
 
 	// SD-4 (ADR-0039, ADR-0148): open the ptrace window around the CRIU restore. Restore is
