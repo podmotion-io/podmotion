@@ -103,6 +103,17 @@ const reclaimSweepInterval = 30 * time.Second
 // margin over an already-reviewed bound, not an arbitrary constant.
 const reclaimQuarantineSeconds = 150 * time.Second
 
+// reclaimDeletionForceTimeout bounds how long handleDeletion holds a PodMigration's finalizer
+// waiting for the ADR-0244 IP-reclaim sweep to complete before force-removing it (fail-open).
+// It mirrors ADR-0241's bounded-retry-then-fail-open posture: the reclaim sweep MUST get a fair
+// chance to run — it cannot even begin until the R3 quarantine floor (reclaimQuarantineSeconds)
+// elapses, after which it needs a teardown pass plus the VerifyCleanup(IP_RECLAIM) retry budget
+// to converge — but a genuinely stuck reclaim (R6/R7 failing closed on a real live connection,
+// or a persistent teardown bug) must never be able to wedge CR deletion forever. Anchored to the
+// quarantine floor plus a generous margin for teardown + verify to complete, not an arbitrary
+// constant.
+const reclaimDeletionForceTimeout = reclaimQuarantineSeconds + 5*time.Minute
+
 // ipReclaimVerifyBackoff is the ADR-0244 VerifyCleanup(IP_RECLAIM) bounded retry schedule,
 // identical in shape to cni0CleanupVerifyBackoff (ADR-0241 item 1 precedent): 3 attempts,
 // 2s/4s/8s, converging to a fail-open (ConditionIPReclaimVerified=False +
@@ -4250,22 +4261,87 @@ func (r *PodMigrationReconciler) isFrozenWithoutRestore(pm *pmv1.PodMigration) b
 }
 
 func (r *PodMigrationReconciler) handleDeletion(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
-	if controllerutil.ContainsFinalizer(pm, finalizerName) {
-		// Clean up checkpoint artifact if it exists.
-		if pm.Status.CheckpointRef != nil {
-			mcp := &pmv1.MigrationCheckpoint{}
-			err := r.Get(ctx, types.NamespacedName{
-				Namespace: pm.Namespace,
-				Name:      pm.Status.CheckpointRef.Name,
-			}, mcp)
-			if err == nil {
-				_ = r.Delete(ctx, mcp)
-			}
-		}
-		controllerutil.RemoveFinalizer(pm, finalizerName)
-		return ctrl.Result{}, r.Update(ctx, pm)
+	log := logf.FromContext(ctx)
+
+	if !controllerutil.ContainsFinalizer(pm, finalizerName) {
+		return ctrl.Result{}, nil
 	}
-	return ctrl.Result{}, nil
+
+	// ADR-0244 finalizer-race guard (NR-BLOCK-2). A terminal TCP-preserving migration installs
+	// five IP-reclaim datapath objects (dest tc filter/qdisc + FORWARD ACCEPT + NOTRACK, and
+	// source flannel.1 /32 route + AF_INET neigh + AF_BRIDGE FDB + NOTRACK). These are torn down
+	// ONLY by the periodic reclaim sweep (reconcileIPReclaimSweep), which runs from the terminal
+	// phase branch of Reconcile — a branch that stops firing the moment the CR enters deletion
+	// (Reconcile then routes here, not to the phase switch). If we remove the finalizer and let
+	// the CR be garbage-collected before that sweep has set ConditionIPReclaimComplete, the sweep
+	// never runs again and every reclaim object is permanently stranded: it fails safe (no live
+	// connection is blackholed) but silently defeats NR-BLOCK-2's entire purpose. So gate the
+	// finalizer removal on reclaim completion, driving the sweep forward in-line, with a bounded
+	// timeout + force-path fallback that mirrors ADR-0241's bounded-retry-then-fail-open posture
+	// so a genuinely stuck reclaim cannot wedge deletion forever.
+	if r.reclaimObjectsOutstanding(pm) {
+		// Drive the reclaim sweep forward in-line: deletion actively progresses reclaim rather
+		// than passively waiting for a terminal-branch requeue that no longer fires under
+		// deletion. reconcileIPReclaimSweep is idempotent and crash-safe (independent per-side
+		// conditions), so re-invoking it here resumes exactly where the last pass left off.
+		if _, err := r.reconcileIPReclaimSweep(ctx, pm); err != nil {
+			log.Error(err, "ADR-0244: IP-reclaim sweep during deletion failed — retrying", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: reclaimSweepInterval}, nil
+		}
+
+		if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionIPReclaimComplete) {
+			// Bounded timeout. Within the force window, hold the finalizer and requeue so the
+			// sweep gets a fair chance (it cannot even start until the R3 quarantine floor
+			// elapses, then needs teardown + verify to converge).
+			elapsed := time.Since(pm.DeletionTimestamp.Time)
+			if elapsed < reclaimDeletionForceTimeout {
+				log.Info("ADR-0244: IP reclaim not yet complete for a CR under deletion — holding finalizer until reclaim converges or the force window elapses",
+					"migration", pm.Name, "elapsed", elapsed, "forceTimeout", reclaimDeletionForceTimeout)
+				return ctrl.Result{RequeueAfter: reclaimSweepInterval}, nil
+			}
+			// Force path (fail-open). Reclaim did not converge within the bounded window — a
+			// genuinely stuck reclaim (R6/R7 failing closed on a real live connection, or a
+			// persistent teardown bug) must not wedge deletion forever. Release the finalizer,
+			// but make the stranded objects visible exactly as ADR-0241 does on VerifyCleanup
+			// exhaustion: a leak metric increment plus a queryable warning Event.
+			log.Error(nil, "ADR-0244: IP reclaim did not complete within the force-delete window — force-removing finalizer; reclaim datapath objects may be stranded",
+				"migration", pm.Name, "elapsed", elapsed, "forceTimeout", reclaimDeletionForceTimeout)
+			pmmetrics.DatapathCleanupLeakTotal.WithLabelValues(pm.Name, pm.Namespace, "ip_reclaim_forced_delete").Inc()
+			if r.Recorder != nil {
+				r.Recorder.Eventf(pm, corev1.EventTypeWarning, "DatapathCleanupLeak",
+					"PodMigration %s deleted before IP-reclaim completed (held %s past the force-delete window); reclaim datapath objects (dest tc redirect/FORWARD ACCEPT/NOTRACK, source flannel.1 route/neigh/FDB, both-side NOTRACK) may be stranded on the source/destination nodes (ADR-0244, fail-open)",
+					pm.Name, reclaimDeletionForceTimeout)
+			}
+			// fall through to finalizer removal
+		}
+	}
+
+	// Clean up checkpoint artifact if it exists.
+	if pm.Status.CheckpointRef != nil {
+		mcp := &pmv1.MigrationCheckpoint{}
+		err := r.Get(ctx, types.NamespacedName{
+			Namespace: pm.Namespace,
+			Name:      pm.Status.CheckpointRef.Name,
+		}, mcp)
+		if err == nil {
+			_ = r.Delete(ctx, mcp)
+		}
+	}
+	controllerutil.RemoveFinalizer(pm, finalizerName)
+	return ctrl.Result{}, r.Update(ctx, pm)
+}
+
+// reclaimObjectsOutstanding reports whether this PodMigration has ADR-0244 IP-reclaim datapath
+// objects still installed and not yet torn down — i.e. OverlayHandoff ran (conditionIPHandoffInjected
+// is True, the same signal ipReclaimEligible R2 and reconcileIPReclaimSweep use to decide there is
+// anything to reclaim) but the reclaim sweep has not yet set ConditionIPReclaimComplete. Used by
+// handleDeletion to decide whether the finalizer-race guard must engage. TCPPreservationMode=None
+// and pre-handoff CRs never install these objects, so they return false and delete immediately.
+func (r *PodMigrationReconciler) reclaimObjectsOutstanding(pm *pmv1.PodMigration) bool {
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
+		return false
+	}
+	return !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionIPReclaimComplete)
 }
 
 func (r *PodMigrationReconciler) getPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {

@@ -266,9 +266,17 @@ func main() {
 		Estimator: &estimation.DefaultEstimator{
 			Prober: &estimation.StubProber{},
 		},
-		// Pass nil source agent client — in M2/M3 the frozen-source watchdog on the
-		// agent handles thawing. Wire a real Abort-capable client in M4+.
-		Rollbacker: rollback.NewStubRollbacker(nil),
+		// ADR-0248 D2: wire a real source-agent client so a mid-checkpoint abort's
+		// rollback pipeline drives the source-agent Abort RPC directly (reaching
+		// thawFrozenSource) on the live (non-restart) path, instead of relying solely
+		// on an agent restart (ReconcileOrphanedFrozenSources) or a coincidental
+		// independent Abort caller. The adapter resolves the migration's source node
+		// (Status.SourceNodeName) and dispatches Abort via the same AgentPool used for
+		// the destination agent. There is no freeze-deadline watchdog; this is the
+		// controller-driven thaw path.
+		Rollbacker: rollback.NewStubRollbacker(
+			agentclient.NewSourceRollbackClient(agentPool, mgr.GetClient()),
+		),
 		AgentPool:       agentPool,
 		TrafficVerifier: compositeVerifier,
 		ReplicationMgr:  replicationMgr,

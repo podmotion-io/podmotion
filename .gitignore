@@ -91,6 +91,7 @@ docs/adr/0207-grounding-obligation-constitutional.md
 docs/adr/ADR-0226-*.md
 
 # Top-level methodology and strategy docs
+docs/sprint-workflow-skeleton.js
 docs/STRATEGY-REVIEW-*.md
 docs/NORTH_STAR_SPRINT_PLAN.md
 docs/FELN_SPRINT_PLAN.md

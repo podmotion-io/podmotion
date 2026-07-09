@@ -97,8 +97,13 @@ func (s *StubNetworkRollback) Execute(ctx context.Context, pm *pmv1.PodMigration
 type StubComputeRollback struct {
 	// SourceAgentClient is the gRPC client for the source node agent.
 	// When nil (pre-M4 stubs / unit tests), the rollback logs a warning and returns nil
-	// rather than failing — the frozen-source watchdog on the agent will recover after
-	// the freeze-deadline fires.
+	// rather than failing. CORRECTED (ADR-0248): there is NO freeze-deadline watchdog
+	// that thaws the source. With a nil client the live (non-restart) rollback path
+	// CANNOT thaw the frozen source. The only two real thaw triggers are (1) an Abort
+	// RPC reaching thawFrozenSource (internal/agent/server/server.go), and (2) the
+	// source agent process restarting and running ReconcileOrphanedFrozenSources
+	// (cmd/agent/main.go) at startup. Until a real client is wired here, a mid-checkpoint
+	// abort leaves the source frozen until an agent restart happens to occur.
 	SourceAgentClient interface {
 		Abort(ctx context.Context, migrationName, reason string) error
 	}
@@ -108,10 +113,13 @@ func (s *StubComputeRollback) Name() string { return "ComputeRollback" }
 func (s *StubComputeRollback) Execute(ctx context.Context, pm *pmv1.PodMigration) error {
 	log := ctrl.LoggerFrom(ctx)
 	if s.SourceAgentClient == nil {
-		// No agent client wired (M2/M3 stub mode). The source agent's frozen-source
-		// watchdog will SIGCONT the source after the freeze deadline. Log clearly so
-		// operators know the thaw path depends on the watchdog.
-		log.Info("ComputeRollback: source agent client not wired — frozen source will be thawed by agent watchdog",
+		// No agent client wired (M2/M3 stub mode). CORRECTED (ADR-0248): there is no
+		// watchdog that will thaw this source. The live rollback path is a no-op here;
+		// the frozen source PID stays SIGSTOP'd until either an operator/chaos Abort RPC
+		// reaches thawFrozenSource, or the source agent process restarts and
+		// ReconcileOrphanedFrozenSources runs at startup. Log clearly so operators do not
+		// assume automatic recovery is coming.
+		log.Info("ComputeRollback: source agent client not wired — frozen source will NOT be thawed on this path; requires an Abort RPC or a source-agent restart",
 			"migration", pm.Name)
 		return nil
 	}
@@ -136,8 +144,10 @@ func (s *StubStorageRollback) Execute(ctx context.Context, pm *pmv1.PodMigration
 
 // NewStubRollbacker returns a DefaultRollbacker wired with all stub steps.
 // Used in cmd/main.go for M2; swap individual steps for real implementations as agents land.
-// sourceAgentClient may be nil in stub/test mode — the frozen-source watchdog on the agent
-// handles thawing when no client is wired.
+// sourceAgentClient may be nil in stub/test mode. CORRECTED (ADR-0248): passing nil here
+// means the live rollback path CANNOT thaw a frozen source — there is no watchdog. Thaw
+// only happens via an Abort RPC (thawFrozenSource) or a source-agent restart
+// (ReconcileOrphanedFrozenSources). Wire a real Abort-capable client per ADR-0248 D2.
 func NewStubRollbacker(sourceAgentClient interface {
 	Abort(ctx context.Context, migrationName, reason string) error
 }) *DefaultRollbacker {
