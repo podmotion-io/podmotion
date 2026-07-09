@@ -9,6 +9,6 @@ import "os/exec"
 
 // newExecCmd is a thin wrapper around exec.Command, kept in a separate file so
 // tests can swap it out via a package-level variable if needed.
-func newExecCmd(name string, args ...string) *exec.Cmd {
+var newExecCmd = func(name string, args ...string) *exec.Cmd {
 	return exec.Command(name, args...)
 }

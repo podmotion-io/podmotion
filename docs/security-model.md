@@ -181,12 +181,25 @@ See `config/rbac/`.
 
 ## Restore Correctness Limitation
 
-CRIU 4.2 does not reliably serialize anonymous shared-memory (`shmem`) mappings at checkpoint time,
-so **pods whose processes hold anonymous shared-memory mappings cannot currently be restored.** This
-was identified during the restore-path redesign recorded in ADR-0245 and is an upstream CRIU defect,
-not a PodMotion transfer/provenance issue. A failed restore rolls back to the source pod, which is
-preserved intact (ADR-0012). See the "Known Limitations" section of the top-level
+**CRIU 4.2 has a confirmed defect where anonymous shared-memory (shmem) mappings are not correctly
+serialized during checkpoint — any workload using anonymous shmem mappings cannot presently be
+restored.** CRIU 4.2 does not reliably serialize anonymous shared-memory (`shmem`) mappings at
+checkpoint time, so **pods whose processes hold anonymous shared-memory mappings cannot currently be
+restored.** This was identified during the restore-path redesign recorded in ADR-0245 and is an
+upstream CRIU defect, not a PodMotion transfer/provenance issue. A failed restore rolls back to the
+source pod, which is preserved intact (ADR-0012). See the "Known Limitations" section of the top-level
 [README](../README.md) for the operator-facing statement.
+
+**Interim guard is not yet validated against a real CRIU-4.2 image.** ADR-0246 introduces a
+shmem-completeness guard that inspects a checkpoint's images before restore is attempted and refuses
+to proceed if the expected `pagemap-shmem-*.img` is missing, so the defect above is *detected* rather
+than silently producing an incomplete restore. However, PodMotion's shmem-completeness guard
+(ADR-0246) is validated only against a synthetic self-consistency fixture, not yet against a real
+CRIU-4.2-produced image — its only current test (`TestVerifyShmemPagemapCompleteness_Smoke`)
+round-trips a synthetic image through the same encode/decode library on both ends. The raw CRIU-4.2
+dump images that first surfaced this defect (gate2/gate3 evidence, ADR-0245) were zeroized from tmpfs
+per the checkpoint-image handling policy before they could be captured as a durable test fixture, so a
+real-fixture validation pass remains outstanding.
 
 ## Intra-Cluster Scope
 

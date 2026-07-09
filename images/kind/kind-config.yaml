@@ -2,10 +2,10 @@
 # Usage: kind create cluster --name podmotion-sprint31 --config images/kind/kind-config.yaml
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
-name: podmotion-sprint40
+name: podmotion-sprint41
 nodes:
   - role: control-plane
-    image: podmotion-node:sprint40b2-amd64
+    image: podmotion-node:sprint41-amd64
     kubeadmConfigPatches:
       - |
         kind: InitConfiguration
@@ -17,7 +17,7 @@ nodes:
         containerPath: /sys/fs/bpf
         propagation: Bidirectional
   - role: worker
-    image: podmotion-node:sprint40b2-amd64
+    image: podmotion-node:sprint41-amd64
     extraMounts:
       - hostPath: /sys/fs/bpf
         containerPath: /sys/fs/bpf

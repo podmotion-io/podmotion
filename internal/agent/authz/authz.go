@@ -110,6 +110,10 @@ var methodPolicy = map[string]map[Role]bool{
 	agentpb.MigrationAgentService_TeardownSourceRedirect_FullMethodName: {RoleOperator: true},
 	agentpb.MigrationAgentService_ProbeConntrackForIP_FullMethodName:    {RoleOperator: true},
 	agentpb.MigrationAgentService_ProbeDestSocketForIP_FullMethodName:   {RoleOperator: true},
+	// ADR-0284 GC-6: agent-side VerifyCleanup(IP_RECLAIM) presence-probe handler, controller-driven
+	// only. Absent from this map, deny-by-default (§2.2.3) would reject the bounded-retry sweep's
+	// confirmation call even though the handler now exists in verify_cleanup.go.
+	agentpb.MigrationAgentService_VerifyCleanup_FullMethodName: {RoleOperator: true},
 	agentpb.MigrationAgentService_Verify_FullMethodName:                  {RoleOperator: true},
 	agentpb.MigrationAgentService_VerifyTCP_FullMethodName:               {RoleOperator: true},
 	agentpb.MigrationAgentService_PreDumpRound_FullMethodName:            {RoleOperator: true},

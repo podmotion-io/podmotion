@@ -17,6 +17,7 @@ client-side reconnect logic required.
 
 - **Current sprint plan (M22–M30):** [`docs/CURRENT-POSITION.md`](./CURRENT-POSITION.md)
 - **Milestone ledger (M1–M21):** [`docs/MILESTONES.md`](./MILESTONES.md)
-- **Live "where are we right now" state:** [`docs/proof/RESUME-STATE.yaml`](./proof/RESUME-STATE.yaml)
+- **Live "where are we right now" state:** see [`docs/CURRENT-POSITION.md`](./CURRENT-POSITION.md) above — the
+  project's tracked, published state tracker (internal resumption machinery is not published)
 
 This document is not updated milestone-by-milestone; update the files above instead.
