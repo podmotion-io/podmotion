@@ -375,6 +375,18 @@ const (
 	// exhaustion emits DatapathCleanupLeakTotal + a DatapathCleanupLeak Event but never
 	// blocks or reverts reclaim (ADR-0244 / NR-BLOCK-2).
 	ConditionIPReclaimVerified = "IPReclaimVerified"
+	// ConditionReclaimObjectsInstalled is a durable PROVENANCE record: it is set True the moment
+	// the destination-agent InjectIPHandoff RPC confirms the reclaim datapath objects (OLD-IP
+	// NOTRACK, FORWARD ACCEPT, tc-ingress redirect, and — best-effort — the source-side redirect)
+	// were physically installed, and is persisted IMMEDIATELY, BEFORE any cross-node reachability
+	// probe runs. It exists because the reclaim sweep must ALWAYS run VerifyCleanup once objects
+	// exist on the wire — even when cross-node/cross-subnet/cross-AZ old-IP reachability never
+	// converges (a legitimate, permanent outcome on AWS VPC CNI where a pod IP is a subnet/AZ-bound
+	// ENI address). Keying the sweep's "NothingToReclaim" short-circuit off IPHandoffInjected was a
+	// leak: that condition is dropped when injectIPHandoff returns done=false on a reachability
+	// requeue, so real orphaned objects were silently left behind (Sprint 42 FS-048). This
+	// provenance condition is never cleared once set and is the authoritative sweep predicate.
+	ConditionReclaimObjectsInstalled = "ReclaimObjectsInstalled"
 )
 
 // PreCopyStats records metrics from the iterative pre-copy phase.

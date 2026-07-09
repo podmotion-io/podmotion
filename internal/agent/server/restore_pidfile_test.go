@@ -25,6 +25,7 @@ package server
 import (
 	"errors"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -238,5 +239,61 @@ func TestRemoveStalePidfile_FailOpenVsFailClosed(t *testing.T) {
 				t.Fatalf("fail-closed error %v does not wrap the underlying removeFn error %v", err, tc.removeErr)
 			}
 		})
+	}
+}
+
+// --- ADR-0228 restore-idempotency: priorRestoredPIDIfAlive ---
+//
+// These cover the source-of-truth guard the gRPC Restore fallback uses to avoid a
+// double-restore hang: if a prior restore for this migration already produced a LIVE
+// workload PID (recorded at <dataDir>/restored.pid by CRIU --pidfile), the RPC confirms
+// idempotently instead of re-running CRIU (which would spawn a second do_wait-blocked parent).
+
+// TestPriorRestoredPIDIfAlive_LivePID: a pidfile holding a live PID (this test process)
+// returns (pid, true) — the confirm-and-advance path.
+func TestPriorRestoredPIDIfAlive_LivePID(t *testing.T) {
+	dataDir := t.TempDir()
+	live := os.Getpid()
+	if err := os.WriteFile(dataDir+"/"+restoredPidfileName, []byte(strconv.Itoa(live)), 0o600); err != nil {
+		t.Fatalf("write pidfile: %v", err)
+	}
+	pid, ok := priorRestoredPIDIfAlive(dataDir)
+	if !ok {
+		t.Fatalf("priorRestoredPIDIfAlive returned ok=false for a live PID %d", live)
+	}
+	if pid != live {
+		t.Fatalf("priorRestoredPIDIfAlive returned pid=%d, want %d", pid, live)
+	}
+}
+
+// TestPriorRestoredPIDIfAlive_AbsentFile: no pidfile → (0,false), caller proceeds to a real restore.
+func TestPriorRestoredPIDIfAlive_AbsentFile(t *testing.T) {
+	dataDir := t.TempDir() // empty — no restored.pid
+	if pid, ok := priorRestoredPIDIfAlive(dataDir); ok || pid != 0 {
+		t.Fatalf("priorRestoredPIDIfAlive on absent pidfile returned (%d,%v), want (0,false)", pid, ok)
+	}
+}
+
+// TestPriorRestoredPIDIfAlive_DeadPID: a pidfile holding a PID that is not alive → (0,false),
+// caller proceeds to a real restore rather than falsely confirming.
+func TestPriorRestoredPIDIfAlive_DeadPID(t *testing.T) {
+	dataDir := t.TempDir()
+	// PID 2^31-1 is effectively guaranteed not to exist on Linux (pid_max is far lower).
+	if err := os.WriteFile(dataDir+"/"+restoredPidfileName, []byte("2147483646"), 0o600); err != nil {
+		t.Fatalf("write pidfile: %v", err)
+	}
+	if pid, ok := priorRestoredPIDIfAlive(dataDir); ok || pid != 0 {
+		t.Fatalf("priorRestoredPIDIfAlive on dead PID returned (%d,%v), want (0,false)", pid, ok)
+	}
+}
+
+// TestPriorRestoredPIDIfAlive_GarbageContent: unparseable pidfile → (0,false).
+func TestPriorRestoredPIDIfAlive_GarbageContent(t *testing.T) {
+	dataDir := t.TempDir()
+	if err := os.WriteFile(dataDir+"/"+restoredPidfileName, []byte("not-a-pid"), 0o600); err != nil {
+		t.Fatalf("write pidfile: %v", err)
+	}
+	if pid, ok := priorRestoredPIDIfAlive(dataDir); ok || pid != 0 {
+		t.Fatalf("priorRestoredPIDIfAlive on garbage returned (%d,%v), want (0,false)", pid, ok)
 	}
 }

@@ -3106,12 +3106,15 @@ func (r *PodMigrationReconciler) ipReclaimEligible(ctx context.Context, pm *pmv1
 	if pm.Status.Phase != pmv1.MigrationPhaseComplete && pm.Status.Phase != pmv1.MigrationPhaseFailed {
 		return false, "R1: not terminal", nil
 	}
-	// R2: TCPPreservationMode != None AND OverlayHandoff actually ran. TCPPreservationMode=None
-	// CRs never install any of the five reclaim objects (server.go InjectIPHandoff early-return),
-	// so IPHandoffInjected never gets set True for them — this conjunct is naturally satisfied
-	// by checking that condition rather than adding a redundant mode check.
-	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
-		return false, "R2: OverlayHandoff did not run (no reclaim objects installed)", nil
+	// R2: reclaim objects were actually installed. TCPPreservationMode=None CRs never install any
+	// of the reclaim objects (server.go InjectIPHandoff early-return), so this conjunct is
+	// satisfied by checking the installed-provenance condition rather than adding a redundant mode
+	// check. Sprint 42 FS-048 FIX: key off ConditionReclaimObjectsInstalled (durable, set the
+	// moment resp.Injected is confirmed) NOT conditionIPHandoffInjected — the latter is dropped on
+	// a cross-node-reachability requeue, which previously made R2 return not-eligible forever and
+	// left the installed objects orphaned. See reconcileIPReclaimSweep for the full rationale.
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionReclaimObjectsInstalled) {
+		return false, "R2: no reclaim objects were installed (InjectIPHandoff never confirmed resp.Injected)", nil
 	}
 	// R3: quarantine floor.
 	if pm.Status.CompletionTime == nil {
@@ -3180,17 +3183,28 @@ func (r *PodMigrationReconciler) reconcileIPReclaimSweep(ctx context.Context, pm
 	}
 
 	// ADR-0244 R2 short-circuit: a terminal CR (Complete/Failed) can never transition again, so
-	// if OverlayHandoff never ran (no reclaim objects were ever installed — e.g. this CR rolled
-	// back or failed before reaching OverlayHandoff, or TCPPreservationMode=None), R2 can never
+	// if no reclaim objects were EVER physically installed (e.g. this CR rolled back or failed
+	// before InjectIPHandoff confirmed resp.Injected, or TCPPreservationMode=None), R2 can never
 	// become true on a future pass either. Without this, reconcileIPReclaimSweep requeues such a
 	// CR every reclaimSweepInterval forever, logging "IP reclaim not yet eligible" indefinitely
 	// against a CR that will never need reclaim (same "nothing to sweep" posture already applied
 	// to MigrationPhaseDryRunComplete above). Treat it as already-reclaimed/verified and stop.
-	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
+	//
+	// Sprint 42 FS-048 FIX: this predicate now keys off ConditionReclaimObjectsInstalled — the
+	// durable PROVENANCE that objects were physically installed — NOT conditionIPHandoffInjected.
+	// IPHandoffInjected is set in-memory but DROPPED whenever verifyDataplaneReachability returns
+	// done=false (cross-node old-IP unreachable — a legitimate, sometimes-permanent outcome on
+	// this substrate and on cross-subnet/cross-AZ AWS VPC CNI). Keying off it caused the sweep to
+	// read the objects as never-installed and short-circuit to NothingToReclaim, silently
+	// orphaning real dest/source reclaim objects with no DatapathCleanupLeak event or metric — the
+	// exact inverse of the invariant this sweep exists to enforce. ReclaimObjectsInstalled is set
+	// and persisted the moment resp.Injected is confirmed, before any reachability probe, so a
+	// requeue can never drop it. When it IS set, we fall through and ALWAYS run VerifyCleanup.
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionReclaimObjectsInstalled) {
 		setCondition(pm, pmv1.ConditionIPReclaimComplete, metav1.ConditionTrue, "NothingToReclaim",
-			"OverlayHandoff never ran for this migration — no reclaim objects were installed (ADR-0244 R2)")
+			"no reclaim objects were ever installed for this migration — InjectIPHandoff never confirmed resp.Injected (ADR-0244 R2 / Sprint 42 FS-048)")
 		setCondition(pm, pmv1.ConditionIPReclaimVerified, metav1.ConditionTrue, "NothingToReclaim",
-			"OverlayHandoff never ran for this migration — no reclaim objects were installed (ADR-0244 R2)")
+			"no reclaim objects were ever installed for this migration — InjectIPHandoff never confirmed resp.Injected (ADR-0244 R2 / Sprint 42 FS-048)")
 		return ctrl.Result{}, r.statusUpdate(ctx, pm)
 	}
 
@@ -3431,6 +3445,26 @@ func (r *PodMigrationReconciler) injectIPHandoff(ctx context.Context, pm *pmv1.P
 			return ctrl.Result{}, sErr, false
 		}
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
+	}
+
+	// PROVENANCE (Sprint 42 FS-048 fix): the destination-agent InjectIPHandoff RPC has confirmed
+	// resp.Injected — the OLD-IP NOTRACK, FORWARD ACCEPT, and tc-ingress redirect objects are now
+	// physically on the wire on the destination node. Record that fact durably and persist it
+	// IMMEDIATELY, before the cross-node reachability probe runs. verifyDataplaneReachability can
+	// legitimately never converge (cross-node on this substrate; cross-subnet/cross-AZ on AWS VPC
+	// CNI where the OLD IP is a subnet-bound ENI address that does not route to another AZ), and on
+	// that failure injectIPHandoff returns done=false and the caller's statusUpdate is skipped —
+	// which is exactly why IPHandoffInjected got dropped and the reclaim sweep short-circuited to
+	// NothingToReclaim, silently orphaning these objects. ReclaimObjectsInstalled is the sweep's
+	// authoritative predicate: once True, the sweep ALWAYS runs VerifyCleanup regardless of whether
+	// reachability ever verified. It is never cleared.
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
+		setCondition(pm, pmv1.ConditionReclaimObjectsInstalled, metav1.ConditionTrue, "Installed",
+			fmt.Sprintf("reclaim datapath objects installed on destination for OLD pod IP %s (dest NOTRACK/FORWARD ACCEPT/tc redirect); reclaim sweep will run VerifyCleanup regardless of cross-node reachability (Sprint 42 FS-048 / ADR-0244)",
+				pm.Spec.SourcePodIP))
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr, false
+		}
 	}
 
 	// ADR-0192 VERIFY-11: write resolved fdbIf to PodMigration annotation for structured
@@ -4332,13 +4366,19 @@ func (r *PodMigrationReconciler) handleDeletion(ctx context.Context, pm *pmv1.Po
 }
 
 // reclaimObjectsOutstanding reports whether this PodMigration has ADR-0244 IP-reclaim datapath
-// objects still installed and not yet torn down — i.e. OverlayHandoff ran (conditionIPHandoffInjected
-// is True, the same signal ipReclaimEligible R2 and reconcileIPReclaimSweep use to decide there is
-// anything to reclaim) but the reclaim sweep has not yet set ConditionIPReclaimComplete. Used by
-// handleDeletion to decide whether the finalizer-race guard must engage. TCPPreservationMode=None
-// and pre-handoff CRs never install these objects, so they return false and delete immediately.
+// objects still installed and not yet torn down — i.e. the objects were physically installed
+// (ConditionReclaimObjectsInstalled is True, the same durable provenance ipReclaimEligible R2 and
+// reconcileIPReclaimSweep use to decide there is anything to reclaim) but the reclaim sweep has not
+// yet set ConditionIPReclaimComplete. Used by handleDeletion to decide whether the finalizer-race
+// guard must engage. TCPPreservationMode=None and pre-handoff CRs never install these objects, so
+// they return false and delete immediately.
+//
+// Sprint 42 FS-048 FIX: key off ConditionReclaimObjectsInstalled, NOT conditionIPHandoffInjected —
+// the latter is dropped whenever cross-node old-IP reachability never converges, which would make
+// this guard return false and let handleDeletion remove the finalizer and hard-delete with real
+// reclaim objects still on the wire (the same silent-leak class the sweep short-circuit had).
 func (r *PodMigrationReconciler) reclaimObjectsOutstanding(pm *pmv1.PodMigration) bool {
-	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionReclaimObjectsInstalled) {
 		return false
 	}
 	return !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionIPReclaimComplete)
