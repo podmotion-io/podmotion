@@ -124,15 +124,6 @@ func (c *CRIUCheckpointer) PreDump(ctx context.Context, opts PreDumpOptions) (Ch
 	case res := <-done:
 		if res.err != nil {
 			predumpLog, _ := os.ReadFile(filepath.Join(opts.ImagesDir, "predump.log"))
-			// SPRINT41-NR-BLOCK-2: pre-dump also injects a parasite into the still-alive
-			// workload PID; a failed pre-dump can leak the same CRIUMFD mapping as a
-			// failed final Dump. Clean up before surfacing the error (best-effort).
-			logger := logf.FromContext(ctx)
-			if cleaned, cleanupErr := CleanupLeakedParasiteMemfds(opts.Pid); cleanupErr != nil {
-				logger.Error(cleanupErr, "post-failure CRIU parasite memfd cleanup failed (pre-dump)", "pid", opts.Pid)
-			} else if cleaned > 0 {
-				logger.Info("cleaned up leaked CRIU parasite memfd mapping(s) after failed pre-dump", "pid", opts.Pid, "cleanedCount", cleaned)
-			}
 			return CheckpointResult{}, fmt.Errorf("criu pre-dump: %w\nstderr: %s\nlog: %s",
 				res.err, stderr.String(), string(predumpLog))
 		}
@@ -472,17 +463,6 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 			"criuError", dumpErr.Error(),
 			"dumpLog", string(dumpLogBytes),
 		)
-		// SPRINT41-NR-BLOCK-2: on a failed dump, CRIU's parasite-injection cure step is
-		// not guaranteed to run (see docs/sprints/SPRINT41-NR-BLOCK-2-POD-SCOPE-INVESTIGATION.md).
-		// The workload PID stays alive across rollback/retry, so any leaked CRIUMFD parasite
-		// memfd mapping must be cleaned up here or it accumulates one leaked mapping per
-		// failed retry against the same still-alive process. Best-effort: never mask the
-		// real dump error with a cleanup error, just log it.
-		if cleaned, cleanupErr := CleanupLeakedParasiteMemfds(opts.Pid); cleanupErr != nil {
-			logger.Error(cleanupErr, "post-failure CRIU parasite memfd cleanup failed", "pid", opts.Pid)
-		} else if cleaned > 0 {
-			logger.Info("cleaned up leaked CRIU parasite memfd mapping(s) after failed dump", "pid", opts.Pid, "cleanedCount", cleaned)
-		}
 		return CheckpointResult{}, fmt.Errorf("criu.Dump(pid=%d): %w\nstderr: %s\ndump.log: %s", opts.Pid, dumpErr, stderr.String(), string(dumpLogBytes))
 	}
 
@@ -496,13 +476,6 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	// failed (e.g. network-lock or ptrace error) even though go-criu returned nil.
 	if _, statErr := os.Stat(filepath.Join(opts.ImagesDir, "inventory.img")); statErr != nil {
 		dumpLog, _ := os.ReadFile(filepath.Join(opts.ImagesDir, "dump.log"))
-		// Same leaked-parasite risk as the dumpErr!=nil path above: this is still a failed
-		// dump attempt against a still-alive PID (see SPRINT41-NR-BLOCK-2 investigation).
-		if cleaned, cleanupErr := CleanupLeakedParasiteMemfds(opts.Pid); cleanupErr != nil {
-			logger.Error(cleanupErr, "post-failure (silent) CRIU parasite memfd cleanup failed", "pid", opts.Pid)
-		} else if cleaned > 0 {
-			logger.Info("cleaned up leaked CRIU parasite memfd mapping(s) after silently-failed dump", "pid", opts.Pid, "cleanedCount", cleaned)
-		}
 		return CheckpointResult{}, fmt.Errorf("criu dump (pid=%d): inventory.img not written — dump may have failed silently\ndump.log:\n%s", opts.Pid, string(dumpLog))
 	}
 
