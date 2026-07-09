@@ -368,9 +368,9 @@ kind-node-image: kind-image
 kind-create:
 	kind get clusters | grep -q $(KIND_CLUSTER) || \
 	  kind create cluster --name $(KIND_CLUSTER) --config images/kind/kind-config.yaml
-	@echo "Waiting for nodes to be ready before installing Flannel..."
+	@echo "Applying Flannel CNI from vendored manifest, then waiting for nodes to be ready..."
+	KUBECONFIG=/tmp/$(KIND_CLUSTER).kubeconfig kubectl apply -f images/kind/kube-flannel-v0.25.4.yml
 	KUBECONFIG=/tmp/$(KIND_CLUSTER).kubeconfig kubectl wait --for=condition=Ready nodes --all --timeout=120s
-	KUBECONFIG=/tmp/$(KIND_CLUSTER).kubeconfig kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/v0.25.4/Documentation/kube-flannel.yml
 
 ## watch: Live dashboard — pods, PodMigrations, events (auto-picks active PodMotion cluster)
 .PHONY: watch
