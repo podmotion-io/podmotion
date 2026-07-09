@@ -4,9 +4,9 @@
 
 Architectural Decision Records capturing every significant design choice in PodMotion — CRIU integration, CRD data model, TCP preservation, security invariants, and more. Each ADR is immutable once accepted; superseding decisions open a new record.
 
-## Sprint plans (`docs/sprints/`)
+## Contributing (`CONTRIBUTING.md`)
 
-Per-sprint execution plans, criteria, and outcome summaries used by the development process. Each sprint plan records the scope, proof targets, and acceptance conditions for that iteration.
+How to propose changes, the ADR authoring process, and the review expectations for pull requests.
 
 ## Proof artifacts (`docs/proof/`)
 

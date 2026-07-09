@@ -35,6 +35,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -48,7 +49,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/network"
 	"github.com/podmotion-io/podmotion/internal/agent/provenance"
 	"github.com/podmotion-io/podmotion/internal/agent/seccomp"
-	pmmetrics "github.com/podmotion-io/podmotion/internal/metrics"
+	"github.com/podmotion-io/podmotion/internal/metrics"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 )
 
@@ -93,8 +94,8 @@ var ErrCRIUCapability = criu.ErrCRIUCapability
 // ErrRestoredPIDNotFound is returned by the cgroup-anchored restored-PID scan (ADR-0123 D2)
 // when, after CRIU exits 0, no process resident in the replacement pod's cgroup can be found
 // within the scan timeout. On the cold (--join-ns net:<path>) path the caller MUST fail loud on this error
-// and MUST NOT fall back to the name-based findRestoredProcessPID scan, and MUST NOT set
-// criuRestoreConfirmed (ADR-0123 D2 step 5 / AC5).
+// and MUST NOT fall back to the retired name-based comm-scan resolver (deleted per ADR-0245), and
+// MUST NOT set criuRestoreConfirmed (ADR-0123 D2 step 5 / AC5).
 var ErrRestoredPIDNotFound = errors.New("restored process PID not found in replacement pod cgroup")
 
 // CRIUImageInconsistencyError is returned by patchCheckpointImages (ADR-0193 P-0193-1) when a
@@ -160,285 +161,6 @@ type zwHoldState struct {
 	watchdogFired bool
 }
 
-// ADR-0240 / R4: agent-owned idempotent reconcile loop that watches the ADR-0140 FORWARD
-// ACCEPT + ADR-0141 NOTRACK rules backing an active zero-window hold and self-heals any
-// external flush. See Decisions D1-D5 in docs/adr/0240-zero-window-hold-flush-detection.md.
-const (
-	// zwFlushPollInterval is the fixed 100ms poll interval (D3), independent of any given
-	// migration's FreezeWindowBudgetMs, bounding worst-case flush-to-self-heal latency to
-	// <=100ms + apply time (well under the existing 500ms zwWatchdogMargin tolerance).
-	zwFlushPollInterval = 100 * time.Millisecond
-	// zwFlushTokenBucketBurst / zwFlushTokenBucketRefill implement the D1a per-migration
-	// reassert-rate limiter: capacity 5 reasserts, refill 1 token per 2s (steady-state
-	// sustained-flush rate capped at 0.5 reassert/sec/migration after the first 5 bursts).
-	zwFlushTokenBucketBurst  = 5
-	zwFlushTokenBucketRefill = 2 * time.Second
-)
-
-// zwRuleFamily is one watched rule family within an R4 flush-detection loop: either the
-// ADR-0140 FORWARD ACCEPT pair or the ADR-0141 NOTRACK rule set (D5 scope: iptables only).
-// metricLabel is the "rule" label value on pmmetrics.ZeroWindowHoldRuleReassertTotal (D4).
-type zwRuleFamily struct {
-	metricLabel string
-	present     func(ctx context.Context) bool
-	reassert    func(ctx context.Context) error
-}
-
-// zwFlushWatchState is the per-migration control block for an active R4 reconcile loop.
-type zwFlushWatchState struct {
-	cancel context.CancelFunc
-	// done is closed by the loop goroutine on exit. DisarmTCRedirect (D2a stop-ordering)
-	// blocks on this channel after calling cancel() so no in-flight probe tick can observe
-	// the intentional removeOldIP* teardown and misreport it as a flush.
-	done chan struct{}
-
-	// tbMu guards tokens/lastRefill (D1a token-bucket reassert limiter).
-	tbMu       sync.Mutex
-	tokens     float64
-	lastRefill time.Time
-
-	// countMu guards counts (cumulative per-rule flush-detected count, surfaced in the
-	// ConditionZeroWindowRuleFlushDetected message per D4's "True/timestamp/count" shape).
-	countMu sync.Mutex
-	counts  map[string]int
-}
-
-// takeToken applies the D1a token-bucket limiter: capacity zwFlushTokenBucketBurst, refill
-// 1 token per zwFlushTokenBucketRefill. Returns true (consuming one token) if a reassert
-// write is currently allowed; false if the bucket is empty. The caller must still probe
-// (detect) on every tick regardless of the return value — only the reapply WRITE is ever
-// suppressed, never detection (D1a: "probing is never suppressed").
-func (w *zwFlushWatchState) takeToken(now time.Time) bool {
-	w.tbMu.Lock()
-	defer w.tbMu.Unlock()
-	if w.lastRefill.IsZero() {
-		w.lastRefill = now
-		w.tokens = zwFlushTokenBucketBurst
-	} else if elapsed := now.Sub(w.lastRefill); elapsed > 0 {
-		if refill := elapsed.Seconds() / zwFlushTokenBucketRefill.Seconds(); refill > 0 {
-			w.tokens += refill
-			if w.tokens > zwFlushTokenBucketBurst {
-				w.tokens = zwFlushTokenBucketBurst
-			}
-			w.lastRefill = now
-		}
-	}
-	if w.tokens >= 1 {
-		w.tokens--
-		return true
-	}
-	return false
-}
-
-// startZeroWindowFlushWatch starts the R4 reconcile loop for migrationName, watching the
-// given rule families. D2a start-ordering: callers must only invoke this from the success
-// branch of the install call(s) that installed those families, passing only families whose
-// OWN install succeeded — never speculatively, and never on an install error-return path (a
-// rule whose initial install failed is a pre-existing absence, not a flush, and must not be
-// watched on tick 1). Idempotent: if a loop is already running for this migration the
-// existing loop is left in place.
-func (s *AgentServer) startZeroWindowFlushWatch(migrationName string, families []zwRuleFamily) {
-	if len(families) == 0 || migrationName == "" {
-		return
-	}
-	s.zwFlushWatchMu.Lock()
-	defer s.zwFlushWatchMu.Unlock()
-	if _, exists := s.zwFlushWatch[migrationName]; exists {
-		return
-	}
-	loopCtx, cancel := context.WithCancel(context.Background())
-	state := &zwFlushWatchState{
-		cancel: cancel,
-		done:   make(chan struct{}),
-		counts: make(map[string]int),
-	}
-	s.zwFlushWatch[migrationName] = state
-	go s.runZeroWindowFlushWatch(loopCtx, migrationName, families, state)
-	log.Info("R4: zero-window hold rule flush-detection loop started (ADR-0240)",
-		"migration", migrationName, "watchedFamilies", len(families))
-}
-
-// stopZeroWindowFlushWatch cancels and synchronously awaits exit of the R4 loop for
-// migrationName, if one is running. D2a stop-ordering: DisarmTCRedirect calls this as its
-// FIRST action, before removeOldIPForwardAccept/removeOldIPNotrack run — the blocking
-// receive on state.done guarantees the loop goroutine has fully exited (no tick in flight)
-// before the intentional teardown proceeds.
-func (s *AgentServer) stopZeroWindowFlushWatch(migrationName string) {
-	s.zwFlushWatchMu.Lock()
-	state, exists := s.zwFlushWatch[migrationName]
-	if exists {
-		delete(s.zwFlushWatch, migrationName)
-	}
-	s.zwFlushWatchMu.Unlock()
-	if !exists {
-		return
-	}
-	state.cancel()
-	<-state.done
-}
-
-// runZeroWindowFlushWatch is the D3 100ms-fixed-interval poll loop. For each watched family
-// it probes presence every tick; on absence it is a detected flush (D4): the
-// ConditionZeroWindowRuleFlushDetected condition is set/refreshed on every detected-absent
-// probe regardless of whether the reapply write was suppressed by the D1a limiter, and the
-// reapply itself is attempted only if a token is available. Runs until ctx is cancelled,
-// then closes state.done (see stopZeroWindowFlushWatch).
-func (s *AgentServer) runZeroWindowFlushWatch(ctx context.Context, migrationName string, families []zwRuleFamily, state *zwFlushWatchState) {
-	defer close(state.done)
-	ticker := time.NewTicker(zwFlushPollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			for _, fam := range families {
-				if fam.present(ctx) {
-					continue
-				}
-				state.countMu.Lock()
-				state.counts[fam.metricLabel]++
-				count := state.counts[fam.metricLabel]
-				state.countMu.Unlock()
-				log.Info("R4: zero-window hold rule flush detected — self-healing (ADR-0240)",
-					"migration", migrationName, "rule", fam.metricLabel, "count", count)
-				s.setZeroWindowRuleFlushDetectedCondition(migrationName, fam.metricLabel, count)
-				if state.takeToken(time.Now()) {
-					if err := fam.reassert(ctx); err != nil {
-						log.Error(err, "R4: rule reassert failed (will retry next tick, ADR-0240)",
-							"migration", migrationName, "rule", fam.metricLabel)
-					} else {
-						pmmetrics.ZeroWindowHoldRuleReassertTotal.WithLabelValues(migrationName, fam.metricLabel).Inc()
-					}
-				} else {
-					pmmetrics.ZeroWindowHoldRuleReassertSuppressedTotal.WithLabelValues(migrationName).Inc()
-					log.Info("R4: reassert suppressed by token-bucket limiter (ADR-0240 D1a)",
-						"migration", migrationName, "rule", fam.metricLabel)
-				}
-			}
-		}
-	}
-}
-
-// setZeroWindowRuleFlushDetectedCondition sets ConditionZeroWindowRuleFlushDetected=True on
-// the named PodMigration (D4). Purely observational: a k8sClient/lookup failure is logged
-// and swallowed rather than propagated, so a control-plane hiccup can never stall the
-// self-heal loop itself (D4 "visibility only, no blocking"). Per D4a the condition persists
-// on the CR after disarm and is never cleared by this loop or by DisarmTCRedirect.
-func (s *AgentServer) setZeroWindowRuleFlushDetectedCondition(migrationName, rule string, count int) {
-	if s.k8sClient == nil || migrationName == "" {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	ns := s.resolveNamespaceForMigration(ctx, migrationName)
-	if ns == "" {
-		ns = "default"
-	}
-	pm := &pmv1.PodMigration{}
-	if err := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: migrationName}, pm); err != nil {
-		log.Info("R4: could not fetch PodMigration to set ConditionZeroWindowRuleFlushDetected (non-fatal, ADR-0240 D4)",
-			"migration", migrationName, "err", err)
-		return
-	}
-	msg := fmt.Sprintf("external flush detected and self-healed for rule=%s; reassert_count=%d (ADR-0240 R4)", rule, count)
-	setConditionAt(pm, pmv1.ConditionZeroWindowRuleFlushDetected, metav1.ConditionTrue, "RuleReasserted", msg, metav1.Now())
-	if err := s.k8sClient.Status().Update(ctx, pm); err != nil {
-		log.Info("R4: failed to persist ConditionZeroWindowRuleFlushDetected (non-fatal, ADR-0240 D4)",
-			"migration", migrationName, "err", err)
-	}
-}
-
-// oldIPForwardAcceptPresent probes (iptables -C, -w 1) whether the ADR-0140 OLD-IP/32
-// FORWARD ACCEPT pair is present. Used by the R4 flush-detection loop (D2/D5).
-func oldIPForwardAcceptPresent(ctx context.Context, oldIP net.IP) bool {
-	cidr := oldIP.String() + "/32"
-	for _, spec := range [][]string{
-		{"-d", cidr},
-		{"-s", cidr},
-	} {
-		args := append([]string{"-w", "1", "-C", "FORWARD"}, spec...)
-		args = append(args, "-j", "ACCEPT", "-m", "comment", "--comment", "podmotion ADR-0140 oldIP fwd")
-		if err := exec.CommandContext(ctx, "iptables", args...).Run(); err != nil {
-			return false
-		}
-	}
-	return true
-}
-
-// oldIPNotrackPresent probes (iptables -t raw -C, -w 1) whether the ADR-0141 NOTRACK rule
-// set for the given mode ("both" dest-node, "source" source-node) is present. Used by the
-// R4 flush-detection loop (D2/D5).
-func oldIPNotrackPresent(ctx context.Context, oldIP net.IP, mode string) bool {
-	cidr := oldIP.String() + "/32"
-	type rule struct {
-		chain string
-		dir   string
-	}
-	var rules []rule
-	switch mode {
-	case "both":
-		rules = []rule{
-			{"PREROUTING", "-d"}, {"PREROUTING", "-s"}, {"OUTPUT", "-d"},
-		}
-	default:
-		rules = []rule{
-			{"PREROUTING", "-s"}, {"OUTPUT", "-d"},
-		}
-	}
-	comment := "podmotion ADR-0141 oldIP notrack"
-	for _, r := range rules {
-		args := []string{"-w", "1", "-t", "raw", "-C", r.chain, r.dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
-		if err := exec.CommandContext(ctx, "iptables", args...).Run(); err != nil {
-			return false
-		}
-	}
-	return true
-}
-
-// zwDestFamiliesForInject returns the R4 flush-watch rule families to start on the
-// DESTINATION node after InjectIPHandoff's FORWARD ACCEPT + NOTRACK("both") install calls
-// return, or nil if either install failed. D2a: destination-side start-ordering is
-// all-or-nothing — the loop is only started inside the success branch of BOTH installs,
-// never speculatively and never on an error-return path (a family whose initial install
-// failed is a pre-existing absence, not a flush, and must not be watched on tick 1). Kept as
-// a pure function (no I/O of its own) so the start-ordering decision is unit-testable
-// without invoking a real iptables/netlink call.
-func zwDestFamiliesForInject(fwErr, ntErr error, oldIP net.IP) []zwRuleFamily {
-	if fwErr != nil || ntErr != nil {
-		return nil
-	}
-	return []zwRuleFamily{
-		{
-			metricLabel: "forward_accept",
-			present:     func(ctx context.Context) bool { return oldIPForwardAcceptPresent(ctx, oldIP) },
-			reassert:    func(ctx context.Context) error { return installOldIPForwardAccept(ctx, oldIP) },
-		},
-		{
-			metricLabel: "notrack",
-			present:     func(ctx context.Context) bool { return oldIPNotrackPresent(ctx, oldIP, "both") },
-			reassert:    func(ctx context.Context) error { return installOldIPNotrack(ctx, oldIP, "both") },
-		},
-	}
-}
-
-// zwSourceFamiliesForInject returns the R4 flush-watch rule family to start on the SOURCE
-// node after InjectSourceRedirect's NOTRACK("source") install call, or nil if that install
-// failed. Unlike the destination side, InjectSourceRedirect's own RPC treats a NOTRACK
-// failure as non-fatal (Injected: true is still returned) — D2a requires the loop to track
-// per-rule install success independently of the RPC's own success, so this only starts
-// watching when the rule itself installed cleanly.
-func zwSourceFamiliesForInject(ntErr error, oldIP net.IP) []zwRuleFamily {
-	if ntErr != nil {
-		return nil
-	}
-	return []zwRuleFamily{{
-		metricLabel: "notrack",
-		present:     func(ctx context.Context) bool { return oldIPNotrackPresent(ctx, oldIP, "source") },
-		reassert:    func(ctx context.Context) error { return installOldIPNotrack(ctx, oldIP, "source") },
-	}}
-}
-
 // AgentServer implements agentpb.MigrationAgentServiceServer.
 // One instance runs per node agent process.
 type AgentServer struct {
@@ -466,12 +188,6 @@ type AgentServer struct {
 	zwHoldMu sync.Mutex
 	// zwHolds tracks active zero-window holds keyed by migration name.
 	zwHolds map[string]*zwHoldState
-
-	// zwFlushWatchMu guards zwFlushWatch.
-	zwFlushWatchMu sync.Mutex
-	// zwFlushWatch tracks active R4 zero-window-hold rule flush-detection reconcile loops
-	// (ADR-0240), keyed by migration name.
-	zwFlushWatch map[string]*zwFlushWatchState
 
 	// frozenSourcePIDsMu guards frozenSourcePIDs.
 	frozenSourcePIDsMu sync.Mutex
@@ -530,7 +246,6 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 		migrationPodUID:       make(map[string]string),
 		migrationSeqSnapshots: make(map[string][]*agentpb.SeqSnapshot),
 		zwHolds:               make(map[string]*zwHoldState),
-		zwFlushWatch:          make(map[string]*zwFlushWatchState),
 		frozenSourcePIDs:      make(map[string]int32),
 		pendingResumePIDs:     make(map[string]int),
 		destHostVeth:          make(map[string]string),
@@ -1310,7 +1025,7 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 		// pod's host-side veth peer, bypassing L3 local-input classification. Best-effort: a
 		// resolution/setup failure is non-fatal so an otherwise-good handoff is not blocked;
 		// the source is held until TrafficVerified so a requeue re-asserts it (idempotent).
-		if replPID := s.restoredPIDForMigration(ctx, req.MigrationName); replPID > 0 {
+		if replPID, pidErr := s.restoredPIDForMigration(ctx, req.MigrationName); pidErr == nil && replPID > 0 {
 			if vethPeer, vErr := resolveReplVethPeer(replPID); vErr != nil {
 				log.Error(vErr, "InjectIPHandoff: ADR-0139 could not resolve repl veth peer — tc redirect NOT installed (non-fatal)",
 					"migration", req.MigrationName, "replPID", replPID)
@@ -1328,8 +1043,7 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 				// KUBE-FORWARD `ctstate INVALID -j DROP` rule drops it. Insert a narrow OLD-IP/32
 				// FORWARD ACCEPT pair at the head of FORWARD (before KUBE-FORWARD). These rules match
 				// on OLD-IP, not on the overlay device, so they are interface-independent. Non-fatal.
-				fwErr := installOldIPForwardAccept(ctx, oldIP)
-				if fwErr != nil {
+				if fwErr := installOldIPForwardAccept(ctx, oldIP); fwErr != nil {
 					log.Error(fwErr, "InjectIPHandoff: ADR-0140 FORWARD ACCEPT install failed (non-fatal)",
 						"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 				} else {
@@ -1340,19 +1054,13 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 				// segment is still conntrack-INVALID (the tc mirred redirect made the forward leg
 				// conntrack-invisible), so the kernel RSTs it (B10). NOTRACK the OLD-IP flow in the
 				// raw table (pre-conntrack) on this destination node, both directions. Non-fatal.
-				ntErr := installOldIPNotrack(ctx, oldIP, "both")
-				if ntErr != nil {
+				if ntErr := installOldIPNotrack(ctx, oldIP, "both"); ntErr != nil {
 					log.Error(ntErr, "InjectIPHandoff: ADR-0141 NOTRACK install failed (non-fatal)",
 						"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 				} else {
 					log.Info("InjectIPHandoff: ADR-0141 OLD-IP NOTRACK installed (reverse data path B10)",
 						"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 				}
-
-				// ADR-0240 D2a start-ordering: destination side is all-or-nothing — the loop
-				// is only started inside this same success branch when BOTH installs
-				// succeeded, never speculatively and never on an error-return path.
-				s.startZeroWindowFlushWatch(req.MigrationName, zwDestFamiliesForInject(fwErr, ntErr, oldIP))
 			}
 		} else {
 			log.Info("InjectIPHandoff: ADR-0139 RestoredPID not yet in CR status — tc redirect deferred to requeue (non-fatal)",
@@ -1420,8 +1128,8 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 		// agent), which flips DataplaneReachabilityVerified. PM-C4: the in-netns dial is DEMOTED
 		// to a fast LOCAL PRE-CHECK (not deleted) — its result is advisory ProbeOk only and no
 		// longer gates the deferred SIGCONT, source disarm, TrafficVerified, or deletion.
-		replPID := s.restoredPIDForMigration(ctx, req.MigrationName)
-		if replPID <= 0 {
+		replPID, pidErr := s.restoredPIDForMigration(ctx, req.MigrationName)
+		if pidErr != nil || replPID <= 0 {
 			resp.ProbeOk = false
 			resp.ProbeOutput = "ADR-0210: RestoredPID not yet resolvable — local pre-check deferred (advisory only; cross-node gate is authoritative)"
 			log.Info("InjectIPHandoff: ADR-0210 local pre-check deferred — RestoredPID not yet in CR status (advisory, non-gating)",
@@ -1532,106 +1240,62 @@ func (s *AgentServer) CleanupSourceIPHandoff(ctx context.Context, req *agentpb.C
 	return &agentpb.CleanupSourceIPHandoffResponse{Cleaned: true}, nil
 }
 
-// VerifyCleanup probes whether the datapath cleanup objects for the given scope are still
-// present (ADR-0241 / NR-BLOCK-1 item 1). CUTOVER_COMPLETE is the only implemented scope:
-// it re-checks the cni0 neigh + cni0 host route that CleanupSourceIPHandoff removes, via a
-// cheap local `ip neigh show`/`ip route show` query on this (source) node — no cross-node
-// call, consistent with ADR-0241's rationale for choosing blocking bounded retry (the check
-// is a sub-millisecond local probe, not a network round trip). IP_RECLAIM is defined here
-// for R4/NR-BLOCK-2 forward compatibility (ADR-0241 Decision 1's reusable-primitive intent)
-// but returns Unimplemented: there is no cleanup code path for those objects to verify yet
-// (disarmTCRedirect has zero controller call sites today — ADR-0241 item 2).
-func (s *AgentServer) VerifyCleanup(ctx context.Context, req *agentpb.VerifyCleanupRequest) (*agentpb.VerifyCleanupResponse, error) {
-	switch req.Scope {
-	case agentpb.CleanupScope_CUTOVER_COMPLETE:
-		oldIP := net.ParseIP(req.OldPodIp)
-		if oldIP == nil || oldIP.To4() == nil {
-			return nil, status.Errorf(codes.InvalidArgument, "VerifyCleanup: old_pod_ip %q is not a valid IPv4", req.OldPodIp)
-		}
-		bridgeIf := req.BridgeIfname
-		if bridgeIf == "" {
-			if discovered, discErr := discoverHostInterface(ctx); discErr == nil && discovered != "" {
-				bridgeIf = discovered
-			}
-		}
-		var present []string
-		for _, obj := range req.Objects {
-			switch obj {
-			case "cni0_neigh":
-				if cni0NeighPresent(ctx, bridgeIf, oldIP) {
-					present = append(present, obj)
-				}
-			case "cni0_host_route":
-				if cni0HostRoutePresent(ctx, bridgeIf, oldIP) {
-					present = append(present, obj)
-				}
-			default:
-				log.Info("VerifyCleanup: unknown object in request (ignored)", "migration", req.MigrationName, "object", obj)
-			}
-		}
-		log.Info("VerifyCleanup: CUTOVER_COMPLETE probe complete (ADR-0241)",
-			"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "presentObjects", present)
-		return &agentpb.VerifyCleanupResponse{Clean: len(present) == 0, PresentObjects: present}, nil
-	case agentpb.CleanupScope_IP_RECLAIM:
-		return nil, status.Errorf(codes.Unimplemented,
-			"VerifyCleanup: IP_RECLAIM scope has no cleanup trigger yet (NR-BLOCK-2, ADR-0241 item 2)")
-	default:
-		return nil, status.Errorf(codes.InvalidArgument, "VerifyCleanup: unknown scope %v", req.Scope)
-	}
-}
-
-// cni0NeighPresent reports whether an AF_INET neighbor entry for oldIP still exists on
-// ifName, via a local `ip neigh show` query (ADR-0241 item 1).
-func cni0NeighPresent(ctx context.Context, ifName string, oldIP net.IP) bool {
-	if ifName == "" || oldIP == nil {
-		return false
-	}
-	out, err := exec.CommandContext(ctx, "ip", "neigh", "show", "dev", ifName, oldIP.String()).CombinedOutput()
-	if err != nil {
-		return false
-	}
-	return strings.Contains(string(out), oldIP.String())
-}
-
-// cni0HostRoutePresent reports whether the /32 host route for oldIP still exists on ifName.
-func cni0HostRoutePresent(ctx context.Context, ifName string, oldIP net.IP) bool {
-	if ifName == "" || oldIP == nil {
-		return false
-	}
-	out, err := exec.CommandContext(ctx, "ip", "route", "show", "dev", ifName, oldIP.String()+"/32").CombinedOutput()
-	if err != nil {
-		return false
-	}
-	return strings.Contains(string(out), oldIP.String())
-}
-
 // restoredPIDForMigration fetches the PodMigration CR and returns Status.RestoredPID (the root
-// PID of the restored container, set by this agent at ReportRestoreConfirmed). Returns 0 if the
-// CR/PID is unavailable. Used by ADR-0139 to resolve the replacement pod's veth peer without a
-// proto change (the agent already holds the k8s client and the migration name).
-func (s *AgentServer) restoredPIDForMigration(ctx context.Context, migrationName string) int {
-	if s.k8sClient == nil || migrationName == "" {
-		return 0
+// PID of the restored container, set by this agent at ReportRestoreConfirmed). Used by ADR-0139
+// to resolve the replacement pod's veth peer without a proto change (the agent already holds the
+// k8s client and the migration name).
+//
+// Return contract (ADR-0244 N1/N2 correction, Sprint 40): callers MUST distinguish two cases
+// that this function previously conflated into a single "0" return:
+//  1. The CR/PID is POSITIVELY resolved and RestoredPID is genuinely unset/zero (pod gone, or
+//     never restored on this node yet) — returns (0, nil). Nothing left to protect; not an error.
+//  2. The LOOKUP ITSELF fails (e.g. a transient List error against the apiserver, or no
+//     k8sClient configured) — returns (0, err). This is a genuine lookup failure, not a positive
+//     absence, and callers on the safety-critical R7 path (ProbeDestSocketForIP) MUST propagate
+//     it as an RPC error so the caller fails closed, exactly as NoLiveConntrackForIP (R6) already
+//     does on its own RPC errors. Before this correction, case (2) was silently folded into case
+//     (1) and returned "0, treat as absent", which failed OPEN on a transient error and could
+//     have authorized a reclaim teardown against a live pinned connection (the same harm class
+//     the R6/C1 finding identified, reached through R7 instead).
+//
+// Best-effort, non-safety-critical callers (e.g. the ADR-0139 tc-redirect install path, the
+// ADR-0210 in-netns pre-check) may continue to treat any error the same as "not yet resolvable"
+// (defer/skip), since those paths are already advisory-only and re-tried on the next requeue.
+func (s *AgentServer) restoredPIDForMigration(ctx context.Context, migrationName string) (int, error) {
+	if s.k8sClient == nil {
+		return 0, fmt.Errorf("restoredPIDForMigration: no k8s client configured")
+	}
+	if migrationName == "" {
+		return 0, fmt.Errorf("restoredPIDForMigration: migration_name is required")
 	}
 	// Namespace is not carried on the InjectIPHandoff request; PodMigrations are namespaced.
 	// The PoC runs in "default". List across namespaces by name as a robust fallback so this
 	// is not hard-wired to one namespace if the operator is reconfigured.
 	pm := &pmv1.PodMigration{}
-	if err := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: migrationName}, pm); err == nil {
-		return int(pm.Status.RestoredPID)
+	getErr := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: migrationName}, pm)
+	if getErr == nil {
+		return int(pm.Status.RestoredPID), nil
+	}
+	if !apierrors.IsNotFound(getErr) {
+		// A non-NotFound Get error (transient apiserver/network failure) is a genuine lookup
+		// failure — propagate it rather than falling through to the list-based fallback, which
+		// would otherwise mask it as "not found in default, try listing" and risk the same
+		// silent-absorption defect the List branch below is careful to avoid.
+		return 0, fmt.Errorf("restoredPIDForMigration: get PodMigration %q: %w", migrationName, getErr)
 	}
 	pmList := &pmv1.PodMigrationList{}
 	if err := s.k8sClient.List(ctx, pmList); err != nil {
-		log.Info("restoredPIDForMigration: list PodMigrations failed (non-fatal)",
-			"migration", migrationName, "err", err)
-		return 0
+		return 0, fmt.Errorf("restoredPIDForMigration: list PodMigrations failed for %q: %w", migrationName, err)
 	}
 	for i := range pmList.Items {
 		if pmList.Items[i].Name == migrationName {
-			return int(pmList.Items[i].Status.RestoredPID)
+			return int(pmList.Items[i].Status.RestoredPID), nil
 		}
 	}
-	return 0
+	// Positively enumerated every PodMigration and found none named migrationName: the CR
+	// genuinely does not exist (or has no RestoredPID yet). This is case (1) — a real absence,
+	// not a lookup failure.
+	return 0, nil
 }
 
 // resolveNamespaceForMigration returns the Kubernetes namespace of the named PodMigration CR.
@@ -1770,14 +1434,11 @@ func installOldIPForwardAccept(ctx context.Context, oldIP net.IP) error {
 		{"-s", cidr},
 	} {
 		// Delete any existing copy first (idempotent; ignore "does not exist").
-		// ADR-0240 D3a: -w 1 so a lost xtables-lock race under R4's added polling
-		// contention degrades to a bounded stall, not a hard "resource unavailable" failure
-		// misread as "rule absent, reassert now".
-		delArgs := append([]string{"-w", "1", "-D", "FORWARD"}, spec...)
+		delArgs := append([]string{"-D", "FORWARD"}, spec...)
 		delArgs = append(delArgs, "-j", "ACCEPT", "-m", "comment", "--comment", "podmotion ADR-0140 oldIP fwd")
 		_, _ = exec.CommandContext(ctx, "iptables", delArgs...).CombinedOutput()
 		// Insert at the head, before KUBE-FORWARD.
-		insArgs := append([]string{"-w", "1", "-I", "FORWARD", "1"}, spec...)
+		insArgs := append([]string{"-I", "FORWARD", "1"}, spec...)
 		insArgs = append(insArgs, "-j", "ACCEPT", "-m", "comment", "--comment", "podmotion ADR-0140 oldIP fwd")
 		if out, err := exec.CommandContext(ctx, "iptables", insArgs...).CombinedOutput(); err != nil {
 			return fmt.Errorf("iptables -I FORWARD %v: %w (%s)", spec, err, strings.TrimSpace(string(out)))
@@ -1814,11 +1475,9 @@ func installOldIPNotrack(ctx context.Context, oldIP net.IP, mode string) error {
 	}
 	comment := "podmotion ADR-0141 oldIP notrack"
 	for _, r := range rules {
-		// ADR-0240 D3a: -w 1 on install too, for the same lock-contention reason as the
-		// probe/reassert calls this rule family feeds into R4.
-		del := []string{"-w", "1", "-t", "raw", "-D", r.chain, r.dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
+		del := []string{"-t", "raw", "-D", r.chain, r.dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
 		_, _ = exec.CommandContext(ctx, "iptables", del...).CombinedOutput()
-		ins := []string{"-w", "1", "-t", "raw", "-I", r.chain, "1", r.dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
+		ins := []string{"-t", "raw", "-I", r.chain, "1", r.dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
 		if out, err := exec.CommandContext(ctx, "iptables", ins...).CombinedOutput(); err != nil {
 			return fmt.Errorf("iptables -t raw -I %s %s %s NOTRACK: %w (%s)", r.chain, r.dir, cidr, err, strings.TrimSpace(string(out)))
 		}
@@ -1833,9 +1492,7 @@ func removeOldIPNotrack(ctx context.Context, oldIP net.IP) {
 	comment := "podmotion ADR-0141 oldIP notrack"
 	for _, chain := range []string{"PREROUTING", "OUTPUT"} {
 		for _, dir := range []string{"-d", "-s"} {
-			// ADR-0240 D3a: -w 1 so removal (which now races the R4 loop's own probes/
-			// reasserts on the same lock) degrades to a bounded stall, not a hard failure.
-			args := []string{"-w", "1", "-t", "raw", "-D", chain, dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
+			args := []string{"-t", "raw", "-D", chain, dir, cidr, "-j", "NOTRACK", "-m", "comment", "--comment", comment}
 			for i := 0; i < 4; i++ {
 				if _, err := exec.CommandContext(ctx, "iptables", args...).CombinedOutput(); err != nil {
 					break
@@ -1853,8 +1510,7 @@ func removeOldIPForwardAccept(ctx context.Context, oldIP net.IP) {
 		{"-d", cidr},
 		{"-s", cidr},
 	} {
-		// ADR-0240 D3a: -w 1, same lock-contention rationale as removeOldIPNotrack above.
-		args := append([]string{"-w", "1", "-D", "FORWARD"}, spec...)
+		args := append([]string{"-D", "FORWARD"}, spec...)
 		args = append(args, "-j", "ACCEPT", "-m", "comment", "--comment", "podmotion ADR-0140 oldIP fwd")
 		// Remove up to a few duplicates defensively.
 		for i := 0; i < 4; i++ {
@@ -1868,13 +1524,6 @@ func removeOldIPForwardAccept(ctx context.Context, oldIP net.IP) {
 // DisarmTCRedirect removes the ADR-0139 tc-ingress filter + qdisc from the overlay interface
 // after TrafficVerified=True (Decision 3 disarm order). Idempotent: tolerates ENOENT.
 func (s *AgentServer) DisarmTCRedirect(ctx context.Context, req *agentpb.DisarmTCRedirectRequest) (*agentpb.DisarmTCRedirectResponse, error) {
-	// ADR-0240 D2a stop-ordering: cancel and synchronously await exit of the R4 flush-
-	// detection loop for this migration BEFORE any removeOldIP* call below runs. This must
-	// be the FIRST action in this function so no in-flight 100ms probe tick can observe the
-	// intentional teardown that follows and misreport it as a flush (a false-positive
-	// reassert masquerading as a real flush-detection event).
-	s.stopZeroWindowFlushWatch(req.MigrationName)
-
 	// ADR-0199 (removal symmetry, item 4): the forward install (InjectIPHandoff)
 	// now installs the tc-ingress redirect on `bridgeIf` when the substrate has no VXLAN
 	// device (kindnet), NOT on `flannel.1`. The teardown MUST remove the filter from the
@@ -1988,8 +1637,7 @@ func (s *AgentServer) InjectSourceRedirect(ctx context.Context, req *agentpb.Inj
 	// ADR-0141 (blocker B10): NOTRACK the OLD-IP flow on the SOURCE node too, so the reply
 	// arriving from the relocated pod (and the client SYN/GET egressing) is never conntrack-
 	// tracked → never INVALID → no RST on the source side. Symmetric to the destination NOTRACK.
-	ntErr := installOldIPNotrack(ctx, oldIP, "source")
-	if ntErr != nil {
+	if ntErr := installOldIPNotrack(ctx, oldIP, "source"); ntErr != nil {
 		log.Error(ntErr, "InjectSourceRedirect: ADR-0141 source NOTRACK install failed (non-fatal)",
 			"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 	} else {
@@ -1997,15 +1645,174 @@ func (s *AgentServer) InjectSourceRedirect(ctx context.Context, req *agentpb.Inj
 			"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 	}
 
-	// ADR-0240 D2a: on the source node NOTRACK install is non-fatal (RPC still returns
-	// Injected: true on failure), so the loop tracks per-rule install success independently
-	// of the RPC's own success — only start watching a family that installed cleanly.
-	s.startZeroWindowFlushWatch(req.MigrationName, zwSourceFamiliesForInject(ntErr, oldIP))
-
 	log.Info("InjectSourceRedirect: source VXLAN redirect installed (ADR-0136)",
 		"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "replVethMAC", req.ReplVethMac,
 		"dstNodeIP", req.DstNodeIp, "ifName", fdbIf)
 	return &agentpb.InjectSourceRedirectResponse{Injected: true}, nil
+}
+
+// TeardownSourceRedirect removes the ADR-0136 SOURCE-node flannel.1 VXLAN redirect and the
+// ADR-0141 source-mode NOTRACK rule for the relocated OLD pod IP (ADR-0244 / NR-BLOCK-2, GC-5
+// "Source-side teardown"). Symmetric to DisarmTCRedirect on the destination node: this is the
+// missing "net new" half of the reclaim sweep — InjectSourceRedirect has no existing caller-side
+// teardown, unlike the destination objects DisarmTCRedirect already removes.
+//
+// Removes, in order (ADR-0244 §5 item 2), tolerating ENOENT/already-absent at every step so a
+// crash mid-teardown or a re-invocation on an already-torn-down IP is always safe to retry:
+//
+//  1. AF_BRIDGE FDB entry (network.NewFDBManager().RemoveFDBEntry) — VXLAN encap mapping.
+//  2. AF_INET neigh (network.DeletePodIPNeigh) on the same interface — reused verbatim against
+//     flannel.1, the same function CleanupSourceIPHandoff already calls against cni0.
+//  3. The /32 host route (network.DeletePodIPHostRoute) that gave the OLD IP LPM priority over
+//     the local cni0 /24.
+//  4. The source-mode NOTRACK raw-table rule (removeOldIPNotrack) — already generic (deletes
+//     both -d/-s directions in both PREROUTING/OUTPUT chains regardless of which
+//     installOldIPNotrack mode installed them), so no change was needed there.
+//
+// This RPC does NOT itself decide reclaim eligibility — that is the controller-side
+// ReclaimEligible/R1-R7 predicate (ADR-0244 §2). By the time this fires, the controller has
+// already confirmed no live client can reach old_pod_ip; this handler's only job is to
+// mechanically remove the five now-provably-dead objects it owns on the source node.
+func (s *AgentServer) TeardownSourceRedirect(ctx context.Context, req *agentpb.TeardownSourceRedirectRequest) (*agentpb.TeardownSourceRedirectResponse, error) {
+	log.Info("TeardownSourceRedirect called (ADR-0244 GC-5)", "migration", req.MigrationName,
+		"oldPodIP", req.OldPodIp, "fdbIfname", req.FdbIfname, "replVethMAC", req.ReplVethMac, "dstNodeIP", req.DstNodeIp)
+
+	if req.OldPodIp == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "TeardownSourceRedirect: old_pod_ip is required")
+	}
+	oldIP := net.ParseIP(req.OldPodIp)
+	if oldIP == nil || oldIP.To4() == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "TeardownSourceRedirect: old_pod_ip %q is not a valid IPv4", req.OldPodIp)
+	}
+
+	fdbIf := req.FdbIfname
+	if fdbIf == "" {
+		fdbIf = "flannel.1"
+	}
+
+	// (a) AF_BRIDGE FDB entry. repl_veth_mac/dst_node_ip identify the exact entry that was
+	// installed by InjectSourceRedirect; both are required to key the delete (ADR-0136 keys the
+	// FDB on the replacement veth MAC, not a VTEP MAC — see InjectSourceRedirect's own comment).
+	// A missing MAC/dst IP is tolerated as a best-effort skip of this one step (not fatal to the
+	// remaining three, which do not need it) rather than failing the whole teardown — the FDB
+	// entry is harmless-if-orphaned relative to a live client (it is a forwarding hint, not a
+	// blocking rule) and VerifyCleanup(IP_RECLAIM)'s flannel1_fdb probe will surface any leak.
+	if req.ReplVethMac != "" && req.DstNodeIp != "" {
+		mac, macErr := net.ParseMAC(req.ReplVethMac)
+		dstNodeIP := net.ParseIP(req.DstNodeIp)
+		if macErr != nil || dstNodeIP == nil {
+			log.Info("TeardownSourceRedirect: repl_veth_mac/dst_node_ip invalid — skipping FDB removal (non-fatal)",
+				"migration", req.MigrationName, "replVethMAC", req.ReplVethMac, "dstNodeIP", req.DstNodeIp)
+		} else if err := network.NewFDBManager().RemoveFDBEntry(ctx, network.FDBEntry{
+			IfName: fdbIf,
+			PodIP:  oldIP,
+			PodMAC: mac,
+			VTEPIP: dstNodeIP,
+		}); err != nil {
+			return &agentpb.TeardownSourceRedirectResponse{TornDown: false,
+				BlockingReason: fmt.Sprintf("flannel.1 AF_BRIDGE FDB removal: %v", err)}, nil
+		}
+	} else {
+		log.Info("TeardownSourceRedirect: repl_veth_mac/dst_node_ip not supplied — skipping FDB removal (non-fatal)",
+			"migration", req.MigrationName)
+	}
+
+	// (b) AF_INET neigh on fdbIf. DeletePodIPNeigh already tolerates ENOENT/missing interface.
+	if err := network.DeletePodIPNeigh(ctx, fdbIf, oldIP); err != nil {
+		return &agentpb.TeardownSourceRedirectResponse{TornDown: false,
+			BlockingReason: fmt.Sprintf("flannel.1 neigh removal: %v", err)}, nil
+	}
+
+	// (c) /32 host route on fdbIf. DeletePodIPHostRoute already tolerates a missing interface.
+	if err := network.DeletePodIPHostRoute(ctx, fdbIf, oldIP); err != nil {
+		return &agentpb.TeardownSourceRedirectResponse{TornDown: false,
+			BlockingReason: fmt.Sprintf("flannel.1 /32 route removal: %v", err)}, nil
+	}
+
+	// (d) source-mode NOTRACK. removeOldIPNotrack is already generic/idempotent and returns no
+	// error (loops a bounded number of -D attempts, tolerating ENOENT at every step).
+	removeOldIPNotrack(ctx, oldIP)
+
+	log.Info("TeardownSourceRedirect: source flannel.1 redirect + NOTRACK torn down (ADR-0244 GC-5)",
+		"migration", req.MigrationName, "oldPodIP", req.OldPodIp, "fdbIf", fdbIf)
+	return &agentpb.TeardownSourceRedirectResponse{TornDown: true}, nil
+}
+
+// ProbeDestSocketForIP reports whether the DESTINATION agent's restored-pod network namespace
+// has an ESTABLISHED TCP socket bound to old_pod_ip (ADR-0244 R7 / NoLiveDestSocketForIP,
+// added by the 2026-07-04 C1 amendment). This is the conjunct that observes the NOTRACK'd
+// tc-redirect flow class ProbeConntrackForIP/R6 structurally cannot see (see the ADR's NOTRACK
+// coverage discussion): a
+// live pinned/source-CIDR client connection carried over the ADR-0139/0136 tc-redirect + ADR-0141
+// NOTRACK path is, by construction, absent from conntrack, but its ESTABLISHED socket in the
+// restored pod's own netns is entirely unaffected by the raw-table NOTRACK rule sitting upstream
+// of it on the host — so it remains directly observable here.
+//
+// Only ESTABLISHED-state sockets are visible through this probe (network.SocketInventory filters
+// strictly on state=="01"); CLOSE_WAIT/FIN_WAIT/SYN_RECV flows on old_pod_ip are observed by
+// neither this probe nor ProbeConntrackForIP — a disclosed residual, not resolved by this RPC.
+//
+// Fail-closed contract (ADR-0244 N1/N2 correction): restoredPIDForMigration now distinguishes a
+// genuine lookup failure (propagated here as a gRPC error, so the controller's
+// noLiveDestSocketForIP conjunct defers the sweep) from a positive absence (CR/PID resolves and
+// is legitimately gone or never restored — present=false, not an error; nothing left to protect).
+func (s *AgentServer) ProbeDestSocketForIP(ctx context.Context, req *agentpb.ProbeDestSocketForIPRequest) (*agentpb.ProbeDestSocketForIPResponse, error) {
+	log.Info("ProbeDestSocketForIP called (ADR-0244 R7)", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+
+	if req.OldPodIp == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "ProbeDestSocketForIP: old_pod_ip is required")
+	}
+	oldIP := net.ParseIP(req.OldPodIp)
+	if oldIP == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "ProbeDestSocketForIP: old_pod_ip %q is not a valid IP", req.OldPodIp)
+	}
+	if req.MigrationName == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "ProbeDestSocketForIP: migration_name is required")
+	}
+
+	replPID, pidErr := s.restoredPIDForMigration(ctx, req.MigrationName)
+	if pidErr != nil {
+		// Case (2): the lookup itself failed (transient apiserver error, no k8s client, etc).
+		// Fail closed — propagate as an RPC error so the controller defers the sweep exactly as
+		// it already does on a ProbeConntrackForIP (R6) RPC error, rather than silently reading
+		// this as "positively absent" (the N1 defect this amendment fixes).
+		return nil, status.Errorf(codes.Unavailable,
+			"ProbeDestSocketForIP: restoredPIDForMigration lookup failed for migration %q: %v",
+			req.MigrationName, pidErr)
+	}
+	if replPID <= 0 {
+		// Case (1): the CR/PID was positively resolved and there is no restored process (pod
+		// gone, or never restored on this node). Nothing left to protect — present=false is a
+		// correct, non-error result, not a fail-open reading of an unresolved lookup.
+		log.Info("ProbeDestSocketForIP: no RestoredPID for migration — nothing to protect (present=false)",
+			"migration", req.MigrationName, "oldPodIP", req.OldPodIp)
+		return &agentpb.ProbeDestSocketForIPResponse{Present: false, Count: 0}, nil
+	}
+
+	entries, invErr := network.SocketInventory(int32(replPID))
+	if invErr != nil {
+		// A failure reading /proc/<pid>/net/tcp[6] (e.g. the process just exited between PID
+		// resolution and the read) is likewise a genuine observation failure, not a positive
+		// absence — fail closed rather than reporting present=false on an error.
+		return nil, status.Errorf(codes.Unavailable,
+			"ProbeDestSocketForIP: SocketInventory(pid=%d) failed for migration %q: %v",
+			replPID, req.MigrationName, invErr)
+	}
+
+	count := 0
+	for _, e := range entries {
+		if e.SrcIP != nil && e.SrcIP.Equal(oldIP) {
+			count++
+			continue
+		}
+		if e.DstIP != nil && e.DstIP.Equal(oldIP) {
+			count++
+		}
+	}
+
+	log.Info("ProbeDestSocketForIP: probe complete (ADR-0244 R7)", "migration", req.MigrationName,
+		"oldPodIP", req.OldPodIp, "replPID", replPID, "present", count > 0, "count", count)
+	return &agentpb.ProbeDestSocketForIPResponse{Present: count > 0, Count: int32(count)}, nil
 }
 
 // ListenAndServe starts the gRPC server on addr (default ":9090").
@@ -2321,7 +2128,7 @@ func sandboxNetnsPath(_ context.Context, sandboxID string) (string, error) {
 // hostBundleDir returns the containerd task bundle directory for a given task ID, resolved
 // through the agent-visible host mount.
 //
-// ADR-0213 D1 (removal-symmetry audit): `ctr`/runc/criu run in the HOST mount namespace via nsenterCmd, but
+// ADR-0213 D1: `ctr`/runc/criu run in the HOST mount namespace via nsenterCmd, but
 // any native Go os.ReadFile in the agent runs in the AGENT container's mount namespace. The
 // daemonset mounts host /run at /host-run (charts/podmotion/templates/daemonset.yaml:65-66,
 // 180-182); the host bundle dir is therefore reachable at /host-run/containerd/...task...,
@@ -2488,7 +2295,7 @@ func ctrCheckpoint(taskID, imagesDir string, tcpEstablished bool) (int64, error)
 	}
 
 	// Copy config.json from the containerd bundle into the checkpoint dir.
-	// ADR-0213 D1 (removal-symmetry audit): same host-mount translation as the dump-log read — the bundle is
+	// ADR-0213 D1: same host-mount translation as the dump-log read — the bundle is
 	// reachable in the agent ns only via /host-run.
 	bundleDir := hostBundleDir(taskID)
 	srcCfg := filepath.Join(bundleDir, "config.json")
@@ -2888,8 +2695,19 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 			args = append(args, "--external", "veth[eth0]:"+hostVethName)
 		}
 	}
+	// Authoritative restored-PID resolution via CRIU's own --pidfile.
+	// CRIU writes the PID of the restored ROOT task to this file as a side effect of the
+	// restore itself — the source-of-truth answer, replacing the prior poll-and-guess
+	// broker-cgroup PID diff, a fragile, non-atomic inference chain (see readRestoredPIDFromPidfile).
+	// dataDir is on /var/lib/podmotion (ext4), visible from BOTH the agent container and the
+	// host mount namespace CRIU runs in, so the agent reads it back with a plain os.ReadFile.
+	args = append(args, "--pidfile", filepath.Join(dataDir, restoredPidfileName))
 	return args
 }
+
+// restoredPidfileName is the basename CRIU writes the restored root PID to (see --pidfile
+// in buildCRIURestoreArgs). It lives in the restore dataDir (host-visible ext4).
+const restoredPidfileName = "restored.pid"
 
 // copyDirAll copies all regular files (non-recursive into subdirs is fine for CRIU image dirs
 // which are flat) from src to dst. dst is created with 0o700 if it doesn't exist.
@@ -3088,7 +2906,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	dataDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/data", migrationName)
 	secretsDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/secrets", migrationName)
 	termlogFile := fmt.Sprintf("/var/lib/podmotion/restore/%s/termination-log", migrationName)
-	_ = os.MkdirAll(dataDir, 0o755)
+	_ = os.MkdirAll(dataDir, 0o700)
 	_ = os.MkdirAll(secretsDir, 0o700)
 	_ = os.WriteFile(termlogFile, nil, 0o644)
 
@@ -3324,7 +3142,22 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// wrapper's stderr and returns it on each exec_poll; criuCmd.Stderr mirrors it.
 	criuStderr := criuCmd.Stderr
 
+	// Remove any stale pidfile from a prior attempt of THIS SAME migration before launching
+	// CRIU. os.MkdirAll(dataDir) above does not clean the directory, and CRIU opens --pidfile
+	// with O_TRUNC (not O_EXCL), so a leftover restored.pid can be read by the pidfile poll
+	// below in its first iteration — before the new CRIU process rewrites it — and if that
+	// stale PID is still live (or recycled) the restore would report success for the WRONG
+	// process. That is exactly the report-success-on-wrong-PID failure class the --pidfile
+	// primitive exists to prevent. Fail CLOSED: any removal error other than "not present"
+	// is a hard stop (an unremovable stale file must never be silently polled past).
+	stalePidfilePath := filepath.Join(dataDir, restoredPidfileName)
+	if err := removeStalePidfile(stalePidfilePath, os.Remove); err != nil {
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_stale_pidfile_unlink").Inc()
+		return 0, nil, err
+	}
+
 	if err := criuCmd.Start(); err != nil {
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_criu_start").Inc()
 		return 0, nil, fmt.Errorf("criu restore start: %w", err)
 	}
 
@@ -3338,7 +3171,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// On the cold --join-ns net:<path> path CRIU does NOT self-exit: after restore it stays as
 	// the foreground workload parent (blocking in wait4 for the lifetime of the workload). A
 	// synchronous Wait would hang until the workload exits — the Sprint 22 failure.
-	// --restore-detached is forbidden (CLAUDE.md Standing Rule 6). --leave-stopped is only on
+	// --restore-detached is forbidden (the project conventions doc Standing Rule 6). --leave-stopped is only on
 	// the TCP-stateful branch. The broker reaps the wrapper exactly once when it eventually
 	// exits (no zombie); the agent polls liveness via exec_poll until either new PIDs appear in
 	// the broker cgroup (proof CRIU launched the workload tree) OR the wrapper exits non-zero.
@@ -3422,32 +3255,58 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	log.Info("joinNsRestore: cgroup-PID signal confirmed workload live — proceeding to PID resolution",
 		"migration", migrationName)
 
-	// Step 5: ADR-0123 D2 — locate the restored application PID via the replacement pod's
-	// cgroup, NOT by process name. CRIU has exited (D1), so its PID can no longer be confused
-	// with the application and there is no zombie to match. On the cold (--join-ns net:<path>) path the
-	// sandboxID anchors the pod cgroup; the comm-based findRestoredProcessPID is never used as a
-	// fallback (D2 step 5). The --join-ns Restore (TCP-stateful) path (no sandboxID) is out of Sprint-18 scope
-	// and retains the legacy name/cgroup scan.
+	// Step 5: resolve the restored application PID from CRIU's own --pidfile primitive on BOTH
+	// restore entry points (the NRI path and the gRPC Restore RPC path). CRIU writes the PID it
+	// restored to <dataDir>/restored.pid on every restore — buildCRIURestoreArgs appends --pidfile
+	// unconditionally, and dataDir is computed identically on both paths — so this is CRIU's own
+	// authoritative output and its resolution does NOT depend on having a sandboxID. Both prior
+	// resolvers are retired and MUST NOT be reintroduced on ANY path: the comm-scan
+	// findRestoredProcessPID (comm is attacker-controlled via prctl(PR_SET_NAME) — ADR-0245) and
+	// the broker-cgroup PID diff (poll-and-guess, non-atomic — ADR-0228 NRI/gRPC symmetry). The
+	// sandboxID gate that previously wrapped this resolution was a remnant of the old resolver
+	// chain (sandboxID was the anchor the cgroup-diff resolver needed); the --pidfile primitive
+	// needs only dataDir, so the gate is removed here and both paths converge on this resolver.
+	if agentPIDsErr != nil {
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_broker_cgroup_snapshot").Inc()
+		return 0, nil, fmt.Errorf("snapshot broker cgroup PIDs before restore: %w", agentPIDsErr)
+	}
+	if beforeAgentPIDs == nil {
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_broker_cgroup_baseline_missing").Inc()
+		return 0, nil, fmt.Errorf("broker cgroup baseline was never captured (wrapper never polled live)")
+	}
 	var pid int
+	pidfilePath := filepath.Join(dataDir, restoredPidfileName)
+	pidfilePoll := func() (bool, error) {
+		exited, _, _, perr := criuCmd.poll()
+		return exited, perr
+	}
+	pid, err = readRestoredPIDFromPidfile(pidfilePath, 30*time.Second, pidfilePoll)
+	if err != nil {
+		// Fail loud — never fall back to comm-scan or cgroup-diff (ADR-0228 NRI/gRPC symmetry).
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_pidfile_missing").Inc()
+		return 0, nil, fmt.Errorf("resolve restored PID via CRIU --pidfile: %w", err)
+	}
+	// ADR-0228 Invariant 1: identity is guaranteed by --pidfile (CRIU reports the PID it
+	// restored — never the wrapper/holder stub); the residual check is liveness. Defense in
+	// depth: reject the impossible case where the pidfile PID coincides with the wrapper PID.
+	if pid == criuWrapperPID {
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_pid_equals_wrapper").Inc()
+		return 0, nil, fmt.Errorf("pidfile-reported PID %d equals the CRIU wrapper (holder) PID — refusing to trust", pid)
+	}
+	if verr := verifyRestoredPIDAlive(pid, 100*time.Millisecond); verr != nil {
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_pid_dead").Inc()
+		return 0, nil, fmt.Errorf("ADR-0228 Invariant 1: %w", verr)
+	}
+	log.Info("joinNsRestore: resolved restored PID via CRIU --pidfile (authoritative primitive)",
+		"pid", pid, "pidfile", pidfilePath, "migration", migrationName)
+
+	// ADR-0128: cgroup placement requires a pod sandbox to anchor to, so it is the ONE step that
+	// still legitimately depends on sandboxID (it is NOT retired). On the NRI path (sandboxID set)
+	// --manage-cgroups=ignore leaves the restored tree in the broker/launcher cgroup, so move it
+	// into the pod's sandbox cgroup for containerd/k8s to manage. The gRPC/--join-ns path has no
+	// pod sandbox (sandboxID == "") and therefore no pod cgroup to move into — this step is
+	// skipped. PID resolution above is identical on both paths regardless.
 	if sandboxID != "" {
-		// ADR-0128: --manage-cgroups=ignore leaves the restored tree in the launcher's cgroup, not
-		// the pod cgroup, so the ADR-0123 D2 pod-cgroup scan finds nothing. Instead diff the
-		// launcher cgroup against the pre-CRIU snapshot to find the new workload PID, then move it
-		// into the pod's sandbox cgroup so containerd/k8s can manage it.
-		// ADR-0234: the launcher is now the BROKER (the wrapper is a broker child), so the diff is
-		// against the BROKER cgroup — the PID set the broker returns on exec_poll. beforeAgentPIDs
-		// is the broker-cgroup baseline captured in the liveness loop above.
-		if agentPIDsErr != nil {
-			return 0, nil, fmt.Errorf("ADR-0128: snapshot broker cgroup PIDs before restore: %w", agentPIDsErr)
-		}
-		if beforeAgentPIDs == nil {
-			return 0, nil, fmt.Errorf("ADR-0128: broker cgroup baseline was never captured (wrapper never polled live)")
-		}
-		pid, err = findRestoredPIDInBrokerCgroup(beforeAgentPIDs, criuWrapperPID, criuCmd)
-		if err != nil {
-			// Fail loud — never fall back to comm-scan on the cold path (D2 step 5 / AC5).
-			return 0, nil, err
-		}
 		// Resolve the pod's sandbox cgroup path from the pause PID (same anchor as ADR-0123 D2).
 		pausePID, perr := sandboxPausePID(sandboxID)
 		if perr != nil {
@@ -3464,11 +3323,6 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 		}
 		log.Info("joinNsRestore: moved restored process into pod cgroup (ADR-0128)",
 			"pid", pid, "podCgroup", podCgroup, "sandboxID", sandboxID)
-	} else {
-		pid, err = findRestoredProcessPID(checkpointDir)
-		if err != nil {
-			return 0, nil, err
-		}
 	}
 	log.Info("joinNsRestore: found restored process", "pid", pid)
 
@@ -3642,8 +3496,8 @@ func (s *AgentServer) StartReachabilityEcho(ctx context.Context, req *agentpb.St
 		resp.Detail = "ADR-0210: listen_ip/listen_port/nonce required"
 		return resp, nil
 	}
-	replPID := s.restoredPIDForMigration(ctx, req.MigrationName)
-	if replPID <= 0 {
+	replPID, pidErr := s.restoredPIDForMigration(ctx, req.MigrationName)
+	if pidErr != nil || replPID <= 0 {
 		resp.Started = false
 		resp.Detail = "ADR-0210: replacement PID not yet resolvable — echo deferred to requeue"
 		return resp, nil
@@ -3691,153 +3545,6 @@ func isConnRefused(err error) bool {
 	return false
 }
 
-// findRestoredPIDByCgroup implements ADR-0123 Decision 2: resolve the restored application PID
-// by cgroup membership in the replacement pod, anchored on the pod's pause/sandbox container.
-//
-//  1. Resolve the pause PID for sandboxID (the ADR-0122 sandbox anchor) via `ctr tasks list`,
-//     then read /proc/<pausePID>/cgroup to obtain the pod cgroup path. If the pause PID has
-//     exited (TOCTOU), fail loud rather than scanning an empty cgroup (Security/Runtime note 3).
-//  2. Scan /proc/*/cgroup for processes whose cgroup path matches the pod-UID subtree exactly
-//     (not a prefix that could match a sibling pod), excluding the CRIU binary and the pause PID.
-//  3. Among survivors, select the restored tree's root/leader: a cgroup-resident process whose
-//     PPid is NOT itself in the pod cgroup (CRIU exited, so the tree was reparented to the agent
-//     subreaper / PID 1). Tie-break by LOWEST PID — the leader starts first; higher PIDs are its
-//     children. "Highest PID" is explicitly wrong (can pick a transient child).
-//  4. Retry for up to 10s at 200ms intervals to allow reparenting to become observable.
-//  5. On zero candidates after timeout, return ErrRestoredPIDNotFound (no comm-scan fallback).
-func findRestoredPIDByCgroup(sandboxID string) (int, error) {
-	pausePID, err := sandboxPausePID(sandboxID)
-	if err != nil {
-		return 0, fmt.Errorf("ADR-0123 D2: resolve pause PID for sandbox %s: %w", sandboxID, err)
-	}
-	// Read the pod cgroup path from the pause container. TOCTOU: if the pause PID has exited,
-	// /proc/<pid>/cgroup is gone — fail loud, never scan an empty cgroup (Security note 3).
-	podCgroup, err := cgroupV2Path(pausePID)
-	if err != nil {
-		return 0, fmt.Errorf("ADR-0123 D2: read pod cgroup from pause PID %d (sandbox %s): %w",
-			pausePID, sandboxID, err)
-	}
-
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		pid, found := scanCgroupForRestoredRoot(podCgroup, pausePID)
-		if found {
-			log.Info("findRestoredPIDByCgroup: resolved restored PID via pod cgroup (ADR-0123 D2)",
-				"pid", pid, "sandboxID", sandboxID, "pausePID", pausePID, "podCgroup", podCgroup)
-			return pid, nil
-		}
-		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("%w (sandbox %s, podCgroup %s, pausePID %d, 10s timeout)",
-				ErrRestoredPIDNotFound, sandboxID, podCgroup, pausePID)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-}
-
-// getAgentCgroupPIDs implements ADR-0128: returns the set of PIDs currently resident in the
-// agent's OWN cgroup. It reads /proc/self/cgroup to get the agent's cgroup v2 path, then reads
-// cgroup.procs for that path. Used to snapshot the agent cgroup before CRIU starts so the
-// restored workload PID can be identified as the new entrant afterwards.
-func getAgentCgroupPIDs() (map[int]bool, error) {
-	selfPath, err := cgroupV2Path(os.Getpid())
-	if err != nil {
-		return nil, fmt.Errorf("read agent cgroup path from /proc/self/cgroup: %w", err)
-	}
-	procsPath := filepath.Join("/sys/fs/cgroup", selfPath, "cgroup.procs")
-	data, err := os.ReadFile(procsPath)
-	if err != nil {
-		return nil, fmt.Errorf("read agent cgroup.procs (%s): %w", procsPath, err)
-	}
-	pids := make(map[int]bool)
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if pid, convErr := strconv.Atoi(line); convErr == nil {
-			pids[pid] = true
-		}
-	}
-	return pids, nil
-}
-
-// findRestoredPIDInAgentCgroup implements ADR-0128: with --manage-cgroups=ignore the CRIU-restored
-// process tree lands in the AGENT's cgroup (the launcher's). This scans the agent cgroup for PIDs
-// that were NOT present in beforePIDs (the pre-CRIU snapshot) and are NOT the CRIU process itself,
-// returning the LOWEST such PID — the restored tree root (the leader starts first; children get
-// higher PIDs). Retries for up to 10s at 200ms intervals to allow the restored tree to appear.
-// findRestoredPIDInBrokerCgroup is the ADR-0234 broker-cgroup analogue of
-// findRestoredPIDInAgentCgroup. Because the CRIU wrapper is launched as a child of
-// the privileged broker (ADR-0234), --manage-cgroups=ignore lands the restored tree
-// in the BROKER cgroup, not the agent cgroup. This polls the broker cgroup PID set
-// (returned by exec_poll) and applies the identical new-entrant selection: the
-// lowest PID that was NOT in beforePIDs, is NOT the wrapper PID, and whose comm is
-// not "criu" (defensive). Retries for up to 10s at 200ms, same as the agent-cgroup
-// path. /proc/<pid>/comm is readable agent-side under hostPID:true even though the
-// PID is a broker-cgroup resident.
-func findRestoredPIDInBrokerCgroup(beforePIDs map[int]bool, wrapperPID int, criuCmd *brokerCriuCmd) (int, error) {
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		_, _, brokerCgroupPIDs, pollErr := criuCmd.poll()
-		if pollErr == nil {
-			bestPID := 0
-			for _, pid := range brokerCgroupPIDs {
-				if beforePIDs[pid] || pid == wrapperPID {
-					continue
-				}
-				comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-				if strings.TrimSpace(string(comm)) == "criu" {
-					continue
-				}
-				if bestPID == 0 || pid < bestPID {
-					bestPID = pid
-				}
-			}
-			if bestPID != 0 {
-				log.Info("findRestoredPIDInBrokerCgroup: resolved restored PID via broker cgroup diff (ADR-0234/ADR-0128)",
-					"pid", bestPID, "wrapperPID", wrapperPID)
-				return bestPID, nil
-			}
-		}
-		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("%w (broker-cgroup diff, wrapperPID %d, 10s timeout)", ErrRestoredPIDNotFound, wrapperPID)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-}
-
-func findRestoredPIDInAgentCgroup(beforePIDs map[int]bool, criuPID int) (int, error) {
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		current, err := getAgentCgroupPIDs()
-		if err == nil {
-			bestPID := 0
-			for pid := range current {
-				if beforePIDs[pid] || pid == criuPID {
-					continue
-				}
-				// Defensive: never select the CRIU binary even if PID-reuse hides it.
-				comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-				if strings.TrimSpace(string(comm)) == "criu" {
-					continue
-				}
-				if bestPID == 0 || pid < bestPID {
-					bestPID = pid
-				}
-			}
-			if bestPID != 0 {
-				log.Info("findRestoredPIDInAgentCgroup: resolved restored PID via agent cgroup diff (ADR-0128)",
-					"pid", bestPID, "criuPID", criuPID)
-				return bestPID, nil
-			}
-		}
-		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("%w (agent-cgroup diff, criuPID %d, 10s timeout)", ErrRestoredPIDNotFound, criuPID)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-}
-
 // moveProcessToPodCgroup implements ADR-0128: moves pid into the pod's sandbox cgroup by writing
 // it to <podCgroupPath>/cgroup.procs under /sys/fs/cgroup. A single cgroup.procs write moves the
 // whole thread group of the leader; the CRIU-restored tree shares one cgroup, so moving the root
@@ -3850,62 +3557,149 @@ func moveProcessToPodCgroup(pid int, podCgroupPath string) error {
 	return nil
 }
 
-// scanCgroupForRestoredRoot performs one pass of the ADR-0123 D2 scan over /proc. It returns the
-// lowest-PID cgroup-resident process whose parent is NOT in the pod cgroup (the reparented tree
-// root), excluding the pause PID and the CRIU binary. found is false when no candidate exists.
-func scanCgroupForRestoredRoot(podCgroup string, pausePID int) (int, bool) {
-	procs, err := os.ReadDir("/proc")
-	if err != nil {
-		return 0, false
+// removeStalePidfile deletes a leftover restored-PID pidfile from a prior attempt of the same
+// migration before a CRIU restore launch (C1 fix). CRIU opens --pidfile with O_TRUNC (not O_EXCL),
+// so a leftover restored.pid could be read by the pidfile poll in its first iteration — before the
+// new CRIU process rewrites it — reporting success for the WRONG (stale/recycled) PID. removeFn is
+// injected (os.Remove in production) so the fail-open-on-not-exist vs fail-closed-on-any-other-error
+// behavior is unit-testable without a real filesystem — the same reader-injection pattern used by
+// readRestoredPIDFromPidfileWithReader. Returns nil when the file was removed OR was already absent;
+// returns a wrapped error for any other removeFn failure (an unremovable stale file must never be
+// silently polled past).
+func removeStalePidfile(path string, removeFn func(string) error) error {
+	if err := removeFn(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale restored-PID pidfile %s before CRIU launch: %w", path, err)
 	}
-
-	// First collect the set of cgroup-resident PIDs so we can test parentage against it.
-	resident := make(map[int]bool)
-	for _, p := range procs {
-		if !p.IsDir() {
-			continue
-		}
-		pid, convErr := strconv.Atoi(p.Name())
-		if convErr != nil || pid == pausePID {
-			continue
-		}
-		if procInPodCgroup(pid, podCgroup) {
-			resident[pid] = true
-		}
-	}
-
-	bestPID := 0
-	for pid := range resident {
-		// Exclude the CRIU binary (it has exited on the cold path, but guard defensively).
-		comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-		if strings.TrimSpace(string(comm)) == "criu" {
-			continue
-		}
-		// Root/leader = a cgroup-resident process whose parent is NOT in the pod cgroup.
-		ppid := procPPid(pid)
-		if resident[ppid] {
-			continue // this is a child of another in-cgroup process, not the tree root
-		}
-		// Tie-break by LOWEST PID (the leader starts first).
-		if bestPID == 0 || pid < bestPID {
-			bestPID = pid
-		}
-	}
-	if bestPID == 0 {
-		return 0, false
-	}
-	return bestPID, true
+	return nil
 }
 
-// procInPodCgroup reports whether the cgroup v2 path of pid is within the podCgroup subtree
-// (exact subtree match, not a sibling-pod-matching prefix). A process is in the subtree when its
-// path equals podCgroup or is a descendant (podCgroup + "/...").
-func procInPodCgroup(pid int, podCgroup string) bool {
-	path, err := cgroupV2Path(pid)
-	if err != nil {
-		return false
+// --- Authoritative restored-PID resolution via CRIU --pidfile ---
+//
+// The prior primary resolver (findRestoredPIDInBrokerCgroup) INFERRED the restored PID by
+// diffing the broker cgroup's PID set against a pre-CRIU snapshot and excluding the wrapper
+// PID and any comm=="criu" entrant — a multi-step poll-and-guess, fragile, non-atomic
+// inference chain: CRIU already knows the restored root
+// PID with certainty internally, yet the agent re-derived it externally, non-atomically, on
+// a signal (comm) the restored workload can spoof via prctl(PR_SET_NAME) (ADR-0228 C3).
+//
+// readRestoredPIDFromPidfile replaces that inference with CRIU's own --pidfile primitive
+// (wired in buildCRIURestoreArgs): CRIU writes the restored root task's PID to a file as an
+// authoritative side effect of the restore. This is the source-of-truth answer, and it
+// structurally satisfies ADR-0228's identity invariant — the PID CRIU reports is BY
+// CONSTRUCTION the process CRIU restored (the application), never a holder/wrapper stub — so
+// no comm-based "not-criu" exclusion is needed or used. The only residual check is liveness
+// (verifyRestoredPIDAlive), covering the legitimate case of a process that exits between
+// pidfile-write and use.
+
+// pidfileReadFunc reads the raw bytes of the pidfile. Injected in tests so no real
+// broker/nsenter/host-mount round-trip is required; production passes os.ReadFile.
+type pidfileReadFunc func(path string) ([]byte, error)
+
+// pidfilePollFunc reports whether the CRIU/wrapper process has already exited. When it has
+// AND the pidfile never became valid, the restore has failed and the poll fails FAST rather
+// than waiting out the full backstop budget. May be nil.
+type pidfilePollFunc func() (exited bool, err error)
+
+// pidfilePollInterval is the between-read backoff while waiting for the pidfile to appear.
+const pidfilePollInterval = 50 * time.Millisecond
+
+// readRestoredPIDFromPidfile is the production entry point (real os.ReadFile). It polls the
+// CRIU --pidfile until it holds a well-formed positive PID, the CRIU/wrapper process exits
+// without producing one, or the timeout expires.
+func readRestoredPIDFromPidfile(path string, timeout time.Duration, poll pidfilePollFunc) (int, error) {
+	return readRestoredPIDFromPidfileWithReader(path, timeout, os.ReadFile, poll)
+}
+
+// readRestoredPIDFromPidfileWithReader is the reader-injected core (see pidfileReadFunc).
+func readRestoredPIDFromPidfileWithReader(path string, timeout time.Duration, read pidfileReadFunc, poll pidfilePollFunc) (int, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		// A successful, parseable read WINS unconditionally — even if the process has since
+		// exited: CRIU may write the pidfile shortly before it exits on some paths, so a
+		// valid read is never overridden by a concurrent process-exit observation.
+		if data, err := read(path); err == nil {
+			if pid, ok := parsePidfileContent(data); ok {
+				return pid, nil
+			}
+			// File present but not yet a valid PID (partial write / garbage) — keep polling.
+		}
+		// Fast-fail: CRIU/wrapper already exited and no valid pidfile → restore failed.
+		if poll != nil {
+			if exited, pollErr := poll(); pollErr == nil && exited {
+				return 0, fmt.Errorf("%w (pidfile %s never appeared; CRIU/wrapper process exited)", ErrRestoredPIDNotFound, path)
+			}
+		}
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("%w (pidfile %s not valid within %s)", ErrRestoredPIDNotFound, path, timeout)
+		}
+		time.Sleep(pidfilePollInterval)
 	}
-	return path == podCgroup || strings.HasPrefix(path, podCgroup+"/")
+}
+
+// parsePidfileContent parses a CRIU pidfile body into a positive PID. ok=false for
+// empty / non-integer / non-positive content.
+func parsePidfileContent(data []byte) (pid int, ok bool) {
+	s := strings.TrimSpace(string(data))
+	if s == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// ErrRestoredPIDDead is returned by verifyRestoredPIDAlive when the resolved restored PID is
+// not present, is a zombie/dead, or exits during the settle window (ADR-0228 Invariant 1).
+var ErrRestoredPIDDead = errors.New("restored PID failed liveness verification")
+
+// verifyRestoredPIDAlive implements ADR-0228 Invariant 1's liveness gate: /proc/<pid> exists
+// and the task is not a zombie, re-confirmed after a short settle window to reject a PID that
+// exits between resolution and use. Identity ("not the holder stub") is guaranteed upstream by
+// the --pidfile source-of-truth, so this gate is liveness-only and never consults comm. A
+// settle of 0 skips the re-read (single-shot liveness).
+func verifyRestoredPIDAlive(pid int, settle time.Duration) error {
+	if pid <= 0 {
+		return fmt.Errorf("%w: non-positive pid %d", ErrRestoredPIDDead, pid)
+	}
+	check := func() (alive bool, fatal error) {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err != nil {
+			return false, nil // /proc/<pid> gone → reaped
+		}
+		// state is the field immediately after "(comm)"; comm may contain spaces and ')',
+		// so anchor on the LAST ')'.
+		s := string(data)
+		i := strings.LastIndexByte(s, ')')
+		if i < 0 || i+2 >= len(s) {
+			return false, fmt.Errorf("%w: unparseable /proc/%d/stat", ErrRestoredPIDDead, pid)
+		}
+		switch s[i+2] {
+		case 'Z', 'X', 'x':
+			return false, nil
+		default:
+			return true, nil
+		}
+	}
+	alive, fatal := check()
+	if fatal != nil {
+		return fatal
+	}
+	if !alive {
+		return fmt.Errorf("%w: pid %d not alive at first check", ErrRestoredPIDDead, pid)
+	}
+	if settle > 0 {
+		time.Sleep(settle)
+		alive, fatal = check()
+		if fatal != nil {
+			return fatal
+		}
+		if !alive {
+			return fmt.Errorf("%w: pid %d exited or became a zombie during the settle window", ErrRestoredPIDDead, pid)
+		}
+	}
+	return nil
 }
 
 // cgroupV2Path returns the unified cgroup v2 path (the "0::<path>" entry) for pid from
@@ -3922,25 +3716,6 @@ func cgroupV2Path(pid int) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no cgroup v2 (0::) entry in /proc/%d/cgroup", pid)
-}
-
-// procPPid returns the parent PID of pid by reading field 4 (PPid) of /proc/<pid>/status.
-// Returns 0 on any read/parse error.
-func procPPid(pid int) int {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
-	if err != nil {
-		return 0
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "PPid:") {
-			fields := strings.Fields(line)
-			if len(fields) == 2 {
-				ppid, _ := strconv.Atoi(fields[1])
-				return ppid
-			}
-		}
-	}
-	return 0
 }
 
 // sandboxPausePID resolves the host PID of the pause/sandbox container identified by sandboxID
@@ -3985,6 +3760,96 @@ var patchCheckpointImagesFn = func(checkpointDir string, inheritFdNames []string
 	return err
 }
 
+// classifyRegFdPy is the SINGLE files.img REG-fd classifier used by patchCheckpointImages.
+//
+// Before this refactor the skip/rebind/hard-stop ladder was written out inline TWICE — once
+// in the main reconciliation pass and once in the post-write consistency re-check — and the
+// two copies could (and historically did) drift, producing blind spots. It is now one Python
+// function, `classify_reg_fd(entry, ctx)`, returning exactly one action:
+//
+//   - 'KEEP'            the fd is outside the PLAIN-REG hard-stop class (external / remap /
+//                       inherited / sentinel mnt_id) OR already consistent (mnt_id kept): no change.
+//   - 'REBIND_TO_ROOT'  a PLAIN-REG *directory* fd with an orphan mnt_id whose rebind target
+//                       (root_mnt_id) is sane: rebind mnt_id → root (covers both generic
+//                       ADR-0193 §4 orphans and ADR-0194 B-2 ext-drop lockstep). The production
+//                       call site emits a WARNING for every such rebind (ADR-0245 D2 visibility).
+//   - 'DECLINE'         a PLAIN-REG *non-directory* fd with an orphan mnt_id (cannot be safely
+//                       rebound — would still fire mount.c:3953 / P-0193-1), OR a *directory* fd
+//                       whose rebind target root_mnt_id is unusable (missing / not a kept
+//                       mountpoint): hard-stop rather than redirect the fd onto another absent
+//                       mnt_id (ADR-0245 D2 fail-closed target validation).
+//
+// ctx carries the cross-image sets the decision needs: remap_ids, inherit_fd_names,
+// kept_mnt_ids, ext_drop_mnt_ids, root_mnt_id. The mnt_id>0 / open_path() discriminants are the
+// CRIU-4.2 source-proven predicate (files-reg.c:2191-2263, mount.c:3946-3953).
+//
+// This constant is prepended verbatim to the production patch script AND is exercised
+// directly (in --classify-selftest mode) by TestClassifyRegFd_RealScript — the test runs the
+// SAME code that ships, not a Go re-implementation of it (the anti-pattern that let
+// patch_checkpoint_regfd_test.go's Go mirror miss real defects).
+const classifyRegFdPy = `
+import sys, os, json
+
+_S_IFMT  = 0o170000
+_S_IFDIR = 0o040000
+
+def classify_reg_fd(entry, ctx):
+    if entry.get('type') != 'REG':
+        return 'KEEP'
+    reg = entry.get('reg', {})
+    fd_id = entry.get('id', -1)
+    name = reg.get('name', '') or ''
+    mnt_id = reg.get('mnt_id')
+    # External (rfe->ext): exits before open_path().
+    if bool(reg.get('ext', False)):
+        return 'KEEP'
+    # Remap: graceful rfi_remap (files-reg.c:2066).
+    if fd_id in ctx['remap_ids']:
+        return 'KEEP'
+    # Inherited: inherited_fd() exits at line 2200 (slash-stripped names, ADR-0188).
+    if name.lstrip('/') in ctx['inherit_fd_names']:
+        return 'KEEP'
+    # Sentinel mnt_id (None/0/-1): rebinds to mntinfo, safe.
+    if mnt_id is None or mnt_id <= 0:
+        return 'KEEP'
+    # Consistent: mnt_id is in the kept mountpoints set.
+    if mnt_id in ctx['kept_mnt_ids']:
+        return 'KEEP'
+    # Positive orphan mnt_id — PLAIN-REG class that would fire mount.c:3953.
+    if (reg.get('mode', 0) & _S_IFMT) == _S_IFDIR:
+        # ADR-0245 D2 (Storage Architect finding): an orphan *directory* fd is rebound to the
+        # container root instead of hard-stopping. That rebind is only safe if the rebind
+        # TARGET is itself sane — root_mnt_id must exist AND be a kept mountpoint, otherwise
+        # rebinding would just move the fd onto another mnt_id that is ALSO absent from the
+        # restored mount set and fire mount.c:3953 anyway. Previously this was assumed rather
+        # than checked, so a directory fd could be silently redirected to an unusable target.
+        # Validate the target here; if it is not sane, fail loud (DECLINE) — consistent with
+        # this redesign's fail-closed philosophy everywhere else (pidfile primitive, C1 guard).
+        # The visibility half of the fix (a WARNING on every directory rebind that DOES fire)
+        # lives at the production call site, which alone holds the fd path/label for diagnostics.
+        root_mnt_id = ctx.get('root_mnt_id')
+        if root_mnt_id is None or root_mnt_id not in ctx['kept_mnt_ids']:
+            return 'DECLINE'
+        return 'REBIND_TO_ROOT'
+    return 'DECLINE'
+
+# --classify-selftest: read {"ctx":{...},"entries":[...]} from stdin, print the action list.
+# Dormant in production (the patch script never passes this argv). This is the entry point the
+# Go unit test drives, so the shipped classifier is what gets tested.
+if len(sys.argv) >= 2 and sys.argv[1] == '--classify-selftest':
+    _p = json.loads(sys.stdin.read())
+    _c = _p.get('ctx', {})
+    _ctx = {
+        'remap_ids': set(_c.get('remap_ids', [])),
+        'inherit_fd_names': set(_c.get('inherit_fd_names', [])),
+        'kept_mnt_ids': set(_c.get('kept_mnt_ids', [])),
+        'ext_drop_mnt_ids': set(_c.get('ext_drop_mnt_ids', [])),
+        'root_mnt_id': _c.get('root_mnt_id'),
+    }
+    print(json.dumps([classify_reg_fd(e, _ctx) for e in _p.get('entries', [])]))
+    sys.exit(0)
+`
+
 // patchCheckpointImages modifies the CRIU image files in checkpointDir to remove entries
 // that cannot be restored cross-node, and enforces the files.img↔mountpoints consistency
 // invariant (ADR-0193 P-0193-1).
@@ -4016,7 +3881,9 @@ func patchCheckpointImages(checkpointDir string, inheritFdNames []string) ([]Ext
 	if err != nil {
 		return nil, fmt.Errorf("marshal inherit fd names: %w", err)
 	}
-	patchScript := `
+	// The single REG-fd classifier (classifyRegFdPy) is prepended verbatim so the main pass and
+	// the consistency re-check below both call the one classify_reg_fd() abstraction.
+	patchScript := classifyRegFdPy + `
 import sys, os, shutil, glob, json
 import pycriu
 from pycriu.images import MagicException
@@ -4390,57 +4257,55 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
         print('PATCH_ERROR: %s:unknown:%s' % (files_img_path, str(fe)), file=sys.stderr)
         sys.exit(1)
 
-    S_IFMT  = 0o170000
-    S_IFDIR = 0o040000
+    # Single source of truth for the REG-fd decision: classify_reg_fd (classifyRegFdPy).
+    # ctx carries the cross-image sets. ext_drop_mnt_ids is a dict (mnt_id->ext_key); its key
+    # set is passed for completeness (classify only needs membership of the other four sets).
+    classify_ctx = {
+        'remap_ids': remap_ids,
+        'inherit_fd_names': inherit_fd_names,
+        'kept_mnt_ids': kept_mnt_ids,
+        'ext_drop_mnt_ids': set(ext_drop_mnt_ids),
+        # ADR-0245 D2: rebind-target for orphan directory fds. The classifier validates this is
+        # a sane (present + kept) target before authorizing REBIND_TO_ROOT; otherwise DECLINE.
+        'root_mnt_id': root_mnt_id,
+    }
     modified = False
     for entry in files_img.get('entries', []):
-        if entry.get('type') != 'REG':
+        action = classify_reg_fd(entry, classify_ctx)
+        if action == 'KEEP':
             continue
         reg = entry.get('reg', {})
         fd_id = entry.get('id', -1)
-        name = reg.get('name', '')
+        name = reg.get('name', '') or ''
         mnt_id = reg.get('mnt_id')
-        mode = reg.get('mode', 0)
-        is_ext = bool(reg.get('ext', False))
-
-        # Skip if external (rfe->ext): exits before line 2263.
-        if is_ext:
-            continue
-        # Skip if remap: exits via graceful rfi_remap (files-reg.c:2066, return -1).
-        if fd_id in remap_ids:
-            continue
-        # Skip if inherited: inherited_fd() exits at line 2200.
-        # inherit_fd_names uses slash-stripped names (ADR-0188): strip leading '/' for comparison.
-        name_stripped = name.lstrip('/')
-        if name_stripped in inherit_fd_names:
-            continue
-        # Skip if mnt_id is None, 0, or -1 (sentinel: rebinds to mntinfo, safe).
-        if mnt_id is None or mnt_id <= 0:
-            continue
-
-        # This fd is in the PLAIN-REG class: it will reach open_path() line 2263.
-        # Check if its mnt_id is in the kept mountpoints set.
-        if mnt_id in kept_mnt_ids:
-            continue  # Consistent — no action needed.
-
-        # Positive orphan mnt_id — action required.
-        is_dir = (mode & S_IFMT) == S_IFDIR
         name_leaf = os.path.basename(name) if name else str(fd_id)
-
-        if is_dir:
-            # C-R3-3 / ADR-0194 B-2 lockstep: REG directory fd with no remap — rebind to
-            # root mnt_id (drop-together). This fires for both:
-            #   (a) generic PLAIN-REG dir orphans (ADR-0193 §4), and
-            #   (b) fds whose mnt_id was in ext_drop_mnt_ids (ADR-0194 B-2 lockstep rebind —
-            #       the symmetric operation that ADR-0193 claimed but never applied).
-            # P-0193-1b / P-0194-1 unified: structured log line (full path stays in
-            # 0700-bounded log — not leaked to world-readable K8s Events).
-            action = 'b2-lockstep-ext-drop' if mnt_id in ext_drop_mnt_ids else 'rebind-to-root'
-            print('pm-image-consistency: reconcile fd_id=%d name=%s backing_mnt_id=%d action=%s new_mnt_id=%d' % (
-                fd_id, name, mnt_id, action, root_mnt_id))
+        if action == 'REBIND_TO_ROOT':
+            # C-R3-3 / ADR-0194 B-2 lockstep: REG directory fd with an orphan mnt_id — rebind to
+            # root mnt_id (drop-together). Covers both generic PLAIN-REG dir orphans (ADR-0193 §4)
+            # and fds whose mnt_id was in ext_drop_mnt_ids (ADR-0194 B-2 lockstep). The label is
+            # diagnostic only; the classifier's decision is identical for both.
+            label = 'b2-lockstep-ext-drop' if mnt_id in ext_drop_mnt_ids else 'generic-orphan'
+            # ADR-0245 D2 (Storage Architect finding): a directory-fd rebind is NOT silent
+            # success. Redirecting an open directory handle from its checkpoint-time backing
+            # mount to the container root is benign for PodMotion checkpoint scaffolding (the
+            # /podmotion holder mount, dropped externals that re-attach at the destination) but
+            # would be a data-visibility change if a live workload held an open directory handle
+            # inside an actively-managed persistent volume (Longhorn / Ceph RBD / RWX NFS
+            # subdirectory / snapshot-rsync target) at checkpoint time. The classifier cannot
+            # distinguish those two cases from the image alone (a PV mount handled as external
+            # lands in ext_drop_mnt_ids exactly like scaffolding does), so instead of silently
+            # picking one interpretation we make EVERY directory rebind LOUD and structured, so
+            # it is visible in restore logs/diagnostics and can be correlated against the
+            # workload's known volume set. The 'generic-orphan' label (mnt_id in neither the
+            # kept nor the ext-drop set) is the higher-suspicion case — an fd backed by a mount
+            # that simply vanished from the mountpoints image — and is called out explicitly.
+            print('WARNING pm-image-consistency: directory-fd rebind — fd_id=%d name=%s backing_mnt_id=%d label=%s new_mnt_id=%d (open directory handle redirected to container root; verify this is not a live persistent-volume directory)' % (
+                fd_id, name, mnt_id, label, root_mnt_id))
+            print('CRIU_IMAGE_DIR_FD_REBOUND:{"fd_id":%d,"name":"%s","backing_mnt_id":%d,"new_mnt_id":%d,"label":"%s"}' % (
+                fd_id, name.replace('"', '\\"'), mnt_id, root_mnt_id, label))
             reg['mnt_id'] = root_mnt_id
             modified = True
-        else:
+        elif action == 'DECLINE':
             # Non-directory REG fd with positive orphan mnt_id — cannot safely rebind.
             # Hard-stop: P-0193-1 (C-R3-3 non-directory path).
             print('CRIU_IMAGE_INCONSISTENCY:{"fd_id":%d,"name_leaf":"%s","backing_mnt_id":%d}' % (
@@ -4473,29 +4338,22 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
     # Re-load the committed files.img to check the final on-disk state.
     with open(files_img_path, 'rb') as f:
         files_img_final = pycriu.images.load(f)
+    # Re-check uses the SAME classify_reg_fd abstraction as the main pass (classify_ctx is
+    # unchanged — the rebind above set orphan dir fds to root_mnt_id, which IS in kept_mnt_ids,
+    # so those now classify KEEP). Any surviving non-KEEP action means an fd would still fire
+    # mount.c:3953 → hard-stop. One classifier, both passes: no divergent copy to drift.
     for entry in files_img_final.get('entries', []):
-        if entry.get('type') != 'REG':
+        if classify_reg_fd(entry, classify_ctx) == 'KEEP':
             continue
         reg = entry.get('reg', {})
         fd_id = entry.get('id', -1)
-        name = reg.get('name', '')
+        name = reg.get('name', '') or ''
         mnt_id = reg.get('mnt_id')
-        is_ext = bool(reg.get('ext', False))
-        if is_ext:
-            continue
-        if fd_id in remap_ids:
-            continue
-        name_stripped = name.lstrip('/')
-        if name_stripped in inherit_fd_names:
-            continue
-        if mnt_id is None or mnt_id <= 0:
-            continue
-        if mnt_id not in kept_mnt_ids:
-            name_leaf = os.path.basename(name) if name else str(fd_id)
-            # P-0193-1 / P-0194-1 unified: hard-stop — this fd would still fire mount.c:3953.
-            print('CRIU_IMAGE_INCONSISTENCY:{"fd_id":%d,"name_leaf":"%s","backing_mnt_id":%d}' % (
-                fd_id, name_leaf.replace('"', '\\"'), mnt_id), file=sys.stderr)
-            sys.exit(1)
+        name_leaf = os.path.basename(name) if name else str(fd_id)
+        # P-0193-1 / P-0194-1 unified: hard-stop — this fd would still fire mount.c:3953.
+        print('CRIU_IMAGE_INCONSISTENCY:{"fd_id":%d,"name_leaf":"%s","backing_mnt_id":%d}' % (
+            fd_id, name_leaf.replace('"', '\\"'), mnt_id), file=sys.stderr)
+        sys.exit(1)
 
     # P-0194-1c cross-image assertion (SC-2): verify dual-write consistency.
     # After rename: mountpoints must have no /data (ext_drop mnt_ids absent from kept_mnt_ids),
@@ -4693,7 +4551,7 @@ func nsenterCmd(args ...string) *brokerCmd {
 // (exec_start / exec_poll / exec_signal) — a detached-spawn + host-PID-return +
 // cross-process-reap mechanism — and routing the wrapper launch through them. The
 // brokerCriuCmd type below emulates the exact *exec.Cmd subset the joinNsRestore
-// call site uses, backed by the broker. nsenterLocalCmd is REMOVED (removal-symmetry audit: its
+// call site uses, backed by the broker. nsenterLocalCmd is REMOVED (its
 // sole consumer, the wrapper launch, is converted in the same commit). The main
 // agent stays privileged:false (SD-1); the broker (privileged:true) does the setns.
 
@@ -4900,104 +4758,6 @@ func setupRestoreOverlayfs(migrationName, checkpointDir, imageName, containerID 
 	return "", fmt.Errorf("placeholder container rootfs overlay not mounted after 5s (checked via /proc/1/mounts): %s", rootfsDir)
 }
 
-// findRestoredProcessPID scans /proc for the restored container process by reading the
-// expected comm name from config.json process.args[0] in checkpointDir.
-// Falls back to scanning for any recently-created non-pause process if config.json is absent.
-func findRestoredProcessPID(checkpointDir string) (int, error) {
-	// Determine the expected process name from config.json.
-	expectedComm := ""
-	cfgData, err := os.ReadFile(filepath.Join(checkpointDir, "config.json"))
-	if err == nil {
-		var cfg struct {
-			Process struct {
-				Args []string `json:"args"`
-			} `json:"process"`
-		}
-		if json.Unmarshal(cfgData, &cfg) == nil && len(cfg.Process.Args) > 0 {
-			expectedComm = filepath.Base(cfg.Process.Args[0])
-		}
-	}
-
-	procs, _ := os.ReadDir("/proc")
-
-	// First pass: look for an exact comm match.
-	if expectedComm != "" {
-		for _, p := range procs {
-			if !p.IsDir() {
-				continue
-			}
-			comm, _ := os.ReadFile(fmt.Sprintf("/proc/%s/comm", p.Name()))
-			commStr := strings.TrimSpace(string(comm))
-			if commStr != expectedComm {
-				continue
-			}
-			pid, err := strconv.Atoi(p.Name())
-			if err != nil {
-				continue
-			}
-			return pid, nil
-		}
-		// Exact match not found — the entrypoint may have exec'd into the real
-		// process (e.g. docker-entrypoint.sh → redis-server).  Fall through to
-		// the generic non-pause scan below rather than failing immediately.
-	}
-
-	// Second pass (fallback): find a process in the agent's own cgroup that is NOT
-	// the agent binary itself.  CRIU-restored processes inherit the cgroup of the
-	// CRIU subprocess (which runs under podmotion-agent-ctl.service), so filtering
-	// by cgroup reliably excludes kubepods containers and host system processes.
-	agentCgroup, _ := os.ReadFile("/proc/self/cgroup")
-	agentCgroupStr := strings.TrimSpace(string(agentCgroup))
-	// Extract the last path component from "0::<path>" to get the service unit name.
-	agentCgroupPath := ""
-	for _, line := range strings.Split(agentCgroupStr, "\n") {
-		if strings.HasPrefix(line, "0::") {
-			agentCgroupPath = strings.TrimPrefix(line, "0::")
-			break
-		}
-	}
-
-	agentPID := os.Getpid()
-	bestPID := 0
-	bestStartTicks := uint64(0)
-	for _, p := range procs {
-		if !p.IsDir() {
-			continue
-		}
-		pid, err := strconv.Atoi(p.Name())
-		if err != nil || pid == agentPID {
-			continue
-		}
-		comm, _ := os.ReadFile(fmt.Sprintf("/proc/%s/comm", p.Name()))
-		commStr := strings.TrimSpace(string(comm))
-		if commStr == "" || commStr == "pause" || commStr == "podmotion-agent" {
-			continue
-		}
-		if agentCgroupPath != "" {
-			procCgroup, _ := os.ReadFile(fmt.Sprintf("/proc/%s/cgroup", p.Name()))
-			if !strings.Contains(string(procCgroup), agentCgroupPath) {
-				continue
-			}
-		}
-		// Among matching processes, prefer the one with the highest start time
-		// (most recently created = the CRIU-restored process from this run).
-		statData, _ := os.ReadFile(fmt.Sprintf("/proc/%s/stat", p.Name()))
-		fields := strings.Fields(string(statData))
-		var startTicks uint64
-		if len(fields) >= 22 {
-			startTicks, _ = strconv.ParseUint(fields[21], 10, 64)
-		}
-		if startTicks > bestStartTicks {
-			bestStartTicks = startTicks
-			bestPID = pid
-		}
-	}
-	if bestPID != 0 {
-		return bestPID, nil
-	}
-	return 0, fmt.Errorf("findRestoredProcessPID: no CRIU-restored process found in agent cgroup after restore (expectedComm=%q)", expectedComm)
-}
-
 // buildMinimalOCIConfig strips pod-specific paths from config.json, leaving only
 // the process spec and standard container mounts. Uses fresh network/ipc/uts namespaces.
 func buildMinimalOCIConfig(src map[string]interface{}, rootfsDir string) map[string]interface{} {
@@ -5197,6 +4957,31 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 			freezeStart := time.Now()
 			sizeBytes, ctrErr := ctrCheckpoint(taskID, imagesDir, tcpEstablished)
 			freezeDurationMs := time.Since(freezeStart).Milliseconds()
+
+			// Sprint 41 NR-BLOCK-2 investigation
+			// (docs/sprints/SPRINT41-NR-BLOCK-2-POD-SCOPE-INVESTIGATION.md): `ctr tasks
+			// checkpoint` invokes CRIU (via runc) against the still-alive workload PID,
+			// which injects a parasite "CRIUMFD" memfd mapping to help dump the process's
+			// own memory. On a successful dump CRIU's own cure step unmaps this; on a
+			// failed/aborted dump it can be left permanently mapped — and since rollback
+			// keeps the source process alive rather than restarting it, every
+			// failed/retried attempt against the same PID stacks one more leaked mapping
+			// (proven live: 5 retries -> 8 stacked leaked pairs). Run the cleanup
+			// unconditionally after EVERY attempt — success or failure — so a retried
+			// Checkpoint never accumulates parasite mappings in the workload process.
+			if ctrPIDForCleanup, cleanupPIDErr := FindContainerPID(podUID); cleanupPIDErr == nil {
+				if cleaned, cleanupErr := criu.CleanupLeakedParasiteMemfds(ctrPIDForCleanup); cleanupErr != nil {
+					log.Error(cleanupErr, "Checkpoint: leaked CRIU parasite memfd cleanup failed (best-effort, non-fatal)",
+						"migration", req.MigrationName, "pid", ctrPIDForCleanup)
+				} else if cleaned > 0 {
+					log.Info("Checkpoint: cleaned up leaked CRIU parasite memfd mapping(s) (SPRINT41-NR-BLOCK-2)",
+						"migration", req.MigrationName, "pid", ctrPIDForCleanup, "cleanedCount", cleaned)
+				}
+			} else {
+				log.Info("Checkpoint: skipping parasite memfd cleanup — container PID not resolvable (process likely gone)",
+					"migration", req.MigrationName, "err", cleanupPIDErr)
+			}
+
 			if ctrErr != nil {
 				// Fall through to raw CRIU only for in-flight/established TCP socket failures —
 				// ctr invokes CRIU without --tcp-established, so containers with active TCP
@@ -5220,6 +5005,20 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 				sha := sha256OfDir(imagesDir)
 				log.Info("Checkpoint complete (ctr)", "migration", req.MigrationName,
 					"sizeBytes", sizeBytes, "sha256", sha, "freezeMs", freezeDurationMs)
+				// ADR-0246 D1/D4: fail closed before transfer if the checkpoint references an
+				// anon-shmem segment (mm-*.img) with no matching pagemap-shmem-<shmid>.img — the
+				// confirmed CRIU 4.2 anon-shmem dump defect. Runs unconditionally on both the
+				// ctr-native path (here) and the raw-CRIU fallback path below; not scoped to one
+				// entry point (D1 step 4).
+				if shmemErr := verifyShmemPagemapCompleteness(imagesDir); shmemErr != nil {
+					log.Error(shmemErr, "Checkpoint (ctr): incomplete shmem pagemap set — refusing to transfer (ADR-0246)",
+						"migration", req.MigrationName)
+					// ADR-0246 typed-status redesign: return codes.FailedPrecondition with a
+					// structured errdetails.ErrorInfo{Reason: ShmemPagemapMissingReason} payload
+					// so the controller classifies this via grpcStatus.Details(), not string
+					// matching (mirrors the ErrCRIUCapability pattern below).
+					return nil, newShmemPagemapMissingStatus(shmemErr)
+				}
 				// Capture socket inventory from the (now frozen) container via its PID.
 				// Non-fatal: ctr checkpoint already succeeded; SeqSnapshot is best-effort here.
 				var ctrSeqSnapshots []*agentpb.SeqSnapshot
@@ -5336,6 +5135,22 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 	// SD-4: ptrace is no longer expected once Dump returns (success or failure) — close the
 	// window immediately on the happy path. The deferred close above is the fallback only.
 	_ = seccomp.PtraceWindowClose(req.MigrationName)
+
+	// Sprint 41 NR-BLOCK-2 investigation
+	// (docs/sprints/SPRINT41-NR-BLOCK-2-POD-SCOPE-INVESTIGATION.md): same leaked-parasite
+	// cleanup as the ctr-native path above, run here for the raw-CRIU (go-criu CLI-exec)
+	// fallback Dump path — CRIU injects the same "CRIUMFD" parasite regardless of whether
+	// it was invoked via `ctr tasks checkpoint` or directly, so both entry points must run
+	// the cleanup on every attempt (success or failure) against the still-alive containerPID.
+	if containerPID != 0 {
+		if cleaned, cleanupErr := criu.CleanupLeakedParasiteMemfds(containerPID); cleanupErr != nil {
+			log.Error(cleanupErr, "Checkpoint: leaked CRIU parasite memfd cleanup failed (raw-CRIU path, best-effort, non-fatal)",
+				"migration", req.MigrationName, "pid", containerPID)
+		} else if cleaned > 0 {
+			log.Info("Checkpoint: cleaned up leaked CRIU parasite memfd mapping(s) (raw-CRIU path, SPRINT41-NR-BLOCK-2)",
+				"migration", req.MigrationName, "pid", containerPID, "cleanedCount", cleaned)
+		}
+	}
 
 	// freezeTimestampNs is CLOCK_REALTIME ns captured immediately after CRIU dump
 	// returns. When LeaveStopped=true the process is in SIGSTOP at this point.
@@ -5459,6 +5274,19 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 	}
 
 	log.Info("Checkpoint complete", "path", checkpointPath, "sha256", sha256sum, "fallback", fallbackNote)
+
+	// ADR-0246 D1/D4: fail closed before transfer if the checkpoint references an anon-shmem
+	// segment (mm-*.img) with no matching pagemap-shmem-<shmid>.img — the confirmed CRIU 4.2
+	// anon-shmem dump defect. Must run here, before encryptCheckpointDir below, since the guard
+	// needs to read plaintext mm-*.img/pagemap-shmem-*.img content. Runs unconditionally on both
+	// the raw-CRIU fallback path (here) and the ctr-native path above (D1 step 4).
+	if shmemErr := verifyShmemPagemapCompleteness(imagesDir); shmemErr != nil {
+		log.Error(shmemErr, "Checkpoint (raw CRIU): incomplete shmem pagemap set — refusing to transfer (ADR-0246)",
+			"migration", req.MigrationName)
+		// ADR-0246 typed-status redesign: see the ctr-native call site above for the full
+		// rationale — same treatment on this path, unconditionally, per D1 step 4.
+		return nil, newShmemPagemapMissingStatus(shmemErr)
+	}
 
 	// SD-2 (ADR-0029, ADR-0160): encrypt the checkpoint layer set AT REST in final/ before the
 	// transfer phase reads it — encrypt-on-write at its source so ciphertext, never plaintext,

@@ -522,7 +522,7 @@ intervention for routine version bumps.
 
 ### Agentic Review panel Testing Pipeline (`.github/workflows/cert-review.yml`)
 - Triggered by: version-bump PR label `needs-certification`
-- Fan-out: one Claude agent per affected matrix row (OS × k8s × CNI × CSI combination to re-test)
+- Fan-out: one the AI assistant agent per affected matrix row (OS × k8s × CNI × CSI combination to re-test)
 - Each agent:
   1. Provisions a kind cluster with the new component version (via `make kind-create VERSION=...`)
   2. Runs the relevant E2E test suite (`make test-e2e SUITE=<test_suite>`)

@@ -1,6 +1,6 @@
 # PodMotion Security Architecture & Remediation Plan
 
-**Author:** Agent 0A (Lead Architect, K8s OSS Security)
+**Author:** Platform architecture, informed by a K8s OSS security review
 **Date:** 2026-06-14
 **Status:** Draft for architecture review
 **Design principle:** Solid remediation designs OR better primitives that mitigate risk. Every open finding below carries a concrete design or a lower-level primitive, not generic advice.

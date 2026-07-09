@@ -52,7 +52,7 @@ type CRIUCheckpointer struct {
 	criuBinaryPath string
 
 	mu              sync.Mutex
-	activeCriu      *gocriu.Criu // non-nil while a dump/restore is in progress
+	activeCriu      *gocriu.Criu  // non-nil while a dump/restore is in progress
 	removedNetLinks []removedLink // links deleted pre-dump for restore-side recreation
 }
 
@@ -124,6 +124,15 @@ func (c *CRIUCheckpointer) PreDump(ctx context.Context, opts PreDumpOptions) (Ch
 	case res := <-done:
 		if res.err != nil {
 			predumpLog, _ := os.ReadFile(filepath.Join(opts.ImagesDir, "predump.log"))
+			// SPRINT41-NR-BLOCK-2: pre-dump also injects a parasite into the still-alive
+			// workload PID; a failed pre-dump can leak the same CRIUMFD mapping as a
+			// failed final Dump. Clean up before surfacing the error (best-effort).
+			logger := logf.FromContext(ctx)
+			if cleaned, cleanupErr := CleanupLeakedParasiteMemfds(opts.Pid); cleanupErr != nil {
+				logger.Error(cleanupErr, "post-failure CRIU parasite memfd cleanup failed (pre-dump)", "pid", opts.Pid)
+			} else if cleaned > 0 {
+				logger.Info("cleaned up leaked CRIU parasite memfd mapping(s) after failed pre-dump", "pid", opts.Pid, "cleanedCount", cleaned)
+			}
 			return CheckpointResult{}, fmt.Errorf("criu pre-dump: %w\nstderr: %s\nlog: %s",
 				res.err, stderr.String(), string(predumpLog))
 		}
@@ -234,7 +243,7 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		// These masking mounts carry NO workload state — they are empty tmpfs the runtime
 		// re-provides from its own bundle on restore. The restore-side SkipMnt list (below)
 		// ALREADY skips this exact set; the dump side did not, so the dump tried to tar them.
-		// §3h-SYM removal/skip-symmetry: skip them at dump time too so CRIU never tar-dumps
+		// removal/skip-symmetry: skip them at dump time too so CRIU never tar-dumps
 		// their content. Skipping the content does not lose state (tmpfs is empty) and keeps
 		// the dump/restore skip sets symmetric. No `tar` fork is attempted for a skipped mount.
 		"/proc/acpi",
@@ -254,11 +263,11 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		// is denied in the constrained agent container, producing the identical
 		// filesystems.c:426 "Can't dump tmpfs content" abort — just one mount later in
 		// the dump order once the /proc/* masking mounts are skipped (healthy-descent
-		// frontier advance, §19f). The projected token is NOT migrated state: it is
+		// frontier advance). The projected token is NOT migrated state: it is
 		// re-provided by the DESTINATION kubelet's own projected-volume plumbing on
 		// restore, which is exactly why the restore-side SkipMnt list below already
 		// skips /var/run/secrets/kubernetes.io/serviceaccount. Skip it at dump too to
-		// keep the dump/restore skip sets symmetric (§3h-SYM). Both /run and /var/run
+		// keep the dump/restore skip sets symmetric. Both /run and /var/run
 		// spellings are listed because the path appears as /run/... in this pod's mount
 		// table while the restore side carries the canonical /var/run/... form
 		// (/var/run is conventionally a symlink to /run); --skip-mnt matches the path
@@ -292,17 +301,17 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		// the need for it. ADR-0227's --manage-cgroups=ignore and ADR-0228's masked-tmpfs
 		// skips advanced the dump frontier into the mountpoint pass; /dev is the FIRST
 		// obscured-parent tmpfs CRIU tries to read via setns (healthy-descent frontier
-		// advance, §19f).
+		// advance).
 		//
 		// The container /dev tmpfs carries NO migratable workload state: it is the
 		// standard device-node set (/dev/null, /dev/zero, /dev/urandom, /dev/console,
 		// ...) that the DESTINATION runtime re-provides verbatim from the OCI spec on
 		// restore, and its tmpfs children (shm/mqueue/pts) are likewise runtime-provided.
 		// Redis opens none of /dev as persistent state. Skip /dev (and its overmounting
-		// tmpfs children, for §3h-SYM removal symmetry so no child is dumped without its
+		// tmpfs children, for removal symmetry so no child is dumped without its
 		// parent) at dump time. --skip-mnt short-circuits dump_one_mountpoint BEFORE the
 		// visibility check fires, so CRIU never attempts the setns. The restore-side
-		// SkipMnt below mirrors this exact set (§3h-SYM dump/restore skip symmetry).
+		// SkipMnt below mirrors this exact set (dump/restore skip symmetry).
 		"/dev",
 		"/dev/shm",
 		"/dev/mqueue",
@@ -378,7 +387,7 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		// provisioned by the destination CNI. Dump the net namespace as empty so CRIU
 		// does NOT invoke the external `ip` tool to save addresses/routes. The agent
 		// image is minimal and does not ship iproute2, so without --empty-ns net CRIU
-		// fails with: execvp("ip", ...) failed: No such file or directory ->
+		// fails with: exec of "ip" failed: No such file or directory ->
 		// "net: IP tool failed on addr save" -> "Dumping FAILED" (Sprint 31).
 		dumpArgs = append(dumpArgs, "--empty-ns", "net")
 	}
@@ -463,6 +472,17 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 			"criuError", dumpErr.Error(),
 			"dumpLog", string(dumpLogBytes),
 		)
+		// SPRINT41-NR-BLOCK-2: on a failed dump, CRIU's parasite-injection cure step is
+		// not guaranteed to run (see docs/sprints/SPRINT41-NR-BLOCK-2-POD-SCOPE-INVESTIGATION.md).
+		// The workload PID stays alive across rollback/retry, so any leaked CRIUMFD parasite
+		// memfd mapping must be cleaned up here or it accumulates one leaked mapping per
+		// failed retry against the same still-alive process. Best-effort: never mask the
+		// real dump error with a cleanup error, just log it.
+		if cleaned, cleanupErr := CleanupLeakedParasiteMemfds(opts.Pid); cleanupErr != nil {
+			logger.Error(cleanupErr, "post-failure CRIU parasite memfd cleanup failed", "pid", opts.Pid)
+		} else if cleaned > 0 {
+			logger.Info("cleaned up leaked CRIU parasite memfd mapping(s) after failed dump", "pid", opts.Pid, "cleanedCount", cleaned)
+		}
 		return CheckpointResult{}, fmt.Errorf("criu.Dump(pid=%d): %w\nstderr: %s\ndump.log: %s", opts.Pid, dumpErr, stderr.String(), string(dumpLogBytes))
 	}
 
@@ -476,6 +496,13 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	// failed (e.g. network-lock or ptrace error) even though go-criu returned nil.
 	if _, statErr := os.Stat(filepath.Join(opts.ImagesDir, "inventory.img")); statErr != nil {
 		dumpLog, _ := os.ReadFile(filepath.Join(opts.ImagesDir, "dump.log"))
+		// Same leaked-parasite risk as the dumpErr!=nil path above: this is still a failed
+		// dump attempt against a still-alive PID (see SPRINT41-NR-BLOCK-2 investigation).
+		if cleaned, cleanupErr := CleanupLeakedParasiteMemfds(opts.Pid); cleanupErr != nil {
+			logger.Error(cleanupErr, "post-failure (silent) CRIU parasite memfd cleanup failed", "pid", opts.Pid)
+		} else if cleaned > 0 {
+			logger.Info("cleaned up leaked CRIU parasite memfd mapping(s) after silently-failed dump", "pid", opts.Pid, "cleanedCount", cleaned)
+		}
 		return CheckpointResult{}, fmt.Errorf("criu dump (pid=%d): inventory.img not written — dump may have failed silently\ndump.log:\n%s", opts.Pid, string(dumpLog))
 	}
 
@@ -579,9 +606,9 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 	// Restore opts mirror the Dump opts: same TCP/shell settings, detached mode
 	// so the restored process tree is reparented to init rather than CRIU.
 	criuOpts := &rpc.CriuOpts{
-		ImagesDirFd:     proto.Int32(int32(imgDirFd.Fd())),
-		LogFile:         proto.String("restore.log"),
-		LogLevel:        proto.Int32(4),
+		ImagesDirFd:    proto.Int32(int32(imgDirFd.Fd())),
+		LogFile:        proto.String("restore.log"),
+		LogLevel:       proto.Int32(4),
 		TcpEstablished: proto.Bool(opts.TcpEstablished),
 		// TcpClose and TcpEstablished are mutually exclusive on restore too. With
 		// TcpClose=true CRIU logs "Will drop all TCP connections on restore" and tears
@@ -606,9 +633,9 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 			}
 			return rpc.CriuNetworkLockMethod_SKIP.Enum()
 		}(),
-		ShellJob:    proto.Bool(false),
-		ExtSharing:  proto.Bool(true),
-		ExtMasters:  proto.Bool(true),
+		ShellJob:   proto.Bool(false),
+		ExtSharing: proto.Bool(true),
+		ExtMasters: proto.Bool(true),
 		// RstSibling restores in detached mode (process reparented to init, not CRIU).
 		RstSibling: proto.Bool(opts.Detached),
 		// AutoExtMnt handles k8s bind-mounts (/etc/resolv.conf, etc.) — mirrors dump option.
@@ -661,7 +688,7 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 			// root in container mnt ns) and re-attached by the destination storage tier on
 			// restore. Mirror the dump-side skip so CRIU does not try to restore it.
 			"/data",
-			// ADR-0230 (§3h-SYM): mirror the dump-side /dev skip set. The /dev tmpfs and
+			// ADR-0230: mirror the dump-side /dev skip set. The /dev tmpfs and
 			// its tmpfs children (shm/mqueue/pts) are not in the dump image (skipped at
 			// dump to avoid the obscured-parent setns), so the restore must not expect to
 			// recreate them — the destination runtime re-provides /dev from the OCI spec.
@@ -1094,4 +1121,3 @@ func netlinkDelLink(ifindex int) error {
 	}
 	return nil
 }
-

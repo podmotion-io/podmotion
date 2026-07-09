@@ -159,7 +159,7 @@ For `NetworkContinuityMode=None`, TCP conditions are not required — the standa
 ## Decision Audit Trail
 
 - **Full ADR index** (all 50 ADRs, grouped and linked): [docs/adr/README.md](adr/README.md)
-- **M19 architecture review** — architecture sign-off recorded in the ADR corpus.
+- **M19 architecture review** — reviewed and accepted, recorded in the ADR corpus.
 - **Open-source readiness review** — readiness gate, recommendation #7 that required this document.
 
 For the milestone delivery record and dependency chain, see [MILESTONES.md](MILESTONES.md).

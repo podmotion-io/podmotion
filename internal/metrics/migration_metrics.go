@@ -95,6 +95,22 @@ var (
 		[]string{"migration", "rule"},
 	)
 
+	// ShmemPagemapGuardFiredTotal counts ADR-0246 fail-closed completeness-guard detections —
+	// i.e. Checkpointed=False/ShmemPagemapMissing events, one per Checkpoint RPC failure caused
+	// by the CRIU 4.2 anon-shmem dump defect (missing pagemap-shmem-<shmid>.img). Distinct from
+	// ContainerConsistencyTotal{result="fail"}, which fires for every Checkpoint RPC error
+	// regardless of cause; this counter isolates the specific, currently-unfixable-upstream
+	// defect so it is trend-visible without parsing the Checkpointed condition message string.
+	// Labels: migration_name, namespace
+	ShmemPagemapGuardFiredTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "podmotion",
+			Name:      "shmem_pagemap_guard_fired_total",
+			Help:      "Count of ADR-0246 fail-closed shmem-pagemap completeness guard detections (CRIU 4.2 anon-shmem dump defect).",
+		},
+		[]string{"migration_name", "namespace"},
+	)
+
 	// ZeroWindowHoldRuleReassertSuppressedTotal counts reassert attempts skipped because the
 	// per-migration token-bucket reassert limiter (burst 5, refill 1/2s) was empty (ADR-0240
 	// D1a). Detection (the iptables -C probe) is never suppressed — only the reapply write is
@@ -120,5 +136,6 @@ func init() {
 		DatapathCleanupLeakTotal,
 		ZeroWindowHoldRuleReassertTotal,
 		ZeroWindowHoldRuleReassertSuppressedTotal,
+		ShmemPagemapGuardFiredTotal,
 	)
 }

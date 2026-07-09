@@ -57,12 +57,10 @@ here so a future session doesn't assume `preview.sh` is the current
 mechanism for the Linux dev server. It may be worth reconciling the two at
 some point, but that's a separate task.
 
-## Known incomplete: Corveth.tsx placeholder
+## Known incomplete: placeholder component
 
-`website/app/page.tsx` imports a `<Corveth />` component for a planned
-"built by the orchestrator" methodology section (references `corveth.ai`). That
-component did not exist and blocked the `npm run build` step above. A
-minimal, honest placeholder was written to
-`website/app/components/Corveth.tsx` to unblock the build — it is not real
-content. Designing the actual Corveth/orchestrator section is still an open item
-for Chad; do not treat the placeholder as final copy.
+`website/app/page.tsx` imports a component for a planned marketing section
+that did not exist and blocked the `npm run build` step above. A minimal,
+honest placeholder component was written to unblock the build — it is not
+real content. Designing the actual section is still an open item for Chad;
+do not treat the placeholder as final copy.

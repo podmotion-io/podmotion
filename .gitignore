@@ -39,11 +39,15 @@ docs/HANDOFF-*.md
 docs/sprints/SPRINT*-VM-*.md
 
 # Compiled binaries at repo root
-local_gate
-pm-cni
-fleetctl
-agent
-hack/gate-workload/gate-server
+# NOTE: these MUST be anchored with a leading '/'. A bare name like `agent` (unanchored)
+# matches every path component of that name anywhere in the tree — the bare `agent` pattern
+# was silently gitignoring the entire internal/agent/ package, which is why prior unit-test
+# files under internal/agent/server were "gitignored, never committed" (Workstream-40C).
+/local_gate
+/pm-cni
+/fleetctl
+/agent
+/hack/gate-workload/gate-server
 
 # macOS artifacts
 .DS_Store
@@ -87,6 +91,7 @@ docs/adr/0207-grounding-obligation-constitutional.md
 docs/adr/ADR-0226-*.md
 
 # Top-level methodology and strategy docs
+docs/sprint-workflow-skeleton.js
 docs/STRATEGY-REVIEW-*.md
 docs/NORTH_STAR_SPRINT_PLAN.md
 docs/FELN_SPRINT_PLAN.md
@@ -111,3 +116,16 @@ __pycache__/
 
 # Line-ending marker file (Windows artifact)
 LF
+
+# Internal gate-run / phase-review logs (process records, not publication proofs — never publish)
+docs/proof/*-GATE-CLOSURE-ATTEMPT-*.md
+docs/proof/*-GATE-ATTEMPT-*.md
+docs/proof/SPRINT40-S1-PROOF.md
+
+# Internal sprint/workstream planning + certification docs at docs/ top level (delivery process — never publish)
+docs/SPRINT*-PLAN.md
+docs/WORKSTREAM-*.md
+
+# Public-CI methodology-lexicon scanner — enumerates the internal codename lexicon in cleartext.
+# Republishing it announces the vocabulary it exists to hide; the local pre-commit hook enforces instead.
+.github/workflows/disclose-check.yaml
