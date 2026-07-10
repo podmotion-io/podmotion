@@ -339,3 +339,58 @@ func TestClassifyRegFd_NonShmTmpfsAliasingRebinds(t *testing.T) {
 		t.Fatalf("non-shm tmpfs-aliasing REG fd: got entry_type %q, want REG", got[0].EntryType)
 	}
 }
+
+// TestClassifyRegFd_TmpfsShmRegRebindViaFstypeMap is the ADR-0311 follow-up (live-path fix)
+// regression: the exact live-failure shape. A /dev/shm PostgreSQL.* REG orphan fd whose
+// backing mnt_id (943, the value observed live) is NOT in tmpfs_drop_mnt_ids — because that
+// mount was never seeded into the narrow is_drop_root ∧ fstype=='TMPFS' drop set — must still
+// REBIND_TO_ROOT because the mnt_id->fstype map resolves it to TMPFS. This is the case the
+// prior corpus test missed: it always pre-loaded the mnt_id into tmpfs_drop_mnt_ids, so the
+// classifier passed on a shape the real image never produced. Keying on the fstype map (not
+// the seed set) is the fix.
+func TestClassifyRegFd_TmpfsShmRegRebindViaFstypeMap(t *testing.T) {
+	ctx := map[string]any{
+		"remap_ids":        []int{},
+		"inherit_fd_names": []string{},
+		"kept_mnt_ids":     []int{1},
+		"ext_drop_mnt_ids": []int{},
+		"root_mnt_id":      1,
+		// Deliberately EMPTY — the live orphan was never seeded here (that was the bug).
+		"tmpfs_drop_mnt_ids": []int{},
+		// The mount is present in the mountpoints table as TMPFS. JSON object keys are strings;
+		// classify_reg_fd tolerates int-or-str lookup (production keys are native ints).
+		"mnt_fstypes": map[string]any{"943": "TMPFS"},
+	}
+	shmRegFd := reg(54, "/dev/shm/PostgreSQL.987654", 943, modeFile, false)
+	got := runClassifySelftest(t, ctx, []map[string]any{shmRegFd})
+	if got[0].Action != "REBIND_TO_ROOT" {
+		t.Fatalf("live /dev/shm PostgreSQL fd (mnt_id 943, tmpfs via fstype map): got action %q, want REBIND_TO_ROOT", got[0].Action)
+	}
+	if got[0].EntryType != "REG" {
+		t.Fatalf("live /dev/shm PostgreSQL fd: got entry_type %q, want REG", got[0].EntryType)
+	}
+}
+
+// TestClassifyRegFd_NonTmpfsFstypeMapDeclines is the ADR-0311 follow-up guard: an orphan REG
+// fd whose backing mnt_id resolves via the mnt_id->fstype map to a NON-tmpfs fstype (here a
+// real persistent-volume-style overlayfs/ext4 mount) must STILL hard-stop (DECLINE). Proves
+// the fstype-keyed widening did not weaken the Strict P-0193-1 guard for genuinely
+// inconsistent, non-memory-backed fds.
+func TestClassifyRegFd_NonTmpfsFstypeMapDeclines(t *testing.T) {
+	ctx := map[string]any{
+		"remap_ids":          []int{},
+		"inherit_fd_names":   []string{},
+		"kept_mnt_ids":       []int{1},
+		"ext_drop_mnt_ids":   []int{},
+		"root_mnt_id":        1,
+		"tmpfs_drop_mnt_ids": []int{},
+		// mnt_id 950 is a real durable mount (NOT tmpfs) — an fd on it that vanished from the
+		// kept set is a genuine inconsistency and must hard-stop, not be silently rebound.
+		"mnt_fstypes": map[string]any{"950": "OVERLAYFS"},
+	}
+	pvRegFd := reg(55, "/var/lib/postgresql/data/base/1/1234", 950, modeFile, false)
+	got := runClassifySelftest(t, ctx, []map[string]any{pvRegFd})
+	if got[0].Action != "DECLINE" {
+		t.Fatalf("non-tmpfs (overlayfs) orphan REG fd: got %q, want DECLINE (Strict guard must not weaken)", got[0].Action)
+	}
+}
