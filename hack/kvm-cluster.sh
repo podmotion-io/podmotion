@@ -137,8 +137,11 @@ cmd_deploy_podmotion() {
   make build-linux   # emits bin/{manager,agent,criu-wrapper}-linux-amd64 (auto-renamed)
 
   echo "==> Building operator + agent images..."
-  docker build -f images/operator/Dockerfile -t "$OP_IMG" .
-  docker build -f images/agent/Dockerfile   -t "$AGENT_IMG" .
+  # Stamp images with the git commit they were built from so deployed images can be
+  # verified against source provenance. Falls back to "unknown" if git is unavailable.
+  local GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  docker build --build-arg GIT_SHA="$GIT_SHA" -f images/operator/Dockerfile -t "$OP_IMG" .
+  docker build --build-arg GIT_SHA="$GIT_SHA" -f images/agent/Dockerfile   -t "$AGENT_IMG" .
 
   echo "==> Importing images into each node's k8s.io containerd namespace (no registry)..."
   # NOTE: CRIU 4.2 is already installed at /usr/sbin/criu on every node, and the

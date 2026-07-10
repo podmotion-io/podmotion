@@ -123,7 +123,7 @@ test-e2e: setup-test-e2e ## Run the e2e tests against the kubeadm cluster.
 	CERT_MANAGER_INSTALL_SKIP=true \
 	go test -tags=e2e ./test/e2e/ -v -ginkgo.v \
 		-timeout $(E2E_TIMEOUT) \
-		$(if $(E2E_LABEL_FILTER),--ginkgo.label-filter=$(E2E_LABEL_FILTER),)
+		$(if $(E2E_LABEL_FILTER),--ginkgo.label-filter="$(E2E_LABEL_FILTER)",)
 
 .PHONY: test-e2e-proof
 test-e2e-proof: setup-test-e2e ## Run only the stateless live-migration proof test.
@@ -193,9 +193,12 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
+# GIT_SHA stamps built images with the source commit for build-provenance
+# verification. Falls back to "unknown" so a build without git still succeeds.
+GIT_SHA ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	$(CONTAINER_TOOL) build --build-arg GIT_SHA=$(GIT_SHA) -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.

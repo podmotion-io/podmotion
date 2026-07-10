@@ -114,7 +114,7 @@ var _ = Describe("M23 CRIU tcp-established + leave-stopped ordering", Ordered, L
 				},
 				Spec: pmv1.PodMigrationSpec{
 					PodName:             podName,
-					DestinationNodeName: m23DestNode,
+					TargetNodeName:      m23DestNode,
 					TCPPreservationMode: pmv1.TCPPreservationModeStrict,
 				},
 			}
@@ -130,9 +130,9 @@ var _ = Describe("M23 CRIU tcp-established + leave-stopped ordering", Ordered, L
 					return false, nil
 				}
 				switch pm.Status.Phase {
-				case pmv1.PhaseComplete:
+				case pmv1.MigrationPhaseComplete:
 					return true, nil
-				case pmv1.PhaseFailed, pmv1.PhaseRollingBack:
+				case pmv1.MigrationPhaseFailed, pmv1.MigrationPhaseRollingBack:
 					return false, fmt.Errorf("migration failed in phase %s", pm.Status.Phase)
 				}
 				return false, nil
@@ -316,7 +316,7 @@ var _ = Describe("M23 CRIU tcp-established + leave-stopped ordering", Ordered, L
 				},
 				Spec: pmv1.PodMigrationSpec{
 					PodName:             nginxPodName,
-					DestinationNodeName: m23DestNode,
+					TargetNodeName:      m23DestNode,
 					TCPPreservationMode: pmv1.TCPPreservationModeNone,
 				},
 			}
@@ -331,9 +331,9 @@ var _ = Describe("M23 CRIU tcp-established + leave-stopped ordering", Ordered, L
 					return false, nil
 				}
 				switch pm.Status.Phase {
-				case pmv1.PhaseComplete:
+				case pmv1.MigrationPhaseComplete:
 					return true, nil
-				case pmv1.PhaseFailed, pmv1.PhaseRollingBack:
+				case pmv1.MigrationPhaseFailed, pmv1.MigrationPhaseRollingBack:
 					return false, fmt.Errorf("stateless regression migration failed in phase %s", pm.Status.Phase)
 				}
 				return false, nil

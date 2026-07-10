@@ -352,7 +352,7 @@ var _ = Describe("M20 — Zero-Window Hold", Ordered, Label("m20", "zero-window"
 				Spec: pmv1.PodMigrationSpec{
 					PodName:                  sourcePod.Name,
 					PodNamespace:             zwNS,
-					Mode:                     pmv1.MigrationModeLive,
+					Mode:                     pmv1.MigrationModePreCopy,
 					TargetNodeName:           destNode,
 					TCPPreservationMode:      pmv1.TCPPreservationModeStrict,
 					FreezeWindowBudgetMs:     10,
@@ -536,7 +536,7 @@ func createZWMigration(ctx context.Context, c client.Client, ns, podName, destNo
 		Spec: pmv1.PodMigrationSpec{
 			PodName:                  podName,
 			PodNamespace:             ns,
-			Mode:                     pmv1.MigrationModeLive,
+			Mode:                     pmv1.MigrationModePreCopy,
 			TargetNodeName:           destNode,
 			TCPPreservationMode:      pmv1.TCPPreservationModeStrict,
 			FreezeWindowBudgetMs:     zwBudgetMs,

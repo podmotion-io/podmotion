@@ -16,6 +16,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-protobuf \
   && rm -rf /var/lib/apt/lists/*
+# Build-provenance stamp: the git commit this image was built from.
+# Defaults to "unknown" so a build without git available still succeeds.
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision=$GIT_SHA
 COPY pycriu/ /usr/lib/python3/dist-packages/pycriu/
 COPY bin/agent-linux-amd64 /agent
 # ADR-0195 Rule A: universal no-op holder binary injected into replacement pods via init-container
