@@ -117,7 +117,7 @@ var _ = Describe("M21 Overlay Netns + FDB Acceptance", Ordered,
 					Spec: pmv1.PodMigrationSpec{
 						PodName:                  m21WorkloadName,
 						PodNamespace:             m21Namespace,
-						Mode:                     pmv1.MigrationModeLive,
+						Mode:                     pmv1.MigrationModePreCopy,
 						TCPPreservationMode:      pmv1.TCPPreservationModeStrict,
 						TargetNodeName:           m21DestNode,
 						RollbackOnFailure:        true,
@@ -188,7 +188,7 @@ var _ = Describe("M21 Overlay Netns + FDB Acceptance", Ordered,
 					Name:      migration.Name,
 				}, pm)).To(Succeed())
 
-				podIP := pm.Status.SourcePodIP
+				podIP := pm.Spec.SourcePodIP
 				if podIP == "" {
 					podIP = sourcePodIP
 				}
@@ -332,7 +332,7 @@ var _ = Describe("M21 Overlay Netns + FDB Acceptance", Ordered,
 						Spec: pmv1.PodMigrationSpec{
 							PodName:             m21WorkloadName,
 							PodNamespace:        m21Namespace,
-							Mode:                pmv1.MigrationModeLive,
+							Mode:                pmv1.MigrationModePreCopy,
 							TCPPreservationMode: pmv1.TCPPreservationModeStrict,
 							TargetNodeName:      m21DestNode,
 							DryRun:              true,
