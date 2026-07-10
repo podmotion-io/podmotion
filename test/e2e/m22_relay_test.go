@@ -130,7 +130,7 @@ var _ = Describe("M22 eBPF Relay — NS#3.5 + NS#3.7", Ordered, Label("m22", "re
 
 		It("PM_SEQ_XLAT shows exactly one entry after relay arm", func() {
 			By("waiting for ZeroWindowArmed condition")
-			Expect(waitForCondition(k8sClient, m22NS, migrationName, "ZeroWindowArmed", m22MigrateTimeout)).
+			Expect(m22WaitForCondition(k8sClient, m22NS, migrationName, "ZeroWindowArmed", m22MigrateTimeout)).
 				To(Succeed())
 
 			By("dumping bpftool map on source node")
@@ -146,7 +146,7 @@ var _ = Describe("M22 eBPF Relay — NS#3.5 + NS#3.7", Ordered, Label("m22", "re
 			armedAt = time.Now()
 
 			By("waiting for ZeroWindowDisarmed condition")
-			Expect(waitForCondition(k8sClient, m22NS, migrationName, "ZeroWindowDisarmed", m22MigrateTimeout)).
+			Expect(m22WaitForCondition(k8sClient, m22NS, migrationName, "ZeroWindowDisarmed", m22MigrateTimeout)).
 				To(Succeed())
 			disarmedAt = time.Now()
 
@@ -157,7 +157,7 @@ var _ = Describe("M22 eBPF Relay — NS#3.5 + NS#3.7", Ordered, Label("m22", "re
 		})
 
 		It("migration reaches TrafficVerified without RST", func() {
-			Expect(waitForCondition(k8sClient, m22NS, migrationName, "TrafficVerified", m22MigrateTimeout)).
+			Expect(m22WaitForCondition(k8sClient, m22NS, migrationName, "TrafficVerified", m22MigrateTimeout)).
 				To(Succeed())
 
 			By("confirming no RST in tcpdump on source node during migration window")
@@ -169,8 +169,8 @@ var _ = Describe("M22 eBPF Relay — NS#3.5 + NS#3.7", Ordered, Label("m22", "re
 		})
 
 		It("PM_SEQ_XLAT has zero entries after relay teardown (NS#3 regression)", func() {
-			By("waiting for migration Completed phase")
-			Expect(waitForMigrationPhase(k8sClient, m22NS, migrationName, "Completed", m22MigrateTimeout)).
+			By("waiting for migration Complete phase")
+			Expect(waitForMigrationPhase(context.Background(), k8sClient, m22NS, migrationName, "Complete", m22MigrateTimeout)).
 				To(Succeed())
 
 			entries := bpftoolSeqXlatCount(m22DestNode)
@@ -234,7 +234,7 @@ var _ = Describe("M22 eBPF Relay — NS#3.5 + NS#3.7", Ordered, Label("m22", "re
 		})
 
 		It("migration reaches TrafficVerified with no RST", func() {
-			Expect(waitForCondition(k8sClient, m22NS, migrationName, "TrafficVerified", m22MigrateTimeout)).
+			Expect(m22WaitForCondition(k8sClient, m22NS, migrationName, "TrafficVerified", m22MigrateTimeout)).
 				To(Succeed())
 
 			rstCount := countRSTInPcapOnNode(m22SourceNode, "m22-ns37")
@@ -279,7 +279,7 @@ var _ = Describe("M22 eBPF Relay — NS#3.5 + NS#3.7", Ordered, Label("m22", "re
 				Skip(fmt.Sprintf("SACK/netem migration skipped: %v", err))
 			}
 
-			Expect(waitForCondition(k8sClient, m22NS, "m22-ns37-sack-loss", "TrafficVerified",
+			Expect(m22WaitForCondition(k8sClient, m22NS, "m22-ns37-sack-loss", "TrafficVerified",
 				m22MigrateTimeout)).To(Succeed())
 
 			rstCount := countRSTInPcapOnNode(m22SourceNode, "m22-ns37-sack-loss")
@@ -288,7 +288,7 @@ var _ = Describe("M22 eBPF Relay — NS#3.5 + NS#3.7", Ordered, Label("m22", "re
 		})
 
 		It("PM_SEQ_XLAT has zero entries after teardown", func() {
-			Expect(waitForMigrationPhase(k8sClient, m22NS, migrationName, "Completed", m22MigrateTimeout)).
+			Expect(waitForMigrationPhase(context.Background(), k8sClient, m22NS, migrationName, "Complete", m22MigrateTimeout)).
 				To(Succeed())
 
 			entries := bpftoolSeqXlatCount(m22DestNode)
@@ -328,8 +328,8 @@ var _ = Describe("M22 eBPF Relay — NS#3.5 + NS#3.7", Ordered, Label("m22", "re
 			}
 			Expect(k8sClient.Create(context.Background(), statelessMig)).To(Succeed())
 
-			Expect(waitForMigrationPhase(k8sClient, m22NS, "m22-ns3-stateless",
-				"Completed", m22MigrateTimeout)).To(Succeed())
+			Expect(waitForMigrationPhase(context.Background(), k8sClient, m22NS, "m22-ns3-stateless",
+				"Complete", m22MigrateTimeout)).To(Succeed())
 
 			By("confirming PM_SEQ_XLAT map is empty throughout stateless migration")
 			entries := bpftoolSeqXlatCount(m22SourceNode)
@@ -434,8 +434,11 @@ func isPodRunning(ctx context.Context, c client.Client, ns, podName, nodeName st
 		(nodeName == "" || pod.Spec.NodeName == nodeName), nil
 }
 
-// waitForCondition polls a PodMigration until the named status condition is True.
-func waitForCondition(c client.Client, ns, name, condType string, timeout time.Duration) error {
+// m22WaitForCondition polls a PodMigration until the named status condition is True.
+// (Distinct from the canonical waitForCondition in zero_window_hold_test.go, which
+// takes a *PodMigration and a context and returns nothing; the m22 call sites use the
+// error-returning name/ns form.)
+func m22WaitForCondition(c client.Client, ns, name, condType string, timeout time.Duration) error {
 	return wait.PollUntilContextTimeout(context.Background(), m22PollInterval, timeout, true,
 		func(ctx context.Context) (bool, error) {
 			var pm pmv1.PodMigration
@@ -443,17 +446,5 @@ func waitForCondition(c client.Client, ns, name, condType string, timeout time.D
 				return false, nil
 			}
 			return apimeta.IsStatusConditionTrue(pm.Status.Conditions, condType), nil
-		})
-}
-
-// waitForMigrationPhase polls a PodMigration until its Phase equals the given value.
-func waitForMigrationPhase(c client.Client, ns, name, phase string, timeout time.Duration) error {
-	return wait.PollUntilContextTimeout(context.Background(), m22PollInterval, timeout, true,
-		func(ctx context.Context) (bool, error) {
-			var pm pmv1.PodMigration
-			if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &pm); err != nil {
-				return false, nil
-			}
-			return string(pm.Status.Phase) == phase, nil
 		})
 }

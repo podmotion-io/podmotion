@@ -66,6 +66,7 @@ docs/AGENTIC_STRATEGY_*.md
 # These document the internal delivery process and must never be published
 docs/sprints/
 docs/personas/
+docs/audit/
 docs/review/
 docs/postmortems/
 docs/process/
@@ -73,6 +74,11 @@ docs/chaos/
 docs/cncf/
 docs/compliance/
 docs/memory/
+
+# Internal sprint handoff/evidence charters — carry internal delivery-process matter
+# (planning-role rosters, process-section citations); live locally only, never committed.
+docs/SPRINT-43-HANDOFF.md
+docs/LIVE-E2E-EVIDENCE-2026-07-10.md
 
 # Internal resumption state file (process engine, never public)
 docs/proof/*-STATE.yaml

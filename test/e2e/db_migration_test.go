@@ -127,7 +127,7 @@ var _ = Describe("Live database migration", Label("live-db"), Ordered, func() {
 			Spec: pmv1.PodMigrationSpec{
 				PodName:                 "postgres-src",
 				PodNamespace:            dbTestNS,
-				TargetNodeName:          "pm-control",
+				TargetNodeName:          "pm-w2",
 				Mode:                    pmv1.MigrationModePreCopy,
 				TCPPreservationMode:     pmv1.TCPPreservationModeNone,
 				PreCopyMaxRounds:        5,
@@ -166,12 +166,12 @@ var _ = Describe("Live database migration", Label("live-db"), Ordered, func() {
 		Expect(finalPM.Status.PreCopyStats).NotTo(BeNil())
 		Expect(finalPM.Status.PreCopyStats.RoundsCompleted).To(BeNumerically(">=", 1))
 
-		By("asserting replacement pod is Running on pm-control")
+		By("asserting replacement pod is Running on pm-w2")
 		var replacement corev1.Pod
 		Expect(pmClient.Get(ctx, types.NamespacedName{
 			Name: finalPM.Status.ReplacementPodName, Namespace: dbTestNS,
 		}, &replacement)).To(Succeed())
-		Expect(replacement.Spec.NodeName).To(Equal("pm-control"))
+		Expect(replacement.Spec.NodeName).To(Equal("pm-w2"))
 		Expect(replacement.Status.Phase).To(Equal(corev1.PodRunning))
 
 		By("waiting for PostgreSQL on replacement pod to pass pg_isready (up to 2 min)")

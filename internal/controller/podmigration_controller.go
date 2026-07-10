@@ -178,6 +178,24 @@ type PodMigrationReconciler struct {
 	// the migrating workload.  Nil → NoopSuspender is used, so existing unit tests are
 	// unaffected.  Wired to ArgoCDClient or FluxClient in production via cmd/main.go.
 	GitOpsSuspender gitops.GitOpsSuspender
+	// onPhaseDecision, when non-nil, is invoked at the single next-phase decision point of the
+	// checkpoint/transfer advance helpers with the (from, decided) phase pair. It is a
+	// test-observable transition ledger hook: it records the branch actually taken at the source
+	// of truth (pm.Status.Phase), giving a deterministic in-process proof of the phase-machine
+	// decision that does not depend on any fake-client status readback. Nil in production — no
+	// behavioral effect. See advanceAfterCheckpoint / advanceAfterTransfer.
+	onPhaseDecision func(from, decided pmv1.MigrationPhase)
+}
+
+// recordPhaseDecision reports the next-phase decision to the injectable ledger hook when one is
+// wired. "decided" is the phase the helper is advancing the migration TOWARD; on the 12-phase
+// FinalFreezeStateCapture path the helper stays on the current phase (status-only requeue), so
+// "decided" equals "from". This is the single source-of-truth transition record the safety test
+// asserts against.
+func (r *PodMigrationReconciler) recordPhaseDecision(from, decided pmv1.MigrationPhase) {
+	if r.onPhaseDecision != nil {
+		r.onPhaseDecision(from, decided)
+	}
 }
 
 // +kubebuilder:rbac:groups=migration.podmotion.io,resources=podmigrations,verbs=get;list;watch;create;update;patch;delete
@@ -1373,6 +1391,91 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
 }
 
+// sourcePodDeletionBlockReason evaluates the single, authoritative source-pod-deletion safety
+// gate (ADR-0012 / invariant-1) against a set of PodMigration status conditions and the declared
+// TCP preservation mode. It returns "" when deletion is permitted, or a non-empty human-readable
+// reason describing which predicate is missing when deletion MUST be blocked.
+//
+// This is the STRICTER UNION of the two gates that had drifted apart in the codebase:
+//   - the CutoverComplete gate (which required TCPSequenceContinuityVerified=True for
+//     Strict/BestEffort), and
+//   - the Verifying gate (which was MISSING that TCPSequenceContinuityVerified requirement and
+//     therefore could delete the source pod under BestEffort — and under Strict once the
+//     dataplane gate passed — without any proof of TCP sequence continuity).
+//
+// Collapsing both call sites onto this one predicate fixes the weak copy UP, never down:
+// the gate is the union of every predicate either copy enforced. The predicate is:
+//   - Strict:      DataplaneReachabilityVerified=True (ADR-0210 cross-node gate) AND
+//                  TCPSequenceContinuityVerified=True.
+//   - BestEffort:  TrafficVerified=True AND TCPSequenceContinuityVerified=True.
+//   - None:        TrafficVerified=True (legacy cold/stateless pre-check).
+//
+// Because the reachability/traffic gate and the TCP-continuity gate are evaluated in a single
+// pass over one authoritative condition set, no A-02/B-06 interleaving can leave a window in
+// which the source pod is deletable under Strict/BestEffort without TCPSequenceContinuityVerified.
+func sourcePodDeletionBlockReason(mode pmv1.TCPPreservationMode, conditions []metav1.Condition) string {
+	// Reachability / traffic predicate (mode-dependent necessary predicate).
+	if mode == pmv1.TCPPreservationModeStrict {
+		if !meta.IsStatusConditionTrue(conditions, conditionDataplaneReachabilityVerified) {
+			return "DataplaneReachabilityVerified is not True (ADR-0210 cross-node gate)"
+		}
+	} else if !meta.IsStatusConditionTrue(conditions, conditionTrafficVerified) {
+		return "TrafficVerified is not True (ADR-0012)"
+	}
+	// TCP sequence-continuity predicate — REQUIRED for both Strict and BestEffort. This is the
+	// predicate the Verifying gate had dropped; it is enforced here for BOTH call sites.
+	if mode == pmv1.TCPPreservationModeStrict || mode == pmv1.TCPPreservationModeBestEffort {
+		if !meta.IsStatusConditionTrue(conditions, pmv1.ConditionTCPSequenceContinuityVerified) {
+			return "TCPSequenceContinuityVerified is not True in Strict/BestEffort mode (ADR-0012)"
+		}
+	}
+	return ""
+}
+
+// deleteSourcePodIfSafe is the SINGLE primitive that gates and performs source-pod deletion for
+// every phase that finalizes a cutover (reconcileVerifying and reconcileCutoverComplete both route
+// through it). It re-reads the authoritative conditions from the API (Status is a writable
+// subresource and in-memory state may be stale), evaluates the STRICTER-union safety gate via
+// sourcePodDeletionBlockReason, and only then deletes the source pod.
+//
+// Return values:
+//   - blocked=true  → the gate refused deletion; the caller MUST requeue (a Result is returned).
+//     The source pod is NOT deleted; the migration phase is untouched.
+//   - blocked=false → the gate permitted deletion and the source pod was deleted (or was already
+//     gone / not on the source node). The caller may proceed to finalization.
+func (r *PodMigrationReconciler) deleteSourcePodIfSafe(ctx context.Context, pm *pmv1.PodMigration) (blocked bool, res ctrl.Result) {
+	log := logf.FromContext(ctx)
+
+	// Defensive re-fetch (ADR-0012): read the latest, authoritative conditions from the API
+	// immediately before deletion — never trust stale in-memory pm.Status.
+	freshPM := &pmv1.PodMigration{}
+	if fetchErr := r.Get(ctx, client.ObjectKeyFromObject(pm), freshPM); fetchErr != nil {
+		log.Error(fetchErr, "deleteSourcePodIfSafe: failed to re-fetch PodMigration before source pod deletion — requeuing for safety (ADR-0012)", "migration", pm.Name)
+		return true, ctrl.Result{RequeueAfter: 5 * time.Second}
+	}
+
+	if reason := sourcePodDeletionBlockReason(freshPM.Spec.TCPPreservationMode, freshPM.Status.Conditions); reason != "" {
+		log.Error(nil, "deleteSourcePodIfSafe: SAFETY BLOCK — refusing to delete source pod (ADR-0012)", "migration", pm.Name, "reason", reason, "mode", freshPM.Spec.TCPPreservationMode)
+		return true, ctrl.Result{RequeueAfter: 10 * time.Second}
+	}
+
+	sourcePod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+	if err == nil {
+		// Only delete if the pod is still on the source node (not already gone or rescheduled).
+		if sourcePod.Spec.NodeName == pm.Status.SourceNodeName {
+			log.Info("deleteSourcePodIfSafe: deleting source pod post-gate",
+				"pod", pm.Spec.PodName, "node", pm.Status.SourceNodeName, "migration", pm.Name)
+			if deleteErr := r.Delete(ctx, sourcePod); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+				log.Error(deleteErr, "deleteSourcePodIfSafe: failed to delete source pod — proceeding anyway (ADR-0019)", "migration", pm.Name)
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		log.Error(err, "deleteSourcePodIfSafe: could not look up source pod — skipping deletion", "migration", pm.Name)
+	}
+	// IsNotFound → already deleted, which is fine.
+	return false, ctrl.Result{}
+}
+
 // reconcileCutoverComplete handles source pod deletion, EndpointSlice cleanup, and final status.
 // Corresponds to the tail of the legacy reconcileVerifying phase.
 func (r *PodMigrationReconciler) reconcileCutoverComplete(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
@@ -1403,54 +1506,14 @@ func (r *PodMigrationReconciler) reconcileCutoverComplete(ctx context.Context, p
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Defensive re-check (ADR-0012 safety contract): re-read the conditions immediately before
-	// deleting the source pod, regardless of how we arrived at CutoverComplete phase.
-	// The source pod is the only surviving copy of process state. Do NOT delete it unless:
-	//   1. TrafficVerified=True (destination is serving real traffic), AND
-	//   2. For Strict/BestEffort: TCPSequenceContinuityVerified=True (TCP continuity confirmed).
-	// The phase transition alone is NOT sufficient because Status is a writable subresource
-	// and can be externally patched to Phase=CutoverComplete.
-	{
-		// Re-fetch to get the latest conditions (not stale in-memory state).
-		freshPM := &pmv1.PodMigration{}
-		if fetchErr := r.Get(ctx, client.ObjectKeyFromObject(pm), freshPM); fetchErr != nil {
-			log.Error(fetchErr, "CutoverComplete: failed to re-fetch PodMigration before source pod deletion — requeuing for safety", "migration", pm.Name)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		// ADR-0210: DataplaneReachabilityVerified=True is now the NECESSARY predicate for
-		// source-pod deletion under Strict (TrafficVerified is demoted to a non-gating pre-check
-		// — it was set by the tautological self-probe and no longer proves off-node reachability).
-		// For Strict, require the cross-node gate. For BestEffort/None (no Strict guarantee),
-		// TrafficVerified remains the legacy pre-check so non-Strict cold/stateless flows proceed.
-		if freshPM.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict {
-			if !meta.IsStatusConditionTrue(freshPM.Status.Conditions, conditionDataplaneReachabilityVerified) {
-				log.Error(nil, "CutoverComplete: SAFETY BLOCK — DataplaneReachabilityVerified is not True (ADR-0210 cross-node gate); refusing to delete source pod", "migration", pm.Name)
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-			}
-		} else if !meta.IsStatusConditionTrue(freshPM.Status.Conditions, conditionTrafficVerified) {
-			log.Error(nil, "CutoverComplete: SAFETY BLOCK — TrafficVerified is not True; refusing to delete source pod (ADR-0012)", "migration", pm.Name)
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
-		if freshPM.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict ||
-			freshPM.Spec.TCPPreservationMode == pmv1.TCPPreservationModeBestEffort {
-			if !meta.IsStatusConditionTrue(freshPM.Status.Conditions, pmv1.ConditionTCPSequenceContinuityVerified) {
-				log.Error(nil, "CutoverComplete: SAFETY BLOCK — TCPSequenceContinuityVerified is not True in Strict/BestEffort mode; refusing to delete source pod (ADR-0012)", "migration", pm.Name)
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-			}
-		}
-	}
-
-	sourcePod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
-	if err == nil {
-		if sourcePod.Spec.NodeName == pm.Status.SourceNodeName {
-			log.Info("deleting source pod post-TCPVerified+ServiceVerified",
-				"pod", pm.Spec.PodName, "node", pm.Status.SourceNodeName, "migration", pm.Name)
-			if deleteErr := r.Delete(ctx, sourcePod); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
-				log.Error(deleteErr, "failed to delete source pod — proceeding to Complete anyway (ADR-0019)")
-			}
-		}
-	} else if !apierrors.IsNotFound(err) {
-		log.Error(err, "could not look up source pod — skipping deletion")
+	// Defensive re-check + deletion via the single STRICTER-union primitive (ADR-0012 safety
+	// contract, invariant-1). The source pod is the only surviving copy of process state; the
+	// phase transition alone is NOT sufficient because Status is a writable subresource and can
+	// be externally patched to Phase=CutoverComplete. deleteSourcePodIfSafe re-reads the
+	// authoritative conditions and enforces the STRICTER union (TCPSequenceContinuityVerified=True
+	// for Strict/BestEffort) before any deletion — identical to the Verifying call site.
+	if blocked, res := r.deleteSourcePodIfSafe(ctx, pm); blocked {
+		return res, nil
 	}
 	setCondition(pm, conditionSourcePodDeleted, metav1.ConditionTrue, "Deleted", "Source pod deleted post-TCPVerified+ServiceVerified")
 
@@ -1499,7 +1562,7 @@ func (r *PodMigrationReconciler) reconcileCutoverComplete(ctx context.Context, p
 	r.releaseDestinationCapacity(ctx, pm)
 
 	key := client.ObjectKeyFromObject(pm)
-	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &pmv1.PodMigration{}
 		if fetchErr := r.Get(ctx, key, fresh); fetchErr != nil {
 			return fetchErr
@@ -1868,7 +1931,7 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 	// Fast-path: if the Checkpointed condition was already set True (e.g. agent called back
 	// directly or we are re-entering after a controller restart), advance immediately.
 	if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionCheckpointed) {
-		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseTransferring)
+		return r.advanceAfterCheckpoint(ctx, pm)
 	}
 
 	// If a concurrent reconcile already claimed the checkpoint slot (Unknown/InProgress),
@@ -2238,6 +2301,31 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 	// the DESTINATION node before the container starts. Removing the gate here
 	// (pre-transfer) would let the scheduler bind and NRI fire before images arrive.
 
+	return r.advanceAfterCheckpoint(ctx, pm)
+}
+
+// advanceAfterCheckpoint decides the next phase once the CRIU dump has succeeded
+// (Checkpointed=True). It is pipeline-aware so the checkpoint handler is not tied to a
+// single terminal transition (A-02, C-2 fix):
+//
+//   - On the 12-phase ADR-0047 pipeline the migration is in phase FinalFreezeStateCapture,
+//     which OWNS the checkpoint→transfer→OverlayHandoff sequencing. The checkpoint handler
+//     must NOT transition to the legacy Transferring phase here — doing so hands the phase
+//     machine to the legacy Transferring→Restoring→Verifying tail and permanently bypasses
+//     OverlayHandoff/RestoreSocketReattach/DisengageHold/TCPVerifying/ServiceVerifying/
+//     CutoverComplete (the entire TCP-continuity path). Instead we requeue so the
+//     FinalFreezeStateCapture delegator re-runs, observes Checkpointed=True, and advances the
+//     transfer step itself.
+//   - On the legacy 8-phase pipeline (a PodMigration already at phase Checkpointing) the
+//     checkpoint handler owns its own next transition to Transferring, as before.
+func (r *PodMigrationReconciler) advanceAfterCheckpoint(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	if pm.Status.Phase == pmv1.MigrationPhaseFinalFreezeStateCapture {
+		// 12-phase path: return control to reconcileFinalFreezeStateCapture (status-only).
+		// Record that the decision was to STAY on FinalFreezeStateCapture (no legacy hijack).
+		r.recordPhaseDecision(pm.Status.Phase, pmv1.MigrationPhaseFinalFreezeStateCapture)
+		return ctrl.Result{Requeue: true}, nil
+	}
+	r.recordPhaseDecision(pm.Status.Phase, pmv1.MigrationPhaseTransferring)
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseTransferring)
 }
 
@@ -2384,13 +2472,28 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 		}
 	}
 
-	// ADR-0185 C7: This transitionTo(Restoring) is dead code on the 12-phase path —
-	// reconcileFinalFreezeStateCapture (the 12-phase delegator) returns early via OverlayHandoff
-	// delegation, bypassing this line, so Restoring is reached only after conditionVXLANFDBUpdated.
-	// Left in place; a contract test asserts Restoring is only reachable
-	// post-conditionVXLANFDBUpdated (a regression firing this tail before OverlayHandoff
-	// would be caught by that test, since OverlayHandoff is NOT in the NRI accept-set under
-	// Option B). See ADR-0185 r1.
+	return r.advanceAfterTransfer(ctx, pm)
+}
+
+// advanceAfterTransfer decides the next phase once the checkpoint has been transferred to the
+// destination and the scheduling gate removed. Pipeline-aware, mirroring advanceAfterCheckpoint
+// (A-02, C-2 fix):
+//
+//   - On the 12-phase pipeline (phase FinalFreezeStateCapture) the transfer step is status-only:
+//     CheckpointTransferred is already persisted, so we requeue to let the FinalFreezeStateCapture
+//     delegator advance to OverlayHandoff. Transitioning to the legacy Restoring phase here would
+//     bypass OverlayHandoff/RestoreSocketReattach/DisengageHold and RST every in-flight TCP
+//     connection under Strict/BestEffort.
+//   - On the legacy 8-phase pipeline (phase Transferring) the handler owns its own transition to
+//     Restoring, as before.
+func (r *PodMigrationReconciler) advanceAfterTransfer(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
+	if pm.Status.Phase == pmv1.MigrationPhaseFinalFreezeStateCapture {
+		// 12-phase path: status-only requeue. Record that the decision was to STAY on
+		// FinalFreezeStateCapture (no legacy Restoring hijack).
+		r.recordPhaseDecision(pm.Status.Phase, pmv1.MigrationPhaseFinalFreezeStateCapture)
+		return ctrl.Result{Requeue: true}, nil
+	}
+	r.recordPhaseDecision(pm.Status.Phase, pmv1.MigrationPhaseRestoring)
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoring)
 }
 
@@ -3106,12 +3209,15 @@ func (r *PodMigrationReconciler) ipReclaimEligible(ctx context.Context, pm *pmv1
 	if pm.Status.Phase != pmv1.MigrationPhaseComplete && pm.Status.Phase != pmv1.MigrationPhaseFailed {
 		return false, "R1: not terminal", nil
 	}
-	// R2: TCPPreservationMode != None AND OverlayHandoff actually ran. TCPPreservationMode=None
-	// CRs never install any of the five reclaim objects (server.go InjectIPHandoff early-return),
-	// so IPHandoffInjected never gets set True for them — this conjunct is naturally satisfied
-	// by checking that condition rather than adding a redundant mode check.
-	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
-		return false, "R2: OverlayHandoff did not run (no reclaim objects installed)", nil
+	// R2: reclaim objects were actually installed. TCPPreservationMode=None CRs never install any
+	// of the reclaim objects (server.go InjectIPHandoff early-return), so this conjunct is
+	// satisfied by checking the installed-provenance condition rather than adding a redundant mode
+	// check. Sprint 42 FS-048 FIX: key off ConditionReclaimObjectsInstalled (durable, set the
+	// moment resp.Injected is confirmed) NOT conditionIPHandoffInjected — the latter is dropped on
+	// a cross-node-reachability requeue, which previously made R2 return not-eligible forever and
+	// left the installed objects orphaned. See reconcileIPReclaimSweep for the full rationale.
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionReclaimObjectsInstalled) {
+		return false, "R2: no reclaim objects were installed (InjectIPHandoff never confirmed resp.Injected)", nil
 	}
 	// R3: quarantine floor.
 	if pm.Status.CompletionTime == nil {
@@ -3180,17 +3286,28 @@ func (r *PodMigrationReconciler) reconcileIPReclaimSweep(ctx context.Context, pm
 	}
 
 	// ADR-0244 R2 short-circuit: a terminal CR (Complete/Failed) can never transition again, so
-	// if OverlayHandoff never ran (no reclaim objects were ever installed — e.g. this CR rolled
-	// back or failed before reaching OverlayHandoff, or TCPPreservationMode=None), R2 can never
+	// if no reclaim objects were EVER physically installed (e.g. this CR rolled back or failed
+	// before InjectIPHandoff confirmed resp.Injected, or TCPPreservationMode=None), R2 can never
 	// become true on a future pass either. Without this, reconcileIPReclaimSweep requeues such a
 	// CR every reclaimSweepInterval forever, logging "IP reclaim not yet eligible" indefinitely
 	// against a CR that will never need reclaim (same "nothing to sweep" posture already applied
 	// to MigrationPhaseDryRunComplete above). Treat it as already-reclaimed/verified and stop.
-	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
+	//
+	// Sprint 42 FS-048 FIX: this predicate now keys off ConditionReclaimObjectsInstalled — the
+	// durable PROVENANCE that objects were physically installed — NOT conditionIPHandoffInjected.
+	// IPHandoffInjected is set in-memory but DROPPED whenever verifyDataplaneReachability returns
+	// done=false (cross-node old-IP unreachable — a legitimate, sometimes-permanent outcome on
+	// this substrate and on cross-subnet/cross-AZ AWS VPC CNI). Keying off it caused the sweep to
+	// read the objects as never-installed and short-circuit to NothingToReclaim, silently
+	// orphaning real dest/source reclaim objects with no DatapathCleanupLeak event or metric — the
+	// exact inverse of the invariant this sweep exists to enforce. ReclaimObjectsInstalled is set
+	// and persisted the moment resp.Injected is confirmed, before any reachability probe, so a
+	// requeue can never drop it. When it IS set, we fall through and ALWAYS run VerifyCleanup.
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionReclaimObjectsInstalled) {
 		setCondition(pm, pmv1.ConditionIPReclaimComplete, metav1.ConditionTrue, "NothingToReclaim",
-			"OverlayHandoff never ran for this migration — no reclaim objects were installed (ADR-0244 R2)")
+			"no reclaim objects were ever installed for this migration — InjectIPHandoff never confirmed resp.Injected (ADR-0244 R2 / Sprint 42 FS-048)")
 		setCondition(pm, pmv1.ConditionIPReclaimVerified, metav1.ConditionTrue, "NothingToReclaim",
-			"OverlayHandoff never ran for this migration — no reclaim objects were installed (ADR-0244 R2)")
+			"no reclaim objects were ever installed for this migration — InjectIPHandoff never confirmed resp.Injected (ADR-0244 R2 / Sprint 42 FS-048)")
 		return ctrl.Result{}, r.statusUpdate(ctx, pm)
 	}
 
@@ -3431,6 +3548,26 @@ func (r *PodMigrationReconciler) injectIPHandoff(ctx context.Context, pm *pmv1.P
 			return ctrl.Result{}, sErr, false
 		}
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, false
+	}
+
+	// PROVENANCE (Sprint 42 FS-048 fix): the destination-agent InjectIPHandoff RPC has confirmed
+	// resp.Injected — the OLD-IP NOTRACK, FORWARD ACCEPT, and tc-ingress redirect objects are now
+	// physically on the wire on the destination node. Record that fact durably and persist it
+	// IMMEDIATELY, before the cross-node reachability probe runs. verifyDataplaneReachability can
+	// legitimately never converge (cross-node on this substrate; cross-subnet/cross-AZ on AWS VPC
+	// CNI where the OLD IP is a subnet-bound ENI address that does not route to another AZ), and on
+	// that failure injectIPHandoff returns done=false and the caller's statusUpdate is skipped —
+	// which is exactly why IPHandoffInjected got dropped and the reclaim sweep short-circuited to
+	// NothingToReclaim, silently orphaning these objects. ReclaimObjectsInstalled is the sweep's
+	// authoritative predicate: once True, the sweep ALWAYS runs VerifyCleanup regardless of whether
+	// reachability ever verified. It is never cleared.
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
+		setCondition(pm, pmv1.ConditionReclaimObjectsInstalled, metav1.ConditionTrue, "Installed",
+			fmt.Sprintf("reclaim datapath objects installed on destination for OLD pod IP %s (dest NOTRACK/FORWARD ACCEPT/tc redirect); reclaim sweep will run VerifyCleanup regardless of cross-node reachability (Sprint 42 FS-048 / ADR-0244)",
+				pm.Spec.SourcePodIP))
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr, false
+		}
 	}
 
 	// ADR-0192 VERIFY-11: write resolved fdbIf to PodMigration annotation for structured
@@ -3771,47 +3908,16 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// ADR-0012 + ADR-0210 defensive re-fetch: re-read the authoritative conditions from the API
-	// before any source pod deletion. In-memory pm.Status may be stale; etcd is authoritative.
-	log.Info("Verifying: re-fetching PodMigration from API for ADR-0012/ADR-0210 safety check", "migration", pm.Name)
-	{
-		freshPM := &pmv1.PodMigration{}
-		if fetchErr := r.Get(ctx, client.ObjectKeyFromObject(pm), freshPM); fetchErr != nil {
-			log.Error(fetchErr, "Verifying: failed to re-fetch PodMigration before source pod deletion — requeuing for safety (ADR-0012)", "migration", pm.Name)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		// ADR-0210: under Strict, DataplaneReachabilityVerified=True (cross-node nonce round-trip)
-		// is the necessary deletion predicate; TrafficVerified is a demoted non-gating pre-check.
-		// Non-Strict modes retain the legacy TrafficVerified gate.
-		if freshPM.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict {
-			if !meta.IsStatusConditionTrue(freshPM.Status.Conditions, conditionDataplaneReachabilityVerified) {
-				log.Error(nil, "Verifying: SAFETY BLOCK — DataplaneReachabilityVerified is not True on re-fetch (ADR-0210 cross-node gate); refusing to delete source pod", "migration", pm.Name)
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-			}
-			log.Info("Verifying: ADR-0210 re-fetch confirmed DataplaneReachabilityVerified=True — proceeding to source pod deletion", "migration", pm.Name)
-		} else if !meta.IsStatusConditionTrue(freshPM.Status.Conditions, conditionTrafficVerified) {
-			log.Error(nil, "Verifying: SAFETY BLOCK — TrafficVerified is not True on re-fetch; refusing to delete source pod (ADR-0012)", "migration", pm.Name)
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
+	// ADR-0012 safety re-fetch + deletion via the single STRICTER-union primitive. This is the
+	// SAME gate the CutoverComplete call site uses. Previously this Verifying copy had drifted
+	// WEAKER — it never re-checked TCPSequenceContinuityVerified, so under BestEffort (and under
+	// Strict once the dataplane gate passed) it could delete the source pod without TCP-continuity
+	// proof. deleteSourcePodIfSafe fixes that UP: it re-reads authoritative conditions and enforces
+	// TCPSequenceContinuityVerified=True for Strict/BestEffort before any deletion.
+	log.Info("Verifying: routing source pod deletion through deleteSourcePodIfSafe (ADR-0012 STRICTER-union gate)", "migration", pm.Name)
+	if blocked, res := r.deleteSourcePodIfSafe(ctx, pm); blocked {
+		return res, nil
 	}
-
-	sourcePod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
-	if err == nil {
-		// Only delete if pod is still on the source node (not already gone or rescheduled).
-		if sourcePod.Spec.NodeName == pm.Status.SourceNodeName {
-			log.Info("deleting source pod post-TrafficVerified",
-				"pod", pm.Spec.PodName,
-				"node", pm.Status.SourceNodeName,
-				"migration", pm.Name)
-			if deleteErr := r.Delete(ctx, sourcePod); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
-				log.Error(deleteErr, "failed to delete source pod — requeuing (ADR-0012)", "migration", pm.Name)
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
-		}
-	} else if !apierrors.IsNotFound(err) {
-		log.Error(err, "could not look up source pod — skipping deletion")
-	}
-	// If IsNotFound — already deleted, that is fine.
 
 	setCondition(pm, conditionSourcePodDeleted, metav1.ConditionTrue, "Deleted", "Source pod deleted post-TrafficVerified")
 
@@ -4332,13 +4438,19 @@ func (r *PodMigrationReconciler) handleDeletion(ctx context.Context, pm *pmv1.Po
 }
 
 // reclaimObjectsOutstanding reports whether this PodMigration has ADR-0244 IP-reclaim datapath
-// objects still installed and not yet torn down — i.e. OverlayHandoff ran (conditionIPHandoffInjected
-// is True, the same signal ipReclaimEligible R2 and reconcileIPReclaimSweep use to decide there is
-// anything to reclaim) but the reclaim sweep has not yet set ConditionIPReclaimComplete. Used by
-// handleDeletion to decide whether the finalizer-race guard must engage. TCPPreservationMode=None
-// and pre-handoff CRs never install these objects, so they return false and delete immediately.
+// objects still installed and not yet torn down — i.e. the objects were physically installed
+// (ConditionReclaimObjectsInstalled is True, the same durable provenance ipReclaimEligible R2 and
+// reconcileIPReclaimSweep use to decide there is anything to reclaim) but the reclaim sweep has not
+// yet set ConditionIPReclaimComplete. Used by handleDeletion to decide whether the finalizer-race
+// guard must engage. TCPPreservationMode=None and pre-handoff CRs never install these objects, so
+// they return false and delete immediately.
+//
+// Sprint 42 FS-048 FIX: key off ConditionReclaimObjectsInstalled, NOT conditionIPHandoffInjected —
+// the latter is dropped whenever cross-node old-IP reachability never converges, which would make
+// this guard return false and let handleDeletion remove the finalizer and hard-delete with real
+// reclaim objects still on the wire (the same silent-leak class the sweep short-circuit had).
 func (r *PodMigrationReconciler) reclaimObjectsOutstanding(pm *pmv1.PodMigration) bool {
-	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionReclaimObjectsInstalled) {
 		return false
 	}
 	return !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionIPReclaimComplete)

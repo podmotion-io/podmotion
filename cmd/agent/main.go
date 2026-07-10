@@ -119,6 +119,32 @@ func init() {
 	utilruntime.Must(corev1.AddToScheme(scheme))
 }
 
+// brokerHostNSProcess adapts the netns-broker async exec ops (ExecPoll/ExecSignal —
+// ADR-0234) to criu.HostNSProcess, so CRIUCheckpointer can poll a detached host-mount-ns
+// CRIU child to completion and SIGKILL it on abort. pid is the broker-returned host PID
+// of the criu-wrapper child.
+type brokerHostNSProcess struct {
+	pid int
+}
+
+// Poll reports whether the wrapper/criu child has exited, surfacing its exit code and
+// captured stderr (the broker's async capture) on exit.
+func (p *brokerHostNSProcess) Poll(ctx context.Context) (exited bool, exitCode int, output []byte, err error) {
+	pr, perr := netnsbroker.NewClient().ExecPoll(ctx, p.pid)
+	if perr != nil {
+		return false, 0, nil, perr
+	}
+	if pr.Running {
+		return false, 0, nil, nil
+	}
+	return true, pr.ExitCode, pr.Stderr, nil
+}
+
+// Signal delivers sig to the child via the broker (SIGKILL on abort).
+func (p *brokerHostNSProcess) Signal(ctx context.Context, sig int) error {
+	return netnsbroker.NewClient().ExecSignal(ctx, p.pid, sig)
+}
+
 // inetnsProbe exit codes — MUST match server.inetnsProbeExit* (ADR-0200 D1 (i)).
 const (
 	inetnsProbeExitSuccess  = 0
@@ -310,7 +336,34 @@ func main() {
 	var checkpointer criu.Checkpointer
 	if runtime.GOOS == "linux" {
 		log.Info("Using CRIUCheckpointer (real CRIU subprocess via go-criu/v7)")
-		checkpointer = criu.NewCRIUCheckpointer("/usr/sbin/criu")
+		cp := criu.NewCRIUCheckpointer("/usr/sbin/criu")
+		// SD-1 (ADR-0231/0234): the de-privileged agent cannot itself setns(CLONE_NEWNS)
+		// into the host mount namespace, and the HOST criu binary at /usr/sbin/criu is
+		// dynamically linked against the host glibc (2.39) — running it directly in the
+		// debian:12-slim agent container (glibc ~2.36) fails with "GLIBC_2.38 not found".
+		// Route the dump/pre-dump CLI through the privileged netns-broker sidecar, which
+		// nsenters the host mount namespace and execve's podmotion-criu-wrapper → criu
+		// (same allowlisted host-ns launch primitive the restore path uses). The wrapper
+		// is invoked with no --cgroup-fd args, so it is a pure "exec criu in host mnt ns"
+		// shim. On kind/dev this runner is still installed but the broker runs criu in the
+		// host mount namespace exactly the same way (the node/container glibc match there
+		// made the old direct exec work only by coincidence).
+		// Route dump/pre-dump through the broker's ASYNC exec ops (ExecStart/ExecPoll/
+		// ExecSignal — ADR-0234), the same primitive the live Restore uses. The async path
+		// lets an aborted dump SIGKILL the broker-side CRIU child (via ExecSignal) so it
+		// cannot keep writing checkpoint images after the caller returns "aborted" and the
+		// zeroize path runs (invariant 7). The broker pins the async binary to the criu
+		// wrapper, which is exactly argv[0] here.
+		cp.SetHostNSRunner(func(_ context.Context, argv ...string) (criu.HostNSProcess, error) {
+			startCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			pid, err := netnsbroker.NewClient().ExecStart(startCtx, argv...)
+			if err != nil {
+				return nil, err
+			}
+			return &brokerHostNSProcess{pid: pid}, nil
+		})
+		checkpointer = cp
 	} else {
 		log.Info("CRIU not available on this OS — using StubCheckpointer (dev mode)",
 			"os", runtime.GOOS)

@@ -1,0 +1,54 @@
+# Redis workload for the live-redis migration-under-load e2e test.
+#
+# A bare source Pod (not a Deployment) pinned to pm-w1, so the operator's
+# replacement-pod path is exercised the same way the stateless nginx-live and
+# postgres-src fixtures exercise it. In-memory state (the gate:counter key set by
+# the load generator) must survive the CRIU checkpoint/restore to pm-w2.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pm-redis-test
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: redis-src
+  namespace: pm-redis-test
+  labels:
+    app: redis-src
+    podmotion.io/test-workload: "true"
+spec:
+  nodeName: pm-w1
+  restartPolicy: Never
+  containers:
+    - name: redis
+      image: redis:7.2-alpine
+      # Disable RDB/AOF persistence: this test proves CRIU preserves in-memory
+      # state, so the counter must NOT be recoverable from an on-disk snapshot.
+      command: ["redis-server", "--save", "", "--appendonly", "no", "--loglevel", "warning"]
+      ports:
+        - containerPort: 6379
+      readinessProbe:
+        exec:
+          command: ["redis-cli", "ping"]
+        initialDelaySeconds: 3
+        periodSeconds: 3
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-src
+  namespace: pm-redis-test
+spec:
+  selector:
+    app: redis-src
+  ports:
+    - port: 6379
+      targetPort: 6379

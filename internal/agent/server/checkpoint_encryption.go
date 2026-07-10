@@ -171,6 +171,47 @@ func (s *AgentServer) encryptCheckpointDir(ctx context.Context, migrationName, d
 	return nil
 }
 
+// finalizeCheckpointDir is the single shared "checkpoint dir is fully populated → make it
+// transfer-ready" step, invoked identically on BOTH the ctr-native success branch and the
+// raw-CRIU fallback success path in Checkpoint (server.go). Before this existed, only the
+// raw-CRIU path ran encryptCheckpointDir; the ctr-native branch (the DEFAULT path) returned
+// before it, shipping plaintext process memory at rest (A-01 / finding C-1). Unifying the two
+// steps here guarantees NO checkpoint reaches the transfer phase unencrypted, regardless of
+// which dumper produced it.
+//
+// Ordering is load-bearing (guard-BEFORE-encrypt): verifyShmemPagemapCompleteness reads the
+// plaintext mm-*.img / pagemap-shmem-*.img content (ADR-0246) and MUST run before
+// encryptCheckpointDir replaces those layers with ciphertext, or it would be decoding
+// ciphertext and always report the set incomplete.
+//
+// The shmem guard failure is returned as the typed codes.FailedPrecondition status
+// (newShmemPagemapMissingStatus) so both call sites surface it identically to the controller;
+// the encrypt failure is a plain wrapped error (fatal: a half-encrypted final/ must not
+// transfer). Both call sites already return whatever this returns straight to the gRPC layer.
+func (s *AgentServer) finalizeCheckpointDir(migrationName, imagesDir string) error {
+	// ADR-0246 D1/D4: fail closed before transfer if the checkpoint references an anon-shmem
+	// segment (mm-*.img) with no matching pagemap-shmem-<shmid>.img — the confirmed CRIU 4.2
+	// anon-shmem dump defect. Runs unconditionally for BOTH dumpers (D1 step 4). Must run here,
+	// before encryptCheckpointDir below, since the guard reads plaintext image content.
+	if shmemErr := verifyShmemPagemapCompleteness(imagesDir); shmemErr != nil {
+		log.Error(shmemErr, "Checkpoint: incomplete shmem pagemap set — refusing to transfer (ADR-0246)",
+			"migration", migrationName)
+		// ADR-0246 typed-status redesign: return codes.FailedPrecondition with a structured
+		// errdetails.ErrorInfo{Reason: ShmemPagemapMissingReason} payload so the controller
+		// classifies this via grpcStatus.Details(), not string matching.
+		return newShmemPagemapMissingStatus(shmemErr)
+	}
+
+	// SD-2 (ADR-0029, ADR-0160): encrypt the checkpoint layer set AT REST in final/ before the
+	// transfer phase reads it — encrypt-on-write at its source so ciphertext, never plaintext,
+	// survives on tmpfs. No-op when no per-migration checkpoint-key Secret is present (ADR-0029
+	// opt-in default). Failure here is FATAL: a half-encrypted final/ must not transfer.
+	if encErr := s.encryptCheckpointDir(context.Background(), migrationName, imagesDir); encErr != nil {
+		return fmt.Errorf("SD-2: encrypt checkpoint layer set at rest: %w", encErr)
+	}
+	return nil
+}
+
 // decryptCheckpointDir reverses encryptCheckpointDir on the destination before CRIU reads
 // final/. No-op when the encrypted-set marker is absent (the layer set is already plaintext —
 // either encryption was off, or this is a replayed restore that already decrypted).

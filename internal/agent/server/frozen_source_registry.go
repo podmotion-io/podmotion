@@ -40,7 +40,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 )
 
 // frozenSourceDir is the hostPath-backed directory where frozen-source records
@@ -193,7 +192,16 @@ func ReconcileOrphanedFrozenSources() (thawed int) {
 			continue
 		}
 		// Orphaned frozen source confirmed (same PID, same start-time, State T).
-		if killErr := syscall.Kill(int(rec.PID), syscall.SIGCONT); killErr == nil {
+		// C-06 (MUST_ROUTE_BROKER): deliver the thaw via the unconfined netns-broker,
+		// not a direct syscall.Kill. The direct peer=podmotion-agent path is UNVERIFIED
+		// against a live containerd-managed source workload (capture owed to the
+		// Sprint-44 live baseline); the broker route is correct-by-construction either
+		// way — if the confined agent's own SIGCONT were AppArmor-DENIED, a direct kill
+		// would leave the source frozen (invariant-1 / ADR-0012 break), and the
+		// unconfined broker forecloses that hazard. rec.StartTimeTicks is the recorded
+		// PID-reuse identity (verified matched above); pass it so the broker re-checks
+		// before signalling.
+		if thawErr := brokerSignalSourcePID(rec.PID, rec.StartTimeTicks); thawErr == nil {
 			thawed++
 		}
 		_ = os.Remove(path)

@@ -13,7 +13,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
@@ -22,6 +21,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/podmotion-io/podmotion/internal/agent/netnsbroker"
 	"github.com/podmotion-io/podmotion/internal/agent/network"
 )
 
@@ -58,20 +58,46 @@ func resolveVethIfindex(podUID string) (uint32, error) {
 	if podUID == "" {
 		return 0, nil
 	}
-	pid, err := FindContainerPID(podUID)
+	// Resolve the SANDBOX (pause) PID, not the application container PID. The veth
+	// lives in the pod's shared sandbox netns, and the sandbox process stays alive
+	// across the CRIU final freeze — whereas the app container is stopped/frozen by
+	// then, so FindContainerPID (which skips pause) returns 0 at ArmZeroWindow time.
+	// That silent pid==0 is what produced the false "ifindex=0 (CNI unsupported)"
+	// fail-close on a perfectly normal veth CNI. Fall back to the app PID only if the
+	// sandbox PID cannot be found (both share the netns pre-freeze).
+	pid, err := FindSandboxPID(podUID)
 	if err != nil || pid == 0 {
-		return 0, nil
+		pid, err = FindContainerPID(podUID)
+		if err != nil || pid == 0 {
+			log.Info("resolveVethIfindex: no sandbox or container PID for pod (netns unresolvable)", "podUID", podUID)
+			return 0, nil
+		}
 	}
 
-	// Enter the pod's network namespace and ask eth0 for its peer ifindex.
-	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
-	out, err := exec.Command("nsenter", "--net="+netnsPath,
-		"ip", "-o", "link", "show", "eth0").CombinedOutput()
-	if err != nil {
-		log.Info("resolveVethIfindex: ip link show eth0 in pod netns failed",
-			"pid", pid, "podUID", podUID, "err", err, "output", strings.TrimSpace(string(out)))
+	// Enter the pod's network namespace VIA THE PRIVILEGED netns-broker sidecar and
+	// ask eth0 for its peer ifindex. The de-privileged SD-1 main agent cannot open
+	// the workload's /proc/<pid>/ns/net itself: that netns-entry routes through a
+	// ptrace_may_access gate the narrow `podmotion-agent` AppArmor profile denies
+	// (it grants ptrace-read only against peer=unconfined; the workload runs under
+	// cri-containerd.apparmor.d) — the exact "apparmor DENIED operation=ptrace"
+	// signature. The broker runs unconfined + hostPID:true, so it can enter the pod
+	// netns. This mirrors the ADR-0231/0234 restore-path broker delegation: a
+	// privileged/host-namespace op the SD-1 agent lacks the privilege for is routed
+	// to the sidecar rather than re-privileging the main agent.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	r := netnsbroker.NewClient().ResolveVeth(ctx, int(pid))
+	if r.SpawnErr != nil {
+		log.Info("resolveVethIfindex: broker resolve_veth failed",
+			"pid", pid, "podUID", podUID, "err", r.SpawnErr)
 		return 0, nil
 	}
+	if r.ExitCode != 0 {
+		log.Info("resolveVethIfindex: ip link show eth0 in pod netns failed",
+			"pid", pid, "podUID", podUID, "exitCode", r.ExitCode, "output", strings.TrimSpace(string(r.Combined)))
+		return 0, nil
+	}
+	out := r.Stdout
 
 	// parseVethPeerIndex extracts N from "eth0@if<N>" in the ip -o link output.
 	peerIdx := parseVethPeerIndex(string(out))
