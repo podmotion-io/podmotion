@@ -38,6 +38,17 @@ SSH_USER="${SSH_USER:-chad}"
 POD_CIDR="10.244.0.0/16"
 FLANNEL_MANIFEST="images/kind/kube-flannel-v0.25.4.yml"   # repo-vendored (CLAUDE.md)
 
+# ── Shared RWX storage (NFS re-attach model — same volume on both workers) ────
+# Live pod migration re-attaches the SAME persistent volume on the destination
+# node (no storage migration); the bytes live on a common NFS pool that pm-w1 and
+# pm-w2 both mount identically. NFS server lives on the control-plane VM.
+NFS_SERVER_IP="${NFS_SERVER_IP:-}"                          # resolved to CP1 in load_ips-time
+NFS_EXPORT_PATH="${NFS_EXPORT_PATH:-/srv/nfs/podmotion}"
+NFS_CLIENT_CIDR="${NFS_CLIENT_CIDR:-192.168.122.0/24}"
+NFS_STORAGE_CLASS="${NFS_STORAGE_CLASS:-nfs-shared}"
+NFS_PROVISIONER_NS="${NFS_PROVISIONER_NS:-nfs-provisioner}"
+NFS_PROVISIONER_IMG_TAG="${NFS_PROVISIONER_IMG_TAG:-v4.0.2}"
+
 # Stable VM names — PERMANENT, never destroyed/undefined.
 CP_VM="pm-cp1"
 WORKER_VMS=("pm-w1" "pm-w2")
@@ -229,13 +240,68 @@ cmd_wipe() {
   echo "==> wipe complete (cluster + VMs still up; k8s control-plane untouched)."
 }
 
+# ── provision-shared-storage: NFS server + clients + dynamic RWX StorageClass ─
+# Idempotent. Reproduces:
+#   1. NFS server on the control-plane VM exporting $NFS_EXPORT_PATH to the cluster
+#      subnet (rw,sync,no_subtree_check,no_root_squash).
+#   2. nfs-common on all 3 nodes.
+#   3. nfs-subdir-external-provisioner (helm) creating StorageClass
+#      "$NFS_STORAGE_CLASS" (RWX, reclaimPolicy Retain) pointed at that export.
+# The same RWX PVC then binds a volume that BOTH workers mount identically — the
+# re-attach-same-volume model live migration depends on. VMs are never touched.
+cmd_provision_shared_storage() {
+  assert_no_vm_destruction
+  load_ips
+  NFS_SERVER_IP="${NFS_SERVER_IP:-$CP1_IP}"
+  echo "==> [1/3] NFS server on $CP_VM ($NFS_SERVER_IP), export $NFS_EXPORT_PATH -> $NFS_CLIENT_CIDR ..."
+  nsh "$NFS_SERVER_IP" "sudo bash -c '
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq nfs-kernel-server >/dev/null
+    mkdir -p $NFS_EXPORT_PATH
+    chmod 1777 $NFS_EXPORT_PATH
+    grep -qF \"$NFS_EXPORT_PATH \" /etc/exports || echo \"$NFS_EXPORT_PATH ${NFS_CLIENT_CIDR}(rw,sync,no_subtree_check,no_root_squash)\" >> /etc/exports
+    exportfs -ra
+    systemctl enable --now nfs-server >/dev/null 2>&1
+    showmount -e localhost
+  '"
+
+  echo "==> [2/3] nfs-common on all 3 nodes ..."
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    echo "  -- nfs-common on $ip"
+    nsh "$ip" "sudo bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get install -y -qq nfs-common >/dev/null'"
+  done
+
+  echo "==> [3/3] nfs-subdir-external-provisioner + StorageClass $NFS_STORAGE_CLASS (RWX, Retain) ..."
+  helm repo add nfs-subdir-external-provisioner \
+    https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
+  helm repo update nfs-subdir-external-provisioner >/dev/null 2>&1 || true
+  KUBECONFIG="$KUBECONFIG_OUT" helm upgrade --install nfs-subdir-external-provisioner \
+    nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+    --namespace "$NFS_PROVISIONER_NS" --create-namespace \
+    --set nfs.server="$NFS_SERVER_IP" \
+    --set nfs.path="$NFS_EXPORT_PATH" \
+    --set storageClass.name="$NFS_STORAGE_CLASS" \
+    --set storageClass.defaultClass=false \
+    --set storageClass.reclaimPolicy=Retain \
+    --set storageClass.accessModes=ReadWriteMany \
+    --set storageClass.archiveOnDelete=true \
+    --set image.repository=registry.k8s.io/sig-storage/nfs-subdir-external-provisioner \
+    --set image.tag="$NFS_PROVISIONER_IMG_TAG"
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$NFS_PROVISIONER_NS" rollout status \
+    deploy/nfs-subdir-external-provisioner --timeout=120s
+  echo "==> Shared storage ready. Workloads use an RWX PVC on storageClassName: $NFS_STORAGE_CLASS"
+}
+
 usage() {
   cat >&2 <<EOF
-Usage: hack/kvm-cluster.sh <verify|reset-cluster|deploy-podmotion|wipe|ssh <node-ip> [cmd]>
+Usage: hack/kvm-cluster.sh <verify|reset-cluster|deploy-podmotion|provision-shared-storage|wipe|ssh <node-ip> [cmd]>
 
   verify            assert 3 nodes Ready via $KUBECONFIG_OUT
   reset-cluster     kubeadm reset+reinit+flannel+join ON the standing VMs (NEVER destroys VMs)
   deploy-podmotion  build+import images, mint mTLS, apply CRDs, helm install (TAG=<tag>)
+  provision-shared-storage  NFS server on cp + nfs-common on all + RWX StorageClass $NFS_STORAGE_CLASS
   wipe              clean k8s + PodMotion state on the VMs WITHOUT destroying the VMs
 
 This script REFUSES to 'virsh destroy'/'virsh undefine' any of: ${PM_VMS[*]}.
@@ -249,6 +315,7 @@ main() {
     verify)           cmd_verify ;;
     reset-cluster)    cmd_reset_cluster ;;
     deploy-podmotion) cmd_deploy_podmotion ;;
+    provision-shared-storage) cmd_provision_shared_storage ;;
     wipe)             cmd_wipe ;;
     ssh)              load_ips; nsh "$@" ;;
     *)                usage ;;
