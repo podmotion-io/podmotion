@@ -3761,7 +3761,23 @@ func verifyRestoredPIDAlive(pid int, settle time.Duration) error {
 // holds a well-formed positive PID, and that PID passes the ADR-0228 liveness gate. Any missing
 // file / unparseable content / dead PID returns (0, false) so the caller proceeds to a real
 // restore. It NEVER re-runs CRIU and NEVER blocks (single-shot reads, no poll loop).
+//
+// ADR-0306 item (d): --pidfile guarantees identity of the PID recorded ONLY at the moment CRIU
+// wrote it (restore-write time). It does NOT guarantee that the PID read back here still refers
+// to the same workload at READ time — the PID could have exited and been recycled by the kernel
+// to an unrelated process between write and read. This function alone is therefore liveness-only,
+// not an identity guarantee; the confirm-path caller re-establishes identity at read time via
+// netns membership (ADR-0306 item a) before trusting this result.
 func priorRestoredPIDIfAlive(dataDir string) (int, bool) {
+	return priorRestoredPIDIfAliveSettle(dataDir, 0)
+}
+
+// priorRestoredPIDIfAliveSettle is priorRestoredPIDIfAlive with an explicit settle window
+// (ADR-0306 item c) passed through to verifyRestoredPIDAlive. Its sole caller today is the
+// confirm-path block in Restore, which needs a non-zero settle to avoid a false-alive read of a
+// PID that is in the middle of exiting. priorRestoredPIDIfAlive (settle=0) keeps its existing
+// contract and all 12 pre-existing tests unmodified.
+func priorRestoredPIDIfAliveSettle(dataDir string, settle time.Duration) (int, bool) {
 	data, err := os.ReadFile(filepath.Join(dataDir, restoredPidfileName))
 	if err != nil {
 		return 0, false
@@ -3770,12 +3786,53 @@ func priorRestoredPIDIfAlive(dataDir string) (int, bool) {
 	if !ok {
 		return 0, false
 	}
-	// Liveness-only (settle=0): identity is guaranteed by CRIU's --pidfile primitive; a live PID
-	// at this deterministic path means a prior restore for THIS migration already succeeded.
-	if err := verifyRestoredPIDAlive(pid, 0); err != nil {
+	// Liveness-only: identity at READ time is NOT guaranteed by CRIU's --pidfile primitive (see
+	// doc comment above) — only that a live PID at this deterministic path means a prior restore
+	// for THIS migration wrote this PID at restore-write time. The confirm-path caller of
+	// priorRestoredPIDIfAliveSettle re-establishes identity via netns membership afterward.
+	if err := verifyRestoredPIDAlive(pid, settle); err != nil {
 		return 0, false
 	}
 	return pid, true
+}
+
+// pidNetnsMatchesPath is the ADR-0306 item (a) B2-style inode/dev cross-check: it stats
+// /proc/<pid>/ns/net and compares its inode/dev against a stat of expectedNetnsPath. Returns
+// (true, nil) only on a genuine match; any stat failure or mismatch returns (false, err/nil)
+// so the caller fails closed.
+func pidNetnsMatchesPath(pid int, expectedNetnsPath string) (bool, error) {
+	var pidStat, expStat syscall.Stat_t
+	pidNsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+	if err := syscall.Stat(pidNsPath, &pidStat); err != nil {
+		return false, fmt.Errorf("pidNetnsMatchesPath: stat %s: %w", pidNsPath, err)
+	}
+	if err := syscall.Stat(expectedNetnsPath, &expStat); err != nil {
+		return false, fmt.Errorf("pidNetnsMatchesPath: stat %s: %w", expectedNetnsPath, err)
+	}
+	return pidStat.Ino == expStat.Ino && pidStat.Dev == expStat.Dev, nil
+}
+
+// procStatStateChar reads field 3 (state) of /proc/<pid>/stat, e.g. 'R', 'S', 'D', 'T', 't', 'Z'.
+// Returns (0, err) if the file cannot be read or parsed — treated by the caller as "not
+// currently eligible for deferred resume" rather than a hard error (ADR-0306 item b).
+func procStatStateChar(pid int) (byte, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, err
+	}
+	// Fields after the "(comm)" parenthesized field can contain spaces, so locate the closing
+	// paren and split from there rather than naive whitespace splitting.
+	s := string(data)
+	closeParen := strings.LastIndexByte(s, ')')
+	if closeParen < 0 || closeParen+2 >= len(s) {
+		return 0, fmt.Errorf("procStatStateChar: malformed /proc/%d/stat", pid)
+	}
+	rest := strings.TrimSpace(s[closeParen+1:])
+	fields := strings.Fields(rest)
+	if len(fields) < 1 || len(fields[0]) != 1 {
+		return 0, fmt.Errorf("procStatStateChar: malformed state field in /proc/%d/stat", pid)
+	}
+	return fields[0][0], nil
 }
 
 // cgroupV2Path returns the unified cgroup v2 path (the "0::<path>" entry) for pid from
@@ -3818,6 +3875,65 @@ func sandboxPausePID(sandboxID string) (int, error) {
 		return pid, nil
 	}
 	return 0, fmt.Errorf("sandbox %s not found in ctr tasks list (pause container may have exited)", sandboxID)
+}
+
+// resolveSandboxIDForMigration is the ADR-0306 item (a) agent-side self-resolve helper used
+// when RestoreRequest.sandbox_id is empty. It reads the PodMigration CR (via
+// resolveNamespaceForMigration's lookup strategy) to find Status.ReplacementPodName, reads that
+// pod's UID from the Kubernetes API, then resolves the containerd sandbox (pause container) ID
+// for that pod UID via `ctr --namespace k8s.io`. Returns "" on any failure (caller fails closed).
+func (s *AgentServer) resolveSandboxIDForMigration(ctx context.Context, migrationName string) (string, error) {
+	if s.k8sClient == nil || migrationName == "" {
+		return "", fmt.Errorf("resolveSandboxIDForMigration: no k8sClient or empty migrationName")
+	}
+	ns := s.resolveNamespaceForMigration(ctx, migrationName)
+	if ns == "" {
+		return "", fmt.Errorf("resolveSandboxIDForMigration: could not resolve namespace for migration %s", migrationName)
+	}
+	pm := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: migrationName}, pm); err != nil {
+		return "", fmt.Errorf("resolveSandboxIDForMigration: get PodMigration %s/%s: %w", ns, migrationName, err)
+	}
+	replName := pm.Status.ReplacementPodName
+	if replName == "" {
+		return "", fmt.Errorf("resolveSandboxIDForMigration: PodMigration %s/%s has no ReplacementPodName yet", ns, migrationName)
+	}
+	podNs := pm.Spec.PodNamespace
+	if podNs == "" {
+		podNs = pm.Namespace
+	}
+	pod := &corev1.Pod{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: replName, Namespace: podNs}, pod); err != nil {
+		return "", fmt.Errorf("resolveSandboxIDForMigration: get replacement pod %s/%s: %w", podNs, replName, err)
+	}
+	if pod.UID == "" {
+		return "", fmt.Errorf("resolveSandboxIDForMigration: replacement pod %s/%s has no UID", podNs, replName)
+	}
+	sandboxID, err := sandboxIDForPodUID(string(pod.UID))
+	if err != nil {
+		return "", fmt.Errorf("resolveSandboxIDForMigration: %w", err)
+	}
+	return sandboxID, nil
+}
+
+// sandboxIDForPodUID resolves the containerd sandbox (pause container) task ID for the given
+// pod UID via `ctr --namespace k8s.io containers list`, filtering by the io.kubernetes.pod.uid
+// label. Mirrors the existing ctr-based lookup idiom (sandboxPausePID/sandboxNetnsPath) — no
+// new external binary dependency.
+func sandboxIDForPodUID(podUID string) (string, error) {
+	out, err := nsenterCmd("/usr/local/bin/ctr", "--namespace", "k8s.io", "containers", "list",
+		"-q", "labels.\"io.kubernetes.pod.uid\"=="+podUID).Output()
+	if err != nil {
+		return "", fmt.Errorf("ctr containers list for pod uid %s: %w", podUID, err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, line := range lines {
+		id := strings.TrimSpace(line)
+		if id != "" {
+			return id, nil
+		}
+	}
+	return "", fmt.Errorf("no sandbox container found for pod uid %s", podUID)
 }
 
 // patchCheckpointImages modifies the CRIU image files in checkpointDir to remove entries
@@ -5596,9 +5712,58 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// re-restoring. This never opens a ptrace window and never blocks on a subprocess.
 	{
 		dataDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/data", req.MigrationName)
-		if priorPID, alive := priorRestoredPIDIfAlive(dataDir); alive {
+		// ADR-0306 item (c): non-zero settle window on the confirm-path liveness check only.
+		const confirmPathSettle = 200 * time.Millisecond
+		if priorPID, alive := priorRestoredPIDIfAliveSettle(dataDir, confirmPathSettle); alive {
 			log.Info("Restore: prior restore already produced a live workload PID — confirming idempotently without re-running CRIU (ADR-0228)",
 				"migration", req.MigrationName, "restoredPID", priorPID)
+
+			// ADR-0306 item (a): restart-durable netns-identity gate. --pidfile only guarantees
+			// identity at CRIU-restore-write time (ADR-0306 item d); a live PID at read time
+			// could be a recycled, unrelated process. Re-establish identity via netns membership,
+			// resolved through the restart-durable ResolveNetnsFromSandbox — NOT the in-memory
+			// s.ResolvedNetnsPath cache, which is empty across an agent restart.
+			sandboxID := req.SandboxId
+			if sandboxID == "" {
+				resolvedID, resolveErr := s.resolveSandboxIDForMigration(ctx, req.MigrationName)
+				if resolveErr != nil {
+					msg := fmt.Sprintf("Restore: idempotent confirm path — sandbox ID unobtainable (req.SandboxId empty and self-resolve failed): %v", resolveErr)
+					log.Error(resolveErr, "Restore: idempotent confirm path — sandbox ID unobtainable, failing closed (ADR-0306 item a)", "migration", req.MigrationName)
+					return &agentpb.RestoreResponse{Success: false, ErrorMessage: msg}, nil
+				}
+				sandboxID = resolvedID
+			}
+			expectedNetnsFile, expectedNetnsPath, netnsErr := ResolveNetnsFromSandbox(ctx, nil, sandboxID)
+			if netnsErr != nil {
+				msg := fmt.Sprintf("Restore: idempotent confirm path — could not resolve expected sandbox netns for identity check: %v", netnsErr)
+				log.Error(netnsErr, "Restore: idempotent confirm path — netns resolution failed, failing closed (ADR-0306 item a)", "migration", req.MigrationName, "sandboxID", sandboxID)
+				return &agentpb.RestoreResponse{Success: false, ErrorMessage: msg}, nil
+			}
+			_ = expectedNetnsFile.Close()
+			match, matchErr := pidNetnsMatchesPath(priorPID, expectedNetnsPath)
+			if matchErr != nil || !match {
+				msg := fmt.Sprintf("Restore: idempotent confirm path — netns identity mismatch for restored PID %d (sandbox %s): matchErr=%v match=%v",
+					priorPID, sandboxID, matchErr, match)
+				log.Info(msg, "migration", req.MigrationName)
+				return &agentpb.RestoreResponse{Success: false, ErrorMessage: msg}, nil
+			}
+			log.Info("Restore: idempotent confirm path — netns identity confirmed via restart-durable sandbox resolution (ADR-0306 item a)",
+				"migration", req.MigrationName, "restoredPID", priorPID, "sandboxID", sandboxID)
+
+			// ADR-0306 item (b): Strict gated-resume fix. If this migration is Strict (or
+			// BestEffort with TCP sequence snapshots) and the restored tree is currently stopped
+			// (SIGSTOP 'T' or tracing-stop 't'), re-insert it into pendingResumePIDs so
+			// InjectIPHandoff's existing dequeue delivers the deferred SIGCONT. A transient
+			// unreadable /proc/<pid>/stat is treated as "not currently eligible," not an error.
+			if req.TcpPreservationMode == "Strict" || (req.TcpPreservationMode == "BestEffort" && len(req.SeqSnapshots) > 0) {
+				if stateChar, stateErr := procStatStateChar(priorPID); stateErr == nil && (stateChar == 'T' || stateChar == 't') {
+					s.pendingResumePIDsMu.Lock()
+					s.pendingResumePIDs[req.MigrationName] = priorPID
+					s.pendingResumePIDsMu.Unlock()
+					log.Info("Restore: idempotent confirm path — restored tree is stopped under Strict/TCP-preserving mode, re-armed deferred SIGCONT (ADR-0306 item b)",
+						"migration", req.MigrationName, "restoredPID", priorPID, "state", string(stateChar))
+				}
+			}
 
 			// Parity with the terminal success path: populate MAC + SingleHomeRestoredPod.
 			netnsPath := s.ResolvedNetnsPath(req.MigrationName)
