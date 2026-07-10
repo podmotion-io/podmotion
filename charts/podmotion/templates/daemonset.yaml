@@ -272,18 +272,19 @@ spec:
                 # (non-fatal per ADR-0158, but it leaves neighbor caches stale at cutover).
                 # The seccomp profile already allows socket(); this was a capability denial.
                 - NET_RAW
-                # ADR-0193/ADR-0095: enforceRestoreOrderingInvariant (server.go) sends
-                # SIGCONT to the CRIU-restored workload tree to resume it after the restore
-                # ordering gate. CRIU restores the process under the IMAGE's own non-root uid
-                # (redis:7-alpine → uid 999, postgres:16-alpine → uid 70), a credential the
-                # host-init-userns agent does not match. The kernel check_kill_permission()
-                # (kernel/signal.c) authorizes kill() to a task with different creds only on
-                # exact real/effective-uid match OR CAP_KILL in the target's userns — so under
-                # drop:ALL the SIGCONT returned EPERM ("permission denied") and the restore
-                # rolled back. (SIGCONT is subprocess-signalled from the agent, not via
-                # `ctr task kill`, so containerd's own privilege does not cover it.) Not
-                # kernel-gated — CAP_KILL predates 5.8. The AppArmor `signal` mediation is a
-                # separate gate handled in podmotion-agent.profile.
+                # ADR-0193/ADR-0095/ADR-0312: the agent sends SIGCONT to workload trees
+                # (thawSourcePID / frozen_source_registry.go resume the SOURCE workload left
+                # in SIGSTOP by --leave-stopped). Those processes run under the IMAGE's own
+                # non-root uid (redis:7-alpine → uid 999, postgres:16-alpine → uid 70), a
+                # credential the host-init-userns agent does not match. The kernel
+                # check_kill_permission() (kernel/signal.c) authorizes kill() to a task with
+                # different creds only on exact real/effective-uid match OR CAP_KILL in the
+                # target's userns — so under drop:ALL the SIGCONT returned EPERM and the source
+                # stayed frozen. Not kernel-gated — CAP_KILL predates 5.8. CAP_KILL is RETAINED
+                # for these source-tree thaws (agent's own profile, permitted by AppArmor).
+                # NOTE (ADR-0312): resuming the RESTORED tree is now delegated to the unconfined
+                # netns-broker (its runtime-defined AppArmor peer label made a confined-agent
+                # signal rule un-matchable); that path does not rely on this agent CAP_KILL.
                 - KILL
                 {{- if .Values.agent.kernelGE58 }}
                 - BPF
