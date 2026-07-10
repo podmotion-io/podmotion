@@ -175,6 +175,37 @@ func (c *Client) ExecSignal(ctx context.Context, wrapperPID, signal int) error {
 	return nil
 }
 
+// ResolveVeth asks the privileged broker to enter the pod's NETWORK namespace
+// (/proc/<srcPID>/ns/net) and run `ip -o link show eth0`, returning the raw ip(8)
+// output. The de-privileged SD-1 agent cannot do this itself: opening another
+// pod's /proc/<pid>/ns/net routes through a ptrace_may_access gate that the narrow
+// `podmotion-agent` AppArmor profile denies (it allows ptrace-read only against
+// peer=unconfined; the workload runs under cri-containerd.apparmor.d) — the exact
+// "apparmor DENIED operation=ptrace" signature. The broker runs unconfined
+// (privileged:true, no AppArmor profile) and hostPID:true, so the netns-entry
+// ptrace read is permitted there. srcPID must be > 0 (a live in-migration PID).
+// SpawnErr is set only on a broker-side failure; a non-zero ip(8) exit is reported
+// via ExitCode/Stderr so the caller reconstructs the result as if it ran nsenter itself.
+func (c *Client) ResolveVeth(ctx context.Context, srcPID int) ExecResult {
+	resp, err := c.do(ctx, Request{Op: "resolve_veth", SrcPID: srcPID})
+	if err != nil {
+		return ExecResult{ExitCode: -1, SpawnErr: fmt.Errorf("netns-broker resolve_veth %d: %w", srcPID, err)}
+	}
+	if resp.Error != "" {
+		return ExecResult{ExitCode: -1, SpawnErr: fmt.Errorf("netns-broker resolve_veth %d: %s", srcPID, resp.Error)}
+	}
+	exit := 0
+	if resp.ExitCode != nil {
+		exit = *resp.ExitCode
+	}
+	return ExecResult{
+		ExitCode: exit,
+		Stdout:   resp.Stdout,
+		Stderr:   resp.Stderr,
+		Combined: resp.Combined,
+	}
+}
+
 // Teardown requests unmount+removal of the per-migration netns. Idempotent broker-side.
 func (c *Client) Teardown(ctx context.Context, migrationUID string) error {
 	resp, err := c.do(ctx, Request{Op: "teardown", MigrationUID: migrationUID})

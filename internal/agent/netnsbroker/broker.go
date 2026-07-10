@@ -99,7 +99,7 @@ var migrationUIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,127}$`)
 
 // Request is the JSON wire request accepted on the broker socket.
 type Request struct {
-	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal"
+	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal" | "resolve_veth"
 	// MigrationUID names the per-migration netns dir. Validated by migrationUIDRe.
 	// Required on create/teardown; ignored on exec*.
 	MigrationUID string `json:"migrationUID"`
@@ -232,6 +232,11 @@ func Handle(req Request) Response {
 	case "exec_signal":
 		// ADR-0234: signal the wrapper (Abort path).
 		return doExecSignal(req.WrapperPID, req.Signal)
+	case "resolve_veth":
+		// Enter the pod's NET namespace and read eth0's veth peer ifindex on the
+		// de-privileged agent's behalf (the agent's AppArmor profile denies the
+		// ptrace-read needed to open another pod's /proc/<pid>/ns/net).
+		return doResolveVeth(req.SrcPID)
 	default:
 		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal)", req.Op))
 	}
@@ -248,8 +253,8 @@ func Handle(req Request) Response {
 //   - /opt/podmotion/bin/podmotion-criu-wrapper — the CRIU launcher (ADR-0181/0183)
 //   - mkdir / touch / rm / mount / umount / sh — rootfs scaffolding + ext-mount setup
 // Adding a new restore-path host-mount-ns command requires adding it here AND a
-// §P-VERIFY assertion (the binary must exist on the node) — same discipline as any
-// other ADR runtime-dependency (§3i).
+// a runtime-dependency assertion (the binary must exist on the node) — same
+// discipline as any other ADR runtime-dependency (see ADR-0231).
 var execAllowlist = map[string]struct{}{
 	"ctr":                                       {},
 	"/usr/local/bin/ctr":                        {},
@@ -304,6 +309,60 @@ func doExec(argv []string) Response {
 	}
 }
 
+// doResolveVeth enters the pod's NET namespace (/proc/<srcPID>/ns/net) and runs
+// `ip -o link show eth0`, returning the raw output for the agent to parse the
+// eth0@if<N> host-side veth peer ifindex from. This is the netns counterpart to
+// doExec (which enters the host MOUNT namespace): the zero-window-hold arm path
+// needs the pod netns, not the host mount ns. The privileged broker (unconfined,
+// hostPID:true) can open the workload's netns; the AppArmor-confined main agent
+// cannot (ptrace-read DENIED against peer=cri-containerd.apparmor.d).
+//
+// SC-1: srcPID is validated (positive + live) exactly like create's srcPID; the
+// broker builds the fixed argv itself (`nsenter --net=/proc/<pid>/ns/net -- ip -o
+// link show eth0`) — no client-supplied argv is executed, so this cannot become an
+// arbitrary-command proxy. A non-zero ip(8) exit is reported via ExitCode/Stderr,
+// not as a broker Error (mirrors doExec).
+func doResolveVeth(srcPID int) Response {
+	if srcPID <= 0 {
+		return Response{Error: fmt.Sprintf("resolve_veth: srcPID %d must be positive", srcPID)}
+	}
+	if err := validateSrcPID(srcPID); err != nil {
+		return Response{Error: fmt.Sprintf("resolve_veth: %v", err)}
+	}
+
+	cmd := nsenterNetNs(srcPID, "ip", "-o", "link", "show", "eth0")
+	var stdout, stderr, combined bytes.Buffer
+	cmd.Stdout = io.MultiWriter(&stdout, &combined)
+	cmd.Stderr = io.MultiWriter(&stderr, &combined)
+
+	runErr := cmd.Run()
+	exitCode := 0
+	if runErr != nil {
+		var ee *exec.ExitError
+		if errors.As(runErr, &ee) {
+			exitCode = ee.ExitCode()
+		} else {
+			return Response{Error: fmt.Sprintf("resolve_veth: spawn nsenter for srcPID %d: %v", srcPID, runErr)}
+		}
+	}
+	return Response{
+		ExitCode: &exitCode,
+		Stdout:   stdout.Bytes(),
+		Stderr:   stderr.Bytes(),
+		Combined: combined.Bytes(),
+	}
+}
+
+// nsenterNetNs builds an *exec.Cmd that runs `nsenter --net=/proc/<pid>/ns/net --
+// <args...>` — the command executes in the target pod's NETWORK namespace. Unlike
+// nsenterHostMnt (host mount ns), this enters a pod netns; opening /proc/<pid>/ns/net
+// is permitted here because the broker is unconfined (no AppArmor ptrace mediation).
+func nsenterNetNs(pid int, args ...string) *exec.Cmd {
+	netNsArg := fmt.Sprintf("--net=/proc/%d/ns/net", pid)
+	full := append([]string{netNsArg, "--"}, args...)
+	return exec.Command("nsenter", full...)
+}
+
 func toResponse(path string, err error) Response {
 	if err != nil {
 		return Response{Error: err.Error()}
@@ -346,7 +405,7 @@ const asyncExecStderrCap = 64 << 10
 // wrapper. The wrapper itself validates its --cgroup-fd=N:path args and execs
 // /usr/sbin/criu; the broker does not re-parse criu's flags here (the wrapper is
 // the trusted PodMotion-built launcher), but it DOES pin argv[0] so no other
-// binary can be detached. (§3h-SYM: this mirrors ADR-0231's execAllowlist binary
+// binary can be detached. (This mirrors ADR-0231's execAllowlist binary
 // gate; the async path narrows it to a single binary.)
 const criuWrapperBin = "/opt/podmotion/bin/podmotion-criu-wrapper"
 

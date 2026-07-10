@@ -2018,6 +2018,48 @@ func FindContainerPID(podUID string) (int32, error) {
 	return lowest, nil
 }
 
+// FindSandboxPID scans /proc/*/cgroup for a line containing podUID and returns the
+// lowest-numbered matching host PID that IS the pause/sandbox container — the inverse
+// of FindContainerPID's skip. The sandbox process holds the pod's network namespace
+// and, unlike the application container, remains alive across the CRIU final-freeze
+// (the app container is stopped/frozen at freeze time, so its PID disappears). Callers
+// that need the POD NETNS (not the app process image) — e.g. veth ifindex resolution
+// for the zero-window hold — must use this, because by ArmZeroWindow time the app PID
+// is gone and FindContainerPID returns 0. The agent must run hostPID:true.
+func FindSandboxPID(podUID string) (int32, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, fmt.Errorf("reading /proc: %w", err)
+	}
+	var lowest int32
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		cgroupData, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+		if err != nil {
+			continue
+		}
+		if !cgroupContainsPodUID(string(cgroupData), podUID) {
+			continue
+		}
+		if !isPauseContainer(pid) {
+			continue
+		}
+		if lowest == 0 || int32(pid) < lowest {
+			lowest = int32(pid)
+		}
+	}
+	if lowest == 0 {
+		return 0, fmt.Errorf("sandbox (pause) PID not found for pod UID %s", podUID)
+	}
+	return lowest, nil
+}
+
 // ResolveNetnsFromSandbox returns an open *os.File for the network namespace of the
 // containerd sandbox (pause container) identified by sandboxID, along with the resolved
 // netns filesystem path. The caller must Close the returned file.
