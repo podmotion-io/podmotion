@@ -495,7 +495,10 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 	// path-independently. Namespace is not available here (no CR fetch in JoinNsRestore);
 	// pass empty string — finalizeRestore will skip the k8s condition patch but still
 	// populate mac and call SingleHomeRestoredPod.
-	netnsPath := s.ResolvedNetnsPath(migrationName)
+	// ADR-0308 follow-up: use finalizeNetnsPath so that if ResolvedNetnsPath was not recorded
+	// (parity with the gRPC fallback path), MAC resolution falls back to the PrepareDestinationNetns
+	// bind mount rather than the ptrace'd /proc/<pid>/ns/net path AppArmor denies.
+	netnsPath := s.finalizeNetnsPath(migrationName)
 	fr, frErr := s.finalizeRestore(context.Background(), pid, netnsPath, migrationName, "", tcpPreservationMode)
 	if frErr != nil {
 		// Strict/Full fail-closed: propagate.
@@ -916,6 +919,46 @@ func (s *AgentServer) ResolvedNetnsPath(migrationName string) string {
 	resolvedNetnsPathsMu.RLock()
 	defer resolvedNetnsPathsMu.RUnlock()
 	return resolvedNetnsPaths[migrationName]
+}
+
+// finalizeNetnsPath resolves the sandbox-netns path handed to ReadReplVethMAC (via
+// finalizeRestore) for migrationName, preferring the value CRIU actually joined
+// (ResolvedNetnsPath) and falling back to the agent-created bind mount recorded by
+// PrepareDestinationNetns.
+//
+// ADR-0308 follow-up: on the raw-CRIU / gRPC fallback path the controller invokes the
+// Restore RPC with req.DestNetnsFd=="" (see "cold migration passes empty string" below).
+// joinNsRestore therefore never records ResolvedNetnsPath (it only does so on the
+// destNetnsFd!="" and sandboxID branches), so ResolvedNetnsPath is empty here and
+// finalizeRestore falls through to ReadReplVethMAC via nsenter --net=/proc/<pid>/ns/net —
+// which the AppArmor podmotion-agent profile denies (no ptrace-read against the restored
+// workload's profile), yielding "replVethMAC empty after restore". PrepareDestinationNetns
+// still ran on this path (Strict/BestEffort always pre-stage the dest netns), and its
+// broker-created bind mount /run/podmotion/netns/pm-mig-<uid>/bind is stored on
+// destMigrationNetns[migrationName].NetnsPath. Reusing that exact path (never a rederived
+// literal) routes ReadReplVethMAC through the bind-mount branch: no ptrace, no AppArmor
+// denial. Returns "" when neither source is available (host-network / no pre-staged netns),
+// in which case finalizeRestore falls back to the PID path as before.
+func (s *AgentServer) finalizeNetnsPath(migrationName string) string {
+	if p := s.ResolvedNetnsPath(migrationName); p != "" {
+		return p
+	}
+	s.destMigrationNetnsMu.RLock()
+	ns := s.destMigrationNetns[migrationName]
+	s.destMigrationNetnsMu.RUnlock()
+	if ns != nil && ns.NetnsPath != "" {
+		// Only hand CRIU/ReadReplVethMAC a bind path that actually exists at this point in
+		// the flow; a torn-down or never-created bind would just re-fail nsenter. Gate on
+		// os.Stat so a missing bind falls back safely to the PID path in finalizeRestore.
+		if _, statErr := os.Stat(ns.NetnsPath); statErr == nil {
+			log.Info("finalizeNetnsPath: ResolvedNetnsPath empty (raw-CRIU/DestNetnsFd-empty path) — using PrepareDestinationNetns bind mount for MAC read (ADR-0308 follow-up)",
+				"migration", migrationName, "bindPath", ns.NetnsPath)
+			return ns.NetnsPath
+		}
+		log.Info("finalizeNetnsPath: stored dest-netns bind path does not exist; falling back to PID netns for MAC read",
+			"migration", migrationName, "bindPath", ns.NetnsPath)
+	}
+	return ""
 }
 
 // SandboxNetnsPath resolves the network namespace path for a containerd sandbox ID, for use
@@ -4041,15 +4084,36 @@ def classify_reg_fd(entry, ctx):
             return 'DECLINE'
         return 'REBIND_TO_ROOT'
     # ADR-0311: a PLAIN-REG *non-directory* fd is still safely rebindable when its orphan
-    # mnt_id is a dropped tmpfs/shm mount (ctx['tmpfs_drop_mnt_ids'], keyed by fstype=='TMPFS'
-    # at seed time — see the tmpfs_drop_mnt_ids comprehension alongside drop_ids). tmpfs/shm
-    # backing storage is memory-only and never survives a checkpoint regardless, so redirecting
-    # the handle to root (rather than the previous dir-vs-nondir proxy that always DECLINEd
-    # non-directory orphans) fixes /dev/shm-backed workloads (PostgreSQL) without weakening the
-    # Strict guard for any other orphan class: entries whose orphan mnt_id is unaccounted for or
-    # sysfs-backed are untouched by this branch and still DECLINE below.
+    # mnt_id is backed by a tmpfs/shm mount. tmpfs/shm backing storage is memory-only and
+    # never survives a checkpoint regardless, so redirecting the handle to root (rather than
+    # the previous dir-vs-nondir proxy that always DECLINEd non-directory orphans) fixes
+    # /dev/shm-backed workloads (PostgreSQL POSIX-shmem segments) without weakening the Strict
+    # guard for any other orphan class.
+    #
+    # ADR-0311 follow-up (live-path fix): the rebind decision is now keyed on the mount FSTYPE,
+    # resolved from the mountpoints table the reconciliation pass already built, NOT solely on
+    # the narrowly-seeded tmpfs_drop_mnt_ids set. The original set was seeded only from mounts
+    # that were BOTH is_drop_root(e) AND fstype=='TMPFS'; a live PostgreSQL checkpoint carried a
+    # /dev/shm PostgreSQL.* REG fd whose backing mnt_id (observed live: 943) resolved to a tmpfs
+    # mount that was NOT in that seed set, so it fell through to DECLINE (the P-0193-1 hard-stop
+    # seen live) even though it is exactly the safe tmpfs/shm rebind class. Keying on
+    # ctx['mnt_fstypes'][mnt_id] ∈ TMPFS_FSTYPES (TMPFS/DEVTMPFS — the pycriu-decoded enum name
+    # spellings, source-grounded in mnt.proto's fstype enum) catches every tmpfs/shm-backed
+    # orphan regardless of how it was (or was not) classified in the drop pass. The pre-existing
+    # tmpfs_drop_mnt_ids set is retained as a belt: an orphan whose mnt_id is a dropped tmpfs
+    # mount that has already been REMOVED from mnt_fstypes (so fstype is no longer resolvable)
+    # still rebinds. Guard is UNWEAKENED: an orphan whose mnt_id is absent from mnt_fstypes AND
+    # tmpfs_drop_mnt_ids (a mount that simply vanished), or whose resolved fstype is non-tmpfs
+    # (sysfs, overlayfs, a real persistent volume), still DECLINEs below.
     tmpfs_drop_mnt_ids = ctx.get('tmpfs_drop_mnt_ids') or set()
-    if mnt_id in tmpfs_drop_mnt_ids:
+    mnt_fstypes = ctx.get('mnt_fstypes') or {}
+    # JSON object keys are strings; the --classify-selftest path serializes mnt_fstypes as such.
+    # Look up by int first (production, where keys are native ints), then by str (selftest).
+    fstype_for_mnt = mnt_fstypes.get(mnt_id)
+    if fstype_for_mnt is None:
+        fstype_for_mnt = mnt_fstypes.get(str(mnt_id))
+    TMPFS_FSTYPES = ('TMPFS', 'DEVTMPFS')
+    if (fstype_for_mnt in TMPFS_FSTYPES) or (mnt_id in tmpfs_drop_mnt_ids):
         root_mnt_id = ctx.get('root_mnt_id')
         if root_mnt_id is None or root_mnt_id not in ctx['kept_mnt_ids']:
             return 'DECLINE'
@@ -4069,6 +4133,9 @@ if len(sys.argv) >= 2 and sys.argv[1] == '--classify-selftest':
         'ext_drop_mnt_ids': set(_c.get('ext_drop_mnt_ids', [])),
         'root_mnt_id': _c.get('root_mnt_id'),
         'tmpfs_drop_mnt_ids': set(_c.get('tmpfs_drop_mnt_ids', [])),
+        # ADR-0311 follow-up: mnt_id -> fstype (enum-name string) for all mountpoints entries.
+        # JSON object keys arrive as strings; classify_reg_fd tolerates int-or-str lookup.
+        'mnt_fstypes': _c.get('mnt_fstypes', {}) or {},
     }
     def _entry_type(e):
         reg = e.get('reg', {}) or {}
@@ -4230,6 +4297,18 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     # fail-closed narrowing (ADR-0311 decision 1), not a regression, out of scope to widen here.
     # Disjoint by construction from any DROP_ROOT_FSTYPES(sysfs) match (TMPFS != sysfs).
     tmpfs_drop_mnt_ids = {e['mnt_id'] for e in img['entries'] if is_drop_root(e) and 'mnt_id' in e and e.get('fstype') == 'TMPFS'}
+
+    # ADR-0311 follow-up (live-path fix): a COMPLETE mnt_id -> fstype map over EVERY mountpoints
+    # entry in the ORIGINAL (pre-drop) image. classify_reg_fd keys the tmpfs/shm REG-fd rebind
+    # on this map so a /dev/shm PostgreSQL.* orphan fd whose backing mnt_id was never seeded into
+    # the narrow tmpfs_drop_mnt_ids set (because its mount was not is_drop_root, or was a kept
+    # /dev/shm rather than a dropped one) is still recognized as tmpfs-backed and rebound to root
+    # instead of hard-stopping (P-0193-1). Built from img['entries'] BEFORE the drop filter so a
+    # dropped tmpfs mount's fstype is still resolvable. fstype is the pycriu-decoded enum name
+    # string (e.g. 'TMPFS'); entries without mnt_id/fstype are skipped. The Strict guard is
+    # unweakened: only tmpfs-class fstypes authorize the rebind (see classify_reg_fd).
+    mnt_fstypes = {e['mnt_id']: e.get('fstype') for e in img['entries']
+                   if 'mnt_id' in e and e.get('fstype') is not None}
 
     # Root mount protection: / must never be dropped even if a logic error tries to add it.
     root_entries = [e for e in img['entries'] if e.get('mountpoint') == '/']
@@ -4515,6 +4594,10 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
         # for non-directory REG orphan fds backed by a dropped tmpfs/shm mount (e.g. PostgreSQL
         # /dev/shm segments) instead of the previous unconditional DECLINE.
         'tmpfs_drop_mnt_ids': tmpfs_drop_mnt_ids,
+        # ADR-0311 follow-up: complete mnt_id->fstype map (pre-drop) so the tmpfs/shm rebind is
+        # keyed on the actual mount FSTYPE rather than only the narrow drop-seed set — the live
+        # PostgreSQL /dev/shm orphan (backing_mnt_id=943) was tmpfs-backed but never in that set.
+        'mnt_fstypes': mnt_fstypes,
     }
     modified = False
     for entry in files_img.get('entries', []):
@@ -4534,10 +4617,16 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
             # is diagnostic only; the classifier's decision is identical for all three.
             is_dir_fd = (reg.get('mode', 0) & _S_IFMT) == _S_IFDIR
             entry_type = 'DIR' if is_dir_fd else 'REG'
-            if not is_dir_fd and mnt_id in tmpfs_drop_mnt_ids:
+            _fst = mnt_fstypes.get(mnt_id)
+            if _fst is None:
+                _fst = mnt_fstypes.get(str(mnt_id))
+            _is_tmpfs_regfd = (not is_dir_fd) and ((_fst in ('TMPFS', 'DEVTMPFS')) or (mnt_id in tmpfs_drop_mnt_ids))
+            if _is_tmpfs_regfd:
                 # ADR-0311: tmpfs/shm-backed non-directory orphan (e.g. PostgreSQL /dev/shm
                 # segment). Distinct label — never aliases with the sysfs/DROP_ROOT_FSTYPES
                 # path (disjoint sets by construction) or with the generic/ext-drop dir labels.
+                # ADR-0311 follow-up: recognized via the mnt_id->fstype map (live-path fix), not
+                # only the narrow tmpfs_drop_mnt_ids seed set.
                 label = 'tmpfs-shmem-regfd'
             else:
                 label = 'b2-lockstep-ext-drop' if mnt_id in ext_drop_mnt_ids else 'generic-orphan'
@@ -5835,7 +5924,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 			}
 
 			// Parity with the terminal success path: populate MAC + SingleHomeRestoredPod.
-			netnsPath := s.ResolvedNetnsPath(req.MigrationName)
+			netnsPath := s.finalizeNetnsPath(req.MigrationName)
 			fr, frErr := s.finalizeRestore(ctx, priorPID, netnsPath, req.MigrationName, "", req.TcpPreservationMode)
 			if frErr != nil {
 				log.Error(frErr, "Restore: finalizeRestore failed on idempotent confirm path (Strict/Full fail-closed)", "migration", req.MigrationName)
@@ -6001,7 +6090,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		// E1 Condition 1+2: call finalizeRestore to populate MAC and run SingleHomeRestoredPod
 		// on this gRPC path (parity with NRI path — Condition 2).
 		// Unconditional: finalizeRestore always runs (MAC resolution + Strict/Full fail-closed applies even without k8s client).
-		netnsPath := s.ResolvedNetnsPath(req.MigrationName)
+		netnsPath := s.finalizeNetnsPath(req.MigrationName)
 		fr, frErr := s.finalizeRestore(ctx, pid, netnsPath, req.MigrationName, "", req.TcpPreservationMode)
 		if frErr != nil {
 			log.Error(frErr, "Restore: finalizeRestore failed (Strict/Full fail-closed)", "migration", req.MigrationName)
@@ -6083,7 +6172,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// E1 Condition 1+2: finalizeRestore for MAC population + SingleHomeRestoredPod parity
 	// on the raw CRIU fallback path (Conditions 1, 2, 3).
 	// Unconditional: finalizeRestore always runs (MAC resolution + Strict/Full fail-closed applies even without k8s client).
-	netnsPath2 := s.ResolvedNetnsPath(req.MigrationName)
+	netnsPath2 := s.finalizeNetnsPath(req.MigrationName)
 	fr2, frErr2 := s.finalizeRestore(ctx, result.PID, netnsPath2, req.MigrationName, "", req.TcpPreservationMode)
 	if frErr2 != nil {
 		log.Error(frErr2, "Restore (raw CRIU path): finalizeRestore failed (Strict/Full fail-closed)", "migration", req.MigrationName)
