@@ -10,8 +10,11 @@ package network
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"syscall"
 	"testing"
+
+	"github.com/podmotion-io/podmotion/internal/agent/netnsbroker"
 )
 
 // mockProvider is a test NetworkProvider where WireDestinationVeth is configurable.
@@ -160,6 +163,35 @@ func TestTruncUID(t *testing.T) {
 		got := truncUID(tc.uid, tc.n)
 		if got != tc.want {
 			t.Errorf("truncUID(%q, %d) = %q; want %q", tc.uid, tc.n, got, tc.want)
+		}
+	}
+}
+
+// TestMigrationNetnsBindPath_MatchesBrokerShape pins the canonical on-disk bind path used by the
+// finalizeNetnsPath restart/teardown-durable fallback (redis live-bug 2026-07-10 cause b) to the
+// SAME path shape PrepareDestinationNetns hands the broker: netnsbroker.NetnsBaseDir/pm-mig-<uid
+// with hyphens stripped>/bind. If these ever drift, the fallback reconstructs a path that does not
+// os.Stat, silently dropping back to the AppArmor-denied /proc/<pid>/ns/net ptrace path and
+// re-introducing the empty-MAC Strict fail-closed.
+func TestMigrationNetnsBindPath_MatchesBrokerShape(t *testing.T) {
+	cases := []struct {
+		uid  string
+		want string
+	}{
+		{"redis-live-migration", "/run/podmotion/netns/pm-mig-redislivemigration/bind"},
+		{"abc-123", "/run/podmotion/netns/pm-mig-abc123/bind"},
+		{"nohyphens", "/run/podmotion/netns/pm-mig-nohyphens/bind"},
+	}
+	for _, tc := range cases {
+		got := MigrationNetnsBindPath(tc.uid)
+		if got != tc.want {
+			t.Errorf("MigrationNetnsBindPath(%q) = %q; want %q", tc.uid, got, tc.want)
+		}
+		// It must also equal filepath.Join(NetnsBaseDir, brokerUID(uid), "bind") — the exact
+		// composition PrepareDestinationNetns → broker.Create → netnsPathFor uses.
+		wantComposed := filepath.Join(netnsbroker.NetnsBaseDir, brokerUID(tc.uid), "bind")
+		if got != wantComposed {
+			t.Errorf("MigrationNetnsBindPath(%q) = %q; broker composition = %q — path shapes drifted", tc.uid, got, wantComposed)
 		}
 	}
 }
