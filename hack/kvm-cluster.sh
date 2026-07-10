@@ -144,6 +144,23 @@ cmd_deploy_podmotion() {
   # NOTE: CRIU 4.2 is already installed at /usr/sbin/criu on every node, and the
   # agent DaemonSet's install-criu-wrapper init container copies the criu-wrapper
   # onto the host (/opt/podmotion/bin) — so no manual per-VM binary copy is needed.
+  #
+  # ctr host-dep: the checkpoint/restore host-mount-ns path invokes ctr at the
+  # ABSOLUTE path /usr/local/bin/ctr (server.go FindContainerTaskID / ctrCheckpoint /
+  # sandbox task-PID lookup; also the netnsbroker exec allowlist). On these Ubuntu
+  # containerd nodes ctr ships at /usr/bin/ctr, so the absolute-path invocation ENOENTs
+  # and the containerd-native task-PID lookup silently degrades to the proc-scan fallback
+  # (which returns PID 0 mid-restart → "criu dump: Pid is 0"). Durably provision the
+  # expected path as a symlink to the real ctr — same "provision host deps on deploy"
+  # discipline as CRIU. Idempotent; resolves ctr wherever it actually lives.
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    echo "  -- ensure /usr/local/bin/ctr on $ip"
+    nsh "$ip" 'set -e; REAL_CTR="$(command -v ctr || true)"; \
+      if [ -z "$REAL_CTR" ]; then echo "ERROR: ctr not found on node" >&2; exit 1; fi; \
+      if [ "$REAL_CTR" != "/usr/local/bin/ctr" ]; then \
+        sudo ln -sfn "$REAL_CTR" /usr/local/bin/ctr; fi; \
+      test -x /usr/local/bin/ctr && echo "    ctr -> $REAL_CTR ok"'
+  done
   for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
     echo "  -- import into $ip"
     docker save "$OP_IMG"    | nsh "$ip" "sudo ctr -n k8s.io images import -"

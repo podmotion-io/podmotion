@@ -238,7 +238,7 @@ func Handle(req Request) Response {
 		// ptrace-read needed to open another pod's /proc/<pid>/ns/net).
 		return doResolveVeth(req.SrcPID)
 	default:
-		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal)", req.Op))
+		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal|resolve_veth)", req.Op))
 	}
 }
 
