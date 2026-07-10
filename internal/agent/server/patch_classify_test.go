@@ -26,9 +26,16 @@ import (
 	"testing"
 )
 
+// classifyResult mirrors one element of the --classify-selftest JSON output: the classifier
+// action plus (ADR-0311) the entry_type ('DIR'|'REG') the production call site now surfaces.
+type classifyResult struct {
+	Action    string `json:"action"`
+	EntryType string `json:"entry_type"`
+}
+
 // runClassifySelftest runs the production classifier in --classify-selftest mode over the
-// given ctx + entries and returns one action per entry.
-func runClassifySelftest(t *testing.T, ctx map[string]any, entries []map[string]any) []string {
+// given ctx + entries and returns one {action, entry_type} result per entry.
+func runClassifySelftest(t *testing.T, ctx map[string]any, entries []map[string]any) []classifyResult {
 	t.Helper()
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 not available — skipping real-classifier selftest")
@@ -50,11 +57,20 @@ func runClassifySelftest(t *testing.T, ctx map[string]any, entries []map[string]
 	if err != nil {
 		t.Fatalf("classifier selftest failed: %v\nstderr: %s", err, stderr.String())
 	}
-	var actions []string
-	if err := json.Unmarshal(out, &actions); err != nil {
-		t.Fatalf("parse actions %q: %v", string(out), err)
+	var results []classifyResult
+	if err := json.Unmarshal(out, &results); err != nil {
+		t.Fatalf("parse results %q: %v", string(out), err)
 	}
-	return actions
+	return results
+}
+
+// actionsOf extracts just the action strings, for tests that don't care about entry_type.
+func actionsOf(results []classifyResult) []string {
+	out := make([]string, len(results))
+	for i, r := range results {
+		out[i] = r.Action
+	}
+	return out
 }
 
 // reg builds a REG files.img entry with the given id/name/mnt_id/mode/ext.
@@ -106,7 +122,7 @@ func TestClassifyRegFd_RealScript(t *testing.T) {
 	}
 	want := []string{"KEEP", "KEEP", "KEEP", "KEEP", "KEEP", "KEEP", "REBIND_TO_ROOT", "DECLINE"}
 
-	got := runClassifySelftest(t, ctx, entries)
+	got := actionsOf(runClassifySelftest(t, ctx, entries))
 	if len(got) != len(want) {
 		t.Fatalf("got %d actions, want %d: %v", len(got), len(want), got)
 	}
@@ -132,13 +148,13 @@ func TestClassifyRegFd_RebindThenReCheckKeep(t *testing.T) {
 		"root_mnt_id":      rootMntID,
 	}
 	orphanDir := reg(20, "/data", 500, modeDir, false)
-	if got := runClassifySelftest(t, ctx, []map[string]any{orphanDir}); got[0] != "REBIND_TO_ROOT" {
-		t.Fatalf("orphan dir: got %q, want REBIND_TO_ROOT", got[0])
+	if got := runClassifySelftest(t, ctx, []map[string]any{orphanDir}); got[0].Action != "REBIND_TO_ROOT" {
+		t.Fatalf("orphan dir: got %q, want REBIND_TO_ROOT", got[0].Action)
 	}
 	// Simulate the main pass rebinding mnt_id -> rootMntID, then re-run the classifier.
 	rebound := reg(20, "/data", rootMntID, modeDir, false)
-	if got := runClassifySelftest(t, ctx, []map[string]any{rebound}); got[0] != "KEEP" {
-		t.Fatalf("rebound dir: got %q, want KEEP (re-check must not false-positive)", got[0])
+	if got := runClassifySelftest(t, ctx, []map[string]any{rebound}); got[0].Action != "KEEP" {
+		t.Fatalf("rebound dir: got %q, want KEEP (re-check must not false-positive)", got[0].Action)
 	}
 }
 
@@ -202,8 +218,8 @@ func TestClassifyRegFd_DirRebindTargetValidation(t *testing.T) {
 				ctx["root_mnt_id"] = tc.rootMntID
 			}
 			got := runClassifySelftest(t, ctx, []map[string]any{orphanDir})
-			if got[0] != tc.want {
-				t.Errorf("orphan dir with %s: got %q, want %q", tc.name, got[0], tc.want)
+			if got[0].Action != tc.want {
+				t.Errorf("orphan dir with %s: got %q, want %q", tc.name, got[0].Action, tc.want)
 			}
 		})
 	}
@@ -224,7 +240,102 @@ func TestClassifyRegFd_GenericOrphanDirRebinds(t *testing.T) {
 		"root_mnt_id":      1,
 	}
 	genericOrphanDir := reg(40, "/workload/pv-subdir", 777, modeDir, false)
-	if got := runClassifySelftest(t, ctx, []map[string]any{genericOrphanDir}); got[0] != "REBIND_TO_ROOT" {
-		t.Fatalf("generic orphan dir: got %q, want REBIND_TO_ROOT", got[0])
+	if got := runClassifySelftest(t, ctx, []map[string]any{genericOrphanDir}); got[0].Action != "REBIND_TO_ROOT" {
+		t.Fatalf("generic orphan dir: got %q, want REBIND_TO_ROOT", got[0].Action)
+	}
+}
+
+// TestClassifyRegFd_TmpfsShmRegRebind is ADR-0311 fixture (a): a positive shm REBIND. A
+// non-directory (REG) orphan fd backed by a dropped tmpfs/shm mount (tmpfs_drop_mnt_ids)
+// classifies REBIND_TO_ROOT — fixing the /dev/shm-backed workload (PostgreSQL) restore-abort
+// that the old dir-vs-nondir proxy always DECLINEd. Asserts on the new entry_type field too.
+func TestClassifyRegFd_TmpfsShmRegRebind(t *testing.T) {
+	ctx := map[string]any{
+		"remap_ids":          []int{},
+		"inherit_fd_names":   []string{},
+		"kept_mnt_ids":       []int{1},
+		"ext_drop_mnt_ids":   []int{},
+		"root_mnt_id":        1,
+		"tmpfs_drop_mnt_ids": []int{600}, // e.g. /dev/shm, fstype=='TMPFS' at seed time.
+	}
+	shmRegFd := reg(50, "/dev/shm/PostgreSQL.123456", 600, modeFile, false)
+	got := runClassifySelftest(t, ctx, []map[string]any{shmRegFd})
+	if got[0].Action != "REBIND_TO_ROOT" {
+		t.Fatalf("shm REG fd: got action %q, want REBIND_TO_ROOT", got[0].Action)
+	}
+	if got[0].EntryType != "REG" {
+		t.Fatalf("shm REG fd: got entry_type %q, want REG", got[0].EntryType)
+	}
+}
+
+// TestClassifyRegFd_UnaccountedOrphanDeclines is ADR-0311 fixture (b): a negative
+// unaccounted-orphan DECLINE. A non-directory orphan fd whose mnt_id is in NEITHER
+// kept_mnt_ids NOR tmpfs_drop_mnt_ids still hard-stops (Strict guard unweakened).
+func TestClassifyRegFd_UnaccountedOrphanDeclines(t *testing.T) {
+	ctx := map[string]any{
+		"remap_ids":          []int{},
+		"inherit_fd_names":   []string{},
+		"kept_mnt_ids":       []int{1},
+		"ext_drop_mnt_ids":   []int{},
+		"root_mnt_id":        1,
+		"tmpfs_drop_mnt_ids": []int{600},
+	}
+	unaccountedRegFd := reg(51, "/data/file", 999, modeFile, false)
+	got := runClassifySelftest(t, ctx, []map[string]any{unaccountedRegFd})
+	if got[0].Action != "DECLINE" {
+		t.Fatalf("unaccounted orphan REG fd: got %q, want DECLINE", got[0].Action)
+	}
+}
+
+// TestClassifyRegFd_SysfsOrphanDeclinesNoAliasing is ADR-0311 fixture (c): a negative
+// sysfs-orphan DECLINE, with a tmpfs_drop_mnt_ids built by the SAME production seed logic
+// (disjoint mnt_id namespace from the sysfs orphan under test), proving no aliasing between
+// tmpfs_drop_mnt_ids and DROP_ROOT_FSTYPES(sysfs) — the Security Reviewer's explicit gating
+// condition (decision 8c).
+func TestClassifyRegFd_SysfsOrphanDeclinesNoAliasing(t *testing.T) {
+	ctx := map[string]any{
+		"remap_ids":        []int{},
+		"inherit_fd_names": []string{},
+		"kept_mnt_ids":     []int{1},
+		"ext_drop_mnt_ids": []int{},
+		"root_mnt_id":      1,
+		// tmpfs_drop_mnt_ids seeded (as production does) from a DIFFERENT, disjoint mnt_id
+		// (700, a real tmpfs) than the sysfs orphan under test (mnt_id 800) — proving the
+		// sysfs orphan is not accidentally swept into the tmpfs set.
+		"tmpfs_drop_mnt_ids": []int{700},
+	}
+	// mnt_id 800 simulates an orphan fd backed by a DROP_ROOT_FSTYPES(sysfs) mount — NOT in
+	// kept_mnt_ids and NOT in tmpfs_drop_mnt_ids, so it must still DECLINE.
+	sysfsOrphanRegFd := reg(52, "/sys/devices/virtual/dmi/id/product_name", 800, modeFile, false)
+	got := runClassifySelftest(t, ctx, []map[string]any{sysfsOrphanRegFd})
+	if got[0].Action != "DECLINE" {
+		t.Fatalf("sysfs orphan REG fd: got %q, want DECLINE (no aliasing with tmpfs_drop_mnt_ids)", got[0].Action)
+	}
+}
+
+// TestClassifyRegFd_NonShmTmpfsAliasingRebinds is ADR-0311 fixture (d): a positive non-shm
+// tmpfs-aliasing fixture — a synthetic non-/dev/shm DROP_PATHS/DROP_ROOT_FSTYPES entry with
+// fstype=='TMPFS' and a REG orphan fd on it still fires REBIND_TO_ROOT. Closes the Network
+// Architect's generalization-unproven gap: the fix is keyed on fstype=='TMPFS', not on the
+// /dev/shm path specifically. Asserts on entry_type per decision 8.
+func TestClassifyRegFd_NonShmTmpfsAliasingRebinds(t *testing.T) {
+	ctx := map[string]any{
+		"remap_ids":        []int{},
+		"inherit_fd_names": []string{},
+		"kept_mnt_ids":     []int{1},
+		"ext_drop_mnt_ids": []int{},
+		"root_mnt_id":      1,
+		// mnt_id 601 is a non-/dev/shm tmpfs mount (e.g. a workload-defined tmpfs volume
+		// mounted at some other path) that was seeded into tmpfs_drop_mnt_ids purely because
+		// its fstype=='TMPFS', proving the fix generalizes beyond /dev/shm specifically.
+		"tmpfs_drop_mnt_ids": []int{601},
+	}
+	nonShmTmpfsRegFd := reg(53, "/var/lib/app/scratch-tmpfs/segment.dat", 601, modeFile, false)
+	got := runClassifySelftest(t, ctx, []map[string]any{nonShmTmpfsRegFd})
+	if got[0].Action != "REBIND_TO_ROOT" {
+		t.Fatalf("non-shm tmpfs-aliasing REG fd: got action %q, want REBIND_TO_ROOT", got[0].Action)
+	}
+	if got[0].EntryType != "REG" {
+		t.Fatalf("non-shm tmpfs-aliasing REG fd: got entry_type %q, want REG", got[0].EntryType)
 	}
 }

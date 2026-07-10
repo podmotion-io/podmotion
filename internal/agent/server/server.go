@@ -3971,17 +3971,25 @@ var patchCheckpointImagesFn = func(checkpointDir string, inheritFdNames []string
 //                       inherited / sentinel mnt_id) OR already consistent (mnt_id kept): no change.
 //   - 'REBIND_TO_ROOT'  a PLAIN-REG *directory* fd with an orphan mnt_id whose rebind target
 //                       (root_mnt_id) is sane: rebind mnt_id → root (covers both generic
-//                       ADR-0193 §4 orphans and ADR-0194 B-2 ext-drop lockstep). The production
-//                       call site emits a WARNING for every such rebind (ADR-0245 D2 visibility).
-//   - 'DECLINE'         a PLAIN-REG *non-directory* fd with an orphan mnt_id (cannot be safely
-//                       rebound — would still fire mount.c:3953 / P-0193-1), OR a *directory* fd
-//                       whose rebind target root_mnt_id is unusable (missing / not a kept
-//                       mountpoint): hard-stop rather than redirect the fd onto another absent
-//                       mnt_id (ADR-0245 D2 fail-closed target validation).
+//                       ADR-0193 §4 orphans and ADR-0194 B-2 ext-drop lockstep). ALSO authorized
+//                       for a PLAIN-REG *non-directory* (REG-type) fd whose orphan mnt_id is a
+//                       dropped tmpfs/shm mount (ctx['tmpfs_drop_mnt_ids'], ADR-0311): tmpfs/shm
+//                       content does not survive a checkpoint anyway (it's memory-backed, not
+//                       durable), so rebinding the handle to root — rather than hard-stopping the
+//                       whole restore — is safe and matches the dir-fd precedent. The production
+//                       call site emits a WARNING for every such rebind (ADR-0245 D2 visibility)
+//                       and records entry_type ('DIR'|'REG') for diagnostics (ADR-0311).
+//   - 'DECLINE'         a PLAIN-REG *non-directory* fd with an orphan mnt_id that is NOT a
+//                       dropped tmpfs/shm mount (cannot be safely rebound — would still fire
+//                       mount.c:3953 / P-0193-1), OR a *directory* fd whose rebind target
+//                       root_mnt_id is unusable (missing / not a kept mountpoint): hard-stop
+//                       rather than redirect the fd onto another absent mnt_id (ADR-0245 D2
+//                       fail-closed target validation).
 //
 // ctx carries the cross-image sets the decision needs: remap_ids, inherit_fd_names,
-// kept_mnt_ids, ext_drop_mnt_ids, root_mnt_id. The mnt_id>0 / open_path() discriminants are the
-// CRIU-4.2 source-proven predicate (files-reg.c:2191-2263, mount.c:3946-3953).
+// kept_mnt_ids, ext_drop_mnt_ids, root_mnt_id, tmpfs_drop_mnt_ids (ADR-0311). The mnt_id>0 /
+// open_path() discriminants are the CRIU-4.2 source-proven predicate (files-reg.c:2191-2263,
+// mount.c:3946-3953).
 //
 // This constant is prepended verbatim to the production patch script AND is exercised
 // directly (in --classify-selftest mode) by TestClassifyRegFd_RealScript — the test runs the
@@ -4016,7 +4024,8 @@ def classify_reg_fd(entry, ctx):
     if mnt_id in ctx['kept_mnt_ids']:
         return 'KEEP'
     # Positive orphan mnt_id — PLAIN-REG class that would fire mount.c:3953.
-    if (reg.get('mode', 0) & _S_IFMT) == _S_IFDIR:
+    is_dir = (reg.get('mode', 0) & _S_IFMT) == _S_IFDIR
+    if is_dir:
         # ADR-0245 D2 (Storage Architect finding): an orphan *directory* fd is rebound to the
         # container root instead of hard-stopping. That rebind is only safe if the rebind
         # TARGET is itself sane — root_mnt_id must exist AND be a kept mountpoint, otherwise
@@ -4027,6 +4036,20 @@ def classify_reg_fd(entry, ctx):
         # this redesign's fail-closed philosophy everywhere else (pidfile primitive, C1 guard).
         # The visibility half of the fix (a WARNING on every directory rebind that DOES fire)
         # lives at the production call site, which alone holds the fd path/label for diagnostics.
+        root_mnt_id = ctx.get('root_mnt_id')
+        if root_mnt_id is None or root_mnt_id not in ctx['kept_mnt_ids']:
+            return 'DECLINE'
+        return 'REBIND_TO_ROOT'
+    # ADR-0311: a PLAIN-REG *non-directory* fd is still safely rebindable when its orphan
+    # mnt_id is a dropped tmpfs/shm mount (ctx['tmpfs_drop_mnt_ids'], keyed by fstype=='TMPFS'
+    # at seed time — see the tmpfs_drop_mnt_ids comprehension alongside drop_ids). tmpfs/shm
+    # backing storage is memory-only and never survives a checkpoint regardless, so redirecting
+    # the handle to root (rather than the previous dir-vs-nondir proxy that always DECLINEd
+    # non-directory orphans) fixes /dev/shm-backed workloads (PostgreSQL) without weakening the
+    # Strict guard for any other orphan class: entries whose orphan mnt_id is unaccounted for or
+    # sysfs-backed are untouched by this branch and still DECLINE below.
+    tmpfs_drop_mnt_ids = ctx.get('tmpfs_drop_mnt_ids') or set()
+    if mnt_id in tmpfs_drop_mnt_ids:
         root_mnt_id = ctx.get('root_mnt_id')
         if root_mnt_id is None or root_mnt_id not in ctx['kept_mnt_ids']:
             return 'DECLINE'
@@ -4045,8 +4068,17 @@ if len(sys.argv) >= 2 and sys.argv[1] == '--classify-selftest':
         'kept_mnt_ids': set(_c.get('kept_mnt_ids', [])),
         'ext_drop_mnt_ids': set(_c.get('ext_drop_mnt_ids', [])),
         'root_mnt_id': _c.get('root_mnt_id'),
+        'tmpfs_drop_mnt_ids': set(_c.get('tmpfs_drop_mnt_ids', [])),
     }
-    print(json.dumps([classify_reg_fd(e, _ctx) for e in _p.get('entries', [])]))
+    def _entry_type(e):
+        reg = e.get('reg', {}) or {}
+        if (reg.get('mode', 0) & _S_IFMT) == _S_IFDIR:
+            return 'DIR'
+        return 'REG'
+    print(json.dumps([
+        {'action': classify_reg_fd(e, _ctx), 'entry_type': _entry_type(e)}
+        for e in _p.get('entries', [])
+    ]))
     sys.exit(0)
 `
 
@@ -4187,6 +4219,17 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     # Phase B: close drop_ids under the parent_mnt_id relation (computed once, not per-entry).
     # Seed: all drop-root mnt_ids.
     drop_ids = {e['mnt_id'] for e in img['entries'] if is_drop_root(e) and 'mnt_id' in e}
+
+    # ADR-0311: tmpfs/shm provenance set, seeded HERE (same pass, same live entry dict) so
+    # mnt_id and fstype are both available. Uppercase 'TMPFS' is the pycriu-decoded protobuf
+    # enum spelling (source-grounded), NOT the lowercase mount(8) fstype string. Scope is
+    # intentionally the DIRECT is_drop_root(e) seed pass only — NOT the fixpoint closure below
+    # over parent_mnt_id. A tmpfs submount nested under a dropped non-tmpfs parent is still
+    # correctly dropped (added to drop_ids by the closure) but is NOT added to
+    # tmpfs_drop_mnt_ids, so its REG orphan fds DECLINE rather than rebind — documented
+    # fail-closed narrowing (ADR-0311 decision 1), not a regression, out of scope to widen here.
+    # Disjoint by construction from any DROP_ROOT_FSTYPES(sysfs) match (TMPFS != sysfs).
+    tmpfs_drop_mnt_ids = {e['mnt_id'] for e in img['entries'] if is_drop_root(e) and 'mnt_id' in e and e.get('fstype') == 'TMPFS'}
 
     # Root mount protection: / must never be dropped even if a logic error tries to add it.
     root_entries = [e for e in img['entries'] if e.get('mountpoint') == '/']
@@ -4468,6 +4511,10 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
         # ADR-0245 D2: rebind-target for orphan directory fds. The classifier validates this is
         # a sane (present + kept) target before authorizing REBIND_TO_ROOT; otherwise DECLINE.
         'root_mnt_id': root_mnt_id,
+        # ADR-0311: dropped tmpfs/shm mnt_ids, seeded in Phase B above. Authorizes REBIND_TO_ROOT
+        # for non-directory REG orphan fds backed by a dropped tmpfs/shm mount (e.g. PostgreSQL
+        # /dev/shm segments) instead of the previous unconditional DECLINE.
+        'tmpfs_drop_mnt_ids': tmpfs_drop_mnt_ids,
     }
     modified = False
     for entry in files_img.get('entries', []):
@@ -4481,10 +4528,19 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
         name_leaf = os.path.basename(name) if name else str(fd_id)
         if action == 'REBIND_TO_ROOT':
             # C-R3-3 / ADR-0194 B-2 lockstep: REG directory fd with an orphan mnt_id — rebind to
-            # root mnt_id (drop-together). Covers both generic PLAIN-REG dir orphans (ADR-0193 §4)
-            # and fds whose mnt_id was in ext_drop_mnt_ids (ADR-0194 B-2 lockstep). The label is
-            # diagnostic only; the classifier's decision is identical for both.
-            label = 'b2-lockstep-ext-drop' if mnt_id in ext_drop_mnt_ids else 'generic-orphan'
+            # root mnt_id (drop-together). Covers generic PLAIN-REG dir orphans (ADR-0193 §4),
+            # fds whose mnt_id was in ext_drop_mnt_ids (ADR-0194 B-2 lockstep), AND (ADR-0311)
+            # non-directory REG fds whose orphan mnt_id is a dropped tmpfs/shm mount. The label
+            # is diagnostic only; the classifier's decision is identical for all three.
+            is_dir_fd = (reg.get('mode', 0) & _S_IFMT) == _S_IFDIR
+            entry_type = 'DIR' if is_dir_fd else 'REG'
+            if not is_dir_fd and mnt_id in tmpfs_drop_mnt_ids:
+                # ADR-0311: tmpfs/shm-backed non-directory orphan (e.g. PostgreSQL /dev/shm
+                # segment). Distinct label — never aliases with the sysfs/DROP_ROOT_FSTYPES
+                # path (disjoint sets by construction) or with the generic/ext-drop dir labels.
+                label = 'tmpfs-shmem-regfd'
+            else:
+                label = 'b2-lockstep-ext-drop' if mnt_id in ext_drop_mnt_ids else 'generic-orphan'
             # ADR-0245 D2 (Storage Architect finding): a directory-fd rebind is NOT silent
             # success. Redirecting an open directory handle from its checkpoint-time backing
             # mount to the container root is benign for PodMotion checkpoint scaffolding (the
@@ -4499,10 +4555,15 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
             # workload's known volume set. The 'generic-orphan' label (mnt_id in neither the
             # kept nor the ext-drop set) is the higher-suspicion case — an fd backed by a mount
             # that simply vanished from the mountpoints image — and is called out explicitly.
-            print('WARNING pm-image-consistency: directory-fd rebind — fd_id=%d name=%s backing_mnt_id=%d label=%s new_mnt_id=%d (open directory handle redirected to container root; verify this is not a live persistent-volume directory)' % (
-                fd_id, name, mnt_id, label, root_mnt_id))
-            print('CRIU_IMAGE_DIR_FD_REBOUND:{"fd_id":%d,"name":"%s","backing_mnt_id":%d,"new_mnt_id":%d,"label":"%s"}' % (
-                fd_id, name.replace('"', '\\"'), mnt_id, root_mnt_id, label))
+            # ADR-0311: entry_type ('DIR'|'REG') is now surfaced alongside label so a consumer
+            # can distinguish the new tmpfs/shm REG-fd rebind class from the pre-existing
+            # directory-fd rebind class without parsing the label string. The event TOKEN NAME
+            # (CRIU_IMAGE_DIR_FD_REBOUND) is unchanged for backward log-parser compatibility even
+            # though it now also covers REG fds — entry_type is the field to key on going forward.
+            print('WARNING pm-image-consistency: %s-fd rebind — fd_id=%d name=%s backing_mnt_id=%d label=%s new_mnt_id=%d entry_type=%s (open handle redirected to container root; verify this is not a live persistent-volume directory)' % (
+                'directory' if is_dir_fd else 'file', fd_id, name, mnt_id, label, root_mnt_id, entry_type))
+            print('CRIU_IMAGE_DIR_FD_REBOUND:{"fd_id":%d,"name":"%s","backing_mnt_id":%d,"new_mnt_id":%d,"label":"%s","entry_type":"%s"}' % (
+                fd_id, name.replace('"', '\\"'), mnt_id, root_mnt_id, label, entry_type))
             reg['mnt_id'] = root_mnt_id
             modified = True
         elif action == 'DECLINE':
