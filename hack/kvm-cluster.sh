@@ -54,6 +54,22 @@ CP_VM="pm-cp1"
 WORKER_VMS=("pm-w1" "pm-w2")
 PM_VMS=("$CP_VM" "${WORKER_VMS[@]}")
 
+# ── Dedicated block storage + Longhorn ───────────────────────────────────────
+# Each VM gets a dedicated 250G virtio disk (target vdb) backing Longhorn, kept
+# OFF the 40G root vda. Longhorn provides live-migratable volumes: during a
+# PodMotion live migration the volume must attach on the destination node while
+# still attached on the source (Longhorn `migratable` volume mode). The disks are
+# attached to the standing VMs (non-destructive — attach only, never destroy).
+LH_DISK_SIZE="${LH_DISK_SIZE:-250G}"
+LH_IMG_DIR="${LH_IMG_DIR:-/var/lib/libvirt/images}"
+LH_DISK_TARGET="${LH_DISK_TARGET:-vdb}"          # new disk shows up as /dev/vdb in-guest
+LH_MOUNT="${LH_MOUNT:-/var/lib/longhorn}"
+LH_VERSION="${LH_VERSION:-v1.9.1}"               # current proven-stable Longhorn tag
+LH_MANIFEST="${LH_MANIFEST:-https://raw.githubusercontent.com/longhorn/longhorn/${LH_VERSION}/deploy/longhorn.yaml}"
+LH_NAMESPACE="${LH_NAMESPACE:-longhorn-system}"
+LH_STORAGE_CLASS="${LH_STORAGE_CLASS:-longhorn}"             # default RWO SC (ships with Longhorn)
+LH_MIGRATABLE_SC="${LH_MIGRATABLE_SC:-longhorn-migratable}"  # RWX live-migration SC (created here)
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
@@ -294,14 +310,105 @@ cmd_provision_shared_storage() {
   echo "==> Shared storage ready. Workloads use an RWX PVC on storageClassName: $NFS_STORAGE_CLASS"
 }
 
+# ── provision-longhorn: dedicated 250G disk per node + Longhorn ──────────────
+# Idempotent end-to-end: (re)creates+attaches the vdb disk if absent, formats +
+# mounts it at $LH_MOUNT with a UUID fstab entry, installs the iSCSI prereq, then
+# installs Longhorn and both StorageClasses. Safe to re-run; never destroys a VM.
+cmd_provision_longhorn() {
+  assert_no_vm_destruction
+  load_ips
+
+  echo "==> [1/5] Ensure a $LH_DISK_SIZE $LH_DISK_TARGET disk on each VM (attach only — never destroy)..."
+  local vm img
+  for vm in "${PM_VMS[@]}"; do
+    img="$LH_IMG_DIR/${vm}-longhorn.qcow2"
+    if sudo virsh domblklist "$vm" | awk '{print $1}' | grep -qx "$LH_DISK_TARGET"; then
+      echo "  -- $vm already has $LH_DISK_TARGET; skipping create+attach"
+      continue
+    fi
+    if ! sudo test -f "$img"; then
+      echo "  -- creating $img ($LH_DISK_SIZE)"
+      sudo qemu-img create -f qcow2 "$img" "$LH_DISK_SIZE"
+      sudo chown libvirt-qemu:kvm "$img"
+    fi
+    echo "  -- attaching $img to $vm as $LH_DISK_TARGET (persistent + live)"
+    sudo virsh attach-disk "$vm" "$img" "$LH_DISK_TARGET" \
+      --driver qemu --subdriver qcow2 --targetbus virtio --persistent --live
+  done
+
+  echo "==> [2/5] Format + mount /dev/$LH_DISK_TARGET at $LH_MOUNT (UUID fstab) on each node..."
+  local ip
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    echo "  -- prep disk on $ip"
+    nsh "$ip" "sudo bash -s" <<REMOTE
+set -e
+DEV=/dev/$LH_DISK_TARGET
+MNT=$LH_MOUNT
+if ! blkid \$DEV >/dev/null 2>&1; then mkfs.ext4 -q -L longhorn \$DEV; fi
+mkdir -p \$MNT
+UUID=\$(blkid -s UUID -o value \$DEV)
+grep -q "\$UUID" /etc/fstab || echo "UUID=\$UUID \$MNT ext4 defaults 0 2" >> /etc/fstab
+mountpoint -q \$MNT || mount \$MNT
+df -h \$MNT | tail -1
+REMOTE
+  done
+
+  echo "==> [3/5] Longhorn iSCSI prereq (open-iscsi + iscsid) on each node..."
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    echo "  -- iscsi prereq on $ip"
+    nsh "$ip" "sudo bash -c 'export DEBIAN_FRONTEND=noninteractive; dpkg -l open-iscsi 2>/dev/null | grep -q \"^ii\" || { apt-get update -qq && apt-get install -y -qq open-iscsi >/dev/null; }; systemctl enable --now iscsid >/dev/null 2>&1; systemctl is-active iscsid'"
+  done
+
+  echo "==> [4/5] Install Longhorn $LH_VERSION and wait for pods Ready..."
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl apply -f "$LH_MANIFEST"
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" rollout status ds/longhorn-manager --timeout=300s
+  # Let Longhorn also use the control-plane node's disk: tolerate the cp taint and
+  # add the toleration to the longhorn-manager DaemonSet (the setting alone does not
+  # patch the manager DS). Idempotent.
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" patch setting taint-toleration \
+    --type=merge -p '{"value":"node-role.kubernetes.io/control-plane:NoSchedule"}' || true
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" patch ds longhorn-manager --type=json \
+    -p '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]' || true
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" rollout status ds/longhorn-manager --timeout=300s
+  echo "  -- waiting for all longhorn-system pods Ready"
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" wait --for=condition=Ready pods --all --timeout=300s || true
+
+  echo "==> [5/5] Ensure StorageClasses ($LH_STORAGE_CLASS default RWO; $LH_MIGRATABLE_SC RWX live-migration)..."
+  # The default $LH_STORAGE_CLASS SC ships with the Longhorn manifest. Create the
+  # RWX live-migration SC: migratable=true lets the volume attach on the destination
+  # node while still attached on the source during a PodMotion live migration.
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl apply -f - <<YAML
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: $LH_MIGRATABLE_SC
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "3"
+  staleReplicaTimeout: "30"
+  fsType: "ext4"
+  dataLocality: "disabled"
+  migratable: "true"
+  accessMode: "rwx"
+YAML
+
+  echo "==> Longhorn ready. Per-node schedulable capacity:"
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" get nodes.longhorn.io
+  echo "==> Workloads: use storageClassName: $LH_STORAGE_CLASS (RWO) or $LH_MIGRATABLE_SC (RWX, live-migratable)."
+}
+
 usage() {
   cat >&2 <<EOF
-Usage: hack/kvm-cluster.sh <verify|reset-cluster|deploy-podmotion|provision-shared-storage|wipe|ssh <node-ip> [cmd]>
+Usage: hack/kvm-cluster.sh <verify|reset-cluster|deploy-podmotion|provision-shared-storage|provision-longhorn|wipe|ssh <node-ip> [cmd]>
 
   verify            assert 3 nodes Ready via $KUBECONFIG_OUT
   reset-cluster     kubeadm reset+reinit+flannel+join ON the standing VMs (NEVER destroys VMs)
   deploy-podmotion  build+import images, mint mTLS, apply CRDs, helm install (TAG=<tag>)
   provision-shared-storage  NFS server on cp + nfs-common on all + RWX StorageClass $NFS_STORAGE_CLASS
+  provision-longhorn  attach $LH_DISK_SIZE $LH_DISK_TARGET per node + Longhorn + SCs ($LH_STORAGE_CLASS, $LH_MIGRATABLE_SC)
   wipe              clean k8s + PodMotion state on the VMs WITHOUT destroying the VMs
 
 This script REFUSES to 'virsh destroy'/'virsh undefine' any of: ${PM_VMS[*]}.
@@ -316,6 +423,7 @@ main() {
     reset-cluster)    cmd_reset_cluster ;;
     deploy-podmotion) cmd_deploy_podmotion ;;
     provision-shared-storage) cmd_provision_shared_storage ;;
+    provision-longhorn) cmd_provision_longhorn ;;
     wipe)             cmd_wipe ;;
     ssh)              load_ips; nsh "$@" ;;
     *)                usage ;;
