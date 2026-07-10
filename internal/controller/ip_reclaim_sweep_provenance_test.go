@@ -162,3 +162,65 @@ func TestIPReclaimSweepProvenance(t *testing.T) {
 		})
 	}
 }
+
+// TestReclaimObjectsOutstanding is the direct table test for
+// (*PodMigrationReconciler).reclaimObjectsOutstanding authorized by ADR-0302 Decision item 2
+// and landed by ADR-0305. It isolates the finalizer-guard predicate consumed by handleDeletion
+// (internal/controller/podmigration_controller.go:4316) without going through
+// reconcileIPReclaimSweep, exercising the function directly against synthetic condition states.
+func TestReclaimObjectsOutstanding(t *testing.T) {
+	now := metav1.Now()
+	cond := func(t string, s metav1.ConditionStatus) metav1.Condition {
+		return metav1.Condition{Type: t, Status: s, Reason: "Test", LastTransitionTime: now}
+	}
+
+	tests := []struct {
+		name       string
+		conditions []metav1.Condition
+		want       bool
+	}{
+		{
+			// Objects installed, IPHandoffInjected absent (dropped by a non-converging
+			// reachability probe), reclaim not yet complete ⇒ outstanding: finalizer HELD.
+			name: "installed, IPHandoffInjected absent, not complete -> outstanding",
+			conditions: []metav1.Condition{
+				cond(pmv1.ConditionReclaimObjectsInstalled, metav1.ConditionTrue),
+			},
+			want: true,
+		},
+		{
+			// Reclaim objects were never installed at all ⇒ nothing outstanding; finalizer
+			// may be released immediately.
+			name:       "never installed -> not outstanding",
+			conditions: []metav1.Condition{},
+			want:       false,
+		},
+		{
+			// Objects installed AND reclaim already confirmed complete ⇒ nothing outstanding.
+			name: "installed and complete -> not outstanding",
+			conditions: []metav1.Condition{
+				cond(pmv1.ConditionReclaimObjectsInstalled, metav1.ConditionTrue),
+				cond(pmv1.ConditionIPReclaimComplete, metav1.ConditionTrue),
+			},
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pm := &pmv1.PodMigration{
+				Status: pmv1.PodMigrationStatus{
+					Conditions: tc.conditions,
+				},
+			}
+
+			r := &PodMigrationReconciler{}
+			got := r.reclaimObjectsOutstanding(pm)
+
+			if got != tc.want {
+				t.Fatalf("reclaimObjectsOutstanding: got=%v want=%v (conditions=%+v)",
+					got, tc.want, tc.conditions)
+			}
+		})
+	}
+}
