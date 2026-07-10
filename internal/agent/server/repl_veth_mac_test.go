@@ -35,14 +35,14 @@ func TestJoinNsRestore_PopulatesMAC(t *testing.T) {
 
 	// Inject stub: always returns the expected MAC.
 	orig := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath string) (string, error) {
+	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
 		return wantMAC, nil
 	}
 	defer func() { readReplVethMACFn = orig }()
 
 	s := New("test-node", &criu.StubCheckpointer{}, nil)
 	// k8sClient is nil — finalizeRestore skips k8s operations but must still populate mac.
-	result, err := s.finalizeRestore(context.Background(), 12345, "/var/run/netns/test", "test-migration", "", "None")
+	result, err := s.finalizeRestore(context.Background(), 12345, "/var/run/netns/test", "eth0", "test-migration", "", "None")
 	if err != nil {
 		t.Fatalf("finalizeRestore returned unexpected error: %v", err)
 	}
@@ -57,13 +57,13 @@ func TestJoinNsRestore_PopulatesMAC(t *testing.T) {
 // preserved because source deletion is gated on TrafficVerified=True.
 func TestJoinNsRestore_EmptyMACStrictFails(t *testing.T) {
 	orig := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath string) (string, error) {
+	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
 		return "", errors.New("stub: nsenter failed")
 	}
 	defer func() { readReplVethMACFn = orig }()
 
 	s := New("test-node", &criu.StubCheckpointer{}, nil)
-	_, err := s.finalizeRestore(context.Background(), 12345, "/var/run/netns/test", "test-migration", "", "Strict")
+	_, err := s.finalizeRestore(context.Background(), 12345, "/var/run/netns/test", "eth0", "test-migration", "", "Strict")
 	if err == nil {
 		t.Fatal("expected non-nil error for Strict mode with empty MAC, got nil")
 	}
@@ -78,13 +78,13 @@ func TestJoinNsRestore_EmptyMACStrictFails(t *testing.T) {
 // queryable CR-status condition set by finalizeRestore (when k8s client is available).
 func TestJoinNsRestore_EmptyMACBestEffortDegrades(t *testing.T) {
 	orig := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath string) (string, error) {
+	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
 		return "", errors.New("stub: nsenter failed")
 	}
 	defer func() { readReplVethMACFn = orig }()
 
 	s := New("test-node", &criu.StubCheckpointer{}, nil)
-	result, err := s.finalizeRestore(context.Background(), 12345, "/var/run/netns/test", "test-migration", "", "BestEffort")
+	result, err := s.finalizeRestore(context.Background(), 12345, "/var/run/netns/test", "eth0", "test-migration", "", "BestEffort")
 	if err != nil {
 		t.Fatalf("BestEffort mode: expected nil error on empty MAC, got: %v", err)
 	}

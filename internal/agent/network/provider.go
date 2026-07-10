@@ -20,6 +20,14 @@ import (
 	"fmt"
 )
 
+// MigrationVethPeer is the fixed name of the veth peer interface created INSIDE the
+// migration netns by PrepareDestinationNetns (see migrationnetns.go). It is NOT "eth0":
+// the migration netns holds only "lo" and this peer. Exported (untagged file, visible on
+// all platforms) so the server package can hand the correct interface name to
+// ReadReplVethMAC when the MAC is read from the PrepareDestinationNetns bind mount — the
+// pod-sandbox netns uses "eth0", but the migration-netns bind uses this name.
+const MigrationVethPeer = "pmdst0"
+
 // NetworkProvider is the ADR-0143 CNI-agnostic seam for IP-handoff datapath.
 // Six core operations are defined by ADR-0143; InjectHostRoute, RemoveHostRoute,
 // and InjectGratuitousARP are additional helpers required by ADR-0158.

@@ -288,14 +288,16 @@ type restoreResult struct {
 // Condition 3). For None/BestEffort: an empty MAC records a queryable CR-status condition and
 // continues. Returns the populated restoreResult; callers must pass result.mac to
 // ReportRestoreConfirmed.
-func (s *AgentServer) finalizeRestore(ctx context.Context, pid int, netnsPath, migrationName, namespace, tcpPreservationMode string) (restoreResult, error) {
+func (s *AgentServer) finalizeRestore(ctx context.Context, pid int, netnsPath, ifname, migrationName, namespace, tcpPreservationMode string) (restoreResult, error) {
 	result := restoreResult{
 		pid:       pid,
 		netnsPath: netnsPath,
 	}
 
 	// Condition 1: call readReplVethMACFn (= ReadReplVethMAC in production; injectable in tests).
-	mac, macErr := readReplVethMACFn(pid, netnsPath)
+	// ifname is the interface to read inside netnsPath — "pmdst0" for a PrepareDestinationNetns
+	// migration netns, "eth0" for the pod-sandbox / PID-fallback netns (see finalizeNetnsPath).
+	mac, macErr := readReplVethMACFn(pid, netnsPath, ifname)
 	result.mac = mac
 
 	// Condition 3: fail-closed on Strict/Full for empty MAC; degrade on None/BestEffort.
@@ -498,8 +500,8 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 	// ADR-0308 follow-up: use finalizeNetnsPath so that if ResolvedNetnsPath was not recorded
 	// (parity with the gRPC fallback path), MAC resolution falls back to the PrepareDestinationNetns
 	// bind mount rather than the ptrace'd /proc/<pid>/ns/net path AppArmor denies.
-	netnsPath := s.finalizeNetnsPath(migrationName)
-	fr, frErr := s.finalizeRestore(context.Background(), pid, netnsPath, migrationName, "", tcpPreservationMode)
+	netnsPath, macIfname := s.finalizeNetnsPath(migrationName)
+	fr, frErr := s.finalizeRestore(context.Background(), pid, netnsPath, macIfname, migrationName, "", tcpPreservationMode)
 	if frErr != nil {
 		// Strict/Full fail-closed: propagate.
 		return 0, "", frErr
@@ -841,16 +843,27 @@ func parseEth0IPv4Addrs(out string) []string {
 	return addrs
 }
 
-// ReadReplVethMAC reads the replacement pod's eth0 MAC for ADR-0133 D3. It prefers the
-// sandbox network namespace path (the same netns the join-ns restore targeted, where eth0
-// is reliably present), falling back to the restored process's own netns. The restored
-// PID's /proc/<pid>/ns/net can transiently resolve to a netns without eth0 right after CRIU
-// exits, so the sandbox-netns read is the authoritative source. Returns "" and a non-nil
-// error if both fail; the caller treats MAC collection as best-effort.
+// ReadReplVethMAC reads the replacement pod's replVeth MAC for ADR-0133 D3. It prefers the
+// sandbox network namespace path (the same netns the join-ns restore targeted, where the
+// veth is reliably present), falling back to the restored process's own netns. The restored
+// PID's /proc/<pid>/ns/net can transiently resolve to a netns without the veth right after
+// CRIU exits, so the sandbox-netns read is the authoritative source. Returns "" and a
+// non-nil error if both fail; the caller treats MAC collection as best-effort.
+//
+// ifname is the interface to read INSIDE the entered netns. It is NOT always "eth0":
+// the true pod-sandbox netns exposes the pod veth as "eth0", but the PrepareDestinationNetns
+// migration-netns bind mount exposes only "lo" and the migration veth peer
+// (network.MigrationVethPeer == "pmdst0"). Reading "eth0" inside the migration netns returns
+// "device does not exist" → empty MAC → Strict fail-closed, which is exactly the
+// path-independent contract violation the ADR-0308 bind-mount fix otherwise ran into. The
+// caller (finalizeNetnsPath) knows which netns it resolved and passes the matching ifname.
 //
 // sandboxNetnsPath may be empty (host-network or unresolved), in which case only the PID
 // path is attempted.
-func ReadReplVethMAC(pid int, sandboxNetnsPath string) (string, error) {
+func ReadReplVethMAC(pid int, sandboxNetnsPath, ifname string) (string, error) {
+	if ifname == "" {
+		ifname = "eth0"
+	}
 	var attempts []string
 	if sandboxNetnsPath != "" {
 		attempts = append(attempts, sandboxNetnsPath)
@@ -864,19 +877,19 @@ func ReadReplVethMAC(pid int, sandboxNetnsPath string) (string, error) {
 	var lastErr error
 	for _, netnsArg := range attempts {
 		// Read the MAC via `ip link` (netlink, net-namespace-scoped) — NOT
-		// `cat /sys/class/net/eth0/address`. nsenter --net changes only the network
+		// `cat /sys/class/net/<ifname>/address`. nsenter --net changes only the network
 		// namespace, leaving the host's /sys mount in place, so reading sysfs would
-		// return the HOST's interfaces, not the pod netns's. `ip -o link show eth0`
+		// return the HOST's interfaces, not the pod netns's. `ip -o link show <ifname>`
 		// queries the kernel via rtnetlink scoped to the entered netns.
 		out, err := exec.Command("nsenter", "--net="+netnsArg,
-			"ip", "-o", "link", "show", "eth0").CombinedOutput()
+			"ip", "-o", "link", "show", ifname).CombinedOutput()
 		if err != nil {
-			lastErr = fmt.Errorf("ReadReplVethMAC: nsenter %s ip link: %w (%s)", netnsArg, err, strings.TrimSpace(string(out)))
+			lastErr = fmt.Errorf("ReadReplVethMAC: nsenter %s ip link show %s: %w (%s)", netnsArg, ifname, err, strings.TrimSpace(string(out)))
 			continue
 		}
 		mac := parseLinkEther(string(out))
 		if mac == "" {
-			lastErr = fmt.Errorf("ReadReplVethMAC: no link/ether in `ip link show eth0` output via %s: %s", netnsArg, strings.TrimSpace(string(out)))
+			lastErr = fmt.Errorf("ReadReplVethMAC: no link/ether in `ip link show %s` output via %s: %s", ifname, netnsArg, strings.TrimSpace(string(out)))
 			continue
 		}
 		return mac, nil
@@ -937,11 +950,25 @@ func (s *AgentServer) ResolvedNetnsPath(migrationName string) string {
 // broker-created bind mount /run/podmotion/netns/pm-mig-<uid>/bind is stored on
 // destMigrationNetns[migrationName].NetnsPath. Reusing that exact path (never a rederived
 // literal) routes ReadReplVethMAC through the bind-mount branch: no ptrace, no AppArmor
-// denial. Returns "" when neither source is available (host-network / no pre-staged netns),
-// in which case finalizeRestore falls back to the PID path as before.
-func (s *AgentServer) finalizeNetnsPath(migrationName string) string {
+// denial.
+//
+// It returns BOTH the netns path AND the interface name to read inside it. This second
+// return value is load-bearing: every non-empty path this function returns is a
+// PrepareDestinationNetns MIGRATION netns, whose only interfaces are "lo" and the migration
+// veth peer network.MigrationVethPeer ("pmdst0") — NOT "eth0". This holds for both branches:
+//   - the ResolvedNetnsPath branch records the value joinNsRestore joined, which on the
+//     destNetnsFd path is exactly ns.NetnsPath (DestNetnsFd = PrepareDestinationNetns's
+//     ns.NetnsPath — see netns_linux.go), i.e. the pmdst0 migration netns; and
+//   - the destMigrationNetns bind branch is ns.NetnsPath directly.
+// So reading "eth0" inside either returns "device does not exist" → empty MAC → Strict
+// fail-closed. That is the residual live failure the ADR-0308 bind routing hit even though it
+// correctly selected the bind path. The fix names the actual interface (pmdst0) for the
+// migration netns. Returns ("", "eth0") when neither source is available (host-network / no
+// pre-staged netns), in which case finalizeRestore falls back to the PID path — the restored
+// process's OWN sandbox netns, where the pod interface IS "eth0".
+func (s *AgentServer) finalizeNetnsPath(migrationName string) (netnsPath, ifname string) {
 	if p := s.ResolvedNetnsPath(migrationName); p != "" {
-		return p
+		return p, network.MigrationVethPeer
 	}
 	s.destMigrationNetnsMu.RLock()
 	ns := s.destMigrationNetns[migrationName]
@@ -952,13 +979,13 @@ func (s *AgentServer) finalizeNetnsPath(migrationName string) string {
 		// os.Stat so a missing bind falls back safely to the PID path in finalizeRestore.
 		if _, statErr := os.Stat(ns.NetnsPath); statErr == nil {
 			log.Info("finalizeNetnsPath: ResolvedNetnsPath empty (raw-CRIU/DestNetnsFd-empty path) — using PrepareDestinationNetns bind mount for MAC read (ADR-0308 follow-up)",
-				"migration", migrationName, "bindPath", ns.NetnsPath)
-			return ns.NetnsPath
+				"migration", migrationName, "bindPath", ns.NetnsPath, "ifname", network.MigrationVethPeer)
+			return ns.NetnsPath, network.MigrationVethPeer
 		}
 		log.Info("finalizeNetnsPath: stored dest-netns bind path does not exist; falling back to PID netns for MAC read",
 			"migration", migrationName, "bindPath", ns.NetnsPath)
 	}
-	return ""
+	return "", "eth0"
 }
 
 // SandboxNetnsPath resolves the network namespace path for a containerd sandbox ID, for use
@@ -2225,6 +2252,64 @@ func hostBundleDir(taskID string) string {
 	return fmt.Sprintf("/host-run/containerd/io.containerd.runtime.v2.task/k8s.io/%s", taskID)
 }
 
+// resolveCtrDumpLogPath returns the agent-visible path to runc's criu-dump.log for a task,
+// trying every place it can actually land, in order of authority. runc runs CRIU with its
+// working directory set to the task's `work` dir — a symlink in the run bundle that points at
+// /var/lib/containerd/io.containerd.runtime.v2.task/k8s.io/<fullID> — and writes criu-dump.log
+// THERE, not in the run bundle. On containerd 2.2.1 the run bundle (/host-run/containerd/...)
+// therefore never contains criu-dump.log, so the old single-path read ("unreadable, no such
+// file") went silent and every non-TCP ctr checkpoint failure (e.g. postgres) hard-failed with
+// only runc's opaque "exit status 1" summary and no CRIU diagnostic surfaced.
+//
+// Resolution order (source-of-truth first):
+//  1. the exact path ctr printed in its own output, if any (ctrReportedDumpLogPath).
+//  2. the `work` symlink target, re-rooted onto the agent-visible containerd-state mount
+//     (/host-var-lib-containerd, added to the agent container's volumeMounts). This is where
+//     runc actually writes the log.
+//  3. the run bundle dir (legacy path) as a last resort.
+// The first path that exists on disk wins; if none exists the run-bundle path is returned so
+// the caller's "unreadable" log still names a concrete location.
+func resolveCtrDumpLogPath(taskID, ctrOutput string) string {
+	const dumpLogName = "criu-dump.log"
+
+	// (1) ctr-reported path — most authoritative (immune to short-vs-full task-ID mismatch).
+	if p := ctrReportedDumpLogPath(ctrOutput); p != "" {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+
+	// (2) `work` symlink target → agent-visible containerd-state mount.
+	// The symlink lives in the run bundle (readable via /host-run) but its target is an absolute
+	// /var/lib/containerd/... path (readable via /host-var-lib-containerd).
+	workLink := filepath.Join(hostBundleDir(taskID), "work")
+	if target, err := os.Readlink(workLink); err == nil {
+		if p := remapWorkTargetToDumpLog(target); p != "" {
+			if _, statErr := os.Stat(p); statErr == nil {
+				return p
+			}
+		}
+	}
+
+	// (3) run bundle dir (legacy) — return unconditionally as the named fallback location.
+	return filepath.Join(hostBundleDir(taskID), dumpLogName)
+}
+
+// remapWorkTargetToDumpLog re-roots a runc task `work` symlink target (an absolute
+// /var/lib/containerd/... host path) onto the agent-visible containerd-state mount
+// (/host-var-lib-containerd) and appends criu-dump.log. Returns "" if the target is not under
+// the containerd state prefix (nothing to remap). Pure string transform, split out so the
+// re-rooting is unit-testable without a real /host-run mount.
+func remapWorkTargetToDumpLog(workTarget string) string {
+	const hostStatePrefix = "/var/lib/containerd"
+	const agentStatePrefix = "/host-var-lib-containerd"
+	if !strings.HasPrefix(workTarget, hostStatePrefix) {
+		return ""
+	}
+	agentWork := agentStatePrefix + strings.TrimPrefix(workTarget, hostStatePrefix)
+	return filepath.Join(agentWork, "criu-dump.log")
+}
+
 // ctrReportedDumpLogPath extracts the criu-dump.log path that ctr reports in its own combined
 // output (`... path= /run/containerd/.../<fullID>/criu-dump.log ...`) and translates it to the
 // agent-visible host mount.
@@ -2341,15 +2426,15 @@ func ctrCheckpoint(taskID, imagesDir string, tcpEstablished bool) (int64, error)
 		// established-socket case is misclassified as fatal and the raw-CRIU fallback never
 		// fires, hard-failing every TCP-stateful checkpoint (ADR-0131).
 		outStr := string(out)
-		// ADR-0213 D1/D2: read the dump log through the agent-visible host mount (/host-run),
-		// NOT the bare /run host path (which does not exist in the agent mount namespace). Prefer
-		// the exact log path ctr itself reports in its output (`path= .../criu-dump.log`) so a
-		// short-vs-full task-ID mismatch (FindContainerTaskID may return the abbreviated ctr-list
-		// ID while the on-disk bundle uses the full container ID) cannot point us at the wrong dir.
-		dumpLogPath := ctrReportedDumpLogPath(outStr)
-		if dumpLogPath == "" {
-			dumpLogPath = filepath.Join(hostBundleDir(taskID), "criu-dump.log")
-		}
+		// ADR-0213 D1/D2 + postgres live fix: read the dump log through the agent-visible host
+		// mounts. resolveCtrDumpLogPath tries, in order, (1) the exact path ctr printed, (2) the
+		// task `work` symlink target where runc actually writes criu-dump.log
+		// (/var/lib/containerd/... re-rooted onto /host-var-lib-containerd), and (3) the run
+		// bundle dir. The old code read ONLY the run bundle (/host-run/containerd/.../<taskID>/),
+		// which on containerd 2.2.1 never holds the log — runc writes it in the `work` dir — so
+		// the classifier went blind and every non-TCP ctr failure (postgres) hard-failed with just
+		// runc's opaque "exit status 1" and no CRIU diagnostic.
+		dumpLogPath := resolveCtrDumpLogPath(taskID, outStr)
 		dumpLogRead := false
 		if dumpLog, readErr := os.ReadFile(dumpLogPath); readErr == nil {
 			outStr += "\n--- criu-dump.log ---\n" + string(dumpLog)
@@ -5924,8 +6009,8 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 			}
 
 			// Parity with the terminal success path: populate MAC + SingleHomeRestoredPod.
-			netnsPath := s.finalizeNetnsPath(req.MigrationName)
-			fr, frErr := s.finalizeRestore(ctx, priorPID, netnsPath, req.MigrationName, "", req.TcpPreservationMode)
+			netnsPath, macIfname := s.finalizeNetnsPath(req.MigrationName)
+			fr, frErr := s.finalizeRestore(ctx, priorPID, netnsPath, macIfname, req.MigrationName, "", req.TcpPreservationMode)
 			if frErr != nil {
 				log.Error(frErr, "Restore: finalizeRestore failed on idempotent confirm path (Strict/Full fail-closed)", "migration", req.MigrationName)
 				return &agentpb.RestoreResponse{Success: false, ErrorMessage: frErr.Error()}, nil
@@ -6090,8 +6175,8 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		// E1 Condition 1+2: call finalizeRestore to populate MAC and run SingleHomeRestoredPod
 		// on this gRPC path (parity with NRI path — Condition 2).
 		// Unconditional: finalizeRestore always runs (MAC resolution + Strict/Full fail-closed applies even without k8s client).
-		netnsPath := s.finalizeNetnsPath(req.MigrationName)
-		fr, frErr := s.finalizeRestore(ctx, pid, netnsPath, req.MigrationName, "", req.TcpPreservationMode)
+		netnsPath, macIfname := s.finalizeNetnsPath(req.MigrationName)
+		fr, frErr := s.finalizeRestore(ctx, pid, netnsPath, macIfname, req.MigrationName, "", req.TcpPreservationMode)
 		if frErr != nil {
 			log.Error(frErr, "Restore: finalizeRestore failed (Strict/Full fail-closed)", "migration", req.MigrationName)
 			return &agentpb.RestoreResponse{Success: false, ErrorMessage: frErr.Error()}, nil
@@ -6172,8 +6257,8 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// E1 Condition 1+2: finalizeRestore for MAC population + SingleHomeRestoredPod parity
 	// on the raw CRIU fallback path (Conditions 1, 2, 3).
 	// Unconditional: finalizeRestore always runs (MAC resolution + Strict/Full fail-closed applies even without k8s client).
-	netnsPath2 := s.finalizeNetnsPath(req.MigrationName)
-	fr2, frErr2 := s.finalizeRestore(ctx, result.PID, netnsPath2, req.MigrationName, "", req.TcpPreservationMode)
+	netnsPath2, macIfname2 := s.finalizeNetnsPath(req.MigrationName)
+	fr2, frErr2 := s.finalizeRestore(ctx, result.PID, netnsPath2, macIfname2, req.MigrationName, "", req.TcpPreservationMode)
 	if frErr2 != nil {
 		log.Error(frErr2, "Restore (raw CRIU path): finalizeRestore failed (Strict/Full fail-closed)", "migration", req.MigrationName)
 		return &agentpb.RestoreResponse{Success: false, ErrorMessage: frErr2.Error()}, nil
