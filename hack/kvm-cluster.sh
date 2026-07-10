@@ -97,6 +97,14 @@ cmd_reset_cluster() {
     nsh "$ip" "sudo kubeadm reset -f && sudo rm -rf /etc/cni/net.d \$HOME/.kube && sudo rm -rf /etc/kubernetes/manifests/*"
   done
 
+  # Post-reset race guard: kubeadm reset disrupts containerd; restart it and wait for the
+  # CRI socket to actually serve before init/join, else 'kubeadm init' fails preflight with
+  # "containerd.sock: connection refused" (transient, intermittent).
+  echo "==> Restarting containerd + waiting for CRI readiness on all nodes (post-reset race guard)..."
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    nsh "$ip" "sudo systemctl restart containerd; for i in \$(seq 1 30); do sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock info >/dev/null 2>&1 && { echo '  CRI ready on '\$(hostname); break; }; sleep 2; done"
+  done
+
   echo "==> INIT control-plane on $CP_VM ($CP1_IP)..."
   nsh "$CP1_IP" "sudo kubeadm init --pod-network-cidr=$POD_CIDR --apiserver-advertise-address=$CP1_IP"
   nsh "$CP1_IP" "mkdir -p \$HOME/.kube && sudo cp -f /etc/kubernetes/admin.conf \$HOME/.kube/config && sudo chown \$(id -u):\$(id -g) \$HOME/.kube/config"
