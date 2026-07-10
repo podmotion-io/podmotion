@@ -20,8 +20,8 @@ spec:
         app: haproxy-tcp
     spec:
       serviceAccountName: haproxy-tcp
-      # Pin to pm-control so it doesn't migrate with the workload
-      nodeName: pm-control
+      # Pin to pm-cp1 so it doesn't migrate with the workload
+      nodeName: pm-cp1
       containers:
       - name: haproxy
         image: haproxy:2.9-alpine
