@@ -326,6 +326,21 @@ func HostVethPeerName(uid string) string {
 	return "pmh-" + truncUID(uid, 8)
 }
 
+// MigrationNetnsBindPath derives the canonical, restart-durable on-disk bind-mount path for a
+// migration's destination netns, using the SAME transforms PrepareDestinationNetns fed to the
+// broker: brokerUID(uid) for the subdir and netnsbroker.NetnsBaseDir/<muid>/bind for the leaf.
+// The bind mount created by PrepareDestinationNetns is a durable artifact under /run/podmotion,
+// but its POINTER is otherwise kept only in the agent's in-memory destMigrationNetns map, which
+// is lost across an agent restart or a prior failed fallback's GC-10 teardown. When those volatile
+// pointers are gone but the on-disk bind still exists, callers (finalizeNetnsPath) can reconstruct
+// the path deterministically here and os.Stat-gate it, rather than falling back to the
+// AppArmor-denied /proc/<pid>/ns/net ptrace path. Single source of truth for the path shape lives
+// in the broker package (NetnsBaseDir); the "pm-mig-" muid transform is shared with the broker
+// call in PrepareDestinationNetns via brokerUID.
+func MigrationNetnsBindPath(uid string) string {
+	return filepath.Join(netnsbroker.NetnsBaseDir, brokerUID(uid), "bind")
+}
+
 // truncUID returns the first n runes of uid, safe for use in interface names.
 func truncUID(uid string, n int) string {
 	uid = strings.ReplaceAll(uid, "-", "")

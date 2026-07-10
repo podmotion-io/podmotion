@@ -387,6 +387,26 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		"/proc/latency_stats",
 		"/proc/scsi",
 		"/proc/timer_list",
+		// dump/restore skip symmetry: the restore-side SkipMnt list (below) skips these
+		// masked /proc/* mounts too, but the dump side historically did not. On the raw
+		// go-criu Dump path this asymmetry is latent — a masked bind CRIU cannot resolve to
+		// a proper root (e.g. /proc/interrupts) aborts the mountpoint-dump pass at
+		// criu/mount.c:753 "doesn't have a proper root mount" BEFORE the network pass. This
+		// is the exact class of failure that hard-fails postgres via `ctr tasks checkpoint`
+		// (which does not carry this list at all) and is routed to this raw path via
+		// ErrCtrMaskedMount. containerd/runc bind these masked /proc entries per the OCI
+		// default maskedPaths set; they carry no migratable workload state and are re-provided
+		// by the destination runtime on restore. Skip them at dump so the mount pass never
+		// tries to resolve their root, keeping the dump and restore skip sets symmetric
+		// (mirrors the restore-side SkipMnt block below — do not let the two drift).
+		"/proc/interrupts",
+		"/proc/timer_stats",
+		"/proc/sched_debug",
+		"/proc/bus",
+		"/proc/fs",
+		"/proc/irq",
+		"/proc/sys",
+		"/proc/sysrq-trigger",
 		// ADR-0228: Kubernetes projected service-account token tmpfs.
 		//
 		// The kubelet mounts the projected SA token as its own tmpfs:

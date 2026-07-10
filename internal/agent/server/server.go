@@ -86,6 +86,22 @@ func init() {
 // TcpSkipInFlight=true.
 var ErrCtrInFlightTCP = errors.New("ctr checkpoint: in-flight TCP sockets detected")
 
+// ErrCtrMaskedMount is returned by ctrCheckpoint when the containerd-native checkpoint fails
+// in CRIU's mountpoint-dump pass on a container-runtime masked/injected mount that runc's CRIU
+// invocation cannot resolve to a proper root — e.g. the masked-path bind over /proc/interrupts:
+//
+//	Error (criu/mount.c:753): mnt: 625:./proc/interrupts doesn't have a proper root mount
+//	Dumping FAILED.
+//
+// ctr tasks checkpoint drives runc's own CRIU argv and carries NONE of the agent's --skip-mnt /
+// --external declarations, so these masked mounts abort the dump before the network pass. The
+// caller should fall back to the raw go-criu Dump path, which DOES carry the dump-side skipMnts
+// (criu_checkpointer.go) that skip this exact masked set — mirroring the ErrCtrInFlightTCP
+// fall-through. This is a mount-class failure, not a TCP one, so it needs its own sentinel: the
+// non-TCP branch would otherwise return it as fatal at the Checkpoint RPC and never reach the
+// raw-CRIU path (the postgres live failure observed 2026-07-10).
+var ErrCtrMaskedMount = errors.New("ctr checkpoint: masked mount has no proper root (fall back to raw CRIU)")
+
 // ErrCRIUCapability aliases the sentinel from the criu package so server-layer code can use
 // errors.Is without importing the criu package directly in every call site.
 // Surface as gRPC codes.FailedPrecondition at the gRPC boundary.
@@ -982,8 +998,27 @@ func (s *AgentServer) finalizeNetnsPath(migrationName string) (netnsPath, ifname
 				"migration", migrationName, "bindPath", ns.NetnsPath, "ifname", network.MigrationVethPeer)
 			return ns.NetnsPath, network.MigrationVethPeer
 		}
-		log.Info("finalizeNetnsPath: stored dest-netns bind path does not exist; falling back to PID netns for MAC read",
+		log.Info("finalizeNetnsPath: stored dest-netns bind path does not exist; trying canonical on-disk bind path",
 			"migration", migrationName, "bindPath", ns.NetnsPath)
+	}
+	// Both volatile pointers (ResolvedNetnsPath and destMigrationNetns) are empty here. This is
+	// the confirmed live-failure residual: on the raw-CRIU/gRPC fallback the in-memory
+	// destMigrationNetns entry can be gone even though PrepareDestinationNetns's bind mount is
+	// still on disk — either the dest agent restarted between prewarm and the ~60s-later fallback
+	// (wiping the in-memory map), or a prior failed fallback attempt ran the GC-10 teardown that
+	// deletes the map entry. In both cases the durable /run/podmotion/netns/pm-mig-<uid>/bind
+	// artifact still exists. Reconstruct that canonical path deterministically (source of truth =
+	// the broker's path shape, network.MigrationNetnsBindPath) and os.Stat-gate it. This keeps the
+	// MAC read on the bind-mount branch (ifname pmdst0, no ptrace) instead of dropping to the
+	// ("", "eth0") PID path, which reads the restored process's /proc/<pid>/ns/net via nsenter and
+	// is denied by the podmotion-agent AppArmor profile — the "replVethMAC empty" Strict
+	// fail-closed observed 2026-07-10.
+	if canonical := network.MigrationNetnsBindPath(migrationName); canonical != "" {
+		if _, statErr := os.Stat(canonical); statErr == nil {
+			log.Info("finalizeNetnsPath: in-memory netns pointers empty — resolved canonical on-disk bind mount for MAC read (restart/teardown-durable path)",
+				"migration", migrationName, "bindPath", canonical, "ifname", network.MigrationVethPeer)
+			return canonical, network.MigrationVethPeer
+		}
 	}
 	return "", "eth0"
 }
@@ -2446,22 +2481,7 @@ func ctrCheckpoint(taskID, imagesDir string, tcpEstablished bool) (int64, error)
 			log.Info("Checkpoint: ctr criu-dump.log unreadable — classifying fail-safe (ADR-0213 D2/D3)",
 				"dumpLogPath", dumpLogPath, "readErr", readErr.Error(), "tcpEstablished", tcpEstablished)
 		}
-		if strings.Contains(outStr, "In-flight") ||
-			strings.Contains(outStr, "in-flight") ||
-			strings.Contains(outStr, "Connected TCP socket") ||
-			strings.Contains(outStr, "tcp-established") ||
-			strings.Contains(outStr, "sk-inet.c") ||
-			strings.Contains(outStr, "inet") {
-			return 0, fmt.Errorf("ctr tasks checkpoint: %w\noutput: %s", ErrCtrInFlightTCP, outStr)
-		}
-		// ADR-0213 D2 fail-safe: if the dump log was unreadable AND TCP preservation is requested,
-		// a correctness-preserving migration must not hard-fail on a missing best-effort diagnostic.
-		// Default to the established-TCP classification so the caller falls back to raw go-criu with
-		// --tcp-established rather than aborting the migration.
-		if !dumpLogRead && tcpEstablished {
-			return 0, fmt.Errorf("ctr tasks checkpoint (dump log unreadable, fail-safe TCP classification): %w\noutput: %s", ErrCtrInFlightTCP, outStr)
-		}
-		return 0, fmt.Errorf("ctr tasks checkpoint: %w\noutput: %s", err, out)
+		return 0, classifyCtrCheckpointFailure(outStr, err, dumpLogRead, tcpEstablished)
 	}
 
 	// Copy config.json from the containerd bundle into the checkpoint dir.
@@ -2483,6 +2503,48 @@ func ctrCheckpoint(taskID, imagesDir string, tcpEstablished bool) (int64, error)
 		return nil
 	})
 	return total, nil
+}
+
+// classifyCtrCheckpointFailure maps a failed `ctr tasks checkpoint` invocation to a typed error
+// so the Checkpoint RPC can decide whether to fall through to the raw go-criu Dump path. outStr is
+// ctr's combined output with the resolved criu-dump.log appended (or not, per dumpLogRead); rawErr
+// is the exec error; tcpEstablished is the tier-driven TCP preservation flag. Extracted as a pure
+// function so the classification — the exact logic the postgres masked-mount live failure exercised
+// (2026-07-10) — is unit-testable without shelling out to ctr/runc. Precedence:
+//  1. established/in-flight TCP → ErrCtrInFlightTCP (raw CRIU re-dumps with --tcp-established).
+//  2. masked-mount dump abort (criu/mount.c "doesn't have a proper root mount") → ErrCtrMaskedMount
+//     (raw CRIU re-dumps carrying the dump-side --skip-mnt list ctr/runc never applied).
+//  3. dump log unreadable AND TCP requested → fail-safe to ErrCtrInFlightTCP (ADR-0213 D2).
+//  4. otherwise fatal (wraps rawErr).
+func classifyCtrCheckpointFailure(outStr string, rawErr error, dumpLogRead, tcpEstablished bool) error {
+	if strings.Contains(outStr, "In-flight") ||
+		strings.Contains(outStr, "in-flight") ||
+		strings.Contains(outStr, "Connected TCP socket") ||
+		strings.Contains(outStr, "tcp-established") ||
+		strings.Contains(outStr, "sk-inet.c") ||
+		strings.Contains(outStr, "inet") {
+		return fmt.Errorf("ctr tasks checkpoint: %w\noutput: %s", ErrCtrInFlightTCP, outStr)
+	}
+	// Masked/injected-mount dump failure (e.g. /proc/interrupts). runc's CRIU invocation via
+	// `ctr tasks checkpoint` does not carry our --skip-mnt list, so CRIU's mountpoint pass aborts
+	// on a masked bind it cannot resolve to a proper root — BEFORE the network pass, so no TCP
+	// diagnostic is emitted and the block above does not fire. Classify it so the Checkpoint RPC
+	// falls through to the raw go-criu Dump path, which DOES skip this set (dump-side skipMnts in
+	// criu_checkpointer.go). Match on the CRIU mount-pass diagnostic strings from the dump log,
+	// not on runc's opaque "exit status 1".
+	if strings.Contains(outStr, "doesn't have a proper root mount") ||
+		strings.Contains(outStr, "mount.c") ||
+		strings.Contains(outStr, "Can't dump a file system") {
+		return fmt.Errorf("ctr tasks checkpoint: %w\noutput: %s", ErrCtrMaskedMount, outStr)
+	}
+	// ADR-0213 D2 fail-safe: if the dump log was unreadable AND TCP preservation is requested, a
+	// correctness-preserving migration must not hard-fail on a missing best-effort diagnostic.
+	// Default to the established-TCP classification so the caller falls back to raw go-criu with
+	// --tcp-established rather than aborting the migration.
+	if !dumpLogRead && tcpEstablished {
+		return fmt.Errorf("ctr tasks checkpoint (dump log unreadable, fail-safe TCP classification): %w\noutput: %s", ErrCtrInFlightTCP, outStr)
+	}
+	return fmt.Errorf("ctr tasks checkpoint: %w\noutput: %s", rawErr, outStr)
 }
 
 // containerdMaskedPaths is the canonical, single source of truth for the set of
@@ -5394,17 +5456,27 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 			freezeDurationMs := time.Since(freezeStart).Milliseconds()
 
 			if ctrErr != nil {
-				// Fall through to raw CRIU only for in-flight/established TCP socket failures —
-				// ctr invokes CRIU without --tcp-established, so containers with active TCP
-				// connections fail. The raw go-criu Dump path below sets TcpEstablished=tcpEstablished
-				// (ADR-0131 D2), so established connections are PRESERVED via TCP_REPAIR, not closed.
+				// Fall through to raw CRIU for two recoverable ctr-checkpoint failure classes:
+				//  1. in-flight/established TCP sockets — ctr invokes CRIU without --tcp-established,
+				//     so active TCP connections fail. The raw go-criu Dump path below sets
+				//     TcpEstablished=tcpEstablished (ADR-0131 D2), preserving them via TCP_REPAIR.
+				//  2. masked-mount dump failure (e.g. /proc/interrupts, criu/mount.c:753) — ctr's runc
+				//     CRIU argv carries none of our --skip-mnt list, so a masked bind CRIU cannot
+				//     resolve aborts the dump. The raw go-criu Dump path below carries the dump-side
+				//     skipMnts (criu_checkpointer.go) that skip exactly this set, so it succeeds where
+				//     ctr could not (postgres live failure 2026-07-10).
 				// Any other ctr error (OOM, permission, corrupt task) is fatal and returned directly
 				// to avoid a double-freeze and to surface the real cause.
-				if !errors.Is(ctrErr, ErrCtrInFlightTCP) {
+				if !errors.Is(ctrErr, ErrCtrInFlightTCP) && !errors.Is(ctrErr, ErrCtrMaskedMount) {
 					return nil, fmt.Errorf("checkpoint failed (ctr): %w", ctrErr)
 				}
-				log.Info("Checkpoint: ctr failed due to established TCP socket — falling back to raw CRIU with --tcp-established (ADR-0131 D2: connection preserved)",
-					"taskID", taskID, "tcpEstablished", tcpEstablished, "err", ctrErr)
+				if errors.Is(ctrErr, ErrCtrMaskedMount) {
+					log.Info("Checkpoint: ctr failed on a masked mount CRIU could not resolve — falling back to raw CRIU which skips the masked set (dump-side skipMnts, criu_checkpointer.go)",
+						"taskID", taskID, "err", ctrErr)
+				} else {
+					log.Info("Checkpoint: ctr failed due to established TCP socket — falling back to raw CRIU with --tcp-established (ADR-0131 D2: connection preserved)",
+						"taskID", taskID, "tcpEstablished", tcpEstablished, "err", ctrErr)
+				}
 				// Clear any partial ctr images before raw CRIU writes to the same dir.
 				// ADR-0182 Issue 2: zeroize-then-unlink, NOT a
 				// bare os.RemoveAll — a partial ctr dump may already contain live memory pages in
