@@ -293,6 +293,21 @@ spec:
               mountPath: /var/run/criu
             - name: containerd-socket
               mountPath: /run/containerd/containerd.sock
+            # host /run, read-only: the checkpoint classifier reads runc's task run bundle
+            # (/host-run/containerd/.../<taskID>/, incl. the `work` symlink and config.json) to
+            # resolve and read criu-dump.log. Without this mount hostBundleDir()/resolveCtrDumpLogPath()
+            # point at a path that does not exist in the agent mount namespace and the CRIU
+            # diagnostic is never surfaced (postgres hard-fails on an opaque runc "exit status 1").
+            - name: host-run
+              mountPath: /host-run
+              readOnly: true
+            # host /var/lib/containerd, read-only: runc writes criu-dump.log into the task `work`
+            # dir, which symlinks to /var/lib/containerd/io.containerd.runtime.v2.task/... — not
+            # into the run bundle. resolveCtrDumpLogPath re-roots that target here so the classifier
+            # can read the real CRIU dump failure (established-socket vs shmem vs mount).
+            - name: host-var-lib-containerd
+              mountPath: /host-var-lib-containerd
+              readOnly: true
             - name: nri-socket
               mountPath: /var/run/nri
             - name: sys
@@ -366,6 +381,11 @@ spec:
         - name: host-run
           hostPath:
             path: /run
+            type: Directory
+        # host containerd state dir — holds the task `work` dirs where runc writes criu-dump.log.
+        - name: host-var-lib-containerd
+          hostPath:
+            path: /var/lib/containerd
             type: Directory
         - name: host-cni-conf
           hostPath:

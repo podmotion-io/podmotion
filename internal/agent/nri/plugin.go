@@ -268,7 +268,17 @@ func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent)
 // The Rule D container-target gate is re-applied here: PostStartContainer fires for every
 // container (including the init container's post-start), and non-restore-target containers return
 // nil immediately, exactly as in HandleStartContainer.
-func (p *Plugin) HandlePostStartContainer(ctx context.Context, event ContainerEvent) error {
+//
+// The synchronous validation gates (ref validation, restore-target gate) run inline; the
+// holder-quiescent barrier and the CRIU restore then run ASYNCHRONOUSLY on an independent
+// context and this handler returns nil promptly. See the block comment at the go func() for
+// why: the inbound ctx is containerd's 2s plugin_request_timeout, which must not govern a 50s
+// barrier or a multi-second restore. Restore completion is reported out-of-band via
+// ReportRestoreConfirmed → status.criuRestoreConfirmed (the controller's 60s poll).
+// The inbound context is intentionally unused (named _): it is containerd's 2s
+// plugin_request_timeout event context and must NOT govern the barrier/restore — those run on
+// an independent context derived below. See the go func() block comment.
+func (p *Plugin) HandlePostStartContainer(_ context.Context, event ContainerEvent) error {
 	// Re-read the checkpoint-ref (dual-path: pod annotation, then container-linux annotation),
 	// mirroring HandleStartContainer.
 	const refKey = "podmotion.io/checkpoint-ref"
@@ -306,45 +316,75 @@ func (p *Plugin) HandlePostStartContainer(ctx context.Context, event ContainerEv
 		"checkpointRef", checkpointRef,
 	)
 
-	// ADR-0195 Rule C — holder-quiescent barrier (relocated to PostStartContainer by ADR-0198
-	// Rule F; mechanism UNCHANGED — still polls the sentinel file via /proc/<pid>/root OR observes
-	// the stdout token, ADR-0197 Rule D/E dual transport). The holder entrypoint is now running, so
-	// one of the two transports fires and the barrier is satisfied.
+	// The inbound (now-discarded) context is containerd's PER-EVENT context, bounded by the NRI
+	// plugin_request_timeout (2s on the standing containerd 2.2.1 substrate — NOT the 60s the
+	// prior comment assumed). It is the source of truth for "how long containerd will block the
+	// container start waiting on this plugin" — it is NOT a budget for CRIU restore. Running the
+	// 50s holder-quiescent barrier and the multi-second CRIU restore on that context means the
+	// select at waitForHolderQuiescent hits Done() at ~2s EVERY time, the handler returns a
+	// hard error, containerd drops the plugin connection (log-spam reconnects), and the migration
+	// is forced onto the raw-CRIU fallback — the live failure observed 2026-07-10.
 	//
-	// Barrier timeout: 50 s — within the plugin_request_timeout budget (60 s). NRI
-	// applies one request timeout to all plugin event handlers, so this governs PostStartContainer
-	// identically to StartContainer. On timeout the handler returns a hard error which surfaces as a
-	// container post-start failure rather than silently proceeding.
-	if barrierErr := waitForHolderQuiescent(ctx, event, 50*time.Second); barrierErr != nil {
-		log.Error(barrierErr, "NRI PostStartContainer: holder-quiescent barrier FAILED — blocking restore",
-			"container", event.ID, "checkpointRef", checkpointRef)
-		return fmt.Errorf("NRI PostStartContainer: holder-quiescent barrier: %w", barrierErr)
-	}
+	// Fix (source-of-truth decoupling): derive an INDEPENDENT context for the barrier + restore
+	// so it is governed by the barrier's own deadline, not containerd's request budget, and
+	// return nil to containerd PROMPTLY so the container start is not blocked and the plugin
+	// connection is not dropped. Restore completion is reported asynchronously by
+	// ReportRestoreConfirmed (called from OnStartContainer), which sets
+	// status.criuRestoreConfirmed — the exact signal the controller's reconcileRestoringNRI
+	// already polls for up to 60s. That poll, not containerd's 2s event context, is the real
+	// restore completion signal. A barrier failure or restore error is logged loudly here; the
+	// controller's 60s poll then times out and falls back to the agent Restore RPC exactly as
+	// before — but the happy path now completes on the NRI path and the fallback is not forced.
+	restoreCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	go func() {
+		defer cancel()
 
-	// ADR-SEC-B §2.6 — provenance gate on the restore path. The final/ dir for this checkpoint-ref
-	// MUST contain the checkpoint-verified sentinel written by PutCheckpointTar (§2.3 step 6) only
-	// after signature + per-file digest + migration-binding all passed. Absent → restore is blocked
-	// (no CRIU restore on unverified images). Placed AFTER the anti-spoof verifyPodMigration check
-	// and BEFORE CRIU engages. Fail-closed: a missing sentinel is a hard block.
-	if err := verifyCheckpointProvenanceSentinel(checkpointRef); err != nil {
-		log.Error(err, "ADR-SEC-B: checkpoint not provenance-verified — refusing restore",
-			"container", event.ID, "checkpointRef", checkpointRef)
-		return fmt.Errorf("ADR-SEC-B: checkpoint not provenance-verified — refusing restore: %w", err)
-	}
+		// ADR-0195 Rule C — holder-quiescent barrier (relocated to PostStartContainer by ADR-0198
+		// Rule F; mechanism UNCHANGED — still polls the sentinel file via /proc/<pid>/root OR
+		// observes the stdout token, ADR-0197 Rule D/E dual transport). Barrier timeout: 50 s,
+		// governed by restoreCtx (independent of containerd's 2s plugin_request_timeout).
+		if barrierErr := waitForHolderQuiescent(restoreCtx, event, 50*time.Second); barrierErr != nil {
+			log.Error(barrierErr, "NRI PostStartContainer: holder-quiescent barrier FAILED — restore aborted (controller 60s poll will fall back to agent Restore RPC)",
+				"container", event.ID, "checkpointRef", checkpointRef)
+			return
+		}
 
-	// ADR-0198 Rule F item 4 — CRIU restore-over-running-holder. The restore lands over the
-	// running, parked holder (which binds no port and parks on <-sigCh). The JoinNsRestore argv is
-	// UNCHANGED and does NOT use --restore-detached (Standing Rule 6).
-	if p.OnStartContainer != nil {
-		return p.OnStartContainer(ctx, event, checkpointRef)
-	}
+		// ADR-SEC-B §2.6 — provenance gate on the restore path. The final/ dir for this
+		// checkpoint-ref MUST contain the checkpoint-verified sentinel written by PutCheckpointTar
+		// (§2.3 step 6) only after signature + per-file digest + migration-binding all passed.
+		// Absent → restore is blocked (no CRIU restore on unverified images). Fail-closed.
+		if err := verifyCheckpointProvenanceSentinel(checkpointRef); err != nil {
+			log.Error(err, "ADR-SEC-B: checkpoint not provenance-verified — refusing restore",
+				"container", event.ID, "checkpointRef", checkpointRef)
+			return
+		}
+
+		// ADR-0198 Rule F item 4 — CRIU restore-over-running-holder. The restore lands over the
+		// running, parked holder (which binds no port and parks on <-sigCh). The JoinNsRestore
+		// argv is UNCHANGED and does NOT use --restore-detached (Standing Rule 6).
+		if p.OnStartContainer != nil {
+			if err := p.OnStartContainer(restoreCtx, event, checkpointRef); err != nil {
+				log.Error(err, "NRI PostStartContainer: CRIU restore failed (controller 60s poll will fall back to agent Restore RPC)",
+					"container", event.ID, "checkpointRef", checkpointRef)
+			}
+		}
+	}()
+
+	// Return nil to containerd immediately — do not block the container start on the barrier or
+	// CRIU restore, and do not drop the plugin connection. Completion is signalled out-of-band
+	// via ReportRestoreConfirmed → status.criuRestoreConfirmed (controller poll).
 	return nil
 }
 
 // verifyCheckpointProvenanceSentinel enforces the ADR-SEC-B §2.6 restore-path gate: the
 // checkpoint-verified sentinel must exist in the migration's final/ dir before CRIU restore may
 // engage. The sentinel is written by PutCheckpointTar only after the full provenance gate passes.
-func verifyCheckpointProvenanceSentinel(checkpointRef string) error {
+//
+// Package var (not a bare func) so the async-restore path can be unit-tested without a writable
+// /run/podmotion tree — production always uses verifyCheckpointProvenanceSentinelImpl.
+var verifyCheckpointProvenanceSentinel = verifyCheckpointProvenanceSentinelImpl
+
+func verifyCheckpointProvenanceSentinelImpl(checkpointRef string) error {
 	sentinel := filepath.Join("/run/podmotion/checkpoints", checkpointRef, "final", "checkpoint-verified")
 	if _, err := os.Stat(sentinel); err != nil {
 		return fmt.Errorf("checkpoint-verified sentinel absent at %q: %w", sentinel, err)

@@ -26,8 +26,10 @@ import (
 )
 
 const (
-	// migrationVethPeer is the host-side veth name prefix inside the migration netns.
-	migrationVethPeer = "pmdst0"
+	// migrationVethPeer is the veth peer name created inside the migration netns.
+	// Aliased to the exported MigrationVethPeer (provider.go) so the server package can
+	// name the same interface when reading the replVeth MAC from the netns bind mount.
+	migrationVethPeer = MigrationVethPeer
 )
 
 // MigrationNetns holds the state of a prepared destination network namespace.
