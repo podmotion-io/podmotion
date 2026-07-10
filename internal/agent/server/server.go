@@ -1285,12 +1285,30 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 		s.pendingResumePIDsMu.Unlock()
 		if hasPending && resumePID > 0 {
 			socketsLiveAt := time.Now()
-			if err := syscall.Kill(resumePID, syscall.SIGCONT); err != nil {
+			// ADR-0312: the restored tree runs under containerd's default AppArmor
+			// profile (a runtime-defined peer label, e.g. runc); the confined main
+			// agent's own profile DENIES this cross-profile SIGCONT (apparmor DENIED
+			// operation="signal" signal=cont). Delegate the resume to the unconfined
+			// netns-broker, which AppArmor does not mediate for signals regardless of
+			// the target label. The restored tree has been held in SIGSTOP continuously
+			// since JoinNsRestore recorded it, so its PID cannot have been reused; read
+			// field 22 (starttime) now and pass it so the broker re-verifies identity
+			// before the kill (PID-reuse guard, mirrors frozen_source_registry.go).
+			resumeStartTime, stErr := readProcStartTime(int32(resumePID))
+			if stErr != nil {
+				// Cannot establish PID-reuse identity — re-record and retry on requeue
+				// rather than signal blind (the broker would reject a 0 starttime anyway).
+				s.pendingResumePIDsMu.Lock()
+				s.pendingResumePIDs[req.MigrationName] = resumePID
+				s.pendingResumePIDsMu.Unlock()
+				log.Error(stErr, "InjectIPHandoff: deferred SIGCONT deferred — could not read restored PID starttime, will retry on requeue (ADR-0312)",
+					"migration", req.MigrationName, "pid", resumePID)
+			} else if err := netnsbroker.NewClient().SignalPID(ctx, resumePID, int(syscall.SIGCONT), resumeStartTime); err != nil {
 				// Re-record so a requeue can retry; do not fail the handoff (source held).
 				s.pendingResumePIDsMu.Lock()
 				s.pendingResumePIDs[req.MigrationName] = resumePID
 				s.pendingResumePIDsMu.Unlock()
-				log.Error(err, "InjectIPHandoff: deferred SIGCONT FAILED — restored tree still stopped, will retry on requeue (ADR-0142 D3)",
+				log.Error(err, "InjectIPHandoff: deferred SIGCONT FAILED via broker — restored tree still stopped, will retry on requeue (ADR-0142 D3 / ADR-0312)",
 					"migration", req.MigrationName, "pid", resumePID)
 			} else {
 				resumedAt := time.Now()
@@ -7753,6 +7771,26 @@ func (s *AgentServer) emitExternalMountDroppedEvent(ctx context.Context, migrati
 // (CRIU --leave-stopped) and the caller records the PID for a later, datapath-gated SIGCONT
 // fired by InjectIPHandoff. resumedAt is returned as the zero time in that case. When false,
 // the legacy behavior is preserved: SIGCONT is sent inline immediately after SocketsLive.
+// brokerResumeRestoredPID delivers SIGCONT to the CRIU-restored workload root via
+// the unconfined netns-broker (ADR-0312). The restored tree runs under containerd's
+// default AppArmor profile (a runtime-defined peer label, e.g. runc), so the
+// confined main agent's own syscall.Kill(pid, SIGCONT) is DENIED by AppArmor signal
+// mediation; the broker is unconfined and not mediated. The PID is at this point
+// held in SIGSTOP by CRIU (--leave-stopped) so it cannot have been reused; field 22
+// (starttime) is read now and passed so the broker re-verifies identity before the
+// kill (PID-reuse guard). Used ONLY for the restored/foreign-profile tree — source-
+// tree thaws (frozen_source_registry.go, thawSourcePID) stay direct: the source runs
+// under the agent's own profile (peer=podmotion-agent), which is permitted.
+func brokerResumeRestoredPID(pid int) error {
+	startTime, err := readProcStartTime(int32(pid))
+	if err != nil {
+		return fmt.Errorf("read restored pid %d starttime for broker resume: %w", pid, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return netnsbroker.NewClient().SignalPID(ctx, pid, int(syscall.SIGCONT), startTime)
+}
+
 func enforceRestoreOrderingInvariant(pid int, migrationName string, expectedCount int, deferResume bool) (time.Time, time.Time, error) {
 	// If the restore was not TCP-stateful (no expected connections), skip socket
 	// polling and resume immediately — the invariant only applies to TCP migrations.
@@ -7762,7 +7800,9 @@ func enforceRestoreOrderingInvariant(pid int, migrationName string, expectedCoun
 		now := time.Now()
 		log.Info("enforceRestoreOrderingInvariant: no TCP connections expected, resuming immediately",
 			"migration", migrationName, "pid", pid)
-		if err := syscall.Kill(pid, syscall.SIGCONT); err != nil {
+		// ADR-0312: the restored tree runs under containerd's default AppArmor profile;
+		// the confined agent's own SIGCONT is DENIED. Delegate to the unconfined broker.
+		if err := brokerResumeRestoredPID(pid); err != nil {
 			return now, time.Time{}, fmt.Errorf("SIGCONT pid=%d: %w", pid, err)
 		}
 		resumedAt := time.Now()
@@ -7816,7 +7856,9 @@ func enforceRestoreOrderingInvariant(pid int, migrationName string, expectedCoun
 				"expectedConnections", expectedCount,
 				"socketsLiveAt", socketsLiveAt.UnixNano(),
 			)
-			if err := syscall.Kill(pid, syscall.SIGCONT); err != nil {
+			// ADR-0312: delegate the cross-profile resume to the unconfined broker
+			// (the confined agent's SIGCONT to the restored tree is AppArmor-DENIED).
+			if err := brokerResumeRestoredPID(pid); err != nil {
 				return socketsLiveAt, time.Time{}, fmt.Errorf("SIGCONT pid=%d: %w", pid, err)
 			}
 			resumedAt := time.Now()

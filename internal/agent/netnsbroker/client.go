@@ -175,6 +175,28 @@ func (c *Client) ExecSignal(ctx context.Context, wrapperPID, signal int) error {
 	return nil
 }
 
+// SignalPID asks the unconfined broker to deliver SIGCONT/SIGSTOP to an arbitrary
+// host PID — the CRIU-restored workload root (ADR-0312). The de-privileged SD-1
+// agent's own `podmotion-agent` AppArmor profile denies that signal because the
+// restored tree runs under containerd's default profile (a runtime-defined peer
+// label, e.g. runc/cri-containerd.apparmor.d) that the agent's signal rule does
+// not cover — the exact apparmor DENIED operation="signal" ... signal=cont
+// signature. The unconfined broker is not subject to AppArmor signal mediation, so
+// the resume succeeds there regardless of the target's profile. expectedStarttime
+// is field 22 of /proc/<pid>/stat captured when the caller recorded the PID; the
+// broker re-reads it and refuses on mismatch (PID-reuse guard). The broker accepts
+// only SIGCONT/SIGSTOP server-side.
+func (c *Client) SignalPID(ctx context.Context, pid, sig int, expectedStarttime uint64) error {
+	resp, err := c.do(ctx, Request{Op: "signal_pid", SignalPID: pid, Signal: sig, ExpectedStartTime: expectedStarttime})
+	if err != nil {
+		return fmt.Errorf("netns-broker signal_pid %d: %w", pid, err)
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("netns-broker signal_pid %d: %s", pid, resp.Error)
+	}
+	return nil
+}
+
 // ResolveVeth asks the privileged broker to enter the pod's NETWORK namespace
 // (/proc/<srcPID>/ns/net) and run `ip -o link show eth0`, returning the raw ip(8)
 // output. The de-privileged SD-1 agent cannot do this itself: opening another

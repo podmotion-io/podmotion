@@ -1,8 +1,10 @@
 package netnsbroker
 
 import (
+	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -59,6 +61,77 @@ func TestHandleResolveVeth(t *testing.T) {
 		resp := Handle(Request{Op: "bogus"})
 		if resp.Error == "" || !strings.Contains(resp.Error, "resolve_veth") {
 			t.Fatalf("unknown-op error should list resolve_veth, got %q", resp.Error)
+		}
+	})
+}
+
+// TestHandleSignalPID locks in the SC-1 properties of the signal_pid broker op
+// (ADR-0312): it accepts ONLY SIGCONT/SIGSTOP, refuses without a PID-reuse
+// starttime identity, refuses on a starttime mismatch, and rejects a dead PID —
+// each BEFORE delivering any signal. signal_pid must NOT consult asyncExecReg (it
+// targets a PID the broker never spawned).
+func TestHandleSignalPID(t *testing.T) {
+	self := os.Getpid()
+	liveStart, err := procStartTime(self)
+	if err != nil {
+		t.Fatalf("procStartTime(self=%d): %v", self, err)
+	}
+
+	t.Run("rejects non-cont/stop signals", func(t *testing.T) {
+		for _, sig := range []int{int(syscall.SIGKILL), int(syscall.SIGTERM), int(syscall.SIGINT), 0} {
+			resp := Handle(Request{Op: "signal_pid", SignalPID: self, Signal: sig, ExpectedStartTime: liveStart})
+			if resp.Error == "" {
+				t.Fatalf("signal %d: expected allowlist rejection, got success", sig)
+			}
+			if !strings.Contains(resp.Error, "signal_pid") {
+				t.Fatalf("signal %d: error %q should mention signal_pid", sig, resp.Error)
+			}
+		}
+	})
+
+	t.Run("rejects missing starttime identity", func(t *testing.T) {
+		resp := Handle(Request{Op: "signal_pid", SignalPID: self, Signal: int(syscall.SIGCONT), ExpectedStartTime: 0})
+		if resp.Error == "" || !strings.Contains(resp.Error, "identity") {
+			t.Fatalf("expected refusal without starttime identity, got %q", resp.Error)
+		}
+	})
+
+	t.Run("rejects starttime mismatch (PID reuse guard)", func(t *testing.T) {
+		resp := Handle(Request{Op: "signal_pid", SignalPID: self, Signal: int(syscall.SIGCONT), ExpectedStartTime: liveStart + 1})
+		if resp.Error == "" || !strings.Contains(resp.Error, "starttime mismatch") {
+			t.Fatalf("expected PID-reuse rejection on starttime mismatch, got %q", resp.Error)
+		}
+	})
+
+	t.Run("rejects non-positive PID", func(t *testing.T) {
+		for _, pid := range []int{0, -1} {
+			resp := Handle(Request{Op: "signal_pid", SignalPID: pid, Signal: int(syscall.SIGCONT), ExpectedStartTime: 1})
+			if resp.Error == "" {
+				t.Fatalf("pid %d: expected rejection", pid)
+			}
+		}
+	})
+
+	t.Run("rejects a dead PID", func(t *testing.T) {
+		deadPID := findDeadPID(t)
+		resp := Handle(Request{Op: "signal_pid", SignalPID: deadPID, Signal: int(syscall.SIGCONT), ExpectedStartTime: 12345})
+		if resp.Error == "" {
+			t.Fatalf("dead PID %d: expected rejection, got success", deadPID)
+		}
+	})
+
+	t.Run("delivers SIGCONT to a live matching PID", func(t *testing.T) {
+		// A running (not stopped) process is harmlessly a no-op under SIGCONT.
+		resp := Handle(Request{Op: "signal_pid", SignalPID: self, Signal: int(syscall.SIGCONT), ExpectedStartTime: liveStart})
+		if resp.Error != "" {
+			t.Fatalf("expected SIGCONT to self to succeed, got error %q", resp.Error)
+		}
+	})
+
+	t.Run("unknown op error names signal_pid", func(t *testing.T) {
+		resp := Handle(Request{Op: "bogus"})
+		if resp.Error == "" || !strings.Contains(resp.Error, "signal_pid") {
+			t.Fatalf("unknown-op error should list signal_pid, got %q", resp.Error)
 		}
 	})
 }

@@ -99,7 +99,7 @@ var migrationUIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,127}$`)
 
 // Request is the JSON wire request accepted on the broker socket.
 type Request struct {
-	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal" | "resolve_veth"
+	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal" | "signal_pid" | "resolve_veth"
 	// MigrationUID names the per-migration netns dir. Validated by migrationUIDRe.
 	// Required on create/teardown; ignored on exec*.
 	MigrationUID string `json:"migrationUID"`
@@ -134,6 +134,25 @@ type Request struct {
 	// process on poll/signal. Signal is the signal number for exec_signal.
 	WrapperPID int `json:"wrapperPID,omitempty"`
 	Signal     int `json:"signal,omitempty"`
+
+	// ADR-0312 (signal_pid op): deliver SIGCONT/SIGSTOP to an ARBITRARY host PID —
+	// specifically the CRIU-restored workload root, which runs under containerd's
+	// default AppArmor profile (a runtime-defined, unpredictable peer label). The
+	// de-privileged main agent's own `podmotion-agent` profile denies that cross-
+	// profile signal (apparmor DENIED operation="signal" ... peer="runc"); the
+	// unconfined broker is not subject to AppArmor signal mediation regardless of
+	// the target's profile, so the resume is delegated here. This is a distinct,
+	// deliberately narrow surface from exec_signal (which signals only wrapper PIDs
+	// the broker itself spawned via asyncExecReg): signal_pid targets a PID the
+	// broker never spawned, so it does NOT consult asyncExecReg and instead calls
+	// syscall.Kill directly. SC-1: only SIGCONT/SIGSTOP are accepted, and the
+	// client-supplied ExpectedStartTime (field 22 of /proc/<pid>/stat) is re-read
+	// and matched before the kill to defeat PID reuse.
+	SignalPID int `json:"signalPID,omitempty"`
+	// ExpectedStartTime is field 22 (starttime, clock ticks since boot) of
+	// /proc/<SignalPID>/stat, captured by the client when it recorded the PID. The
+	// broker re-reads the live value and refuses to signal on any mismatch.
+	ExpectedStartTime uint64 `json:"expectedStartTime,omitempty"`
 }
 
 // Response is the JSON wire response. Error is "" on success.
@@ -232,13 +251,18 @@ func Handle(req Request) Response {
 	case "exec_signal":
 		// ADR-0234: signal the wrapper (Abort path).
 		return doExecSignal(req.WrapperPID, req.Signal)
+	case "signal_pid":
+		// ADR-0312: deliver SIGCONT/SIGSTOP to the CRIU-restored workload root (a PID
+		// the broker never spawned) so AppArmor does not mediate the cross-profile
+		// resume. Signal allowlist + PID-reuse (starttime) guard enforced here.
+		return doSignalPID(req.SignalPID, req.Signal, req.ExpectedStartTime)
 	case "resolve_veth":
 		// Enter the pod's NET namespace and read eth0's veth peer ifindex on the
 		// de-privileged agent's behalf (the agent's AppArmor profile denies the
 		// ptrace-read needed to open another pod's /proc/<pid>/ns/net).
 		return doResolveVeth(req.SrcPID)
 	default:
-		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal|resolve_veth)", req.Op))
+		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal|signal_pid|resolve_veth)", req.Op))
 	}
 }
 
@@ -571,6 +595,76 @@ func doExecSignal(pid, signal int) Response {
 	}
 	if err := entry.cmd.Process.Signal(sig); err != nil {
 		return Response{Error: fmt.Sprintf("exec_signal: signal %d to PID %d: %v", signal, pid, err)}
+	}
+	return Response{}
+}
+
+// signalPIDAllowed is the SC-1 server-side signal allowlist for the signal_pid op.
+// signal_pid exists ONLY to resume/pause the CRIU-restored workload tree, so the
+// broker accepts EXACTLY SIGCONT and SIGSTOP and rejects everything else loudly.
+// This keeps the "signal an arbitrary PID" surface from becoming a general kill
+// proxy: a compromised de-privileged agent cannot direct the unconfined broker to
+// send SIGKILL/SIGTERM/etc. to any host process.
+func signalPIDAllowed(signal int) bool {
+	return signal == int(syscall.SIGCONT) || signal == int(syscall.SIGSTOP)
+}
+
+// procStartTime returns field 22 (starttime, clock ticks since boot) of
+// /proc/<pid>/stat — the PID-reuse identity guard for signal_pid. The comm field
+// (2nd) may contain spaces and parentheses, so parse from the last ')'.
+func procStartTime(pid int) (uint64, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, err
+	}
+	s := string(data)
+	rparen := strings.LastIndex(s, ")")
+	if rparen < 0 || rparen+2 >= len(s) {
+		return 0, fmt.Errorf("malformed /proc/%d/stat", pid)
+	}
+	// Fields after comm: state is index 0 (overall field 3); starttime is overall
+	// field 22 ⇒ index 19 in the post-comm slice.
+	fields := strings.Fields(s[rparen+2:])
+	const startTimeIdx = 19
+	if len(fields) <= startTimeIdx {
+		return 0, fmt.Errorf("truncated /proc/%d/stat", pid)
+	}
+	return strconv.ParseUint(fields[startTimeIdx], 10, 64)
+}
+
+// doSignalPID delivers SIGCONT or SIGSTOP to an arbitrary host PID — the CRIU-
+// restored workload root, which the broker did NOT spawn (so asyncExecReg is not
+// consulted; syscall.Kill is used directly). The unconfined broker is not subject
+// to AppArmor signal mediation, so the cross-profile resume the confined main
+// agent is DENIED succeeds here (ADR-0312).
+//
+// SC-1 constraints:
+//   (a) only SIGCONT/SIGSTOP are accepted — any other signal is a loud reject.
+//   (b) PID-reuse guard: the client supplies the starttime it captured when it
+//       recorded the PID; the broker re-reads /proc/<pid>/stat field 22 and
+//       refuses to signal on any mismatch (the PID has been reused for an
+//       unrelated process). expectedStartTime==0 is treated as "no identity
+//       supplied" and rejected — we never signal without a verified identity.
+func doSignalPID(pid, signal int, expectedStartTime uint64) Response {
+	if pid <= 0 {
+		return Response{Error: fmt.Sprintf("signal_pid: pid %d must be positive", pid)}
+	}
+	if !signalPIDAllowed(signal) {
+		// Do not run; SC-1 hard reject (only cont/stop permitted on this surface).
+		return Response{Error: fmt.Sprintf("signal_pid: signal %d not permitted (only SIGCONT/SIGSTOP)", signal)}
+	}
+	if expectedStartTime == 0 {
+		return Response{Error: fmt.Sprintf("signal_pid: no expected starttime supplied for pid %d — refusing to signal without a PID-reuse identity", pid)}
+	}
+	liveStart, err := procStartTime(pid)
+	if err != nil {
+		return Response{Error: fmt.Sprintf("signal_pid: read starttime for pid %d (process gone?): %v", pid, err)}
+	}
+	if liveStart != expectedStartTime {
+		return Response{Error: fmt.Sprintf("signal_pid: pid %d starttime mismatch (expected %d, live %d) — PID reused, refusing to signal", pid, expectedStartTime, liveStart)}
+	}
+	if err := syscall.Kill(pid, syscall.Signal(signal)); err != nil {
+		return Response{Error: fmt.Sprintf("signal_pid: kill(%d, %d): %v", pid, signal, err)}
 	}
 	return Response{}
 }
