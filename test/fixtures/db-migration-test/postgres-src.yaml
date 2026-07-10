@@ -38,7 +38,7 @@ metadata:
   labels:
     app: postgres-live
 spec:
-  nodeName: pm-worker
+  nodeName: pm-w1
   containers:
   - name: postgres
     image: postgres:16-alpine
