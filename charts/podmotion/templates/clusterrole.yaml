@@ -74,6 +74,15 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch]
+  # Restore-time re-attach mount resolution (resolveReattachMounts, server.go) reads the
+  # migrating pod's PVCs to map each claim to its backing PV name, then resolves the
+  # destination kubelet volume host dir for the CRIU --ext-mount-map. Without get/list/watch
+  # on persistentvolumeclaims the claim->PV lookup returns empty, the re-attach host target
+  # never resolves, and the RWX re-attach restore fails closed ("reattach host target
+  # unresolved"). Required for the Tier0 shared/RWX re-attach storage path.
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, list, watch]
   - apiGroups: [migration.podmotion.io]
     resources: [nodemigrationcapacities]
     verbs: [create, get, list, patch, update, watch]
