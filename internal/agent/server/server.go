@@ -120,14 +120,23 @@ var ErrRestoredPIDNotFound = errors.New("restored process PID not found in repla
 // carries {FdID, NameLeaf, BackingMntID} for structured event emission (P-0193-4 / S1). The
 // NameLeaf is filepath.Base(name) — never the full path — so it is safe to surface in a
 // world-readable Kubernetes Event (SEC-EVENT-1).
+//
+// ADR-0193 P-0193-1 grounding: BackingFstype and BackingMountpoint are the DECODED backing-mount
+// fstype/mountpoint for BackingMntID, added so the orphan cause is diagnosable in one run (a
+// tmpfs/shm segment that should have rebound vs a genuine persistent data mount that correctly
+// DECLINEd). BackingFstype (a filesystem-type enum name, not a path) is safe in the world-readable
+// Event; BackingMountpoint is a full path and stays OUT of the Event — it is logged only to the
+// 0700-bounded agent log (SEC-EVENT-1 / P-0193-1b).
 type CRIUImageInconsistencyError struct {
 	FdID        int
 	NameLeaf    string // filepath.Base(name) — e.g. "data" for "/data"
 	BackingMntID int
+	BackingFstype     string // decoded fstype enum name of BackingMntID, or "None"; safe for Event
+	BackingMountpoint string // full mountpoint path of BackingMntID; log-only, NEVER in the Event
 }
 
 func (e *CRIUImageInconsistencyError) Error() string {
-	return criuImageInconsistencyEventMsg(e.FdID, e.NameLeaf, e.BackingMntID)
+	return criuImageInconsistencyEventMsg(e.FdID, e.NameLeaf, e.BackingMntID, e.BackingFstype)
 }
 
 // ExternalMountUnresolvedError is returned by patchCheckpointImages (ADR-0194 P-0194-1) when a
@@ -161,8 +170,16 @@ type ExternalMountDroppedInfo struct {
 // filepath.Base(name) — never the full path — so the full volume path is not
 // leaked into the world-readable Event. The full path stays only in the 0700-bounded
 // agent log line (P-0193-1b / C-STATE).
-func criuImageInconsistencyEventMsg(fdID int, nameLeaf string, backingMntID int) string {
-	return fmt.Sprintf("files.img REG fd id=%d name_leaf=%s backing_mnt_id=%d: positive orphan mnt_id not in kept mountpoints — hard-stopped before criu restore (ADR-0193 P-0193-1)", fdID, nameLeaf, backingMntID)
+func criuImageInconsistencyEventMsg(fdID int, nameLeaf string, backingMntID int, backingFstype string) string {
+	// ADR-0193 P-0193-1 grounding: include the decoded backing_fstype (a filesystem-type
+	// enum name — NOT a path, so SEC-EVENT-1-safe). It disambiguates a tmpfs/shm orphan
+	// (should have rebound) from a genuine persistent data mount (correctly declined). The
+	// full mountpoint path is deliberately omitted here (log-only). Empty fstype ("") means
+	// the decode was unavailable (older marker / mount absent from mnt_fstypes).
+	if backingFstype == "" {
+		return fmt.Sprintf("files.img REG fd id=%d name_leaf=%s backing_mnt_id=%d: positive orphan mnt_id not in kept mountpoints — hard-stopped before criu restore (ADR-0193 P-0193-1)", fdID, nameLeaf, backingMntID)
+	}
+	return fmt.Sprintf("files.img REG fd id=%d name_leaf=%s backing_mnt_id=%d backing_fstype=%s: positive orphan mnt_id not in kept mountpoints — hard-stopped before criu restore (ADR-0193 P-0193-1)", fdID, nameLeaf, backingMntID, backingFstype)
 }
 
 // zwHoldState tracks per-migration zero-window hold state including armed timestamp and
@@ -4457,6 +4474,20 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     mnt_fstypes = {e['mnt_id']: e.get('fstype') for e in img['entries']
                    if 'mnt_id' in e and e.get('fstype') is not None}
 
+    # ADR-0193 P-0193-1 grounding (live-path diagnostic): a COMPLETE mnt_id -> (fstype,
+    # mountpoint) map over EVERY mountpoints entry, so that when a PLAIN-REG orphan fd
+    # hard-stops (DECLINE), the marker can report the DECODED backing-mount fstype and
+    # mountpoint instead of only the bare backing_mnt_id. Without this the operator log
+    # said "orphan mnt_id not in kept mountpoints" but never WHY the mount was orphaned —
+    # the ungrounded gap that made it indistinguishable whether the fd was a tmpfs/shm
+    # segment (should REBIND, ADR-0311) or a genuine persistent data mount (correctly
+    # DECLINEd — e.g. a postgres emptyDir /var/lib/postgresql/data relation file). Built
+    # from the pre-drop image so a dropped mount's fstype/mountpoint is still resolvable.
+    # Diagnostic only: it does NOT feed classify_reg_fd's decision and cannot weaken the
+    # Strict guard. fstype is the pycriu-decoded enum-name string; 'None' where absent.
+    mnt_mountpoints = {e['mnt_id']: e.get('mountpoint') for e in img['entries']
+                       if 'mnt_id' in e}
+
     # Root mount protection: / must never be dropped even if a logic error tries to add it.
     root_entries = [e for e in img['entries'] if e.get('mountpoint') == '/']
     root_ids = {e['mnt_id'] for e in root_entries if 'mnt_id' in e}
@@ -4805,8 +4836,24 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
         elif action == 'DECLINE':
             # Non-directory REG fd with positive orphan mnt_id — cannot safely rebind.
             # Hard-stop: P-0193-1 (C-R3-3 non-directory path).
-            print('CRIU_IMAGE_INCONSISTENCY:{"fd_id":%d,"name_leaf":"%s","backing_mnt_id":%d}' % (
-                fd_id, name_leaf.replace('"', '\\"'), mnt_id), file=sys.stderr)
+            # ADR-0193 P-0193-1 grounding: surface the DECODED backing-mount fstype +
+            # mountpoint so the operator log tells WHY this fd was orphaned — a tmpfs/shm
+            # segment (should have REBOUND, ADR-0311, indicates a real classifier bug) vs a
+            # genuine persistent data mount (correctly DECLINEd, e.g. postgres emptyDir
+            # /var/lib/postgresql/data; the fix belongs upstream in mount preservation, NOT
+            # here). Diagnostic only — the DECLINE decision is unchanged; the guard is not
+            # weakened. Full name/path stays out of the world-readable marker (SEC-EVENT-1).
+            _decline_fst = mnt_fstypes.get(mnt_id)
+            if _decline_fst is None:
+                _decline_fst = mnt_fstypes.get(str(mnt_id))
+            _decline_mp = mnt_mountpoints.get(mnt_id)
+            if _decline_mp is None:
+                _decline_mp = mnt_mountpoints.get(str(mnt_id))
+            print('pm-image-consistency: P-0193-1 DECLINE — fd_id=%d name=%s backing_mnt_id=%d backing_fstype=%s backing_mountpoint=%s (orphan mnt_id absent from kept mountpoints; non-tmpfs backing means fix belongs in restore-time mount preservation, not a classifier rebind)' % (
+                fd_id, name, mnt_id, _decline_fst, _decline_mp))
+            print('CRIU_IMAGE_INCONSISTENCY:{"fd_id":%d,"name_leaf":"%s","backing_mnt_id":%d,"backing_fstype":"%s","backing_mountpoint":"%s"}' % (
+                fd_id, name_leaf.replace('"', '\\"'), mnt_id,
+                str(_decline_fst).replace('"', '\\"'), str(_decline_mp).replace('"', '\\"')), file=sys.stderr)
             sys.exit(1)
 
     # Atomic files.img write: temp file → fsync → rename (H1 / SC-2 dual-image atomicity).
@@ -4848,8 +4895,19 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
         mnt_id = reg.get('mnt_id')
         name_leaf = os.path.basename(name) if name else str(fd_id)
         # P-0193-1 / P-0194-1 unified: hard-stop — this fd would still fire mount.c:3953.
-        print('CRIU_IMAGE_INCONSISTENCY:{"fd_id":%d,"name_leaf":"%s","backing_mnt_id":%d}' % (
-            fd_id, name_leaf.replace('"', '\\"'), mnt_id), file=sys.stderr)
+        # ADR-0193 P-0193-1 grounding (see the main-pass DECLINE above): report the decoded
+        # backing-mount fstype + mountpoint so the orphan cause is diagnosable in one run.
+        _rc_fst = mnt_fstypes.get(mnt_id)
+        if _rc_fst is None:
+            _rc_fst = mnt_fstypes.get(str(mnt_id))
+        _rc_mp = mnt_mountpoints.get(mnt_id)
+        if _rc_mp is None:
+            _rc_mp = mnt_mountpoints.get(str(mnt_id))
+        print('pm-image-consistency: P-0193-1 DECLINE (re-check) — fd_id=%d name=%s backing_mnt_id=%d backing_fstype=%s backing_mountpoint=%s' % (
+            fd_id, name, mnt_id, _rc_fst, _rc_mp))
+        print('CRIU_IMAGE_INCONSISTENCY:{"fd_id":%d,"name_leaf":"%s","backing_mnt_id":%d,"backing_fstype":"%s","backing_mountpoint":"%s"}' % (
+            fd_id, name_leaf.replace('"', '\\"'), mnt_id,
+            str(_rc_fst).replace('"', '\\"'), str(_rc_mp).replace('"', '\\"')), file=sys.stderr)
         sys.exit(1)
 
     # P-0194-1c cross-image assertion (SC-2): verify dual-write consistency.
@@ -4917,12 +4975,27 @@ else:
 					FdID        int    `json:"fd_id"`
 					NameLeaf    string `json:"name_leaf"`
 					BackingMntID int   `json:"backing_mnt_id"`
+					// ADR-0193 P-0193-1 grounding: decoded backing-mount fstype/mountpoint.
+					// Absent on older marker lines — the zero value ("") is handled downstream.
+					BackingFstype     string `json:"backing_fstype"`
+					BackingMountpoint string `json:"backing_mountpoint"`
 				}
 				if jsonErr := json.Unmarshal([]byte(payload), &parsed); jsonErr == nil {
+					// ADR-0193 P-0193-1b / SEC-EVENT-1: the full mountpoint path is logged
+					// ONLY here (0700-bounded agent log), never in the world-readable Event.
+					log.Info("patchCheckpointImages: P-0193-1 hard-stop (orphan REG fd not in kept mountpoints)",
+						"fd_id", parsed.FdID,
+						"name_leaf", parsed.NameLeaf,
+						"backing_mnt_id", parsed.BackingMntID,
+						"backing_fstype", parsed.BackingFstype,
+						"backing_mountpoint", parsed.BackingMountpoint,
+					)
 					return nil, &CRIUImageInconsistencyError{
 						FdID:        parsed.FdID,
 						NameLeaf:    parsed.NameLeaf,
 						BackingMntID: parsed.BackingMntID,
+						BackingFstype:     parsed.BackingFstype,
+						BackingMountpoint: parsed.BackingMountpoint,
 					}
 				}
 			}
@@ -7532,7 +7605,7 @@ func (s *AgentServer) emitCRIUImageInconsistencyEvent(ctx context.Context, migra
 			"migration", migrationName)
 		return
 	}
-	msg := criuImageInconsistencyEventMsg(imgErr.FdID, imgErr.NameLeaf, imgErr.BackingMntID)
+	msg := criuImageInconsistencyEventMsg(imgErr.FdID, imgErr.NameLeaf, imgErr.BackingMntID, imgErr.BackingFstype)
 	now := metav1.Now()
 	event := &corev1.Event{
 		ObjectMeta: metav1.ObjectMeta{

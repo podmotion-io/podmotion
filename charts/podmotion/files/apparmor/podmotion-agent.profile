@@ -21,6 +21,23 @@ profile podmotion-agent flags=(attach_disconnected,mediate_deleted) {
   signal (send, receive) peer=podmotion-agent,
   ptrace (read, trace) peer=podmotion-agent,
 
+  # ADR-0193/ADR-0095: enforceRestoreOrderingInvariant (server.go) sends SIGCONT
+  # (and, on the deferResume path, relies on the prior CRIU SIGSTOP) to the
+  # CRIU-restored workload tree to resume it after the restore ordering gate.
+  # That target process runs under containerd's default profile
+  # (cri-containerd.apparmor.d) — NOT podmotion-agent — so AppArmor's `signal`
+  # mediation denies the cross-profile SIGCONT under the peer=podmotion-agent rule
+  # above, exactly the ADR-0299/ADR-0300 cross-profile signature:
+  #   apparmor="DENIED" operation="signal" class="signal"
+  #   profile="podmotion-agent" peer="cri-containerd.apparmor.d"
+  #   requested_mask="send" signal="cont"
+  # Narrowly permit ONLY cont/stop to that peer (and to unconfined, the case where
+  # the restored container ran without a runtime AppArmor profile). This does NOT
+  # widen to arbitrary signals — kill/term/etc. to a foreign peer stay denied.
+  # Strictly additive; the capability half (CAP_KILL) is handled in daemonset.yaml.
+  signal (send) set=(cont,stop) peer=cri-containerd.apparmor.d,
+  signal (send) set=(cont,stop) peer=unconfined,
+
   # The single narrow allow this profile exists for: mustEnsureCheckpointTmpfs
   # (cmd/agent/main.go:88-108) statfs's /proc/1/root/run/podmotion/checkpoints
   # through the host PID-1 mount namespace (hostPID: true). The kernel routes
