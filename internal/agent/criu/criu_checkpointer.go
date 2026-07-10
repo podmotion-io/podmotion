@@ -33,6 +33,51 @@ import (
 
 const defaultCRIUBinaryPath = "/usr/local/sbin/criu"
 
+// hostCRIUWrapperPath is the host-node install location of podmotion-criu-wrapper
+// (ADR-0181/0183: the install-criu-wrapper init container copies it here). Under
+// SD-1 (ADR-0231/0234) the de-privileged agent cannot itself setns(CLONE_NEWNS)
+// into the host mount namespace, so the CRIU checkpoint/pre-dump binary — which is
+// the HOST criu (glibc 2.39), dynamically linked and NOT runnable against the
+// debian:12-slim agent-container glibc (~2.36) — is launched in the host mount
+// namespace via the privileged netns-broker sidecar, which nsenters host mnt ns and
+// execve's this wrapper, which in turn execve's /usr/sbin/criu. With no --cgroup-fd
+// args the wrapper is a pure "exec criu in host mnt ns" shim. This is the same
+// allowlisted host-ns launch primitive the restore path uses (server.go joinNsRestore).
+const hostCRIUWrapperPath = "/opt/podmotion/bin/podmotion-criu-wrapper"
+
+// HostNSProcess is a handle to a command spawned DETACHED in the HOST mount namespace.
+// The checkpointer drives it: it Polls until the command exits (surfacing exit code +
+// captured combined stdout/stderr), or — on context cancel/abort — Signals it (SIGKILL)
+// so an aborted dump/pre-dump cannot keep writing checkpoint images into ImagesDir after
+// the caller has returned "aborted" and started zeroizing (invariant 7: checkpoints
+// zeroized on ALL exit paths — the kill makes that zeroize race-free).
+type HostNSProcess interface {
+	// Poll reports whether the process has exited. When exited, exitCode and output
+	// (combined stdout+stderr) are valid. A non-zero exit is NOT an err; err is set only
+	// on a poll/broker transport failure.
+	Poll(ctx context.Context) (exited bool, exitCode int, output []byte, err error)
+	// Signal delivers signal sig to the process (SIGKILL on abort). Best-effort.
+	Signal(ctx context.Context, sig int) error
+}
+
+// HostNSRunner spawns argv DETACHED inside the HOST mount namespace and returns a
+// handle the checkpointer polls/signals. It is injected into CRIUCheckpointer so the
+// criu package stays free of any netns-broker import (no cycle) and remains
+// unit-testable. In the agent binary it is backed by the privileged netns-broker
+// sidecar's async exec ops (ExecStart/ExecPoll/ExecSignal — ADR-0234), the same
+// primitive the live Restore path uses, so an aborted dump can SIGKILL the CRIU child.
+// When nil, CRIUCheckpointer falls back to a direct in-container exec of the CRIU binary
+// (kind/dev, where the node and agent container share the same glibc, and unit tests).
+type HostNSRunner func(ctx context.Context, argv ...string) (HostNSProcess, error)
+
+// hostNSPollInterval is how often runCRIUCLI polls a detached host-ns CRIU child.
+// Matches the broker's brokerCriuWrapperPollInterval (50ms) so abort latency is bounded.
+const hostNSPollInterval = 50 * time.Millisecond
+
+// sigKill is the signal number the checkpointer asks the broker to deliver on abort.
+// (The broker maps 0→SIGKILL; we pass the explicit SIGKILL number for clarity.)
+const sigKill = 9
+
 // ErrCRIUCapability is a sentinel returned (wrapped) when CRIU or a preflight check fails
 // because CAP_SYS_PTRACE is missing or a seccomp profile is blocking ptrace. Callers use
 // errors.Is/As to distinguish this from transient or configuration errors (M19.5 criterion 13).
@@ -51,6 +96,13 @@ type removedLink struct {
 type CRIUCheckpointer struct {
 	criuBinaryPath string
 
+	// hostNSRun, when non-nil, runs the CRIU dump/pre-dump CLI in the HOST mount
+	// namespace (via the podmotion-criu-wrapper through the privileged netns-broker)
+	// so the dynamically-linked host CRIU binary links against the host glibc rather
+	// than the older agent-container glibc. When nil, PreDump/Dump exec the CRIU
+	// binary directly in the agent container's mount namespace (kind/dev/tests).
+	hostNSRun HostNSRunner
+
 	mu              sync.Mutex
 	activeCriu      *gocriu.Criu  // non-nil while a dump/restore is in progress
 	removedNetLinks []removedLink // links deleted pre-dump for restore-side recreation
@@ -63,6 +115,107 @@ func NewCRIUCheckpointer(criuBinaryPath string) *CRIUCheckpointer {
 		criuBinaryPath = defaultCRIUBinaryPath
 	}
 	return &CRIUCheckpointer{criuBinaryPath: criuBinaryPath}
+}
+
+// SetHostNSRunner installs the host-mount-namespace runner used to launch the CRIU
+// dump/pre-dump CLI. When set, PreDump and Dump run CRIU in the host mount namespace
+// (via podmotion-criu-wrapper through the netns-broker) so the host CRIU binary links
+// against the host glibc — fixing the "GLIBC_2.38 not found" failure that occurred when
+// the host binary was exec'd directly in the older-glibc agent container. Must be called
+// before any PreDump/Dump. Passing nil restores direct in-container exec (kind/dev/tests).
+func (c *CRIUCheckpointer) SetHostNSRunner(r HostNSRunner) {
+	c.hostNSRun = r
+}
+
+// runCRIUCLI runs `criu <criuArgs...>` and returns (combinedOutput, error). When a
+// host-namespace runner is installed it launches the CRIU binary in the host mount
+// namespace via the podmotion-criu-wrapper (no --cgroup-fd args → pure exec-criu shim),
+// spawning it DETACHED and polling to completion; otherwise it execs the CRIU binary
+// directly in the agent container. In BOTH cases an aborted run ACTIVELY terminates the
+// CRIU child before returning: the direct path kills its local process, the host-ns path
+// SIGKILLs the broker-side child. This guarantees no CRIU keeps writing checkpoint images
+// into ImagesDir after runCRIUCLI returns "aborted", so the caller's zeroize path is
+// race-free (invariant 7). The returned bytes are CRIU's combined stdout+stderr so an
+// early fatal emitted to stdout before the -o log file is opened is not lost. The caller
+// reads the CRIU --log-file (predump.log/dump.log) from ImagesDir separately.
+func (c *CRIUCheckpointer) runCRIUCLI(ctx context.Context, criuArgs []string) (output []byte, err error) {
+	if c.hostNSRun != nil {
+		// Launch host CRIU in the host mount namespace via the wrapper. Zero --cgroup-fd
+		// args: argv is [wrapper, "--", criuBinary, criuArgs...] so the wrapper's first
+		// token is "--" and it execs criu directly (no fd delivery) in host mnt ns.
+		argv := append([]string{hostCRIUWrapperPath, "--", c.criuBinaryPath}, criuArgs...)
+
+		// Spawn detached. Use a Background context for the spawn RPC itself so a caller
+		// ctx that is ALREADY cancelled still lets us learn the child PID (needed to kill
+		// it); the poll loop below observes ctx cancellation and SIGKILLs.
+		proc, startErr := c.hostNSRun(context.Background(), argv...)
+		if startErr != nil {
+			return nil, fmt.Errorf("host-ns criu launch: %w", startErr)
+		}
+
+		// abortKill SIGKILLs the detached child and drains one final poll so the broker
+		// reaps it (best-effort — errors are non-fatal on the abort path).
+		abortKill := func() {
+			killCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = proc.Signal(killCtx, sigKill)
+			// One reaping poll so the broker Wait()s the killed child (no zombie leak).
+			_, _, _, _ = proc.Poll(killCtx)
+		}
+
+		ticker := time.NewTicker(hostNSPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				// Aborted: actively kill the CRIU child BEFORE returning so it cannot keep
+				// writing images into ImagesDir concurrently with the caller's zeroize.
+				abortKill()
+				return nil, ctx.Err()
+			case <-ticker.C:
+				// Poll with the caller ctx so a broker transport hang is bounded; on ctx
+				// cancel Poll returns and the next loop iteration hits the ctx.Done() case.
+				exited, exitCode, out, pollErr := proc.Poll(ctx)
+				if pollErr != nil {
+					if ctx.Err() != nil {
+						// Poll failed because ctx was cancelled — kill and report abort.
+						abortKill()
+						return nil, ctx.Err()
+					}
+					// Genuine broker/transport failure: kill the child (it may still be
+					// running and writing images) before surfacing the error.
+					abortKill()
+					return out, fmt.Errorf("host-ns criu poll: %w", pollErr)
+				}
+				if !exited {
+					continue
+				}
+				if exitCode != 0 {
+					return out, fmt.Errorf("exit status %d", exitCode)
+				}
+				return out, nil
+			}
+		}
+	}
+
+	// Direct in-container exec (kind/dev/tests: node and container share glibc).
+	//nolint:gosec // binary path is a trusted constant, args are controlled internally
+	cmd := exec.CommandContext(ctx, c.criuBinaryPath, criuArgs...)
+	var buf bytes.Buffer
+	cmd.Stderr = &buf
+	cmd.Stdout = &buf
+	type result struct{ err error }
+	done := make(chan result, 1)
+	go func() { done <- result{err: cmd.Run()} }()
+	select {
+	case <-ctx.Done():
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		return buf.Bytes(), ctx.Err()
+	case res := <-done:
+		return buf.Bytes(), res.err
+	}
 }
 
 // darwinError returns a clear error when running on macOS (CRIU is Linux-only).
@@ -106,27 +259,17 @@ func (c *CRIUCheckpointer) PreDump(ctx context.Context, opts PreDumpOptions) (Ch
 		args = append(args, "--prev-images-dir", rel)
 	}
 
-	//nolint:gosec // binary path is a trusted constant, args are controlled internally
-	cmd := exec.CommandContext(ctx, c.criuBinaryPath, args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	type result struct{ err error }
-	done := make(chan result, 1)
-	go func() {
-		done <- result{err: cmd.Run()}
-	}()
-
-	select {
-	case <-ctx.Done():
-		_ = cmd.Process.Kill()
-		return CheckpointResult{}, fmt.Errorf("PreDump aborted: %w", ctx.Err())
-	case res := <-done:
-		if res.err != nil {
-			predumpLog, _ := os.ReadFile(filepath.Join(opts.ImagesDir, "predump.log"))
-			return CheckpointResult{}, fmt.Errorf("criu pre-dump: %w\nstderr: %s\nlog: %s",
-				res.err, stderr.String(), string(predumpLog))
+	// Run CRIU pre-dump. Under SD-1 this runs in the host mount namespace via the
+	// netns-broker + podmotion-criu-wrapper (host CRIU binary → host glibc); on
+	// kind/dev/tests it execs directly in the agent container. runCRIUCLI handles both.
+	stderrBytes, runErr := c.runCRIUCLI(ctx, args)
+	if runErr != nil {
+		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+			return CheckpointResult{}, fmt.Errorf("PreDump aborted: %w", runErr)
 		}
+		predumpLog, _ := os.ReadFile(filepath.Join(opts.ImagesDir, "predump.log"))
+		return CheckpointResult{}, fmt.Errorf("criu pre-dump: %w\nstderr: %s\nlog: %s",
+			runErr, string(stderrBytes), string(predumpLog))
 	}
 
 	return CheckpointResult{
@@ -417,30 +560,15 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		"args", strings.Join(dumpArgs, " "),
 	)
 
-	//nolint:gosec // binary path is a trusted constant, args are controlled internally
-	cmd := exec.CommandContext(ctx, c.criuBinaryPath, dumpArgs...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	// Redirect combined stdout+stderr to the stderr buffer so CRIU's early error messages
-	// (e.g. before the log file is opened) are captured.
-	cmd.Stdout = &stderr
-
-	type result struct{ err error }
-	done := make(chan result, 1)
-	go func() {
-		done <- result{err: cmd.Run()}
-	}()
-
-	var dumpErr error
-	select {
-	case <-ctx.Done():
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		return CheckpointResult{}, fmt.Errorf("Dump aborted: %w", ctx.Err())
-	case res := <-done:
-		dumpErr = res.err
+	// Run CRIU dump. Under SD-1 this runs in the host mount namespace via the
+	// netns-broker + podmotion-criu-wrapper (host CRIU binary → host glibc); on
+	// kind/dev/tests it execs directly in the agent container. runCRIUCLI captures
+	// combined stdout+stderr (CRIU's early errors before the log file is opened).
+	stderrBytes, dumpErr := c.runCRIUCLI(ctx, dumpArgs)
+	if dumpErr != nil && (errors.Is(dumpErr, context.Canceled) || errors.Is(dumpErr, context.DeadlineExceeded)) {
+		return CheckpointResult{}, fmt.Errorf("Dump aborted: %w", dumpErr)
 	}
+	stderr := bytes.NewBuffer(stderrBytes)
 
 	// Always surface the CRIU dump log — invaluable for diagnosing failures on kind.
 	dumpLogBytes, _ := os.ReadFile(filepath.Join(opts.ImagesDir, "dump.log"))
@@ -773,6 +901,16 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 
 	c.mu.Lock()
 	cr := gocriu.MakeCriu()
+	// LANDMINE (do NOT wire into the live SD-1 agent): this go-criu RPC restore path
+	// execs `criu swrk` at c.criuBinaryPath IN-CONTAINER (the agent's mount namespace).
+	// On the KVM/AMI nodes that is the HOST criu (glibc 2.39) run against the debian:12-slim
+	// container glibc (~2.36) → the exact "GLIBC_2.38 not found" bug this file's dump/pre-dump
+	// path was fixed for (host-ns launch via broker+wrapper). Unlike dump/pre-dump, this
+	// Restore method is NOT plumbed through hostNSRun — it is currently DEAD CODE (no live
+	// caller; the live restore goes through server.go joinNsRestore, which runs criu in the
+	// host mount namespace via the broker+wrapper). If a future post-copy mode ever wires this
+	// method live, it MUST first route this swrk exec through the host mount namespace the same
+	// way (broker+wrapper), or it will re-trigger the glibc failure.
 	cr.SetCriuPath(c.criuBinaryPath)
 	c.activeCriu = cr
 	c.mu.Unlock()
