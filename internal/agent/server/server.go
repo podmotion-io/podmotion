@@ -3034,6 +3034,14 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 			log.Info("joinNsRestore: joining replacement pod netns via --join-ns net:<path> (ADR-0125)",
 				"sandboxID", sandboxID, "netnsPath", petnsPath)
 		}
+	} else {
+		// ADR (this fix): on the destNetnsFd != "" branch — the one that actually executes for
+		// every Strict-mode migration via the gRPC Restore call sites (5833, 6003) — destNetnsFd
+		// is already the agent-owned bind-mount path (sourced end-to-end from
+		// PrepareDestinationNetns via the controller and RestoreRequest.DestNetnsFd). Record it
+		// the same way the sandboxID branch above records petnsPath, so the NRI callback / MAC
+		// resolution reads the agent-created bind netns instead of ptrace'd /proc/<pid>/ns/net.
+		storeResolvedNetnsPath(migrationName, destNetnsFd)
 	}
 
 	criuArgs := buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath, hostVethName, strictMode)
