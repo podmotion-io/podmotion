@@ -38,8 +38,15 @@ import (
 // Conditions that require a live agent are pre-seeded so each phase advances without
 // blocking on external RPCs.
 func TestTwelvePhaseTransitions(t *testing.T) {
-	var logBuf bytes.Buffer
-	logf.SetLogger(zap.New(zap.WriteTo(&logBuf), zap.UseDevMode(true)))
+	// NOTE: this test intentionally does NOT call logf.SetLogger. controller-runtime's
+	// global root logger is one-shot — the first SetLogger in the whole test binary wins
+	// and every later call (including this test's) is silently ignored (deleg.go Fulfill
+	// nils the promise). A prior version asserted the 10 non-strict phases via a log
+	// substring captured into a local buffer; when another test in the package won the
+	// one-shot logger race that buffer stayed empty and this test failed ~1/3 of full-package
+	// runs. The assertions below now rely ONLY on the executed phase-visit map, so they are
+	// deterministic regardless of test ordering (Constitutional Invariant 5: no flaky proof
+	// of the TCP-continuity spine).
 
 	scheme := runtime.NewScheme()
 	if err := pmv1.AddToScheme(scheme); err != nil {
@@ -145,9 +152,13 @@ func TestTwelvePhaseTransitions(t *testing.T) {
 		}
 	}
 
-	logs := logBuf.String()
-
-	// Each of the 12 phase names must appear either in the phase visit record or in logs.
+	// Each of the 12 phase names must have been VISITED as an executed state transition
+	// (i.e. the PodMigration status actually held that phase across a reconcile). Every one
+	// of the 12 phases is a real dispatch case that transitions phase-to-phase via
+	// transitionTo, and the loop below records the phase both before and after each reconcile,
+	// so every held phase is captured. No log-substring fallback is used (see the note at the
+	// top of this test): a log line is not proof a phase was entered, and depending on it made
+	// this test order-dependent and flaky.
 	expectedPhases := []pmv1.MigrationPhase{
 		pmv1.MigrationPhaseSocketInventory,
 		pmv1.MigrationPhaseValidating,
@@ -163,17 +174,20 @@ func TestTwelvePhaseTransitions(t *testing.T) {
 		pmv1.MigrationPhaseCutoverComplete,
 	}
 
+	// A-02 (C-2): OverlayHandoff and DisengageHold are the two phases whose bypass the C-2
+	// finding is about (two-sided FDB/neighbor handoff and the zero-window disarm barrier — the
+	// TCP-continuity spine). The finding was precisely that a log line can be printed while the
+	// phase is never entered as a state transition, so EVERY phase here — not just those two —
+	// must appear in the phase-visit map. There is no log-substring escape hatch for any phase.
 	var missing []string
 	for _, phase := range expectedPhases {
-		inPhaseMap := visitedPhases[phase]
-		inLogs := strings.Contains(logs, string(phase))
-		if !inPhaseMap && !inLogs {
-			missing = append(missing, string(phase))
+		if !visitedPhases[phase] {
+			missing = append(missing, string(phase)+" (must be VISITED as a state transition, not a log substring)")
 		}
 	}
 	if len(missing) > 0 {
-		t.Errorf("12-phase transitions not observed (missing from both phase map and logs): %v\n\nvisited phases: %v\n\nlog output:\n%s",
-			missing, visitedPhases, logs)
+		t.Errorf("12-phase transitions not observed: %v\n\nvisited phases: %v",
+			missing, visitedPhases)
 	}
 }
 
@@ -568,5 +582,350 @@ func TestVXLANFDBUpdatedCondition(t *testing.T) {
 				t.Errorf("mode=%s: VXLANFDBUpdated must not be True without AddFDBEntry/ConfirmOverlayReady RPC (M22 gate)", tc.mode)
 			}
 		})
+	}
+}
+
+// TestFinalFreezeStateCaptureDoesNotHijackPipeline is the A-02 (C-2) contract test: on the
+// 12-phase ADR-0047 pipeline the phase is MigrationPhaseFinalFreezeStateCapture, which OWNS the
+// checkpoint→transfer→OverlayHandoff sequencing. The checkpoint and transfer sub-handlers must
+// therefore NOT self-transition to the legacy Transferring/Restoring phases when invoked on this
+// phase — doing so hands the phase machine to the legacy Transferring→Restoring→Verifying tail
+// and permanently bypasses OverlayHandoff/RestoreSocketReattach/DisengageHold/TCPVerifying/
+// ServiceVerifying/CutoverComplete (the entire TCP-continuity spine).
+//
+// This test is FALSIFIABLE and would have caught the C-2 bug: against the pre-A-02 tree the
+// checkpoint fast-path ended at transitionTo(Transferring) and the transfer tail at
+// transitionTo(Restoring), so both sub-assertions below would FAIL (phase would read
+// Transferring / Restoring). It passes only once each sub-handler is pipeline-aware.
+func TestFinalFreezeStateCaptureDoesNotHijackPipeline(t *testing.T) {
+	// Defense-in-depth (fix item 3): the controller package's one un-scoped mutable global,
+	// macWritebackFirstSeen (keyed by pm.Name), is the only cross-test state-bleed channel in this
+	// package. It is NOT consulted on the checkpoint/transfer advance path under test, but resetting
+	// it here — plus giving every fixture a unique t.Name()-derived pm.Name below — eliminates the
+	// entire class of co-scheduled-test leak that caused a prior round's misdiagnosis. Reset before
+	// AND after so neither a sibling test's residue nor this test's residue can bleed.
+	resetMACWriteback := func() {
+		macWritebackFirstSeen.Range(func(k, _ any) bool {
+			macWritebackFirstSeen.Delete(k)
+			return true
+		})
+	}
+	resetMACWriteback()
+	t.Cleanup(resetMACWriteback)
+
+	// transition records the (from, decided) next-phase decisions the advance helpers make at their
+	// single source-of-truth decision point. This recorded ledger is the source-of-truth primitive that
+	// replaces observing the phase via a fake-client readback: it is written synchronously, in-process, at the
+	// exact branch, with no timing, no goroutine, and no round-trip — so the safety assertion is
+	// deterministic-by-construction and cannot be spoofed by a partial/aliased readback or masked by a
+	// CPU-starvation process kill.
+	type transition struct{ from, to pmv1.MigrationPhase }
+
+	// Build a minimal reconciler + PM fixture at phase FinalFreezeStateCapture. Each fixture gets a
+	// UNIQUE name (t.Name()-derived) and its own reconciler with a fresh ledger, so no two subtests
+	// share client, object, or ledger state.
+	buildFixture := func(t *testing.T, mutate func(pm *pmv1.PodMigration)) (*PodMigrationReconciler, *pmv1.PodMigration, func() *pmv1.PodMigration, *[]transition) {
+		scheme := runtime.NewScheme()
+		if err := pmv1.AddToScheme(scheme); err != nil {
+			t.Fatalf("AddToScheme pmv1: %v", err)
+		}
+		if err := corev1.AddToScheme(scheme); err != nil {
+			t.Fatalf("AddToScheme corev1: %v", err)
+		}
+		// Unique, DNS-safe name derived from the subtest so co-scheduled runs never collide on the
+		// name-keyed global or on the fake-client object key.
+		name := "nohijack-" + strings.Map(func(r rune) rune {
+			switch {
+			case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
+				return r
+			case r >= 'A' && r <= 'Z':
+				return r + ('a' - 'A')
+			default:
+				return '-'
+			}
+		}, t.Name())
+		now := metav1.Now()
+		pm := &pmv1.PodMigration{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: pmv1.PodMigrationSpec{
+				PodName:             "src-pod",
+				PodNamespace:        "default",
+				Mode:                pmv1.MigrationModeCold,
+				TCPPreservationMode: pmv1.TCPPreservationModeStrict,
+				TargetNodeName:      "dst-node",
+			},
+			Status: pmv1.PodMigrationStatus{
+				Phase:               pmv1.MigrationPhaseFinalFreezeStateCapture,
+				SourceNodeName:      "src-node",
+				DestinationNodeName: "dst-node",
+				Conditions: []metav1.Condition{
+					{
+						Type:               conditionCheckpointed,
+						Status:             metav1.ConditionTrue,
+						Reason:             "PreSeeded",
+						Message:            "checkpoint already complete (fixture)",
+						LastTransitionTime: now,
+					},
+				},
+			},
+		}
+		if mutate != nil {
+			mutate(pm)
+		}
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(pm).
+			WithStatusSubresource(pm).
+			Build()
+		ledger := &[]transition{}
+		r := &PodMigrationReconciler{
+			Client: fakeClient,
+			Scheme: scheme,
+			onPhaseDecision: func(from, decided pmv1.MigrationPhase) {
+				*ledger = append(*ledger, transition{from: from, to: decided})
+			},
+		}
+		getFresh := func() *pmv1.PodMigration {
+			fresh := &pmv1.PodMigration{}
+			if err := fakeClient.Get(context.Background(),
+				types.NamespacedName{Name: name, Namespace: "default"}, fresh); err != nil {
+				t.Fatalf("Get fresh: %v", err)
+			}
+			return fresh
+		}
+		return r, pm, getFresh, ledger
+	}
+
+	// assertNoLegacyHijack is the deterministic safety assertion. It verifies, from the recorded
+	// transition ledger (the source-of-truth primitive), that the advance helper made NO
+	// FinalFreezeStateCapture→Transferring and NO FinalFreezeStateCapture→Restoring decision — the
+	// exact edges that would hand the phase machine to the legacy tail and bypass the TCP-continuity
+	// spine. This is a recorded-decision check, not a value-observation of an eventually-consistent
+	// readback, so it cannot flake on timing or be masqueraded by a harness kill.
+	assertNoLegacyHijack := func(t *testing.T, ledger *[]transition) {
+		t.Helper()
+		if len(*ledger) != 1 {
+			t.Fatalf("expected exactly one recorded phase decision on the 12-phase path, got %d: %+v",
+				len(*ledger), *ledger)
+		}
+		dec := (*ledger)[0]
+		if dec.from != pmv1.MigrationPhaseFinalFreezeStateCapture {
+			t.Fatalf("phase decision was evaluated from %q, expected %q",
+				dec.from, pmv1.MigrationPhaseFinalFreezeStateCapture)
+		}
+		if dec.to == pmv1.MigrationPhaseTransferring || dec.to == pmv1.MigrationPhaseRestoring {
+			t.Fatalf("C-2 regression: advance helper decided FinalFreezeStateCapture→%q, handing the "+
+				"phase machine to the legacy tail (OverlayHandoff/RestoreSocketReattach/DisengageHold "+
+				"bypassed); the 12-phase delegator must own the transition", dec.to)
+		}
+		if dec.to != pmv1.MigrationPhaseFinalFreezeStateCapture {
+			t.Fatalf("expected the 12-phase advance to stay on %q, decided %q",
+				pmv1.MigrationPhaseFinalFreezeStateCapture, dec.to)
+		}
+	}
+
+	t.Run("checkpoint fast-path does not transition to legacy Transferring", func(t *testing.T) {
+		r, pm, getFresh, ledger := buildFixture(t, nil)
+		ctx := context.Background()
+		// reconcileCheckpointing on the 12-phase phase hits the Checkpointed=True fast-path.
+		res, err := r.reconcileCheckpointing(ctx, pm)
+		if err != nil {
+			t.Fatalf("reconcileCheckpointing: %v", err)
+		}
+		// PRIMARY, in-process signal: the recorded transition ledger proves the branch taken with no
+		// dependence on the fake-client round-trip.
+		assertNoLegacyHijack(t, ledger)
+		// The status-only 12-phase path requeues without a transitionTo; a legacy hijack would have
+		// gone through transitionTo (also Requeue:true) but WOULD have recorded a Transferring edge,
+		// which assertNoLegacyHijack already rejects. The Requeue flag pins the status-only contract.
+		if !res.Requeue {
+			t.Fatalf("expected Requeue:true from the 12-phase checkpoint fast-path, got %+v", res)
+		}
+		// Defense-in-depth: the durable readback must ALSO show no hijack.
+		if got := getFresh().Status.Phase; got != pmv1.MigrationPhaseFinalFreezeStateCapture {
+			t.Fatalf("readback: expected phase to remain %q on the 12-phase path, got %q",
+				pmv1.MigrationPhaseFinalFreezeStateCapture, got)
+		}
+	})
+
+	t.Run("transfer tail does not transition to legacy Restoring", func(t *testing.T) {
+		// The transfer-side stealing point is advanceAfterTransfer (reconcileTransferring's
+		// terminal call). Its full body requires a live AgentPool to reach, so the seam helper
+		// is asserted directly: on the 12-phase phase it must NOT transition to legacy Restoring.
+		// Pre-A-02 this helper's body was an unconditional transitionTo(Restoring), so the ledger
+		// assertion would FAIL (a FinalFreezeStateCapture→Restoring edge would be recorded).
+		r, pm, getFresh, ledger := buildFixture(t, func(pm *pmv1.PodMigration) {
+			pm.Status.CheckpointTransferred = true
+		})
+		ctx := context.Background()
+		res, err := r.advanceAfterTransfer(ctx, pm)
+		if err != nil {
+			t.Fatalf("advanceAfterTransfer: %v", err)
+		}
+		assertNoLegacyHijack(t, ledger)
+		if !res.Requeue {
+			t.Fatalf("expected Requeue:true from the 12-phase transfer tail, got %+v", res)
+		}
+		if got := getFresh().Status.Phase; got != pmv1.MigrationPhaseFinalFreezeStateCapture {
+			t.Fatalf("readback: expected phase to remain %q on the 12-phase path, got %q",
+				pmv1.MigrationPhaseFinalFreezeStateCapture, got)
+		}
+	})
+
+	t.Run("legacy Transferring phase still owns its transition to Restoring", func(t *testing.T) {
+		// Backward-compat guard for the transfer seam: a PodMigration on the legacy path
+		// (phase Transferring) must still self-transition to Restoring.
+		r, pm, getFresh, ledger := buildFixture(t, func(pm *pmv1.PodMigration) {
+			pm.Status.Phase = pmv1.MigrationPhaseTransferring
+			pm.Status.CheckpointTransferred = true
+		})
+		ctx := context.Background()
+		if _, err := r.advanceAfterTransfer(ctx, pm); err != nil {
+			t.Fatalf("advanceAfterTransfer (legacy): %v", err)
+		}
+		// Ledger primitive: the recorded decision must be exactly Transferring→Restoring.
+		if len(*ledger) != 1 || (*ledger)[0] != (transition{from: pmv1.MigrationPhaseTransferring, to: pmv1.MigrationPhaseRestoring}) {
+			t.Fatalf("legacy Transferring must record a Transferring→Restoring decision, got %+v", *ledger)
+		}
+		if got := getFresh().Status.Phase; got != pmv1.MigrationPhaseRestoring {
+			t.Fatalf("legacy Transferring must transition to Restoring, got %q", got)
+		}
+	})
+
+	t.Run("legacy Checkpointing phase still owns its transition to Transferring", func(t *testing.T) {
+		// Backward-compat guard: a PodMigration already on the legacy 8-phase path (phase
+		// Checkpointing) must still self-transition to Transferring — the fix must not break
+		// the legacy pipeline for existing in-flight objects.
+		r, pm, getFresh, ledger := buildFixture(t, func(pm *pmv1.PodMigration) {
+			pm.Status.Phase = pmv1.MigrationPhaseCheckpointing
+		})
+		ctx := context.Background()
+		if _, err := r.reconcileCheckpointing(ctx, pm); err != nil {
+			t.Fatalf("reconcileCheckpointing (legacy): %v", err)
+		}
+		if len(*ledger) != 1 || (*ledger)[0] != (transition{from: pmv1.MigrationPhaseCheckpointing, to: pmv1.MigrationPhaseTransferring}) {
+			t.Fatalf("legacy Checkpointing must record a Checkpointing→Transferring decision, got %+v", *ledger)
+		}
+		if got := getFresh().Status.Phase; got != pmv1.MigrationPhaseTransferring {
+			t.Fatalf("legacy Checkpointing must transition to Transferring, got %q", got)
+		}
+	})
+}
+
+// TestStrictMigrationVisitsOverlayHandoffAndDisengageHold drives a full Strict migration through
+// the real Reconcile dispatcher from FinalFreezeStateCapture and asserts that OverlayHandoff AND
+// DisengageHold are VISITED as executed state transitions (present in the observed phase set), NOT
+// as log substrings. This is the arch_a-C1 / oss_qa-C1 contract: a Strict migration must pass
+// through OverlayHandoff and DisengageHold before Complete, and the assertion is not satisfiable
+// by a log line.
+//
+// Agent-dependent legs are advanced via their fast-path conditions (no AgentPool is available in
+// a unit test); the point under test is the phase-machine sequencing owned by the controller, not
+// the agent RPCs.
+func TestStrictMigrationVisitsOverlayHandoffAndDisengageHold(t *testing.T) {
+	var logBuf bytes.Buffer
+	logf.SetLogger(zap.New(zap.WriteTo(&logBuf), zap.UseDevMode(true)))
+
+	scheme := runtime.NewScheme()
+	if err := pmv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme pmv1: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme corev1: %v", err)
+	}
+
+	srcPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "src-pod", Namespace: "default", UID: "uid-strict"},
+		Spec:       corev1.PodSpec{NodeName: "src-node"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.9"},
+	}
+	nmc := &pmv1.NodeMigrationCapacity{
+		ObjectMeta: metav1.ObjectMeta{Name: "src-node"},
+		Status:     pmv1.NodeMigrationCapacityStatus{Ready: true},
+	}
+
+	now := metav1.Now()
+	cond := func(t string) metav1.Condition {
+		return metav1.Condition{Type: t, Status: metav1.ConditionTrue, Reason: "PreSeeded",
+			Message: "fast-path pre-seed (strict visitation test)", LastTransitionTime: now}
+	}
+
+	pm := &pmv1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-strict-visit", Namespace: "default"},
+		Spec: pmv1.PodMigrationSpec{
+			PodName:             "src-pod",
+			PodNamespace:        "default",
+			Mode:                pmv1.MigrationModeCold,
+			TCPPreservationMode: pmv1.TCPPreservationModeStrict,
+			RollbackOnFailure:   true,
+			TargetNodeName:      "dst-node",
+		},
+		Status: pmv1.PodMigrationStatus{
+			Phase: pmv1.MigrationPhaseFinalFreezeStateCapture,
+			Conditions: []metav1.Condition{
+				cond(conditionCheckpointed),
+				// OverlayHandoff fast-path: VXLANFDBUpdated=True → RestoreSocketReattach.
+				cond(string(pmv1.ConditionVXLANFDBUpdated)),
+				// RestoreSocketReattach fast-path: Restored=True → DisengageHold.
+				cond(conditionRestored),
+				// DisengageHold fast-path: RelayProgramsLoaded=True → TCPVerifying.
+				cond(string(pmv1.ConditionRelayProgramsLoaded)),
+				cond(conditionTrafficVerified),
+				cond(conditionDestinationVolumeReady),
+			},
+			CheckpointTransferred: true,
+			SourceNodeName:        "src-node",
+			DestinationNodeName:   "dst-node",
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pm, srcPod, nmc).
+		WithStatusSubresource(pm, nmc).
+		Build()
+
+	r := &PodMigrationReconciler{Client: fakeClient, Scheme: scheme}
+	ctx := context.Background()
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-strict-visit", Namespace: "default"}}
+
+	visited := make(map[pmv1.MigrationPhase]bool)
+	const maxIter = 60
+	for i := 0; i < maxIter; i++ {
+		fresh := &pmv1.PodMigration{}
+		if err := fakeClient.Get(ctx, req.NamespacedName, fresh); err != nil {
+			t.Fatalf("iter %d: Get before: %v", i, err)
+		}
+		visited[fresh.Status.Phase] = true
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			// A requeue-with-error on a stub leg is acceptable; keep the phases already visited.
+			break
+		}
+		if err := fakeClient.Get(ctx, req.NamespacedName, fresh); err != nil {
+			t.Fatalf("iter %d: Get after: %v", i, err)
+		}
+		visited[fresh.Status.Phase] = true
+		p := fresh.Status.Phase
+		if p == pmv1.MigrationPhaseComplete || p == pmv1.MigrationPhaseFailed ||
+			p == pmv1.MigrationPhaseRollingBack || p == pmv1.MigrationPhaseDryRunComplete {
+			break
+		}
+	}
+
+	// Executed-state-transition assertions — NOT satisfiable by log substrings.
+	if !visited[pmv1.MigrationPhaseOverlayHandoff] {
+		t.Errorf("Strict migration never VISITED OverlayHandoff (C-2 bypass); visited=%v", visited)
+	}
+	if !visited[pmv1.MigrationPhaseDisengageHold] {
+		t.Errorf("Strict migration never VISITED DisengageHold (C-2 bypass); visited=%v", visited)
+	}
+	// The migration must NOT have taken the legacy Transferring/Restoring/Verifying tail.
+	for _, legacy := range []pmv1.MigrationPhase{
+		pmv1.MigrationPhaseTransferring, pmv1.MigrationPhaseRestoring, pmv1.MigrationPhaseVerifying,
+	} {
+		if visited[legacy] {
+			t.Errorf("Strict migration visited legacy phase %q — the 12-phase pipeline was bypassed; visited=%v",
+				legacy, visited)
+		}
 	}
 }

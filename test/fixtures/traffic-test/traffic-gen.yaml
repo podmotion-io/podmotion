@@ -6,7 +6,7 @@ metadata:
   name: traffic-gen
   namespace: pm-live-test
 spec:
-  nodeName: pm-control
+  nodeName: pm-cp1
   restartPolicy: OnFailure
   containers:
   - name: gen

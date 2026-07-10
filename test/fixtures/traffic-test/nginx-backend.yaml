@@ -32,7 +32,7 @@ metadata:
   labels:
     app: nginx-live
 spec:
-  nodeName: pm-worker
+  nodeName: pm-w1
   containers:
   - name: nginx
     image: nginx:1.25-alpine

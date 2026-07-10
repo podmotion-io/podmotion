@@ -32,6 +32,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -45,6 +46,8 @@ const (
 	liveTrafficNS      = "pm-live-test"
 	liveTrafficTimeout = 10 * time.Minute
 	liveTrafficPoll    = 5 * time.Second
+	liveTrafficSrcNode = "pm-w1"
+	liveTrafficDstNode = "pm-w2"
 )
 
 var _ = Describe("Live migration traffic continuity", Label("live-traffic"), Ordered, func() {
@@ -69,10 +72,13 @@ var _ = Describe("Live migration traffic continuity", Label("live-traffic"), Ord
 			Expect(err).NotTo(HaveOccurred(), "kubectl apply %s: %s", f, string(out))
 		}
 
-		By("waiting for nginx-live-src to be Ready")
+		By("waiting for nginx-live-src to be Ready on " + liveTrafficSrcNode)
 		Eventually(func() bool {
 			var pod corev1.Pod
 			if err := pmClient.Get(ctx, types.NamespacedName{Name: "nginx-live-src", Namespace: liveTrafficNS}, &pod); err != nil {
+				return false
+			}
+			if pod.Spec.NodeName != liveTrafficSrcNode {
 				return false
 			}
 			for _, c := range pod.Status.Conditions {
@@ -81,7 +87,7 @@ var _ = Describe("Live migration traffic continuity", Label("live-traffic"), Ord
 				}
 			}
 			return false
-		}, 2*time.Minute, 3*time.Second).Should(BeTrue(), "nginx-live-src must be Ready")
+		}, 2*time.Minute, 3*time.Second).Should(BeTrue(), "nginx-live-src must be Ready on "+liveTrafficSrcNode)
 
 		By("waiting for HAProxy deployment to be ready")
 		Eventually(func() bool {
@@ -117,13 +123,13 @@ var _ = Describe("Live migration traffic continuity", Label("live-traffic"), Ord
 				Namespace: liveTrafficNS,
 			},
 			Spec: pmv1.PodMigrationSpec{
-				PodName:                 "nginx-live-src",
-				PodNamespace:            liveTrafficNS,
-				TargetNodeName:          "pm-control",
-				Mode:                    pmv1.MigrationModePreCopy,
-				TCPPreservationMode:     pmv1.TCPPreservationModeNone,
-				PreCopyMaxRounds:        5,
-				PreCopyDirtyThresholdMB: 16,
+				PodName:                  "nginx-live-src",
+				PodNamespace:             liveTrafficNS,
+				TargetNodeName:           liveTrafficDstNode,
+				Mode:                     pmv1.MigrationModePreCopy,
+				TCPPreservationMode:      pmv1.TCPPreservationModeNone,
+				PreCopyMaxRounds:         5,
+				PreCopyDirtyThresholdMB:  16,
 				CompletionTimeoutSeconds: 600,
 			},
 		}
@@ -178,17 +184,25 @@ var _ = Describe("Live migration traffic continuity", Label("live-traffic"), Ord
 		GinkgoWriter.Printf("HAProxy errors during migration: econ_delta=%d dreq_delta=%d total=%d\n",
 			econDuring, dreqDuring, errsDuring)
 
-		By("asserting replacement pod is Running on pm-control")
+		By("asserting replacement pod is Running on " + liveTrafficDstNode)
 		var replacement corev1.Pod
 		Expect(pmClient.Get(ctx, types.NamespacedName{
 			Name: finalPM.Status.ReplacementPodName, Namespace: liveTrafficNS,
 		}, &replacement)).To(Succeed())
-		Expect(replacement.Spec.NodeName).To(Equal("pm-control"))
+		Expect(replacement.Spec.NodeName).To(Equal(liveTrafficDstNode),
+			"replacement pod must be scheduled on the target node")
 		Expect(replacement.Status.Phase).To(Equal(corev1.PodRunning))
 
 		By("asserting pre-copy ran at least one round")
 		Expect(finalPM.Status.PreCopyStats).NotTo(BeNil())
 		Expect(finalPM.Status.PreCopyStats.RoundsCompleted).To(BeNumerically(">=", 1))
+
+		By("asserting source pod nginx-live-src is deleted (ADR-0012: only after TrafficVerified)")
+		Eventually(func() bool {
+			var srcPod corev1.Pod
+			err := pmClient.Get(ctx, types.NamespacedName{Name: "nginx-live-src", Namespace: liveTrafficNS}, &srcPod)
+			return apierrors.IsNotFound(err)
+		}, 2*time.Minute, liveTrafficPoll).Should(BeTrue(), "source pod must be deleted after migration completes")
 
 		By("asserting EndpointSliceCleanupVerified=True")
 		var esCond *metav1.Condition

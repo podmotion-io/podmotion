@@ -33,7 +33,7 @@ func TestCRIUImageInconsistencyEventMsg_S1(t *testing.T) {
 	nameLeaf := "data" // filepath.Base("/data") — must be computed before this call
 	backingMntID := 2951
 
-	msg := criuImageInconsistencyEventMsg(fdID, nameLeaf, backingMntID)
+	msg := criuImageInconsistencyEventMsg(fdID, nameLeaf, backingMntID, "")
 
 	// S1 requirement 1: message contains "data" (leaf basename present — observer can identify
 	// which fd caused the inconsistency).
@@ -63,5 +63,52 @@ func TestCRIUImageInconsistencyError_S1(t *testing.T) {
 	}
 	if strings.Contains(msg, "/data") {
 		t.Errorf("S1 FAIL: CRIUImageInconsistencyError.Error() contains full path %q (must be leaf only)\nmsg=%q", "/data", msg)
+	}
+}
+
+// TestCRIUImageInconsistencyEventMsg_GroundedFstype is the ADR-0193 P-0193-1 grounding test.
+// The live postgres failure (2026-07-10) hard-stopped on an orphan REG fd whose backing mount
+// was a real emptyDir data volume (fd base/1/1 under /var/lib/postgresql/data), but the message
+// reported ONLY the bare backing_mnt_id — giving no way to tell in one run whether the orphan was
+// a tmpfs/shm segment that should have rebound (a classifier bug) or a genuine persistent data
+// mount that correctly DECLINEd (a mount-preservation gap). This test asserts the decoded
+// backing_fstype IS surfaced in the message when known, so the orphan cause is diagnosable.
+func TestCRIUImageInconsistencyEventMsg_GroundedFstype(t *testing.T) {
+	// Postgres live shape: emptyDir data mount (disk-backed → fstype EXT4/other, NOT tmpfs).
+	msg := criuImageInconsistencyEventMsg(47, "000000010000000000000001", 778, "EXT4")
+
+	if !strings.Contains(msg, "backing_fstype=EXT4") {
+		t.Errorf("grounding FAIL: message must surface the decoded backing_fstype so a persistent-data orphan is distinguishable from a tmpfs/shm one\nmsg=%q", msg)
+	}
+	// Empty fstype (decode unavailable / older marker) must degrade gracefully — no bare
+	// "backing_fstype=" fragment, and the base P-0193-1 message still emitted.
+	msgNoFst := criuImageInconsistencyEventMsg(47, "000000010000000000000001", 778, "")
+	if strings.Contains(msgNoFst, "backing_fstype=") {
+		t.Errorf("grounding FAIL: empty fstype must be omitted, not rendered as an empty field\nmsg=%q", msgNoFst)
+	}
+	if !strings.Contains(msgNoFst, "P-0193-1") {
+		t.Errorf("grounding FAIL: base P-0193-1 message must still be emitted when fstype is unknown\nmsg=%q", msgNoFst)
+	}
+}
+
+// TestCRIUImageInconsistencyError_NoMountpointLeak is the SEC-EVENT-1 guard for the new
+// grounding fields. BackingMountpoint is a full path and MUST NEVER appear in the
+// world-readable Event/error message (it is log-only). BackingFstype (an fs-type enum, not a
+// path) IS allowed. This locks the leak surface the grounding change introduced.
+func TestCRIUImageInconsistencyError_NoMountpointLeak(t *testing.T) {
+	err := &CRIUImageInconsistencyError{
+		FdID:              47,
+		NameLeaf:          "000000010000000000000001",
+		BackingMntID:      778,
+		BackingFstype:     "EXT4",
+		BackingMountpoint: "/var/lib/postgresql/data", // full path — must NOT leak into the message
+	}
+	msg := err.Error()
+
+	if strings.Contains(msg, "/var/lib/postgresql/data") {
+		t.Errorf("SEC-EVENT-1 FAIL: full backing mountpoint path leaked into the Event/error message\nmsg=%q", msg)
+	}
+	if !strings.Contains(msg, "EXT4") {
+		t.Errorf("grounding FAIL: backing_fstype (safe, non-path) should be present in the message\nmsg=%q", msg)
 	}
 }

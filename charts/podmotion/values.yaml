@@ -35,6 +35,26 @@ agent:
   # capability names do not exist and the kubelet/runtime rejects them; set false on such
   # nodes and BPF/perf rights fall back to CAP_SYS_ADMIN (as they always did pre-5.8).
   kernelGE58: true
+  # ADR-0299: the agent's host-namespace statfs (cmd/agent/main.go:99, via
+  # /proc/1/root under hostPID) is denied by containerd's default AppArmor
+  # profile (cri-containerd.apparmor.d) on substrates where that profile is
+  # in enforce mode against host-init-userns ptrace/proc reads (confirmed via
+  # live audit evidence: "apparmor=\"DENIED\" operation=\"ptrace\" ...
+  # profile=\"cri-containerd.apparmor.d\" ... peer=\"unconfined\""). Default
+  # "unconfined" is a no-op on substrates that do not exhibit this denial
+  # (e.g. kind/docker); only set otherwise on substrates that do (e.g. the
+  # standing KVM/containerd cluster).
+  #
+  # ADR-0300: narrowed from "unconfined" (ADR-0299 stopgap) to the custom
+  # least-privilege profile "localhost/podmotion-agent" — containerd's default
+  # cri-containerd base PLUS exactly one added rule (ptrace (read)
+  # peer=unconfined) for the mustEnsureCheckpointTmpfs host statfs. The profile
+  # is loaded onto each node by the install-apparmor-profile init container in
+  # the DaemonSet. "unconfined" remains selectable (--set
+  # agent.apparmorProfile=unconfined) as an explicit degraded-but-working
+  # fallback for substrates where the profile has not been loaded or fails to
+  # parse.
+  apparmorProfile: localhost/podmotion-agent
   resources:
     requests:
       cpu: 50m

@@ -38,8 +38,6 @@ package server
 // environment-independent, deterministic regression coverage of the invariant.
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -318,16 +316,19 @@ func TestPatchCheckpointImages_DevChildrenRetained(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // Source-sync guard: the Go drop mirror must stay aligned with the production
-// Python script embedded in patchCheckpointImages (server.go). If someone edits
-// the production drop_mnts set without updating dropMnts here, this fails — so
-// the regression tests above can never silently test stale logic.
+// patch script. As of Sprint 43 (H-19) the script is the single source of truth
+// returned by assemblePatchScript() (classifyRegFdPy + patchCheckpointScriptBody in
+// patch_checkpoint_script.go), NOT an inline server.go literal — so these guards grep
+// the assembled script text itself. If someone edits the production drop_mnts set
+// without updating dropMnts here, this fails — so the regression tests above can never
+// silently test stale logic.
 // ---------------------------------------------------------------------------
 
 func TestPatchScript_DropLogicInSyncWithProduction(t *testing.T) {
-	src := readServerGoSource(t)
+	src := readPatchScriptSource(t)
 
 	// Every exact-drop entry in the Go mirror must appear as a quoted literal
-	// inside the production drop_mnts_exact set in server.go.
+	// inside the production drop_mnts_exact set in the assembled patch script.
 	for mnt := range dropMntsExact {
 		needle := "'" + mnt + "'"
 		if !strings.Contains(src, needle) {
@@ -470,7 +471,7 @@ func TestADR0194_B2_LeafVerification(t *testing.T) {
 // (These fields are not in mountEntry; the test is a source-sync guard asserting the
 // Python script checks them before proceeding with the drop.)
 func TestADR0194_B2_SharedMasterIDZero(t *testing.T) {
-	src := readServerGoSource(t)
+	src := readPatchScriptSource(t)
 	// The Python script must check shared_id and master_id before dropping.
 	if !strings.Contains(src, "shared_id") {
 		t.Errorf("ADR-0194 P-0194-1b: production script no longer checks shared_id (SC-3 / H5 — propagation-peer guard missing)")
@@ -487,7 +488,7 @@ func TestADR0194_B2_SharedMasterIDZero(t *testing.T) {
 // load-bearing B-2 implementation tokens. A missing token means the fix was not applied or
 // was removed, and the mount.c:3141 failure would return.
 func TestADR0194_B2_SourceSyncAnchors(t *testing.T) {
-	src := readServerGoSource(t)
+	src := readPatchScriptSource(t)
 
 	anchors := []struct {
 		token string
@@ -511,18 +512,13 @@ func TestADR0194_B2_SourceSyncAnchors(t *testing.T) {
 	}
 }
 
-// readServerGoSource returns the text of server.go (located relative to this
-// test's package directory).
-func readServerGoSource(t *testing.T) string {
+// readPatchScriptSource returns the assembled production patch script text — the single source of
+// truth patchCheckpointImages ships (H-19). The B-2 / drop-logic source-sync guards grep THIS
+// (not a server.go substring) so they verify the tokens in the exact script that runs. Before
+// Sprint 43 the script was an inline server.go literal and these guards read server.go directly;
+// after the H-19 extraction the body lives in patch_checkpoint_script.go, so grepping server.go
+// would have silently passed on nothing — the guards must follow the source of truth.
+func readPatchScriptSource(t *testing.T) string {
 	t.Helper()
-	dir, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
-	path := filepath.Join(dir, "server.go")
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read server.go: %v", err)
-	}
-	return string(b)
+	return assemblePatchScript()
 }

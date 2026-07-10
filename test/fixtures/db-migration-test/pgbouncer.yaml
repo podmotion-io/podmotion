@@ -54,10 +54,12 @@ spec:
       labels:
         app: pgbouncer
     spec:
-      nodeName: pm-control
+      nodeName: pm-w2
       containers:
       - name: pgbouncer
-        image: bitnami/pgbouncer:1.22.1
+        # Bitnami relocated their public catalog in 2025; the image now lives
+        # under the bitnamilegacy org with an identical env-var config contract.
+        image: bitnamilegacy/pgbouncer:1.22.1
         env:
         - name: PGBOUNCER_DATABASE
           value: pmtest
@@ -73,6 +75,12 @@ spec:
           value: "50"
         - name: PGBOUNCER_DEFAULT_POOL_SIZE
           value: "10"
+        # The Bitnami image is env-driven and defaults its listener to 6432,
+        # ignoring the pgbouncer.ini ConfigMap (which is not mounted). Pin the
+        # listen port to 5432 so the container/Service ports below match, and
+        # clients using PGPORT=5432 reach the pool directly.
+        - name: PGBOUNCER_PORT
+          value: "5432"
         ports:
         - containerPort: 5432
           name: pgbouncer

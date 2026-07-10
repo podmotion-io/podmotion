@@ -1,0 +1,101 @@
+# Redis load generator — runs a continuous INCR + read loop against the redis
+# service while the redis pod is being live-migrated. Symmetric to the postgres
+# db-load-gen fixture.
+#
+#   write loop: INCR gate:counter  — a monotonically increasing in-memory value.
+#               Any lost increment (redis died mid-command, or the restored pod
+#               came back with a stale value) shows up as a sequence regression.
+#   read  loop: GET gate:counter    — verifies the connection is live.
+#
+# On any redis-cli non-zero exit (TCP reset, connection refused, timeout) the
+# loop logs a WRITE_ERROR line. The e2e test reads these lines to assert zero
+# client errors across the Strict-mode freeze window.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: redis-load-gen
+  namespace: pm-redis-test
+spec:
+  nodeName: pm-w2
+  restartPolicy: OnFailure
+  containers:
+  - name: load-gen
+    image: redis:7.2-alpine
+    env:
+    - name: REDIS_HOST
+      value: redis-src.pm-redis-test.svc.cluster.local
+    - name: REDIS_PORT
+      value: "6379"
+    command:
+    - sh
+    - -c
+    - |
+      echo "Redis load gen starting at $(date)"
+      WRITES=0
+      ERRORS=0
+      RECONNECTS=0
+      LAST_SEQ=0
+
+      # Wait for redis-src to accept connections before starting the counted loop.
+      # Startup connection races (the load-gen scheduling before redis is Ready)
+      # must NOT be counted as WRITE_ERRORs — the test's pre-migration baseline
+      # only cares about errors against a healthy workload. Bounded so the pod
+      # never hangs forever if the service genuinely never comes up.
+      echo "[$(date +%T)] waiting for redis at $REDIS_HOST:$REDIS_PORT ..."
+      READY=0
+      i=0
+      while [ $i -lt 120 ]; do
+        if timeout 2 redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" PING 2>/dev/null | grep -q PONG; then
+          READY=1
+          echo "[$(date +%T)] redis reachable, starting write load"
+          break
+        fi
+        i=$((i+1))
+        sleep 1
+      done
+      if [ $READY -ne 1 ]; then
+        echo "[$(date +%T)] WRITE_ERROR #1: redis never became reachable within 120s"
+      fi
+
+      while true; do
+        # INCR returns the new value of gate:counter. redis-cli exits non-zero on
+        # a connection failure. redis-cli has no per-command timeout flag, so the
+        # `timeout 2` wrapper bounds a hung connection during the freeze window.
+        RESULT=$(timeout 2 redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" INCR gate:counter 2>&1)
+        EXIT=$?
+
+        if [ $EXIT -ne 0 ]; then
+          ERRORS=$((ERRORS+1))
+          RECONNECTS=$((RECONNECTS+1))
+          echo "[$(date +%T)] WRITE_ERROR #$ERRORS exit=$EXIT: $RESULT"
+          sleep 0.2
+          continue
+        fi
+
+        # Verify the sequence strictly increased. A stale restored pod that lost
+        # the counter would return a value <= the last one we saw.
+        SEQ=$(echo "$RESULT" | grep -oE '^[0-9]+$' | head -1)
+        if [ -z "$SEQ" ]; then
+          ERRORS=$((ERRORS+1))
+          echo "[$(date +%T)] WRITE_ERROR #$ERRORS: no value in response: $RESULT"
+        elif [ "$SEQ" -le "$LAST_SEQ" ]; then
+          ERRORS=$((ERRORS+1))
+          echo "[$(date +%T)] WRITE_ERROR #$ERRORS: sequence regression: was $LAST_SEQ now $SEQ (lost increment)"
+        else
+          LAST_SEQ=$SEQ
+          WRITES=$((WRITES+1))
+          # Read-back to confirm the connection round-trips a GET too.
+          timeout 2 redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" GET gate:counter >/dev/null 2>&1 || {
+            ERRORS=$((ERRORS+1))
+            echo "[$(date +%T)] WRITE_ERROR #$ERRORS: GET read-back failed"
+          }
+          if [ $((WRITES % 50)) -eq 0 ]; then
+            echo "[$(date +%T)] writes=$WRITES errors=$ERRORS seq=$SEQ reconnects=$RECONNECTS"
+          fi
+        fi
+        sleep 0.1
+      done
+    resources:
+      requests:
+        memory: "32Mi"
+        cpu: "50m"

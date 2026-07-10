@@ -227,7 +227,7 @@ var _ = Describe("M24 NS#4 — live pgbench migration, zero dropped connections"
 						},
 						Spec: pmv1.PodMigrationSpec{
 							PodName:             pgbenchPod,
-							DestinationNodeName: m24DestNode,
+							TargetNodeName:      m24DestNode,
 							TCPPreservationMode: pmv1.TCPPreservationModeStrict,
 							FreezeWindowBudgetMs: m24FreezeBudgetMs,
 							ApplicationProbe: &pmv1.ApplicationProbeSpec{
@@ -397,7 +397,7 @@ var _ = Describe("M24 NS#4 — live pgbench migration, zero dropped connections"
 					},
 					Spec: pmv1.PodMigrationSpec{
 						PodName:             pgbenchPod,
-						DestinationNodeName: m24DestNode,
+						TargetNodeName:      m24DestNode,
 						TCPPreservationMode: pmv1.TCPPreservationModeStrict,
 						FreezeWindowBudgetMs: m24FreezeBudgetMs,
 						ApplicationProbe: &pmv1.ApplicationProbeSpec{
@@ -491,7 +491,7 @@ var _ = Describe("M24 NS#4 — live pgbench migration, zero dropped connections"
 					},
 					Spec: pmv1.PodMigrationSpec{
 						PodName:             podName,
-						DestinationNodeName: m24DestNode,
+						TargetNodeName:      m24DestNode,
 						TCPPreservationMode: pmv1.TCPPreservationModeNone,
 					},
 				}

@@ -1,0 +1,21 @@
+{{- /*
+ADR-0300: ships the narrow podmotion-agent AppArmor profile into the cluster as
+a ConfigMap so the install-apparmor-profile init container (daemonset.yaml) can
+mount it and copy it onto each node's /etc/apparmor.d before loading it with
+apparmor_parser. Populated verbatim from
+charts/podmotion/files/apparmor/podmotion-agent.profile via .Files.Get, so the
+in-chart profile file is the single source of truth (no drift between chart and
+node).
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: podmotion-agent-apparmor-profile
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+data:
+  podmotion-agent.profile: |
+{{ .Files.Get "files/apparmor/podmotion-agent.profile" | indent 4 }}

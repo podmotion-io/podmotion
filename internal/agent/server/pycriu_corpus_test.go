@@ -161,7 +161,9 @@ func TestPycriuCorpus_KnownMagicImagesLoadWithoutException(t *testing.T) {
 		if err := os.WriteFile(scriptPath, []byte(patchScript), 0o600); err != nil {
 			t.Fatalf("write patch script: %v", err)
 		}
-		cmd := exec.Command("python3", scriptPath, ckptDir, string(maskedJSON))
+		// argv[3]=inheritJSON (C-R3-1): the production call passes the --inherit-fd name set as a
+		// third arg; assemblePatchScript() reads sys.argv[3]. Empty set here (no cgroup fds inherited).
+		cmd := exec.Command("python3", scriptPath, ckptDir, string(maskedJSON), "[]")
 		cmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -217,7 +219,8 @@ func TestPycriuCorpus_StripOnlyUnknownMagicSkipped(t *testing.T) {
 	if err := os.WriteFile(scriptPath, []byte(patchScript), 0o600); err != nil {
 		t.Fatalf("write patch script: %v", err)
 	}
-	cmd := exec.Command("python3", scriptPath, ckptDir, string(maskedJSON))
+	// argv[3]=inheritJSON (C-R3-1): production passes the --inherit-fd name set; empty here.
+	cmd := exec.Command("python3", scriptPath, ckptDir, string(maskedJSON), "[]")
 	cmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
 	out, err := cmd.CombinedOutput()
 	// Script must succeed (exit 0) — strip-only unknown magic is skip-on-unknown.
@@ -247,7 +250,8 @@ func TestPycriuCorpus_MountpointsUnknownMagicFailsLoud(t *testing.T) {
 	if err := os.WriteFile(scriptPath, []byte(patchScript), 0o600); err != nil {
 		t.Fatalf("write patch script: %v", err)
 	}
-	cmd := exec.Command("python3", scriptPath, ckptDir, string(maskedJSON))
+	// argv[3]=inheritJSON (C-R3-1): production passes the --inherit-fd name set; empty here.
+	cmd := exec.Command("python3", scriptPath, ckptDir, string(maskedJSON), "[]")
 	cmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
 	out, err := cmd.CombinedOutput()
 	// Script must fail (exit 1) — mountpoints unknown magic is fail-loud.
@@ -263,105 +267,17 @@ func TestPycriuCorpus_MountpointsUnknownMagicFailsLoud(t *testing.T) {
 	}
 }
 
-// buildPatchScript extracts the embedded patch script from patchCheckpointImages.
-// This is a test helper that returns the same script text as the production function
-// so the corpus test covers exactly the production code path.
+// buildPatchScript returns the EXACT patch script that patchCheckpointImages ships (H-19).
+//
+// Before Sprint 43 this helper hand-copied an OUTDATED reproduction of the embedded script:
+// it lacked the entire ADR-0190/0193/0194/0311 mount-graph closure (parent_mnt_id fixpoint),
+// the files.img↔mountpoints P-0193-1/P-0194-1 reconciliation, the external-mount B-2 drop, and
+// the tmpfs/shm REG-fd rebind. The corpus tests therefore exercised stale logic that could never
+// decode or fail on the real checkpoint shapes. buildPatchScript now delegates to
+// assemblePatchScript() — the single source of truth production also uses — so the corpus tests
+// run byte-for-byte the shipped script and no divergent copy can drift (H-19 fix).
 func buildPatchScript() string {
-	// Reproduce the script embedded in patchCheckpointImages (server.go).
-	// Keep in sync with patchCheckpointImages; any divergence is a test gap.
-	return `
-import sys, os, shutil, glob, json
-import pycriu
-from pycriu.images import MagicException
-
-ckpt = sys.argv[1]
-null_ext_key_masked = set(json.loads(sys.argv[2]))
-
-def backup(path):
-    orig = path + '.orig'
-    if not os.path.exists(orig):
-        shutil.copy2(path, orig)
-    return orig
-
-def load_image(image_file, fail_on_magic_error=True):
-    try:
-        with open(image_file, 'rb') as f:
-            return pycriu.images.load(f)
-    except MagicException as e:
-        magic_val = getattr(e, 'magic', 'unknown')
-        if fail_on_magic_error:
-            print('PATCH_ERROR: %s:%s:%s' % (image_file, magic_val, str(e)), file=sys.stderr)
-            sys.exit(1)
-        else:
-            print('WARNING: skipping %s — unknown magic %s: %s' % (image_file, magic_val, str(e)))
-            return None
-    except Exception as e:
-        if fail_on_magic_error:
-            print('PATCH_ERROR: %s:unknown:%s' % (image_file, str(e)), file=sys.stderr)
-            sys.exit(1)
-        else:
-            print('WARNING: skipping %s — no pycriu handler: %s' % (image_file, str(e)))
-            return None
-
-# mountpoints: fail-loud on unknown magic (S1)
-for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
-    src = backup(mp_path)
-    img = load_image(src, fail_on_magic_error=True)
-    if img is None:
-        continue
-    kept = [e for e in img.get('entries', [])
-            if not (e.get('mountpoint') in null_ext_key_masked and not e.get('ext_key'))]
-    img['entries'] = kept
-    with open(mp_path, 'wb') as f:
-        pycriu.images.dump(img, f)
-    print('mountpoints:', os.path.basename(mp_path), 'kept', len(kept), 'entries')
-
-# netns: strip-only — skip-on-unknown-magic (S1)
-netns_path = os.path.join(ckpt, 'netns-10.img')
-if os.path.exists(netns_path):
-    src = backup(netns_path)
-    img = load_image(src, fail_on_magic_error=False)
-    if img is not None:
-        for e in img.get('entries', []):
-            e.pop('ext_key', None)
-        with open(netns_path, 'wb') as f:
-            pycriu.images.dump(img, f)
-        print('netns: removed ext_key entries')
-
-# netdev: strip-only — skip-on-unknown-magic (S1)
-netdev_path = os.path.join(ckpt, 'netdev-10.img')
-if os.path.exists(netdev_path):
-    src = backup(netdev_path)
-    img = load_image(src, fail_on_magic_error=False)
-    if img is not None:
-        kept = [e for e in img.get('entries', []) if e.get('link', {}).get('type') == 772]
-        img['entries'] = kept
-        with open(netdev_path, 'wb') as f:
-            pycriu.images.dump(img, f)
-        print('netdev: kept', len(kept), 'entries (loopback only)')
-
-# ifaddr: strip-only — skip-on-unknown-magic (S1)
-# When no non-loopback entries remain (or pycriu cannot parse the image), delete the
-# file so CRIU never launches its external 'ip addr restore' subprocess against it.
-# Writing any stub (even a zero-entry image) risks "Magic mismatch" from that subprocess.
-ifaddr_path = os.path.join(ckpt, 'ifaddr-10.img')
-if os.path.exists(ifaddr_path):
-    src = backup(ifaddr_path)
-    img = load_image(src, fail_on_magic_error=False)
-    if img is not None:
-        kept = [e for e in img.get('entries', []) if e.get('ifaddr', {}).get('ifindex') == 1]
-        if kept:
-            img['entries'] = kept
-            with open(ifaddr_path, 'wb') as f:
-                pycriu.images.dump(img, f)
-            print('ifaddr: kept', len(kept), 'entries (loopback only)')
-        else:
-            os.remove(ifaddr_path)
-            print('ifaddr: 0 non-loopback entries — deleted', ifaddr_path, '(CRIU skip-restore path; dest IP pre-staged by ADR-0165)')
-    else:
-        os.remove(ifaddr_path)
-        print('ifaddr: pycriu handler missing — deleted', ifaddr_path, '(CRIU skip-restore path; dest IP pre-staged by ADR-0165)')
-`
+	return assemblePatchScript()
 }
 
 // TestPatchCheckpointImages_IfaddrDeletedWhenNoNonLoopback is the regression guard for
@@ -390,7 +306,9 @@ func TestPatchCheckpointImages_IfaddrDeletedWhenNoNonLoopback(t *testing.T) {
 		if err := os.WriteFile(scriptPath, []byte(patchScript), 0o600); err != nil {
 			t.Fatalf("write patch script: %v", err)
 		}
-		cmd := exec.Command("python3", scriptPath, ckptDir, string(maskedJSON))
+		// argv[3]=inheritJSON (C-R3-1): the production call passes the --inherit-fd name set as a
+		// third arg; assemblePatchScript() reads sys.argv[3]. Empty set here (no cgroup fds inherited).
+		cmd := exec.Command("python3", scriptPath, ckptDir, string(maskedJSON), "[]")
 		cmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
 		out, err := cmd.CombinedOutput()
 		return string(out), err

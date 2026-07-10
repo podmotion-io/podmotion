@@ -87,9 +87,27 @@ func (sc *StorageClassifier) ClassifyPod(ctx context.Context, pod *corev1.Pod) (
 			})
 			continue
 		}
+		// Disk-backed emptyDir holds real pod-local writable state on the source
+		// kubelet directory, on no PV. No tier migrator moves it today (the full
+		// data-staging migrator is deferred), so it MUST be classified TierBlocked
+		// rather than silently dropped — otherwise the pod freezes and restores
+		// with an empty volume (silent data loss, C-4/A-04). Classifying it Blocked
+		// makes admission hard-refuse with a recoverable, human-actionable reason.
+		if vol.EmptyDir != nil {
+			results = append(results, TierClassification{
+				Tier: TierBlocked,
+				Reason: "disk-backed emptyDir holds pod-local state that no migrator " +
+					"currently moves; migration would silently lose it — remove the " +
+					"emptyDir or use a supported PVC-backed volume",
+				PVCName: vol.Name,
+			})
+			continue
+		}
 
 		if vol.PersistentVolumeClaim == nil {
-			// Non-PVC volumes (configMap, secret, emptyDir disk) are transparent — no classification needed.
+			// Remaining non-PVC volumes (configMap, secret, downwardAPI, projected)
+			// are reconstructed on the destination from the pod spec — no data
+			// movement is required, so they are transparent to migration.
 			continue
 		}
 
