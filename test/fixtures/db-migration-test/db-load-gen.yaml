@@ -15,7 +15,7 @@ metadata:
   name: db-load-gen
   namespace: pm-db-test
 spec:
-  nodeName: pm-control
+  nodeName: pm-w2
   restartPolicy: OnFailure
   containers:
   - name: load-gen
@@ -40,6 +40,27 @@ spec:
       ERRORS=0
       RECONNECTS=0
       LAST_SEQ=0
+
+      # Wait for PgBouncer -> PostgreSQL to accept queries before starting the
+      # counted loop. Startup races (load-gen scheduling before pgbouncer/postgres
+      # are Ready) must NOT be counted as WRITE_ERRORs — the pre-migration baseline
+      # only measures errors against a healthy workload. Bounded so the pod never
+      # hangs forever if the backend genuinely never comes up.
+      echo "[$(date +%T)] waiting for DB at $PGHOST:$PGPORT ..."
+      READY=0
+      i=0
+      while [ $i -lt 120 ]; do
+        if psql -t -A -c "SELECT 1;" >/dev/null 2>&1; then
+          READY=1
+          echo "[$(date +%T)] DB reachable, starting write load"
+          break
+        fi
+        i=$((i+1))
+        sleep 1
+      done
+      if [ $READY -ne 1 ]; then
+        echo "[$(date +%T)] WRITE_ERROR #1: DB never became reachable within 120s"
+      fi
 
       while true; do
         # Write transaction via bump_counter(); capture full stderr separately.
