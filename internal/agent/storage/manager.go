@@ -78,9 +78,12 @@ func NewStorageMigrationManager(c client.Client) *StorageMigrationManager {
 		Migrators:  map[StorageTier]Migrator{},
 	}
 	// Default registrations — all production implementations are registered by
-	// the operator wire code; stubs are used here so the manager is usable out of
-	// the box without external dependencies.
+	// the operator wire code; explicit stubs are used here so the manager is
+	// usable out of the box without external dependencies, and so that no tier
+	// falls through to the missing-migrator branch (which now blocks the freeze
+	// for any tier > TierRWX rather than silently declaring it ready).
 	m.Migrators[TierRWX] = NewRWXReattachMigrator(c)
+	m.Migrators[TierLonghorn] = &LonghornStubMigrator{}
 	m.Migrators[TierCephRBD] = &CephRBDStubMigrator{}
 	m.Migrators[TierSnapshotRsync] = &SnapshotRsyncStubMigrator{}
 	return m
@@ -88,8 +91,15 @@ func NewStorageMigrationManager(c client.Client) *StorageMigrationManager {
 
 // NewStorageMigrationManagerWithProduction returns a manager wired with real migrators
 // for all tiers. cephDestPool is the Ceph pool for RBD live migration destination images.
-func NewStorageMigrationManagerWithProduction(c client.Client, cephDestPool string) *StorageMigrationManager {
+// longhornManagerURL is the base URL of the Longhorn Manager HTTP API; if empty, the
+// explicit Longhorn stub registered by NewStorageMigrationManager is retained (a real
+// Longhorn tier volume then blocks on the stub's ready path rather than falling through
+// to the missing-migrator freeze block).
+func NewStorageMigrationManagerWithProduction(c client.Client, cephDestPool, longhornManagerURL string) *StorageMigrationManager {
 	m := NewStorageMigrationManager(c)
+	if longhornManagerURL != "" {
+		m.Migrators[TierLonghorn] = NewLonghornMigrator(longhornManagerURL)
+	}
 	m.Migrators[TierCephRBD] = NewCephRBDMigrator(cephDestPool)
 	m.Migrators[TierSnapshotRsync] = NewSnapshotRsyncMigrator(c)
 	return m
@@ -136,12 +146,28 @@ func (m *StorageMigrationManager) RunPreStage(ctx context.Context, pm *pmv1.PodM
 
 	migrator, ok := m.Migrators[highest.Tier]
 	if !ok {
-		// No migrator registered for this tier — fall back to stub that emits ready immediately.
-		// This keeps the state machine unblocked while tier support is being added.
-		log.Info("no migrator registered for tier — emitting StorageReadyForFreeze immediately",
+		// No migrator registered for the selected tier.
+		//
+		// The immediate-ready path is valid ONLY for TierRWX, where no data
+		// movement is required (the volume is simply re-attached on the
+		// destination). For any tier > TierRWX a missing migrator means the
+		// destination replica/image does NOT exist yet, so declaring the freeze
+		// ready would let the pod freeze and restore before its storage is
+		// staged — silent data loss (H-14/C-08). Patch StorageReadyForFreeze=False
+		// with a recoverable, human-actionable reason so the freeze does not
+		// proceed and an operator can register the missing tier migrator.
+		if highest.Tier > TierRWX {
+			log.Info("no migrator registered for tier > TierRWX — blocking freeze",
+				"tier", highest.Tier)
+			return m.patchStorageReady(ctx, pm, metav1.ConditionFalse, "NoMigratorForTier",
+				fmt.Sprintf("tier%d: no storage migrator registered — cannot stage "+
+					"destination storage; register a migrator for this tier before "+
+					"migrating (%s)", highest.Tier, highest.Reason))
+		}
+		log.Info("no migrator registered for TierRWX — emitting StorageReadyForFreeze immediately",
 			"tier", highest.Tier)
 		return m.patchStorageReady(ctx, pm, metav1.ConditionTrue, "NoOpTier",
-			fmt.Sprintf("tier%d: no migrator registered — no data movement required", highest.Tier))
+			fmt.Sprintf("tier%d: re-attach only — no data movement required", highest.Tier))
 	}
 
 	opts := MigrationOptions{

@@ -202,6 +202,77 @@ func TestStorageClassifier_Tier4_MemoryEmptyDir(t *testing.T) {
 	}
 }
 
+// TestStorageClassifier_DiskEmptyDir_IsBlocked is the contract test for C-4/A-04.
+// A disk-backed emptyDir holds pod-local writable state that no migrator moves, so
+// it MUST be classified TierBlocked rather than silently dropped. On the pre-change
+// logic this pod produced ZERO classifications (the disk-emptyDir fell through the
+// `PersistentVolumeClaim == nil` continue), so this test would have failed then —
+// making it a genuine regression guard against the silent-data-loss path.
+func TestStorageClassifier_DiskEmptyDir_IsBlocked(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "disk-emptydir-pod", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{
+				{
+					Name: "scratch",
+					VolumeSource: corev1.VolumeSource{
+						// Disk-backed emptyDir: Medium is the default (StorageMediumDefault),
+						// NOT memory.
+						EmptyDir: &corev1.EmptyDirVolumeSource{},
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(newScheme()).Build()
+	classifier := storage.NewStorageClassifier(fakeClient)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(clsfs) != 1 {
+		t.Fatalf("expected 1 classification (disk emptyDir must not be silently dropped), got %d", len(clsfs))
+	}
+	if clsfs[0].Tier != storage.TierBlocked {
+		t.Errorf("expected TierBlocked (4) for disk-backed emptyDir, got %d", clsfs[0].Tier)
+	}
+	if clsfs[0].Reason == "" {
+		t.Errorf("expected a human-actionable Reason on the blocked classification, got empty")
+	}
+}
+
+// TestStorageClassifier_TransparentVolumes_NotClassified confirms that genuinely
+// transparent non-PVC volumes (configMap/secret) are still skipped — the emptyDir
+// fix must not over-block volumes that carry no writable pod-local state.
+func TestStorageClassifier_TransparentVolumes_NotClassified(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm-pod", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{
+				{
+					Name: "cfg",
+					VolumeSource: corev1.VolumeSource{
+						ConfigMap: &corev1.ConfigMapVolumeSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "my-cm"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(newScheme()).Build()
+	classifier := storage.NewStorageClassifier(fakeClient)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(clsfs) != 0 {
+		t.Fatalf("expected 0 classifications for a configMap-only pod, got %d", len(clsfs))
+	}
+}
+
 func TestLonghornStubMigrator_EmitsReadyImmediately(t *testing.T) {
 	stub := &storage.LonghornStubMigrator{}
 

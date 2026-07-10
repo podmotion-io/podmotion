@@ -73,7 +73,10 @@ func TestRestoreAbortOnPatchFailure_Strict(t *testing.T) {
 		MigrationName:       "test-strict-abort",
 		CheckpointRef:       imagesDir,
 		TcpPreservationMode: "Strict",
-		// No SeqSnapshots → B2 netns guard does not fire; mode is carried explicitly.
+		// DestNetnsFd is non-empty so the D2-C1 mode-keyed netns guard (which now fires on
+		// mode==Strict regardless of SeqSnapshots) is satisfied and Restore proceeds to the
+		// raw CRIU / patchCheckpointImages path this test exercises.
+		DestNetnsFd: "/proc/self/ns/net",
 	})
 
 	// Under Strict + patch failure: must return a non-nil error (abort).

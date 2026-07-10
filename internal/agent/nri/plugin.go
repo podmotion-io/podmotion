@@ -351,7 +351,7 @@ func (p *Plugin) HandlePostStartContainer(_ context.Context, event ContainerEven
 
 		// ADR-SEC-B §2.6 — provenance gate on the restore path. The final/ dir for this
 		// checkpoint-ref MUST contain the checkpoint-verified sentinel written by PutCheckpointTar
-		// (§2.3 step 6) only after signature + per-file digest + migration-binding all passed.
+		// (ADR-SEC-B §2.3 step 6) only after signature + per-file digest + migration-binding all passed.
 		// Absent → restore is blocked (no CRIU restore on unverified images). Fail-closed.
 		if err := verifyCheckpointProvenanceSentinel(checkpointRef); err != nil {
 			log.Error(err, "ADR-SEC-B: checkpoint not provenance-verified — refusing restore",
