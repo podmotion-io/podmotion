@@ -4668,12 +4668,24 @@ func procStatStateChar(pid int) (byte, error) {
 // cgroupV2Path returns the unified cgroup v2 path (the "0::<path>" entry) for pid from
 // /proc/<pid>/cgroup. Returns an error if the file cannot be read (e.g. the PID has exited) or
 // has no unified entry.
+// cgroupV2Path returns the host-ABSOLUTE cgroup v2 path of pid (the 0:: line of
+// /proc/<pid>/cgroup), e.g. "/kubepods.slice/.../cri-containerd-<id>.scope".
+//
+// ADR-0128 fix: the value MUST be read in the HOST cgroup namespace. The agent main
+// container runs in its own cgroup namespace, so reading /proc/<pausePID>/cgroup locally
+// renders the line RELATIVE to the agent's own cgroupns root — the shared kubepods.slice
+// ancestry is stripped and replaced with "../.." escapes (observed:
+// "/../../kubepods-burstable-pod<uid>.slice/cri-containerd-<id>.scope"). Joined with
+// /sys/fs/cgroup that collapses to a nonexistent path and the ADR-0128 cgroup.procs move
+// fails with ENOENT. The pause PID's cgroup is read via the privileged netns-broker sidecar
+// (nsenterCmd), which runs in the HOST cgroup namespace and therefore returns the true
+// absolute path that resolves under the host /sys/fs/cgroup the agent mounts.
 func cgroupV2Path(pid int) (string, error) {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	out, err := nsenterCmd("cat", fmt.Sprintf("/proc/%d/cgroup", pid)).Output()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("read /proc/%d/cgroup via host cgroupns: %w", pid, err)
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for _, line := range strings.Split(string(out), "\n") {
 		if strings.HasPrefix(line, "0::") {
 			return strings.TrimPrefix(line, "0::"), nil
 		}
