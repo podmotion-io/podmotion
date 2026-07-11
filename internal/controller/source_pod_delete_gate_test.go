@@ -57,6 +57,7 @@ func TestSourcePodDeletionBlockReason(t *testing.T) {
 			conditions: []metav1.Condition{
 				cond(conditionDataplaneReachabilityVerified, metav1.ConditionTrue),
 				cond(pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionTrue),
+				cond(pmv1.ConditionWorkloadLivenessVerified, metav1.ConditionTrue),
 			},
 			wantBlock: false,
 		},
@@ -86,6 +87,7 @@ func TestSourcePodDeletionBlockReason(t *testing.T) {
 			conditions: []metav1.Condition{
 				cond(conditionTrafficVerified, metav1.ConditionTrue),
 				cond(pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionTrue),
+				cond(pmv1.ConditionWorkloadLivenessVerified, metav1.ConditionTrue),
 			},
 			wantBlock: false,
 		},
@@ -107,6 +109,7 @@ func TestSourcePodDeletionBlockReason(t *testing.T) {
 			mode: pmv1.TCPPreservationModeNone,
 			conditions: []metav1.Condition{
 				cond(conditionTrafficVerified, metav1.ConditionTrue),
+				cond(pmv1.ConditionWorkloadLivenessVerified, metav1.ConditionTrue),
 			},
 			wantBlock: false,
 		},
@@ -200,7 +203,8 @@ func TestDeleteSourcePodIfSafe_BestEffortWithoutTCPContinuity(t *testing.T) {
 		t.Fatalf("Get pm: %v", err)
 	}
 	fresh.Status.Conditions = append(fresh.Status.Conditions,
-		cond(pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionTrue))
+		cond(pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionTrue),
+		cond(pmv1.ConditionWorkloadLivenessVerified, metav1.ConditionTrue))
 	if err := fakeClient.Status().Update(ctx, fresh); err != nil {
 		t.Fatalf("Status().Update seeding TCPSequenceContinuityVerified: %v", err)
 	}

@@ -1296,30 +1296,171 @@ func (r *PodMigrationReconciler) reconcileTCPVerifying(ctx context.Context, pm *
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseServiceVerifying)
 }
 
+// resolveProbeProtocol (ADR-0325) is a PURE, controller-local helper. If spec.applicationProbe
+// is set, it wins. Otherwise it scans destPod's containers (init containers EXCLUDED,
+// pod-wide) against the port heuristic 5432->SQL, 6379->Redis, {80,8080,443}->HTTP.
+// Exactly-one-match -> protocol; zero-match -> zeroMatch=true; two-or-more-match ->
+// ambiguous=true. Never persisted/cached — callers must re-derive every reconcile.
+func resolveProbeProtocol(spec *pmv1.ApplicationProbeSpec, destPod *corev1.Pod) (protocol string, ambiguous bool, zeroMatch bool) {
+	if spec != nil {
+		return string(spec.Protocol), false, false
+	}
+	if destPod == nil {
+		return "", false, true
+	}
+	matches := map[string]bool{}
+	for _, c := range destPod.Spec.Containers {
+		for _, p := range c.Ports {
+			switch p.ContainerPort {
+			case 5432:
+				matches["SQL"] = true
+			case 6379:
+				matches["Redis"] = true
+			case 80, 8080, 443:
+				matches["HTTP"] = true
+			}
+		}
+	}
+	if len(matches) == 0 {
+		return "", false, true
+	}
+	if len(matches) > 1 {
+		return "", true, false
+	}
+	for k := range matches {
+		return k, false, false
+	}
+	return "", false, true
+}
+
+// setWorkloadLivenessCondition (ADR-0325) is the single condition-encoding setter mapping a
+// (verified, reason) pair onto ConditionWorkloadLivenessVerified. The reason vocabulary is
+// CLOSED: {NoKnownProtocol, ExplicitProbePassed, DefaultedProbePassed, ExplicitProbeFailed,
+// DefaultedProbeFailed, AmbiguousProbeDefault}.
+func setWorkloadLivenessCondition(pm *pmv1.PodMigration, verified bool, reason, message string) {
+	status := metav1.ConditionFalse
+	if verified {
+		status = metav1.ConditionTrue
+	}
+	setCondition(pm, pmv1.ConditionWorkloadLivenessVerified, status, reason, message)
+}
+
 // reconcileServiceVerifying runs HTTP/endpoint readiness checks (the existing service-layer verifier).
 // This is the ServiceVerifier discipline split from the legacy Verifying phase.
 func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// ADR-0210: the prior short-circuit (TrafficVerified=True => jump to CutoverComplete) is
-	// REMOVED — TrafficVerified is no longer a sufficient gate (it was set by the tautological
-	// self-probe). Advance only when the AUTHORITATIVE cross-node DataplaneReachabilityVerified
-	// is True; otherwise fall through to the real HTTP/endpoint verifier below.
-	if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionDataplaneReachabilityVerified) {
-		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
-	}
-
-	// Build verify request for HTTP/endpoint verification (no TCP-as-liveness here).
+	// ADR-0325: destination-pod fetch MOVED to the top of the function and HARDENED — a
+	// fetch error is a REQUEUE, never a silent NoKnownProtocol default, because the
+	// resolver needs Spec.Containers[].Ports[].
 	destPodName := pm.Status.ReplacementPodName
 	if destPodName == "" {
 		destPodName = pm.Spec.PodName
 	}
-	destPodIP := ""
-	if destPodName != "" {
-		destPod := &corev1.Pod{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: pm.Spec.PodNamespace, Name: destPodName}, destPod); err == nil {
-			destPodIP = destPod.Status.PodIP
+	destPod := &corev1.Pod{}
+	destPodFetchErr := r.Get(ctx, types.NamespacedName{Namespace: pm.Spec.PodNamespace, Name: destPodName}, destPod)
+	if destPodFetchErr != nil {
+		log.Error(destPodFetchErr, "ServiceVerifying: ADR-0325 destination pod fetch failed — requeuing (never silently defaulting)",
+			"migration", pm.Name, "destPod", destPodName)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	destPodIP := destPod.Status.PodIP
+
+	// ADR-0325: resolve the probe protocol fresh every reconcile (local, never cached) and,
+	// unless already confirmed True this reconcile, issue the AppProbeOnly RPC to the
+	// DESTINATION-node agent BEFORE the DataplaneReachabilityVerified short-circuit below —
+	// this is the exact hole a dead-but-echo-alive workload previously escaped through.
+	probeProtocol, ambiguous, zeroMatch := resolveProbeProtocol(pm.Spec.ApplicationProbe, destPod)
+	alreadyVerified := meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionWorkloadLivenessVerified)
+
+	switch {
+	case ambiguous:
+		setWorkloadLivenessCondition(pm, false, "AmbiguousProbeDefault",
+			"ServiceVerifying: ADR-0325 multiple container-port heuristic matches; set spec.applicationProbe to disambiguate")
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return ctrl.Result{}, err
 		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	case zeroMatch && pm.Spec.ApplicationProbe == nil:
+		// Deliberate transport-only resolution — no known protocol to probe. Not a silent
+		// fallback: the condition is explicitly written True/NoKnownProtocol.
+		if !alreadyVerified {
+			setWorkloadLivenessCondition(pm, true, "NoKnownProtocol",
+				"ServiceVerifying: ADR-0325 no application-probe protocol resolved; transport-only verification applies")
+			if err := r.statusUpdate(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	case !alreadyVerified:
+		// Idempotency guard: only skip the RPC when WorkloadLivenessVerified is already
+		// True on this reconcile's read — always re-run otherwise.
+		if r.AgentPool == nil {
+			log.Error(nil, "ServiceVerifying: AgentPool not wired — requeuing", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		destNode := pm.Status.DestinationNodeName
+		destAgent, agentErr := r.AgentPool.ForNode(ctx, destNode)
+		if agentErr != nil {
+			log.Error(agentErr, "ServiceVerifying: could not resolve destination-node agent client — requeuing",
+				"migration", pm.Name, "destNode", destNode)
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		explicit := pm.Spec.ApplicationProbe != nil
+		vtcpReq := &agentpb.VerifyTCPRequest{
+			MigrationName:    pm.Name,
+			AppProbeOnly:     true,
+			AppProbeProtocol: probeProtocol,
+		}
+		var port int32
+		switch probeProtocol {
+		case "SQL":
+			port = 5432
+		case "Redis":
+			port = 6379
+		case "HTTP":
+			port = 80
+		}
+		if explicit && pm.Spec.ApplicationProbe.Port > 0 {
+			port = pm.Spec.ApplicationProbe.Port
+			vtcpReq.AppProbeQuery = pm.Spec.ApplicationProbe.Query
+			vtcpReq.AppProbeTimeoutS = pm.Spec.ApplicationProbe.TimeoutSeconds
+		}
+		if destPodIP != "" && port > 0 {
+			// ADR-0325: app_probe_query (proto field 6) is OVERLOADED — for SQL it carries
+			// the query, for HTTP the path, unused for Redis/TCP.
+			vtcpReq.AppProbeAddress = fmt.Sprintf("%s:%d", destPodIP, port)
+		}
+		vtcpResp, rpcErr := destAgent.VerifyTCP(ctx, vtcpReq)
+		reasonPrefix := "Defaulted"
+		if explicit {
+			reasonPrefix = "Explicit"
+		}
+		if rpcErr != nil || vtcpResp == nil || !vtcpResp.Verified {
+			msg := "app probe RPC error"
+			if rpcErr == nil && vtcpResp != nil {
+				msg = vtcpResp.AppProbeError
+			}
+			setWorkloadLivenessCondition(pm, false, reasonPrefix+"ProbeFailed",
+				fmt.Sprintf("ServiceVerifying: ADR-0325 workload-liveness probe (%s) failed: %v / %s", probeProtocol, rpcErr, msg))
+			if err := r.statusUpdate(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		setWorkloadLivenessCondition(pm, true, reasonPrefix+"ProbePassed",
+			fmt.Sprintf("ServiceVerifying: ADR-0325 workload-liveness probe (%s) passed", probeProtocol))
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// ADR-0210 + ADR-0325: advance only when the AUTHORITATIVE cross-node
+	// DataplaneReachabilityVerified is True AND (no known protocol OR WorkloadLivenessVerified
+	// is True). Textual placement alone is insufficient — the guard condition itself gates on
+	// the new predicate.
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionDataplaneReachabilityVerified) &&
+		(probeProtocol == "" || meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionWorkloadLivenessVerified)) {
+		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
 	}
 
 	strictMode := pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict
@@ -1444,6 +1585,12 @@ func sourcePodDeletionBlockReason(mode pmv1.TCPPreservationMode, conditions []me
 		if !meta.IsStatusConditionTrue(conditions, pmv1.ConditionTCPSequenceContinuityVerified) {
 			return "TCPSequenceContinuityVerified is not True in Strict/BestEffort mode (ADR-0012)"
 		}
+	}
+	// ADR-0325: additive predicate for ALL THREE modes, including None (which previously
+	// required only TrafficVerified). Lexically distinct from the two messages above so
+	// on-call can substring-match "probe failing, will retry" vs "rollback in progress".
+	if !meta.IsStatusConditionTrue(conditions, pmv1.ConditionWorkloadLivenessVerified) {
+		return "WorkloadLivenessVerified is not True (ADR-0325 real-liveness gate)"
 	}
 	return ""
 }

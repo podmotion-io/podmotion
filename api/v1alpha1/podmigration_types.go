@@ -339,6 +339,14 @@ const (
 	// The CONTROLLER is the authority that flips this condition, based on the nonce
 	// round-trip — never a self-asserted ProbeOk boolean from a single agent.
 	ConditionDataplaneReachabilityVerified = "DataplaneReachabilityVerified"
+	// ConditionWorkloadLivenessVerified is set by reconcileServiceVerifying (ADR-0325) from a
+	// real wire-protocol application probe (Postgres v3 handshake+SELECT, Redis RESP PING/PONG,
+	// HTTP GET requiring a genuine [200,300) response with redirect-refusal) issued via
+	// VerifyTCP(AppProbeOnly=true) against the DESTINATION pod. Reason vocabulary is CLOSED:
+	// True/{NoKnownProtocol, ExplicitProbePassed, DefaultedProbePassed};
+	// False/{ExplicitProbeFailed, DefaultedProbeFailed, AmbiguousProbeDefault}.
+	// Consumed additively by sourcePodDeletionBlockReason for ALL TCPPreservationMode values.
+	ConditionWorkloadLivenessVerified = "WorkloadLivenessVerified"
 	// ConditionCni0CleanupVerified is set by reconcileVerifying after CleanupSourceIPHandoff
 	// (ADR-0241 item 1 / NR-BLOCK-1 CUTOVER_COMPLETE scope). True once VerifyCleanup confirms
 	// the cni0 neigh and cni0 host route for the OLD pod IP are both absent, within the
