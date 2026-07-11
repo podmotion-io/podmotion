@@ -2707,6 +2707,12 @@ func ResolveNetnsFromSandbox(ctx context.Context, containerdClient interface{}, 
 
 	// B2: open the path, then cross-check inodes (path stat vs fd fstat) to detect a netns
 	// that was recycled between resolution and open.
+	// ADR-0325: netnsPath is a HOST-namespace path. On the Cilium/containerd substrate it is now
+	// a stable bind mount /var/run/netns/cni-<id> (mapped by sandboxNetnsPath from the OCI
+	// /proc/<pid>/ns/net form via inode identity). The agent daemonset mounts the host
+	// /var/run/netns at /var/run/netns (HostToContainer), so this native os.Open/stat resolves
+	// the SAME bind mount the agent can open — no /proc/<pid>/ns/net AppArmor denial — and it is
+	// exactly the path CRIU joins via --join-ns net:<path> in the host mount namespace.
 	f, err := os.Open(netnsPath)
 	if err != nil {
 		return nil, "", fmt.Errorf("ResolveNetnsFromSandbox: open netns path %s for sandbox %s: %w", netnsPath, sandboxID, err)
@@ -2761,10 +2767,59 @@ func sandboxNetnsPath(_ context.Context, sandboxID string) (string, error) {
 	}
 	for _, ns := range rec.Spec.Linux.Namespaces {
 		if ns.Type == "network" {
+			// ADR-0325 UNIVERSAL POD-NETNS INTEGRATION: some CNIs (Cilium cluster-pool on
+			// containerd 2.x) record the sandbox network namespace in the OCI spec as a
+			// per-process path "/proc/<pause-pid>/ns/net" rather than a stable bind mount. The
+			// agent (under its AppArmor profile, in its own mount namespace) cannot open another
+			// process's /proc/<pid>/ns/net — and even if it could, that path is not a durable
+			// join target for CRIU across the restore. Every CNI that plumbs a pod netns ALSO
+			// bind-mounts it at /var/run/netns/cni-<id> (ip-netns convention). Resolve that
+			// stable bind path by NETNS INODE IDENTITY (the source of truth), not by name: read
+			// the proc path's netns inode in the HOST mount namespace (where /proc is reachable)
+			// and match it against the /var/run/netns/cni-* bind mounts. The returned bind path
+			// is openable from the agent (via the /host-run mount) AND is exactly what CRIU joins
+			// via --join-ns net:<path> in the host mount namespace. Fall back to the raw proc
+			// path only if no bind mount matches (preserves prior behavior for CNIs that already
+			// hand back a bind path).
+			if strings.HasPrefix(ns.Path, "/proc/") && strings.HasSuffix(ns.Path, "/ns/net") {
+				if bind := resolveNetnsBindByProcPath(ns.Path); bind != "" {
+					log.Info("sandboxNetnsPath: mapped /proc/<pid>/ns/net to stable /var/run/netns bind by inode (ADR-0325)",
+						"sandboxID", sandboxID, "procPath", ns.Path, "bindPath", bind)
+					return bind, nil
+				}
+				log.Info("sandboxNetnsPath: could not map proc netns path to a /var/run/netns bind — returning raw proc path (ADR-0325 fallback)",
+					"sandboxID", sandboxID, "procPath", ns.Path)
+			}
 			return ns.Path, nil
 		}
 	}
 	return "", nil
+}
+
+// resolveNetnsBindByProcPath maps a per-process network-namespace path of the form
+// "/proc/<pid>/ns/net" to the stable bind-mount path "/var/run/netns/cni-<id>" that refers to
+// the SAME network namespace, matched by netns inode identity (ADR-0325). Both the inode read
+// of the proc path and the inode reads of the bind mounts run in the HOST mount namespace via
+// nsenterCmd (the agent's own mount namespace cannot see the host /proc/<pid> or the CNI's
+// /var/run/netns bind mounts). Returns "" when no bind mount matches (caller falls back to the
+// raw proc path). This is not a poll-and-hope: the netns inode is an exact kernel identity.
+func resolveNetnsBindByProcPath(procPath string) string {
+	// Both the proc-path inode read and the /var/run/netns bind-mount scan run in ONE `sh -c`
+	// (the netns-broker's exec allowlist permits "sh" but not a bare "stat"; the shell invokes
+	// the node's real stat). The shell resolves the proc-path netns inode, then scans the
+	// /var/run/netns/* bind mounts for the one with the matching inode and prints it. Empty
+	// output → no match → caller falls back to the raw proc path.
+	script := fmt.Sprintf(
+		`want=$(stat -L -c %%i %q 2>/dev/null); [ -z "$want" ] && exit 0; `+
+			`for f in /var/run/netns/*; do i=$(stat -L -c %%i "$f" 2>/dev/null); `+
+			`if [ "$i" = "$want" ]; then printf '%%s\n' "$f"; break; fi; done`,
+		procPath)
+	matchOut, err := nsenterCmd("sh", "-c", script).Output()
+	if err != nil {
+		log.Error(err, "resolveNetnsBindByProcPath: proc→bind inode scan failed", "procPath", procPath)
+		return ""
+	}
+	return strings.TrimSpace(string(matchOut))
 }
 
 // FindContainerTaskID finds the containerd task ID (container ID) for a pod by scanning
@@ -4699,6 +4754,46 @@ func (s *AgentServer) resolveSandboxIDForMigration(ctx context.Context, migratio
 	return sandboxID, nil
 }
 
+// resolvePodNetnsSandbox is the universal pod-netns-integration entry point (ADR-0325) for the
+// gRPC Restore path. It decides which sandbox ID (if any) joinNsRestore should use to join the
+// restored process into its pod's network namespace:
+//
+//   - destNetnsFd != "" (Strict/BestEffort pre-staged path): the agent-owned bind-mount netns
+//     is already plumbed end-to-end from PrepareDestinationNetns; joinNsRestore joins THAT via
+//     --join-ns net:<destNetnsFd> and ignores sandboxID. Return "" — no self-resolve needed.
+//   - destNetnsFd == "" (cold path — None, or BestEffort/Strict that declared no pre-staged
+//     netns): resolve the replacement pod's real sandbox (pause-container) netns via the SAME
+//     restart-durable source-of-truth the idempotent-confirm path uses
+//     (resolveSandboxIDForMigration → replacement-pod UID → containerd sandbox label). This is
+//     what makes pod-netns join UNIVERSAL: the cold path used to skip the join and leave the
+//     workload in a detached placeholder petns (unreachable at the pod IP). Returns "" on
+//     failure so the caller fails closed rather than restoring into a detached namespace.
+//
+// Gated on s.k8sClient != nil, consistent with every other k8s-backed self-resolve/fail-closed
+// gate on this path (finalizeRestore's ReportRestoreConfirmed side effects, the idempotent
+// confirm path above): without a running k8s client there is no source of truth to resolve the
+// replacement pod's sandbox from, so self-resolve cannot even be attempted — that is a missing
+// operator connection, not evidence of a detached namespace. In that case resolvePodNetnsSandbox
+// returns ("", false) and the caller falls back to its pre-ADR-0325 behavior (no pod-netns join
+// attempted) rather than failing the restore closed. When s.k8sClient != nil, resolution failure
+// IS evidence-bearing (the source of truth was consulted and came back empty/erroring) and the
+// caller fails closed as designed.
+func (s *AgentServer) resolvePodNetnsSandbox(ctx context.Context, migrationName string) (sandboxID string, attempted bool) {
+	if s.k8sClient == nil {
+		log.Info("resolvePodNetnsSandbox: no k8sClient — skipping pod-netns self-resolve (ADR-0325); restore proceeds without pod-netns join",
+			"migration", migrationName)
+		return "", false
+	}
+	id, err := s.resolveSandboxIDForMigration(ctx, migrationName)
+	if err != nil {
+		log.Error(err, "resolvePodNetnsSandbox: pod-sandbox self-resolve failed (ADR-0325) — pod-netns join cannot proceed", "migration", migrationName)
+		return "", true
+	}
+	log.Info("resolvePodNetnsSandbox: pod-netns join will use self-resolved replacement pod sandbox (ADR-0325)",
+		"migration", migrationName, "sandboxID", id)
+	return id, true
+}
+
 // sandboxIDForPodUID resolves the containerd sandbox (pause container) task ID for the given
 // pod UID via `ctr --namespace k8s.io containers list`, filtering by the io.kubernetes.pod.uid
 // label. Mirrors the existing ctr-based lookup idiom (sandboxPausePID/sandboxNetnsPath) — no
@@ -6239,7 +6334,26 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		if reErr != nil {
 			return nil, fmt.Errorf("resolve re-attach mounts: %w", reErr)
 		}
-		pid, droppedMnts, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, "", storedVeth, false, reattachMounts)
+		// UNIVERSAL POD-NETNS INTEGRATION (ADR-0325): joining the restored process into ITS
+		// pod's REAL network namespace (the CNI-wired sandbox netns that owns the new pod IP) is a
+		// property of the restore path, NOT of tcpPreservationMode. We resolve the replacement
+		// pod's sandbox (pause-container) netns from the source-of-truth — the replacement pod UID
+		// → containerd sandbox label → sandbox OCI network/path (resolveSandboxIDForMigration →
+		// ResolveNetnsFromSandbox) — and hand THAT sandbox to joinNsRestore for None/BestEffort/
+		// Strict alike, so CRIU restores via --join-ns net:<pod-sandbox-netns> and the workload
+		// serves at its pod IP. We deliberately do NOT join the agent-staged migration netns
+		// (req.DestNetnsFd = /run/podmotion/netns/pm-mig-*/bind): that synthetic netns exists only
+		// for OLD-IP preservation (a separate substrate effort, explicitly out of scope here) and
+		// carries the source pod's /32 old IP with no CNI routing — restoring into it left the
+		// workload alive but unreachable at the new pod IP. This is not a poll-and-hope: the
+		// sandbox ID derives deterministically from the pod UID. Fail-closed on resolution failure.
+		joinSandboxID, sandboxAttempted := s.resolvePodNetnsSandbox(ctx, req.MigrationName)
+		if joinSandboxID == "" && sandboxAttempted {
+			msg := fmt.Sprintf("Restore: pod-netns integration failed for migration %s: could not resolve replacement pod sandbox netns (ADR-0325) — refusing to restore into a detached/non-pod namespace", req.MigrationName)
+			log.Info(msg, "migration", req.MigrationName)
+			return &agentpb.RestoreResponse{Success: false, ErrorMessage: msg}, nil
+		}
+		pid, droppedMnts, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", "", joinSandboxID, storedVeth, false, reattachMounts)
 		// SD-4: CRIU restore has returned — ptrace is no longer expected. Close the window on
 		// the happy path immediately (the deferred close above is the fallback for early returns).
 		_ = seccomp.PtraceWindowClose(req.MigrationName)
@@ -6415,7 +6529,18 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	s.destHostVethMu.RLock()
 	storedVeth2 := s.destHostVeth[req.MigrationName]
 	s.destHostVethMu.RUnlock()
-	rawPID, droppedMnts2, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, "", storedVeth2, false, rawReattachMounts)
+	// UNIVERSAL POD-NETNS INTEGRATION (ADR-0325): raw-CRIU gRPC path parity with the
+	// config.json branch above — resolve the replacement pod's REAL sandbox netns and join it so
+	// the restored process serves at its pod IP regardless of tcpPreservationMode. The synthetic
+	// migration netns (req.DestNetnsFd) is deliberately NOT joined (old-IP preservation is out of
+	// scope). See the config.json branch for the full rationale. Fail-closed on resolution failure.
+	joinSandboxID2, sandboxAttempted2 := s.resolvePodNetnsSandbox(ctx, req.MigrationName)
+	if joinSandboxID2 == "" && sandboxAttempted2 {
+		msg := fmt.Sprintf("Restore: pod-netns integration failed for migration %s: could not resolve replacement pod sandbox netns (ADR-0325) — refusing to restore into a detached/non-pod namespace", req.MigrationName)
+		log.Info(msg, "migration", req.MigrationName)
+		return nil, fmt.Errorf("%s", msg)
+	}
+	rawPID, droppedMnts2, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", "", joinSandboxID2, storedVeth2, false, rawReattachMounts)
 	for _, d := range droppedMnts2 {
 		s.emitExternalMountDroppedEvent(context.Background(), req.MigrationName, d)
 	}

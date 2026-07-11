@@ -1354,6 +1354,113 @@ func setWorkloadLivenessCondition(pm *pmv1.PodMigration, verified bool, reason, 
 	setCondition(pm, pmv1.ConditionWorkloadLivenessVerified, status, reason, message)
 }
 
+// ensureWorkloadLivenessVerified drives the ADR-0325 real-liveness probe against the DESTINATION
+// pod's CURRENT IP and sets ConditionWorkloadLivenessVerified accordingly. It is the shared
+// mechanism used by BOTH the newer ServiceVerifying phase and the legacy Verifying phase so that
+// the ADR-0325 gate — which sourcePodDeletionBlockReason enforces for ALL modes (including None) —
+// is actually PRODUCED on whichever verification path a migration takes. Without this, the legacy
+// live-migration path (…→RestoreSocketReattach→Verifying) reached the deletion gate that requires
+// WorkloadLivenessVerified but never ran the phase that sets it, deadlocking None migrations.
+//
+// The probe targets the replacement pod's real, current IP (NOT the old source IP) — exactly the
+// new-IP liveness this gate is meant to confirm. Returns:
+//   - verified=true  → WorkloadLivenessVerified is now True (probe passed or NoKnownProtocol).
+//   - verified=false → the condition was set False (probe failed / ambiguous / not yet ready);
+//     res carries the requeue the caller should return.
+func (r *PodMigrationReconciler) ensureWorkloadLivenessVerified(ctx context.Context, pm *pmv1.PodMigration) (verified bool, res ctrl.Result) {
+	log := logf.FromContext(ctx)
+
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionWorkloadLivenessVerified) {
+		return true, ctrl.Result{}
+	}
+
+	destPodName := pm.Status.ReplacementPodName
+	if destPodName == "" {
+		destPodName = pm.Spec.PodName
+	}
+	destPod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: pm.Spec.PodNamespace, Name: destPodName}, destPod); err != nil {
+		log.Error(err, "ensureWorkloadLivenessVerified: ADR-0325 destination pod fetch failed — requeuing", "migration", pm.Name, "destPod", destPodName)
+		return false, ctrl.Result{RequeueAfter: 5 * time.Second}
+	}
+	destPodIP := destPod.Status.PodIP
+
+	probeProtocol, ambiguous, zeroMatch := resolveProbeProtocol(pm.Spec.ApplicationProbe, destPod)
+	switch {
+	case ambiguous:
+		setWorkloadLivenessCondition(pm, false, "AmbiguousProbeDefault",
+			"ADR-0325: multiple container-port heuristic matches; set spec.applicationProbe to disambiguate")
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return false, ctrl.Result{}
+		}
+		return false, ctrl.Result{RequeueAfter: 30 * time.Second}
+	case zeroMatch && pm.Spec.ApplicationProbe == nil:
+		setWorkloadLivenessCondition(pm, true, "NoKnownProtocol",
+			"ADR-0325: no application-probe protocol resolved; transport-only verification applies")
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return false, ctrl.Result{}
+		}
+		return true, ctrl.Result{}
+	}
+
+	if r.AgentPool == nil {
+		log.Error(nil, "ensureWorkloadLivenessVerified: AgentPool not wired — requeuing", "migration", pm.Name)
+		return false, ctrl.Result{RequeueAfter: 30 * time.Second}
+	}
+	destNode := pm.Status.DestinationNodeName
+	destAgent, agentErr := r.AgentPool.ForNode(ctx, destNode)
+	if agentErr != nil {
+		log.Error(agentErr, "ensureWorkloadLivenessVerified: could not resolve destination-node agent client — requeuing", "migration", pm.Name, "destNode", destNode)
+		return false, ctrl.Result{RequeueAfter: 30 * time.Second}
+	}
+	explicit := pm.Spec.ApplicationProbe != nil
+	vtcpReq := &agentpb.VerifyTCPRequest{
+		MigrationName:    pm.Name,
+		AppProbeOnly:     true,
+		AppProbeProtocol: probeProtocol,
+	}
+	var port int32
+	switch probeProtocol {
+	case "SQL":
+		port = 5432
+	case "Redis":
+		port = 6379
+	case "HTTP":
+		port = 80
+	}
+	if explicit && pm.Spec.ApplicationProbe.Port > 0 {
+		port = pm.Spec.ApplicationProbe.Port
+		vtcpReq.AppProbeQuery = pm.Spec.ApplicationProbe.Query
+		vtcpReq.AppProbeTimeoutS = pm.Spec.ApplicationProbe.TimeoutSeconds
+	}
+	if destPodIP != "" && port > 0 {
+		vtcpReq.AppProbeAddress = fmt.Sprintf("%s:%d", destPodIP, port)
+	}
+	vtcpResp, rpcErr := destAgent.VerifyTCP(ctx, vtcpReq)
+	reasonPrefix := "Defaulted"
+	if explicit {
+		reasonPrefix = "Explicit"
+	}
+	if rpcErr != nil || vtcpResp == nil || !vtcpResp.Verified {
+		msg := "app probe RPC error"
+		if rpcErr == nil && vtcpResp != nil {
+			msg = vtcpResp.AppProbeError
+		}
+		setWorkloadLivenessCondition(pm, false, reasonPrefix+"ProbeFailed",
+			fmt.Sprintf("ADR-0325: workload-liveness probe (%s) against destination pod IP %s failed: %v / %s", probeProtocol, destPodIP, rpcErr, msg))
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return false, ctrl.Result{}
+		}
+		return false, ctrl.Result{RequeueAfter: 15 * time.Second}
+	}
+	setWorkloadLivenessCondition(pm, true, reasonPrefix+"ProbePassed",
+		fmt.Sprintf("ADR-0325: workload-liveness probe (%s) against destination pod IP %s passed", probeProtocol, destPodIP))
+	if err := r.statusUpdate(ctx, pm); err != nil {
+		return false, ctrl.Result{}
+	}
+	return true, ctrl.Result{}
+}
+
 // reconcileServiceVerifying runs HTTP/endpoint readiness checks (the existing service-layer verifier).
 // This is the ServiceVerifier discipline split from the legacy Verifying phase.
 func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
@@ -1467,8 +1574,22 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 	// DataplaneReachabilityVerified is True AND (no known protocol OR WorkloadLivenessVerified
 	// is True). Textual placement alone is insufficient — the guard condition itself gates on
 	// the new predicate.
-	if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionDataplaneReachabilityVerified) &&
-		(probeProtocol == "" || meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionWorkloadLivenessVerified)) {
+	//
+	// Mode=None (ADR-0325): None deliberately accepts the replacement pod's NEW IP and does not
+	// preserve the OLD source pod IP, so the ADR-0210 old-IP cross-node nonce probe
+	// (DataplaneReachabilityVerified) is structurally inapplicable — injectIPHandoff is skipped
+	// for None (see reconcileVerifying) and DataplaneReachabilityVerified is never set. For None
+	// the AUTHORITATIVE liveness proof is WorkloadLivenessVerified against the replacement pod's
+	// current IP (ADR-0325). Advance when the workload is verified alive on the new IP (or no
+	// known protocol resolved, in which case transport-only verification applies). Strict and
+	// BestEffort are unchanged: they still require the old-IP DataplaneReachabilityVerified gate.
+	noneMode := pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeNone
+	livenessOK := probeProtocol == "" || meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionWorkloadLivenessVerified)
+	if noneMode {
+		if livenessOK {
+			return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
+		}
+	} else if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionDataplaneReachabilityVerified) && livenessOK {
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
 	}
 
@@ -4133,12 +4254,24 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 	// Strict once the dataplane gate passed) it could delete the source pod without TCP-continuity
 	// proof. deleteSourcePodIfSafe fixes that UP: it re-reads authoritative conditions and enforces
 	// TCPSequenceContinuityVerified=True for Strict/BestEffort before any deletion.
+	// ADR-0325: the source-pod deletion gate (sourcePodDeletionBlockReason) requires
+	// WorkloadLivenessVerified=True for ALL modes, including None. On this legacy
+	// (…→RestoreSocketReattach→Verifying) path the newer ServiceVerifying phase — which is
+	// where that condition is otherwise produced — is never entered, so we must run the
+	// real-liveness probe HERE (against the replacement pod's current IP) before attempting
+	// deletion. Without this the gate can never be satisfied and the migration deadlocks in
+	// Verifying, refusing to delete the source pod forever.
+	if verified, res := r.ensureWorkloadLivenessVerified(ctx, pm); !verified {
+		log.Info("Verifying: ADR-0325 workload-liveness not yet verified on destination pod — holding source, requeuing", "migration", pm.Name)
+		return res, nil
+	}
+
 	log.Info("Verifying: routing source pod deletion through deleteSourcePodIfSafe (ADR-0012 STRICTER-union gate)", "migration", pm.Name)
 	if blocked, res := r.deleteSourcePodIfSafe(ctx, pm); blocked {
 		return res, nil
 	}
 
-	setCondition(pm, conditionSourcePodDeleted, metav1.ConditionTrue, "Deleted", "Source pod deleted post-TrafficVerified")
+	setCondition(pm, conditionSourcePodDeleted, metav1.ConditionTrue, "Deleted", "Source pod deleted post-TrafficVerified+WorkloadLivenessVerified")
 
 	// ADR-0133 Decision 4: source-side cleanup. Now that TrafficVerified=True and the
 	// zero-window hold has been disarmed (reconcileDisengageHold), remove the stale
