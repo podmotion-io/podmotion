@@ -204,6 +204,12 @@ type AgentServer struct {
 	nodeName     string
 	k8sClient    client.Client // may be nil in pure-stub mode
 
+	// podCIDRAllowlist is the ADR-0325 cached SSRF dial-allowlist, parsed once from
+	// Node.Spec.PodCIDRs and refreshed on the NMC re-registration cadence. nil-safe: an
+	// unpopulated/empty allowlist makes dialAllowed fail CLOSED (refuse), never open.
+	podCIDRAllowlistMu sync.RWMutex
+	podCIDRAllowlist   []*net.IPNet
+
 	// ebpfMgr is the eBPF manager used for zero-window hold arm/disarm.
 	// Initialised by New via network.NewEBPFManager; uses real cilium/ebpf
 	// on kernel ≥5.9 and the no-op stub otherwise.
@@ -6505,7 +6511,7 @@ func (s *AgentServer) Verify(_ context.Context, req *agentpb.VerifyRequest) (*ag
 func (s *AgentServer) VerifyTCP(ctx context.Context, req *agentpb.VerifyTCPRequest) (*agentpb.VerifyTCPResponse, error) {
 	log.Info("VerifyTCP called", "migration", req.MigrationName, "appProbeOnly", req.AppProbeOnly)
 
-	// ADR-0312: AppProbeOnly scopes this call to ONLY the application-layer probe.
+	// ADR-0325: AppProbeOnly scopes this call to ONLY the application-layer probe.
 	// Skip PID/socket-inventory resolution and seq-delta accounting entirely — this
 	// path MUST NOT write TCPSequenceContinuityVerified, the measured-seq-delta
 	// annotation, or the seq_delta gauge (those remain owned exclusively by the
@@ -6518,7 +6524,7 @@ func (s *AgentServer) VerifyTCP(ctx context.Context, req *agentpb.VerifyTCPReque
 			resp.Verified = true
 			return resp, nil
 		}
-		probeErr := runAppProbe(ctx, req)
+		probeErr := s.runAppProbe(ctx, req)
 		if probeErr != nil {
 			resp.Verified = false
 			resp.AppProbeOk = false
@@ -6679,7 +6685,7 @@ func (s *AgentServer) VerifyTCP(ctx context.Context, req *agentpb.VerifyTCPReque
 
 	// Application probe: SQL or TCP probe if configured.
 	if req.AppProbeProtocol != "" {
-		probeErr := runAppProbe(ctx, req)
+		probeErr := s.runAppProbe(ctx, req)
 		if probeErr != nil {
 			resp.Verified = false
 			resp.AppProbeOk = false
@@ -6724,14 +6730,72 @@ func absDiffU32(a, b uint32) uint32 {
 	return d
 }
 
-// runAppProbe issues a SQL (SELECT 1) or raw TCP connect probe.
-func runAppProbe(ctx context.Context, req *agentpb.VerifyTCPRequest) error {
+// nodePodCIDRAllowlist returns the cached []*net.IPNet parsed from this node's
+// Node.Spec.PodCIDRs (ADR-0325 SSRF containment). Nil-safe: k8sClient==nil or an empty/
+// unparsable PodCIDRs list yields an EMPTY slice, which makes dialAllowed fail CLOSED
+// (refuse), never open. Never hardcode a CIDR literal — Flannel's 10.244.0.0/16 breaks the
+// moment the CNI changes (scope item #1, Cilium handoff).
+func (s *AgentServer) nodePodCIDRAllowlist(ctx context.Context) []*net.IPNet {
+	s.podCIDRAllowlistMu.RLock()
+	cached := s.podCIDRAllowlist
+	s.podCIDRAllowlistMu.RUnlock()
+	if cached != nil {
+		return cached
+	}
+	var out []*net.IPNet
+	if s.k8sClient != nil && s.nodeName != "" {
+		nodeObj := &corev1.Node{}
+		if err := s.k8sClient.Get(ctx, client.ObjectKey{Name: s.nodeName}, nodeObj); err == nil {
+			for _, cidr := range nodeObj.Spec.PodCIDRs {
+				if _, ipnet, perr := net.ParseCIDR(cidr); perr == nil {
+					out = append(out, ipnet)
+				}
+			}
+		}
+	}
+	s.podCIDRAllowlistMu.Lock()
+	s.podCIDRAllowlist = out
+	s.podCIDRAllowlistMu.Unlock()
+	return out
+}
+
+// dialAllowed refuses to dial any host outside this node's pod CIDR allowlist
+// (ADR-0325 SSRF containment control — non-negotiable). Called at the top of runAppProbe
+// for every protocol, before any dial.
+func (s *AgentServer) dialAllowed(ctx context.Context, address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("NonPodCIDRRefused: address %q host %q is not a valid IP", address, host)
+	}
+	allowlist := s.nodePodCIDRAllowlist(ctx)
+	for _, ipnet := range allowlist {
+		if ipnet.Contains(ip) {
+			return nil
+		}
+	}
+	return fmt.Errorf("NonPodCIDRRefused: %s is outside the node pod-CIDR allowlist", ip)
+}
+
+// runAppProbe (ADR-0325) issues a real wire-protocol application probe. This is now a
+// METHOD on *AgentServer (previously a free function) so it can read this node's identity
+// to derive the pod-CIDR SSRF allowlist. Both VerifyTCP call sites (the AppProbeOnly branch
+// and the full-verification tail) route through it and inherit the CIDR guard and the real
+// protocol bodies.
+func (s *AgentServer) runAppProbe(ctx context.Context, req *agentpb.VerifyTCPRequest) error {
 	timeout := time.Duration(req.AppProbeTimeoutS) * time.Second
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
+	if err := s.dialAllowed(ctx, req.AppProbeAddress); err != nil {
+		return err
+	}
 
 	switch strings.ToUpper(req.AppProbeProtocol) {
 	case "TCP":
@@ -6742,28 +6806,36 @@ func runAppProbe(ctx context.Context, req *agentpb.VerifyTCPRequest) error {
 		conn.Close()
 		return nil
 	case "SQL":
-		// Raw TCP connect to the SQL port + send the query, read one response line.
-		// This avoids importing a database driver (custom-over-packages, ADR).
+		// ADR-0325: app_probe_query (proto field 6) carries the SQL query for this
+		// protocol (default "SELECT 1" when empty). Real Postgres v3 handshake+query —
+		// see pgprobe.go. Never sends a password.
 		conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", req.AppProbeAddress)
 		if err != nil {
 			return fmt.Errorf("SQL probe TCP connect to %s failed: %w", req.AppProbeAddress, err)
 		}
 		defer conn.Close()
-		query := req.AppProbeQuery
-		if query == "" {
-			query = "SELECT 1"
+		if err := pgProbe(dialCtx, conn, req.AppProbeQuery, timeout); err != nil {
+			return fmt.Errorf("SQL probe to %s failed: %w", req.AppProbeAddress, err)
 		}
-		_ = conn.SetDeadline(time.Now().Add(timeout))
-		// For PostgreSQL wire protocol, a startup message is required before queries.
-		// A bare TCP connect + immediate read is sufficient to confirm the port is open
-		// and the server is accepting connections. A full SQL response requires the
-		// protocol handshake; the probe here validates TCP-level liveness.
-		// Read one byte to confirm the server is actively listening (sends startup banner).
-		buf := make([]byte, 1)
-		_, readErr := conn.Read(buf)
-		// EOF is acceptable: server accepted and closed cleanly (e.g. healthcheck port).
-		if readErr != nil && readErr.Error() != "EOF" && !isNetTimeout(readErr) {
-			return fmt.Errorf("SQL probe read from %s failed: %w", req.AppProbeAddress, readErr)
+		return nil
+	case "REDIS":
+		// app_probe_query is unused/ignored for Redis.
+		conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", req.AppProbeAddress)
+		if err != nil {
+			return fmt.Errorf("Redis probe TCP connect to %s failed: %w", req.AppProbeAddress, err)
+		}
+		defer conn.Close()
+		if err := respPing(conn, timeout); err != nil {
+			return fmt.Errorf("Redis probe to %s failed: %w", req.AppProbeAddress, err)
+		}
+		return nil
+	case "HTTP":
+		// ADR-0325: app_probe_query (proto field 6) carries the HTTP path for this
+		// protocol (default "/" when empty). Requires a genuine [200,300) response;
+		// CheckRedirect=http.ErrUseLastResponse refuses to follow redirects (3xx=FAILURE).
+		// No auth header attached.
+		if err := httpGet2xx(dialCtx, req.AppProbeAddress, req.AppProbeQuery, timeout); err != nil {
+			return fmt.Errorf("HTTP probe to %s failed: %w", req.AppProbeAddress, err)
 		}
 		return nil
 	default:

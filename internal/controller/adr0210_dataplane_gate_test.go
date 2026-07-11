@@ -51,6 +51,7 @@ func strictPMReadyForDeletion(name string, dataplaneVerified *bool) (*pmv1.PodMi
 		{Type: conditionDestinationVolumeReady, Status: metav1.ConditionTrue, Reason: "Ready", LastTransitionTime: metav1.Now()},
 		{Type: conditionTrafficVerified, Status: metav1.ConditionTrue, Reason: "HandoffInstalled", LastTransitionTime: metav1.Now()},
 		{Type: pmv1.ConditionTCPSequenceContinuityVerified, Status: metav1.ConditionTrue, Reason: "SequenceContinuityVerified", LastTransitionTime: metav1.Now()},
+		{Type: pmv1.ConditionWorkloadLivenessVerified, Status: metav1.ConditionTrue, Reason: "NoKnownProtocol", LastTransitionTime: metav1.Now()},
 	}
 	if dataplaneVerified != nil {
 		st := metav1.ConditionFalse
