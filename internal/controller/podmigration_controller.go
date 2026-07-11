@@ -27,6 +27,9 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/client-go/dynamic"
+
+	"github.com/podmotion-io/podmotion/internal/agent/iphandoff"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -170,6 +173,12 @@ type PodMigrationReconciler struct {
 	// Wired to CompositeVerifier (EndpointSlice + AWSALB) in production.
 	// Nil in unit tests — Verifying phase logs a skip when nil.
 	TrafficVerifier traffic.Verifier
+	// DynamicClient is used by the ADR-0322 Cilium CiliumEndpoint readiness check
+	// (injectIPHandoff, immediately before verifyDataplaneReachability) to poll the
+	// cilium.io/v2 CiliumEndpoint CRD directly, and is threaded into CiliumHandoff via
+	// CNIMobilitySelector. Nil in unit tests — the Cilium-readiness branch is skipped
+	// (fail-closed at the call site, not here) when nil.
+	DynamicClient dynamic.Interface
 	// GPUCheckpointer handles NVIDIA CUDA context checkpoint/restore.
 	// Only called when GPUMigration feature gate is enabled and the pod has GPU resources.
 	// Defaults to GPUCheckpointerStub when nil (so GPU-unaware environments are unaffected).
@@ -3607,6 +3616,20 @@ func readIPReclaimVerifyAttempts(pm *pmv1.PodMigration) int {
 	return n
 }
 
+// resolveDestCNIPlugin (ADR-0322) fetches the destination NodeMigrationCapacity and
+// returns the write-verified CNI signal (destNMC.Spec.NetworkCapability.CNIPlugin).
+// This is the single source both the controller (injectIPHandoff, fail-closed) and the
+// pod-mutating webhook (pod_webhook.go, fail-through) read from — never
+// pm.Status.CNIProvider, which has zero writers. Each caller decides its own fail
+// policy; this helper only resolves the signal.
+func (r *PodMigrationReconciler) resolveDestCNIPlugin(ctx context.Context, node string) (string, error) {
+	destNMC := &pmv1.NodeMigrationCapacity{}
+	if err := r.Get(ctx, types.NamespacedName{Name: node}, destNMC); err != nil {
+		return "", fmt.Errorf("resolveDestCNIPlugin: fetch NMC %s: %w", node, err)
+	}
+	return destNMC.Spec.NetworkCapability.CNIPlugin, nil
+}
+
 // injectIPHandoff calls InjectIPHandoff on the DESTINATION agent (ADR-0133 D1/D2) to make
 // the OLD pod IP reachable at the replacement pod, then gates on the in-node reachability
 // probe (D5). On success it sets conditionIPHandoffInjected=True (and TrafficVerified=True
@@ -3810,6 +3833,39 @@ func (r *PodMigrationReconciler) injectIPHandoff(ctx context.Context, pm *pmv1.P
 	// (2) ask a SOURCE-node agent (node != dest) to dial it cross-node and read the nonce back.
 	// DataplaneReachabilityVerified is set True ONLY on a matched nonce — the source agent
 	// cannot synthesize success, and the IP-handoff alone cannot fake an off-node datapath.
+	// ADR-0322: on a Cilium destination, DataplaneReachabilityVerified must not be
+	// credited until cilium-agent has actually programmed the migrated identity into
+	// ipcache (CiliumEndpoint status.state=="ready" && status.identity.id!=0) — NOT
+	// merely pod-IP assignment. Fail-closed: an unresolved/empty CNI signal on what
+	// must be treated as a Cilium-capable dest, a lookup error, or not-yet-ready all
+	// block here with the same (ctrl.Result, error, false) requeue shape used above
+	// for the replVethMAC wait.
+	cniPlugin, cniErr := r.resolveDestCNIPlugin(ctx, destNode)
+	if cniErr != nil {
+		log.Error(cniErr, "injectIPHandoff: ADR-0322 unable to resolve destination CNI plugin — blocking (fail-closed)", "migration", pm.Name)
+		setCondition(pm, pmv1.ConditionDataplaneReachabilityVerified, metav1.ConditionFalse, pmv1.ReasonCNISignalUnresolved,
+			fmt.Sprintf("destNMC fetch error for node %s: %v", destNode, cniErr))
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr, false
+		}
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil, false
+	}
+	if strings.Contains(strings.ToLower(cniPlugin), "cilium") {
+		ch := &iphandoff.CiliumHandoff{DynamicClient: r.DynamicClient}
+		if ceErr := ch.WaitForCiliumEndpointReady(ctx, pm.Spec.PodNamespace, pm.Status.ReplacementPodName); ceErr != nil {
+			reason := pmv1.ReasonCiliumEndpointNotReady
+			if strings.Contains(ceErr.Error(), "lookup error") {
+				reason = pmv1.ReasonCiliumEndpointLookupError
+			}
+			log.Error(ceErr, "injectIPHandoff: ADR-0322 CiliumEndpoint not ready — blocking (fail-closed)", "migration", pm.Name)
+			setCondition(pm, pmv1.ConditionDataplaneReachabilityVerified, metav1.ConditionFalse, reason, ceErr.Error())
+			if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+				return ctrl.Result{}, sErr, false
+			}
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil, false
+		}
+	}
+
 	if res, err, done := r.verifyDataplaneReachability(ctx, pm, destNode); !done {
 		return res, err, false
 	}

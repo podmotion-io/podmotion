@@ -5,14 +5,12 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 */
 
-// Package iphandoff: CiliumHandoff in this file is dead code on the current
-// preflight-gated path. ADR-0082 names it the v1.1 starting point for a future
-// Cilium IP-mobility implementation; ADR-0313 removed "cilium" from
-// ipMobilitySupported's supported-CNI case list and added a CNICompatible=False/
-// CNIUnsupported NodeMigrationCapacity status condition at agent registration
-// (internal/agent/nmcregistrar/registrar.go), so migrations on Cilium nodes are
-// now refused at preflight before any code in this file would run. Do not delete —
-// retained as the v1.1 starting point per ADR-0082.
+// Package iphandoff: CiliumHandoff in this file was dead code on the preflight-gated
+// path prior to ADR-0322. ADR-0313 refused migrations on Cilium nodes at preflight
+// (CNICompatible=False/CNIUnsupported). ADR-0322 introduces the real ipcache/
+// CiliumEndpoint readiness check (replacing the pod-IP proxy below) and wires a
+// concrete call site into injectIPHandoff (podmigration_controller.go:3813), making
+// this file reachable again.
 package iphandoff
 
 import (
@@ -20,8 +18,11 @@ import (
 	"fmt"
 	"time"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -29,6 +30,14 @@ const (
 	ciliumEndpointPollInterval = 1 * time.Second
 	ciliumEndpointReadyTimeout = 30 * time.Second
 )
+
+// ciliumEndpointGVR is the cilium.io/v2 CiliumEndpoint resource, cluster-scoped-name
+// but namespaced object (same namespace as the pod it tracks).
+var ciliumEndpointGVR = schema.GroupVersionResource{
+	Group:    "cilium.io",
+	Version:  "v2",
+	Resource: "ciliumendpoints",
+}
 
 // CiliumHandoff implements IPHandoffStrategy for Cilium CNI clusters.
 //
@@ -38,12 +47,17 @@ const (
 //
 // After restore, CiliumEndpoint regeneration is required so that Cilium's eBPF
 // ipcache and kube-proxy-replacement tables are updated for the new node location.
-// The eBPF hold must not be released until CiliumEndpoint.Status.State == "ready".
+// ADR-0322: WaitForCiliumEndpointReady polls the CiliumEndpoint CRD directly via
+// DynamicClient rather than treating pod IP assignment as a proxy for endpoint
+// regeneration — the eBPF hold/reachability gate must not be released until
+// status.state=="ready" AND status.identity.id!=0 (non-zero identity confirms
+// ipcache programming, not just object creation).
 //
 // Note: kube-proxy-replacement=strict mode may conflict with the PodMotion XDP
 // bridge. When detected, the agent falls back to TC ingress for the bridge.
 type CiliumHandoff struct {
-	KubeClient kubernetes.Interface
+	KubeClient    kubernetes.Interface
+	DynamicClient dynamic.Interface
 }
 
 // AnnotateDestPodIPAM patches the destination pod with the Cilium IPAM annotation
@@ -64,13 +78,15 @@ func (c *CiliumHandoff) AnnotateDestPodIPAM(ctx context.Context, namespace, dest
 	return nil
 }
 
-// WaitForCiliumEndpointReady polls the destination pod's IP assignment until Cilium
-// has regenerated the endpoint and updated the eBPF ipcache. Uses pod IP as proxy
-// for endpoint regeneration complete (full CiliumEndpoint CR polling is M9 work).
-//
-// The full M9 implementation will watch CiliumEndpoint.Status.State == "ready"
-// via the Cilium CRD client. For now, pod IP assignment is a sufficient proxy.
+// WaitForCiliumEndpointReady polls the cilium.io/v2 CiliumEndpoint object (same name/
+// namespace as the destination pod — Cilium mirrors pod identity) via DynamicClient
+// until status.state=="ready" AND status.identity.id!=0. Fail-closed: any lookup error
+// other than "not yet created" is returned immediately (never silently falls back to
+// the old pod-IP proxy). Read-only — cilium-agent is the sole writer of this object.
 func (c *CiliumHandoff) WaitForCiliumEndpointReady(ctx context.Context, namespace, podName string) error {
+	if c.DynamicClient == nil {
+		return fmt.Errorf("WaitForCiliumEndpointReady: DynamicClient is nil (not wired)")
+	}
 	deadline := time.Now().Add(ciliumEndpointReadyTimeout)
 	for {
 		select {
@@ -79,16 +95,51 @@ func (c *CiliumHandoff) WaitForCiliumEndpointReady(ctx context.Context, namespac
 		default:
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout waiting for Cilium endpoint %s/%s to become ready", namespace, podName)
+			return fmt.Errorf("timeout waiting for CiliumEndpoint %s/%s to become ready", namespace, podName)
 		}
 
-		pod, err := c.KubeClient.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
-		if err == nil && pod.Status.PodIP != "" && pod.Status.Phase != "Pending" {
+		obj, err := c.DynamicClient.Resource(ciliumEndpointGVR).Namespace(namespace).Get(ctx, podName, metav1.GetOptions{})
+		if err != nil {
+			// Fail-closed on any error other than the object not yet existing —
+			// a transient API error must not be swallowed into a false-ready result.
+			if !isNotFound(err) {
+				return fmt.Errorf("CiliumEndpoint lookup error for %s/%s: %w", namespace, podName, err)
+			}
+			// Not found yet — cilium-agent has not created the endpoint object.
+			// Fall through to the poll-sleep and retry until the deadline.
+		} else if ready(obj) {
 			return nil
 		}
 
 		time.Sleep(ciliumEndpointPollInterval)
 	}
+}
+
+// ready reports whether the given CiliumEndpoint unstructured object has
+// status.state=="ready" and a non-zero status.identity.id (ipcache programmed).
+func ready(obj *unstructured.Unstructured) bool {
+	state, found, err := unstructured.NestedString(obj.Object, "status", "state")
+	if err != nil || !found || state != "ready" {
+		return false
+	}
+	identityID, found, err := unstructured.NestedInt64(obj.Object, "status", "identity", "id")
+	if err != nil || !found || identityID == 0 {
+		return false
+	}
+	return true
+}
+
+// isNotFound is a narrow, dependency-free NotFound check for the dynamic client's
+// unstructured error path (avoids importing apierrors solely for this one check —
+// kept local since this file otherwise has no other apimachinery errors dependency).
+func isNotFound(err error) bool {
+	type statusErr interface {
+		Status() metav1.Status
+	}
+	if se, ok := err.(statusErr); ok {
+		return se.Status().Reason == metav1.StatusReasonNotFound
+	}
+	return false
 }
 
 func (c *CiliumHandoff) Name() string { return "cilium-ipam-pin" }

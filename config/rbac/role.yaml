@@ -126,3 +126,11 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - cilium.io
+  resources:
+  - ciliumendpoints
+  verbs:
+  - get
+  - list
+  - watch
