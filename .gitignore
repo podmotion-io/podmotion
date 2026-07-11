@@ -139,3 +139,4 @@ docs/WORKSTREAM-*.md
 .github/workflows/disclose-check.yaml
 docs/design/PREAUTHOR-GATE-DEADEND-ANALYSIS.md
 docs/design/DEV-PHASE-INTERDEP-HARDENING.md
+docs/design/SPRINT-CONVERGENCE-POSTMORTEM.md
