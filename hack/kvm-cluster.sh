@@ -498,6 +498,84 @@ cmd_provision_cilium() {
   echo "==> Cilium ready. CNI swap done at the install layer; run the cutover to remove Flannel/kube-proxy."
 }
 
+# ── multi-pool IPAM re-provision (ADR-0324 P-VERIFY-C escalation) ──
+# cluster-pool IPAM binds each node's pod CIDR to that node only, so the
+# ipam.cilium.io/ip pinning annotation used by CiliumHandoff.AnnotateDestPodIPAM
+# to preserve a source pod's IP on a DIFFERENT destination node can never be
+# honored (confirmed negative by TestCrossNodeReachability). multi-pool IPAM
+# with per-node CiliumPodIPPool CRs lets an IP from ANY pool be requested on
+# ANY node, which is required for cross-node IP preservation. This is the
+# re-provision step the ADR-0324 escalation path calls for. Idempotent
+# (helm upgrade --install + kubectl apply), safe to re-run. VMs never touched.
+cmd_provision_cilium_multipool() {
+  assert_no_vm_destruction
+  load_ips
+  CILIUM_APISERVER_HOST="${CILIUM_APISERVER_HOST:-$CP1_IP}"
+
+  echo "==> [1/3] Switching Cilium IPAM mode: cluster-pool -> multi-pool..."
+  helm repo add cilium https://helm.cilium.io >/dev/null 2>&1 || true
+  helm repo update cilium >/dev/null 2>&1 || true
+  KUBECONFIG="$KUBECONFIG_OUT" helm upgrade --install cilium cilium/cilium \
+    --version "$CILIUM_CHART_VERSION" --namespace "$CILIUM_NAMESPACE" \
+    --set ipam.mode=multi-pool \
+    --set routingMode=tunnel \
+    --set tunnelProtocol=geneve \
+    --set endpointRoutes.enabled=true \
+    --set kubeProxyReplacement=true \
+    --set k8sServiceHost="$CILIUM_APISERVER_HOST" \
+    --set k8sServicePort="$CILIUM_APISERVER_PORT" \
+    --set bpf.masquerade=true \
+    --set enableIPv4Masquerade=true \
+    --set ipv4NativeRoutingCIDR="$POD_CIDR" \
+    --set image.pullPolicy=IfNotPresent \
+    --set operator.image.pullPolicy=IfNotPresent \
+    --set operator.replicas=1
+
+  echo "==> [2/3] Applying CiliumPodIPPool CRs (one /24 pool per node, same CIDRs as before)..."
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl apply -f - <<'EOF'
+apiVersion: cilium.io/v2alpha1
+kind: CiliumPodIPPool
+metadata:
+  name: pm-cp1-pool
+spec:
+  ipv4:
+    cidrs:
+      - 10.244.0.0/24
+    maskSize: 24
+---
+apiVersion: cilium.io/v2alpha1
+kind: CiliumPodIPPool
+metadata:
+  name: pm-w1-pool
+spec:
+  ipv4:
+    cidrs:
+      - 10.244.1.0/24
+    maskSize: 24
+---
+apiVersion: cilium.io/v2alpha1
+kind: CiliumPodIPPool
+metadata:
+  name: pm-w2-pool
+spec:
+  ipv4:
+    cidrs:
+      - 10.244.2.0/24
+    maskSize: 24
+EOF
+
+  echo "==> [3/3] Waiting for Cilium to come up (cilium status --wait)..."
+  if command -v cilium >/dev/null 2>&1; then
+    KUBECONFIG="$KUBECONFIG_OUT" cilium status --wait
+  else
+    echo "  -- cilium-cli not on PATH; waiting on the DaemonSet/Deployment rollout instead"
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" rollout status ds/cilium --timeout=300s
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" rollout status deploy/cilium-operator --timeout=300s
+  fi
+  echo "==> Cilium now in multi-pool IPAM mode with per-node CiliumPodIPPool CRs."
+  echo "==> Re-run TestCrossNodeReachability (PODMOTION_CILIUM_LIVE_TEST=1) to confirm the ipam.cilium.io/ip pin now honors cross-node placement."
+}
+
 # ── cutover: remove Flannel/kube-proxy remnants after Cilium is confirmed live ──
 # Authored artifact for the Flannel→Cilium CNI cutover step (ADR-0322/ADR-0318
 # P-VERIFY-B / P-VERIFY-0 precondition). Idempotent and order-safe: verifies Cilium
@@ -582,6 +660,7 @@ main() {
     provision-shared-storage) cmd_provision_shared_storage ;;
     provision-longhorn) cmd_provision_longhorn ;;
     provision-cilium) cmd_provision_cilium ;;
+    provision-cilium-multipool) cmd_provision_cilium_multipool ;;
     cutover)          cmd_cutover ;;
     wipe)             cmd_wipe ;;
     ssh)              load_ips; nsh "$@" ;;
