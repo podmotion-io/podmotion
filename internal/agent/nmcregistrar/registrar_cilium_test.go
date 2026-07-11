@@ -16,25 +16,25 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// TestIPMobilitySupported_CiliumFalse verifies ADR-0313: Cilium no longer advertises
-// IP-mobility support regardless of kernel features, since PODMOTION_FORCE_IP_MOBILITY
-// is not set in this test's environment.
-func TestIPMobilitySupported_CiliumFalse(t *testing.T) {
+// TestIPMobilitySupported_CiliumTrue verifies ADR-0318: Cilium now advertises real
+// IP-mobility support via the ipcache/CiliumEndpoint handoff mechanism, regardless of
+// PODMOTION_FORCE_IP_MOBILITY (that env var is no longer required to force this path).
+func TestIPMobilitySupported_CiliumTrue(t *testing.T) {
 	if _, ok := os.LookupEnv("PODMOTION_FORCE_IP_MOBILITY"); ok {
 		t.Setenv("PODMOTION_FORCE_IP_MOBILITY", "")
 		os.Unsetenv("PODMOTION_FORCE_IP_MOBILITY")
 	}
 
 	got := ipMobilitySupported("cilium", pmv1.KernelFeatures{XDPSupported: true, BPFEnabled: true})
-	if got != false {
-		t.Fatalf("ipMobilitySupported(\"cilium\", full kernel features) = %v, want false (ADR-0313)", got)
+	if got != true {
+		t.Fatalf("ipMobilitySupported(\"cilium\", full kernel features) = %v, want true (ADR-0318)", got)
 	}
 }
 
-// TestIPMobilitySupported_CiliumFalse_EvenWithAllFeatures re-asserts the same
+// TestIPMobilitySupported_CiliumTrue_EvenWithAllFeatures re-asserts the same
 // invariant with every kernel feature flag set, to guard against a future
-// regression that re-adds "cilium" to the supported-CNI case list.
-func TestIPMobilitySupported_CiliumFalse_EvenWithAllFeatures(t *testing.T) {
+// regression that removes "cilium" from the supported-CNI case list.
+func TestIPMobilitySupported_CiliumTrue_EvenWithAllFeatures(t *testing.T) {
 	os.Unsetenv("PODMOTION_FORCE_IP_MOBILITY")
 	kf := pmv1.KernelFeatures{
 		CheckpointRestore: true,
@@ -44,32 +44,33 @@ func TestIPMobilitySupported_CiliumFalse_EvenWithAllFeatures(t *testing.T) {
 		XDPSupported:      true,
 		TCClsactSupported: true,
 	}
-	if ipMobilitySupported("cilium", kf) {
-		t.Fatalf("ipMobilitySupported(\"cilium\", all kernel features) = true, want false (ADR-0313)")
+	if !ipMobilitySupported("cilium", kf) {
+		t.Fatalf("ipMobilitySupported(\"cilium\", all kernel features) = false, want true (ADR-0318)")
 	}
 }
 
-// TestCNICompatibleCondition_Cilium verifies the CNICompatible=False/CNIUnsupported
-// condition shape emitted when detectCNI()=="cilium" (ADR-0313), using the same
+// TestCNICompatibleCondition_Cilium verifies the CNICompatible=True/CNISupported
+// condition shape emitted when detectCNI()=="cilium" (ADR-0318: real ipcache/
+// CiliumEndpoint IP-mobility handoff implemented), using the same
 // meta.SetStatusCondition idiom as the registrar's real write path.
 func TestCNICompatibleCondition_Cilium(t *testing.T) {
 	var conditions []metav1.Condition
 	meta.SetStatusCondition(&conditions, metav1.Condition{
 		Type:    pmv1.ConditionCNICompatible,
-		Status:  metav1.ConditionFalse,
-		Reason:  pmv1.ReasonCNIUnsupported,
-		Message: "Cilium has no IP-mobility handoff implementation.",
+		Status:  metav1.ConditionTrue,
+		Reason:  pmv1.ReasonCNISupported,
+		Message: "CNI plugin \"cilium\" is supported by PodMotion's live-migration datapath.",
 	})
 
 	cond := meta.FindStatusCondition(conditions, pmv1.ConditionCNICompatible)
 	if cond == nil {
 		t.Fatal("CNICompatible condition not found")
 	}
-	if cond.Status != metav1.ConditionFalse {
-		t.Errorf("Status = %v, want False", cond.Status)
+	if cond.Status != metav1.ConditionTrue {
+		t.Errorf("Status = %v, want True", cond.Status)
 	}
-	if cond.Reason != pmv1.ReasonCNIUnsupported {
-		t.Errorf("Reason = %q, want %q", cond.Reason, pmv1.ReasonCNIUnsupported)
+	if cond.Reason != pmv1.ReasonCNISupported {
+		t.Errorf("Reason = %q, want %q", cond.Reason, pmv1.ReasonCNISupported)
 	}
 }
 
