@@ -58,6 +58,16 @@ rules:
   - apiGroups: [admissionregistration.k8s.io]
     resources: [validatingwebhookconfigurations, mutatingwebhookconfigurations]
     verbs: [get, list, watch, patch, update]
+  # ADR-0322: the Cilium ipcache/CiliumEndpoint handoff readiness check (injectIPHandoff,
+  # immediately before verifyDataplaneReachability) polls cilium.io/v2 CiliumEndpoint via
+  # DynamicClient. This runs in the OPERATOR reconciler (podmigration_controller.go), so the
+  # grant belongs on podmotion-manager-role, not podmotion-agent-role. ClusterRole (not a
+  # namespaced Role) is deliberate: migrated workloads and their CiliumEndpoint objects can
+  # originate from any application namespace, matching the operator's existing cluster-scoped
+  # rules for other cross-namespace resources above.
+  - apiGroups: [cilium.io]
+    resources: [ciliumendpoints]
+    verbs: [get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -110,11 +120,3 @@ rules:
   - apiGroups: [""]
     resources: [events]
     verbs: [create, patch, update]
-  # ADR-0322: the Cilium ipcache/CiliumEndpoint handoff readiness check (injectIPHandoff,
-  # immediately before verifyDataplaneReachability) polls cilium.io/v2 CiliumEndpoint via
-  # DynamicClient. ClusterRole (not a namespaced Role) is deliberate: migrated workloads and
-  # their CiliumEndpoint objects can originate from any application namespace, matching the
-  # operator's existing cluster-scoped rules for other cross-namespace resources above.
-  - apiGroups: [cilium.io]
-    resources: [ciliumendpoints]
-    verbs: [get, list, watch]
