@@ -279,6 +279,7 @@ func Handle(req Request) Response {
 //     — rootfs scaffolding + ext-mount setup; the absolute "/bin/sh" form is the
 //     one server.go's kubeletVolumeGlobFn uses to `cat /proc/self/mountinfo` for
 //     kubelet volume host-target resolution during re-attach restore.
+//
 // Adding a new restore-path host-mount-ns command requires adding it here AND a
 // a runtime-dependency assertion (the binary must exist on the node) — same
 // discipline as any other ADR runtime-dependency (see ADR-0231).
@@ -287,8 +288,8 @@ func Handle(req Request) Response {
 // /proc/self/mountinfo directly (mirroring the existing signal_pid dedicated op),
 // avoiding a general-shell exec on the restore path entirely.
 var execAllowlist = map[string]struct{}{
-	"ctr":                                       {},
-	"/usr/local/bin/ctr":                        {},
+	"ctr":                {},
+	"/usr/local/bin/ctr": {},
 	"/opt/podmotion/bin/podmotion-criu-wrapper": {},
 	"mkdir":   {},
 	"touch":   {},
@@ -298,6 +299,12 @@ var execAllowlist = map[string]struct{}{
 	"sh":      {},
 	"/bin/sh": {},
 	"ls":      {},
+	// ADR-0128: cat /proc/<pausePID>/cgroup — resolve the pod sandbox's host-ABSOLUTE
+	// cgroup v2 path in the broker's HOST cgroup namespace (the de-privileged agent's
+	// own cgroupns renders /proc/<pid>/cgroup relative, stripping the kubepods ancestry
+	// and yielding a "../.." path that fails the cgroup.procs move with ENOENT).
+	"cat":      {},
+	"/bin/cat": {},
 }
 
 // doExec runs an allowlisted host-mount-namespace command via nsenterHostMnt and
@@ -647,12 +654,13 @@ func procStartTime(pid int) (uint64, error) {
 // agent is DENIED succeeds here (ADR-0312).
 //
 // SC-1 constraints:
-//   (a) only SIGCONT/SIGSTOP are accepted — any other signal is a loud reject.
-//   (b) PID-reuse guard: the client supplies the starttime it captured when it
-//       recorded the PID; the broker re-reads /proc/<pid>/stat field 22 and
-//       refuses to signal on any mismatch (the PID has been reused for an
-//       unrelated process). expectedStartTime==0 is treated as "no identity
-//       supplied" and rejected — we never signal without a verified identity.
+//
+//	(a) only SIGCONT/SIGSTOP are accepted — any other signal is a loud reject.
+//	(b) PID-reuse guard: the client supplies the starttime it captured when it
+//	    recorded the PID; the broker re-reads /proc/<pid>/stat field 22 and
+//	    refuses to signal on any mismatch (the PID has been reused for an
+//	    unrelated process). expectedStartTime==0 is treated as "no identity
+//	    supplied" and rejected — we never signal without a verified identity.
 func doSignalPID(pid, signal int, expectedStartTime uint64) Response {
 	if pid <= 0 {
 		return Response{Error: fmt.Sprintf("signal_pid: pid %d must be positive", pid)}
