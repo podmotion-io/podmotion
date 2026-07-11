@@ -498,9 +498,66 @@ cmd_provision_cilium() {
   echo "==> Cilium ready. CNI swap done at the install layer; run the cutover to remove Flannel/kube-proxy."
 }
 
+# ── cutover: remove Flannel/kube-proxy remnants after Cilium is confirmed live ──
+# Authored artifact for the Flannel→Cilium CNI cutover step (ADR-0322/ADR-0318
+# P-VERIFY-B / P-VERIFY-0 precondition). Idempotent and order-safe: verifies Cilium
+# is Ready on all 3 nodes FIRST (refuses to remove Flannel/kube-proxy if Cilium is not
+# confirmed live — that would leave the cluster with no CNI), then removes the
+# kube-flannel DaemonSet/namespace and kube-proxy DaemonSet/configmap if present, and
+# confirms each node's /etc/cni/net.d contains only the Cilium conflist. On this
+# standing cluster the install-layer swap (cmd_provision_cilium, cluster-pool IPAM,
+# kube-proxy-replacement) already left no Flannel pods and no kube-proxy DaemonSet —
+# this command makes that outcome an explicit, re-runnable, checked step rather than
+# an implicit side effect, and is safe to re-run (no-ops cleanly when nothing is left
+# to remove). VMs never touched.
+cmd_cutover() {
+  assert_no_vm_destruction
+  load_ips
+
+  echo "==> [1/3] Confirming Cilium is Ready on all nodes before removing Flannel/kube-proxy..."
+  local ready
+  ready=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" get ds cilium -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+  local desired
+  desired=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" get ds cilium -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo -1)
+  if [[ "$ready" -lt 1 || "$ready" != "$desired" ]]; then
+    echo "ERROR: Cilium DaemonSet not fully Ready ($ready/$desired) — refusing to remove Flannel/kube-proxy (cluster would be left with no CNI)." >&2
+    exit 1
+  fi
+  echo "  -- cilium DaemonSet Ready: $ready/$desired"
+
+  echo "==> [2/3] Removing Flannel remnants (if any)..."
+  if KUBECONFIG="$KUBECONFIG_OUT" kubectl get ns kube-flannel >/dev/null 2>&1; then
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-flannel delete daemonset kube-flannel-ds --ignore-not-found
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl delete ns kube-flannel --ignore-not-found
+  else
+    echo "  -- no kube-flannel namespace present (already clean)"
+  fi
+
+  echo "==> [3/3] Removing kube-proxy remnants (if any — Cilium kubeProxyReplacement=true supersedes it)..."
+  if KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-system get ds kube-proxy >/dev/null 2>&1; then
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-system delete daemonset kube-proxy --ignore-not-found
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-system delete configmap kube-proxy --ignore-not-found
+  else
+    echo "  -- no kube-proxy DaemonSet present (already clean)"
+  fi
+
+  echo "==> Verifying each node's CNI conf dir contains only the Cilium conflist..."
+  local ip
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    local confs
+    confs=$(nsh "$ip" "sudo ls /etc/cni/net.d/" 2>/dev/null || echo "UNKNOWN")
+    echo "  -- $ip: $confs"
+    if echo "$confs" | grep -qi flannel; then
+      echo "ERROR: node $ip still has a flannel CNI conflist present after cutover." >&2
+      exit 1
+    fi
+  done
+  echo "==> Cutover complete: Flannel/kube-proxy removed (or already absent), Cilium sole CNI-of-record on all nodes."
+}
+
 usage() {
   cat >&2 <<EOF
-Usage: hack/kvm-cluster.sh <verify|reset-cluster|deploy-podmotion|provision-shared-storage|provision-longhorn|provision-cilium|wipe|ssh <node-ip> [cmd]>
+Usage: hack/kvm-cluster.sh <verify|reset-cluster|deploy-podmotion|provision-shared-storage|provision-longhorn|provision-cilium|cutover|wipe|ssh <node-ip> [cmd]>
 
   verify            assert 3 nodes Ready via $KUBECONFIG_OUT
   reset-cluster     kubeadm reset+reinit+flannel+join ON the standing VMs (NEVER destroys VMs)
@@ -508,6 +565,7 @@ Usage: hack/kvm-cluster.sh <verify|reset-cluster|deploy-podmotion|provision-shar
   provision-shared-storage  NFS server on cp + nfs-common on all + RWX StorageClass $NFS_STORAGE_CLASS
   provision-longhorn  attach $LH_DISK_SIZE $LH_DISK_TARGET per node + Longhorn + SCs ($LH_STORAGE_CLASS, $LH_MIGRATABLE_SC)
   provision-cilium  pre-import Cilium images + helm install cilium/cilium $CILIUM_CHART_VERSION (cluster-pool/geneve/kube-proxy-replacement)
+  cutover           Flannel→Cilium CNI cutover: verify Cilium Ready, remove Flannel/kube-proxy remnants
   wipe              clean k8s + PodMotion state on the VMs WITHOUT destroying the VMs
 
 This script REFUSES to 'virsh destroy'/'virsh undefine' any of: ${PM_VMS[*]}.
@@ -524,6 +582,7 @@ main() {
     provision-shared-storage) cmd_provision_shared_storage ;;
     provision-longhorn) cmd_provision_longhorn ;;
     provision-cilium) cmd_provision_cilium ;;
+    cutover)          cmd_cutover ;;
     wipe)             cmd_wipe ;;
     ssh)              load_ips; nsh "$@" ;;
     *)                usage ;;
