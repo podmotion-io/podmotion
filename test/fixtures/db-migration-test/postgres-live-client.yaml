@@ -1,0 +1,61 @@
+# postgres-live-client — the Service-DNS read-side proof pod for ADR-0331's
+# live transcript capture.
+#
+# Purpose: prove the Endpoints repoint by connecting via postgres-live-svc's
+# Service DNS name (postgres-live-svc.pm-db-test.svc.cluster.local:5432) —
+# NEVER a hardcoded ClusterIP and NEVER the pod IP — and SELECTing the marker
+# row (counters.name='reads' or 'writes') both BEFORE and AFTER the migration,
+# with no client re-point in between. A successful post-migration read through
+# the unchanged Service DNS name is proof the Endpoints controller repointed
+# postgres-live-svc's subsets[].addresses[].targetRef to the replacement pod
+# (see docs/adr/0331-postgres-serviceip-green-selector-label-preservation.md).
+#
+# This is a SEPARATE trust route from the agent's pgProbe/dialAllowed
+# pod-CIDR-allowlist liveness path (internal/agent/server/server.go,
+# internal/agent/server/pgprobe.go) — this client pod must never route
+# through or relax that allowlist. It is a plain client-side `psql`
+# connection over the cluster network, exactly as any real application
+# client would connect.
+#
+# Credential handling (Security Reviewer constraint): POSTGRES_PASSWORD is
+# pmpass, trust/no-auth, for the throwaway pm-db-test namespace only. The
+# value is passed via env (PGPASSWORD), never baked into the image layer,
+# and this fixture must not be copied outside test/fixtures/db-migration-test/.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-live-client
+  namespace: pm-db-test
+  labels:
+    app: postgres-live-client
+spec:
+  restartPolicy: Never
+  containers:
+  - name: client
+    image: postgres:16-alpine
+    env:
+    - name: PGHOST
+      value: postgres-live-svc.pm-db-test.svc.cluster.local
+    - name: PGPORT
+      value: "5432"
+    - name: PGDATABASE
+      value: pmtest
+    - name: PGUSER
+      value: pmuser
+    - name: PGPASSWORD
+      value: pmpass
+    command:
+    - /bin/sh
+    - -c
+    - |
+      set -eu
+      echo "postgres-live-client: reading marker row via Service DNS ($PGHOST:$PGPORT)"
+      psql -X -A -t -c "SELECT name, value, updated FROM counters ORDER BY name;"
+      echo "postgres-live-client: read complete"
+    resources:
+      requests:
+        memory: "32Mi"
+        cpu: "50m"
+      limits:
+        memory: "64Mi"
+        cpu: "200m"
