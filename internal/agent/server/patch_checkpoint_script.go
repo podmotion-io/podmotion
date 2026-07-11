@@ -31,6 +31,14 @@ null_ext_key_masked = set(json.loads(sys.argv[2]))
 # ADR-0193 C-R3-1: inherit-fd name set (slash-stripped, from same builder as buildCRIURestoreArgs).
 # Used by P-0193-1 to exclude inherited fds from the PLAIN-REG firing class.
 _raw_inherit = json.loads(sys.argv[3]); inherit_fd_names = set(_raw_inherit) if _raw_inherit is not None else set()
+# argv[4]: shared/re-attach PVC mount paths (Tier0 RWX). An external mountpoints entry whose
+# ext_key (== the in-container mountPath) is in this set is a legitimate re-attachable volume the
+# destination pod mounts identically; it is PRESERVED (not B-2 dropped) so its files.img REG fds
+# classify consistent instead of orphaning into the P-0193-1 hard-stop, and CRIU re-attaches it via
+# the restore-side --ext-mount-map <path>:<path>. Empty for stateless workloads (prior behavior).
+# argv[4] may be absent on an older caller — default to empty for backward compatibility.
+_raw_reattach = json.loads(sys.argv[4]) if len(sys.argv) > 4 else []
+reattach_mount_paths = set(_raw_reattach) if _raw_reattach is not None else set()
 
 def backup(path):
     orig = path + '.orig'
@@ -253,10 +261,23 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     # Identify and drop external entries. Collect the mnt_ids being dropped (ext_drop_mnt_ids)
     # for the lockstep files.img rebind in the next section.
     ext_drop_mnt_ids = {}  # mnt_id -> ext_key (for event emission)
+    reattach_kept_mnt_ids = set()  # mnt_ids preserved as shared/re-attach externals (Tier0 RWX)
     kept_after_ext_drop = []
     for e in kept:
         ext_key = e.get('ext_key')
         mnt_id = e.get('mnt_id')
+        # Preserve shared/re-attach PVC externals (ext_key == in-container mountPath in
+        # reattach_mount_paths): keep the entry so its files.img REG fds stay consistent, and let
+        # CRIU re-attach the identically-mounted destination volume via the restore-side
+        # --ext-mount-map <path>:<path>. NOT dropped, NOT orphaned. Guard is unweakened: only an
+        # ext_key that exactly matches a pod-spec-derived PVC mountPath is preserved; every other
+        # external (masked /proc bind, SA token, /etc/* file binds) is still dropped below.
+        if ext_key and mnt_id is not None and ext_key in reattach_mount_paths:
+            reattach_kept_mnt_ids.add(mnt_id)
+            kept_after_ext_drop.append(e)
+            print('mountpoints: preserving re-attach external mnt_id=%d ext_key=%s (Tier0 RWX; CRIU re-attaches via --ext-mount-map)' % (
+                mnt_id, ext_key))
+            continue
         if ext_key and mnt_id is not None:
             # P-0194-1b re-entry guard (H2): before dropping, assert no kept entry references
             # this mnt_id as parent_mnt_id (i.e. confirm it is a leaf — AC-1 re-assertion).
@@ -280,10 +301,12 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     kept_mnt_ids = {e['mnt_id'] for e in kept_after_ext_drop if 'mnt_id' in e}
 
     # P-0194-1 (H2 re-entry guard / P-0194-1c pre-check): verify no external entry survives
-    # without a mapping. Under B-2 all external entries were dropped above; if any survived
-    # (e.g. future code path adds one back), HARD-STOP before writing the image.
+    # WITHOUT a mapping. Under B-2 all external entries were dropped above EXCEPT the deliberately
+    # preserved shared/re-attach PVC externals (reattach_kept_mnt_ids), which are resolved on
+    # restore by --ext-mount-map <path>:<path>. Any OTHER surviving external entry is unmapped —
+    # HARD-STOP before writing the image.
     for e in kept_after_ext_drop:
-        if e.get('ext_key'):
+        if e.get('ext_key') and e.get('mnt_id') not in reattach_kept_mnt_ids:
             print('EXTERNAL_MOUNT_UNRESOLVED:{"mnt_id":%d,"ext_key":"%s","shared_id":0,"master_id":0,"reason":"survived_drop"}' % (
                 e.get('mnt_id', -1), (e.get('ext_key') or '').replace('"', '\\"')), file=sys.stderr)
             sys.exit(1)
@@ -473,7 +496,12 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
             _fst = mnt_fstypes.get(mnt_id)
             if _fst is None:
                 _fst = mnt_fstypes.get(str(mnt_id))
-            _is_tmpfs_regfd = (not is_dir_fd) and ((_fst in ('TMPFS', 'DEVTMPFS')) or (mnt_id in tmpfs_drop_mnt_ids))
+            # Accept both the enum-name string (pretty=True/selftest) and the raw integer enum
+            # code (production pretty=False: TMPFS=5, DEVTMPFS=3) — same int-vs-string fix as
+            # classify_reg_fd (see classifyRegFdPy grounding note). Keeps the diagnostic
+            # 'tmpfs-shmem-regfd' label in lockstep with the classifier's REBIND decision on
+            # real live images, not just synthetic string-spelled corpora.
+            _is_tmpfs_regfd = (not is_dir_fd) and ((_fst in ('TMPFS', 'DEVTMPFS', 5, 3)) or (mnt_id in tmpfs_drop_mnt_ids))
             if _is_tmpfs_regfd:
                 # ADR-0311: tmpfs/shm-backed non-directory orphan (e.g. PostgreSQL /dev/shm
                 # segment). Distinct label — never aliases with the sysfs/DROP_ROOT_FSTYPES
@@ -586,13 +614,21 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
         sys.exit(1)
 
     # P-0194-1c cross-image assertion (SC-2): verify dual-write consistency.
-    # After rename: mountpoints must have no /data (ext_drop mnt_ids absent from kept_mnt_ids),
-    # AND files.img must have no REG fd still referencing those dropped mnt_ids.
+    # After rename: mountpoints must have no B-2-DROPPED external mount (ext_drop mnt_ids absent
+    # from kept_mnt_ids), AND files.img must have no REG fd still referencing those dropped mnt_ids.
     # This is the both-or-neither enforcement at the assertion layer.
+    #
+    # Shared/re-attach PVC externals (reattach_kept_mnt_ids) are DELIBERATELY preserved with their
+    # ext_key intact — they are resolved on restore by --ext-mount-map <path>:<path>, not dropped.
+    # They are therefore EXEMPT from the "surviving external" mismatch: their presence in the
+    # mountpoints image is the intended state, and their files.img fds are kept-consistent (KEEP),
+    # not dangling references to a dropped mnt_id. Only a B-2-dropped external surviving unexpectedly
+    # (or a files.img fd still pointing at a dropped mnt_id) is a real dual-write mismatch.
     with open(mp_path, 'rb') as f:
         mp_img_final = pycriu.images.load(f)
     surviving_ext_in_mp = {e['mnt_id'] for e in mp_img_final.get('entries', [])
-                           if e.get('ext_key') and 'mnt_id' in e}
+                           if e.get('ext_key') and 'mnt_id' in e
+                           and e['mnt_id'] not in reattach_kept_mnt_ids}
     surviving_ext_in_files = set()
     for entry in files_img_final.get('entries', []):
         if entry.get('type') != 'REG':

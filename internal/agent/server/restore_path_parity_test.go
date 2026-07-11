@@ -83,7 +83,7 @@ func TestRestoreBranch1_MACFlowsToReportRestoreConfirmed(t *testing.T) {
 	// Track that joinNsRestoreFn was called.
 	joinNsCalled := false
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error) {
+	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount) (int, []ExternalMountDroppedInfo, error) {
 		joinNsCalled = true
 		return 99999, nil, nil
 	}
@@ -123,13 +123,13 @@ func TestRestoreBranch2_MACFlowsToReportRestoreConfirmed(t *testing.T) {
 
 	// Stub patchCheckpointImagesFn — Branch 2 calls this; without stub it would exec Python.
 	origPatch := patchCheckpointImagesFn
-	patchCheckpointImagesFn = func(_ string, _ []string) error { return nil }
+	patchCheckpointImagesFn = func(_ string, _ []string, _ []string) error { return nil }
 	defer func() { patchCheckpointImagesFn = origPatch }()
 
 	// Track that joinNsRestoreFn was called.
 	joinNsCalled := false
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error) {
+	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount) (int, []ExternalMountDroppedInfo, error) {
 		joinNsCalled = true
 		return 99999, nil, nil
 	}
@@ -167,7 +167,7 @@ func TestJoinNsRestore_ReturnsMACToCaller(t *testing.T) {
 
 	// Stub joinNsRestoreFn — avoids real CRIU subprocess.
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error) {
+	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount) (int, []ExternalMountDroppedInfo, error) {
 		return 99999, nil, nil
 	}
 	defer func() { joinNsRestoreFn = origJoin }()
@@ -217,7 +217,7 @@ func TestRestoreBranch1_StrictFailsWhenNoK8sClient(t *testing.T) {
 	defer func() { readReplVethMACFn = orig }()
 
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error) {
+	joinNsRestoreFn = func(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount) (int, []ExternalMountDroppedInfo, error) {
 		return 12345, nil, nil
 	}
 	defer func() { joinNsRestoreFn = origJoin }()

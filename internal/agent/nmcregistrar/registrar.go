@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -316,6 +317,7 @@ func (r *Registrar) Register(ctx context.Context) error {
 	assertMagicTableCoverage(criuVersion)
 	kernelFeatures := detectKernelFeatures()
 	longhornAvailable := detectLonghorn(ctx, r.client)
+	cni := detectCNI() // ADR-0313: single call, reused for CNIPlugin, IPMobilitySupported, CNICompatible
 
 	// Resolve the node's InternalIP so the operator can reach this agent even when
 	// it runs as a systemd service (no pod IP discoverable via label selector).
@@ -348,8 +350,8 @@ func (r *Registrar) Register(ctx context.Context) error {
 				LocalPVMigratable: true,
 			},
 			NetworkCapability: pmv1.NetworkCapability{
-				CNIPlugin:           detectCNI(),
-				IPMobilitySupported: ipMobilitySupported(detectCNI(), kernelFeatures),
+				CNIPlugin:           cni,
+				IPMobilitySupported: ipMobilitySupported(cni, kernelFeatures),
 				XDPBridgeCapable:    kernelFeatures.XDPSupported && kernelFeatures.BPFEnabled,
 			},
 			MaxConcurrentMigrationsSource:      2,
@@ -391,6 +393,26 @@ func (r *Registrar) Register(ctx context.Context) error {
 	if ipsec, err := detectIPSecModeCNI(podCIDR); err == nil {
 		nmc.Status.IPSecEncryption = ipsec
 	}
+
+	// ADR-0313: CNICompatible condition, driven by detectCNI()=="cilium" INDEPENDENTLY
+	// of PODMOTION_FORCE_IP_MOBILITY (that override answers a different question — an
+	// operator bring-up escape hatch — and must not suppress this truthful advisory).
+	if cni == "cilium" {
+		meta.SetStatusCondition(&nmc.Status.Conditions, metav1.Condition{
+			Type:    pmv1.ConditionCNICompatible,
+			Status:  metav1.ConditionFalse,
+			Reason:  pmv1.ReasonCNIUnsupported,
+			Message: "Cilium has no IP-mobility handoff implementation (ADR-0082 CiliumHandoff is a v1.1 starting point, not yet live; tracked by cni-roadmap/cilium-v1.1). Live migration is refused at preflight for this node's CNI.",
+		})
+	} else {
+		meta.SetStatusCondition(&nmc.Status.Conditions, metav1.Condition{
+			Type:    pmv1.ConditionCNICompatible,
+			Status:  metav1.ConditionTrue,
+			Reason:  pmv1.ReasonCNISupported,
+			Message: fmt.Sprintf("CNI plugin %q is supported by PodMotion's live-migration datapath.", cni),
+		})
+	}
+
 	if err := r.client.Status().Update(ctx, nmc); err != nil {
 		return fmt.Errorf("updating NodeMigrationCapacity status: %w", err)
 	}
@@ -529,8 +551,11 @@ func ipMobilitySupported(cni string, kf pmv1.KernelFeatures) bool {
 		// kindnet is host-routed (no VXLAN overlay); no FDB device exists.
 		// DiscoverFdbInterface would return "" — return false directly (ADR-0192 B2).
 		return false
-	case "calico", "cilium", "ovn-kubernetes": // BGP/native routing or native eBPF datapath
+	case "calico", "ovn-kubernetes": // BGP/native routing or native eBPF datapath
 		return true
+	case "cilium": // ADR-0313: no IP-mobility handoff implemented for Cilium — see
+		// CNICompatible=False/CNIUnsupported condition emitted at registration.
+		return false
 	default:
 		return false
 	}

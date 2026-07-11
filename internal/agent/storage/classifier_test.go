@@ -273,6 +273,79 @@ func TestStorageClassifier_TransparentVolumes_NotClassified(t *testing.T) {
 	}
 }
 
+// TestStorageClassifier_PostgresPGDataOnRWX_ReachesTier0 is the PINNED regression
+// guard for the postgres checkpoint-stage failure (2026-07-10 live gate).
+//
+// Ground truth from the live KVM run: postgres never reached Checkpointing. With
+// PGDATA on a disk-backed emptyDir the classifier (correctly) returns TierBlocked,
+// so StorageReadyForFreeze stays False (reason=BlockedVolume) and the migration
+// hangs in PreCopyMemory — silent-data-loss protection, but the pod can never
+// migrate. The fix backs PGDATA with an RWX PV (nfs-shared) so both source and
+// destination nodes see the SAME live data directory: it maps to Tier0 (re-attach,
+// zero data movement) and the freeze is allowed to proceed past Checkpointing.
+//
+// This test pins the exact postgres pod shape — an RWX PVC-backed PGDATA mount
+// alongside a transparent configMap init volume — and asserts the highest tier is
+// Tier0, NOT TierBlocked. If a future change reverts PGDATA to a raw emptyDir, or
+// mis-classifies an RWX PVC, the migration would silently regress back to the
+// PreCopyMemory hang; this test fails loudly instead.
+func TestStorageClassifier_PostgresPGDataOnRWX_ReachesTier0(t *testing.T) {
+	// RWX PVC on the shared-NFS StorageClass, exactly as the postgres-src fixture
+	// declares it after the fix.
+	pvc := makePVC("postgres-pgdata", "pm-db-test", "nfs-shared",
+		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "postgres-src", Namespace: "pm-db-test"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{
+				{
+					// PGDATA — the writable DB state, now on an RWX PV.
+					Name: "data",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: "postgres-pgdata",
+						},
+					},
+				},
+				{
+					// init.sql — transparent, reconstructed from the pod spec.
+					Name: "init",
+					VolumeSource: corev1.VolumeSource{
+						ConfigMap: &corev1.ConfigMapVolumeSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "postgres-init"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(newScheme()).
+		WithObjects(pvc).
+		Build()
+
+	classifier := storage.NewStorageClassifier(fakeClient)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Only the PVC volume is classified; the configMap is transparent (skipped).
+	if len(clsfs) != 1 {
+		t.Fatalf("expected 1 classification (PGDATA PVC; configMap transparent), got %d", len(clsfs))
+	}
+	highest := storage.HighestTier(clsfs)
+	if highest.Tier != storage.TierRWX {
+		t.Fatalf("postgres PGDATA on an RWX PV must map to Tier0 re-attach (not Blocked) so the "+
+			"migration reaches past Checkpointing; got tier=%d reason=%q", highest.Tier, highest.Reason)
+	}
+	if highest.Tier == storage.TierBlocked {
+		t.Fatalf("regression: postgres migration blocked at the storage freeze gate (would hang in PreCopyMemory)")
+	}
+}
+
 func TestLonghornStubMigrator_EmitsReadyImmediately(t *testing.T) {
 	stub := &storage.LonghornStubMigrator{}
 

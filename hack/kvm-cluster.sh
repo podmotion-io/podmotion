@@ -70,6 +70,28 @@ LH_NAMESPACE="${LH_NAMESPACE:-longhorn-system}"
 LH_STORAGE_CLASS="${LH_STORAGE_CLASS:-longhorn}"             # default RWO SC (ships with Longhorn)
 LH_MIGRATABLE_SC="${LH_MIGRATABLE_SC:-longhorn-migratable}"  # RWX live-migration SC (created here)
 
+# ── Cilium CNI (eBPF-native, per-endpoint routing) ───────────────────────────
+# Cilium replaces Flannel as the CNI. Flannel routes a pod IP by per-node /24
+# subnet over VXLAN, so a live-migrated pod that KEEPS its source IP lands on the
+# wrong node and cross-node reachability fails. Cilium's per-endpoint /32 routing
+# (endpointRoutes.enabled=true + ipcache) makes a preserved pod IP routable to the
+# node that actually holds the endpoint — the primitive PodMotion IP-handoff needs.
+#
+# IPAM=cluster-pool with the EXISTING 10.244.0.0/16 + /24-per-node mask preserves
+# the current podCIDRs byte-identically (no kubeadm re-init, no renumbering).
+# routingMode=tunnel + geneve wraps every inter-node pod packet in a 192.168.122.x
+# outer header — byte-identical traversal to the Flannel VXLAN this substrate has
+# already proven (avoids the unproven native-routing chain across the libvirt NAT
+# L2). kube-proxy replacement is ON (eBPF service datapath). The Flannel path in
+# reset-cluster stays intact as the rollback baseline.
+CILIUM_VERSION="${CILIUM_VERSION:-1.17.6}"
+CILIUM_CHART_VERSION="${CILIUM_CHART_VERSION:-1.17.6}"
+CILIUM_NAMESPACE="${CILIUM_NAMESPACE:-kube-system}"
+CILIUM_IMG="${CILIUM_IMG:-quay.io/cilium/cilium:v${CILIUM_VERSION}}"
+CILIUM_OPERATOR_IMG="${CILIUM_OPERATOR_IMG:-quay.io/cilium/operator-generic:v${CILIUM_VERSION}}"
+CILIUM_APISERVER_HOST="${CILIUM_APISERVER_HOST:-}"   # resolved to CP1_IP at run time
+CILIUM_APISERVER_PORT="${CILIUM_APISERVER_PORT:-6443}"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
@@ -400,15 +422,92 @@ YAML
   echo "==> Workloads: use storageClassName: $LH_STORAGE_CLASS (RWO) or $LH_MIGRATABLE_SC (RWX, live-migratable)."
 }
 
+# ── provision-cilium: pre-import Cilium images → helm install → status --wait ──
+# Idempotent. Installs Cilium as the CNI with the IP-preservation primitive PodMotion
+# needs (per-endpoint /32 routing + ipcache), preserving the existing pod CIDR
+# (10.244.0.0/16, /24 per node) via cluster-pool IPAM — no kubeadm re-init, no
+# renumbering. routingMode=tunnel/geneve gives proven-traversable inter-node encap on
+# this libvirt NAT L2; kube-proxy replacement is ON. Images are pre-imported into each
+# node's k8s.io containerd namespace (no-registry idiom, same as deploy-podmotion) so a
+# stalled pull cannot leave the cluster CNI-less. This does NOT remove Flannel or
+# kube-proxy — the operator performs the ordered, recoverable cutover on the live
+# cluster; reset-cluster's Flannel path stays the rollback baseline. VMs never touched.
+cmd_provision_cilium() {
+  assert_no_vm_destruction
+  load_ips
+  CILIUM_APISERVER_HOST="${CILIUM_APISERVER_HOST:-$CP1_IP}"
+
+  echo "==> [1/3] Pre-importing Cilium images into each node's k8s.io containerd namespace (no registry)..."
+  # Pre-import is MANDATORY: removing Flannel before the Cilium images are resident on
+  # every node would leave the cluster with no CNI while pods pull — so pull to the
+  # host, docker save, and import per node, verifying each tag landed before install.
+  local ip
+  for img in "$CILIUM_IMG" "$CILIUM_OPERATOR_IMG"; do
+    echo "  -- ensure $img present on host"
+    docker image inspect "$img" >/dev/null 2>&1 || docker pull "$img"
+  done
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    echo "  -- import into $ip"
+    docker save "$CILIUM_IMG"          | nsh "$ip" "sudo ctr -n k8s.io images import -"
+    docker save "$CILIUM_OPERATOR_IMG" | nsh "$ip" "sudo ctr -n k8s.io images import -"
+    if ! nsh "$ip" "sudo ctr -n k8s.io images ls -q | grep -q 'cilium:v${CILIUM_VERSION}'"; then
+      echo "ERROR: cilium:v${CILIUM_VERSION} not present in k8s.io containerd namespace on node $ip after import." >&2
+      exit 1
+    fi
+    if ! nsh "$ip" "sudo ctr -n k8s.io images ls -q | grep -q 'operator-generic:v${CILIUM_VERSION}'"; then
+      echo "ERROR: operator-generic:v${CILIUM_VERSION} not present in k8s.io containerd namespace on node $ip after import." >&2
+      exit 1
+    fi
+  done
+
+  echo "==> [2/3] helm install cilium/cilium $CILIUM_CHART_VERSION (cluster-pool + tunnel/geneve + kube-proxy-replacement)..."
+  helm repo add cilium https://helm.cilium.io >/dev/null 2>&1 || true
+  helm repo update cilium >/dev/null 2>&1 || true
+  # cluster-pool IPAM with the EXISTING /16 + /24 mask = byte-identical podCIDRs.
+  # tunnel/geneve = proven inter-node encap; kubeProxyReplacement + k8sServiceHost/Port
+  # (apiserver reachable before the eBPF service map is programmed); bpf.masquerade with
+  # ipv4NativeRoutingCIDR = pod CIDR excluded from SNAT so pod<->pod keeps its real
+  # source IP (essential for TCP/IP preservation). pullPolicy IfNotPresent picks up the
+  # pre-imported images. This is upgrade --install so re-running is safe.
+  KUBECONFIG="$KUBECONFIG_OUT" helm upgrade --install cilium cilium/cilium \
+    --version "$CILIUM_CHART_VERSION" --namespace "$CILIUM_NAMESPACE" \
+    --set ipam.mode=cluster-pool \
+    --set ipam.operator.clusterPoolIPv4PodCIDRList="{$POD_CIDR}" \
+    --set ipam.operator.clusterPoolIPv4MaskSize=24 \
+    --set routingMode=tunnel \
+    --set tunnelProtocol=geneve \
+    --set endpointRoutes.enabled=true \
+    --set kubeProxyReplacement=true \
+    --set k8sServiceHost="$CILIUM_APISERVER_HOST" \
+    --set k8sServicePort="$CILIUM_APISERVER_PORT" \
+    --set bpf.masquerade=true \
+    --set enableIPv4Masquerade=true \
+    --set ipv4NativeRoutingCIDR="$POD_CIDR" \
+    --set image.pullPolicy=IfNotPresent \
+    --set operator.image.pullPolicy=IfNotPresent \
+    --set operator.replicas=1
+
+  echo "==> [3/3] Waiting for Cilium to come up (cilium status --wait)..."
+  if command -v cilium >/dev/null 2>&1; then
+    KUBECONFIG="$KUBECONFIG_OUT" cilium status --wait
+  else
+    echo "  -- cilium-cli not on PATH; waiting on the DaemonSet/Deployment rollout instead"
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" rollout status ds/cilium --timeout=300s
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" rollout status deploy/cilium-operator --timeout=300s
+  fi
+  echo "==> Cilium ready. CNI swap done at the install layer; run the cutover to remove Flannel/kube-proxy."
+}
+
 usage() {
   cat >&2 <<EOF
-Usage: hack/kvm-cluster.sh <verify|reset-cluster|deploy-podmotion|provision-shared-storage|provision-longhorn|wipe|ssh <node-ip> [cmd]>
+Usage: hack/kvm-cluster.sh <verify|reset-cluster|deploy-podmotion|provision-shared-storage|provision-longhorn|provision-cilium|wipe|ssh <node-ip> [cmd]>
 
   verify            assert 3 nodes Ready via $KUBECONFIG_OUT
   reset-cluster     kubeadm reset+reinit+flannel+join ON the standing VMs (NEVER destroys VMs)
   deploy-podmotion  build+import images, mint mTLS, apply CRDs, helm install (TAG=<tag>)
   provision-shared-storage  NFS server on cp + nfs-common on all + RWX StorageClass $NFS_STORAGE_CLASS
   provision-longhorn  attach $LH_DISK_SIZE $LH_DISK_TARGET per node + Longhorn + SCs ($LH_STORAGE_CLASS, $LH_MIGRATABLE_SC)
+  provision-cilium  pre-import Cilium images + helm install cilium/cilium $CILIUM_CHART_VERSION (cluster-pool/geneve/kube-proxy-replacement)
   wipe              clean k8s + PodMotion state on the VMs WITHOUT destroying the VMs
 
 This script REFUSES to 'virsh destroy'/'virsh undefine' any of: ${PM_VMS[*]}.
@@ -424,6 +523,7 @@ main() {
     deploy-podmotion) cmd_deploy_podmotion ;;
     provision-shared-storage) cmd_provision_shared_storage ;;
     provision-longhorn) cmd_provision_longhorn ;;
+    provision-cilium) cmd_provision_cilium ;;
     wipe)             cmd_wipe ;;
     ssh)              load_ips; nsh "$@" ;;
     *)                usage ;;

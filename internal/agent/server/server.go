@@ -465,7 +465,15 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 	// This is the last resort before fail-close: the replacement pod created by the operator
 	// carries the correct workload image in its spec, so we read it directly.
 	if imageName == "" && s.k8sClient != nil {
-		if resolved := s.resolveImageFromReplacementPod(migrationName); resolved != "" {
+		// AUTHORITATIVE source first: MCP.Spec.WorkloadImage (ADR-0217 D1) is set in Validating and
+		// is race-free (independent of Status.ReplacementPodName / a live replacement pod). Prefer
+		// it over the replacement-pod resolver, which was observed racing on the agent-Restore-RPC
+		// fallback path. Fall back to the pod resolver only if the MCP is unreadable/empty.
+		if resolved := s.resolveImageFromMCP(migrationName); resolved != "" {
+			imageName = resolved
+			log.Info("ADR-0217 D1: resolved workload image from MCP.Spec.WorkloadImage (authoritative)",
+				"migration", migrationName, "image", imageName)
+		} else if resolved := s.resolveImageFromReplacementPod(migrationName); resolved != "" {
 			imageName = resolved
 			log.Info("ADR-0217 D2: resolved workload image from replacement pod spec",
 				"migration", migrationName, "image", imageName)
@@ -476,7 +484,20 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 		// pod spec). Fail-close rather than substitute a wrong image (gate-11 lesson, ADR-0215).
 		return 0, "", fmt.Errorf("ADR-0217: restore image unresolved — NRI event, PrepareDestinationNetns cache, and replacement pod spec all empty for migration %s", migrationName)
 	}
-	pid, droppedMounts, err := joinNsRestoreFn(migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode)
+	// Resolve shared/re-attach PVC mount paths (Tier0 RWX) so patchCheckpointImages preserves them
+	// and CRIU re-attaches them on restore instead of P-0193-1 hard-stopping their open file fds.
+	// The replacement pod is a paused placeholder created ~5s before restore; its RWX volume may not
+	// be published in the destination kubelet's mount table at the instant this NRI restore fires, so
+	// bounded-wait on the kubelet-published mount rather than emitting a broken 1:1 map. Budget is
+	// 85s — kept just under the 90s outer NRI restoreCtx so the wait yields to the outer deadline.
+	// (JoinNsRestore takes no ctx param; the budget is derived here to keep the diff minimal.)
+	reCtx, reCancel := context.WithTimeout(context.Background(), 85*time.Second)
+	reattachMounts, reErr := s.resolveReattachMountsWaiting(reCtx, migrationName)
+	reCancel()
+	if reErr != nil {
+		return 0, "", reErr
+	}
+	pid, droppedMounts, err := joinNsRestoreFn(migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode, reattachMounts)
 	if err != nil {
 		// ADR-0193 P-0193-4 / S1: emit a Warning CRIUImageInconsistency Kubernetes Event on the
 		// PodMigration CR when the P-0193-1 hard-stop fires. The event message carries only
@@ -549,6 +570,64 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 // it reads the replacement pod's own container[0].Image from the Kubernetes API. The
 // replacement pod name lives on PodMigration.Status.ReplacementPodName and is carried in the
 // workload namespace (pm.Spec.PodNamespace). Returns "" on any failure (caller fail-closes).
+// lookupPodMigration resolves the PodMigration CR for migrationName. The CR lives in the
+// workload namespace; probe POD_NAMESPACE then podmotion-system, and finally fall back to a
+// cross-namespace List (the CR may live in the workload namespace, e.g. "default", not the
+// agent's POD_NAMESPACE). Returns the CR (and its resolved namespace) or false on any failure.
+func (s *AgentServer) lookupPodMigration(ctx context.Context, migrationName string) (*pmv1.PodMigration, bool) {
+	if s.k8sClient == nil || migrationName == "" {
+		return nil, false
+	}
+	ns := os.Getenv("POD_NAMESPACE")
+	if ns == "" {
+		ns = "podmotion-system"
+	}
+	pm := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: migrationName, Namespace: ns}, pm); err != nil {
+		pmList := &pmv1.PodMigrationList{}
+		if listErr := s.k8sClient.List(ctx, pmList); listErr != nil {
+			return nil, false
+		}
+		for i := range pmList.Items {
+			if pmList.Items[i].Name == migrationName {
+				*pm = pmList.Items[i]
+				return pm, true
+			}
+		}
+		return nil, false
+	}
+	return pm, true
+}
+
+// resolveImageFromMCP is the AUTHORITATIVE, race-free restore-image source. It reads
+// MigrationCheckpoint.Spec.WorkloadImage — set by the controller's ADR-0217 D1 producer in the
+// Validating phase (podmigration_controller.go), long before restore, and equal to the source
+// pod's container[0].Image. The MCP is named {pm.Name, pm.Namespace} (same key as the
+// PodMigration CR). Unlike resolveImageFromReplacementPod, this does NOT depend on
+// Status.ReplacementPodName being populated or on the replacement pod being alive/not mid-teardown
+// at resolve time — the observed race on the agent-Restore-RPC fallback path (~60s after the NRI
+// confirm window times out) where the replacement pod resolver returned empty. Returns "" on any
+// failure (caller falls through to the pod resolver, then fail-closes).
+func (s *AgentServer) resolveImageFromMCP(migrationName string) string {
+	if s.k8sClient == nil || migrationName == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// The MCP shares the PodMigration CR's name+namespace. Resolve the namespace via the same
+	// lookup the pod resolver uses so we tolerate the CR living in a non-agent namespace.
+	pm, ok := s.lookupPodMigration(ctx, migrationName)
+	if !ok {
+		return ""
+	}
+	mcp := &pmv1.MigrationCheckpoint{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: pm.Name, Namespace: pm.Namespace}, mcp); err != nil {
+		return ""
+	}
+	return mcp.Spec.WorkloadImage
+}
+
 func (s *AgentServer) resolveImageFromReplacementPod(migrationName string) string {
 	if s.k8sClient == nil || migrationName == "" {
 		return ""
@@ -556,30 +635,9 @@ func (s *AgentServer) resolveImageFromReplacementPod(migrationName string) strin
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// The PodMigration CR lives in the workload namespace; probe POD_NAMESPACE then default.
-	ns := os.Getenv("POD_NAMESPACE")
-	if ns == "" {
-		ns = "podmotion-system"
-	}
-	pm := &pmv1.PodMigration{}
-	if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: migrationName, Namespace: ns}, pm); err != nil {
-		// Fall back to a List across namespaces (the CR may live in the workload namespace,
-		// e.g. "default", not the agent's POD_NAMESPACE).
-		pmList := &pmv1.PodMigrationList{}
-		if listErr := s.k8sClient.List(ctx, pmList); listErr != nil {
-			return ""
-		}
-		found := false
-		for i := range pmList.Items {
-			if pmList.Items[i].Name == migrationName {
-				*pm = pmList.Items[i]
-				found = true
-				break
-			}
-		}
-		if !found {
-			return ""
-		}
+	pm, ok := s.lookupPodMigration(ctx, migrationName)
+	if !ok {
+		return ""
 	}
 
 	replName := pm.Status.ReplacementPodName
@@ -598,6 +656,402 @@ func (s *AgentServer) resolveImageFromReplacementPod(migrationName string) strin
 		return ""
 	}
 	return pod.Spec.Containers[0].Image
+}
+
+// reattachMount is one shared/re-attach (Tier0) volume mount preserved across a migration.
+// ContainerPath is the in-container mountPath (== the CRIU ext_key recorded by ctr checkpoint,
+// the source of truth the patch classifier keys on). HostTarget is the path — visible in the
+// destination HOST mount namespace where CRIU runs via nsenter — that CRIU binds the mount FROM
+// on restore (the kubelet-mounted volume dir of the replacement pod). ContainerPath alone drives
+// the patch's KEEP decision; the (ContainerPath, HostTarget) pair drives the restore-side
+// --ext-mount-map so CRIU re-attaches the SAME live data the destination pod already mounted.
+type reattachMount struct {
+	ContainerPath string
+	HostTarget    string
+}
+
+// reattachContainerPaths projects the in-container paths from a []reattachMount (the set the patch
+// classifier needs). Order-preserving.
+func reattachContainerPaths(ms []reattachMount) []string {
+	if len(ms) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(ms))
+	for _, m := range ms {
+		paths = append(paths, m.ContainerPath)
+	}
+	return paths
+}
+
+// replacementPodLabelKey is the label the controller stamps on the replacement pod at creation
+// time (podmigration_controller.go). It equals the PodMigration name. It is the authoritative,
+// race-free way to find the replacement pod on the destination node — unlike
+// pm.Status.ReplacementPodName, which is a Status field that is frequently read back empty at
+// restore time (the replacement pod is created ~5s before restore runs and the status write races
+// the agent's cached read). This mirrors the image-resolution hardening (resolveImageFromMCP):
+// prefer a source of truth that does not depend on a Status field being populated at the exact
+// instant the agent reads it (primitive over brittle chain).
+const replacementPodLabelKey = "podmotion.io/migration-name"
+
+// resolveReplacementPod finds the replacement pod for a migration by the authoritative
+// migration-name label instead of the flaky pm.Status.ReplacementPodName status field. It lists
+// pods in podNs carrying replacementPodLabelKey==migrationName and returns the single match.
+// Returns nil if none/ambiguous — callers decide whether that is fatal. This is the label-selector
+// primitive the Sprint-44 diagnosis prescribes: the controller stamps the label at replacement-pod
+// creation, so it is present long before restore and does not race the status write.
+func (s *AgentServer) resolveReplacementPod(ctx context.Context, migrationName, podNs string) *corev1.Pod {
+	if s.k8sClient == nil || migrationName == "" || podNs == "" {
+		return nil
+	}
+	podList := &corev1.PodList{}
+	if err := s.k8sClient.List(ctx, podList,
+		client.InNamespace(podNs),
+		client.MatchingLabels{replacementPodLabelKey: migrationName}); err != nil {
+		return nil
+	}
+	var match *corev1.Pod
+	for i := range podList.Items {
+		p := &podList.Items[i]
+		// Skip pods already terminating (a prior failed attempt's replacement mid-teardown).
+		if p.DeletionTimestamp != nil {
+			continue
+		}
+		if match != nil {
+			// Ambiguous: more than one live replacement pod for this migration. Do not guess.
+			return nil
+		}
+		match = p
+	}
+	return match
+}
+
+// ReattachVolumeNotYetPublishedError is a RETRYABLE sentinel returned by resolveReattachMounts when
+// the replacement pod is resolved (its UID is known via the migration-name label) but the kubelet
+// has NOT yet published the re-attach (Tier0 RWX) PV's mount into the host mount table — i.e. the
+// destination kubelet's NodePublish for that volume has not completed at the instant restore fires.
+// This is DISTINCT from the terminal ExternalMountUnresolvedError: callers separate "not yet"
+// (bounded wait on the real kubelet-driven mount-table edge) from "never" (fail closed). The
+// replacement pod is a paused placeholder created ~5s before restore; its RWX volume mount is not
+// guaranteed established on the destination node at the instant restore is dispatched, so a present
+// mountpoint is a legitimate bounded WAIT rather than an immediate hard stop.
+type ReattachVolumeNotYetPublishedError struct {
+	ContainerPath string
+	PVName        string
+	ReplUID       string
+}
+
+func (e *ReattachVolumeNotYetPublishedError) Error() string {
+	return fmt.Sprintf("reattach volume not yet published: kubelet mountpoint for pv=%s (pod uid=%s) backing container path %s is not present in the host mount table yet", e.PVName, e.ReplUID, e.ContainerPath)
+}
+
+// resolveReattachMounts returns the shared/re-attach (Tier0 RWX) PVC mounts of the migrating pod,
+// each as an (in-container path, destination host-target path) pair. These are legitimate,
+// restorable EXTERNAL mounts: `ctr tasks checkpoint` records a PVC-backed volume as an external
+// mountpoints entry (ext_key = the in-container mountPath), and the workload holds open file
+// handles on it (e.g. PostgreSQL WAL/relation files under /var/lib/postgresql/data). Such a mount
+// must be PRESERVED across the checkpoint-image patch (kept in kept_mnt_ids so its files.img REG
+// fds classify consistent, NOT dropped-and-orphaned into the P-0193-1 hard-stop) and re-attached on
+// restore via --ext-mount-map <containerPath>:<hostTarget>. This is the "RWX re-attach" storage
+// tier — no data bytes move; the same volume is visible on both nodes.
+//
+// The in-container path comes from the pod spec (not a hardcoded workload path): every
+// container volumeMount whose named volume resolves to a PVC. The HOST TARGET is the kubelet volume
+// directory the destination kubelet already mounted for the replacement pod
+// (/var/lib/kubelet/pods/<replUID>/volumes/kubernetes.io~*/<pvName>) — CRIU runs in the host mount
+// namespace and cannot see the in-container path (it exists only inside the replacement pod's mount
+// ns), so mapping <containerPath>:<containerPath> fails with "open_tree ... No such file or
+// directory"; the host kubelet dir is the real bind source. Returns nil on any failure — the caller
+// then patches with no re-attach set (prior fail-closed behavior).
+// resolveReattachMounts single-shot-resolves the re-attach mounts. It returns:
+//   - (nil, nil)   — no re-attach mounts apply (no client, lookup fail, no PVCs, spec pod get fail).
+//   - (mounts, nil) — every re-attach mount's host target resolved.
+//   - (nil, *ReattachVolumeNotYetPublishedError) — the replacement pod is resolved (UID known via
+//     label) but at least one PVC-backed mount's kubelet volume is not yet published in the host
+//     mount table. This is the RETRYABLE "not yet" case — the caller re-probes under its ctx budget.
+//
+// When the replacement pod is NOT resolved at all (no label match and Status.ReplacementPodName
+// empty), the "never/label-missing" branch stays terminal: a HostTarget=="" mount is appended so
+// buildCRIURestoreArgs' guard (server.go ~3266) fails closed with "replacement pod not found by
+// label".
+func (s *AgentServer) resolveReattachMounts(migrationName string) ([]reattachMount, error) {
+	return s.resolveReattachMountsImpl(migrationName, false)
+}
+
+// resolveReattachMountsImpl is the shared body behind resolveReattachMounts (terminalOnBudget=false,
+// returns the retryable sentinel for a not-yet-published volume) and reattachMountsUnresolvedForTerminal
+// (terminalOnBudget=true, promotes the not-yet mount to a HostTarget=="" entry so the terminal
+// buildCRIURestoreArgs guard fails closed once the wait budget is spent).
+func (s *AgentServer) resolveReattachMountsImpl(migrationName string, terminalOnBudget bool) ([]reattachMount, error) {
+	if s.k8sClient == nil || migrationName == "" {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pm, ok := s.lookupPodMigration(ctx, migrationName)
+	if !ok {
+		return nil, nil
+	}
+	podNs := pm.Spec.PodNamespace
+	if podNs == "" {
+		podNs = pm.Namespace
+	}
+
+	// The REPLACEMENT pod is authoritative for the host target — it is the pod whose kubelet
+	// mount we bind from on the destination. Its volume set is identical to the source's by
+	// construction (same spec). Resolve it by the migration-name LABEL (the source of truth the
+	// controller stamps at replacement-pod creation) rather than pm.Status.ReplacementPodName,
+	// which is frequently read back empty at restore time — the defect that produced the broken
+	// 1:1 container-path ext-mount-map (primitive over brittle chain). Fall back to the
+	// status field only if the label lookup finds nothing, then to the source pod for the
+	// in-container path set (host-target resolution then no-ops and buildCRIURestoreArgs
+	// fail-closes on the unresolved host target).
+	replPod := s.resolveReplacementPod(ctx, migrationName, podNs)
+	if replPod == nil {
+		replName := pm.Status.ReplacementPodName
+		if replName != "" {
+			p := &corev1.Pod{}
+			if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: replName, Namespace: podNs}, p); err == nil {
+				replPod = p
+			}
+		}
+	}
+	specPod := replPod
+	if specPod == nil {
+		p := &corev1.Pod{}
+		if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: pm.Spec.PodName, Namespace: podNs}, p); err != nil {
+			return nil, nil
+		}
+		specPod = p
+	}
+
+	// Map each PVC-backed volume name → its in-container mountPath(s).
+	pvcVolToClaim := make(map[string]string)
+	for _, v := range specPod.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil {
+			pvcVolToClaim[v.Name] = v.PersistentVolumeClaim.ClaimName
+		}
+	}
+	if len(pvcVolToClaim) == 0 {
+		return nil, nil
+	}
+
+	// Resolve each claim → PV name (the leaf dir under the kubelet volumes dir) once.
+	claimToPV := make(map[string]string)
+	for _, claim := range pvcVolToClaim {
+		if _, done := claimToPV[claim]; done {
+			continue
+		}
+		pvc := &corev1.PersistentVolumeClaim{}
+		if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: claim, Namespace: podNs}, pvc); err == nil {
+			claimToPV[claim] = pvc.Spec.VolumeName
+		}
+	}
+
+	replUID := ""
+	if replPod != nil {
+		replUID = string(replPod.UID)
+	}
+
+	seen := make(map[string]bool)
+	var mounts []reattachMount
+	// Track the first PVC mount whose host target could not be resolved while the replacement pod
+	// WAS resolved (replUID known) — that is the retryable "not yet published" case. We defer the
+	// decision until after the collect loops so the whole mount set is walked deterministically.
+	var notYetCP, notYetPV string
+	collect := func(mnts []corev1.VolumeMount) {
+		for _, m := range mnts {
+			claim, isPVC := pvcVolToClaim[m.Name]
+			if !isPVC {
+				continue
+			}
+			cp := filepath.Clean(m.MountPath)
+			if cp == "" || cp == "." || seen[cp] {
+				continue
+			}
+			seen[cp] = true
+			host := resolveKubeletVolumeHostPath(replUID, claimToPV[claim])
+			if host == "" && replUID != "" && !terminalOnBudget {
+				// Replacement pod resolved but its kubelet volume is not yet published in the host
+				// mount table: capture it as the retryable "not yet" case rather than appending a
+				// HostTarget=="" mount (which would fail closed immediately).
+				if notYetCP == "" {
+					notYetCP = cp
+					notYetPV = claimToPV[claim]
+				}
+				continue
+			}
+			mounts = append(mounts, reattachMount{ContainerPath: cp, HostTarget: host})
+		}
+	}
+	for i := range specPod.Spec.InitContainers {
+		collect(specPod.Spec.InitContainers[i].VolumeMounts)
+	}
+	for i := range specPod.Spec.Containers {
+		collect(specPod.Spec.Containers[i].VolumeMounts)
+	}
+	if notYetCP != "" {
+		// At least one re-attach volume is not yet published (replacement pod resolved). Signal the
+		// retryable sentinel so the caller re-probes the mount table under its bounded ctx budget.
+		return nil, &ReattachVolumeNotYetPublishedError{ContainerPath: notYetCP, PVName: notYetPV, ReplUID: replUID}
+	}
+	return mounts, nil
+}
+
+// reattachMountsUnresolvedForTerminal rebuilds the re-attach mount list exactly like
+// resolveReattachMounts but, once the wait budget is spent, appends any not-yet-published mount with
+// HostTarget=="" so buildCRIURestoreArgs' terminal guard fires with its actionable
+// "reattach host target unresolved" error (never the broken 1:1 map). Used only by
+// resolveReattachMountsWaiting on ctx expiry — the "never" branch.
+func (s *AgentServer) reattachMountsUnresolvedForTerminal(migrationName string) []reattachMount {
+	mounts, _ := s.resolveReattachMountsImpl(migrationName, true)
+	return mounts
+}
+
+// resolveReattachMountsWaiting re-probes the kubelet mount table under ctx until every RWX re-attach
+// volume is published, or ctx expires. "Not yet" is a bounded wait on the real kubelet-driven state
+// transition (mountpoint absent → re-probe); expiry fails closed via the caller's existing terminal
+// guard (buildCRIURestoreArgs refuses the broken 1:1 map when HostTarget=="").
+func (s *AgentServer) resolveReattachMountsWaiting(ctx context.Context, migrationName string) ([]reattachMount, error) {
+	for {
+		m, err := s.resolveReattachMounts(migrationName)
+		var notYet *ReattachVolumeNotYetPublishedError
+		if !errors.As(err, &notYet) {
+			return m, err // resolved, no-mounts, or a real error
+		}
+		select {
+		case <-ctx.Done():
+			// Budget spent: convert to the terminal path. Rebuild the mount list with the not-yet
+			// mount promoted to a HostTarget=="" entry so buildCRIURestoreArgs' existing guard
+			// fails closed (never the 1:1 map) with an actionable message.
+			return s.reattachMountsUnresolvedForTerminal(migrationName), nil
+		case <-time.After(1 * time.Second):
+		}
+	}
+}
+
+// parseKubeletMountFromMountinfo resolves the destination-host bind source for a re-attach PV by
+// reading the kubelet-published mount out of a /proc/self/mountinfo dump, rather than globbing the
+// pod dir. The mount table is written by the kubelet exactly when NodePublish completes and is the
+// same bind source CRIU passes to open_tree, so a present mountpoint is the atomic non-flapping
+// truth (both presence AND exact shape) — a mkdir'd-but-unmounted dir reads as NOT ready. CSI
+// publishes a <pvName>/mount leaf; in-tree NFS a <pvName> dir; one table resolves both.
+//
+// Per proc(5) each mountinfo line is `mountID parentID major:minor root MOUNTPOINT ...`, so the
+// mountpoint is field index 4 (0-based). A mountpoint matches this PV iff it begins with
+// /var/lib/kubelet/pods/<replUID>/volumes/, the first path segment after that prefix matches
+// kubernetes.io~* (any provisioner subdir — nfs, csi, …; discovered not hardcoded), and the
+// remainder is EITHER exactly <pvName> (in-tree NFS shape) OR <pvName>/mount (CSI shape). When both
+// the bare dir and the /mount leaf are present (CSI), the /mount leaf wins — that is the bind the
+// workload holds open. Returns "" when nothing matches.
+//
+// Pure/deterministic (no broker) so the parsing is unit-testable without a host-ns round trip.
+func parseKubeletMountFromMountinfo(mountinfo []byte, replUID, pvName string) string {
+	if replUID == "" || pvName == "" {
+		return ""
+	}
+	basePrefix := "/var/lib/kubelet/pods/" + replUID + "/volumes/"
+	var bareDir, mountLeaf string
+	for _, line := range strings.Split(string(mountinfo), "\n") {
+		fields := strings.Split(line, " ")
+		if len(fields) < 5 {
+			continue
+		}
+		mountpoint := fields[4]
+		if !strings.HasPrefix(mountpoint, basePrefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(mountpoint, basePrefix)
+		segs := strings.Split(rest, "/")
+		// segs[0] is the provisioner subdir (kubernetes.io~nfs, ~csi, …); the remainder is the PV.
+		if len(segs) < 2 {
+			continue
+		}
+		if !strings.HasPrefix(segs[0], "kubernetes.io~") {
+			continue
+		}
+		remainder := strings.Join(segs[1:], "/")
+		switch remainder {
+		case pvName:
+			bareDir = mountpoint
+		case pvName + "/mount":
+			mountLeaf = mountpoint
+		}
+	}
+	// Prefer the CSI /mount leaf over the bare PV dir when both are published.
+	if mountLeaf != "" {
+		return mountLeaf
+	}
+	return bareDir
+}
+
+// kubeletVolumeGlobFn resolves the on-host kubelet volume directory for (replUID, pvName) by reading
+// the HOST kernel mount table (/proc/self/mountinfo in the host mount namespace via the broker) and
+// matching the kubelet-published mountpoint for this PV. This replaces the prior `ls -d <glob>`
+// inference (which reads true for a half-created/wrong-shaped dir and false during the publish
+// window): the mount table is written by the kubelet exactly when — and only when — NodePublish
+// completes, and is the same bind source CRIU passes to open_tree, so a present mountpoint is the
+// atomic non-flapping truth for both presence and exact shape (read the fact from its writer,
+// not a proxy). The provisioner subdir (kubernetes.io~nfs, ~csi, …) is discovered, not hardcoded.
+// Overridable in tests. Returns "" when nothing resolves (the volume is not yet published, or the
+// pod/PV is wrong); a not-yet-published read is a legitimate bounded WAIT for the caller.
+var kubeletVolumeGlobFn = func(replUID, pvName string) string {
+	if replUID == "" || pvName == "" {
+		return ""
+	}
+	// Read the host mount table in the host mount namespace (broker-delegated nsenter) — the agent's
+	// own mount ns does not carry /var/lib/kubelet, and the de-privileged agent EPERMs on a local
+	// setns, so it MUST go through the broker.
+	out, err := nsenterCmd("/bin/sh", "-c", "cat /proc/self/mountinfo 2>/dev/null").Output()
+	if err != nil {
+		return ""
+	}
+	return parseKubeletMountFromMountinfo(out, replUID, pvName)
+}
+
+// resolveKubeletVolumeHostPath returns the destination-host path CRIU binds the re-attach volume
+// FROM (the replacement pod's kubelet-mounted volume dir), or "" if it cannot be resolved.
+func resolveKubeletVolumeHostPath(replUID, pvName string) string {
+	return kubeletVolumeGlobFn(replUID, pvName)
+}
+
+// pvcBackedMountPaths extracts, from a pod spec, the set of container volumeMount mountPaths whose
+// named volume is a PersistentVolumeClaim. Pure/deterministic (no client) so it is unit-testable
+// without a live pod. Paths are cleaned and de-duplicated; ordering is stable (first-seen,
+// init-containers before app containers). This is the in-container-path half of
+// resolveReattachMounts (the half the patch classifier keys on).
+func pvcBackedMountPaths(pod *corev1.Pod) []string {
+	pvcVolNames := make(map[string]bool)
+	for _, v := range pod.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil {
+			pvcVolNames[v.Name] = true
+		}
+	}
+	if len(pvcVolNames) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var paths []string
+	collect := func(mounts []corev1.VolumeMount) {
+		for _, m := range mounts {
+			if !pvcVolNames[m.Name] {
+				continue
+			}
+			p := filepath.Clean(m.MountPath)
+			if p == "" || p == "." || seen[p] {
+				continue
+			}
+			seen[p] = true
+			paths = append(paths, p)
+		}
+	}
+	for i := range pod.Spec.InitContainers {
+		collect(pod.Spec.InitContainers[i].VolumeMounts)
+	}
+	for i := range pod.Spec.Containers {
+		collect(pod.Spec.Containers[i].VolumeMounts)
+	}
+	return paths
 }
 
 // ReportRestoreConfirmed patches the PodMigration CR status to record that CRIU
@@ -1039,6 +1493,8 @@ func (s *AgentServer) finalizeNetnsPath(migrationName string) (netnsPath, ifname
 			return canonical, network.MigrationVethPeer
 		}
 	}
+	log.Info("finalizeNetnsPath: all bind-mount sources exhausted (ResolvedNetnsPath, in-memory destMigrationNetns, canonical on-disk bind) — falling back to PID path (\"\", \"eth0\"); this is the branch that reaches the AppArmor-denied nsenter read",
+		"migration", migrationName)
 	return "", "eth0"
 }
 
@@ -2635,7 +3091,7 @@ var standardPodMounts = []string{
 //
 // pycriu is invoked as a python3 subprocess with PYTHONPATH set (ADR-0121); imagesDir is passed
 // as argv (never string-formatted into the script body — Security note).
-func buildMaskedPathExtMountArgs(imagesDir string) ([]string, error) {
+func buildMaskedPathExtMountArgs(imagesDir string, reattachMountPaths []string) ([]string, error) {
 	const scanScript = `
 import pycriu, glob, json, sys
 imgs = glob.glob(sys.argv[1] + '/mountpoints-*.img')
@@ -2679,6 +3135,10 @@ print(json.dumps(results))
 	for _, p := range standardPodMounts {
 		stdPod[p] = true
 	}
+	reattach := make(map[string]bool, len(reattachMountPaths))
+	for _, p := range reattachMountPaths {
+		reattach[p] = true
+	}
 
 	var args []string
 	var unmapped []string
@@ -2693,6 +3153,12 @@ print(json.dumps(results))
 		// not by numeric mnt_id here — emitting a numeric /dev/null map would clobber them. They are
 		// covered, so skip without flagging as unmapped (ADR-0124 R2 / AC6).
 		if stdPod[e.Mountpoint] {
+			continue
+		}
+		// Shared/re-attach PVC volumes (Tier0 RWX) are preserved in the image and mapped by PATH in
+		// buildCRIURestoreArgs (<mountpoint>:<mountpoint>) — the destination pod mounts the identical
+		// volume. Covered, so skip without a numeric /dev/null clobber or an unmapped fail-loud.
+		if reattach[e.Mountpoint] {
 			continue
 		}
 		// An external mount (root is external / ext_key set) that is neither a null bind, a known
@@ -2861,7 +3327,7 @@ func resolveInheritCgroupSource(recordedPath, sandboxID string) string {
 	return filepath.Join("/sys/fs/cgroup", base)
 }
 
-func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath, hostVethName string, strictMode bool) []string {
+func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath, hostVethName string, strictMode bool, reattachMountPaths []reattachMount) ([]string, error) {
 	// Choose --tcp-established whenever the checkpoint actually captured an established
 	// TCP connection (presence of a tcp-stream-*.img), NOT merely when a pre-staged
 	// migration netns fd was supplied. The NRI StartContainer restore path joins the
@@ -2916,7 +3382,14 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		// survive into the image, so --skip-mnt for dmi/id/*, powercap, firmware are
 		// not needed and have been removed. Defense-in-depth --skip-mnt for service
 		// account paths is kept (see above).
-		"--ext-mount-map", "/dev/shm:/dev/shm",
+		// NOTE: no "--ext-mount-map /dev/shm:/dev/shm" here. The live restore.log proves
+		// /dev/shm is NOT a mount in the checkpointed container — it is a plain subdirectory
+		// inside the single /dev tmpfs, which the OCI runtime recreates empty on restore. A
+		// /dev/shm ext-mount-map is therefore a dead no-op (there is no /dev/shm mount to map),
+		// and PostgreSQL's dynamic shared memory is routed to SysV (dynamic_shared_memory_type=sysv)
+		// so CRIU content-captures it in the image rather than as a dangling /dev/shm/* files-reg
+		// reference that ENOENTs on restore (files-reg.c:2353). Removing the entry deletes a false
+		// signal that /dev/shm is being handled here.
 		"--ext-mount-map", "/etc/resolv.conf:/etc/resolv.conf",
 		"--ext-mount-map", "/etc/hostname:/etc/hostname",
 		"--ext-mount-map", "/etc/hosts:/etc/hosts",
@@ -2928,6 +3401,32 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		"--network-lock", "skip",
 		"-v4",
 		"-o", restoreLogPath,
+	}
+	// Shared/re-attach PVC volumes (Tier0 RWX): the source recorded each as an external mount
+	// (ext_key == the in-container mountPath) and patchCheckpointImages PRESERVED it in the image.
+	// Map <containerPath>:<hostTarget> where hostTarget is the destination kubelet volume dir the
+	// replacement pod already mounted — CRIU runs in the HOST mount ns and cannot see the
+	// in-container path (it exists only inside the replacement pod's mount ns), so a 1:1
+	// container:container map fails "open_tree ... No such file or directory". The host kubelet dir
+	// is the same live NFS/CSI data, so CRIU re-attaches exactly the bytes the restored process
+	// holds open (e.g. PostgreSQL WAL/relation files). No data bytes move; "RWX re-attach" tier.
+	// FAIL CLOSED on an unresolved host target. The prior behavior fell back to a 1:1
+	// <containerPath>:<containerPath> map when HostTarget was empty. CRIU runs in the HOST mount
+	// namespace, where the in-container path does not exist, so that map aborts the restore with
+	// "open_tree ... No such file or directory" BEFORE the pidfile is written — surfacing only as
+	// the misleading "restored PID not found" symptom downstream. For a Tier0 RWX re-attach mount
+	// the host target is a precondition, not a best-effort hint: if it is unresolved we stop here
+	// with an actionable error instead of emitting a known-broken map (fail closed on a
+	// missing source of truth, do not guess).
+	for _, m := range reattachMountPaths {
+		if m.ContainerPath == "" {
+			continue
+		}
+		if m.HostTarget == "" {
+			return nil, fmt.Errorf("reattach host target unresolved for %s: the destination kubelet volume dir for this re-attach (Tier0 RWX) mount could not be resolved (replacement pod not found by label %s, or its kubelet volume dir not yet mounted); refusing to emit the broken 1:1 container-path ext-mount-map that would abort CRIU restore with open_tree ENOENT",
+				m.ContainerPath, replacementPodLabelKey)
+		}
+		args = append(args, "--ext-mount-map", fmt.Sprintf("%s:%s", m.ContainerPath, m.HostTarget))
 	}
 	if destNetnsFd != "" {
 		args = append(args, "--join-ns", "net:"+destNetnsFd)
@@ -2973,7 +3472,7 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 	// dataDir is on /var/lib/podmotion (ext4), visible from BOTH the agent container and the
 	// host mount namespace CRIU runs in, so the agent reads it back with a plain os.ReadFile.
 	args = append(args, "--pidfile", filepath.Join(dataDir, restoredPidfileName))
-	return args
+	return args, nil
 }
 
 // restoredPidfileName is the basename CRIU writes the restored root PID to (see --pidfile
@@ -3054,7 +3553,10 @@ func copyFile(src, dst string) error {
 //
 // Returns the host PID of the restored process.
 // storedHostVeth is the host-side veth peer name stored by PrepareDestinationNetns (Gate30).
-func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error) {
+// reattachMountPaths are the shared/re-attach PVC mounts (resolveReattachMounts): they are
+// preserved as external mounts through patchCheckpointImages (keyed on ContainerPath) and
+// re-attached on restore via --ext-mount-map <ContainerPath>:<HostTarget>. Empty for stateless.
+func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount) (int, []ExternalMountDroppedInfo, error) {
 	// Gate30: use the host-side veth name stored during PrepareDestinationNetns rather than
 	// re-deriving from migrationName.  Re-derivation diverges when the controller passes a
 	// pod UID to PrepareDestinationNetns and a migration name to Restore.
@@ -3119,7 +3621,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// the files.img↔mountpoints consistency invariant (ADR-0193 P-0193-1).
 	// inheritFdNamesForPatch is the same set that buildCRIURestoreArgs will pass via --inherit-fd
 	// (C-R3-1 single source of truth — no independent recomputation).
-	droppedMounts, patchErr := patchCheckpointImages(checkpointDir, inheritFdNamesForPatch)
+	droppedMounts, patchErr := patchCheckpointImages(checkpointDir, inheritFdNamesForPatch, reattachContainerPaths(reattachMountPaths))
 	if patchErr != nil {
 		return 0, nil, fmt.Errorf("patch checkpoint images: %w", patchErr)
 	}
@@ -3273,11 +3775,15 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 		storeResolvedNetnsPath(migrationName, destNetnsFd)
 	}
 
-	criuArgs := buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath, hostVethName, strictMode)
+	criuArgs, err := buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath, hostVethName, strictMode, reattachMountPaths)
+	if err != nil {
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_reattach_host_target_unresolved").Inc()
+		return 0, nil, err
+	}
 	// ADR-0124: dynamically scan the (post-patch) mountpoints-*.img for containerd masked-path
 	// external mounts and append their --ext-mount-map <mnt_id>:/dev/null args. Fail loud before
 	// invoking CRIU if any external mount is not safely mappable (D4).
-	maskedArgs, err := buildMaskedPathExtMountArgs(checkpointDir)
+	maskedArgs, err := buildMaskedPathExtMountArgs(checkpointDir, reattachContainerPaths(reattachMountPaths))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -3482,8 +3988,9 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 				if len(stderrTail) > 4096 {
 					stderrTail = stderrTail[len(stderrTail)-4096:]
 				}
-				return 0, nil, fmt.Errorf("criu restore exited (exit code %d): broker-delegated wrapper\ncriu stderr:\n%s",
-					exitCode, stderrTail)
+				logTail := restoreLogTail(restoreLogPath, 4096)
+				return 0, nil, fmt.Errorf("criu restore exited (exit code %d): broker-delegated wrapper\ncriu restore.log tail:\n%s\ncriu stderr:\n%s",
+					exitCode, logTail, stderrTail)
 			}
 			// Exit 0 means restore succeeded and CRIU is done (detached-like path or early exit).
 			workloadLive = true
@@ -3519,8 +4026,9 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 		if len(stderrTail) > 4096 {
 			stderrTail = stderrTail[len(stderrTail)-4096:]
 		}
-		return 0, nil, fmt.Errorf("criu restore did not produce workload PIDs in agent cgroup within %s: criu stderr:\n%s",
-			cgroupPollTimeout, stderrTail)
+		logTail := restoreLogTail(restoreLogPath, 4096)
+		return 0, nil, fmt.Errorf("criu restore did not produce workload PIDs in agent cgroup within %s: criu restore.log tail:\n%s\ncriu stderr:\n%s",
+			cgroupPollTimeout, logTail, stderrTail)
 	}
 
 	// Copy restore.log to checkpointDir so gate checks can find it under
@@ -3562,8 +4070,12 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	pid, err = readRestoredPIDFromPidfile(pidfilePath, 30*time.Second, pidfilePoll)
 	if err != nil {
 		// Fail loud — never fall back to comm-scan or cgroup-diff (ADR-0228 NRI/gRPC symmetry).
+		// Surface the CRIU restore.log tail: a missing pidfile is usually the DOWNSTREAM symptom
+		// of a restore that aborted earlier (e.g. mount-v2 open_tree on an external mount), and the
+		// real cause is only in restore.log — not in this wrapper message.
 		metrics.MigrationsFailedTotal.WithLabelValues("restore_pidfile_missing").Inc()
-		return 0, nil, fmt.Errorf("resolve restored PID via CRIU --pidfile: %w", err)
+		logTail := restoreLogTail(restoreLogPath, 4096)
+		return 0, nil, fmt.Errorf("resolve restored PID via CRIU --pidfile: %w\ncriu restore.log tail:\n%s", err, logTail)
 	}
 	// ADR-0228 Invariant 1: identity is guaranteed by --pidfile (CRIU reports the PID it
 	// restored — never the wrapper/holder stub); the residual check is liveness. Defense in
@@ -3622,6 +4134,26 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 
 // readLogTail was removed: ADR-0127 scaffold (restore.log success-signal) removed per ADR-0192.
 // The liveness signal is now the cgroup-PID diff (see joinNsRestore above).
+
+// restoreLogTail reads the tail of CRIU's restore.log (written by criu -o restoreLogPath, running
+// via nsenter in the host mount ns) so the REAL restore failure — e.g. the mount-v2 open_tree
+// error that aborts before the pidfile is written — is surfaced in the failure/RPC error instead
+// of only the downstream "restored PID not found" wrapper symptom. Returns "" when the log is
+// absent/unreadable (CRIU may have failed before opening it, in which case the caller still has the
+// captured stderr). Bounded to the last maxBytes so a large log cannot balloon the error message.
+func restoreLogTail(restoreLogPath string, maxBytes int) string {
+	if restoreLogPath == "" {
+		return ""
+	}
+	b, err := os.ReadFile(restoreLogPath)
+	if err != nil || len(b) == 0 {
+		return ""
+	}
+	if maxBytes > 0 && len(b) > maxBytes {
+		b = b[len(b)-maxBytes:]
+	}
+	return strings.TrimSpace(string(b))
+}
 
 // ADR-0200: exit codes for the __inetns_probe helper subcommand. The helper performs the
 // TCP dial INSIDE the replacement pod netns (entered via nsenter by probeOldIPInPodNetns)
@@ -4131,20 +4663,28 @@ func (s *AgentServer) resolveSandboxIDForMigration(ctx context.Context, migratio
 	if err := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: migrationName}, pm); err != nil {
 		return "", fmt.Errorf("resolveSandboxIDForMigration: get PodMigration %s/%s: %w", ns, migrationName, err)
 	}
-	replName := pm.Status.ReplacementPodName
-	if replName == "" {
-		return "", fmt.Errorf("resolveSandboxIDForMigration: PodMigration %s/%s has no ReplacementPodName yet", ns, migrationName)
-	}
 	podNs := pm.Spec.PodNamespace
 	if podNs == "" {
 		podNs = pm.Namespace
 	}
-	pod := &corev1.Pod{}
-	if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: replName, Namespace: podNs}, pod); err != nil {
-		return "", fmt.Errorf("resolveSandboxIDForMigration: get replacement pod %s/%s: %w", podNs, replName, err)
+	// Resolve the replacement pod by the migration-name LABEL (source of truth stamped by the
+	// controller at creation) rather than pm.Status.ReplacementPodName, which frequently reads
+	// back empty at restore time (primitive over brittle chain). Fall back to the status
+	// field only if the label lookup finds nothing.
+	pod := s.resolveReplacementPod(ctx, migrationName, podNs)
+	if pod == nil {
+		replName := pm.Status.ReplacementPodName
+		if replName == "" {
+			return "", fmt.Errorf("resolveSandboxIDForMigration: no replacement pod found for migration %s/%s by label %s and Status.ReplacementPodName is empty", ns, migrationName, replacementPodLabelKey)
+		}
+		p := &corev1.Pod{}
+		if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: replName, Namespace: podNs}, p); err != nil {
+			return "", fmt.Errorf("resolveSandboxIDForMigration: get replacement pod %s/%s: %w", podNs, replName, err)
+		}
+		pod = p
 	}
 	if pod.UID == "" {
-		return "", fmt.Errorf("resolveSandboxIDForMigration: replacement pod %s/%s has no UID", podNs, replName)
+		return "", fmt.Errorf("resolveSandboxIDForMigration: replacement pod %s/%s has no UID", podNs, pod.Name)
 	}
 	sandboxID, err := sandboxIDForPodUID(string(pod.UID))
 	if err != nil {
@@ -4184,8 +4724,8 @@ func sandboxIDForPodUID(podUID string) (string, error) {
 // Tests can replace this variable to inject failures without requiring real CRIU images.
 // The function variable wraps patchCheckpointImages; it discards the dropped-mounts info
 // (callers that need events use patchCheckpointImages directly).
-var patchCheckpointImagesFn = func(checkpointDir string, inheritFdNames []string) error {
-	_, err := patchCheckpointImages(checkpointDir, inheritFdNames)
+var patchCheckpointImagesFn = func(checkpointDir string, inheritFdNames []string, reattachMountPaths []string) error {
+	_, err := patchCheckpointImages(checkpointDir, inheritFdNames, reattachMountPaths)
 	return err
 }
 
@@ -4298,7 +4838,22 @@ def classify_reg_fd(entry, ctx):
     fstype_for_mnt = mnt_fstypes.get(mnt_id)
     if fstype_for_mnt is None:
         fstype_for_mnt = mnt_fstypes.get(str(mnt_id))
-    TMPFS_FSTYPES = ('TMPFS', 'DEVTMPFS')
+    # ADR-0311 live-path grounding (postgres /dev/shm P-0193-1, decoded 2026-07-10):
+    # mnt_entry.fstype in CRIU's mnt.proto is a plain uint32 field carrying an enum-valued
+    # code (fstype enum: DEVTMPFS=3, TMPFS=5), NOT a native protobuf enum field. pycriu's
+    # pb2dict therefore decodes it as the raw INTEGER unless load() is called with pretty=True
+    # (which the production patch path is NOT — patchCheckpointImages calls
+    # pycriu.images.load(f) with no pretty flag). The prior ADR-0311 classifier compared the
+    # decoded fstype ONLY against the enum-NAME strings ('TMPFS','DEVTMPFS'); on a real live
+    # image fstype came back as int 5, so the "5 in TMPFS/DEVTMPFS" test was always False and the
+    # postgres /dev/shm REG fd fell through to DECLINE -> P-0193-1 hard-stop -> restore fail.
+    # The synthetic corpus that gated ADR-0311 used the string spelling, hiding the mismatch.
+    # Fix: accept BOTH representations — the enum-name strings (pretty=True / selftest corpora)
+    # AND the raw integer enum codes (production, pretty=False). Source of truth for the codes:
+    # pycriu/images/mnt_pb2.py (TMPFS=5, DEVTMPFS=3). Guard is UNWEAKENED: only genuine
+    # tmpfs/devtmpfs backings authorize the rebind; any other fstype (sysfs=2, overlayfs=17,
+    # proc=1, a real persistent volume=0) still DECLINEs.
+    TMPFS_FSTYPES = ('TMPFS', 'DEVTMPFS', 5, 3)
     if (fstype_for_mnt in TMPFS_FSTYPES) or (mnt_id in tmpfs_drop_mnt_ids):
         root_mnt_id = ctx.get('root_mnt_id')
         if root_mnt_id is None or root_mnt_id not in ctx['kept_mnt_ids']:
@@ -4344,10 +4899,17 @@ if len(sys.argv) >= 2 and sys.argv[1] == '--classify-selftest':
 // the P-0193-1 "NOT inherited" exclusion is byte-identical to CRIU's own inherited_fd()
 // line-2200 decision. Pass nil/empty when no cgroup fds are inherited (degrade-and-continue).
 //
+// reattachMountPaths is the set of in-container mount paths backed by a shared/re-attach PVC
+// (Tier0 RWX). Such an external mountpoints entry is PRESERVED (not B-2 dropped) so its files.img
+// REG fds classify consistent instead of orphaning into the P-0193-1 hard-stop; on restore CRIU
+// re-attaches it via --ext-mount-map <path>:<path> to the identically-mounted destination volume.
+// Sourced from the pod spec (resolveReattachMounts primitive), NOT a hardcoded workload
+// path. Pass nil/empty for stateless workloads (prior behavior — every external entry is dropped).
+//
 // Idempotent: backs up originals as *.orig on first call; subsequent calls are no-ops.
 // Returns (droppedMounts, error). droppedMounts is non-nil when B-2 external drops fired
 // successfully; callers should emit CRIUExternalMountDropped Normal events for each entry.
-func patchCheckpointImages(checkpointDir string, inheritFdNames []string) ([]ExternalMountDroppedInfo, error) {
+func patchCheckpointImages(checkpointDir string, inheritFdNames []string, reattachMountPaths []string) ([]ExternalMountDroppedInfo, error) {
 	// Write the patch script to a temp file and run it with the system python3 + pycriu.
 	// containerdMaskedPaths is injected as a JSON argv so the patch step consumes the same
 	// single source of truth as buildMaskedPathExtMountArgs (ADR-0124 R2 / AC6) — no divergent
@@ -4366,6 +4928,14 @@ func patchCheckpointImages(checkpointDir string, inheritFdNames []string) ([]Ext
 	if err != nil {
 		return nil, fmt.Errorf("marshal inherit fd names: %w", err)
 	}
+	// argv[4]: shared/re-attach PVC mount paths (preserved external mounts). Normalize nil→[].
+	if reattachMountPaths == nil {
+		reattachMountPaths = []string{}
+	}
+	reattachJSON, err := json.Marshal(reattachMountPaths)
+	if err != nil {
+		return nil, fmt.Errorf("marshal reattach mount paths: %w", err)
+	}
 	// The single REG-fd classifier (classifyRegFdPy) is prepended verbatim so the main pass and
 	// the consistency re-check below both call the one classify_reg_fd() abstraction.
 	// assemblePatchScript() is the SINGLE SOURCE OF TRUTH for the assembled patch script (H-19):
@@ -4381,8 +4951,8 @@ func patchCheckpointImages(checkpointDir string, inheritFdNames []string) ([]Ext
 		return nil, fmt.Errorf("write patch script: %w", err)
 	}
 	defer os.Remove(scriptPath)
-	// argv[1]=checkpointDir argv[2]=maskedJSON argv[3]=inheritJSON (C-R3-1).
-	cmd := exec.Command("python3", scriptPath, checkpointDir, string(maskedJSON), string(inheritJSON))
+	// argv[1]=checkpointDir argv[2]=maskedJSON argv[3]=inheritJSON (C-R3-1) argv[4]=reattachJSON.
+	cmd := exec.Command("python3", scriptPath, checkpointDir, string(maskedJSON), string(inheritJSON), string(reattachJSON))
 	cmd.Env = append(os.Environ(), "PYTHONPATH=/usr/lib/python3/dist-packages")
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
@@ -5462,7 +6032,16 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// the same. No hardcoded image is reintroduced — D2 reads the operator-created replacement
 	// pod's real container[0].Image; ADR-0215's fail-closed-rather-than-guess intent is preserved.
 	if storedWorkloadImage == "" && s.k8sClient != nil {
-		if resolved := s.resolveImageFromReplacementPod(req.MigrationName); resolved != "" {
+		// AUTHORITATIVE source first: MCP.Spec.WorkloadImage (ADR-0217 D1) is set in Validating
+		// and is race-free — it does not depend on Status.ReplacementPodName or a live replacement
+		// pod. On the agent-Restore-RPC fallback path (~60s after the NRI confirm window times out)
+		// the replacement pod resolver was observed returning empty (ReplacementPodName not yet
+		// populated / pod mid-teardown). Read the MCP directly before the racy pod resolver.
+		if resolved := s.resolveImageFromMCP(req.MigrationName); resolved != "" {
+			storedWorkloadImage = resolved
+			log.Info("ADR-0235: gRPC Restore — B2 cache empty, resolved workload image from MCP.Spec.WorkloadImage (authoritative, ADR-0217 D1)",
+				"migration", req.MigrationName, "image", storedWorkloadImage)
+		} else if resolved := s.resolveImageFromReplacementPod(req.MigrationName); resolved != "" {
 			storedWorkloadImage = resolved
 			log.Info("ADR-0235: gRPC Restore — B2 cache empty, resolved workload image from replacement pod spec (ADR-0217 D2 parity)",
 				"migration", req.MigrationName, "image", storedWorkloadImage)
@@ -5648,7 +6227,13 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		storedVeth := s.destHostVeth[req.MigrationName]
 		s.destHostVethMu.RUnlock()
 		// ADR-0168 B2: pass storedWorkloadImage so the placeholder uses the correct image.
-		pid, droppedMnts, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, "", storedVeth, false)
+		// Bounded-wait on the kubelet-published re-attach mount (defense-in-depth for the gRPC
+		// fallback path); the RPC handler ctx carries the deadline.
+		reattachMounts, reErr := s.resolveReattachMountsWaiting(ctx, req.MigrationName)
+		if reErr != nil {
+			return nil, fmt.Errorf("resolve re-attach mounts: %w", reErr)
+		}
+		pid, droppedMnts, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, "", storedVeth, false, reattachMounts)
 		// SD-4: CRIU restore has returned — ptrace is no longer expected. Close the window on
 		// the happy path immediately (the deferred close above is the fallback for early returns).
 		_ = seccomp.PtraceWindowClose(req.MigrationName)
@@ -5801,7 +6386,13 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// ADR-0193 C-R3-1: no early enumerate here (gRPC Restore path does not build cgroup inherit-fds
 	// at this layer; joinNsRestoreFn handles that internally when config.json branch is taken above).
 	// For the non-config.json gRPC path below, pass nil (degrade-and-continue on P-0193-1).
-	if patchErr := patchCheckpointImagesFn(imagesDir, nil); patchErr != nil {
+	// Shared/re-attach PVC mounts (Tier0 RWX) are preserved + re-attached on both paths.
+	// Bounded-wait on the kubelet-published mount (defense-in-depth for the gRPC fallback path).
+	rawReattachMounts, rawReErr := s.resolveReattachMountsWaiting(ctx, req.MigrationName)
+	if rawReErr != nil {
+		return nil, fmt.Errorf("resolve re-attach mounts: %w", rawReErr)
+	}
+	if patchErr := patchCheckpointImagesFn(imagesDir, nil, reattachContainerPaths(rawReattachMounts)); patchErr != nil {
 		if req.TcpPreservationMode == "Strict" {
 			// Strict: fail closed. The controller will initiate rollback.
 			log.Error(patchErr, "Restore: patchCheckpointImages failed under Strict — aborting restore (ADR-0049 Amendment D A1)", "migration", req.MigrationName)
@@ -5818,7 +6409,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	s.destHostVethMu.RLock()
 	storedVeth2 := s.destHostVeth[req.MigrationName]
 	s.destHostVethMu.RUnlock()
-	rawPID, droppedMnts2, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, "", storedVeth2, false)
+	rawPID, droppedMnts2, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", req.DestNetnsFd, "", storedVeth2, false, rawReattachMounts)
 	for _, d := range droppedMnts2 {
 		s.emitExternalMountDroppedEvent(context.Background(), req.MigrationName, d)
 	}
@@ -5912,7 +6503,35 @@ func (s *AgentServer) Verify(_ context.Context, req *agentpb.VerifyRequest) (*ag
 // and issues the configured SQL/TCP application probe. Returns verified=true only when
 // all connections pass the continuity check and the application probe succeeds.
 func (s *AgentServer) VerifyTCP(ctx context.Context, req *agentpb.VerifyTCPRequest) (*agentpb.VerifyTCPResponse, error) {
-	log.Info("VerifyTCP called", "migration", req.MigrationName)
+	log.Info("VerifyTCP called", "migration", req.MigrationName, "appProbeOnly", req.AppProbeOnly)
+
+	// ADR-0312: AppProbeOnly scopes this call to ONLY the application-layer probe.
+	// Skip PID/socket-inventory resolution and seq-delta accounting entirely — this
+	// path MUST NOT write TCPSequenceContinuityVerified, the measured-seq-delta
+	// annotation, or the seq_delta gauge (those remain owned exclusively by the
+	// full-verification path below). Used by reconcileServiceVerifying to populate
+	// WorkloadLivenessVerified for ALL TCPPreservationMode values, including None,
+	// which never reaches the full-verification path.
+	if req.AppProbeOnly {
+		resp := &agentpb.VerifyTCPResponse{}
+		if req.AppProbeProtocol == "" {
+			resp.Verified = true
+			return resp, nil
+		}
+		probeErr := runAppProbe(ctx, req)
+		if probeErr != nil {
+			resp.Verified = false
+			resp.AppProbeOk = false
+			resp.AppProbeError = probeErr.Error()
+			resp.FailureReason = fmt.Sprintf("app probe failed: %v", probeErr)
+			log.Info("VerifyTCP: application probe failed (AppProbeOnly)",
+				"migration", req.MigrationName, "protocol", req.AppProbeProtocol, "err", probeErr)
+			return resp, nil
+		}
+		resp.Verified = true
+		resp.AppProbeOk = true
+		return resp, nil
+	}
 
 	// Retrieve stored SeqSnapshots; fall back to request-supplied ones.
 	s.migrationSeqSnapshotsMu.RLock()

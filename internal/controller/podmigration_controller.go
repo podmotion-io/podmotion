@@ -1157,14 +1157,30 @@ func (r *PodMigrationReconciler) reconcileTCPVerifying(ctx context.Context, pm *
 	// the source pod has no live process on the destination node, so a fallback can only
 	// fail-closed. Requeue if the replacement pod is not yet visible (it is guaranteed named by
 	// the time TCPVerifying is reached, but its object may lag the cache).
-	replForVerify := &corev1.Pod{}
-	if getErr := r.Get(ctx, types.NamespacedName{
-		Namespace: pm.Spec.PodNamespace,
-		Name:      pm.Status.ReplacementPodName,
-	}, replForVerify); getErr != nil || replForVerify.UID == "" {
+	// Resolve the replacement pod by the podmotion.io/migration-name LABEL — the same
+	// source-of-truth primitive the restore/agent path uses (server.go resolveReplacementPod).
+	// pm.Status.ReplacementPodName is a controller-written status field that can be lost to a
+	// status-subresource clobber race between createReplacementPod's RetryOnConflict update and
+	// a later full statusUpdate that re-fetched before the name was persisted. When that happens
+	// the field reads empty here even though the replacement pod is created, Running, and was
+	// successfully restored INTO by the label-keyed agent path — causing an infinite
+	// "replacement pod not yet visible" requeue in TCPVerifying. Resolving by the label the
+	// controller stamps at creation (line ~4815) makes this step depend on the authoritative
+	// object, not the flaky mirror. Fall back to the status field only if the label lookup finds
+	// nothing (belt-and-suspenders).
+	replForVerify, resolveErr := r.resolveReplacementPodByLabel(ctx, pm)
+	if resolveErr != nil || replForVerify == nil || replForVerify.UID == "" {
 		log.Info("ADR-0225: TCPVerifying: replacement pod not yet visible for dest PID resolution — requeuing",
-			"migration", pm.Name, "replacementPod", pm.Status.ReplacementPodName)
+			"migration", pm.Name, "replacementPod", pm.Status.ReplacementPodName, "resolveErr", resolveErr)
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+	// Heal the status mirror so later phases that still read pm.Status.ReplacementPodName resolve.
+	if pm.Status.ReplacementPodName == "" {
+		pm.Status.ReplacementPodName = replForVerify.Name
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			log.Error(err, "TCPVerifying: failed to heal Status.ReplacementPodName — continuing",
+				"migration", pm.Name, "replacementPod", replForVerify.Name)
+		}
 	}
 	vtcpReq := &agentpb.VerifyTCPRequest{
 		MigrationName: pm.Name,
@@ -4812,7 +4828,7 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 			newLabels[k] = v
 		}
 	}
-	newLabels["podmotion.io/migration-name"] = pm.Name
+	newLabels[replacementPodMigrationNameLabel] = pm.Name
 
 	// Copy annotations; strip immutable fields that cause API conflict.
 	newAnnotations := make(map[string]string, len(sourcePod.Annotations))
@@ -5068,6 +5084,53 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 		fresh.Status.ReplacementPodName = replacementName
 		return r.Status().Update(ctx, fresh)
 	})
+}
+
+// replacementPodMigrationNameLabel is the label the controller stamps on every replacement pod
+// at creation (see the newLabels assignment in createReplacementPod). It is the source of truth
+// for resolving the replacement pod — the agent restore path keys on the same label
+// (server.go replacementPodLabelKey) — and must be preferred over pm.Status.ReplacementPodName,
+// which is a controller-written mirror that a status-subresource race can leave empty.
+const replacementPodMigrationNameLabel = "podmotion.io/migration-name"
+
+// resolveReplacementPodByLabel returns the replacement pod for this migration by listing pods in
+// the migration namespace carrying podmotion.io/migration-name == pm.Name. This is the
+// authoritative resolution (matching the agent's server.go resolveReplacementPod) and is robust
+// to a lost pm.Status.ReplacementPodName. It returns (nil, nil) when no pod is found yet (the
+// caller should requeue). If the label lookup finds nothing but Status.ReplacementPodName is set,
+// it falls back to a direct Get so behavior never regresses below the old status-field path.
+func (r *PodMigrationReconciler) resolveReplacementPodByLabel(ctx context.Context, pm *pmv1.PodMigration) (*corev1.Pod, error) {
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList,
+		client.InNamespace(pm.Spec.PodNamespace),
+		client.MatchingLabels{replacementPodMigrationNameLabel: pm.Name},
+	); err != nil {
+		return nil, fmt.Errorf("listing replacement pod by label %s=%s: %w",
+			replacementPodMigrationNameLabel, pm.Name, err)
+	}
+	if len(podList.Items) > 0 {
+		// Deterministic pick: the single match in the normal case; the newest by
+		// CreationTimestamp if a stale prior-attempt pod lingers.
+		newest := &podList.Items[0]
+		for i := 1; i < len(podList.Items); i++ {
+			if podList.Items[i].CreationTimestamp.After(newest.CreationTimestamp.Time) {
+				newest = &podList.Items[i]
+			}
+		}
+		return newest, nil
+	}
+	// Fallback: the label lookup found nothing but a name was recorded — resolve it directly.
+	if pm.Status.ReplacementPodName != "" {
+		pod := &corev1.Pod{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Namespace: pm.Spec.PodNamespace,
+			Name:      pm.Status.ReplacementPodName,
+		}, pod); err != nil {
+			return nil, client.IgnoreNotFound(err)
+		}
+		return pod, nil
+	}
+	return nil, nil
 }
 
 // statusUpdate persists pm.Status via a fresh re-fetch + retry.RetryOnConflict loop so that

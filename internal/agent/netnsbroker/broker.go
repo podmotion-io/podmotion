@@ -275,21 +275,29 @@ func Handle(req Request) Response {
 // path (server.go joinNsRestore / setupRestoreOverlayfs) invokes via nsenterCmd:
 //   - ctr / /usr/local/bin/ctr — containerd image pull, snapshot, task lifecycle
 //   - /opt/podmotion/bin/podmotion-criu-wrapper — the CRIU launcher (ADR-0181/0183)
-//   - mkdir / touch / rm / mount / umount / sh — rootfs scaffolding + ext-mount setup
+//   - mkdir / touch / rm / mount / umount / sh (bare "sh" and absolute "/bin/sh")
+//     — rootfs scaffolding + ext-mount setup; the absolute "/bin/sh" form is the
+//     one server.go's kubeletVolumeGlobFn uses to `cat /proc/self/mountinfo` for
+//     kubelet volume host-target resolution during re-attach restore.
 // Adding a new restore-path host-mount-ns command requires adding it here AND a
 // a runtime-dependency assertion (the binary must exist on the node) — same
 // discipline as any other ADR runtime-dependency (see ADR-0231).
+//
+// FOLLOW-ON: a cleaner primitive would be a DEDICATED broker op that reads
+// /proc/self/mountinfo directly (mirroring the existing signal_pid dedicated op),
+// avoiding a general-shell exec on the restore path entirely.
 var execAllowlist = map[string]struct{}{
 	"ctr":                                       {},
 	"/usr/local/bin/ctr":                        {},
 	"/opt/podmotion/bin/podmotion-criu-wrapper": {},
-	"mkdir":  {},
-	"touch":  {},
-	"rm":     {},
-	"mount":  {},
-	"umount": {},
-	"sh":     {},
-	"ls":     {},
+	"mkdir":   {},
+	"touch":   {},
+	"rm":      {},
+	"mount":   {},
+	"umount":  {},
+	"sh":      {},
+	"/bin/sh": {},
+	"ls":      {},
 }
 
 // doExec runs an allowlisted host-mount-namespace command via nsenterHostMnt and

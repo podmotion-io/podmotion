@@ -1,11 +1,34 @@
 # PostgreSQL source pod for live DB migration testing.
-# Pinned to pm-worker; migrated to pm-control.
-# Uses emptyDir so there are no PVC complications in Phase 1.
-# Phase 2 will use a PVC with Longhorn RWO to exercise the storage migration path.
+# Pinned to pm-w1; migrated to pm-w2.
+#
+# PGDATA is backed by an RWX PVC on the standing shared-NFS StorageClass
+# (nfs-shared), NOT a disk-backed emptyDir. Rationale: a disk-backed emptyDir is
+# pod-local writable state that lives only on the source node's kubelet dir; no
+# storage tier moves it, so the classifier (correctly) blocks the freeze
+# (StorageReadyForFreeze=BlockedVolume) to prevent silent data loss — the pod
+# would restore with an empty PGDATA. An RWX PV is visible from both pm-w1 and
+# pm-w2, so it maps to Tier0 (re-attach only, no data movement) and the
+# destination pod mounts the SAME live data directory — the migration then
+# reaches past Checkpointing and CRIU restore re-attaches the same mount. This is
+# the supported storage path for stateful pods; the disk-emptyDir data-staging
+# migrator is a separate storage-tier effort.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: pm-db-test
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pgdata
+  namespace: pm-db-test
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: nfs-shared
+  resources:
+    requests:
+      storage: 1Gi
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -42,6 +65,19 @@ spec:
   containers:
   - name: postgres
     image: postgres:16-alpine
+    # Route PostgreSQL's dynamic shared memory to a System V segment instead of a
+    # POSIX /dev/shm file. The postgres:16-alpine entrypoint (docker-entrypoint.sh ->
+    # postgres) passes container args to the postgres server as flags, so this sets
+    # dynamic_shared_memory_type=sysv without overriding the entrypoint (no command:).
+    # CRIU content-captures SysV shmem in the checkpoint image (IPC namespace + SysV
+    # shmem segment restore cleanly), whereas POSIX /dev/shm/PostgreSQL.* segments are
+    # recorded only as dangling files-reg path references that cannot be re-opened in
+    # the replacement pod's freshly-recreated /dev tmpfs on restore (files-reg.c:2353
+    # ENOENT). This keeps the DSM bytes inside the one artifact CRIU authoritatively
+    # writes and reads back.
+    args:
+    - "-c"
+    - "dynamic_shared_memory_type=sysv"
     env:
     - name: POSTGRES_DB
       value: pmtest
@@ -73,7 +109,8 @@ spec:
       periodSeconds: 2
   volumes:
   - name: data
-    emptyDir: {}
+    persistentVolumeClaim:
+      claimName: postgres-pgdata
   - name: init
     configMap:
       name: postgres-init

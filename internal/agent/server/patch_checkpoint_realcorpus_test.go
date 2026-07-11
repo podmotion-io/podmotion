@@ -54,6 +54,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 // realCorpusGenPy is a pycriu fixture generator. argv[1] is the output directory; argv[2] selects
@@ -110,6 +112,22 @@ if shape == 'full':
     ])
     dump('fdinfo-2.img', 'FDINFO', [fd(1, 10), fd(2, 11), fd(3, 12)])
 
+elif shape == 'reattach_only':
+    # Postgres PGDATA shape, isolated: root(overlay) + /proc + a single EXTERNAL re-attach mount
+    # (/data, ext_key set — the RWX-PVC analogue) carrying an open data-file fd. No cgroup/sys
+    # orphan, so the script runs to completion and exercises the P-0194-1c dual-write assertion
+    # on the preserved external. With /data in argv[4] this must exit 0 (mount preserved, fd KEEP).
+    dump('mountpoints-10.img', 'MNTS', [
+        mnt(2943, 0,    '/',     17, src='overlay'),
+        mnt(2945, 2943, '/proc', 1,  src='proc'),
+        mnt(2951, 2943, '/data', 0,  ext_key='/data', src='192.168.122.130:/srv/nfs/pgdata'),
+    ])
+    dump('files.img', 'FILES', [
+        reg(1, '/data/base/relation.db', 2951),
+        reg(2, '/app/main.py', 2943),
+    ])
+    dump('fdinfo-2.img', 'FDINFO', [fd(1, 10), fd(2, 11)])
+
 elif shape == 'inherit_only':
     # Same mounts, but the ONLY files.img entry is the /data orphan fd, and the test passes its
     # slash-stripped name as an --inherit-fd name (argv[3]) so classify_reg_fd returns KEEP.
@@ -155,7 +173,7 @@ func generateRealShapeCorpus(t *testing.T, dir, shape string) (pypath string, ex
 // runProductionPatchScript writes assemblePatchScript() (the shipped script) to disk and runs it
 // against ckptDir with the given masked-paths and inherit-fd-name sets (argv[2], argv[3]). Returns
 // combined stdout+stderr and the process error (non-nil on exit!=0).
-func runProductionPatchScript(t *testing.T, pypath string, extraEnv []string, ckptDir string, masked, inherit []string) (string, error) {
+func runProductionPatchScript(t *testing.T, pypath string, extraEnv []string, ckptDir string, masked, inherit []string, reattach ...[]string) (string, error) {
 	t.Helper()
 	// Production normalizes nil→[] so json.Marshal emits "[]" not "null" (patchCheckpointImages:
 	// set(json.loads(...)) raises TypeError on null). Mirror that here.
@@ -171,7 +189,18 @@ func runProductionPatchScript(t *testing.T, pypath string, extraEnv []string, ck
 	if err := os.WriteFile(scriptPath, []byte(assemblePatchScript()), 0o600); err != nil {
 		t.Fatalf("write production patch script: %v", err)
 	}
-	cmd := exec.Command("python3", scriptPath, ckptDir, string(maskedJSON), string(inheritJSON))
+	argv := []string{scriptPath, ckptDir, string(maskedJSON), string(inheritJSON)}
+	// argv[4] (reattach mount paths) is optional — omit it to exercise the older 3-argv contract
+	// (the len(sys.argv)>4 backward-compat guard), pass it to exercise the re-attach preserve path.
+	if len(reattach) > 0 {
+		reattachSet := reattach[0]
+		if reattachSet == nil {
+			reattachSet = []string{}
+		}
+		reattachJSON, _ := json.Marshal(reattachSet)
+		argv = append(argv, string(reattachJSON))
+	}
+	cmd := exec.Command("python3", argv...)
 	cmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
@@ -219,6 +248,232 @@ func TestRealCorpus_ParentMntGraphClosureAndExternalDrop(t *testing.T) {
 	}
 }
 
+// TestRealCorpus_ReattachExternalMountPreserved is the PINNED regression for the postgres
+// checkpoint→restore live failure decoded 2026-07-10 (this session, real KVM run).
+//
+// GROUND TRUTH: a real postgres live migration reached past Checkpointing (ctr checkpoint
+// captured 27 MB) then FAILED at restore in patchCheckpointImages with:
+//
+//	files.img REG fd id=47 name_leaf=000000010000000000000001 backing_mnt_id=2408
+//	backing_fstype=0 backing_mountpoint=/var/lib/postgresql/data:
+//	positive orphan mnt_id not in kept mountpoints — hard-stopped (ADR-0193 P-0193-1)
+//
+// The PGDATA volume is an RWX NFS PVC (Tier0 re-attach) that `ctr tasks checkpoint` records as an
+// EXTERNAL mountpoints entry (ext_key = the in-container mountPath), decoded live as:
+//
+//	mnt_id=2408 fstype=0 root='/' ext_key='/var/lib/postgresql/data'
+//	source='192.168.122.130:/srv/nfs/...postgres-pgdata-...' shared_id=0 master_id=0
+//
+// The B-2 external-drop pass dropped it, orphaning postgres's open WAL/relation-file fds → P-0193-1.
+// That is WRONG for a shared/re-attach volume: the destination replacement pod mounts the identical
+// NFS PVC at the identical path, so CRIU must PRESERVE the mount (keep it in kept_mnt_ids) and
+// re-attach it via --ext-mount-map <path>:<path>, NOT drop-and-hard-stop.
+//
+// This test drives the SHIPPED patch script over the real-shape corpus whose external mount is
+// exactly this shape (the `full` corpus /data mount, mnt_id 2951, ext_key '/data', with an open
+// data-file fd '/data/base/relation.db' on it — structurally identical to the postgres PGDATA fd).
+// It asserts that when '/data' is supplied in argv[4] (the reattach set), the mount is PRESERVED
+// (no CRIU_EXTERNAL_MOUNT_DROPPED, no P-0193-1 CRIU_IMAGE_INCONSISTENCY, exit 0). The negative
+// control (TestRealCorpus_ParentMntGraphClosureAndExternalDrop, same corpus, EMPTY reattach set)
+// proves the assertion is not vacuous: without the reattach coverage the identical fd hard-stops.
+func TestRealCorpus_ReattachExternalMountPreserved(t *testing.T) {
+	ckptDir := t.TempDir()
+	pypath, extraEnv := generateRealShapeCorpus(t, ckptDir, "full")
+
+	// '/data' declared as a shared/re-attach PVC mount (argv[4]) — the postgres PGDATA case.
+	// masked empty so /data is NOT treated as a masked path; it is a genuine re-attach volume.
+	//
+	// NOTE: the `full` corpus ALSO carries an unrelated /sys/fs/cgroup orphan fd (fd_id 3, mnt_id
+	// 9107) that hard-stops independently of this fix (it is covered by the --inherit-fd contract in
+	// TestRealCorpus_InheritFdNameExcludesFromFiringClass, not exercised here). So the script may
+	// still exit non-zero for THAT fd; this test asserts ONLY that the /data re-attach fd (fd_id 1,
+	// backing_mnt_id 2951) is preserved and does NOT orphan — the exact postgres PGDATA property.
+	out, _ := runProductionPatchScript(t, pypath, extraEnv, ckptDir, nil, nil, []string{"/data"})
+
+	// (1) The /data external mount must be PRESERVED (kept), not B-2 dropped.
+	if strings.Contains(out, `CRIU_EXTERNAL_MOUNT_DROPPED:`) && strings.Contains(out, `"ext_key":"/data"`) {
+		t.Errorf("re-attach /data must NOT be B-2 dropped when in the reattach set; got a drop event:\n%s", out)
+	}
+	if !strings.Contains(out, "preserving re-attach external") || !strings.Contains(out, "ext_key=/data") {
+		t.Errorf("expected a 'preserving re-attach external ... ext_key=/data' log line; got:\n%s", out)
+	}
+
+	// (2) The data-file fd on the preserved /data mount (fd_id 1, backing_mnt_id 2951 — the postgres
+	//     WAL/relation-file analogue) must NOT orphan. The negative control
+	//     (TestRealCorpus_ParentMntGraphClosureAndExternalDrop, empty reattach set) asserts this
+	//     SAME fd DOES hard-stop with backing_mnt_id 2951 — so this is a real inversion.
+	if strings.Contains(out, `"backing_mnt_id":2951`) {
+		t.Errorf("preserved re-attach mount /data (mnt_id 2951) must not orphan its open data-file fd "+
+			"(no P-0193-1 for backing_mnt_id 2951); postgres restore would fail. got:\n%s", out)
+	}
+	if strings.Contains(out, `"ext_key":"/data"`) && strings.Contains(out, `survived_drop`) {
+		t.Errorf("preserved re-attach /data must be exempt from the survived_drop hard-stop; got:\n%s", out)
+	}
+
+	// (3) The preserved mount must be EXEMPT from the P-0194-1c dual-write mismatch assertion: it is
+	//     supposed to survive in the mountpoints image WITH its ext_key (resolved on restore by
+	//     --ext-mount-map). A mismatch here was the second live failure this session
+	//     (reason=p0194_1c_dual_write_mismatch) after the P-0193-1 orphan was cleared.
+	if strings.Contains(out, `p0194_1c_dual_write_mismatch`) {
+		t.Errorf("preserved re-attach mount must be exempt from the P-0194-1c dual-write mismatch; got:\n%s", out)
+	}
+
+	// (4) Isolated corpus (no unrelated cgroup orphan) — the script must run to FULL SUCCESS
+	//     (exit 0) with the re-attach external preserved, exercising the P-0194-1c dual-write
+	//     assertion end-to-end. This is the clean postgres PGDATA end-state.
+	isoDir := t.TempDir()
+	isoPy, isoEnv := generateRealShapeCorpus(t, isoDir, "reattach_only")
+	isoOut, isoErr := runProductionPatchScript(t, isoPy, isoEnv, isoDir, nil, nil, []string{"/data"})
+	if isoErr != nil {
+		t.Fatalf("isolated re-attach corpus with /data in argv[4]: expected exit 0 (mount preserved, "+
+			"dual-write verified, fd consistent) — postgres end-state. got error %v, output:\n%s", isoErr, isoOut)
+	}
+	if !strings.Contains(isoOut, "P-0194-1c dual-write verified") {
+		t.Errorf("expected the P-0194-1c dual-write consistency check to PASS on the preserved mount; got:\n%s", isoOut)
+	}
+	// Negative control on the SAME isolated corpus: WITHOUT /data in the reattach set, the data-file
+	// fd on the (now dropped) external mount must hard-stop — proving the assertion is not vacuous.
+	ncDir := t.TempDir()
+	ncPy, ncEnv := generateRealShapeCorpus(t, ncDir, "reattach_only")
+	ncOut, ncErr := runProductionPatchScript(t, ncPy, ncEnv, ncDir, nil, nil, []string{})
+	if ncErr == nil {
+		t.Errorf("negative control (empty reattach set): expected the /data orphan fd to hard-stop, "+
+			"but script succeeded — the preserve path would be vacuous. output:\n%s", ncOut)
+	}
+	if !strings.Contains(ncOut, `"backing_mnt_id":2951`) {
+		t.Errorf("negative control: expected P-0193-1 on the /data fd (backing_mnt_id 2951); got:\n%s", ncOut)
+	}
+}
+
+// TestPvcBackedMountPaths_PostgresShape pins the pod-spec → re-attach-path primitive
+// (resolveReattachMountPaths' pure core). It asserts that a postgres-shaped pod — a PVC-backed
+// `data` volume mounted at /var/lib/postgresql/data, plus a configMap init volume and the SA-token
+// projected volume — yields EXACTLY the PVC mountPath, and that non-PVC volumes (configMap,
+// emptyDir, projected SA token) are NOT included. This is the source of truth that authorizes the
+// patch script to preserve /var/lib/postgresql/data; if it regressed to returning the configMap or
+// emptyDir path, the wrong mount would be preserved (or the real one dropped → P-0193-1).
+func TestPvcBackedMountPaths_PostgresShape(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{
+				{Name: "data", VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "postgres-pgdata"}}},
+				{Name: "init", VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: "postgres-init"}}}},
+				{Name: "scratch", VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+				{Name: "kube-api-access", VolumeSource: corev1.VolumeSource{
+					Projected: &corev1.ProjectedVolumeSource{}}},
+			},
+			Containers: []corev1.Container{{
+				Name: "postgres",
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: "data", MountPath: "/var/lib/postgresql/data"},
+					{Name: "init", MountPath: "/docker-entrypoint-initdb.d/init.sql"},
+					{Name: "scratch", MountPath: "/scratch"},
+					{Name: "kube-api-access", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount"},
+				},
+			}},
+		},
+	}
+	got := pvcBackedMountPaths(pod)
+	if len(got) != 1 || got[0] != "/var/lib/postgresql/data" {
+		t.Fatalf("pvcBackedMountPaths(postgres pod): got %v, want exactly [/var/lib/postgresql/data] "+
+			"(only the PVC-backed mount; configMap/emptyDir/projected excluded)", got)
+	}
+
+	// No PVCs at all → nil (stateless workload; prior drop-everything behavior preserved).
+	stateless := &corev1.Pod{Spec: corev1.PodSpec{
+		Volumes:    []corev1.Volume{{Name: "cfg", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{}}}},
+		Containers: []corev1.Container{{VolumeMounts: []corev1.VolumeMount{{Name: "cfg", MountPath: "/cfg"}}}},
+	}}
+	if got := pvcBackedMountPaths(stateless); got != nil {
+		t.Fatalf("pvcBackedMountPaths(stateless pod): got %v, want nil", got)
+	}
+}
+
+// TestBuildCRIURestoreArgs_ReattachExtMountMapUsesHostTarget pins the third live failure decoded
+// this session: after the mount was preserved (P-0193-1 cleared) and exempted from the P-0194-1c
+// dual-write assertion, CRIU restore ran and failed at:
+//
+//	mnt-v2: Bind /var/lib/postgresql/data to /tmp/.criu.mntns.../mnt-0000002408
+//	Error (criu/mount-v2.c:319): Failed to open_tree /var/lib/postgresql/data: No such file or directory
+//
+// because CRIU runs in the HOST mount namespace where the in-container path does not exist; the
+// re-attach --ext-mount-map target must be the destination kubelet volume dir the replacement pod
+// already mounted. This test asserts buildCRIURestoreArgs emits <containerPath>:<hostTarget>
+// (NOT <containerPath>:<containerPath>) when a host target is resolved, and falls back to 1:1 when
+// it is not.
+func TestBuildCRIURestoreArgs_ReattachExtMountMapUsesHostTarget(t *testing.T) {
+	hostTarget := "/var/lib/kubelet/pods/b1bffab8/volumes/kubernetes.io~nfs/pvc-abc"
+	args, err := buildCRIURestoreArgs(
+		"/ckpt", "/rootfs", "/data", "/termlog", "/secrets", "/restore.log",
+		"", "/var/run/netns/cni-x", "", false,
+		[]reattachMount{{ContainerPath: "/var/lib/postgresql/data", HostTarget: hostTarget}},
+	)
+	if err != nil {
+		t.Fatalf("buildCRIURestoreArgs returned error with a resolved host target: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	want := "--ext-mount-map /var/lib/postgresql/data:" + hostTarget
+	if !strings.Contains(joined, want) {
+		t.Errorf("expected re-attach ext-mount-map to HOST target %q; got: %s", want, joined)
+	}
+	// The broken 1:1 container:container form (the live open_tree failure) must NOT be emitted
+	// when a host target is present.
+	if strings.Contains(joined, "--ext-mount-map /var/lib/postgresql/data:/var/lib/postgresql/data") {
+		t.Errorf("must NOT emit the 1:1 container:container map when a host target resolved (open_tree fails); got: %s", joined)
+	}
+
+	// FAIL CLOSED: no host target → buildCRIURestoreArgs returns an error instead of emitting the
+	// known-broken 1:1 map that aborts CRIU restore with open_tree ENOENT (Sprint-44 root cause).
+	argsFB, errFB := buildCRIURestoreArgs(
+		"/ckpt", "/rootfs", "/data", "/termlog", "/secrets", "/restore.log",
+		"", "/var/run/netns/cni-x", "", false,
+		[]reattachMount{{ContainerPath: "/mnt/data", HostTarget: ""}},
+	)
+	if errFB == nil {
+		t.Errorf("expected an error when re-attach host target is unresolved (fail closed); got args: %s", strings.Join(argsFB, " "))
+	}
+	if argsFB != nil {
+		t.Errorf("expected nil args on fail-closed; got: %s", strings.Join(argsFB, " "))
+	}
+	if strings.Contains(strings.Join(argsFB, " "), "--ext-mount-map /mnt/data:/mnt/data") {
+		t.Errorf("must NOT emit the broken 1:1 fallback map when host target empty; got: %s", strings.Join(argsFB, " "))
+	}
+}
+
+// TestResolveKubeletVolumeHostPath_GlobContract pins the host-target resolver: given a replacement
+// pod UID and PV name it must return the single kubelet volume dir the glob resolves, discovering
+// the provisioner subdir (kubernetes.io~nfs/~csi/…) rather than hardcoding it, and returning ""
+// (safe fallback) on no-match / ambiguity / missing inputs.
+func TestResolveKubeletVolumeHostPath_GlobContract(t *testing.T) {
+	orig := kubeletVolumeGlobFn
+	t.Cleanup(func() { kubeletVolumeGlobFn = orig })
+
+	// Empty inputs → "" without consulting the host.
+	if got := resolveKubeletVolumeHostPath("", "pv"); got != "" {
+		t.Errorf("empty replUID: got %q, want \"\"", got)
+	}
+	if got := resolveKubeletVolumeHostPath("uid", ""); got != "" {
+		t.Errorf("empty pvName: got %q, want \"\"", got)
+	}
+
+	// Resolved single match is returned verbatim.
+	kubeletVolumeGlobFn = func(replUID, pvName string) string {
+		if replUID == "u1" && pvName == "pvc-1" {
+			return "/var/lib/kubelet/pods/u1/volumes/kubernetes.io~nfs/pvc-1"
+		}
+		return ""
+	}
+	if got := resolveKubeletVolumeHostPath("u1", "pvc-1"); got != "/var/lib/kubelet/pods/u1/volumes/kubernetes.io~nfs/pvc-1" {
+		t.Errorf("resolved host path mismatch: got %q", got)
+	}
+	if got := resolveKubeletVolumeHostPath("u2", "pvc-1"); got != "" {
+		t.Errorf("no-match must return \"\"; got %q", got)
+	}
+}
+
 // TestRealCorpus_InheritFdNameExcludesFromFiringClass proves the argv[3] inherit-fd contract: an
 // orphan REG-fd whose slash-stripped name is in the --inherit-fd set is classified KEEP (CRIU's
 // inherited_fd() exits before open_path()), so it does NOT hard-stop.
@@ -258,23 +513,29 @@ func TestRealCorpus_InheritFdNameExcludesFromFiringClass(t *testing.T) {
 	})
 }
 
-// TestRealCorpus_TmpfsShmRebind_RequiresRealCRIUImage records the grounding boundary for the
-// ADR-0311 tmpfs/shm REG-fd rebind (C-06 MUST_ROUTE_BROKER).
+// TestRealCorpus_TmpfsShmRebind_IntegerFstypeIsFixturable closes the grounding boundary that the
+// prior skip-test (TestRealCorpus_TmpfsShmRebind_RequiresRealCRIUImage) left open, and pins the
+// ROOT CAUSE of the postgres restore-frontier live failure (decoded 2026-07-10).
 //
-// classify_reg_fd authorizes REBIND_TO_ROOT for a non-directory orphan REG-fd only when its
-// backing mount's fstype is the enum-NAME 'TMPFS'/'DEVTMPFS'. The vendored pycriu declares
-// mnt_entry.fstype as a bare uint32 (mnt_pb2.py: type=13, enum_type=None), so any image dumped and
-// re-loaded by this pycriu renders fstype as an INT (5), and a /dev/shm PostgreSQL orphan fd
-// DECLINEs instead of rebinding. A synthetic pycriu fixture therefore CANNOT honestly exercise the
-// rebind branch; only a corpus produced by real CRIU 4.2 (which does not produce in-sandbox: a
-// new-mount-namespace dump fails on the dev host's unsupported filesystems) can. This test asserts
-// the boundary — that a pycriu-round-tripped /dev/shm orphan renders fstype as an int, so the
-// rebind is un-fixturable here — and skips, routing the real-image validation to the cluster
-// broker rather than faking a green.
-func TestRealCorpus_TmpfsShmRebind_RequiresRealCRIUImage(t *testing.T) {
+// The prior test PROVED that vendored pycriu round-trips mnt_entry.fstype as the raw INT 5 (not
+// the enum-NAME 'TMPFS'), then SKIPPED — because the ADR-0311 classifier only matched the string
+// 'TMPFS'/'DEVTMPFS', so a real image (int 5) DECLINEd and the rebind was "un-fixturable" without
+// real CRIU. That skip WAS the bug hiding in plain sight: production always feeds the int, so the
+// rebind never fired live (postgres /dev/shm PostgreSQL.* → P-0193-1 hard-stop, restore failed).
+//
+// The fix makes classify_reg_fd accept BOTH the enum-name string AND the raw int enum codes
+// (TMPFS=5, DEVTMPFS=3). This test therefore does what the old one declared impossible: it dumps a
+// tmpfs /dev/shm mount + a /dev/shm orphan REG-fd through the REAL vendored pycriu (so fstype is
+// the honest int 5, not a hand-written string), runs the SHIPPED assembled patch script, and
+// asserts the fd is REBOUND (CRIU_IMAGE_DIR_FD_REBOUND with entry_type=REG, label tmpfs-shmem-regfd)
+// and does NOT hard-stop (no CRIU_IMAGE_INCONSISTENCY). The path is now grounded in-sandbox against
+// a pycriu-faithful image — no MUST_ROUTE_BROKER deferral, no synthetic string spelling.
+func TestRealCorpus_TmpfsShmRebind_IntegerFstypeIsFixturable(t *testing.T) {
 	pypath, extraEnv := pycriuEnv(t)
-	// Dump a single tmpfs mount + one orphan REG-fd, reload, and read back the rendered fstype.
-	dir := t.TempDir()
+
+	// 1. Confirm the vendored pycriu still renders fstype as the honest int 5 (if a future env
+	//    upgrade makes it render the name, that is a benign change — the classifier accepts both).
+	probeDir := t.TempDir()
 	probe := `
 import sys, os
 import pycriu
@@ -291,23 +552,84 @@ print('FSTYPE_RENDER=%r' % (back['entries'][0]['fstype'],))
 	if err := os.WriteFile(probePath, []byte(probe), 0o600); err != nil {
 		t.Fatalf("write fstype probe: %v", err)
 	}
-	cmd := exec.Command("python3", probePath, dir)
+	cmd := exec.Command("python3", probePath, probeDir)
 	cmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fstype probe failed: %v\noutput: %s", err, out)
 	}
 	rendered := strings.TrimSpace(string(out))
-	// If this pycriu renders the name (a build where mnt_entry.fstype is a proper enum), the
-	// synthetic rebind fixture WOULD be faithful — surface that so a future env upgrade is noticed.
-	if strings.Contains(rendered, "'TMPFS'") {
-		t.Fatalf("fstype now renders as the enum NAME (%s) under this pycriu — the tmpfs-rebind path is NOW fixturable synthetically; add the REBIND_TO_ROOT contract test and remove this skip", rendered)
+	if !strings.Contains(rendered, "FSTYPE_RENDER=5") && !strings.Contains(rendered, "'TMPFS'") {
+		t.Fatalf("unexpected fstype rendering from pycriu round-trip: %q (expected int 5 or 'TMPFS')", rendered)
 	}
-	if !strings.Contains(rendered, "FSTYPE_RENDER=5") {
-		t.Fatalf("unexpected fstype rendering from pycriu round-trip: %q (expected the int 5)", rendered)
+	t.Logf("vendored pycriu renders /dev/shm mnt_entry.fstype as: %s", rendered)
+
+	// 2. Build a REAL-SHAPE corpus with a tmpfs /dev/shm mount (fstype int 5) whose mnt_id is NOT
+	//    is_drop_root-seeded into tmpfs_drop_mnt_ids on its own — resolution must come from the
+	//    mnt_id->fstype map — plus a /dev/shm PostgreSQL.* orphan REG-fd in files.img. Run the
+	//    shipped patch script and assert REBIND, not hard-stop.
+	corpusDir := t.TempDir()
+	gen := `
+import sys, os
+import pycriu
+d = sys.argv[1]
+# Root overlay + /dev (tmpfs) + /dev/shm (tmpfs, source 'shm'). fstype ints: OVERLAYFS=17, TMPFS=5.
+mnts = [
+    {'fstype': 17, 'mnt_id': 1, 'root_dev': 0, 'parent_mnt_id': 0, 'flags': 0,
+     'root': '/', 'mountpoint': '/', 'source': 'overlay', 'options': '', 'sb_flags': 0},
+    {'fstype': 5, 'mnt_id': 2, 'root_dev': 0, 'parent_mnt_id': 1, 'flags': 0,
+     'root': '/', 'mountpoint': '/dev', 'source': 'tmpfs', 'options': '', 'sb_flags': 0},
+    {'fstype': 5, 'mnt_id': 3, 'root_dev': 0, 'parent_mnt_id': 2, 'flags': 0,
+     'root': '/', 'mountpoint': '/dev/shm', 'source': 'shm', 'options': '', 'sb_flags': 0},
+]
+with open(os.path.join(d, 'mountpoints-12.img'), 'wb') as f:
+    pycriu.images.dump({'magic': 'MNTS', 'entries': mnts}, f)
+# files.img: one PLAIN-REG fd backed by mnt_id 3 (the /dev/shm tmpfs) — the PostgreSQL shm segment.
+# Required RegFileEntry/FileEntry fields (reg.id, reg.fown) must be present or SerializeToString fails.
+_FOWN = {'uid': 0, 'euid': 0, 'signum': 0, 'pid_type': 0, 'pid': 0}
+files = {'magic': 'FILES', 'entries': [
+    {'type': 'REG', 'id': 3,
+     'reg': {'id': 3, 'flags': 2, 'pos': 0, 'fown': _FOWN,
+             'name': '/dev/shm/PostgreSQL.846862466', 'mnt_id': 3, 'mode': 0o100600,
+             'ext': False}},
+]}
+with open(os.path.join(d, 'files.img'), 'wb') as f:
+    pycriu.images.dump(files, f)
+print('CORPUS_OK')
+`
+	genPath := filepath.Join(t.TempDir(), "pm-shm-gen.py")
+	if err := os.WriteFile(genPath, []byte(gen), 0o600); err != nil {
+		t.Fatalf("write corpus gen: %v", err)
 	}
-	t.Skip("ADR-0311 tmpfs/shm REG-fd rebind (REBIND_TO_ROOT) keys on the fstype enum-NAME 'TMPFS', " +
-		"but vendored pycriu round-trips fstype as the int 5 — a synthetic fixture cannot exercise the " +
-		"rebind branch (it DECLINEs). Grounds ONLY against a real CRIU-4.2 corpus (routed to the cluster " +
-		"broker, C-06 MUST_ROUTE_BROKER); real full-mount-ns dump does not produce in-sandbox.")
+	genCmd := exec.Command("python3", genPath, corpusDir)
+	genCmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
+	if genOut, genErr := genCmd.CombinedOutput(); genErr != nil {
+		t.Fatalf("corpus gen failed: %v\noutput: %s", genErr, genOut)
+	}
+
+	// Run the SHIPPED patch script (assemblePatchScript) over the corpus.
+	scriptPath := filepath.Join(t.TempDir(), "pm-patch-ckpt.py")
+	if err := os.WriteFile(scriptPath, []byte(assemblePatchScript()), 0o600); err != nil {
+		t.Fatalf("write patch script: %v", err)
+	}
+	patchCmd := exec.Command("python3", scriptPath, corpusDir, "[]", "[]")
+	patchCmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
+	patchOut, patchErr := patchCmd.CombinedOutput()
+	outStr := string(patchOut)
+	if patchErr != nil {
+		t.Fatalf("shipped patch script hard-stopped on the /dev/shm shm orphan (the live P-0193-1 "+
+			"regression): %v\noutput:\n%s", patchErr, outStr)
+	}
+	if strings.Contains(outStr, "CRIU_IMAGE_INCONSISTENCY") {
+		t.Fatalf("shm orphan fd fired P-0193-1 hard-stop instead of rebinding — int-fstype regression:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "CRIU_IMAGE_DIR_FD_REBOUND") {
+		t.Fatalf("expected the /dev/shm shm orphan REG-fd to REBIND (CRIU_IMAGE_DIR_FD_REBOUND), got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "tmpfs-shmem-regfd") {
+		t.Fatalf("expected the tmpfs-shmem-regfd label on the rebind, got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, `"entry_type":"REG"`) {
+		t.Fatalf("expected entry_type REG on the rebind token, got:\n%s", outStr)
+	}
 }
