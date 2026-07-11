@@ -110,3 +110,11 @@ rules:
   - apiGroups: [""]
     resources: [events]
     verbs: [create, patch, update]
+  # ADR-0322: the Cilium ipcache/CiliumEndpoint handoff readiness check (injectIPHandoff,
+  # immediately before verifyDataplaneReachability) polls cilium.io/v2 CiliumEndpoint via
+  # DynamicClient. ClusterRole (not a namespaced Role) is deliberate: migrated workloads and
+  # their CiliumEndpoint objects can originate from any application namespace, matching the
+  # operator's existing cluster-scoped rules for other cross-namespace resources above.
+  - apiGroups: [cilium.io]
+    resources: [ciliumendpoints]
+    verbs: [get, list, watch]

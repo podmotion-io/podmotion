@@ -177,7 +177,22 @@ func (w *PodMutatingWebhook) Handle(ctx context.Context, req admission.Request) 
 	//    source pod's IP before the sandbox starts (CNI ADD fires with pinned address).
 	//    CRIU does NOT overwrite the IP — the CNI annotation is authoritative (ADR-0046).
 	if pm.Spec.SourcePodIP != "" {
-		injectIPAMAnnotation(pod, pm.Spec.SourcePodIP, pm.Status.CNIProvider)
+		// ADR-0322 fix: pm.Status.CNIProvider is write-never (zero writers), so the
+		// cilium case never fired and the ipam.cilium.io/ip pin annotation was never
+		// written. Resolve the real, write-verified signal from the destination NMC
+		// (mirroring the controller's fetch pattern) — but on fetch error, fall
+		// THROUGH to no-annotation (a mutating admission request cannot requeue);
+		// the unpinned case is caught downstream by P-VERIFY-C, not blocked here.
+		cniPlugin := pm.Status.CNIProvider
+		if pm.Spec.TargetNodeName != "" {
+			destNMC := &pmv1.NodeMigrationCapacity{}
+			if nmcErr := w.Client.Get(ctx, types.NamespacedName{Name: pm.Spec.TargetNodeName}, destNMC); nmcErr == nil {
+				cniPlugin = destNMC.Spec.NetworkCapability.CNIPlugin
+			} else {
+				log.Error(nmcErr, "ADR-0322: destNMC fetch failed — falling through to no-annotation (P-VERIFY-C catches unpinned case)")
+			}
+		}
+		injectIPAMAnnotation(pod, pm.Spec.SourcePodIP, cniPlugin)
 	}
 
 	// Fix 2 — Patch all DoNotSchedule topology spread constraints to ScheduleAnyway.

@@ -397,6 +397,23 @@ const (
 	ConditionReclaimObjectsInstalled = "ReclaimObjectsInstalled"
 )
 
+// Reason vocabulary for the ADR-0322 Cilium ipcache/CiliumEndpoint handoff branch,
+// inserted into injectIPHandoff immediately before verifyDataplaneReachability.
+// These gate ConditionDataplaneReachabilityVerified=False under tcpPreservationMode=Strict
+// on a Cilium destination; all three are fail-closed (block/requeue, never silently skip).
+const (
+	// ReasonCiliumEndpointLookupError: the CiliumEndpoint dynamic-client Get/lookup itself
+	// returned an error (not "not found" as a terminal state, but a transient/API error).
+	ReasonCiliumEndpointLookupError = "CiliumEndpointLookupError"
+	// ReasonCiliumEndpointNotReady: the CiliumEndpoint was found but status.state != "ready"
+	// or status.identity.id == 0 (ipcache programming not yet confirmed).
+	ReasonCiliumEndpointNotReady = "CiliumEndpointNotReady"
+	// ReasonCNISignalUnresolved: destNMC.Spec.NetworkCapability.CNIPlugin could not be
+	// resolved (fetch error or empty value) on a destination that must be treated as
+	// Cilium-capable; fail-closed rather than silently skipping the readiness check.
+	ReasonCNISignalUnresolved = "CNISignalUnresolved"
+)
+
 // PreCopyStats records metrics from the iterative pre-copy phase.
 type PreCopyStats struct {
 	// RoundsCompleted is the number of pre-dump rounds completed.

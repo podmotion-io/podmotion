@@ -24,6 +24,7 @@ import (
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+	"k8s.io/client-go/dynamic"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -260,9 +261,18 @@ func main() {
 	replicationMgr := &replication.ReplicationManager{Client: mgr.GetClient(), AgentPool: agentPool}
 	storageMgr := storage.NewStorageMigrationManager(mgr.GetClient())
 
+	// ADR-0322: dynamic client for the Cilium CiliumEndpoint readiness poll
+	// (cilium.io/v2 is a CRD, not compiled into the typed clientset).
+	dynamicClient, err := dynamic.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to create dynamic client for Cilium CiliumEndpoint polling (ADR-0322)")
+		os.Exit(1)
+	}
+
 	if err := (&controller.PodMigrationReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		DynamicClient: dynamicClient,
 		Estimator: &estimation.DefaultEstimator{
 			Prober: &estimation.StubProber{},
 		},

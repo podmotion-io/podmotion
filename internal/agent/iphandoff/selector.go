@@ -43,7 +43,7 @@ func (s *CNIMobilitySelector) Select(ctx context.Context, cniPlugin string) IPHa
 	case strings.Contains(lower, "cilium"):
 		// Cilium IPAM-pin approach: annotate destination pod with ipam.cilium.io/ip.
 		// Requires multi-pool or CRD IPAM mode. Live migration only.
-		return &CiliumHandoff{KubeClient: s.KubeClient}
+		return &CiliumHandoff{KubeClient: s.KubeClient, DynamicClient: s.DynamicClient}
 	case strings.Contains(lower, "flannel"):
 		// Flannel does not support IP mobility — cold migration only.
 		// NetworkContinuity=true requests are rejected at admission and at runtime.
