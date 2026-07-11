@@ -5,6 +5,14 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 */
 
+// Package iphandoff: CiliumHandoff in this file is dead code on the current
+// preflight-gated path. ADR-0082 names it the v1.1 starting point for a future
+// Cilium IP-mobility implementation; ADR-0313 removed "cilium" from
+// ipMobilitySupported's supported-CNI case list and added a CNICompatible=False/
+// CNIUnsupported NodeMigrationCapacity status condition at agent registration
+// (internal/agent/nmcregistrar/registrar.go), so migrations on Cilium nodes are
+// now refused at preflight before any code in this file would run. Do not delete —
+// retained as the v1.1 starting point per ADR-0082.
 package iphandoff
 
 import (

@@ -604,6 +604,13 @@ message VerifyTCPRequest {
   string app_probe_address       = 5; // host:port for TCP/SQL probe
   string app_probe_query         = 6; // SQL query (e.g. "SELECT 1")
   int32  app_probe_timeout_s     = 7;
+  // ADR-0312: when true, VerifyTCP skips PID/socket-inventory resolution and
+  // seq-delta accounting entirely and runs ONLY the application-layer probe.
+  // Zero-value-safe (default false preserves today's full-verification behavior).
+  // Used by reconcileServiceVerifying to populate WorkloadLivenessVerified for
+  // ALL TCPPreservationMode values (including None, which never calls VerifyTCP
+  // for sequence continuity).
+  bool   app_probe_only          = 8;
 }
 
 message VerifyTCPResponse {

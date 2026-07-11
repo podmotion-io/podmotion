@@ -150,7 +150,30 @@ type NodeMigrationCapacityStatus struct {
 	// (ADR-0102).
 	// +optional
 	IPSecEncryption bool `json:"ipSecEncryption,omitempty"`
+
+	// Conditions provides status conditions including CNICompatible (ADR-0313).
+	// +listType=map
+	// +listMapKey=type
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
+
+// ADR-0313: CNICompatible condition Type/Reason constants for NodeMigrationCapacity.
+// Written by the agent registrar via meta.SetStatusCondition — no call-site literals
+// (same freeform status.conditions discipline as PodMigration's condition constants).
+const (
+	// ConditionCNICompatible is True when the detected CNI plugin is fully supported
+	// by PodMotion's live-migration datapath; False when the CNI is structurally
+	// incompatible (e.g. Cilium — no IP-mobility handoff implemented, ADR-0082/ADR-0313).
+	ConditionCNICompatible = "CNICompatible"
+
+	// ReasonCNIUnsupported is the Reason used when ConditionCNICompatible is False
+	// because the detected CNI plugin lacks an IP-mobility handoff implementation.
+	ReasonCNIUnsupported = "CNIUnsupported"
+
+	// ReasonCNISupported is the Reason used when ConditionCNICompatible is True.
+	ReasonCNISupported = "CNISupported"
+)
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status

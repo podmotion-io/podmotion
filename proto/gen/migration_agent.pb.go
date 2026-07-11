@@ -3461,8 +3461,15 @@ type VerifyTCPRequest struct {
 	AppProbeAddress  string `protobuf:"bytes,5,opt,name=app_probe_address,json=appProbeAddress,proto3" json:"app_probe_address,omitempty"` // host:port for TCP/SQL probe
 	AppProbeQuery    string `protobuf:"bytes,6,opt,name=app_probe_query,json=appProbeQuery,proto3" json:"app_probe_query,omitempty"`       // SQL query (e.g. "SELECT 1")
 	AppProbeTimeoutS int32  `protobuf:"varint,7,opt,name=app_probe_timeout_s,json=appProbeTimeoutS,proto3" json:"app_probe_timeout_s,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// ADR-0312: when true, VerifyTCP skips PID/socket-inventory resolution and
+	// seq-delta accounting entirely and runs ONLY the application-layer probe.
+	// Zero-value-safe (default false preserves today's full-verification behavior).
+	// Used by reconcileServiceVerifying to populate WorkloadLivenessVerified for
+	// ALL TCPPreservationMode values (including None, which never calls VerifyTCP
+	// for sequence continuity).
+	AppProbeOnly  bool `protobuf:"varint,8,opt,name=app_probe_only,json=appProbeOnly,proto3" json:"app_probe_only,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VerifyTCPRequest) Reset() {
@@ -3542,6 +3549,13 @@ func (x *VerifyTCPRequest) GetAppProbeTimeoutS() int32 {
 		return x.AppProbeTimeoutS
 	}
 	return 0
+}
+
+func (x *VerifyTCPRequest) GetAppProbeOnly() bool {
+	if x != nil {
+		return x.AppProbeOnly
+	}
+	return false
 }
 
 type VerifyTCPResponse struct {
@@ -4213,7 +4227,7 @@ const file_migration_agent_proto_rawDesc = "" +
 	"old_pod_ip\x18\x02 \x01(\tR\boldPodIp\"N\n" +
 	"\x1cProbeDestSocketForIPResponse\x12\x18\n" +
 	"\apresent\x18\x01 \x01(\bR\apresent\x12\x14\n" +
-	"\x05count\x18\x02 \x01(\x05R\x05count\"\xd6\x02\n" +
+	"\x05count\x18\x02 \x01(\x05R\x05count\"\xfc\x02\n" +
 	"\x10VerifyTCPRequest\x12%\n" +
 	"\x0emigration_name\x18\x01 \x01(\tR\rmigrationName\x12\x17\n" +
 	"\apod_uid\x18\x02 \x01(\tR\x06podUid\x12Q\n" +
@@ -4221,7 +4235,8 @@ const file_migration_agent_proto_rawDesc = "" +
 	"\x12app_probe_protocol\x18\x04 \x01(\tR\x10appProbeProtocol\x12*\n" +
 	"\x11app_probe_address\x18\x05 \x01(\tR\x0fappProbeAddress\x12&\n" +
 	"\x0fapp_probe_query\x18\x06 \x01(\tR\rappProbeQuery\x12-\n" +
-	"\x13app_probe_timeout_s\x18\a \x01(\x05R\x10appProbeTimeoutS\"\xdc\x02\n" +
+	"\x13app_probe_timeout_s\x18\a \x01(\x05R\x10appProbeTimeoutS\x12$\n" +
+	"\x0eapp_probe_only\x18\b \x01(\bR\fappProbeOnly\"\xdc\x02\n" +
 	"\x11VerifyTCPResponse\x12\x1a\n" +
 	"\bverified\x18\x01 \x01(\bR\bverified\x12%\n" +
 	"\x0efailure_reason\x18\x02 \x01(\tR\rfailureReason\x121\n" +

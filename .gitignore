@@ -98,6 +98,8 @@ docs/adr/ADR-0226-*.md
 
 # Top-level methodology and strategy docs
 docs/sprint-workflow-skeleton.js
+docs/self-heal-workflow-skeleton.js
+docs/design/SELF-HEAL-WORKFLOW-MONITORING.md
 docs/STRATEGY-REVIEW-*.md
 docs/NORTH_STAR_SPRINT_PLAN.md
 docs/FELN_SPRINT_PLAN.md
@@ -135,3 +137,5 @@ docs/WORKSTREAM-*.md
 # Public-CI methodology-lexicon scanner — enumerates the internal codename lexicon in cleartext.
 # Republishing it announces the vocabulary it exists to hide; the local pre-commit hook enforces instead.
 .github/workflows/disclose-check.yaml
+docs/design/PREAUTHOR-GATE-DEADEND-ANALYSIS.md
+docs/design/DEV-PHASE-INTERDEP-HARDENING.md

@@ -21,7 +21,7 @@ import (
 // that --empty-ns and --tcp-close are absent (M19 acceptance criterion: joinNsRestore
 // unit test asserts --join-ns net:<fd> selected when NetworkContinuity != None).
 func TestBuildCRIURestoreArgs_JoinNs(t *testing.T) {
-	args := buildCRIURestoreArgs(
+	args, err := buildCRIURestoreArgs(
 		"/run/podmotion/checkpoints/test/final",
 		"/var/lib/podmotion/restore/test/bundle/rootfs",
 		"/var/lib/podmotion/restore/test/data",
@@ -32,7 +32,11 @@ func TestBuildCRIURestoreArgs_JoinNs(t *testing.T) {
 		"",
 		"",
 		false,
+		nil,
 	)
+	if err != nil {
+		t.Fatalf("buildCRIURestoreArgs returned error: %v", err)
+	}
 	joined := strings.Join(args, " ")
 
 	if !strings.Contains(joined, "--join-ns net:/proc/12345/fd/7") {
@@ -60,7 +64,7 @@ func TestBuildCRIURestoreArgs_JoinNs(t *testing.T) {
 // PATH via --join-ns net:<path> + --tcp-close (ADR-0125, supersedes ADR-0122 §3), and that
 // --empty-ns, --net-fd, and --tcp-established are absent. CRIU 4.2 has no --net-fd flag.
 func TestBuildCRIURestoreArgs_ColdJoinNsPath(t *testing.T) {
-	args := buildCRIURestoreArgs(
+	args, err := buildCRIURestoreArgs(
 		"/run/podmotion/checkpoints/test/final",
 		"/var/lib/podmotion/restore/test/bundle/rootfs",
 		"/var/lib/podmotion/restore/test/data",
@@ -71,7 +75,11 @@ func TestBuildCRIURestoreArgs_ColdJoinNsPath(t *testing.T) {
 		"/var/run/netns/cni-abc123",
 		"",
 		false,
+		nil,
 	)
+	if err != nil {
+		t.Fatalf("buildCRIURestoreArgs returned error: %v", err)
+	}
 	joined := strings.Join(args, " ")
 
 	if !strings.Contains(joined, "--join-ns net:/var/run/netns/cni-abc123") {
@@ -98,7 +106,7 @@ func TestBuildCRIURestoreArgs_ColdJoinNsPath(t *testing.T) {
 // destNetnsFd="" (the NRI path), --leave-stopped is emitted (ADR-0144 Decision Point 1).
 // This is the gate that prevents a write into an unwired datapath on an actively-writing client.
 func TestBuildCRIURestoreArgs_StrictModeNRIPath(t *testing.T) {
-	args := buildCRIURestoreArgs(
+	args, err := buildCRIURestoreArgs(
 		"/run/podmotion/checkpoints/test/final",
 		"/var/lib/podmotion/restore/test/bundle/rootfs",
 		"/var/lib/podmotion/restore/test/data",
@@ -109,7 +117,11 @@ func TestBuildCRIURestoreArgs_StrictModeNRIPath(t *testing.T) {
 		"/var/run/netns/cni-abc123",
 		"",
 		true, // strictMode=true → must emit --leave-stopped (ADR-0144 D1)
+		nil,
 	)
+	if err != nil {
+		t.Fatalf("buildCRIURestoreArgs returned error: %v", err)
+	}
 	joined := strings.Join(args, " ")
 
 	if !strings.Contains(joined, "--leave-stopped") {
@@ -120,6 +132,75 @@ func TestBuildCRIURestoreArgs_StrictModeNRIPath(t *testing.T) {
 	}
 	if strings.Contains(joined, "--restore-detached") {
 		t.Errorf("--restore-detached must never appear (ADR-0142 D4); got: %s", joined)
+	}
+}
+
+// hasAdjacentPair reports whether args contains flag immediately followed by value.
+func hasAdjacentPair(args []string, flag, value string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag && args[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+// TestBuildCRIURestoreArgs_NoDevShmExtMountMap asserts that buildCRIURestoreArgs no
+// longer emits the dead "--ext-mount-map /dev/shm:/dev/shm" entry. The live restore.log
+// proves there is no /dev/shm mount in the checkpointed container (/dev/shm is a plain
+// subdirectory inside the single /dev tmpfs the OCI runtime recreates empty on restore),
+// so that entry was a proven-inert no-op that falsely signaled /dev/shm was handled here.
+// PostgreSQL's dynamic shared memory is instead routed to a SysV segment (fixture arg
+// dynamic_shared_memory_type=sysv) that CRIU content-captures in the image. The retained
+// ext-mount-map entries (auto, /dev/null, resolv.conf, hostname, hosts) must remain.
+func TestBuildCRIURestoreArgs_NoDevShmExtMountMap(t *testing.T) {
+	args, err := buildCRIURestoreArgs(
+		"/run/podmotion/checkpoints/test/final",
+		"/var/lib/podmotion/restore/test/bundle/rootfs",
+		"/var/lib/podmotion/restore/test/data",
+		"/var/lib/podmotion/restore/test/termination-log",
+		"/var/lib/podmotion/restore/test/secrets",
+		"/run/podmotion/checkpoints/test/final/restore.log",
+		"",
+		"/var/run/netns/cni-abc123",
+		"",
+		false,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("buildCRIURestoreArgs returned error: %v", err)
+	}
+
+	// The dead /dev/shm ext-mount-map must be gone.
+	if hasAdjacentPair(args, "--ext-mount-map", "/dev/shm:/dev/shm") {
+		t.Errorf("--ext-mount-map /dev/shm:/dev/shm must not appear (dead no-op removed); got: %s", strings.Join(args, " "))
+	}
+
+	// Stronger guard: NO ext-mount-map value may reference /dev/shm in ANY form (not just the
+	// exact /dev/shm:/dev/shm pair). /dev/shm is a subdirectory of the single /dev tmpfs, not a
+	// mount, so there is nothing to map — any /dev/shm ext-mount-map is a dead no-op and a false
+	// signal that /dev/shm is handled here. The no-/dev/shm guarantee holds because PostgreSQL's
+	// dynamic shared memory is routed to a SysV segment (dynamic_shared_memory_type=sysv, a
+	// postgres-specific config primitive) that CRIU content-captures in the checkpoint image,
+	// leaving no /dev/shm/* files-reg path to reopen on restore.
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--ext-mount-map" && strings.Contains(args[i+1], "/dev/shm") {
+			t.Errorf("no --ext-mount-map value may reference /dev/shm; found %q; got: %s", args[i+1], strings.Join(args, " "))
+		}
+	}
+
+	// Retained ext-mount-map entries must still be present.
+	retained := []struct{ flag, value string }{
+		{"--ext-mount-map", "auto"},
+		{"--ext-mount-map", "/dev/null:/dev/null"},
+		{"--ext-mount-map", "/etc/resolv.conf:/etc/resolv.conf"},
+		{"--ext-mount-map", "/etc/hostname:/etc/hostname"},
+		{"--ext-mount-map", "/etc/hosts:/etc/hosts"},
+	}
+	for _, r := range retained {
+		if !hasAdjacentPair(args, r.flag, r.value) {
+			t.Errorf("expected retained %s %s in args; got: %s", r.flag, r.value, strings.Join(args, " "))
+		}
 	}
 }
 

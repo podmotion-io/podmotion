@@ -371,6 +371,92 @@ func TestClassifyRegFd_TmpfsShmRegRebindViaFstypeMap(t *testing.T) {
 	}
 }
 
+// TestClassifyRegFd_TmpfsShmRegRebind_IntegerFstype is the PINNED regression for the postgres
+// checkpoint-stage / restore-frontier live failure decoded 2026-07-10.
+//
+// GROUND TRUTH: a real postgres live migration on KVM reached past Checkpointing (checkpoint
+// captured, 25MB image) and then FAILED at restore with:
+//
+//	files.img REG fd id=3 name_leaf=PostgreSQL.846862466 backing_mnt_id=1164 backing_fstype=5:
+//	positive orphan mnt_id not in kept mountpoints — hard-stopped (ADR-0193 P-0193-1)
+//
+// backing_fstype=5 is the smoking gun. CRIU's mnt_entry.fstype (mnt.proto) is a bare uint32
+// carrying an enum-valued code (mnt_pb2.py: TMPFS=5, DEVTMPFS=3), NOT a native protobuf enum
+// field, so the vendored pycriu decodes it as the raw INT 5 on the production load() path
+// (no pretty=True). Every prior ADR-0311 test fed the enum-NAME string "TMPFS" into
+// mnt_fstypes, so the classifier's `fstype in ('TMPFS','DEVTMPFS')` check passed in tests but
+// on a real image compared `5 in ('TMPFS','DEVTMPFS')` == False → DECLINE → P-0193-1 hard-stop.
+// That is the corpus-vs-reality divergence the whole live-gate policy exists to catch.
+//
+// This test drives the SHIPPED classifier with the fstype rendered as the raw INTEGER (5 for
+// TMPFS, 3 for DEVTMPFS) — exactly as production pycriu produces — and asserts REBIND_TO_ROOT.
+// If a future edit reverts the classifier to string-only matching, this fails loudly and the
+// postgres restore regresses back to the P-0193-1 hard-stop.
+func TestClassifyRegFd_TmpfsShmRegRebind_IntegerFstype(t *testing.T) {
+	// (a) /dev/shm PostgreSQL segment — backing mnt_id resolves to the raw int TMPFS code 5.
+	//     This is the exact live shape (mnt_id 1164, fstype 5).
+	ctxTmpfs := map[string]any{
+		"remap_ids":          []int{},
+		"inherit_fd_names":   []string{},
+		"kept_mnt_ids":       []int{1},
+		"ext_drop_mnt_ids":   []int{},
+		"root_mnt_id":        1,
+		"tmpfs_drop_mnt_ids": []int{}, // deliberately empty — resolution must come from the fstype map.
+		// Raw integer enum code, as vendored pycriu renders it on the production load() path.
+		"mnt_fstypes": map[string]any{"1164": 5},
+	}
+	shmRegFd := reg(60, "/dev/shm/PostgreSQL.846862466", 1164, modeFile, false)
+	got := runClassifySelftest(t, ctxTmpfs, []map[string]any{shmRegFd})
+	if got[0].Action != "REBIND_TO_ROOT" {
+		t.Fatalf("live /dev/shm PostgreSQL fd (mnt_id 1164, fstype INT 5): got action %q, want REBIND_TO_ROOT "+
+			"(int-vs-string enum regression — postgres restore would P-0193-1 hard-stop)", got[0].Action)
+	}
+	if got[0].EntryType != "REG" {
+		t.Fatalf("live /dev/shm PostgreSQL fd: got entry_type %q, want REG", got[0].EntryType)
+	}
+
+	// (b) devtmpfs-backed orphan — raw int DEVTMPFS code 3 must also rebind.
+	ctxDev := map[string]any{
+		"remap_ids":          []int{},
+		"inherit_fd_names":   []string{},
+		"kept_mnt_ids":       []int{1},
+		"ext_drop_mnt_ids":   []int{},
+		"root_mnt_id":        1,
+		"tmpfs_drop_mnt_ids": []int{},
+		"mnt_fstypes":        map[string]any{"70": 3},
+	}
+	devRegFd := reg(61, "/dev/something", 70, modeFile, false)
+	if got := runClassifySelftest(t, ctxDev, []map[string]any{devRegFd}); got[0].Action != "REBIND_TO_ROOT" {
+		t.Fatalf("devtmpfs orphan fd (fstype INT 3): got action %q, want REBIND_TO_ROOT", got[0].Action)
+	}
+
+	// (c) Guard UNWEAKENED: a non-tmpfs fstype rendered as a raw int (sysfs=2, overlayfs=17,
+	//     proc=1, a real persistent volume=0) must STILL DECLINE. The int widening authorizes
+	//     ONLY the tmpfs/devtmpfs codes.
+	for _, tc := range []struct {
+		name   string
+		fstype int
+	}{
+		{"proc(1)", 1}, {"sysfs(2)", 2}, {"persistent-vol(0)", 0}, {"overlayfs(17)", 17},
+	} {
+		t.Run("non_tmpfs_int_declines/"+tc.name, func(t *testing.T) {
+			ctx := map[string]any{
+				"remap_ids":          []int{},
+				"inherit_fd_names":   []string{},
+				"kept_mnt_ids":       []int{1},
+				"ext_drop_mnt_ids":   []int{},
+				"root_mnt_id":        1,
+				"tmpfs_drop_mnt_ids": []int{},
+				"mnt_fstypes":        map[string]any{"900": tc.fstype},
+			}
+			regFd := reg(62, "/var/lib/postgresql/data/base/1/1234", 900, modeFile, false)
+			if got := runClassifySelftest(t, ctx, []map[string]any{regFd}); got[0].Action != "DECLINE" {
+				t.Fatalf("non-tmpfs int fstype %d: got %q, want DECLINE (Strict guard must not weaken)", tc.fstype, got[0].Action)
+			}
+		})
+	}
+}
+
 // TestClassifyRegFd_NonTmpfsFstypeMapDeclines is the ADR-0311 follow-up guard: an orphan REG
 // fd whose backing mnt_id resolves via the mnt_id->fstype map to a NON-tmpfs fstype (here a
 // real persistent-volume-style overlayfs/ext4 mount) must STILL hard-stop (DECLINE). Proves
