@@ -394,24 +394,15 @@ func (r *Registrar) Register(ctx context.Context) error {
 		nmc.Status.IPSecEncryption = ipsec
 	}
 
-	// ADR-0313: CNICompatible condition, driven by detectCNI()=="cilium" INDEPENDENTLY
-	// of PODMOTION_FORCE_IP_MOBILITY (that override answers a different question — an
-	// operator bring-up escape hatch — and must not suppress this truthful advisory).
-	if cni == "cilium" {
-		meta.SetStatusCondition(&nmc.Status.Conditions, metav1.Condition{
-			Type:    pmv1.ConditionCNICompatible,
-			Status:  metav1.ConditionFalse,
-			Reason:  pmv1.ReasonCNIUnsupported,
-			Message: "Cilium has no IP-mobility handoff implementation (ADR-0082 CiliumHandoff is a v1.1 starting point, not yet live; tracked by cni-roadmap/cilium-v1.1). Live migration is refused at preflight for this node's CNI.",
-		})
-	} else {
-		meta.SetStatusCondition(&nmc.Status.Conditions, metav1.Condition{
-			Type:    pmv1.ConditionCNICompatible,
-			Status:  metav1.ConditionTrue,
-			Reason:  pmv1.ReasonCNISupported,
-			Message: fmt.Sprintf("CNI plugin %q is supported by PodMotion's live-migration datapath.", cni),
-		})
-	}
+	// ADR-0318: CNICompatible condition. Cilium now has a real ipcache/CiliumEndpoint
+	// IP-mobility handoff path (ADR-0318 Decision §2) and is reported compatible like
+	// the other supported CNIs; ipMobilitySupported below is flipped to match.
+	meta.SetStatusCondition(&nmc.Status.Conditions, metav1.Condition{
+		Type:    pmv1.ConditionCNICompatible,
+		Status:  metav1.ConditionTrue,
+		Reason:  pmv1.ReasonCNISupported,
+		Message: fmt.Sprintf("CNI plugin %q is supported by PodMotion's live-migration datapath.", cni),
+	})
 
 	if err := r.client.Status().Update(ctx, nmc); err != nil {
 		return fmt.Errorf("updating NodeMigrationCapacity status: %w", err)
@@ -553,9 +544,8 @@ func ipMobilitySupported(cni string, kf pmv1.KernelFeatures) bool {
 		return false
 	case "calico", "ovn-kubernetes": // BGP/native routing or native eBPF datapath
 		return true
-	case "cilium": // ADR-0313: no IP-mobility handoff implemented for Cilium — see
-		// CNICompatible=False/CNIUnsupported condition emitted at registration.
-		return false
+	case "cilium": // ADR-0318: real ipcache/CiliumEndpoint IP-mobility handoff implemented.
+		return true
 	default:
 		return false
 	}
