@@ -377,6 +377,15 @@ const (
 	// ConditionIPReclaimSourceTornDown are True (ADR-0244 / NR-BLOCK-2). Distinct from
 	// ConditionCni0CleanupVerified, which is scoped only to CUTOVER_COMPLETE objects.
 	ConditionIPReclaimComplete = "IPReclaimComplete"
+	// ConditionSourceStorageWriteRestored is True once the source's Tier0 (RWX)
+	// storage has been confirmed writable again after a rollback (ADR-0007
+	// remount-handoff protocol, ADR-0344 Decision A.2). The RollingBack phase
+	// handler must observe this condition True before resuming (SIGCONT-ing) the
+	// frozen source process, closing the concurrent-writer/split-brain window
+	// described in ADR-0344 Context §2. For non-Tier0 migrations this is set
+	// True immediately (same-reconcile no-op) since there is no shared-mount
+	// hazard to guard against.
+	ConditionSourceStorageWriteRestored = "SourceStorageWriteRestored"
 	// ConditionIPReclaimVerified records the VerifyCleanup(IP_RECLAIM) bounded-retry outcome
 	// (3 attempts, 2s/4s/8s), same fail-open posture as ConditionCni0CleanupVerified
 	// (ADR-0241 item 1 precedent). False (reason CleanupLeakExhausted) on retry-budget

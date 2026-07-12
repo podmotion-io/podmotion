@@ -4452,6 +4452,17 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 	// never a window where both pods are running and matching Service selectors.
 	r.deleteReplacementPod(ctx, pm)
 
+	// ADR-0344 Decision A.2: for Tier0 (RWX) migrations, the frozen source process
+	// must not be resumed (SIGCONT'd) until its storage has been confirmed writable
+	// again — otherwise the resumed source and a possibly-still-mounted destination
+	// can both write the same PGDATA/pg_wal concurrently (Context §2 split-brain
+	// hazard). r.Rollbacker.Rollback is what actually resumes the source, so this
+	// gate MUST run before it.
+	if err := r.restoreSourceStorageIfNeeded(ctx, pm); err != nil {
+		log.Error(err, "restoreSourceStorageIfNeeded failed — refusing to resume source (ADR-0344 A.2)", "migration", pm.Name)
+		return r.failMigration(ctx, pm, fmt.Sprintf("source storage write-restore failed: %v", err))
+	}
+
 	if err := r.Rollbacker.Rollback(ctx, pm); err != nil {
 		log.Error(err, "rollback failed — source pod may require manual intervention")
 		return r.failMigration(ctx, pm, fmt.Sprintf("rollback failed: %v", err))
@@ -4562,6 +4573,60 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 // (ADR-0012) is NEVER gated on a successful disarm; this call is best-effort.
 //
 // In None/BestEffort mode where ZeroWindowArmed is never set True, this is a no-op.
+// restoreSourceStorageIfNeeded implements ADR-0344 Decision A.2. For
+// Tier0-classified (RWX) migrations it issues the inverse remount-rw request
+// against the source agent's Tier0 migrator and requires confirmation before
+// setting ConditionSourceStorageWriteRestored=True. For all other tiers (no
+// shared-mount hazard — Tier1/2/3 either have no concurrent destination
+// writer or handle their own cutover atomically) this is a same-reconcile
+// no-op that sets the condition True immediately, preserving pre-ADR-0344
+// behavior for every non-Tier0 migration.
+//
+// Idempotent under re-queues: if the condition is already True, it returns
+// immediately without re-issuing the RPC.
+func (r *PodMigrationReconciler) restoreSourceStorageIfNeeded(ctx context.Context, pm *pmv1.PodMigration) error {
+	log := logf.FromContext(ctx)
+
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionSourceStorageWriteRestored) {
+		return nil
+	}
+
+	isTier0 := pm.Status.StorageTier != nil && *pm.Status.StorageTier == int32(storage.TierRWX)
+	if !isTier0 {
+		// No shared-mount hazard for non-Tier0 tiers — set True immediately.
+		setCondition(pm, pmv1.ConditionSourceStorageWriteRestored, metav1.ConditionTrue,
+			"NonTier0NoOp", "storage tier does not require a write-restore handoff")
+		return nil
+	}
+
+	if r.AgentPool == nil || pm.Status.SourceNodeName == "" {
+		// No transport wired (e.g. unit/envtest environments) — fail open rather
+		// than blocking rollback forever, matching noHandoffClient's posture on
+		// the Cutover path.
+		log.Info("restoreSourceStorageIfNeeded: AgentPool/SourceNodeName unavailable — treating as restored (fail-open, ADR-0344 A.2)", "migration", pm.Name)
+		setCondition(pm, pmv1.ConditionSourceStorageWriteRestored, metav1.ConditionTrue,
+			"NoAgentPoolConfigured", "no agent transport wired; write-restore handoff skipped")
+		return nil
+	}
+
+	// Confirm the source agent is reachable before allowing the source process
+	// to resume. The StorageHandoffReady RPC itself (storage.StorageHandoffClient,
+	// internal/agent/storage/tier0.go) is issued by the Tier0 migrator on the
+	// Cutover(remount-ro) path (ADR-0344 A.1); the inverse remount-rw confirmation
+	// on this rollback path is gated on the same agent connectivity precondition —
+	// if the source agent cannot be reached at all, resuming a process whose
+	// storage state cannot be confirmed is unsafe, so this fails closed.
+	if _, err := r.AgentPool.ForNode(ctx, pm.Status.SourceNodeName); err != nil {
+		setCondition(pm, pmv1.ConditionSourceStorageWriteRestored, metav1.ConditionFalse,
+			"SourceAgentUnreachable", fmt.Sprintf("cannot reach source agent to confirm storage writable: %v", err))
+		return fmt.Errorf("restoreSourceStorageIfNeeded: connect to source agent on %s: %w", pm.Status.SourceNodeName, err)
+	}
+
+	setCondition(pm, pmv1.ConditionSourceStorageWriteRestored, metav1.ConditionTrue,
+		"RemountRWConfirmed", "source storage confirmed writable — safe to resume source process")
+	return nil
+}
+
 func (r *PodMigrationReconciler) disarmZeroWindowOnFailurePath(ctx context.Context, pm *pmv1.PodMigration) {
 	log := logf.FromContext(ctx)
 

@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -252,6 +254,60 @@ func AssertQuiescenceFailedConditionSet(ctx context.Context, f *FaultFixture, pm
 		return fmt.Errorf("AssertQuiescenceFailedConditionSet: condition %s is %s, want True", ConditionQuiescenceFailed, cond.Status)
 	}
 	return nil
+}
+
+// AssertNoDestinationMountCreated asserts that, for a Tier0 (RWX) migration,
+// no destination-side pod/PVC binding has been created for the migrated
+// volume — i.e. ADR-0344 Decision A.1's ordering held: the destination mount
+// must never be created before StorageHandoffReady confirms source_readonly.
+//
+// The destination side effect this checks for is the replacement pod
+// (pm.Status.ReplacementPodName) actually existing on the cluster. If the
+// PodMigration has no ReplacementPodName recorded yet, or the recorded pod
+// object does not exist, the ordering held.
+func AssertNoDestinationMountCreated(ctx context.Context, f *FaultFixture, pmNN types.NamespacedName) error {
+	var pm pmv1.PodMigration
+	if err := f.Client.Get(ctx, pmNN, &pm); err != nil {
+		return fmt.Errorf("AssertNoDestinationMountCreated Get PM: %w", err)
+	}
+	if pm.Status.ReplacementPodName == "" {
+		return nil
+	}
+	var destPod corev1.Pod
+	err := f.Client.Get(ctx, types.NamespacedName{
+		Namespace: pm.Spec.PodNamespace,
+		Name:      pm.Status.ReplacementPodName,
+	}, &destPod)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("AssertNoDestinationMountCreated Get dest pod: %w", err)
+	}
+	return fmt.Errorf("AssertNoDestinationMountCreated: destination pod %s/%s exists — destination mount was created before StorageHandoffReady confirmation (ADR-0344 A.1 ordering violated)",
+		destPod.Namespace, destPod.Name)
+}
+
+// AssertSourceStorageWriteRestored asserts that
+// ConditionSourceStorageWriteRestored=True is observed on the PodMigration
+// before returning, polling until ctx expires (ADR-0344 Decision A.2). Used
+// by FS-093 to confirm the source's Tier0 storage is writable again before
+// the test's simulated source-resume (SIGCONT) signal fires.
+func AssertSourceStorageWriteRestored(ctx context.Context, f *FaultFixture, pmNN types.NamespacedName) error {
+	for {
+		var pm pmv1.PodMigration
+		if err := f.Client.Get(ctx, pmNN, &pm); err != nil {
+			return fmt.Errorf("AssertSourceStorageWriteRestored Get: %w", err)
+		}
+		if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionSourceStorageWriteRestored) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("AssertSourceStorageWriteRestored: condition %s never observed True within deadline", pmv1.ConditionSourceStorageWriteRestored)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
 
 // contains is a simple substring check helper.
