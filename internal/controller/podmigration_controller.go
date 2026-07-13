@@ -187,6 +187,15 @@ type PodMigrationReconciler struct {
 	// the migrating workload.  Nil → NoopSuspender is used, so existing unit tests are
 	// unaffected.  Wired to ArgoCDClient or FluxClient in production via cmd/main.go.
 	GitOpsSuspender gitops.GitOpsSuspender
+	// TestOnlyAllowNilAgentPoolFailOpen must be explicitly set true by a test to let
+	// restoreSourceStorageIfNeeded fail OPEN (set ConditionSourceStorageWriteRestored=True)
+	// when AgentPool/SourceNodeName are unavailable. It defaults to false, so a production
+	// reconciler (or any test that forgets to set it) fails CLOSED on this specific
+	// safety-critical condition instead of silently inferring "restored" from a nil pointer
+	// (ADR-0344 sign-off finding, 2026-07-12; see SECURITY-DEBT-LEDGER.md). This flag
+	// governs ONLY restoreSourceStorageIfNeeded — it has no effect on any other AgentPool-nil
+	// check in this reconciler.
+	TestOnlyAllowNilAgentPoolFailOpen bool
 	// onPhaseDecision, when non-nil, is invoked at the single next-phase decision point of the
 	// checkpoint/transfer advance helpers with the (from, decided) phase pair. It is a
 	// test-observable transition ledger hook: it records the branch actually taken at the source
@@ -1690,39 +1699,25 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 //     therefore could delete the source pod under BestEffort — and under Strict once the
 //     dataplane gate passed — without any proof of TCP sequence continuity).
 //
-// Collapsing both call sites onto this one predicate fixes the weak copy UP, never down:
-// the gate is the union of every predicate either copy enforced. The predicate is:
+// The predicate itself lives in exactly one place — pmv1.SourceTeardownBlockReason
+// (api/v1alpha1/source_teardown.go) — and this function DELEGATES to it rather than
+// hand-keeping a second copy. Prior to this fix this function was a byte-for-byte-identical
+// but independently maintained duplicate: pmv1.SourceTeardownBlockReason's doc comment claimed
+// "both call sites delegating to this one function is what makes their parity true BY
+// CONSTRUCTION," but this call site never actually called it, and the traffic-package call site
+// that did (traffic.EndpointSliceManager.RemoveSourceIfVerified) is dead code with no production
+// caller — so the "by construction" parity claim was false. Delegating here makes it true for
+// the live gate, and a drift-guard test
+// (internal/controller/adr0344_restore_source_storage_test.go /
+// internal/agent/traffic/remove_source_if_verified_test.go) asserts the two entry points agree.
+// The predicate is:
 //   - Strict:      DataplaneReachabilityVerified=True (ADR-0210 cross-node gate) AND
 //                  TCPSequenceContinuityVerified=True.
 //   - BestEffort:  TrafficVerified=True AND TCPSequenceContinuityVerified=True.
-//   - None:        TrafficVerified=True (legacy cold/stateless pre-check).
-//
-// Because the reachability/traffic gate and the TCP-continuity gate are evaluated in a single
-// pass over one authoritative condition set, no A-02/B-06 interleaving can leave a window in
-// which the source pod is deletable under Strict/BestEffort without TCPSequenceContinuityVerified.
+//   - None:        TrafficVerified=True (legacy cold/stateless pre-check), AND
+//   - ALL modes:   additionally WorkloadLivenessVerified=True (ADR-0325).
 func sourcePodDeletionBlockReason(mode pmv1.TCPPreservationMode, conditions []metav1.Condition) string {
-	// Reachability / traffic predicate (mode-dependent necessary predicate).
-	if mode == pmv1.TCPPreservationModeStrict {
-		if !meta.IsStatusConditionTrue(conditions, conditionDataplaneReachabilityVerified) {
-			return "DataplaneReachabilityVerified is not True (ADR-0210 cross-node gate)"
-		}
-	} else if !meta.IsStatusConditionTrue(conditions, conditionTrafficVerified) {
-		return "TrafficVerified is not True (ADR-0012)"
-	}
-	// TCP sequence-continuity predicate — REQUIRED for both Strict and BestEffort. This is the
-	// predicate the Verifying gate had dropped; it is enforced here for BOTH call sites.
-	if mode == pmv1.TCPPreservationModeStrict || mode == pmv1.TCPPreservationModeBestEffort {
-		if !meta.IsStatusConditionTrue(conditions, pmv1.ConditionTCPSequenceContinuityVerified) {
-			return "TCPSequenceContinuityVerified is not True in Strict/BestEffort mode (ADR-0012)"
-		}
-	}
-	// ADR-0325: additive predicate for ALL THREE modes, including None (which previously
-	// required only TrafficVerified). Lexically distinct from the two messages above so
-	// on-call can substring-match "probe failing, will retry" vs "rollback in progress".
-	if !meta.IsStatusConditionTrue(conditions, pmv1.ConditionWorkloadLivenessVerified) {
-		return "WorkloadLivenessVerified is not True (ADR-0325 real-liveness gate)"
-	}
-	return ""
+	return pmv1.SourceTeardownBlockReason(mode, conditions)
 }
 
 // deleteSourcePodIfSafe is the SINGLE primitive that gates and performs source-pod deletion for
@@ -4573,17 +4568,40 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 // (ADR-0012) is NEVER gated on a successful disarm; this call is best-effort.
 //
 // In None/BestEffort mode where ZeroWindowArmed is never set True, this is a no-op.
-// restoreSourceStorageIfNeeded implements ADR-0344 Decision A.2. For
-// Tier0-classified (RWX) migrations it issues the inverse remount-rw request
-// against the source agent's Tier0 migrator and requires confirmation before
-// setting ConditionSourceStorageWriteRestored=True. For all other tiers (no
-// shared-mount hazard — Tier1/2/3 either have no concurrent destination
-// writer or handle their own cutover atomically) this is a same-reconcile
-// no-op that sets the condition True immediately, preserving pre-ADR-0344
-// behavior for every non-Tier0 migration.
+// restoreSourceStorageIfNeeded implements the structural scaffolding for ADR-0344
+// Decision A.2, NOT yet the full remount-rw handoff it is named for.
+//
+// CORRECTED (sign-off finding C2, 2026-07-12): for Tier0-classified (RWX)
+// migrations this function today only confirms that the source agent's gRPC
+// connection is reachable (r.AgentPool.ForNode succeeds) — it does NOT issue
+// any remount-rw RPC and does NOT confirm the destination volume is
+// unmounted. There is no `StorageHandoffReady`-class RPC for the rollback
+// direction on the wire (see storage.StorageHandoffClient, which only covers
+// the forward Cutover/remount-ro path). Setting
+// ConditionSourceStorageWriteRestored=True here is therefore a connectivity
+// check, not a storage-state confirmation — it does NOT close the
+// concurrent-writer/split-brain window described in ADR-0344 Context §1/§2.
+// That window remains open and is tracked as open security debt in
+// docs/security/SECURITY-DEBT-LEDGER.md ("ADR-0344 Decision A.2 rollback
+// remount-rw confirmation is connectivity-only"). No consumer may treat
+// ConditionSourceStorageWriteRestored=True as proof the concurrent-writer
+// window is closed until a real remount-rw RPC exists on the wire (see
+// api/v1alpha1/podmigration_types.go doc comment on the condition).
+//
+// CORRECTED (sign-off finding, 2026-07-12): when r.AgentPool is nil (or
+// SourceNodeName is unset) this now fails CLOSED by default — it only fails
+// open when the caller has explicitly set TestOnlyAllowNilAgentPoolFailOpen,
+// which production wiring (cmd/main.go) never sets. This closes the prior gap
+// where a misconfigured production reconciler with a nil AgentPool would
+// silently set a storage-named safety condition True having verified nothing.
+//
+// For all other tiers (no shared-mount hazard — Tier1/2/3 either have no
+// concurrent destination writer or handle their own cutover atomically) this
+// is a same-reconcile no-op that sets the condition True immediately,
+// preserving pre-ADR-0344 behavior for every non-Tier0 migration.
 //
 // Idempotent under re-queues: if the condition is already True, it returns
-// immediately without re-issuing the RPC.
+// immediately without re-checking connectivity.
 func (r *PodMigrationReconciler) restoreSourceStorageIfNeeded(ctx context.Context, pm *pmv1.PodMigration) error {
 	log := logf.FromContext(ctx)
 
@@ -4600,22 +4618,32 @@ func (r *PodMigrationReconciler) restoreSourceStorageIfNeeded(ctx context.Contex
 	}
 
 	if r.AgentPool == nil || pm.Status.SourceNodeName == "" {
-		// No transport wired (e.g. unit/envtest environments) — fail open rather
-		// than blocking rollback forever, matching noHandoffClient's posture on
-		// the Cutover path.
-		log.Info("restoreSourceStorageIfNeeded: AgentPool/SourceNodeName unavailable — treating as restored (fail-open, ADR-0344 A.2)", "migration", pm.Name)
+		// CORRECTED (sign-off finding, 2026-07-12): a nil AgentPool/SourceNodeName is no
+		// longer inferred as "test environment, safe to fail open." That inference let a
+		// misconfigured production reconciler silently set a storage-named safety condition
+		// True having verified nothing. Failing open now requires the caller to have
+		// explicitly opted in via TestOnlyAllowNilAgentPoolFailOpen — set only by unit tests
+		// (see adr0344_restore_source_storage_test.go) — so a production reconciler with a
+		// nil AgentPool fails CLOSED on this condition instead.
+		if !r.TestOnlyAllowNilAgentPoolFailOpen {
+			setCondition(pm, pmv1.ConditionSourceStorageWriteRestored, metav1.ConditionFalse,
+				"AgentTransportNotConfigured", "no agent transport wired and fail-open not explicitly authorized; refusing to confirm source storage restored")
+			return fmt.Errorf("restoreSourceStorageIfNeeded: AgentPool/SourceNodeName unavailable and TestOnlyAllowNilAgentPoolFailOpen not set")
+		}
+		log.Info("restoreSourceStorageIfNeeded: AgentPool/SourceNodeName unavailable — treating as restored (fail-open, explicitly authorized by TestOnlyAllowNilAgentPoolFailOpen)", "migration", pm.Name)
 		setCondition(pm, pmv1.ConditionSourceStorageWriteRestored, metav1.ConditionTrue,
-			"NoAgentPoolConfigured", "no agent transport wired; write-restore handoff skipped")
+			"NoAgentPoolConfigured", "no agent transport wired; write-restore handoff skipped (test-only fail-open explicitly authorized)")
 		return nil
 	}
 
-	// Confirm the source agent is reachable before allowing the source process
-	// to resume. The StorageHandoffReady RPC itself (storage.StorageHandoffClient,
-	// internal/agent/storage/tier0.go) is issued by the Tier0 migrator on the
-	// Cutover(remount-ro) path (ADR-0344 A.1); the inverse remount-rw confirmation
-	// on this rollback path is gated on the same agent connectivity precondition —
-	// if the source agent cannot be reached at all, resuming a process whose
-	// storage state cannot be confirmed is unsafe, so this fails closed.
+	// Confirm the source agent's gRPC connection is reachable before allowing
+	// the source process to resume. NOTE: this is a connectivity precondition
+	// only — there is no remount-rw RPC on the wire yet (see the function doc
+	// comment above / ADR-0344 sign-off finding C2), so reaching the agent
+	// does NOT itself confirm the source's Tier0 volume is writable or that
+	// the destination is unmounted. If the source agent cannot be reached at
+	// all, resuming the process is refused (fails closed on unreachability),
+	// but reachability succeeding does not mean storage state was verified.
 	if _, err := r.AgentPool.ForNode(ctx, pm.Status.SourceNodeName); err != nil {
 		setCondition(pm, pmv1.ConditionSourceStorageWriteRestored, metav1.ConditionFalse,
 			"SourceAgentUnreachable", fmt.Sprintf("cannot reach source agent to confirm storage writable: %v", err))
@@ -4623,7 +4651,10 @@ func (r *PodMigrationReconciler) restoreSourceStorageIfNeeded(ctx context.Contex
 	}
 
 	setCondition(pm, pmv1.ConditionSourceStorageWriteRestored, metav1.ConditionTrue,
-		"RemountRWConfirmed", "source storage confirmed writable — safe to resume source process")
+		"SourceAgentReachableRemountUnverified",
+		"source agent gRPC connectivity confirmed — NOTE: this does not yet verify actual remount-rw "+
+			"storage state (no remount-rw RPC exists on the wire); see ADR-0344 sign-off finding C2 and "+
+			"docs/security/SECURITY-DEBT-LEDGER.md")
 	return nil
 }
 
@@ -5741,28 +5772,76 @@ func (r *PodMigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // if one was recorded. Called on rollback and migration failure to prevent an
 // orphaned gated pod from lingering and matching Service selectors.
 // Non-fatal: if the pod is already gone, the delete is a no-op.
+// deleteReplacementPod tears down EVERY replacement pod created for this migration on the
+// rollback / hard-failure path. Deleting the pod is the durable, kube-honored de-enrollment
+// from the Service: once the pod acquires a deletionTimestamp the endpoint-slice controller
+// drops it, so a resumed source (r.Rollbacker.Rollback, reconcileRollingBack) never
+// round-robins with a live, unsynchronized replacement — the split-brain observed in
+// live-proof-cycle2 §6 (replacement pod redis-src-m-24b3bf9b left Running AND in the redis-src
+// Service Endpoints, driving sequence-regression WRITE_ERRORs minutes after RolledBack=True).
+//
+// It resolves the pods by the source-of-truth podmotion.io/migration-name LABEL stamped at
+// createReplacementPod time (replacementPodMigrationNameLabel) — NOT by the pm.Status.
+// ReplacementPodName mirror. That mirror is losable to the documented status-subresource
+// clobber race (see the resolveReplacementPodByLabel switch in reconcileTCPVerifying, ~L1180);
+// when it read empty here the prior name-only implementation early-returned and never deleted
+// the replacement pod, leaving it live and enrolled indefinitely. Keying the teardown on the
+// label the pod actually carries makes it a source-of-truth primitive rather than an
+// inference from a losable mirror (source-of-truth primitive). All label matches are
+// reaped, so a stale prior-attempt replacement pod cannot linger as a second split-brain
+// endpoint either. Best-effort throughout: a resolution/list error is logged and MUST NOT
+// block the ADR-0012-critical source rollback that follows this call.
 func (r *PodMigrationReconciler) deleteReplacementPod(ctx context.Context, pm *pmv1.PodMigration) {
-	if pm.Status.ReplacementPodName == "" {
-		return
-	}
 	log := logf.FromContext(ctx)
-	pod := &corev1.Pod{}
-	err := r.Get(ctx, types.NamespacedName{
-		Namespace: pm.Spec.PodNamespace,
-		Name:      pm.Status.ReplacementPodName,
-	}, pod)
-	if apierrors.IsNotFound(err) {
-		return
-	}
-	if err != nil {
-		log.Error(err, "deleteReplacementPod: get failed", "pod", pm.Status.ReplacementPodName)
-		return
-	}
-	if deleteErr := r.Delete(ctx, pod); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
-		log.Error(deleteErr, "deleteReplacementPod: delete failed — manual cleanup may be required",
-			"pod", pm.Status.ReplacementPodName)
+
+	// Source-of-truth resolution: every pod carrying this migration's label.
+	toDelete := make(map[string]*corev1.Pod)
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList,
+		client.InNamespace(pm.Spec.PodNamespace),
+		client.MatchingLabels{replacementPodMigrationNameLabel: pm.Name},
+	); err != nil {
+		log.Error(err, "deleteReplacementPod: label list failed — falling back to recorded name",
+			"migration", pm.Name)
 	} else {
-		log.Info("deleted replacement pod on rollback/failure", "pod", pm.Status.ReplacementPodName)
+		for i := range podList.Items {
+			p := &podList.Items[i]
+			toDelete[p.Name] = p
+		}
+	}
+
+	// Belt-and-suspenders for the inverse race (recorded name present, label lookup missed it):
+	// resolve pm.Status.ReplacementPodName directly if it is not already collected.
+	if pm.Status.ReplacementPodName != "" {
+		if _, have := toDelete[pm.Status.ReplacementPodName]; !have {
+			p := &corev1.Pod{}
+			err := r.Get(ctx, types.NamespacedName{
+				Namespace: pm.Spec.PodNamespace,
+				Name:      pm.Status.ReplacementPodName,
+			}, p)
+			switch {
+			case err == nil:
+				toDelete[p.Name] = p
+			case apierrors.IsNotFound(err):
+				// already gone
+			default:
+				log.Error(err, "deleteReplacementPod: get by recorded name failed",
+					"migration", pm.Name, "pod", pm.Status.ReplacementPodName)
+			}
+		}
+	}
+
+	if len(toDelete) == 0 {
+		return // nothing was ever created for this migration, or it is already reaped
+	}
+
+	for name, pod := range toDelete {
+		if deleteErr := r.Delete(ctx, pod); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+			log.Error(deleteErr, "deleteReplacementPod: delete failed — manual cleanup may be required",
+				"migration", pm.Name, "pod", name)
+		} else {
+			log.Info("deleted replacement pod on rollback/failure", "migration", pm.Name, "pod", name)
+		}
 	}
 }
 

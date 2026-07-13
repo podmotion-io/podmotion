@@ -35,6 +35,26 @@ func Run(ctx context.Context, log logr.Logger) error {
 func Serve(ctx context.Context) error {
 	log := logf.FromContext(ctx).WithName("netns-broker")
 
+	// ADR-0347 A1 / SR-DEP: resolve the outer-program pins ONCE at startup, before
+	// any op is served, so PATH is consulted from the trusted startup environment
+	// and never re-asked per call. nsenter is required by EVERY op (host-mount-ns
+	// bind/teardown, the `exec` set, and the CRIU-restore wrapper launch via
+	// exec_start) — a broker that cannot resolve nsenter cannot do its irreducible
+	// job, so fail loud. ip is used ONLY by the reachability/IP-config ops
+	// (resolve_veth, netns_exec* with argv[0]=="ip"), which fail CLOSED on an
+	// unresolvable ip (ADR-0348 D4) at the point of use — so an absent ip must NOT
+	// crash-loop the broker and take the ip-free restore/teardown/rollback path
+	// (including the ADR-0012 source-survival rollback) down with it. Pin ip
+	// best-effort here; the ip sites hard-fail-closed if it never resolves. No
+	// silent bare-name fallback ever occurs (ADR-0347 A1's security property is
+	// preserved — the fail-closed point moves from startup crash-loop to use).
+	if err := resolvePinnedNsenter(); err != nil {
+		return fmt.Errorf("netns-broker: %w", err)
+	}
+	if err := resolvePinnedIP(); err != nil {
+		log.Error(err, "netns-broker: ip not resolvable at startup — resolve_veth and netns_exec ip ops will fail closed until ip is present; the nsenter-only host-mount-ns bind/teardown and CRIU-restore path is unaffected")
+	}
+
 	// Ensure the socket parent dir exists (host-shared /run/podmotion).
 	if err := os.MkdirAll(filepath.Dir(SocketPath), 0o700); err != nil {
 		return fmt.Errorf("netns-broker: mkdir %s: %w", filepath.Dir(SocketPath), err)

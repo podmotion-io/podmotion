@@ -97,9 +97,54 @@ const (
 // so the broker-computed target path cannot escape NetnsBaseDir.
 var migrationUIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,127}$`)
 
+// ADR-0346 D4: netnsPathRe is the SR-4 containment gate for the netns_exec*/
+// NetnsPath client-supplied-path case (srcPID <= 0). It enforces properties
+// (a) and (c); property (b) — traversal/proc rejection — and (d) — symlink-safe
+// leaf resolution — are NOT expressible in a regex and are enforced in
+// validateNetnsPath below.
+//
+// (a) fully anchored: ^...$
+// (b) traversal/proc rejection is enforced in validateNetnsPath, NOT here — a
+//     single regex expressing "no .. segment anywhere" is brittle (D4).
+// (c) scoped to /run/netns/<name> or /var/run/netns/<name>, <name> a single
+//     bounded metacharacter-free component.
+var netnsPathRe = regexp.MustCompile(`^(?:/run/netns|/var/run/netns)/[A-Za-z0-9_.-]{1,64}$`)
+
+// validateNetnsPath enforces all four SR-4 properties (ADR-0346 D4 a-d) on a
+// client-supplied NetnsPath (the srcPID<=0 branch only). It is the sole gate
+// before netnsPath reaches any nsenter --net= invocation.
+func validateNetnsPath(netnsPath string) error {
+	if netnsPath == "" {
+		return fmt.Errorf("netnsPath is required when srcPID <= 0")
+	}
+	// (b) traversal/proc rejection: Clean must be a no-op (nothing collapsed
+	// away) and the cleaned value must not contain /proc/.
+	cleaned := filepath.Clean(netnsPath)
+	if cleaned != netnsPath {
+		return fmt.Errorf("netnsPath %q is not clean (traversal?)", netnsPath)
+	}
+	if strings.Contains(cleaned, "/proc/") {
+		return fmt.Errorf("netnsPath %q must not reference /proc", netnsPath)
+	}
+	// (a) anchored + (c) scoped bounded name.
+	if !netnsPathRe.MatchString(cleaned) {
+		return fmt.Errorf("netnsPath %q does not match the /run/netns|/var/run/netns bind-mount convention", netnsPath)
+	}
+	// (d) symlink-safe resolved leaf: resolve and assert the result is still
+	// lexically under one of the two allowed roots.
+	resolved, err := filepath.EvalSymlinks(cleaned)
+	if err != nil {
+		return fmt.Errorf("netnsPath %q: resolve: %w", netnsPath, err)
+	}
+	if !strings.HasPrefix(resolved, "/run/netns/") && !strings.HasPrefix(resolved, "/var/run/netns/") {
+		return fmt.Errorf("netnsPath %q resolves to %q, outside the netns bind-mount scope", netnsPath, resolved)
+	}
+	return nil
+}
+
 // Request is the JSON wire request accepted on the broker socket.
 type Request struct {
-	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal" | "signal_pid" | "resolve_veth"
+	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal" | "signal_pid" | "resolve_veth" | "netns_exec" | "netns_exec_start"
 	// MigrationUID names the per-migration netns dir. Validated by migrationUIDRe.
 	// Required on create/teardown; ignored on exec*.
 	MigrationUID string `json:"migrationUID"`
@@ -153,6 +198,28 @@ type Request struct {
 	// /proc/<SignalPID>/stat, captured by the client when it recorded the PID. The
 	// broker re-reads the live value and refuses to signal on any mismatch.
 	ExpectedStartTime uint64 `json:"expectedStartTime,omitempty"`
+
+	// ADR-0326: netns_exec / netns_exec_start generalize the broker's pre-existing
+	// nsenterNetNs helper (previously used only by doResolveVeth's hardcoded
+	// `ip -o link show eth0`) into a general in-pod-netns exec, closing the twelve
+	// AppArmor-denied direct-agent `nsenter --net=` call sites on the confined
+	// restore-path agent (server.go). Reuses the Argv field above with op-scoped
+	// semantics (SC-1-EXEC): argv[0] must be exactly "ip" or the broker's own
+	// os.Executable()-pinned self path — the broker NEVER execs a client-supplied
+	// path, only its own re-resolved one (see netnsExecSelfPath / doNetnsExec).
+	//
+	// The target netns is selected exactly like doResolveVeth/doCreate: SrcPID > 0
+	// selects /proc/<SrcPID>/ns/net (validated by the existing validateSrcPID
+	// liveness check, reused unchanged). NetnsPath is a narrow ADR-0326
+	// implementation-time addition beyond ADR-0323's original text: some call
+	// sites (ReadReplVethMAC) resolve a stable CNI bind-mount netns path (e.g.
+	// /var/run/netns/cni-<id>) rather than a live PID (ADR-0325 UNIVERSAL
+	// POD-NETNS INTEGRATION) — SrcPID cannot express that. When SrcPID <= 0,
+	// NetnsPath is validated against netnsPathRe (a closed, traversal-safe
+	// pattern matching only the /var/run/netns|/run/netns bind-mount convention)
+	// before being used verbatim as the nsenter --net= target. SrcPID takes
+	// precedence when both are supplied.
+	NetnsPath string `json:"netnsPath,omitempty"`
 }
 
 // Response is the JSON wire response. Error is "" on success.
@@ -229,6 +296,120 @@ func validateSrcPID(srcPID int) error {
 	return nil
 }
 
+// ADR-0346 D3/D5: netnsExecSelfToken is the fixed sentinel a client sends to
+// request the self allowlist entry. It is NEVER a live path — this is what
+// makes the self entry match regardless of agent-vs-broker os.Executable()/
+// symlink skew, or the /proc/self/exe fallback a caller uses when
+// os.Executable() errors. It is the package-internal spelling of the exported
+// wire-contract constant NetnsExecSelfToken (types.go); both name ONE literal so
+// the broker allowlist and every cross-package client (internal/agent/server)
+// cannot drift (a single source of truth).
+const netnsExecSelfToken = NetnsExecSelfToken
+
+var (
+	netnsExecSelfPathOnce sync.Once
+	netnsExecSelfPathVal  string
+	netnsExecSelfPathErr  error
+)
+
+// netnsExecSelfPath resolves the broker's own binary path exactly once
+// (os.Executable() then EvalSymlinks), pinning it for both Serve() and direct
+// Handle() calls in unit tests (ADR-0346 D5). Same "resolve once at startup"
+// primitive the absolute-pinning scope item applies to nsenter/ip.
+func netnsExecSelfPath() (string, error) {
+	netnsExecSelfPathOnce.Do(func() {
+		p, err := os.Executable()
+		if err != nil {
+			netnsExecSelfPathErr = fmt.Errorf("netnsExecSelfPath: os.Executable: %w", err)
+			return
+		}
+		resolved, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			netnsExecSelfPathErr = fmt.Errorf("netnsExecSelfPath: EvalSymlinks(%q): %w", p, err)
+			return
+		}
+		netnsExecSelfPathVal = resolved
+	})
+	return netnsExecSelfPathVal, netnsExecSelfPathErr
+}
+
+// ADR-0347 A1: pinnedNsenter/pinnedIP are the broker's own nsenter/ip binary
+// paths, each resolved to an absolute path exactly ONCE (sync.Once, the same
+// resolve-once-at-startup primitive netnsExecSelfPath uses above) from the
+// broker's trusted startup PATH via exec.LookPath. This is a source-of-truth
+// primitive, not a per-call chain: PATH is consulted once, before any client
+// request can influence anything, and is never re-asked per call. A resolution
+// failure is fail-CLOSED at the point of use — the site that needs the binary
+// returns that error and NO bare "nsenter"/"ip" is ever execed (ADR-0347 A1's
+// load-bearing security property: no silent bare-name PATH-shadow fallback).
+//
+// SR-DEP (Security Reviewer, sprint46 surgical fix): nsenter and ip are pinned
+// by SEPARATE sync.Once resolvers because they sit on DIFFERENT op classes with
+// different criticality. nsenter is required by EVERY broker op (host-mount-ns
+// bind/teardown, the host-mount-ns `exec` set, and the CRIU-restore wrapper
+// launch via exec_start) — a broker that cannot resolve nsenter cannot do its
+// irreducible, safety-critical job, so it fails loud at startup. ip is used
+// ONLY by the reachability/IP-config ops (resolve_veth, and netns_exec* with
+// argv[0]=="ip"), ALL of which already fail CLOSED on an unresolvable ip
+// (ADR-0348 D4) — ip is NOT on the bind/teardown/CRIU-restore path. Coupling
+// both pins into one resolver made an unresolvable ip crash-loop the WHOLE
+// privileged broker, taking down the ip-free restore/teardown/rollback path
+// (including the ADR-0012 source-survival rollback) with it — an over-broad
+// runtime dependency and an unbounded blast radius for a non-safety binary.
+// Split so each site depends on exactly the binary it execs.
+var (
+	pinNsenterOnce sync.Once
+	pinnedNsenter  string
+	pinNsenterErr  error
+
+	pinIPOnce sync.Once
+	pinnedIP  string
+	pinIPErr  error
+)
+
+// resolvePinnedNsenter pins nsenter to an absolute path exactly once. Called by
+// every nsenter-spawning site (nsenterHostMnt / nsenterNetNs / nsenterNetNsPath)
+// and by Serve() at startup (fail-loud — nsenter is required by every op class).
+func resolvePinnedNsenter() error {
+	pinNsenterOnce.Do(func() {
+		p, err := exec.LookPath("nsenter")
+		if err != nil {
+			pinNsenterErr = fmt.Errorf("resolve nsenter at broker startup: %w", err)
+			return
+		}
+		pinnedNsenter = p
+	})
+	return pinNsenterErr
+}
+
+// resolvePinnedIP pins ip to an absolute path exactly once. Called by the
+// ip-consuming reachability sites (resolveNetnsExecBinary "ip" case, doResolveVeth)
+// and best-effort by Serve() at startup. An unresolvable ip is fail-CLOSED at
+// these sites (ADR-0348 D4), never a bare-name exec, and never blocks the
+// ip-free host-mount-ns / CRIU-restore path (SR-DEP).
+func resolvePinnedIP() error {
+	pinIPOnce.Do(func() {
+		p, err := exec.LookPath("ip")
+		if err != nil {
+			pinIPErr = fmt.Errorf("resolve ip at broker startup: %w", err)
+			return
+		}
+		pinnedIP = p
+	})
+	return pinIPErr
+}
+
+// resolvePinnedBinaries resolves BOTH pins. Retained as the single entry point
+// for the ADR-0347 discharge tests (which assert both are pinned once) and any
+// caller that needs both; it returns the first resolution error. Per-op sites
+// use the narrow resolver for the one binary they exec (SR-DEP).
+func resolvePinnedBinaries() error {
+	if err := resolvePinnedNsenter(); err != nil {
+		return err
+	}
+	return resolvePinnedIP()
+}
+
 // Handle dispatches a single decoded Request and returns its Response. It is the
 // pure-logic core, exported for unit testing without a live socket.
 func Handle(req Request) Response {
@@ -261,8 +442,21 @@ func Handle(req Request) Response {
 		// de-privileged agent's behalf (the agent's AppArmor profile denies the
 		// ptrace-read needed to open another pod's /proc/<pid>/ns/net).
 		return doResolveVeth(req.SrcPID)
+	case "netns_exec":
+		// ADR-0326: run an allowlisted ("ip" or the broker's own pinned self path)
+		// command inside the target pod's NET namespace, run-to-completion.
+		return doNetnsExec(req.SrcPID, req.NetnsPath, req.Argv)
+	case "netns_exec_start":
+		// ADR-0326: spawn an allowlisted command inside the target pod's NET
+		// namespace DETACHED (the __inetns_echo listener, which must outlive the
+		// originating RPC). Reuses the same asyncExecReg/exec_poll/exec_signal
+		// machinery as the host-mount-ns exec_start path — that registry is keyed
+		// generically on the spawned PID, not on which op launched it, so
+		// exec_poll/exec_signal already reap/signal netns_exec_start children
+		// exactly as they do exec_start children (ADR-0326 Decision item 4).
+		return doNetnsExecStart(req.SrcPID, req.NetnsPath, req.Argv)
 	default:
-		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal|signal_pid|resolve_veth)", req.Op))
+		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal|signal_pid|resolve_veth|netns_exec|netns_exec_start)", req.Op))
 	}
 }
 
@@ -307,6 +501,44 @@ var execAllowlist = map[string]struct{}{
 	"/bin/cat": {},
 }
 
+// ADR-0346 D3: netnsExecAllowlist is the SC-1-EXEC allowlist for
+// netns_exec/netns_exec_start. It is DISTINCT from execAllowlist (host-mount-ns
+// "exec" op, above) — do not merge them; that would silently widen both
+// surfaces (ADR-0346 Context 3). Exactly two client-facing match keys:
+//   - "ip"               — resolves to the ip binary in the target netns.
+//   - netnsExecSelfToken — resolves to netnsExecSelfPath() (D5), the broker's
+//                          own pinned binary, for __inetns_probe/__inetns_echo.
+//
+// Matching is exact string equality against Argv[0] (map-key lookup) — never
+// prefix, never substring. The EXECUTED argv[0] is always the broker-resolved
+// value, never the client-transmitted string (D3).
+var netnsExecAllowlist = map[string]struct{}{
+	"ip":               {},
+	netnsExecSelfToken: {},
+}
+
+// resolveNetnsExecBinary maps a validated netnsExecAllowlist key to the
+// broker-side binary it actually executes (ADR-0346 D3). Call ONLY after
+// confirming the key is present in netnsExecAllowlist.
+func resolveNetnsExecBinary(key string) (string, error) {
+	switch key {
+	case "ip":
+		// ADR-0347 A2: return the pinned absolute ip path, never the bare "ip"
+		// string — the EXECUTED argv[0] is always broker-resolved (D3), and the
+		// pin removes the per-call PATH re-resolution surface (ADR-0347 A1).
+		// SR-DEP: only the ip pin is needed here (not nsenter).
+		if err := resolvePinnedIP(); err != nil {
+			return "", fmt.Errorf("resolveNetnsExecBinary: %w", err)
+		}
+		return pinnedIP, nil
+	case netnsExecSelfToken:
+		return netnsExecSelfPath()
+	default:
+		// Unreachable if callers gate on netnsExecAllowlist first.
+		return "", fmt.Errorf("resolveNetnsExecBinary: key %q not in netnsExecAllowlist", key)
+	}
+}
+
 // doExec runs an allowlisted host-mount-namespace command via nsenterHostMnt and
 // returns its exit code + captured output. A non-zero command exit is reported in
 // the Response (ExitCode/Stderr), NOT as a broker Error — the agent reconstructs
@@ -321,7 +553,10 @@ func doExec(argv []string) Response {
 		return Response{Error: fmt.Sprintf("exec: binary %q not in broker allowlist", argv[0])}
 	}
 
-	cmd := nsenterHostMnt(argv...)
+	cmd, err := nsenterHostMnt(argv...)
+	if err != nil {
+		return Response{Error: fmt.Sprintf("exec: %v", err)}
+	}
 	var stdout, stderr, combined bytes.Buffer
 	// Tee both streams into a combined buffer so we satisfy both .Output() and
 	// .CombinedOutput() call sites with one round-trip.
@@ -369,7 +604,17 @@ func doResolveVeth(srcPID int) Response {
 		return Response{Error: fmt.Sprintf("resolve_veth: %v", err)}
 	}
 
-	cmd := nsenterNetNs(srcPID, "ip", "-o", "link", "show", "eth0")
+	// ADR-0347 A2: resolve the pin first so pinnedIP is populated, then pass the
+	// pinned absolute path as the inner argv[0] — never the bare "ip" string
+	// (a bare name would be PATH-searched by nsenter when it exec's its child).
+	// SR-DEP: the inner binary is ip; nsenterNetNs resolves the outer nsenter pin.
+	if err := resolvePinnedIP(); err != nil {
+		return Response{Error: fmt.Sprintf("resolve_veth: %v", err)}
+	}
+	cmd, err := nsenterNetNs(srcPID, pinnedIP, "-o", "link", "show", "eth0")
+	if err != nil {
+		return Response{Error: fmt.Sprintf("resolve_veth: %v", err)}
+	}
 	var stdout, stderr, combined bytes.Buffer
 	cmd.Stdout = io.MultiWriter(&stdout, &combined)
 	cmd.Stderr = io.MultiWriter(&stderr, &combined)
@@ -396,10 +641,146 @@ func doResolveVeth(srcPID int) Response {
 // <args...>` — the command executes in the target pod's NETWORK namespace. Unlike
 // nsenterHostMnt (host mount ns), this enters a pod netns; opening /proc/<pid>/ns/net
 // is permitted here because the broker is unconfined (no AppArmor ptrace mediation).
-func nsenterNetNs(pid int, args ...string) *exec.Cmd {
+//
+// ADR-0347 A2: the outer program is pinnedNsenter (an absolute path resolved
+// exactly once at broker startup), never the bare name "nsenter" — a bare
+// name would re-resolve against the process PATH, a client-influenceable
+// surface, on every call.
+func nsenterNetNs(pid int, args ...string) (*exec.Cmd, error) {
+	if err := resolvePinnedNsenter(); err != nil { // SR-DEP: outer program is nsenter
+		return nil, err
+	}
 	netNsArg := fmt.Sprintf("--net=/proc/%d/ns/net", pid)
 	full := append([]string{netNsArg, "--"}, args...)
-	return exec.Command("nsenter", full...)
+	return exec.Command(pinnedNsenter, full...), nil
+}
+
+// resolveNetnsExecTarget implements ADR-0346 D2's single source of truth:
+// srcPID takes precedence when > 0 (validated via the EXISTING validateSrcPID,
+// unchanged); only when srcPID <= 0 is netnsPath consulted, gated by
+// validateNetnsPath (D4). Never both; never a fallback chain between them.
+func resolveNetnsExecTarget(srcPID int, netnsPath string) (nsArg string, err error) {
+	if srcPID > 0 {
+		if err := validateSrcPID(srcPID); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("/proc/%d/ns/net", srcPID), nil
+	}
+	if err := validateNetnsPath(netnsPath); err != nil {
+		return "", err
+	}
+	return netnsPath, nil
+}
+
+// nsenterNetNsPath is nsenterNetNs generalized to an arbitrary --net= target (a
+// /proc/<pid>/ns/net string OR a validated /run/netns|/var/run/netns bind
+// path) instead of only a PID. nsenterNetNs (PID-only) stays unchanged and is
+// still used by doResolveVeth.
+//
+// ADR-0347 A2: outer program is pinnedNsenter, never the bare "nsenter" name.
+func nsenterNetNsPath(netnsTarget string, args ...string) (*exec.Cmd, error) {
+	if err := resolvePinnedNsenter(); err != nil { // SR-DEP: outer program is nsenter
+		return nil, err
+	}
+	netNsArg := "--net=" + netnsTarget
+	full := append([]string{netNsArg, "--"}, args...)
+	return exec.Command(pinnedNsenter, full...), nil
+}
+
+// doNetnsExec runs an allowlisted (ADR-0346 D3) command inside the target
+// pod's NET namespace (D2 target selection), run-to-completion. Mirrors
+// doResolveVeth's body shape: a non-zero exit is reported via
+// ExitCode/Stderr, NOT a broker Error. Argv[0] must be exactly "ip" or
+// netnsExecSelfToken (D3); the EXECUTED binary is always the broker-resolved
+// value (resolveNetnsExecBinary), never the client string.
+func doNetnsExec(srcPID int, netnsPath string, argv []string) Response {
+	if len(argv) == 0 {
+		return Response{Error: "netns_exec: empty argv"}
+	}
+	if _, ok := netnsExecAllowlist[argv[0]]; !ok {
+		// SC-1-EXEC: hard reject, do not leak the permitted set (mirrors doExec).
+		return Response{Error: fmt.Sprintf("netns_exec: binary %q not in broker allowlist", argv[0])}
+	}
+	binary, err := resolveNetnsExecBinary(argv[0])
+	if err != nil {
+		return Response{Error: fmt.Sprintf("netns_exec: %v", err)}
+	}
+	nsTarget, err := resolveNetnsExecTarget(srcPID, netnsPath)
+	if err != nil {
+		return Response{Error: fmt.Sprintf("netns_exec: %v", err)}
+	}
+
+	execArgv := append([]string{binary}, argv[1:]...)
+	cmd, err := nsenterNetNsPath(nsTarget, execArgv...)
+	if err != nil {
+		return Response{Error: fmt.Sprintf("netns_exec: %v", err)}
+	}
+	var stdout, stderr, combined bytes.Buffer
+	cmd.Stdout = io.MultiWriter(&stdout, &combined)
+	cmd.Stderr = io.MultiWriter(&stderr, &combined)
+
+	runErr := cmd.Run()
+	exitCode := 0
+	if runErr != nil {
+		var ee *exec.ExitError
+		if errors.As(runErr, &ee) {
+			exitCode = ee.ExitCode()
+		} else {
+			return Response{Error: fmt.Sprintf("netns_exec: spawn nsenter for %q: %v", argv[0], runErr)}
+		}
+	}
+	return Response{
+		ExitCode: &exitCode,
+		Stdout:   stdout.Bytes(),
+		Stderr:   stderr.Bytes(),
+		Combined: combined.Bytes(),
+	}
+}
+
+// doNetnsExecStart spawns an allowlisted (ADR-0346 D3) command DETACHED
+// inside the target pod's NET namespace and returns its host PID (for the
+// __inetns_echo listener, which must outlive the originating RPC). Reuses
+// asyncExecReg/doExecPoll/doExecSignal UNCHANGED (D1) — the registry is keyed
+// generically on PID, not on which op launched it.
+func doNetnsExecStart(srcPID int, netnsPath string, argv []string) Response {
+	if len(argv) == 0 {
+		return Response{Error: "netns_exec_start: empty argv"}
+	}
+	if _, ok := netnsExecAllowlist[argv[0]]; !ok {
+		return Response{Error: fmt.Sprintf("netns_exec_start: binary %q not in broker allowlist", argv[0])}
+	}
+	binary, err := resolveNetnsExecBinary(argv[0])
+	if err != nil {
+		return Response{Error: fmt.Sprintf("netns_exec_start: %v", err)}
+	}
+	nsTarget, err := resolveNetnsExecTarget(srcPID, netnsPath)
+	if err != nil {
+		return Response{Error: fmt.Sprintf("netns_exec_start: %v", err)}
+	}
+
+	beforePIDs, _ := brokerCgroupPIDs()
+	if beforePIDs == nil {
+		beforePIDs = map[int]bool{}
+	}
+
+	execArgv := append([]string{binary}, argv[1:]...)
+	cmd, err := nsenterNetNsPath(nsTarget, execArgv...)
+	if err != nil {
+		return Response{Error: fmt.Sprintf("netns_exec_start: %v", err)}
+	}
+	stderr := &bytes.Buffer{}
+	cmd.Stderr = &capWriter{buf: stderr, cap: asyncExecStderrCap}
+
+	if err := cmd.Start(); err != nil {
+		return Response{Error: fmt.Sprintf("netns_exec_start: spawn: %v", err)}
+	}
+	pid := cmd.Process.Pid
+
+	asyncExecMu.Lock()
+	asyncExecReg[pid] = &asyncExecEntry{cmd: cmd, stderr: stderr, beforePIDs: beforePIDs}
+	asyncExecMu.Unlock()
+
+	return Response{WrapperPID: pid}
 }
 
 func toResponse(path string, err error) Response {
@@ -516,7 +897,10 @@ func doExecStart(argv []string) Response {
 		beforePIDs = map[int]bool{}
 	}
 
-	cmd := nsenterHostMnt(argv...)
+	cmd, err := nsenterHostMnt(argv...)
+	if err != nil {
+		return Response{Error: fmt.Sprintf("exec_start: %v", err)}
+	}
 	stderr := &bytes.Buffer{}
 	cmd.Stderr = &capWriter{buf: stderr, cap: asyncExecStderrCap}
 
@@ -765,12 +1149,12 @@ func doCreate(migrationUID string, srcPID int) (string, error) {
 	// would create them only in the broker container's private mount namespace, so
 	// we create them via nsenter in the host mount namespace (matches the prior
 	// createBindMountedNetns mkdir/touch chain).
-	if out, err := nsenterHostMnt("mkdir", "-p", dir).CombinedOutput(); err != nil {
+	if out, err := nsenterHostMntCombined("mkdir", "-p", dir); err != nil {
 		return "", fmt.Errorf("mkdir %s in host mount ns: %w\n%s", dir, err, out)
 	}
-	if out, err := nsenterHostMnt("sh", "-c",
+	if out, err := nsenterHostMntCombined("sh", "-c",
 		fmt.Sprintf("[ -e %q ] || touch %q", bindPath, bindPath),
-	).CombinedOutput(); err != nil {
+	); err != nil {
 		return "", fmt.Errorf("create bind target %s in host mount ns: %w\n%s", bindPath, err, out)
 	}
 
@@ -804,18 +1188,18 @@ func doTeardown(migrationUID string) error {
 	dir := filepath.Dir(bindPath)
 
 	// Lazy detach unmount in the host mount namespace — tolerate "not mounted".
-	if out, err := nsenterHostMnt("umount", "-l", bindPath).CombinedOutput(); err != nil {
+	if out, err := nsenterHostMntCombined("umount", "-l", bindPath); err != nil {
 		if !isNotMountedOutput(out) {
 			return fmt.Errorf("unmount %s in host mount ns: %w\n%s", bindPath, err, out)
 		}
 	}
 	// Remove the bind-target file in the host mount namespace.
-	if out, err := nsenterHostMnt("rm", "-f", bindPath).CombinedOutput(); err != nil {
+	if out, err := nsenterHostMntCombined("rm", "-f", bindPath); err != nil {
 		return fmt.Errorf("remove %s in host mount ns: %w\n%s", bindPath, err, out)
 	}
 	// Remove the now-empty per-migration dir in the host mount namespace.
 	// `rmdir` on a non-empty dir is non-fatal (idempotent teardown).
-	if out, err := nsenterHostMnt("rmdir", dir).CombinedOutput(); err != nil {
+	if out, err := nsenterHostMntCombined("rmdir", dir); err != nil {
 		if !strings.Contains(string(out), "not empty") &&
 			!strings.Contains(string(out), "No such file") {
 			return fmt.Errorf("remove dir %s in host mount ns: %w\n%s", dir, err, out)
@@ -880,7 +1264,7 @@ func unshareAndBind(bindPath string) error {
 // across the host mount ns on a hostPID:true pod, so /proc/<tid>/ns/net and
 // /proc/<srcPID>/ns/net resolve to the intended netns from the host mount ns.
 func bindInHostMountNs(src, target string) error {
-	if out, err := nsenterHostMnt("mount", "--bind", src, target).CombinedOutput(); err != nil {
+	if out, err := nsenterHostMntCombined("mount", "--bind", src, target); err != nil {
 		return fmt.Errorf("bind mount %s -> %s in host mount ns: %w\n%s", src, target, err, out)
 	}
 	return nil
@@ -891,9 +1275,31 @@ func bindInHostMountNs(src, target string) error {
 // single-threaded process. This is the syscall-free replacement for the prior
 // in-process unix.Setns(CLONE_NEWNS) host-mount-ns entry, which returns EINVAL
 // from the multithreaded Go runtime regardless of CAP_SYS_ADMIN.
-func nsenterHostMnt(args ...string) *exec.Cmd {
+//
+// ADR-0347 A2: outer program is pinnedNsenter, never the bare "nsenter" name.
+func nsenterHostMnt(args ...string) (*exec.Cmd, error) {
+	// SR-DEP: the host-mount-ns path (bind/teardown, the `exec` set, and the
+	// CRIU-restore wrapper launch via exec_start) spawns ONLY nsenter and never
+	// ip — resolve just the nsenter pin so an unresolvable ip cannot fail this
+	// safety-critical, ip-free path closed.
+	if err := resolvePinnedNsenter(); err != nil {
+		return nil, err
+	}
 	full := append([]string{hostMountNsArg, "--"}, args...)
-	return exec.Command("nsenter", full...)
+	return exec.Command(pinnedNsenter, full...), nil
+}
+
+// nsenterHostMntCombined is nsenterHostMnt + CombinedOutput() folded into one
+// call, for the run-to-completion mkdir/touch/umount/rm/rmdir/mount call sites
+// in doCreate/doTeardown/bindInHostMountNs that only need the combined output
+// and an error — a pin-resolution failure (ADR-0347 A1) surfaces the same way
+// a spawn failure always has, via the returned error.
+func nsenterHostMntCombined(args ...string) ([]byte, error) {
+	cmd, err := nsenterHostMnt(args...)
+	if err != nil {
+		return nil, err
+	}
+	return cmd.CombinedOutput()
 }
 
 // isNotMountedOutput reports whether umount's stderr indicates the target was

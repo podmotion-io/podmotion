@@ -696,7 +696,7 @@ func reattachContainerPaths(ms []reattachMount) []string {
 // restore time (the replacement pod is created ~5s before restore runs and the status write races
 // the agent's cached read). This mirrors the image-resolution hardening (resolveImageFromMCP):
 // prefer a source of truth that does not depend on a Status field being populated at the exact
-// instant the agent reads it (primitive over brittle chain).
+// instant the agent reads it (reads the authoritative value instead of inferring it).
 const replacementPodLabelKey = "podmotion.io/migration-name"
 
 // resolveReplacementPod finds the replacement pod for a migration by the authoritative
@@ -808,7 +808,7 @@ func (s *AgentServer) resolveReattachMountsImpl(migrationName string, terminalOn
 	// construction (same spec). Resolve it by the migration-name LABEL (the source of truth the
 	// controller stamps at replacement-pod creation) rather than pm.Status.ReplacementPodName,
 	// which is frequently read back empty at restore time — the defect that produced the broken
-	// 1:1 container-path ext-mount-map (primitive over brittle chain). Fall back to the
+	// 1:1 container-path ext-mount-map (reads the authoritative value instead of inferring it). Fall back to the
 	// status field only if the label lookup finds nothing, then to the source pod for the
 	// in-container path set (host-target resolution then no-ops and buildCRIURestoreArgs
 	// fail-closes on the unresolved host target).
@@ -1141,11 +1141,16 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 
 	// List eth0 IPv4 addresses inside the pod netns. `ip -o -4 addr show eth0` is netns-scoped
 	// via nsenter --net (sysfs/`cat` would read the HOST's interfaces — see ReadReplVethMAC).
-	out, err := exec.Command("nsenter", "--net="+netnsPath,
-		"ip", "-o", "-4", "addr", "show", "eth0").CombinedOutput()
-	if err != nil {
+	// ADR-0348: routed through the netns broker (fail-closed) instead of a direct nsenter exec.
+	r1 := netnsbroker.NewClient().NetnsExec(ctx, pid, "", "ip", "-o", "-4", "addr", "show", "eth0")
+	if r1.SpawnErr != nil {
+		return fmt.Errorf("SingleHomeRestoredPod: netns exec failed: list eth0 addrs in netns %s: %w",
+			netnsPath, r1.SpawnErr)
+	}
+	out := r1.Combined
+	if r1.ExitCode != 0 {
 		return fmt.Errorf("SingleHomeRestoredPod: list eth0 addrs in netns %s: %w (%s)",
-			netnsPath, err, strings.TrimSpace(string(out)))
+			netnsPath, fmt.Errorf("exit %d", r1.ExitCode), strings.TrimSpace(string(out)))
 	}
 	addrs := parseEth0IPv4Addrs(string(out))
 	log.Info("SingleHomeRestoredPod: eth0 addresses before single-home (ADR-0137)",
@@ -1181,8 +1186,18 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 			}
 		}
 		// Strip it so the pod is single-homed on the OLD IP.
-		delOut, delErr := exec.Command("nsenter", "--net="+netnsPath,
-			"ip", "addr", "del", cidr, "dev", "eth0").CombinedOutput()
+		// ADR-0348: routed through the netns broker (fail-closed).
+		delR := netnsbroker.NewClient().NetnsExec(ctx, pid, "", "ip", "addr", "del", cidr, "dev", "eth0")
+		var delOut []byte
+		var delErr error
+		if delR.SpawnErr != nil {
+			delErr = fmt.Errorf("netns exec failed: %w", delR.SpawnErr)
+		} else if delR.ExitCode != 0 {
+			delOut = delR.Combined
+			delErr = fmt.Errorf("exit %d", delR.ExitCode)
+		} else {
+			delOut = delR.Combined
+		}
 		if delErr != nil {
 			msg := strings.TrimSpace(string(delOut))
 			// Idempotent: tolerate an already-absent address.
@@ -1202,8 +1217,18 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 	// ADR-0138 step 2: ASSIGN the OLD IP to eth0 if not already present (idempotent: tolerate
 	// EEXIST). This replaces ADR-0137's invalid assumption that CRIU restored it.
 	if !oldSeen {
-		addOut, addErr := exec.Command("nsenter", "--net="+netnsPath,
-			"ip", "addr", "add", oldIP+"/24", "dev", "eth0").CombinedOutput()
+		// ADR-0348: routed through the netns broker (fail-closed).
+		addR := netnsbroker.NewClient().NetnsExec(ctx, pid, "", "ip", "addr", "add", oldIP+"/24", "dev", "eth0")
+		var addOut []byte
+		var addErr error
+		if addR.SpawnErr != nil {
+			addErr = fmt.Errorf("netns exec failed: %w", addR.SpawnErr)
+		} else if addR.ExitCode != 0 {
+			addOut = addR.Combined
+			addErr = fmt.Errorf("exit %d", addR.ExitCode)
+		} else {
+			addOut = addR.Combined
+		}
 		if addErr != nil {
 			msg := strings.TrimSpace(string(addOut))
 			if strings.Contains(strings.ToLower(msg), "exists") {
@@ -1222,18 +1247,20 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 	// arrives via cni0. The OLD /24 is foreign to the destination cni0 subnet, so without this
 	// the pod has no return path off its own /24 ("Network is unreachable").
 	if cni0Gateway != "" {
-		// link route to the gateway (idempotent)
-		if rOut, rErr := exec.Command("nsenter", "--net="+netnsPath,
-			"ip", "route", "add", cni0Gateway, "dev", "eth0").CombinedOutput(); rErr != nil {
-			msg := strings.TrimSpace(string(rOut))
+		// link route to the gateway (idempotent). ADR-0348: routed through the netns broker (fail-closed).
+		if linkR := netnsbroker.NewClient().NetnsExec(ctx, pid, "", "ip", "route", "add", cni0Gateway, "dev", "eth0"); linkR.SpawnErr != nil {
+			log.Info("SingleHomeRestoredPod: warning — add gateway link route", "gw", cni0Gateway, "err", linkR.SpawnErr, "op", "netns_exec")
+		} else if linkR.ExitCode != 0 {
+			msg := strings.TrimSpace(string(linkR.Combined))
 			if !strings.Contains(strings.ToLower(msg), "exists") {
-				log.Info("SingleHomeRestoredPod: warning — add gateway link route", "gw", cni0Gateway, "err", rErr, "output", msg)
+				log.Info("SingleHomeRestoredPod: warning — add gateway link route", "gw", cni0Gateway, "err", fmt.Errorf("exit %d", linkR.ExitCode), "output", msg)
 			}
 		}
-		// onlink default via the gateway (replace if present)
-		if rOut, rErr := exec.Command("nsenter", "--net="+netnsPath,
-			"ip", "route", "replace", "default", "via", cni0Gateway, "dev", "eth0", "onlink").CombinedOutput(); rErr != nil {
-			log.Info("SingleHomeRestoredPod: warning — set onlink default route", "gw", cni0Gateway, "err", rErr, "output", strings.TrimSpace(string(rOut)))
+		// onlink default via the gateway (replace if present). ADR-0348: routed through the netns broker (fail-closed).
+		if defR := netnsbroker.NewClient().NetnsExec(ctx, pid, "", "ip", "route", "replace", "default", "via", cni0Gateway, "dev", "eth0", "onlink"); defR.SpawnErr != nil {
+			log.Info("SingleHomeRestoredPod: warning — set onlink default route", "gw", cni0Gateway, "err", defR.SpawnErr, "op", "netns_exec")
+		} else if defR.ExitCode != 0 {
+			log.Info("SingleHomeRestoredPod: warning — set onlink default route", "gw", cni0Gateway, "err", fmt.Errorf("exit %d", defR.ExitCode), "output", strings.TrimSpace(string(defR.Combined)))
 		} else {
 			log.Info("SingleHomeRestoredPod: installed cni0-gateway routes (ADR-0138)",
 				"migration", migrationName, "restoredPID", pid, "gateway", cni0Gateway)
@@ -1247,10 +1274,13 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 		// source CIDR is the /24 of the OLD IP. `ip route replace` is inherently idempotent.
 		srcNodeCIDR := cidr24ForIP(oldIP)
 		if srcNodeCIDR != "" {
-			if rOut, rErr := exec.Command("nsenter", "--net="+netnsPath,
-				"ip", "route", "replace", srcNodeCIDR, "via", cni0Gateway, "dev", "eth0").CombinedOutput(); rErr != nil {
+			// ADR-0348: routed through the netns broker (fail-closed).
+			if revR := netnsbroker.NewClient().NetnsExec(ctx, pid, "", "ip", "route", "replace", srcNodeCIDR, "via", cni0Gateway, "dev", "eth0"); revR.SpawnErr != nil {
 				log.Info("SingleHomeRestoredPod: warning — set reverse-path route (ADR-0139 D2)",
-					"srcNodeCIDR", srcNodeCIDR, "gw", cni0Gateway, "err", rErr, "output", strings.TrimSpace(string(rOut)))
+					"srcNodeCIDR", srcNodeCIDR, "gw", cni0Gateway, "err", revR.SpawnErr, "op", "netns_exec")
+			} else if revR.ExitCode != 0 {
+				log.Info("SingleHomeRestoredPod: warning — set reverse-path route (ADR-0139 D2)",
+					"srcNodeCIDR", srcNodeCIDR, "gw", cni0Gateway, "err", fmt.Errorf("exit %d", revR.ExitCode), "output", strings.TrimSpace(string(revR.Combined)))
 			} else {
 				log.Info("SingleHomeRestoredPod: installed reverse-path route to source CIDR via cni0 gateway (ADR-0139 D2)",
 					"migration", migrationName, "restoredPID", pid, "srcNodeCIDR", srcNodeCIDR, "gateway", cni0Gateway)
@@ -1258,12 +1288,16 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 		}
 	}
 
-	// Verify: only the OLD IP should remain on eth0.
-	verifyOut, verifyErr := exec.Command("nsenter", "--net="+netnsPath,
-		"ip", "-o", "-4", "addr", "show", "eth0").CombinedOutput()
-	if verifyErr != nil {
+	// Verify: only the OLD IP should remain on eth0. ADR-0348: routed through the netns broker (fail-closed).
+	verifyR := netnsbroker.NewClient().NetnsExec(ctx, pid, "", "ip", "-o", "-4", "addr", "show", "eth0")
+	if verifyR.SpawnErr != nil {
+		return fmt.Errorf("SingleHomeRestoredPod: netns exec failed: verify eth0 addrs in netns %s: %w",
+			netnsPath, verifyR.SpawnErr)
+	}
+	verifyOut := verifyR.Combined
+	if verifyR.ExitCode != 0 {
 		return fmt.Errorf("SingleHomeRestoredPod: verify eth0 addrs in netns %s: %w (%s)",
-			netnsPath, verifyErr, strings.TrimSpace(string(verifyOut)))
+			netnsPath, fmt.Errorf("exit %d", verifyR.ExitCode), strings.TrimSpace(string(verifyOut)))
 	}
 	remaining := parseEth0IPv4Addrs(string(verifyOut))
 	log.Info("SingleHomeRestoredPod: eth0 addresses after single-home (ADR-0138 AC5)",
@@ -1359,32 +1393,47 @@ func ReadReplVethMAC(pid int, sandboxNetnsPath, ifname string) (string, error) {
 	if ifname == "" {
 		ifname = "eth0"
 	}
-	var attempts []string
+	// ADR-0348: each attempt is either a stable sandbox bind-mount path (routed to the broker
+	// as NetnsPath, validated broker-side by netnsPathRe) or a live PID (routed as SrcPID, the
+	// broker derives /proc/<pid>/ns/net itself) — never both for the same attempt (D3).
+	type attempt struct {
+		label     string // for error messages only
+		netnsPath string // non-empty => broker NetnsPath attempt
+		pid       int    // >0 => broker SrcPID attempt
+	}
+	var attempts []attempt
 	if sandboxNetnsPath != "" {
-		attempts = append(attempts, sandboxNetnsPath)
+		attempts = append(attempts, attempt{label: sandboxNetnsPath, netnsPath: sandboxNetnsPath})
 	}
 	if pid > 0 {
-		attempts = append(attempts, "/proc/"+strconv.Itoa(pid)+"/ns/net")
+		attempts = append(attempts, attempt{label: "/proc/" + strconv.Itoa(pid) + "/ns/net", pid: pid})
 	}
 	if len(attempts) == 0 {
 		return "", fmt.Errorf("ReadReplVethMAC: no netns source (pid=%d, sandboxNetnsPath=%q)", pid, sandboxNetnsPath)
 	}
+	// ADR-0348: no context.Context is threaded through this exported free function (its
+	// signature is fixed by readReplVethMACFn's test-injection contract, used across multiple
+	// pre-existing test files) — use context.Background() for the broker call.
+	ctx := context.Background()
 	var lastErr error
-	for _, netnsArg := range attempts {
+	for _, a := range attempts {
 		// Read the MAC via `ip link` (netlink, net-namespace-scoped) — NOT
 		// `cat /sys/class/net/<ifname>/address`. nsenter --net changes only the network
 		// namespace, leaving the host's /sys mount in place, so reading sysfs would
 		// return the HOST's interfaces, not the pod netns's. `ip -o link show <ifname>`
 		// queries the kernel via rtnetlink scoped to the entered netns.
-		out, err := exec.Command("nsenter", "--net="+netnsArg,
-			"ip", "-o", "link", "show", ifname).CombinedOutput()
-		if err != nil {
-			lastErr = fmt.Errorf("ReadReplVethMAC: nsenter %s ip link show %s: %w (%s)", netnsArg, ifname, err, strings.TrimSpace(string(out)))
+		r := netnsbroker.NewClient().NetnsExec(ctx, a.pid, a.netnsPath, "ip", "-o", "link", "show", ifname)
+		if r.SpawnErr != nil {
+			lastErr = fmt.Errorf("ReadReplVethMAC: netns exec failed via %s ip link show %s: %w", a.label, ifname, r.SpawnErr)
 			continue
 		}
-		mac := parseLinkEther(string(out))
+		if r.ExitCode != 0 {
+			lastErr = fmt.Errorf("ReadReplVethMAC: nsenter %s ip link show %s: %w (%s)", a.label, ifname, fmt.Errorf("exit %d", r.ExitCode), strings.TrimSpace(string(r.Combined)))
+			continue
+		}
+		mac := parseLinkEther(string(r.Combined))
 		if mac == "" {
-			lastErr = fmt.Errorf("ReadReplVethMAC: no link/ether in `ip link show %s` output via %s: %s", ifname, netnsArg, strings.TrimSpace(string(out)))
+			lastErr = fmt.Errorf("ReadReplVethMAC: no link/ether in `ip link show %s` output via %s: %s", ifname, a.label, strings.TrimSpace(string(r.Combined)))
 			continue
 		}
 		return mac, nil
@@ -1404,20 +1453,48 @@ func parseLinkEther(out string) string {
 	return ""
 }
 
-// resolvedNetnsPaths caches the netns path CRIU joined per migration (ADR-0133), so the NRI
-// restore callback can read eth0's MAC from the exact pod netns rather than the restored
-// PID's own ns/net (which can transiently resolve to the host netns post-restore).
+// resolvedNetns records, per migration, the exact netns path AND the interface name CRIU
+// joined on restore (ADR-0133), so the restore callback can read the replacement pod's replVeth
+// MAC from the exact netns+interface CRIU joined rather than the restored PID's own ns/net
+// (which can transiently resolve to the host netns post-restore).
+//
+// The ifname is load-bearing and MUST be recorded here rather than inferred downstream. Two
+// different restore targets are possible and they expose DIFFERENT interfaces:
+//   - ADR-0325 pod-sandbox-netns join (--join-ns net:<pod-sandbox>): the CNI-wired pod netns,
+//     whose dataplane interface is "eth0".
+//   - agent-staged migration netns (--join-ns net:<destNetnsFd>): holds only "lo" and the
+//     migration veth peer network.MigrationVethPeer ("pmdst0"), never "eth0".
+//
+// joinNsRestore is the only component that knows which of these it joined, so it is the source
+// of truth for the interface name. Recording it here (instead of finalizeNetnsPath re-deriving
+// "pmdst0" from the mere presence of a resolved path) is the fix for the live Strict
+// fail-closed: ADR-0325 retargeted the join from the migration netns to the pod sandbox netns
+// (eth0), but finalizeNetnsPath still hardcoded "pmdst0", so `ip link show pmdst0` inside the
+// pod sandbox netns returned "device does not exist" → empty MAC → "replVethMAC empty after
+// restore" (sprint46 live-proof cycle 2).
+type resolvedNetns struct {
+	path   string
+	ifname string
+}
+
 var (
 	resolvedNetnsPathsMu sync.RWMutex
-	resolvedNetnsPaths   = map[string]string{}
+	resolvedNetnsPaths   = map[string]resolvedNetns{}
 )
 
-func storeResolvedNetnsPath(migrationName, path string) {
+// storeResolvedNetnsPath records the netns path AND the dataplane interface name CRIU joined for
+// migrationName. ifname is the interface INSIDE that netns whose MAC the replVeth handoff reads:
+// "eth0" for a pod sandbox netns (ADR-0325), network.MigrationVethPeer ("pmdst0") for the
+// agent-staged migration netns. An empty ifname defaults to "eth0" (the pod-sandbox convention).
+func storeResolvedNetnsPath(migrationName, path, ifname string) {
 	if migrationName == "" || path == "" {
 		return
 	}
+	if ifname == "" {
+		ifname = "eth0"
+	}
 	resolvedNetnsPathsMu.Lock()
-	resolvedNetnsPaths[migrationName] = path
+	resolvedNetnsPaths[migrationName] = resolvedNetns{path: path, ifname: ifname}
 	resolvedNetnsPathsMu.Unlock()
 }
 
@@ -1425,7 +1502,16 @@ func storeResolvedNetnsPath(migrationName, path string) {
 func (s *AgentServer) ResolvedNetnsPath(migrationName string) string {
 	resolvedNetnsPathsMu.RLock()
 	defer resolvedNetnsPathsMu.RUnlock()
-	return resolvedNetnsPaths[migrationName]
+	return resolvedNetnsPaths[migrationName].path
+}
+
+// resolvedNetnsIfname returns the dataplane interface name CRIU joined for migrationName (the
+// interface whose MAC the replVeth handoff reads), or "" if unknown. Keyed on the value
+// joinNsRestore recorded — never inferred from the netns kind.
+func (s *AgentServer) resolvedNetnsIfname(migrationName string) string {
+	resolvedNetnsPathsMu.RLock()
+	defer resolvedNetnsPathsMu.RUnlock()
+	return resolvedNetnsPaths[migrationName].ifname
 }
 
 // finalizeNetnsPath resolves the sandbox-netns path handed to ReadReplVethMAC (via
@@ -1446,24 +1532,36 @@ func (s *AgentServer) ResolvedNetnsPath(migrationName string) string {
 // literal) routes ReadReplVethMAC through the bind-mount branch: no ptrace, no AppArmor
 // denial.
 //
-// It returns BOTH the netns path AND the interface name to read inside it. This second
-// return value is load-bearing: every non-empty path this function returns is a
-// PrepareDestinationNetns MIGRATION netns, whose only interfaces are "lo" and the migration
-// veth peer network.MigrationVethPeer ("pmdst0") — NOT "eth0". This holds for both branches:
-//   - the ResolvedNetnsPath branch records the value joinNsRestore joined, which on the
-//     destNetnsFd path is exactly ns.NetnsPath (DestNetnsFd = PrepareDestinationNetns's
-//     ns.NetnsPath — see netns_linux.go), i.e. the pmdst0 migration netns; and
-//   - the destMigrationNetns bind branch is ns.NetnsPath directly.
+// It returns BOTH the netns path AND the interface name to read inside it. This second return
+// value is load-bearing and the two branches return DIFFERENT interfaces — which is why the
+// ifname must come from the source of truth (what joinNsRestore actually joined), never be
+// inferred from the presence of a resolved path:
+//   - the ResolvedNetnsPath branch returns the exact (path, ifname) pair joinNsRestore
+//     recorded. Post-ADR-0325 the default restore joins the pod SANDBOX netns
+//     (--join-ns net:<pod-sandbox>), whose dataplane interface is "eth0"; the legacy
+//     destNetnsFd!="" path joins the agent-staged MIGRATION netns, whose interface is the
+//     migration veth peer network.MigrationVethPeer ("pmdst0"). joinNsRestore records whichever
+//     it joined, so this branch returns eth0 or pmdst0 correctly rather than assuming pmdst0.
+//   - the destMigrationNetns bind fallback is always a PrepareDestinationNetns MIGRATION netns
+//     (ns.NetnsPath), whose only interfaces are "lo" and pmdst0 — so it returns pmdst0.
 //
-// So reading "eth0" inside either returns "device does not exist" → empty MAC → Strict
-// fail-closed. That is the residual live failure the ADR-0308 bind routing hit even though it
-// correctly selected the bind path. The fix names the actual interface (pmdst0) for the
-// migration netns. Returns ("", "eth0") when neither source is available (host-network / no
+// The live regression this reconciles (sprint46 live-proof cycle 2): ADR-0308 hardcoded pmdst0
+// on the ResolvedNetnsPath branch when the Strict restore joined the migration netns; ADR-0325
+// later retargeted that join to the pod sandbox netns (eth0) without updating the ifname, so
+// `ip link show pmdst0` inside the sandbox netns returned "device does not exist" → empty MAC →
+// Strict fail-closed. Returns ("", "eth0") when neither source is available (host-network / no
 // pre-staged netns), in which case finalizeRestore falls back to the PID path — the restored
 // process's OWN sandbox netns, where the pod interface IS "eth0".
 func (s *AgentServer) finalizeNetnsPath(migrationName string) (netnsPath, ifname string) {
 	if p := s.ResolvedNetnsPath(migrationName); p != "" {
-		return p, network.MigrationVethPeer
+		// Source of truth: joinNsRestore recorded BOTH the path and the interface it actually
+		// joined for this migration. Read that ifname back — do NOT infer "pmdst0" from the mere
+		// presence of a resolved path. ADR-0325 retargeted the CRIU join from the agent-staged
+		// migration netns (pmdst0) to the pod sandbox netns (eth0); the old hardcoded
+		// network.MigrationVethPeer here then made `ip link show pmdst0` fail inside that sandbox
+		// netns → empty MAC → Strict fail-closed ("replVethMAC empty after restore", sprint46
+		// live-proof cycle 2). The recorded ifname keys the read on what CRIU joined.
+		return p, s.resolvedNetnsIfname(migrationName)
 	}
 	s.destMigrationNetnsMu.RLock()
 	ns := s.destMigrationNetns[migrationName]
@@ -1933,12 +2031,20 @@ func (s *AgentServer) resolveNamespaceForMigration(ctx context.Context, migratio
 // No netlink dependency (ADR-0045): reuses the in-tree nsenter+ip exec idiom.
 func resolveReplVethPeer(replPID int) (string, error) {
 	netnsPath := fmt.Sprintf("/proc/%d/ns/net", replPID)
-	out, err := exec.Command("nsenter", "--net="+netnsPath,
-		"ip", "-o", "link", "show", "eth0").CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("resolveReplVethPeer: ip link show eth0 in netns %s: %w (%s)",
-			netnsPath, err, strings.TrimSpace(string(out)))
+	// ADR-0348: routed through the netns broker (fail-closed), SrcPID (replPID is always a live
+	// PID here, not a stable bind-mount path — see the D3 discussion in ADR-0348 §3). No
+	// context.Context is threaded through this function's fixed signature — see ReadReplVethMAC's
+	// identical note.
+	r := netnsbroker.NewClient().NetnsExec(context.Background(), replPID, "", "ip", "-o", "link", "show", "eth0")
+	if r.SpawnErr != nil {
+		return "", fmt.Errorf("resolveReplVethPeer: netns exec failed: ip link show eth0 in netns %s: %w",
+			netnsPath, r.SpawnErr)
 	}
+	if r.ExitCode != 0 {
+		return "", fmt.Errorf("resolveReplVethPeer: ip link show eth0 in netns %s: %w (%s)",
+			netnsPath, fmt.Errorf("exit %d", r.ExitCode), strings.TrimSpace(string(r.Combined)))
+	}
+	out := r.Combined
 	peerIdx := parseVethPeerIndex(string(out))
 	if peerIdx <= 0 {
 		return "", fmt.Errorf("resolveReplVethPeer: no eth0@if<N> peer index in: %s", strings.TrimSpace(string(out)))
@@ -3388,6 +3494,16 @@ func resolveInheritCgroupSource(recordedPath, sandboxID string) string {
 	return filepath.Join("/sys/fs/cgroup", base)
 }
 
+// NON-REGRESSION (ADR-0346 D8): the ADR-0348 twelve-site re-point of the direct-agent
+// `nsenter --net=` calls onto the netns broker does NOT reorder the external-mount reattach
+// (the Tier0-RWX postgres re-attach, emitted here as --ext-mount-map entries) relative to CRIU
+// restore. open_tree for those ext-mounts is performed by `criu restore` ITSELF, inside the child
+// process this function's argv launches; every broker-delegated netns-exec on the restore path
+// (joinNsRestore's lo-up at ~server.go:4245, ReadReplVethMAC, resolveReplVethPeer, and the
+// ADR-0200/0210 probe/echo) runs only AFTER that CRIU child returns (buildCRIURestoreArgs ->
+// exec CRIU -> reap -> post-restore netns-exec). The re-point changes WHO runs nsenter (broker vs
+// confined agent), never WHEN open_tree runs relative to CRIU return — so the postgres reattach
+// ordering the next milestone rides on is preserved.
 func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath, hostVethName string, strictMode bool, reattachMountPaths []reattachMount) ([]string, error) {
 	// Choose --tcp-established whenever the checkpoint actually captured an established
 	// TCP connection (presence of a tcp-stream-*.img), NOT merely when a pre-staged
@@ -3539,6 +3655,41 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 // restoredPidfileName is the basename CRIU writes the restored root PID to (see --pidfile
 // in buildCRIURestoreArgs). It lives in the restore dataDir (host-visible ext4).
 const restoredPidfileName = "restored.pid"
+
+// restoreDevNode is one OCI-standard character device node the restore rootfs must carry so
+// CRIU's reopen-by-PATH of a workload fd whose backing file is /dev/<name> (files-reg.c:2353)
+// succeeds. See joinNsRestore's provisioning loop for the grounding (pm-w2 restore.log, sprint46).
+type restoreDevNode struct {
+	rel          string // path relative to the rootfs root, e.g. "dev/null" (no leading slash — CRIU openat is root-relative)
+	major, minor int    // fixed Linux device numbers (Documentation/admin-guide/devices.txt)
+	required     bool   // true => fail CLOSED if creation fails (a workload fd is backed by it)
+}
+
+// standardRestoreDevNodes is the workload-agnostic OCI default device-node set (runc
+// defaultDevices) that a container overlay image lacks: an image ships an EMPTY /dev, and the
+// runtime-managed /dev tmpfs is not part of the host-mount-ns bundle rootfs we restore into. Only
+// /dev/null is `required`: CRIU aborts the ENTIRE restore before writing --pidfile when a workload
+// fd (e.g. redis fd 0) reopens /dev/null by path and it is absent (decoded live on pm-w2, sprint46
+// live-proof cycle 1). The rest are best-effort (log-and-continue).
+var standardRestoreDevNodes = []restoreDevNode{
+	{rel: "dev/null", major: 1, minor: 3, required: true},
+	{rel: "dev/zero", major: 1, minor: 5},
+	{rel: "dev/full", major: 1, minor: 7},
+	{rel: "dev/random", major: 1, minor: 8},
+	{rel: "dev/urandom", major: 1, minor: 9},
+	{rel: "dev/tty", major: 5, minor: 0},
+}
+
+// devNodeMknodShellCmd returns the idempotent shell command (run via the privileged netns broker's
+// allowlisted "sh") that creates one device node at <rootfsDir>/<node.rel>. `umask 0000` defeats
+// the broker umask so `-m 666` yields exactly crw-rw-rw- (matching the host nodes); the `[ -e ]`
+// guard makes it idempotent so an NRI bundle whose runtime already populated /dev is left
+// untouched. Pure (string-only) so the provisioning contract is unit-testable without a broker /
+// mknod round-trip — the coverage that was absent when the missing /dev/null aborted cycle 1.
+func devNodeMknodShellCmd(rootfsDir string, node restoreDevNode) string {
+	p := filepath.Join(rootfsDir, node.rel)
+	return fmt.Sprintf("umask 0000; [ -e %q ] || mknod -m 666 %q c %d %d", p, p, node.major, node.minor)
+}
 
 // copyDirAll copies all regular files (non-recursive into subdirs is fine for CRIU image dirs
 // which are flat) from src to dst. dst is created with 0o700 if it doesn't exist.
@@ -3782,6 +3933,51 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 			log.Error(err, "setupRootfsFiles: touch failed (non-fatal)", "file", f, "out", string(out))
 		}
 	}
+	// Populate the restore rootfs /dev with the OCI-standard device nodes before CRIU restore.
+	//
+	// GROUNDING (decoded live on pm-w2, sprint46 live-proof cycle 1 — NOT inferred):
+	// /var/lib/podmotion/restore/redis-live-strict/data/restore.log ended with
+	//   1: Error (criu/files-reg.c:2353): Can't open file dev/null on restore: No such file or directory
+	//   1: Error (criu/files.c:1221): Unable to open fd=0 id=0x5
+	//   Error (criu/cr-restore.c:2324): Restoring FAILED.
+	// CRIU dumped the workload's fd 0 as a REG-file open of path "/dev/null" (image fd table:
+	// FD 0 -> id 0x5 type 1/REG). On restore CRIU reopens that backing file by PATH relative to
+	// --root <rootfsDir> (openat(root, "dev/null")). A container's /dev is a runtime-managed tmpfs
+	// the OCI runtime (runc defaultDevices) populates with these nodes at container-create time; it
+	// is NOT part of the overlay image and is NOT mounted into the host-mount-ns view of the bundle
+	// rootfs we restore into — so /dev is empty here, the reopen ENOENTs, and CRIU ABORTS the whole
+	// restore at ~0.8s BEFORE it writes --pidfile. That abort surfaced only as the misleading
+	// downstream "restored process PID not found ... pidfile never appeared" symptom (the real cause
+	// is the restore.log tail the caller appends). This is the classic kind->KVM substrate exposure:
+	// kind's node /dev differed; the standing KVM containerd bundle leaves /dev unpopulated.
+	//
+	// FIX (general primitive, workload-agnostic — covers every workload with a /dev-backed fd, not
+	// just this redis fd 0): create the standard char device nodes so CRIU's reopen-by-path succeeds.
+	// mknod requires CAP_MKNOD, which the SD-1 de-privileged agent (privileged:false) does not hold —
+	// so it is DELEGATED to the privileged broker via the already-allowlisted "sh" host-mount-ns exec
+	// (execAllowlist, ADR-0231/0346), the SAME mechanism the mkdir/touch scaffolding above uses; no
+	// allowlist widening. `umask 0000` defeats the broker umask so -m 666 yields exactly 0666 (match
+	// the host nodes: crw-rw-rw-). Idempotent ([ -e ] guard) so an NRI bundle whose runtime already
+	// populated /dev is left untouched. Major/minor are the fixed Linux mem/tty device numbers
+	// (Documentation/admin-guide/devices.txt), verified against pm-w2 /dev.
+	// The node list + command builder are extracted to package scope (standardRestoreDevNodes /
+	// devNodeMknodShellCmd) so the provisioning contract is unit-testable — see restore_devnode_test.go.
+	for _, n := range standardRestoreDevNodes {
+		p := filepath.Join(rootfsDir, n.rel)
+		out, err := nsenterCmd("sh", "-c", devNodeMknodShellCmd(rootfsDir, n)).CombinedOutput()
+		if err == nil {
+			continue
+		}
+		if n.required {
+			// /dev/null is the load-bearing node: CRIU reopens fd 0/1/2's /dev/null backing by path
+			// under --root and aborts the ENTIRE restore before writing --pidfile if it is absent (the
+			// decoded pm-w2 failure). Fail CLOSED here with the real cause rather than letting the
+			// restore proceed and re-surface as the downstream "restored PID not found" symptom.
+			metrics.MigrationsFailedTotal.WithLabelValues("restore_devnull_create").Inc()
+			return 0, nil, fmt.Errorf("create required restore-rootfs device node %s (CRIU aborts reopening a workload fd backed by it without it): %w\n%s", p, err, string(out))
+		}
+		log.Error(err, "setupRootfsDevNodes: mknod failed (non-fatal)", "path", p, "out", string(out))
+	}
 	// Step 4: CRIU restore — standalone rootfs.
 	//
 	// ADR-0125 (supersedes ADR-0122 §3): on the stateless (destNetnsFd-empty) path, resolve the
@@ -3821,8 +4017,10 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 			petnsPath = resolvedPath
 			// ADR-0133: stash the exact netns path CRIU joined so the NRI callback can read the
 			// replacement pod's eth0 MAC from it (the restored PID's own /proc/<pid>/ns/net can
-			// transiently resolve to the host netns right after CRIU exits).
-			storeResolvedNetnsPath(migrationName, petnsPath)
+			// transiently resolve to the host netns right after CRIU exits). ADR-0325: this is the
+			// pod SANDBOX netns, whose dataplane interface is "eth0" — record that ifname as the
+			// source of truth so finalizeNetnsPath reads eth0 here, not the migration-netns pmdst0.
+			storeResolvedNetnsPath(migrationName, petnsPath, "eth0")
 			log.Info("joinNsRestore: joining replacement pod netns via --join-ns net:<path> (ADR-0125)",
 				"sandboxID", sandboxID, "netnsPath", petnsPath)
 		}
@@ -3833,7 +4031,10 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 		// PrepareDestinationNetns via the controller and RestoreRequest.DestNetnsFd). Record it
 		// the same way the sandboxID branch above records petnsPath, so the NRI callback / MAC
 		// resolution reads the agent-created bind netns instead of ptrace'd /proc/<pid>/ns/net.
-		storeResolvedNetnsPath(migrationName, destNetnsFd)
+		// This is the agent-staged MIGRATION netns, whose only interfaces are "lo" and the
+		// migration veth peer — record network.MigrationVethPeer ("pmdst0") as the ifname so
+		// finalizeNetnsPath reads pmdst0 here (this netns has no "eth0").
+		storeResolvedNetnsPath(migrationName, destNetnsFd, network.MigrationVethPeer)
 	}
 
 	criuArgs, err := buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath, hostVethName, strictMode, reattachMountPaths)
@@ -4182,11 +4383,13 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// using the PID resolved from the pod cgroup (never the CRIU PID). On the cold path this
 	// is the CNI-wired pod netns (lo is normally already up); on the TCP-stateful path it is the
 	// pre-staged migration netns. Idempotent either way.
-	if out, err := exec.Command("nsenter",
-		fmt.Sprintf("--net=/proc/%d/ns/net", pid), "--",
-		"ip", "link", "set", "lo", "up",
-	).CombinedOutput(); err != nil {
-		log.Info("joinNsRestore: warning — failed to bring up loopback", "err", err, "output", string(out))
+	// ADR-0348: routed through the netns broker (fail-closed), SrcPID. No context.Context is
+	// threaded through joinNsRestore's fixed signature (shared by both the NRI and gRPC restore
+	// paths) — use context.Background(), matching ReadReplVethMAC/resolveReplVethPeer.
+	if r := netnsbroker.NewClient().NetnsExec(context.Background(), pid, "", "ip", "link", "set", "lo", "up"); r.SpawnErr != nil {
+		log.Info("joinNsRestore: warning — failed to bring up loopback", "err", r.SpawnErr, "op", "netns_exec")
+	} else if r.ExitCode != 0 {
+		log.Info("joinNsRestore: warning — failed to bring up loopback", "err", fmt.Errorf("exit %d", r.ExitCode), "output", string(r.Combined))
 	}
 
 	success = true
@@ -4228,6 +4431,20 @@ const (
 	inetnsProbeExitOtherErr = 66 // any other dial error — failure
 )
 
+// netnsSelfExecFn / netnsSelfExecStartFn are the broker-delegated SELF-PATH exec seams for the two
+// in-netns primitives that re-execute this agent's own binary (ADR-0200 __inetns_probe /
+// ADR-0210 __inetns_echo). They default to the real netns-broker client calls; they exist so a
+// server-package test can capture the transmitted Argv and prove the ADR-0346 D3/D5 self-path
+// sentinel (netnsbroker.NetnsExecSelfToken) is what these sites send — NEVER a live
+// os.Executable()/"/proc/self/exe" path, which the broker's exact-match allowlist rejects
+// (discharge req 11). Same package-var test-seam idiom already used by joinNsRestoreFn.
+var netnsSelfExecFn = func(ctx context.Context, replPID int, netnsPath string, argv ...string) netnsbroker.ExecResult {
+	return netnsbroker.NewClient().NetnsExec(ctx, replPID, netnsPath, argv...)
+}
+var netnsSelfExecStartFn = func(ctx context.Context, replPID int, netnsPath string, argv ...string) (int, error) {
+	return netnsbroker.NewClient().NetnsExecStart(ctx, replPID, netnsPath, argv...)
+}
+
 // probeOldIPInPodNetns performs the ADR-0200 D1 reachability probe by re-executing this same
 // agent binary's __inetns_probe helper INSIDE the replacement pod's network namespace via the
 // established in-tree nsenter --net=/proc/<replPID>/ns/net idiom (the same idiom used by
@@ -4235,40 +4452,44 @@ const (
 // no netlink/new external dependency). Dialing the OLD IP:7 from where the IP is owned returns
 // RST (ECONNREFUSED) → ProbeOk=true (ADR-0200 D3: port :7 and RST=success are unchanged).
 // Returns (probeOk, probeOutput) mirroring the prior in-process dial's contract exactly.
-func probeOldIPInPodNetnsImpl(replPID int, oldPodIP string) (bool, string) {
-	netnsPath := fmt.Sprintf("/proc/%d/ns/net", replPID)
-	self, err := os.Executable()
-	if err != nil {
-		self = "/proc/self/exe"
+// ADR-0348 (D2, D5a, D4): routed through the netns broker (fail-closed), SrcPID. This is the
+// sync (non-detached) probe site — do NOT map it to NetnsExecStart (it is a synchronous,
+// classification-bearing call, not a fire-and-forget listener). The broker's ExecResult.ExitCode
+// MUST carry the __inetns_probe child's real exit code (nsenter-propagated, not broker-collapsed)
+// for inetnsProbeExitRefused (64) to be observably distinguishable from inetnsProbeExitTimeout
+// (65) here — see doNetnsExec in internal/agent/netnsbroker/broker.go.
+func probeOldIPInPodNetnsImpl(ctx context.Context, replPID int, oldPodIP string) (bool, string) {
+	// ADR-0346 D3/D5: transmit the fixed self-path sentinel as argv[0], NEVER os.Executable()/
+	// "/proc/self/exe". The broker's exact-match netnsExecAllowlist keys on NetnsExecSelfToken and
+	// substitutes its OWN pinned self path server-side; a live binary path is not in the allowlist,
+	// so it is rejected ("not in broker allowlist"), r.SpawnErr fires, and the probe fails closed on
+	// every call — the datapath-dead regression discharge req 11 guards against.
+	// netns broker exec: <broker-self-binary> __inetns_probe <oldIP> 7, run inside the pod netns.
+	r := netnsSelfExecFn(ctx, replPID, "", netnsbroker.NetnsExecSelfToken, "__inetns_probe", oldPodIP, "7")
+	if r.SpawnErr != nil {
+		// D4: broker unreachable -> fail closed, advisory-only probe returns false (matches
+		// the prior local exec-launch-failure behavior).
+		return false, fmt.Sprintf("ADR-0200: in-netns probe exec failed: %v", r.SpawnErr)
 	}
-	// nsenter --net=<pod netns> <agent-binary> __inetns_probe <oldIP> 7
-	cmd := exec.Command("nsenter", "--net="+netnsPath, self, "__inetns_probe", oldPodIP, "7")
-	out, runErr := cmd.CombinedOutput()
-	output := strings.TrimSpace(string(out))
-	if runErr == nil {
+	output := strings.TrimSpace(string(r.Combined))
+	switch r.ExitCode {
+	case inetnsProbeExitSuccess:
 		// Exit 0 — SYN-ACK success.
 		return true, output
+	case inetnsProbeExitRefused:
+		// RST / ECONNREFUSED — the kernel in the pod netns answered: IP is live (success),
+		// identical to the host-netns isConnRefused()==true classification it replaces.
+		return true, output
+	case inetnsProbeExitTimeout:
+		return false, output
+	default:
+		return false, output
 	}
-	var exitErr *exec.ExitError
-	if errors.As(runErr, &exitErr) {
-		switch exitErr.ExitCode() {
-		case inetnsProbeExitRefused:
-			// RST / ECONNREFUSED — the kernel in the pod netns answered: IP is live (success),
-			// identical to the host-netns isConnRefused()==true classification it replaces.
-			return true, output
-		case inetnsProbeExitTimeout:
-			return false, output
-		default:
-			return false, output
-		}
-	}
-	// Could not even launch nsenter / the helper — treat as failure (deferred to requeue).
-	return false, fmt.Sprintf("ADR-0200: in-netns probe exec failed: %v (%s)", runErr, output)
 }
 
 // probeOldIPInPodNetns is the AgentServer method seam (overridable in tests).
-func (s *AgentServer) probeOldIPInPodNetns(_ context.Context, replPID int, oldPodIP string) (bool, string) {
-	return probeOldIPInPodNetnsImpl(replPID, oldPodIP)
+func (s *AgentServer) probeOldIPInPodNetns(ctx context.Context, replPID int, oldPodIP string) (bool, string) {
+	return probeOldIPInPodNetnsImpl(ctx, replPID, oldPodIP)
 }
 
 // ProbeDataplaneReachability is the ADR-0210 cross-node dataplane probe. It is called by
@@ -4378,22 +4599,25 @@ func (s *AgentServer) StartReachabilityEcho(ctx context.Context, req *agentpb.St
 	if ttl <= 0 {
 		ttl = 15
 	}
-	self, err := os.Executable()
-	if err != nil {
-		self = "/proc/self/exe"
-	}
-	netnsPath := fmt.Sprintf("/proc/%d/ns/net", replPID)
-	// Launch the in-netns echo listener detached — it serves for ttl seconds then exits.
-	cmd := exec.Command("nsenter", "--net="+netnsPath, self, "__inetns_echo",
+	// ADR-0348 (D2, D4): launch the in-netns echo listener detached, routed through the netns
+	// broker's NetnsExecStart (SrcPID) — it serves for ttl seconds then exits. Reap is handled by
+	// the broker's existing asyncExecReg/doExecPoll/doExecSignal machinery (ADR-0346 D1); do not
+	// re-add a local `go func(){ cmd.Wait() }()`.
+	// ADR-0346 D3/D5: transmit the fixed self-path sentinel as argv[0], NEVER os.Executable()/
+	// "/proc/self/exe" — the broker exact-matches NetnsExecSelfToken and substitutes its own pinned
+	// self path server-side; a live binary path is rejected, startErr fires, and the listener never
+	// starts (Started=false) on every call, the dead-datapath regression discharge req 11 guards.
+	_, startErr := netnsSelfExecStartFn(ctx, replPID, "", netnsbroker.NetnsExecSelfToken, "__inetns_echo",
 		req.ListenIp, fmt.Sprintf("%d", req.ListenPort), req.Nonce, fmt.Sprintf("%d", ttl))
-	if startErr := cmd.Start(); startErr != nil {
+	if startErr != nil {
+		// D4: broker-unreachable -> Started MUST be false. Never true when no listener actually
+		// started -- a downstream bug could otherwise misread the absence as a real listener.
 		resp.Started = false
-		resp.Detail = fmt.Sprintf("ADR-0210: failed to start in-netns echo listener: %v", startErr)
-		log.Error(startErr, "StartReachabilityEcho: launch failed (ADR-0210)", "migration", req.MigrationName)
+		resp.Detail = fmt.Sprintf("ADR-0210: netns exec failed: %v", startErr)
+		log.Error(startErr, "StartReachabilityEcho: launch failed (ADR-0210)", "migration", req.MigrationName,
+			"op", "netns_exec_start")
 		return resp, nil
 	}
-	// Reap the helper asynchronously so it does not become a zombie.
-	go func() { _ = cmd.Wait() }()
 	resp.Started = true
 	resp.Detail = fmt.Sprintf("ADR-0210: in-netns nonce-echo listener started on %s:%d (replPID=%d, ttl=%ds)",
 		req.ListenIp, req.ListenPort, replPID, ttl)
@@ -4742,7 +4966,7 @@ func (s *AgentServer) resolveSandboxIDForMigration(ctx context.Context, migratio
 	}
 	// Resolve the replacement pod by the migration-name LABEL (source of truth stamped by the
 	// controller at creation) rather than pm.Status.ReplacementPodName, which frequently reads
-	// back empty at restore time (primitive over brittle chain). Fall back to the status
+	// back empty at restore time (reads the authoritative value instead of inferring it). Fall back to the status
 	// field only if the label lookup finds nothing.
 	pod := s.resolveReplacementPod(ctx, migrationName, podNs)
 	if pod == nil {
