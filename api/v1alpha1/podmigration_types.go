@@ -377,12 +377,31 @@ const (
 	// ConditionIPReclaimSourceTornDown are True (ADR-0244 / NR-BLOCK-2). Distinct from
 	// ConditionCni0CleanupVerified, which is scoped only to CUTOVER_COMPLETE objects.
 	ConditionIPReclaimComplete = "IPReclaimComplete"
-	// ConditionSourceStorageWriteRestored is True once the source's Tier0 (RWX)
-	// storage has been confirmed writable again after a rollback (ADR-0007
-	// remount-handoff protocol, ADR-0344 Decision A.2). The RollingBack phase
-	// handler must observe this condition True before resuming (SIGCONT-ing) the
-	// frozen source process, closing the concurrent-writer/split-brain window
-	// described in ADR-0344 Context §2. For non-Tier0 migrations this is set
+	// ConditionSourceStorageWriteRestored: NAME IS ASPIRATIONAL — READ THIS BEFORE
+	// TREATING True AS A STORAGE GUARANTEE (ADR-0344 sign-off finding, 2026-07-12).
+	//
+	// As implemented today this condition is CONNECTIVITY-ONLY. For Tier0 (RWX)
+	// migrations it is set True once the source agent's gRPC connection is
+	// reachable (restoreSourceStorageIfNeeded, internal/controller/podmigration_controller.go).
+	// There is no remount-rw RPC on the wire for the rollback direction, so
+	// True here does NOT confirm the source volume is actually writable, does
+	// NOT confirm the destination volume is unmounted, and does NOT by itself
+	// close the concurrent-writer/split-brain window described in ADR-0344
+	// Context §1/§2 (two backends able to write the same PGDATA mount). See
+	// docs/security/SECURITY-DEBT-LEDGER.md for the full tracked-debt
+	// writeup and resolution path.
+	//
+	// BINDING RULE: no consumer — including ADR-0344 Decision A's deferred
+	// second-SIGCONT gate in ReconcileOrphanedFrozenSources — may treat
+	// ConditionSourceStorageWriteRestored=True as proof the concurrent-writer
+	// window is closed until a real remount-rw RPC exists on the wire and
+	// restoreSourceStorageIfNeeded actually calls it and awaits confirmation.
+	// Until then, treat True as "source agent reachable, remount state
+	// unverified" only (reason SourceAgentReachableRemountUnverified).
+	//
+	// The RollingBack phase handler observes this condition before resuming
+	// (SIGCONT-ing) the frozen source process (ADR-0007 remount-handoff
+	// protocol, ADR-0344 Decision A.2). For non-Tier0 migrations this is set
 	// True immediately (same-reconcile no-op) since there is no shared-mount
 	// hazard to guard against.
 	ConditionSourceStorageWriteRestored = "SourceStorageWriteRestored"

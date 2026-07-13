@@ -9,6 +9,7 @@ package traffic
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -16,7 +17,16 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 )
+
+// errSourceEndpointRemovalBlocked is returned by RemoveSourceIfVerified when
+// pmv1.SourceTeardownBlockReason reports a non-empty block reason — i.e. the
+// canonical ADR-0341 predicate does not yet permit removing the source IP
+// from EndpointSlices. Callers should treat this as "not yet safe to
+// remove," not a transport/API failure.
+var errSourceEndpointRemovalBlocked = errors.New("traffic: source EndpointSlice removal blocked by SourceTeardownBlockReason")
 
 // EndpointSliceManager handles the EndpointSlice transition during migration cutover.
 //
@@ -81,6 +91,19 @@ func (m *EndpointSliceManager) RemoveSource(ctx context.Context, namespace, sour
 		removed++
 	}
 	return removed, nil
+}
+
+// RemoveSourceIfVerified is the canonical, ADR-0341/ADR-0344-aligned gate for
+// source-EndpointSlice removal: it delegates to pmv1.SourceTeardownBlockReason
+// (the single predicate also used by the controller's source-pod-deletion
+// gate) and only calls RemoveSource when that predicate reports no block
+// reason. On block, it returns errSourceEndpointRemovalBlocked and mutates
+// nothing. Returns the number of EndpointSlices updated on success.
+func (m *EndpointSliceManager) RemoveSourceIfVerified(ctx context.Context, pm *pmv1.PodMigration, namespace, sourcePodIP string) (int, error) {
+	if reason := pmv1.SourceTeardownBlockReason(pm.Spec.TCPPreservationMode, pm.Status.Conditions); reason != "" {
+		return 0, fmt.Errorf("%w: %s", errSourceEndpointRemovalBlocked, reason)
+	}
+	return m.RemoveSource(ctx, namespace, sourcePodIP)
 }
 
 // MarkDestinationReady sets the destination endpoint's Ready condition to true

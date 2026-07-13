@@ -38,6 +38,16 @@ func (c *Client) Teardown(_ context.Context, _ string) error {
 	return fmt.Errorf("netns-broker: unsupported on this OS (linux only)")
 }
 
+// NetnsExec errors on non-linux (ADR-0346 D6).
+func (c *Client) NetnsExec(_ context.Context, _ int, _ string, _ ...string) ExecResult {
+	return ExecResult{ExitCode: -1, SpawnErr: fmt.Errorf("netns-broker: unsupported on this OS (linux only)")}
+}
+
+// NetnsExecStart errors on non-linux (ADR-0346 D6).
+func (c *Client) NetnsExecStart(_ context.Context, _ int, _ string, _ ...string) (int, error) {
+	return 0, fmt.Errorf("netns-broker: unsupported on this OS (linux only)")
+}
+
 // Run errors on non-linux.
 func Run(_ context.Context, _ logr.Logger) error {
 	return fmt.Errorf("netns-broker: unsupported on this OS (linux only)")
