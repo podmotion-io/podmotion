@@ -51,28 +51,29 @@ func TestSourcePodDeletionBlockReason(t *testing.T) {
 		wantBlock  bool // true => deletion must be refused (non-empty block reason)
 	}{
 		{
-			// Strict, all predicates satisfied → allowed.
+			// Strict, all predicates satisfied → allowed. ADR-0352: keyed on
+			// ServiceContinuityVerified, not the retired DataplaneReachabilityVerified.
 			name: "Strict_AllPredicates_Allowed",
 			mode: pmv1.TCPPreservationModeStrict,
 			conditions: []metav1.Condition{
-				cond(conditionDataplaneReachabilityVerified, metav1.ConditionTrue),
+				cond(string(pmv1.ConditionServiceContinuityVerified), metav1.ConditionTrue),
 				cond(pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionTrue),
 				cond(pmv1.ConditionWorkloadLivenessVerified, metav1.ConditionTrue),
 			},
 			wantBlock: false,
 		},
 		{
-			// Strict, dataplane gate passed but TCP-continuity NOT verified → MUST block.
+			// Strict, ServiceContinuity gate passed but TCP-continuity NOT verified → MUST block.
 			// The pre-change weak Verifying gate would have ALLOWED this (bug).
 			name: "Strict_DataplaneOK_NoTCPContinuity_Blocked",
 			mode: pmv1.TCPPreservationModeStrict,
 			conditions: []metav1.Condition{
-				cond(conditionDataplaneReachabilityVerified, metav1.ConditionTrue),
+				cond(string(pmv1.ConditionServiceContinuityVerified), metav1.ConditionTrue),
 			},
 			wantBlock: true,
 		},
 		{
-			// Strict, no dataplane reachability → MUST block.
+			// Strict, no ServiceContinuityVerified → MUST block.
 			name: "Strict_NoDataplane_Blocked",
 			mode: pmv1.TCPPreservationModeStrict,
 			conditions: []metav1.Condition{
@@ -119,6 +120,38 @@ func TestSourcePodDeletionBlockReason(t *testing.T) {
 			mode:       pmv1.TCPPreservationModeNone,
 			conditions: []metav1.Condition{},
 			wantBlock:  true,
+		},
+		{
+			// SECURITY / split-brain veto (Security Reviewer sprint46B3 cycle-2): BestEffort with
+			// TrafficVerified + TCP-continuity + liveness ALL satisfied, but DataplaneReachabilityVerified
+			// EXPLICITLY False (destination affirmatively unreachable — e.g. preserved IP not honored by
+			// the CNI). The ADR-0210 handoff path sets TrafficVerified=True on mere install; without the
+			// fail-closed veto this install-derived True would authorize teardown while the destination
+			// cannot serve the preserved IP → source deleted, clients stranded (split-brain). MUST block.
+			// This case returns "" (permit) against the pre-fix predicate; the fix makes it block.
+			name: "BestEffort_DataplaneExplicitlyFalse_Blocked",
+			mode: pmv1.TCPPreservationModeBestEffort,
+			conditions: []metav1.Condition{
+				cond(conditionTrafficVerified, metav1.ConditionTrue),
+				cond(pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionTrue),
+				cond(pmv1.ConditionWorkloadLivenessVerified, metav1.ConditionTrue),
+				cond(conditionDataplaneReachabilityVerified, metav1.ConditionFalse),
+			},
+			wantBlock: true,
+		},
+		{
+			// SECURITY / split-brain veto: None-mode variant — TrafficVerified + liveness satisfied but
+			// DataplaneReachabilityVerified EXPLICITLY False must still block teardown. (None normally
+			// leaves this condition ABSENT — see the absent-not-False cases above, which stay ALLOWED —
+			// so this proves the veto is mode-independent and fires only on an affirmative False.)
+			name: "None_DataplaneExplicitlyFalse_Blocked",
+			mode: pmv1.TCPPreservationModeNone,
+			conditions: []metav1.Condition{
+				cond(conditionTrafficVerified, metav1.ConditionTrue),
+				cond(pmv1.ConditionWorkloadLivenessVerified, metav1.ConditionTrue),
+				cond(conditionDataplaneReachabilityVerified, metav1.ConditionFalse),
+			},
+			wantBlock: true,
 		},
 	}
 

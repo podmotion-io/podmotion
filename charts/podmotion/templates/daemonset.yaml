@@ -200,6 +200,28 @@ spec:
               # namespace; the agent consumes them via HostToContainer. The shared
               # /run/podmotion mount carries both the socket and the netns dir.
               mountPropagation: Bidirectional
+            # ADR-0349 sprint46B2 cycle-1 (Architect B — substrate root cause). The broker's
+            # netns_exec NetnsPath mode (ADR-0326) VALIDATES a /var/run/netns/cni-<id> handle
+            # with an IN-PROCESS filepath.EvalSymlinks (validateNetnsPath, broker.go:135) and
+            # only THEN runs the op via `nsenter --mount=/proc/1/ns/mnt --net=<path>` in the
+            # HOST mount namespace. Without this mount the broker's OWN mount namespace has no
+            # /run/netns (the CNI bind dir), so EvalSymlinks fails with
+            # `lstat /run/netns: no such file or directory` and the gate REJECTS a valid handle
+            # BEFORE the op ever runs — the gate validates a filesystem view the operation does
+            # not use. Live-decoded on pm-w2 (docs/sprints/sprint46B2/live-proof-cycle1.md: the
+            # agent-side ReadReplVethMAC bind read returned empty via that exact lstat error;
+            # broker mount-ns probe confirms `ls /run/netns` -> "No such file or directory").
+            # The agent container already mounts host-var-run-netns for the same reason (its
+            # os.Open of the handle succeeds); give the broker the same READ-ONLY view so its
+            # containment gate validates against the same mounts it enters. /var/run is a symlink
+            # to /run, so this surfaces the CNI bind dir at /run/netns; HostToContainer propagates
+            # binds CNI creates after the broker starts. This makes the broker's netns visibility
+            # consistent — it does NOT change MAC resolution, which reads the restored process's
+            # own netns via SrcPID (/proc/<pid>/ns/net), never a bind path.
+            - name: host-var-run-netns
+              mountPath: /var/run/netns
+              mountPropagation: HostToContainer
+              readOnly: true
           resources:
             {{- toYaml .Values.agent.netnsBroker.resources | nindent 12 }}
         - name: agent

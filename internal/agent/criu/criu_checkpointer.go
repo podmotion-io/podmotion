@@ -514,8 +514,13 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	if opts.LeaveStopped {
 		dumpArgs = append(dumpArgs, "--leave-stopped")
 	}
+	// TCP-disposition flags (--tcp-established/--tcp-close plus --skip-in-flight) come from the
+	// pure helper criuTCPDumpFlags so the flag set is unit-testable without invoking CRIU
+	// (TestCRIUTCPDumpFlags_SkipInFlightBothPaths). --skip-in-flight is now emitted on BOTH the
+	// preservation and the cold-close path — see the helper for the ADR-0131/ADR-0352 rationale
+	// (a co-resident in-flight socket must not abort a dump that is preserving a held connection).
+	dumpArgs = append(dumpArgs, criuTCPDumpFlags(opts.TcpEstablished)...)
 	if opts.TcpEstablished {
-		dumpArgs = append(dumpArgs, "--tcp-established")
 		// ADR-0162-rev: CRIU 4.2 does not honor --external net[] for ARPHRD_TUNNEL (ipip).
 		// Delete tunnel devices from the container netns before the final dump.
 		// tunl0/sit0/etc are always DOWN on Flannel-VXLAN clusters (no pod traffic).
@@ -534,8 +539,6 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 				"pid", opts.Pid, "links", names)
 		}
 	} else {
-		dumpArgs = append(dumpArgs, "--tcp-close")
-		dumpArgs = append(dumpArgs, "--skip-in-flight")
 		// Cold network migration (tcpPreservationMode=None): we do NOT preserve any
 		// network state — the pod is restored into a fresh (empty) network namespace
 		// provisioned by the destination CNI. Dump the net namespace as empty so CRIU
@@ -1013,6 +1016,36 @@ func openDirFd(dirPath string) (*os.File, error) {
 // for use in package-level tests (package criu_test).
 func ExportedParseTCPImageEntries(logContent string) (int, int) {
 	return parseTCPImageEntries(logContent)
+}
+
+// criuTCPDumpFlags is the single source of truth for the TCP-disposition CRIU dump flags.
+// Extracting it makes the flag set testable in isolation (no live CRIU needed).
+//
+//   - tcpEstablished=true (BestEffort/Strict): ESTABLISHED sockets are snapshotted via
+//     TCP_REPAIR (--tcp-established). --skip-in-flight is REQUIRED alongside it, not optional:
+//     a real held connection almost always has a co-resident socket in a transitional/in-flight
+//     state (SYN-SENT/SYN-RECV, or an ESTABLISHED socket carrying an unacked in-flight segment
+//     that CRIU rejects at criu/sk-inet.c:185 "inet: In-flight connection"). WITHOUT
+//     --skip-in-flight that single socket aborts the ENTIRE dump (cr-dump.c "Dumping FAILED"),
+//     taking the preservable ESTABLISHED connection down with it — the exact cycle-2 live-proof
+//     checkpoint failure (dump collected ESTABLISHED src 10.244.x then died on in-flight
+//     socket 0x30cc26). --skip-in-flight lets CRIU drop ONLY the un-snapshottable in-flight
+//     socket (its peer retransmits the SYN) while --tcp-established still preserves the held
+//     connection byte-exact. The two flags are complementary, not alternatives.
+//     (ADR-0131 D2 raw-CRIU established fallback; ADR-0352 Strict held-connection dump.)
+//   - tcpEstablished=false (None/cold): all TCP is closed (--tcp-close); --skip-in-flight is
+//     likewise emitted so a transitional socket cannot abort the cold dump either.
+func criuTCPDumpFlags(tcpEstablished bool) []string {
+	if tcpEstablished {
+		return []string{"--tcp-established", "--skip-in-flight"}
+	}
+	return []string{"--tcp-close", "--skip-in-flight"}
+}
+
+// ExportedCRIUTCPDumpFlags is the exported wrapper around criuTCPDumpFlags
+// for use in package-level tests (package criu_test).
+func ExportedCRIUTCPDumpFlags(tcpEstablished bool) []string {
+	return criuTCPDumpFlags(tcpEstablished)
 }
 
 // parseTCPImageEntries scans a CRIU dump or restore log for TCP image entries

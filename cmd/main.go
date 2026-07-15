@@ -43,6 +43,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/storage"
 	agenttls "github.com/podmotion-io/podmotion/internal/agent/tls"
 	"github.com/podmotion-io/podmotion/internal/agent/traffic"
+	"github.com/podmotion-io/podmotion/internal/buildinfo"
 	"github.com/podmotion-io/podmotion/internal/controller"
 	"github.com/podmotion-io/podmotion/internal/controller/spotreclaim"
 	"github.com/podmotion-io/podmotion/internal/estimation"
@@ -372,6 +373,16 @@ func main() {
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "Failed to set up ready check")
 		os.Exit(1)
+	}
+
+	// Surface the authoritative build identity so a live-migration proof run can be
+	// bound to the exact source tree this binary was built from, instead of inferring
+	// artifact/source correspondence structurally after the fact. A dirty build is
+	// flagged explicitly: its identity is not pinned to a commit.
+	prov := buildinfo.Read()
+	setupLog.Info("build provenance", prov.LogValues()...)
+	if prov.Dirty {
+		setupLog.Info("WARNING: operator built from a working tree with uncommitted changes — build identity is NOT pinned to a commit; a proof artifact must record this and be rebuilt from a committed tree to establish artifact/source correspondence")
 	}
 
 	setupLog.Info("Starting manager")

@@ -23,11 +23,15 @@ import (
 // lets the two copies drift apart again — it exercises the full condition-set/mode combinatorics
 // and asserts byte-for-byte identical results from both entry points.
 func TestSourcePodDeletionBlockReasonDelegatesToSourceTeardownBlockReason(t *testing.T) {
+	// ADR-0352 DR-3: ConditionServiceContinuityVerified is included so this test's
+	// combinatorics actually exercise the Strict-only veto at source_teardown.go:66-70 —
+	// without it, the drift guard never touches the new condition family at all.
 	allConditions := []string{
 		conditionDataplaneReachabilityVerified,
 		conditionTrafficVerified,
 		string(pmv1.ConditionTCPSequenceContinuityVerified),
 		string(pmv1.ConditionWorkloadLivenessVerified),
+		string(pmv1.ConditionServiceContinuityVerified),
 	}
 	modes := []pmv1.TCPPreservationMode{
 		pmv1.TCPPreservationModeStrict,
@@ -35,7 +39,7 @@ func TestSourcePodDeletionBlockReasonDelegatesToSourceTeardownBlockReason(t *tes
 		pmv1.TCPPreservationModeNone,
 	}
 
-	// Enumerate every subset of the 4 relevant conditions being True (16 combinations) x 3 modes.
+	// Enumerate every subset of the 5 relevant conditions being True (32 combinations) x 3 modes.
 	for mask := 0; mask < (1 << len(allConditions)); mask++ {
 		var conditions []metav1.Condition
 		for i, name := range allConditions {

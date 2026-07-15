@@ -225,6 +225,7 @@ func (r *PodMigrationReconciler) recordPhaseDecision(from, decided pmv1.Migratio
 // +kubebuilder:rbac:groups="",resources=pods/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
@@ -283,6 +284,39 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	} else {
 		return r.handleDeletion(deadline, pm)
+	}
+
+	// ADR-0012 / invariant #8 — AUTHORITATIVE completion-deadline primitive (single source-of-truth
+	// gate over the WHOLE phase machine). A live migration that never reaches a terminal phase is the
+	// exact forever-wedge invariant #8 forbids: the sprint46B3 live-proof cycle-2 migration wedged in
+	// phase=Verifying past the 120s cap with its finalizer intact and the namespace stuck Terminating
+	// (docs/sprints/sprint46B3/live-proof-c2-transcript.txt: DisengageHold→Verifying→…→watch rc=124 at
+	// 125s, MIG1_FINAL_PHASE=Verifying), because NO phase on that path enforced a wall-clock terminal
+	// bound. The pre-existing bound in reconcileServiceVerifying is phase-LOCAL and never runs here —
+	// the live Strict path (fresh CRs) is DisengageHold→TCPVerifying→ServiceVerifying
+	// (reconcileServiceVerifying); DisengageHold→Verifying (reconcileVerifying) is the
+	// LEGACY backward-compat topology for pre-existing CRs (ADR-0352).
+	// Stamping the same deadline check into every phase handler is the brittle-chain anti-pattern
+	// (invariant #10). Instead enforce it ONCE, at the dispatch, keyed on the CR's OWN source of truth:
+	// creationTimestamp + spec.completionTimeoutSeconds — values already on the object, NOT an inferred
+	// or polled timer. The per-reconcile context.WithTimeout at :250 only bounds downstream RPCs; every
+	// requeue derives a fresh timer, so it can never advance the CR to a terminal phase on its own. If a
+	// NON-terminal, non-rolling-back migration has burned its entire declared completion budget without
+	// reaching Complete, fail closed to RollingBack (source is never deleted — ADR-0012; the replacement
+	// pod is torn down by the rollback path). This BOUNDS the wedge to a terminal decision; it does NOT
+	// itself establish dataplane reachability — that remains the authoritative substrate gate. Guarded
+	// on a non-zero creationTimestamp so it is inert for unit CRs that carry none.
+	if !pm.CreationTimestamp.IsZero() && !isTerminalOrRollingBackPhase(pm.Status.Phase) {
+		budgetSecs := pm.Spec.CompletionTimeoutSeconds
+		if budgetSecs <= 0 {
+			budgetSecs = 600
+		}
+		if time.Now().After(pm.CreationTimestamp.Add(time.Duration(budgetSecs) * time.Second)) {
+			log.Error(nil, "completion budget exceeded before reaching a terminal phase — failing closed to RollingBack (invariant #8; source never deleted, ADR-0012)",
+				"migration", pm.Name, "phase", pm.Status.Phase, "budgetSeconds", budgetSecs)
+			return r.initiateRollback(deadline, pm,
+				fmt.Sprintf("completion budget (%ds) exceeded before reaching a terminal phase (invariant #8); failing closed to rollback rather than wedging past the cap (source never deleted — ADR-0012)", budgetSecs))
+		}
 	}
 
 	switch pm.Status.Phase {
@@ -944,79 +978,44 @@ func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm 
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseTCPVerifying)
 	}
 
-	// ConfirmOverlayReady (post-restore pass, M22): call the destination agent with
-	// restore_complete=true to evaluate all 6 ADR-0049 barrier predicates before
-	// DisarmZeroWindow. Sets OverlayReady=True only when all predicates pass (ADR-0049).
+	// OverlayReady post-restore gate — ADR-0352 / invariant #10 (primitives over brittle chains).
+	// The ADR-0049 6-predicate atomicity barrier is NOT re-derived here by re-issuing a live
+	// ConfirmOverlayReady RPC to the destination agent. Every predicate the post-restore pass
+	// would check has already been written to CR status as a source-of-truth condition by an
+	// upstream phase, and the pure read of those write-backs IS the primitive:
+	//   B/C/D (PM_SEQ_XLAT seeded + AF_BRIDGE/AF_INET FDB confirmed on the destination) and the
+	//     destination-conntrack axis of E  ->  VXLANFDBUpdated=True (reconcileOverlayHandoff,
+	//     pre-restore pass; the RPC already ran once there and recorded the result).
+	//   E source-conntrack axis (deferred pre-restore per ADR-0049 §gate20)  ->
+	//     Status.SourceConntrackArmed (written by reconcileZeroWindowArm).
+	//   F (CRIU restore complete)  ->  Restored=True (reconcileRestoreSocketReattach).
+	// Re-deriving this via a remote RPC that can transiently fail (agent-connection blip, netlink
+	// re-probe, status-update conflict) is the brittle chain that wedged the live redis Strict
+	// migration at phase=DisengageHold for the full 120s cap in sprint46B4 live-proof cycle 2:
+	// the barrier's own inputs were already True in status (VXLANFDBUpdated=True, Restored=True,
+	// SourceConntrackArmed=true — see live-proof-c2-transcript.txt) while the re-check requeued
+	// every 5s and never advanced. Read the write-backs directly; fail CLOSED to rollback if an
+	// upstream invariant is somehow absent (these conditions gate entry to this phase, so their
+	// absence is a real defect, never a wait condition — infinite requeue would trip invariant #8).
 	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionOverlayReady) {
-		if r.AgentPool == nil {
-			log.Error(nil, "DisengageHold: AgentPool not wired for ConfirmOverlayReady — requeuing",
-				"migration", pm.Name)
-			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
-		}
-		destNode := pm.Status.DestinationNodeName
-		if destNode == "" && pm.Spec.TargetNodeName != "" {
-			destNode = pm.Spec.TargetNodeName
-		}
-		if destNode == "" {
-			log.Error(nil, "DisengageHold: DestinationNodeName not set for ConfirmOverlayReady — requeuing",
-				"migration", pm.Name)
-			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
-		}
-		destAgentForConfirm, destAgentErr := r.AgentPool.ForNode(ctx, destNode)
-		if destAgentErr != nil {
-			log.Error(destAgentErr, "DisengageHold: cannot connect to destination agent for ConfirmOverlayReady — requeuing",
-				"migration", pm.Name, "node", destNode)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-
-		// ADR-0192 R2 B2c: pass empty FdbIfname — delegate to agent VXLAN discovery. No "flannel.1" literal.
-		fdbIfname := pm.Status.OverlayFdbIfname
-		// fdbIfname may be "" — intentional; agent discovers at runtime.
-		// Vacuously true when no TCP connections exist (same fix as OverlayHandoff B5).
-		seqXlatSeeded := true
-
-		log.Info("DisengageHold: calling ConfirmOverlayReady on destination agent (post-restore, all 6 predicates)",
-			"migration", pm.Name, "node", destNode)
-		overlayResp, overlayErr := destAgentForConfirm.ConfirmOverlayReady(ctx, &agentpb.ConfirmOverlayReadyRequest{
-			MigrationName: pm.Name,
-			SeqXlatSeeded: seqXlatSeeded,
-			FdbIfname:     fdbIfname,
-			PodIp:         pm.Spec.SourcePodIP,
-			PodMac:        pm.Status.SourcePodMac,
-			// VtepIp intentionally omitted: the destination agent resolves its local
-			// VTEP IP from FdbIfname at call time (avoids conflating MAC with IP).
-			SourceConntrackArmed: pm.Status.SourceConntrackArmed,
-			RestoreComplete:      true,  // CRIU restore succeeded before this phase
-			PreRestore:           false, // post-restore pass: enforce all six predicates (gate20)
-			SourceClockNs:        pm.Status.SourceFreezeTimestampNs,
-		})
-		if overlayErr != nil {
-			log.Error(overlayErr, "DisengageHold: ConfirmOverlayReady RPC failed — requeuing",
-				"migration", pm.Name)
-			setCondition(pm, pmv1.ConditionOverlayReady, metav1.ConditionFalse,
-				"RPCFailed", fmt.Sprintf("ConfirmOverlayReady (post-restore) RPC error: %v", overlayErr))
+		fdbConfirmed := meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionVXLANFDBUpdated)
+		restoreComplete := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionRestored)
+		if !fdbConfirmed || !restoreComplete || !pm.Status.SourceConntrackArmed {
+			msg := fmt.Sprintf("post-restore overlay barrier inputs not all present in status: "+
+				"VXLANFDBUpdated=%v Restored=%v SourceConntrackArmed=%v (ADR-0049 predicates B–F) — failing closed",
+				fdbConfirmed, restoreComplete, pm.Status.SourceConntrackArmed)
+			log.Error(nil, "DisengageHold: "+msg, "migration", pm.Name)
+			setCondition(pm, pmv1.ConditionOverlayReady, metav1.ConditionFalse, "BarrierInputsAbsent", msg)
 			if sErr := r.statusUpdate(ctx, pm); sErr != nil {
 				return ctrl.Result{}, sErr
 			}
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			return r.initiateRollback(ctx, pm, msg)
 		}
-		if !overlayResp.Ready {
-			log.Error(nil, "DisengageHold: ConfirmOverlayReady returned ready=false (6-predicate barrier not met) — requeuing",
-				"migration", pm.Name, "reason", overlayResp.BlockingReason)
-			setCondition(pm, pmv1.ConditionOverlayReady, metav1.ConditionFalse,
-				"BarrierNotMet", fmt.Sprintf("ConfirmOverlayReady: %s", overlayResp.BlockingReason))
-			if sErr := r.statusUpdate(ctx, pm); sErr != nil {
-				return ctrl.Result{}, sErr
-			}
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-
-		overlayMsg := fmt.Sprintf("All ADR-0049 predicates satisfied on destination node %s; "+
-			"predB=%v predC=%v predD=%v predE=%v predF=%v ts_delta=%d (ADR-0049)",
-			destNode, overlayResp.PredicateBOk, overlayResp.PredicateCOk, overlayResp.PredicateDOk,
-			overlayResp.PredicateEOk, overlayResp.PredicateFOk, overlayResp.TsDelta)
-		log.Info("DisengageHold: ConfirmOverlayReady — all predicates satisfied", "migration", pm.Name,
-			"tsDelta", overlayResp.TsDelta)
+		overlayMsg := "All ADR-0049 barrier predicates satisfied from source-of-truth status " +
+			"write-backs (VXLANFDBUpdated=B/C/D+dest-E, SourceConntrackArmed=source-E, Restored=F); " +
+			"post-restore live re-probe RPC retired per invariant #10 (ADR-0352)"
+		log.Info("DisengageHold: overlay ready from status conditions — no live re-probe (ADR-0352)",
+			"migration", pm.Name)
 		setCondition(pm, pmv1.ConditionOverlayReady, metav1.ConditionTrue, "AllPredicatesMet", overlayMsg)
 		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
 			return ctrl.Result{}, sErr
@@ -1251,6 +1250,53 @@ func (r *PodMigrationReconciler) reconcileTCPVerifying(ctx context.Context, pm *
 		}
 	}
 
+	// ADR-0352 B8-DR-2 / D6(i) / DR-23 — Strict NON-VACUITY guard (source-of-truth read, not
+	// inferred continuity). Under Strict, preserving active TCP connections IS the guarantee.
+	// VerifyTCP legitimately returns Verified=true with ConnectionsExpected=0 for the STATELESS
+	// fast path (server.go: no source SeqSnapshots AND no destination ESTABLISHED sockets). For
+	// None/BestEffort that is a real pass. For STRICT it is a VACUOUS proof: measuredSeqDelta==0
+	// is trivially true over ZERO connections and proves nothing about connection preservation —
+	// exactly the "0/0 connections" completion the sprint46B re-author declared a hard FAIL. The
+	// gate previously inferred continuity from the trivially-true seq_delta and never read the
+	// authoritative connection count; this reads vtcpResp.ConnectionsExpected/ConnectionsVerified
+	// directly and FAILS CLOSED, so a Strict migration that preserved zero connections can never
+	// reach Complete and the source pod is never deleted on a vacuous proof (ADR-0012 / source
+	// pod never deleted until the guarantee is verified). This is a mode-specific POLICY and
+	// belongs in the controller, which knows PreservationMode — not in the mode-agnostic VerifyTCP
+	// RPC, which correctly reports the count as an honest fact.
+	if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict {
+		if vtcpResp.ConnectionsExpected <= 0 || vtcpResp.ConnectionsVerified != vtcpResp.ConnectionsExpected {
+			msg := fmt.Sprintf("ADR-0352 B8-DR-2: Strict mode requires a non-vacuous held-connection proof "+
+				"(ConnectionsExpected>0 AND ConnectionsVerified==ConnectionsExpected) but VerifyTCP returned "+
+				"verified=%d/expected=%d — a 0/0 (or sentinel) completion is a vacuous proof (D6(i)/DR-23) that "+
+				"cannot verify TCP continuity; failing closed",
+				vtcpResp.ConnectionsVerified, vtcpResp.ConnectionsExpected)
+			log.Error(nil, msg, "migration", pm.Name)
+			setCondition(pm, pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionFalse,
+				"VacuousTCPProof", msg)
+			if err := r.statusUpdate(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+			return r.initiateRollback(ctx, pm, msg)
+		}
+		// The application-probe result was previously computed but never gated (decorative). When a
+		// probe IS configured, its outcome is authoritative liveness evidence for the held connection
+		// and must be OK for a Strict pass; a probe-less Strict migration is not forced to invent one.
+		if pm.Spec.ApplicationProbe != nil && !vtcpResp.AppProbeOk {
+			msg := fmt.Sprintf("ADR-0352 B8-DR-2: Strict mode with a configured %s application probe requires "+
+				"AppProbeOk=true but VerifyTCP returned AppProbeOk=false (%s) — the held connection is not "+
+				"provably alive post-restore; failing closed",
+				pm.Spec.ApplicationProbe.Protocol, vtcpResp.AppProbeError)
+			log.Error(nil, msg, "migration", pm.Name)
+			setCondition(pm, pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionFalse,
+				"AppProbeFailed", msg)
+			if err := r.statusUpdate(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+			return r.initiateRollback(ctx, pm, msg)
+		}
+	}
+
 	// All connections verified.
 	// NOTE: We do NOT retroactively set RelayProgramsLoaded or ZeroWindowArmed here.
 	// VerifyTCP only reads /proc/<pid>/net/tcp[6] and compares snd_nxt/rcv_nxt — it does NOT
@@ -1298,6 +1344,28 @@ func (r *PodMigrationReconciler) reconcileTCPVerifying(ctx context.Context, pm *
 		return r.initiateRollback(ctx, pm, msg)
 	}
 
+	// ADR-0352 B8-DR-2 / D6(i) / DR-23 — NON-VACUITY GATE (invariant #10 substrate primitive).
+	// Fail CLOSED under Strict when VerifyTCP certified success over ZERO held connections. A 0/0
+	// result (the agent stateless fast-path, internal/agent/server/server.go:7580-7589) cannot
+	// distinguish a genuinely-preserved flow from a frozen-dead one — seq_delta==0 is trivially
+	// true over zero connections — yet TCPSequenceContinuityVerified=True is a REQUIRED Strict
+	// source-teardown predicate (api/v1alpha1/source_teardown.go:80-84), so certifying it here
+	// would authorise deleting the source on a proof of nothing (invariant #1). This reads the
+	// agent's source-of-truth held-connection count (ConnectionsExpected) DIRECTLY, so no routing
+	// or harness gap — e.g. a DisengageHold-skipped, still-frozen held socket (:3415-3428) — can
+	// slip a vacuous pass through; the gate fails closed on the count itself, not on control-flow
+	// reachability. No-op for BestEffort/None, which legitimately preserve nothing.
+	if reason := strictTCPContinuityVacuityReason(pm.Spec.TCPPreservationMode, vtcpResp); reason != "" {
+		msg := fmt.Sprintf("ADR-0352 DR-23 non-vacuity gate: %s — refusing to certify TCPSequenceContinuityVerified; rolling back rather than tearing down the source on a vacuous proof", reason)
+		log.Error(nil, msg, "migration", pm.Name)
+		setCondition(pm, pmv1.ConditionTCPSequenceContinuityVerified, metav1.ConditionFalse,
+			"VacuousZeroConnectionProof", msg)
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
+		return r.initiateRollback(ctx, pm, msg)
+	}
+
 	connMsg := fmt.Sprintf("TCP sequence continuity verified: %d/%d connections snd_nxt/rcv_nxt within ±MSS (ADR-0210 measured seq_delta: snd=%d rcv=%d)",
 		vtcpResp.ConnectionsVerified, vtcpResp.ConnectionsExpected, vtcpResp.SndSeqDeltaMax, vtcpResp.RcvSeqDeltaMax)
 	if vtcpResp.AppProbeOk {
@@ -1312,6 +1380,36 @@ func (r *PodMigrationReconciler) reconcileTCPVerifying(ctx context.Context, pm *
 		return ctrl.Result{}, err
 	}
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseServiceVerifying)
+}
+
+// strictTCPContinuityVacuityReason implements the ADR-0352 B8-DR-2 / D6(i) / DR-23 NON-VACUITY
+// primitive as a PURE, source-of-truth predicate (invariant #10: an authoritative read that fails
+// closed, not a control-flow/harness inference). A SUCCESSFUL VerifyTCP response (Verified=true)
+// can still be VACUOUS under Strict: the agent stateless fast-path
+// (internal/agent/server/server.go:7580-7589) returns Verified=true with ConnectionsExpected=0
+// when ZERO ESTABLISHED connections were snapshotted at the source freeze. seq_delta==0 is then
+// trivially true over zero connections and proves NOTHING about the Strict connection-preservation
+// guarantee, yet TCPSequenceContinuityVerified=True is a REQUIRED Strict source-teardown predicate
+// (api/v1alpha1/source_teardown.go:80-84) — so a 0/0 pass authorises deleting the source on a proof
+// of nothing (the frozen-held-socket / cycle-2 "0/0 connections" vacuity described at
+// podmigration_controller.go:3415-3428 and declared a FAIL by DR-23).
+//
+// ConnectionsExpected is the source-of-truth count of live connections snapshotted at freeze
+// (server.go:7659 = len(sourceSnaps)); reading it directly IS the primitive. Returns a non-empty
+// reason ONLY for Strict with a non-positive held-connection count. BestEffort/None legitimately
+// preserve nothing, so they are never vacuous here. (ConnectionsVerified==ConnectionsExpected and
+// seq_delta==0 are already enforced upstream: any unmatched 4-tuple or over-MSS drift sets
+// Verified=false at server.go:7666, and Strict rolls back on any non-zero delta at the seq_delta
+// gate above.)
+func strictTCPContinuityVacuityReason(mode pmv1.TCPPreservationMode, vtcpResp *agentpb.VerifyTCPResponse) string {
+	if mode != pmv1.TCPPreservationModeStrict {
+		return ""
+	}
+	if vtcpResp.GetConnectionsExpected() > 0 {
+		return ""
+	}
+	return fmt.Sprintf("Strict requires >=1 preserved TCP connection but VerifyTCP reported ConnectionsExpected=%d ConnectionsVerified=%d (vacuous 0/0 proof)",
+		vtcpResp.GetConnectionsExpected(), vtcpResp.GetConnectionsVerified())
 }
 
 // resolveProbeProtocol (ADR-0325) is a PURE, controller-local helper. If spec.applicationProbe
@@ -1579,6 +1677,12 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 		}
 	}
 
+	// ADR-0352 D0.1: WorkloadLivenessVerified has just been (re-)established above (or was
+	// already True) — this is the ADR-specified landing point: both convergence signals
+	// (liveness + CRIURestoreConfirmed) are simultaneously observable here for the first
+	// time this reconcile. Warn-only / idempotent — see markDestinationReadyIfConverged.
+	r.markDestinationReadyIfConverged(ctx, pm, destPodIP)
+
 	// ADR-0210 + ADR-0325: advance only when the AUTHORITATIVE cross-node
 	// DataplaneReachabilityVerified is True AND (no known protocol OR WorkloadLivenessVerified
 	// is True). Textual placement alone is insufficient — the guard condition itself gates on
@@ -1592,10 +1696,62 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 	// current IP (ADR-0325). Advance when the workload is verified alive on the new IP (or no
 	// known protocol resolved, in which case transport-only verification applies). Strict and
 	// BestEffort are unchanged: they still require the old-IP DataplaneReachabilityVerified gate.
+	//
+	// ADR-0352 D3: the two pod-IP-preservation inference producers
+	// (tryEstablishCiliumDataplaneReachability, verifyDataplaneReachability — reached via
+	// injectIPHandoff) are RETIRED from the Strict completion path. They could never
+	// converge on some substrates (the never-converging Cilium-ipcache wedge the ADR-0352
+	// Context documents), which is exactly the invariant-#10 brittle chain this ADR
+	// replaces. D1's establishServiceContinuity (EndpointSlice-Ready enrollment + real
+	// ClusterIP round-trip, both source-of-truth reads) is the replacement primitive — not
+	// a stacked fallback tier. BestEffort/None are unaffected: their teardown gate remains
+	// TrafficVerified via the service-path verifier below, and the legacy DataplaneReachability-
+	// Verified veto (source_teardown.go D2.2b) still protects them via reconcileVerifying.
+	//
+	// ADR-0352 D4: the completion-deadline backstop's STRUCTURE is preserved byte-for-byte
+	// from the retired ADR-0210 block — only the condition identifier changed
+	// (DataplaneReachabilityVerified -> ServiceContinuityVerified) and the producer call
+	// (injectIPHandoff -> establishServiceContinuity). Invariant #8 terminal bound
+	// (fail-closed, source-of-truth deadline): without it the migration requeues here
+	// forever once 2/3 of spec.completionTimeoutSeconds has elapsed since creation without
+	// ServiceContinuityVerified converging — fail closed to RollingBack rather than wedging
+	// past the 120s cap (source never deleted — ADR-0012).
+	if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict &&
+		!meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionServiceContinuityVerified) {
+		budgetSecs := pm.Spec.CompletionTimeoutSeconds
+		if budgetSecs <= 0 {
+			budgetSecs = 600
+		}
+		reachDeadline := pm.CreationTimestamp.Add(time.Duration(budgetSecs) * time.Second * 2 / 3)
+		if !pm.CreationTimestamp.IsZero() && time.Now().After(reachDeadline) {
+			log.Error(nil, "ServiceVerifying: ServiceContinuityVerified (ADR-0352 Service-continuity gate) not established within completion budget — failing closed to RollingBack (source never deleted, ADR-0012)",
+				"migration", pm.Name, "budgetSeconds", budgetSecs)
+			setCondition(pm, pmv1.ConditionServiceContinuityVerified, metav1.ConditionFalse, "ServiceContinuityDeadlineExceeded",
+				fmt.Sprintf("ADR-0352: ServiceContinuityVerified not established within %ds completion budget; failing closed to rollback rather than wedging past the cap (source never deleted — ADR-0012)", budgetSecs))
+			if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+				return ctrl.Result{}, sErr
+			}
+			return r.initiateRollback(ctx, pm, "ServiceContinuityVerified (ADR-0352) not established within completion budget")
+		}
+		if res, err, done := r.establishServiceContinuity(ctx, pm, destPodIP); !done {
+			return res, err
+		}
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	noneMode := pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeNone
 	livenessOK := probeProtocol == "" || meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionWorkloadLivenessVerified)
+
 	if noneMode {
 		if livenessOK {
+			return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
+		}
+	} else if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict {
+		// ADR-0352 D2.1: Strict now advances on ServiceContinuityVerified, not the retired
+		// DataplaneReachabilityVerified.
+		if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionServiceContinuityVerified) && livenessOK {
 			return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
 		}
 	} else if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionDataplaneReachabilityVerified) && livenessOK {
@@ -1684,6 +1840,22 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 		cniPlugin,
 	).Set(seqDelta)
 
+	// ADR-0352 D4 (re-pointed, structure unchanged from the retired ADR-0210 guard). The
+	// service-path verifier above establishes TrafficVerified, which is a sufficient
+	// teardown gate for BestEffort/None but NOT for Strict, whose SourceTeardownBlockReason
+	// gate requires ServiceContinuityVerified=True (D2.1). Strict must reach CutoverComplete
+	// ONLY through the authoritative gate above (the `ServiceContinuityVerified && livenessOK`
+	// branch); advancing here on TrafficVerified alone is the exact bypass that wedged the
+	// live redis Strict migration at CutoverComplete previously. The producer above normally
+	// makes this unreachable for Strict (it exits once the gate converges, or holds until it
+	// does); this guard fail-closes the residual edge — hold in ServiceVerifying (bounded
+	// requeue; source never deleted — ADR-0012) rather than cutting over unproven.
+	if strictMode && !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionServiceContinuityVerified) {
+		log.Info("ServiceVerifying: Strict — holding until ServiceContinuityVerified (ADR-0352 Service-continuity gate) is established; not advancing to CutoverComplete on TrafficVerified alone",
+			"migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
 }
 
@@ -1711,7 +1883,7 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 // (internal/controller/adr0344_restore_source_storage_test.go /
 // internal/agent/traffic/remove_source_if_verified_test.go) asserts the two entry points agree.
 // The predicate is:
-//   - Strict:      DataplaneReachabilityVerified=True (ADR-0210 cross-node gate) AND
+//   - Strict:      ServiceContinuityVerified=True (ADR-0352 Service-continuity gate) AND
 //                  TCPSequenceContinuityVerified=True.
 //   - BestEffort:  TrafficVerified=True AND TCPSequenceContinuityVerified=True.
 //   - None:        TrafficVerified=True (legacy cold/stateless pre-check), AND
@@ -2866,12 +3038,42 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 		return r.failMigration(ctx, pm, condFailed.Message)
 	}
 
-	// Operator-driven path (NS#3): replacement pod was created by the operator, and the
-	// NRI StartContainer hook handles CRIU restore when containerd starts the container.
-	// Do NOT call the Restore RPC — that would conflict with the NRI hook (two simultaneous
-	// CRIU restores into the same namespace). Instead, wait for the replacement pod to
-	// become Running (which means NRI fired and CRIU restore succeeded).
-	if pm.Status.ReplacementPodName != "" {
+	// Operator-driven path (NS#3): the replacement pod was created by the operator and the
+	// NRI StartContainer hook drives CRIU restore when containerd starts the replacement
+	// pod's holder container — that hook carries the AUTHORITATIVE pod-sandbox netns straight
+	// from the container-start event (pod.GetId()). Route to it here instead of the direct
+	// Restore RPC below: the direct path resolves the sandbox by racing `ctr` against
+	// containerd sandbox creation (agent resolvePodNetnsSandbox -> sandboxIDForPodUID) and,
+	// when it loses that race, fails closed at the ADR-0325 gate ("could not resolve
+	// replacement pod sandbox netns … no sandbox container found for pod uid <uid>"), marking
+	// the migration Failed in seconds — which then blocks the NRI hook, since it only restores
+	// while the CR is still in the Restoring phase. This is the exact live-proof-cycle1
+	// failure (pm-w2 agent log, 2026-07-13: sandboxIDForPodUID returned empty because the
+	// replacement pod's containerd sandbox was not yet created when the direct RPC fired).
+	//
+	// Decide NRI-vs-direct on the AUTHORITATIVE podmotion.io/migration-name label the
+	// controller stamps at replacement-pod creation (createReplacementPod), NOT on
+	// pm.Status.ReplacementPodName. The status mirror is routinely lost to the
+	// status-subresource clobber race (the same defect already fixed one phase later in
+	// reconcileTCPVerifying, ~L1189, and named in ADR-0349 D3): when it reads empty here even
+	// though the replacement pod exists, the old gate fell through to the sandbox-racing
+	// direct path. Reading the label is reading the source of truth directly rather than
+	// inferring the restore strategy from a flaky mirror (invariant #10 — primitive over
+	// brittle chain). Heal the mirror so reconcileRestoringNRI's by-name reads resolve.
+	replForRestore, resolveErr := r.resolveReplacementPodByLabel(ctx, pm)
+	if resolveErr != nil {
+		log.Info("reconcileRestoring: replacement-pod resolve errored — requeuing",
+			"migration", pm.Name, "resolveErr", resolveErr)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+	if replForRestore != nil {
+		if pm.Status.ReplacementPodName == "" {
+			pm.Status.ReplacementPodName = replForRestore.Name
+			if err := r.statusUpdate(ctx, pm); err != nil {
+				log.Error(err, "reconcileRestoring: failed to heal Status.ReplacementPodName — continuing",
+					"migration", pm.Name, "replacementPod", replForRestore.Name)
+			}
+		}
 		return r.reconcileRestoringNRI(ctx, pm)
 	}
 
@@ -2967,6 +3169,21 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 		DestNetnsFd:             pm.Status.DestNetnsPath,
 		TcpPreservationMode:     string(pm.Spec.TCPPreservationMode),
 	})
+	if err != nil && status.Code(err) == codes.Aborted {
+		// ADR-0353 R5/R6: this is reconcileRestoring's direct/primary Restore RPC call site — the
+		// second reachable caller of the gRPC Restore RPC (the resolve-race fall-through documented
+		// above, :2949-2951: this path only runs when resolveReplacementPodByLabel found no
+		// replacement pod yet, so it can race the NRI async restore already driving CRIU on a
+		// replacement pod that in fact exists/is starting). codes.Aborted means another owner (the
+		// NRI async restore) currently holds the ADR-0353 single-owner in-flight claim for this
+		// migration. TRANSIENT — the in-flight restore may still confirm. Do NOT mark RestoreFailed,
+		// do NOT initiate rollback, do NOT touch checkpoint images (still owned by the in-flight
+		// restore) — just requeue and let the criuRestoreConfirmed poll (reconcileRestoringNRI /
+		// the :3247 branch) continue observing the in-flight owner's eventual confirm.
+		log.Info("reconcileRestoring: gRPC Restore declined — another restore owner holds the in-flight claim (ADR-0353), requeuing",
+			"migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
 	if err != nil || (restoreResp != nil && !restoreResp.Success) {
 		msg := "restore RPC failed"
 		if err != nil {
@@ -3206,6 +3423,17 @@ func (r *PodMigrationReconciler) reconcileRestoringNRI(ctx context.Context, pm *
 				TcpPreservationMode: string(pm.Spec.TCPPreservationMode),
 			})
 			if restoreErr != nil {
+				if status.Code(restoreErr) == codes.Aborted {
+					// ADR-0353 R5/R6: another owner (the NRI async restore) currently holds the
+					// single-owner in-flight claim for this migration. TRANSIENT — the in-flight
+					// restore may still confirm. Do NOT mark RestoreFailed, do NOT initiate
+					// rollback, do NOT touch checkpoint images (still owned by the in-flight
+					// restore) — just requeue and let the existing criuRestoreConfirmed poll
+					// above continue observing the in-flight owner's eventual confirm.
+					log.Info("NRI fallback: gRPC Restore declined — another restore owner holds the in-flight claim (ADR-0353), requeuing",
+						"migration", pm.Name)
+					return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+				}
 				log.Error(restoreErr, "NRI fallback: agent Restore RPC failed", "migration", pm.Name)
 				setCondition(pm, conditionRestored, metav1.ConditionFalse, "RestoreFailed",
 					fmt.Sprintf("agent Restore RPC failed: %v", restoreErr))
@@ -3275,6 +3503,30 @@ func (r *PodMigrationReconciler) reconcileRestoringNRI(ctx context.Context, pm *
 
 	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
+	}
+	// ADR-0352 B8-D1/B8-D2 (round-2 correction): a Strict CR routes onto the authoritative
+	// DisengageHold -> TCPVerifying -> ServiceVerifying spine instead of the legacy 8-phase
+	// Verifying tail (W1/W2). Round-1 targeted MigrationPhaseTCPVerifying directly, which
+	// DIVERGED from reconcileRestoreSocketReattach's post-delegate override target
+	// (MigrationPhaseDisengageHold, :953-954): on a freshly-created CR the override fires in
+	// the same reconcile and wins, but a process exit between this write and the override's
+	// write durably persists phase=TCPVerifying. On restart the phase switch dispatches
+	// straight to reconcileTCPVerifying, BYPASSING reconcileDisengageHold — the only phase
+	// that disarms the source zero-window hold (DisarmZeroWindow, :1045) and enforces the
+	// ADR-0049 overlay barrier — so VerifyTCP measures a still-frozen socket, seq_delta==0
+	// vacuously satisfies the Strict gate, and Strict reaches Complete with the hold never
+	// disarmed (invariant #1 violation via source_teardown.go's missing ZeroWindowDisarmed
+	// predicate). Targeting MigrationPhaseDisengageHold instead converges BOTH cases (override
+	// fires / override skipped by crash) on the disarm barrier: reconcileDisengageHold is
+	// idempotent (:965-967 fast-paths straight to TCPVerifying once RelayProgramsLoaded=True,
+	// so this costs nothing on the normal fresh-CR path) and still closes W1/W2 — its own
+	// terminal transition (:1109) reaches TCPVerifying, which is the real
+	// TCPSequenceContinuityVerified producer (:1229/:1308) B8-D2 required. Routing to
+	// ServiceVerifying would remain INSUFFICIENT for the same reason B8-D2 already rejected it:
+	// its advance primitive (:1652-1657) reads ServiceContinuityVerified, never produces
+	// TCPSequenceContinuityVerified.
+	if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict {
+		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseDisengageHold)
 	}
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseVerifying)
 }
@@ -3944,48 +4196,104 @@ func (r *PodMigrationReconciler) injectIPHandoff(ctx context.Context, pm *pmv1.P
 	setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "HandoffInstalled",
 		fmt.Sprintf("OLD pod IP %s installed at replacement pod (ADR-0210 non-gating pre-check)", pm.Spec.SourcePodIP))
 
-	// ADR-0210: authoritative cross-node reachability. The CONTROLLER drives a nonce round-trip:
-	// (1) ask the DEST agent to open an in-netns echo listener bound to the preserved IP,
-	// (2) ask a SOURCE-node agent (node != dest) to dial it cross-node and read the nonce back.
-	// DataplaneReachabilityVerified is set True ONLY on a matched nonce — the source agent
-	// cannot synthesize success, and the IP-handoff alone cannot fake an off-node datapath.
-	// ADR-0322: on a Cilium destination, DataplaneReachabilityVerified must not be
-	// credited until cilium-agent has actually programmed the migrated identity into
-	// ipcache (CiliumEndpoint status.state=="ready" && status.identity.id!=0) — NOT
-	// merely pod-IP assignment. Fail-closed: an unresolved/empty CNI signal on what
-	// must be treated as a Cilium-capable dest, a lookup error, or not-yet-ready all
-	// block here with the same (ctrl.Result, error, false) requeue shape used above
-	// for the replVethMAC wait.
+	// Cross-node dataplane reachability of the preserved IP — the Strict source-teardown gate
+	// (api/v1alpha1/source_teardown.go: DataplaneReachabilityVerified=True). On a Cilium
+	// cross-node destination this is established from cilium-agent's authoritative CiliumEndpoint
+	// status (tryEstablishCiliumDataplaneReachability); same-node/non-Cilium fall back to the
+	// ADR-0210 producer below.
+	if res, err, done, handled := r.tryEstablishCiliumDataplaneReachability(ctx, pm, destNode); handled {
+		if !done {
+			return res, err, false
+		}
+		return ctrl.Result{}, nil, true
+	}
+
+	// Same-node (ADR-0237 vacuous) or non-Cilium destination: fall back to the ADR-0210 producer.
+	if res, err, done := r.verifyDataplaneReachability(ctx, pm, destNode); !done {
+		return res, err, false
+	}
+	return ctrl.Result{}, nil, true
+}
+
+// tryEstablishCiliumDataplaneReachability establishes the Strict cross-node source-teardown gate
+// (DataplaneReachabilityVerified) from cilium-agent's AUTHORITATIVE CiliumEndpoint status instead
+// of the ADR-0210 source-node nonce round-trip.
+//
+// SUBSTRATE ROOT CAUSE (sprint46B2, decoded from source — see docs/sprints/sprint46B2/
+// live-proof-cycle2.md): the ADR-0210 producer establishes the condition with a nonce round-trip
+// dialed FROM the source-node agent (ProbeDataplaneReachability, server.go: net.Dialer.DialContext
+// + `ip route get`) TO the preserved IP. But ADR-0012 holds the SOURCE pod alive on the SOURCE
+// node with that exact IP until this very condition is True, so on the source node the preserved
+// IP resolves to the still-alive LOCAL held pod (Cilium endpointRoutes installs a /32 to the local
+// lxc veth), NOT across the geneve overlay to the destination. The dial is delivered locally to the
+// old pod (which is not the nonce echo listener), the round-trip can NEVER match, and the migration
+// wedges at CutoverComplete forever (invariant #8 breach). This is structurally identical to the
+// ADR-0237 same-node deadlock — the source-node vantage is blind to cross-node reachability of an
+// IP it still hosts locally. It is not KVM flakiness; the ADR-0210 loopback corpus cannot exhibit it.
+//
+// FIX (invariant #10 / SUBSTRATE-PRIMITIVE BIAS: read the authoritative write-back, retire the
+// inference chain). On a Cilium destination doing a CROSS-node migration, establish the gate from
+// cilium-agent's OWN CiliumEndpoint status — the source of truth that the preserved IP has been
+// programmed onto the replacement endpoint on the destination node (state=ready, identity!=0, AND
+// status.networking.addressing advertises the preserved IP). cilium-agent is the sole writer
+// (un-synthesizable by our agents — the same anti-spoof property the nonce round-trip reached for)
+// and the read is not confounded by the held source pod. This ELEVATES the ADR-0322 primitive to be
+// the gate producer and RETIRES the ADR-0210 source-node probe on this path.
+//
+// Returns handled=false ONLY for a same-node or non-Cilium destination, signalling the caller to
+// fall back to verifyDataplaneReachability (same-node vacuous per ADR-0237; non-Cilium nonce
+// round-trip — the source-node-vantage limitation applies to a per-CNI Calico read as follow-up).
+// When handled=true the caller must honor (res,err,done): done=true means the gate was set True;
+// done=false means fail-closed (condition set False, requeue, source held per ADR-0012).
+func (r *PodMigrationReconciler) tryEstablishCiliumDataplaneReachability(ctx context.Context, pm *pmv1.PodMigration, destNode string) (ctrl.Result, error, bool, bool) {
+	log := logf.FromContext(ctx)
+
 	cniPlugin, cniErr := r.resolveDestCNIPlugin(ctx, destNode)
 	if cniErr != nil {
 		log.Error(cniErr, "injectIPHandoff: ADR-0322 unable to resolve destination CNI plugin — blocking (fail-closed)", "migration", pm.Name)
 		setCondition(pm, pmv1.ConditionDataplaneReachabilityVerified, metav1.ConditionFalse, pmv1.ReasonCNISignalUnresolved,
 			fmt.Sprintf("destNMC fetch error for node %s: %v", destNode, cniErr))
 		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
-			return ctrl.Result{}, sErr, false
+			return ctrl.Result{}, sErr, false, true
 		}
-		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil, false
-	}
-	if strings.Contains(strings.ToLower(cniPlugin), "cilium") {
-		ch := &iphandoff.CiliumHandoff{DynamicClient: r.DynamicClient}
-		if ceErr := ch.WaitForCiliumEndpointReady(ctx, pm.Spec.PodNamespace, pm.Status.ReplacementPodName); ceErr != nil {
-			reason := pmv1.ReasonCiliumEndpointNotReady
-			if strings.Contains(ceErr.Error(), "lookup error") {
-				reason = pmv1.ReasonCiliumEndpointLookupError
-			}
-			log.Error(ceErr, "injectIPHandoff: ADR-0322 CiliumEndpoint not ready — blocking (fail-closed)", "migration", pm.Name)
-			setCondition(pm, pmv1.ConditionDataplaneReachabilityVerified, metav1.ConditionFalse, reason, ceErr.Error())
-			if sErr := r.statusUpdate(ctx, pm); sErr != nil {
-				return ctrl.Result{}, sErr, false
-			}
-			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil, false
-		}
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil, false, true
 	}
 
-	if res, err, done := r.verifyDataplaneReachability(ctx, pm, destNode); !done {
-		return res, err, false
+	crossNode := pm.Status.SourceNodeName != "" && pm.Status.SourceNodeName != destNode
+	if !crossNode || !strings.Contains(strings.ToLower(cniPlugin), "cilium") {
+		// Same-node or non-Cilium: caller falls back to verifyDataplaneReachability.
+		return ctrl.Result{}, nil, false, false
 	}
-	return ctrl.Result{}, nil, true
+
+	ch := &iphandoff.CiliumHandoff{DynamicClient: r.DynamicClient}
+	node, ceErr := ch.ConfirmEndpointOwnsPreservedIP(ctx, pm.Spec.PodNamespace, pm.Status.ReplacementPodName, pm.Spec.SourcePodIP)
+	if ceErr != nil {
+		reason := pmv1.ReasonCiliumEndpointNotReady
+		switch {
+		case strings.Contains(ceErr.Error(), "lookup error"):
+			reason = pmv1.ReasonCiliumEndpointLookupError
+		case strings.Contains(ceErr.Error(), "does not advertise preserved IP"):
+			reason = pmv1.ReasonPreservedIPNotOnEndpoint
+		}
+		log.Error(ceErr, "injectIPHandoff: ADR-0322 authoritative CiliumEndpoint read did not confirm preserved IP on destination endpoint — blocking (fail-closed)", "migration", pm.Name, "reason", reason)
+		setCondition(pm, pmv1.ConditionDataplaneReachabilityVerified, metav1.ConditionFalse, reason, ceErr.Error())
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr, false, true
+		}
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil, false, true
+	}
+
+	// Authoritative source-of-truth read succeeded: cilium-agent programmed the preserved IP onto
+	// the replacement endpoint on the destination node. No source-node probe (retired).
+	log.Info("injectIPHandoff: cross-node DataplaneReachability established from authoritative CiliumEndpoint status (ADR-0322 primitive; ADR-0210 source-node probe retired)",
+		"migration", pm.Name, "preservedIP", pm.Spec.SourcePodIP, "endpointNode", node)
+	setCondition(pm, pmv1.ConditionDataplaneReachabilityVerified, metav1.ConditionTrue, pmv1.ReasonCiliumDataplaneProgrammed,
+		fmt.Sprintf("cilium-agent programmed preserved IP %s onto replacement endpoint %s on node %s (authoritative CiliumEndpoint read; ADR-0322 primitive, ADR-0210 source-node nonce round-trip retired — structurally blind while source held per ADR-0012)",
+			pm.Spec.SourcePodIP, pm.Status.ReplacementPodName, node))
+	if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+		return ctrl.Result{}, sErr, false, true
+	}
+	return ctrl.Result{}, nil, true, true
 }
 
 // verifyDataplaneReachability performs the ADR-0210 cross-node nonce round-trip and sets
@@ -4114,6 +4422,28 @@ func (r *PodMigrationReconciler) verifyDataplaneReachability(ctx context.Context
 func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	// ADR-0352 B8-D3 (round-2 correction): a Strict CR reaching this legacy 8-phase completion
+	// tail (a pre-existing CR already persisted at phase=Verifying, or a crash/restart in the
+	// narrow window between reconcileRestoringNRI's DisengageHold-targeted write and
+	// reconcileRestoreSocketReattach's :953-954 override — see this ADR's Context
+	// "Composed-flow reachability") hands off to the authoritative
+	// DisengageHold -> TCPVerifying -> ServiceVerifying spine instead of running the retired
+	// parallel completion below. Round-1 handed off directly to MigrationPhaseTCPVerifying,
+	// which for THIS population is not a divergence-on-crash race (there is no downstream
+	// override here) but the SAME underlying defect: a CR entering here has never traversed
+	// reconcileDisengageHold, so it can reach TCPVerifying with the source zero-window hold
+	// still armed and the ADR-0049 overlay barrier unchecked, letting VerifyTCP vacuously
+	// satisfy seq_delta==0 against a frozen socket (invariant #1). Handing off to
+	// MigrationPhaseDisengageHold instead routes through the one phase that disarms the hold
+	// (DisarmZeroWindow, :1045) before ever reaching TCPVerifying (:1109 terminal transition)
+	// — reconcileDisengageHold is idempotent if the hold was already disarmed by an earlier
+	// pass. This still closes W1 (the gateTrueLegacy skip that never set TrafficVerified) and
+	// W2 (the missing TCPSequenceContinuityVerified producer) as ONE fix — replace the
+	// divergent tail, do not patch it (invariant #10).
+	if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict {
+		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseDisengageHold)
+	}
+
 	// the traffic reviewer drives readiness + traffic verification. Watches TrafficVerified.
 	// ADR-0019: if verification fails AFTER handoff, warn only — do not rollback.
 	trafficVerified := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionTrafficVerified)
@@ -4123,6 +4453,10 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 		// and BEFORE TrafficVerified is set / source is disarmed/cleaned. The reachability
 		// probe (Decision 5) gates TrafficVerified for the directly-pinned pod-IP client;
 		// the service-path TrafficVerifier remains as the L4/Service backstop below.
+		// ADR-0352 B8-D3: Strict never reaches this point (handed off at the top of the
+		// function), so the injectIPHandoff / establishServiceContinuity fork this comment
+		// used to describe is retired — only BestEffort/None reach here now, byte-identical
+		// to their pre-fix behavior (B8-DR-7).
 		if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionIPHandoffInjected) {
 			if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeNone {
 				setCondition(pm, conditionIPHandoffInjected, metav1.ConditionTrue, "Skipped",
@@ -4138,13 +4472,15 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 		}
 
 		// Drive verification: call the TrafficVerifier and set the condition.
-		// ADR-0210: the short-circuit now keys on the AUTHORITATIVE cross-node gate
-		// (DataplaneReachabilityVerified), not the demoted TrafficVerified self-probe. The
-		// service-path verifier is skipped only when the cross-node nonce round-trip has
-		// already proven the OLD pod IP reachable off-node — the strongest proof.
-		if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionDataplaneReachabilityVerified) {
-			log.Info("Verifying: DataplaneReachabilityVerified set by ADR-0210 cross-node probe — skipping service-path verifier",
-				"migration", pm.Name)
+		// ADR-0352 B8-D3: the Strict/ServiceContinuityVerified fork this comment used to
+		// describe is retired — Strict is handed off at the top of the function, so this
+		// gate is now unconditionally the legacy DataplaneReachabilityVerified cross-node
+		// gate (D2.2b — preserved verbatim for BestEffort/None).
+		gateSatisfiedLegacy := conditionDataplaneReachabilityVerified
+		gateTrueLegacy := meta.IsStatusConditionTrue(pm.Status.Conditions, conditionDataplaneReachabilityVerified)
+		if gateTrueLegacy {
+			log.Info("Verifying: authoritative reachability gate set — skipping service-path verifier",
+				"migration", pm.Name, "gate", gateSatisfiedLegacy)
 		} else if r.TrafficVerifier != nil {
 			// Build verify request with correct pod names and IPs.
 			destPodName := pm.Status.ReplacementPodName
@@ -4182,6 +4518,11 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 			// Verifier returned nil — traffic is genuinely confirmed.
 			setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "TrafficVerified",
 				"Traffic verified by TrafficVerifier")
+			// ADR-0352 B8-D5 (3a): this log used to fire unconditionally after the
+			// gateTrueLegacy/TrafficVerifier/else chain, including on the gateTrueLegacy skip
+			// branch that never set TrafficVerified=True. Moved into the branch that actually
+			// sets it True so the log claim matches the write it describes.
+			log.Info("Verifying: TrafficVerified set — requeueing for source pod deletion", "migration", pm.Name)
 		} else {
 			// ADR-0012: no verifier wired — cannot confirm traffic; do NOT promote to True.
 			// Requeue and wait for a verifier to be wired, or for an operator to intervene.
@@ -4199,7 +4540,6 @@ func (r *PodMigrationReconciler) reconcileVerifying(ctx context.Context, pm *pmv
 		// Requeue immediately so the next pass starts from etcd (TrafficVerified=True)
 		// and proceeds to source pod deletion. Status updates do not self-trigger the
 		// controller watch, so an explicit requeue is required here.
-		log.Info("Verifying: TrafficVerified set — requeueing for source pod deletion", "migration", pm.Name)
 		return ctrl.Result{Requeue: true}, nil
 	}
 
@@ -4445,7 +4785,9 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 
 	// Delete the replacement pod first — before rolling back the source — so there is
 	// never a window where both pods are running and matching Service selectors.
-	r.deleteReplacementPod(ctx, pm)
+	// ADR-0350 D1: capture the reaped UIDs — this is the source-of-truth handoff consumed
+	// below by ensureReplacementEndpointsRemoved. Never re-resolved after this point.
+	reapedPods := r.deleteReplacementPod(ctx, pm)
 
 	// ADR-0344 Decision A.2: for Tier0 (RWX) migrations, the frozen source process
 	// must not be resumed (SIGCONT'd) until its storage has been confirmed writable
@@ -4545,8 +4887,36 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 		// When CheckpointRef.Name is empty there is no MCP CR to advance (failure before checkpoint).
 	}
 
+	// ADR-0350 D1/D2: gate RolledBack=True on confirmed replacement-endpoint absence. Placed
+	// here — after Rollbacker.Rollback has resumed the source, immediately before the 4548-4549
+	// mutation — so the synchronous EndpointSlice round-trip is paid only on the path that
+	// actually publishes RolledBack, and the pod Delete above has had the maximum possible
+	// window to acquire its deletionTimestamp before the CAS runs (S-REORDER safety margin).
+	if ok, mode, ensErr := r.ensureReplacementEndpointsRemoved(ctx, pm, reapedPods); !ok {
+		reason := "ReplacementEndpointRemovalContended"
+		if mode == "undeletable" {
+			reason = "ReplacementPodUndeletable"
+		}
+		msg := fmt.Sprintf("replacement endpoint removal not confirmed (mode=%s): %v", mode, ensErr)
+		setCondition(pm, pmv1.ConditionReplacementEndpointsRemoved, metav1.ConditionFalse, reason, msg)
+		pmmetrics.ReplacementEndpointRemovalExhaustedTotal.WithLabelValues(pm.Name, pm.Namespace, reason).Inc()
+		if r.Recorder != nil {
+			r.Recorder.Eventf(pm, corev1.EventTypeWarning, "ReplacementEndpointRemovalExhausted",
+				"replacement endpoint removal exhausted its retry budget for migration %s (mode=%s); RolledBack withheld",
+				pm.Name, mode)
+		}
+		if ensErr != nil {
+			log.Error(ensErr, "reconcileRollingBack: ensureReplacementEndpointsRemoved did not confirm absence — withholding RolledBack and requeuing (ADR-0350 D2/D3)",
+				"migration", pm.Name, "mode", mode)
+		}
+		// Fail-closed: do NOT set Phase=Failed or RolledBack=True. Persist the False signal and
+		// requeue so the next reconcile re-runs the idempotent removal from a fresh read.
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, r.statusUpdate(ctx, pm)
+	}
+	setCondition(pm, pmv1.ConditionReplacementEndpointsRemoved, metav1.ConditionTrue, "ReplacementEndpointsAbsent", "")
+
 	pm.Status.Phase = pmv1.MigrationPhaseFailed
-	setCondition(pm, "RolledBack", metav1.ConditionTrue, "RollbackComplete", "Source pod restored to live state")
+	setCondition(pm, pmv1.ConditionRolledBack, metav1.ConditionTrue, "RollbackComplete", "Source pod restored to live state")
 	// M26: emit flow_loss counter at Failed (all TCP connections inventoried are treated as lost).
 	pmmetrics.MigrationFlowLossTotal.WithLabelValues(pm.Name, pm.Namespace).Add(
 		float64(len(pm.Status.TCPSeqSnapshots)),
@@ -4776,7 +5146,7 @@ func (r *PodMigrationReconciler) failMigration(ctx context.Context, pm *pmv1.Pod
 		fresh.Status.Phase = pmv1.MigrationPhaseFailed
 		now := metav1.Now()
 		fresh.Status.CompletionTime = &now
-		setCondition(fresh, "Failed", metav1.ConditionTrue, "MigrationFailed", reason)
+		setCondition(fresh, pmv1.ConditionFailed, metav1.ConditionTrue, "MigrationFailed", reason)
 		return r.Status().Update(ctx, fresh)
 	})
 	return ctrl.Result{}, err
@@ -4785,6 +5155,20 @@ func (r *PodMigrationReconciler) failMigration(ctx context.Context, pm *pmv1.Pod
 func (r *PodMigrationReconciler) initiateRollback(ctx context.Context, pm *pmv1.PodMigration, reason string) (ctrl.Result, error) {
 	setCondition(pm, "RollbackReason", metav1.ConditionTrue, "Initiating", reason)
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRollingBack)
+}
+
+// isTerminalOrRollingBackPhase reports whether a phase is a terminal outcome or already on the
+// rollback path. The top-level completion-deadline primitive (Reconcile) must NOT re-fire on these:
+// firing on RollingBack would loop the rollback it just initiated, and firing on Complete/Failed/
+// DryRunComplete would fight the terminal-outcome handlers (ADR-0244 IP-reclaim sweep).
+func isTerminalOrRollingBackPhase(p pmv1.MigrationPhase) bool {
+	switch p {
+	case pmv1.MigrationPhaseComplete, pmv1.MigrationPhaseFailed,
+		pmv1.MigrationPhaseRollingBack, pmv1.MigrationPhaseDryRunComplete:
+		return true
+	default:
+		return false
+	}
 }
 
 // isFrozenWithoutRestore detects the crash-safety condition from ADR-0018:
@@ -5791,7 +6175,16 @@ func (r *PodMigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // reaped, so a stale prior-attempt replacement pod cannot linger as a second split-brain
 // endpoint either. Best-effort throughout: a resolution/list error is logged and MUST NOT
 // block the ADR-0012-critical source rollback that follows this call.
-func (r *PodMigrationReconciler) deleteReplacementPod(ctx context.Context, pm *pmv1.PodMigration) {
+//
+// ADR-0350 D1: returns the reaped pods' UIDs plus a per-UID deleteConfirmed flag, captured at
+// the point of deletion from the full pod objects this function already resolves and holds
+// (toDelete). This is the ONLY change to this function — the resolution/reaping/best-effort
+// logic above stays byte-for-byte. The caller (ensureReplacementEndpointsRemoved) consumes this
+// return value directly and MUST NOT re-List/re-resolve the reaped pods after this call
+// returns: replacement pods carry no finalizer, so a post-delete re-resolution races their
+// disappearance and can return empty — reintroducing the losable-mirror inference this ADR
+// retires (invariant #10).
+func (r *PodMigrationReconciler) deleteReplacementPod(ctx context.Context, pm *pmv1.PodMigration) []reapedReplacementPod {
 	log := logf.FromContext(ctx)
 
 	// Source-of-truth resolution: every pod carrying this migration's label.
@@ -5832,17 +6225,100 @@ func (r *PodMigrationReconciler) deleteReplacementPod(ctx context.Context, pm *p
 	}
 
 	if len(toDelete) == 0 {
-		return // nothing was ever created for this migration, or it is already reaped
+		return nil // nothing was ever created for this migration, or it is already reaped
 	}
 
+	reaped := make([]reapedReplacementPod, 0, len(toDelete))
 	for name, pod := range toDelete {
+		confirmed := true
 		if deleteErr := r.Delete(ctx, pod); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+			confirmed = false
 			log.Error(deleteErr, "deleteReplacementPod: delete failed — manual cleanup may be required",
 				"migration", pm.Name, "pod", name)
 		} else {
 			log.Info("deleted replacement pod on rollback/failure", "migration", pm.Name, "pod", name)
 		}
+		reaped = append(reaped, reapedReplacementPod{uid: pod.UID, deleteConfirmed: confirmed})
 	}
+	return reaped
+}
+
+// reapedReplacementPod is deleteReplacementPod's per-pod outcome, handed to
+// ensureReplacementEndpointsRemoved as the source-of-truth UID set (ADR-0350 D1 — never
+// re-resolved after the delete; replacement pods carry no finalizer, so a post-delete List
+// races their disappearance).
+type reapedReplacementPod struct {
+	uid             types.UID
+	deleteConfirmed bool // true iff r.Delete returned nil or NotFound
+}
+
+// ensureReplacementEndpointsRemoved is the ADR-0350 D1.2/D1.3/D3 happens-before primitive: it
+// removes every reaped replacement pod's endpoint from all EndpointSlices in
+// pm.Spec.PodNamespace via a bounded, operator-performed compare-and-set (never inferring kube's
+// async EndpointSlice controller has converged — the retired brittle chain), then confirms
+// absence. reaped is deleteReplacementPod's return value; the UIDs are never re-resolved here
+// (D1's UID-handoff — a post-delete List/resolveReplacementPodByLabel call would race the pods'
+// finalizer-less disappearance).
+//
+// Returns ok=true only when absence is confirmed durable (including the trivial case of no
+// reaped pods). Returns ok=false, mode="undeletable" if any reaped pod's delete was not
+// confirmed (deleteConfirmed=false — a stuck finalizer/rejecting webhook; the actionable case),
+// else mode="contended" (transient EndpointSlice CAS contention exhausted the retry budget). The
+// caller (reconcileRollingBack) is responsible for the D6 signal (condition/metric/event) and
+// for withholding RolledBack=True on ok=false — this function never falls through to any
+// inferred/async mechanism itself (invariant #10).
+func (r *PodMigrationReconciler) ensureReplacementEndpointsRemoved(ctx context.Context, pm *pmv1.PodMigration, reaped []reapedReplacementPod) (ok bool, mode string, err error) {
+	if len(reaped) == 0 {
+		return true, "", nil
+	}
+
+	uids := make(map[types.UID]bool, len(reaped))
+	anyUnconfirmed := false
+	for _, rp := range reaped {
+		uids[rp.uid] = true
+		if !rp.deleteConfirmed {
+			anyUnconfirmed = true
+		}
+	}
+
+	// Removal is attempted for ALL reaped UIDs regardless of deleteConfirmed (D1: the flag does
+	// not gate whether removal is attempted) — a confirmed pod's endpoint should still be
+	// cleaned up even in a mixed reap batch.
+	esMgr := traffic.NewEndpointSliceManager(r.Client)
+	if _, remErr := esMgr.RemoveByTargetRefUIDs(ctx, pm.Spec.PodNamespace, uids); remErr != nil {
+		if anyUnconfirmed {
+			return false, "undeletable", remErr
+		}
+		return false, "contended", remErr
+	}
+
+	still, checkErr := esMgr.HasAnyTargetRefUID(ctx, pm.Spec.PodNamespace, uids)
+	if checkErr != nil {
+		if anyUnconfirmed {
+			return false, "undeletable", checkErr
+		}
+		return false, "contended", checkErr
+	}
+	if still {
+		// Removal reported success but a fresh read still finds a match — treat as exhaustion
+		// under the same mode split (should be rare; RemoveByTargetRefUIDs already re-confirms
+		// per-slice inside its own CAS loop, but D1.3 is the independent write-then-verify read).
+		if anyUnconfirmed {
+			return false, "undeletable", nil
+		}
+		return false, "contended", nil
+	}
+
+	// S-UNDELETABLE (arch_b): a reaped pod whose delete was not confirmed is still Running and
+	// selector-matched, so kube's own EndpointSlice controller will re-materialize its endpoint
+	// on its very next sync (S-REORDER) — an unwinnable CAS loop this reconcile's momentary
+	// absence read cannot certify as durable. Do NOT trust a transient confirm here: treat any
+	// unconfirmed delete as a decisive fail-closed exhaustion, not an inferred/hoped-for
+	// convergence (invariant #10 — this is the primitive's own known-fact read, not a poll).
+	if anyUnconfirmed {
+		return false, "undeletable", nil
+	}
+	return true, "", nil
 }
 
 // preCopyDirtyConvergence returns the dirty-page convergence ratio [0.0, 1.0] based on

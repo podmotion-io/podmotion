@@ -19,45 +19,18 @@ package server
 
 import (
 	"context"
-	"os"
-	"path/filepath"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
 	"github.com/podmotion-io/podmotion/internal/agent/network"
 )
 
-// TestFinalizeNetnsPath_MigrationBindReturnsPmdst0Ifname asserts that when a
-// PrepareDestinationNetns bind mount is recorded for a migration, finalizeNetnsPath returns
-// that path AND the "pmdst0" interface name — not "eth0".
-func TestFinalizeNetnsPath_MigrationBindReturnsPmdst0Ifname(t *testing.T) {
-	s := New("test-node", &criu.StubCheckpointer{}, nil)
-
-	// A real, on-disk path so the os.Stat gate in finalizeNetnsPath passes (the branch
-	// returns "" if the bind does not exist).
-	dir := t.TempDir()
-	bindPath := filepath.Join(dir, "bind")
-	if err := os.WriteFile(bindPath, []byte("nsfs-bind-placeholder"), 0o600); err != nil {
-		t.Fatalf("seed bind file: %v", err)
-	}
-
-	const migration = "redis-live-migration"
-	s.destMigrationNetnsMu.Lock()
-	s.destMigrationNetns[migration] = &network.MigrationNetns{NetnsPath: bindPath}
-	s.destMigrationNetnsMu.Unlock()
-
-	gotPath, gotIfname := s.finalizeNetnsPath(migration)
-	if gotPath != bindPath {
-		t.Errorf("finalizeNetnsPath path = %q, want %q", gotPath, bindPath)
-	}
-	if gotIfname != network.MigrationVethPeer {
-		t.Errorf("finalizeNetnsPath ifname = %q, want %q (migration netns holds only lo + %s, never eth0)",
-			gotIfname, network.MigrationVethPeer, network.MigrationVethPeer)
-	}
-	if gotIfname == "eth0" {
-		t.Fatal("finalizeNetnsPath returned eth0 for a migration-netns bind — this is the exact live bug (ip link show eth0 fails, MAC empty, Strict fail-closed)")
-	}
-}
+// TestFinalizeNetnsPath_MigrationBindReturnsPmdst0Ifname pinned the old Tier-2
+// (destMigrationNetns bind-mount fallback) that ADR-0349 R2 deletes — finalizeNetnsPath is now
+// Tier-1-only. DELETED atomically with the R2 change: the fallback tier it pinned no longer
+// exists, so keeping/weakening this test would silently re-legitimize it.
 
 // TestFinalizeNetnsPath_NoBindReturnsEth0 asserts the PID-fallback branch still names "eth0":
 // when no netns bind is available, finalizeRestore falls back to /proc/<pid>/ns/net, which IS
@@ -174,5 +147,79 @@ func TestFinalizeRestore_PassesIfnameToMACRead(t *testing.T) {
 	}
 	if gotIfname != network.MigrationVethPeer {
 		t.Errorf("MAC read ifname = %q, want %q (migration netns)", gotIfname, network.MigrationVethPeer)
+	}
+}
+
+// TestFinalizeRestore_WriteBack_CaptureLatchesValue_NoReReadOnReinvocation is the falsifiable
+// proof of the ADR-0349 security write-back (Security Reviewer, sprint46B2 validation cycle 1).
+// The live-proof (docs/sprints/sprint46B2/live-proof-cycle1.md) showed the controller re-invoked
+// Restore ~25 times over ~75s, each RE-READING eth0 against the recorded /var/run/netns/cni-<id>
+// bind handle via the broker's path-mode nsenter and getting empty — the invariant-#10 poll-and-hope
+// brittle chain the Security Reviewer rejected on. This test pins the fix: the AT-RESTORE capture
+// (captureRestoredVethMAC, invoked by joinNsRestore the instant CRIU brings the process up) reads
+// the MAC from the restored process's OWN netns (SrcPID — pid>0, netnsPath=="", NEVER the recorded
+// bind path) and WRITES IT BACK; every finalizeRestore thereafter (including the idempotent-confirm
+// re-invocations of the gRPC Restore RPC) serves the latched VALUE with ZERO further kernel reads.
+// Falsifiable: the spy fails any read the capture did not make, so a regression that re-reads the
+// recorded path in finalizeRestore blows the read count and fails the test.
+func TestFinalizeRestore_WriteBack_CaptureLatchesValue_NoReReadOnReinvocation(t *testing.T) {
+	const migration = "redis-live-strict-writeback"
+	const wantMAC = "aa:bb:cc:dd:ee:ff"
+
+	// Shrink the capture bounded wait so the happy path never sleeps.
+	ob, oi := restoredVethMACCaptureBudget, restoredVethMACCaptureInterval
+	restoredVethMACCaptureBudget, restoredVethMACCaptureInterval = 2*time.Second, time.Millisecond
+	defer func() { restoredVethMACCaptureBudget, restoredVethMACCaptureInterval = ob, oi }()
+
+	var reads int
+	var captureReadPID int
+	captureReadNetnsPath := "SENTINEL"
+	orig := readReplVethMACFn
+	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
+		reads++
+		if reads == 1 {
+			captureReadPID, captureReadNetnsPath = pid, netnsPath
+			return wantMAC, nil
+		}
+		// Any read AFTER the at-restore capture latched is precisely the recorded-path re-read the
+		// write-back retires (invariant #10) — fail it so a regression fails the test loudly.
+		return "", errors.New("stub: kernel re-read after the value was already captured and latched")
+	}
+	defer func() { readReplVethMACFn = orig }()
+
+	s := New("test-node", &criu.StubCheckpointer{}, nil)
+	// joinNsRestore recorded the authoritative pod-sandbox netns handle (ADR-0325 / R1) ...
+	storeResolvedNetnsPath(migration, "/var/run/netns/cni-writeback", "eth0")
+	// ... and, the instant CRIU brought the process up, captured the MAC from the process's OWN netns.
+	captureRestoredVethMAC(migration, 7777, "")
+
+	// The capture read the process's OWN netns by SrcPID (pid>0), NOT the recorded bind PATH — the
+	// bind-path read is the exact one that returned empty for ~75s on the live substrate.
+	if captureReadPID != 7777 {
+		t.Fatalf("capture read pid = %d, want 7777 — the MAC is captured from the restored process's OWN netns (SrcPID), not the recorded bind path", captureReadPID)
+	}
+	if captureReadNetnsPath != "" {
+		t.Fatalf("capture read netnsPath = %q, want \"\" — the capture MUST NOT re-enter the recorded bind path", captureReadNetnsPath)
+	}
+	// The value is written back into the record.
+	if got := s.resolvedNetnsMAC(migration); got != wantMAC {
+		t.Fatalf("resolvedNetnsMAC after capture = %q, want %q (write-back did not latch)", got, wantMAC)
+	}
+
+	netnsPath, ifname := s.finalizeNetnsPath(migration)
+
+	// Two finalizes (models the idempotent-confirm re-invocations of the gRPC Restore RPC): each
+	// serves the latched VALUE with NO kernel read (the spy fails any read after the capture).
+	for i := 1; i <= 2; i++ {
+		fr, err := s.finalizeRestore(context.Background(), 7777, netnsPath, ifname, migration, "", "Strict")
+		if err != nil {
+			t.Fatalf("finalizeRestore #%d re-read the recorded path instead of serving the latched value: %v", i, err)
+		}
+		if fr.mac != wantMAC {
+			t.Fatalf("finalizeRestore #%d mac = %q, want the latched %q", i, fr.mac, wantMAC)
+		}
+	}
+	if reads != 1 {
+		t.Fatalf("readReplVethMACFn called %d times, want exactly 1 (the at-restore capture) — finalizeRestore must serve the write-back, never re-read (invariant #10)", reads)
 	}
 }

@@ -248,10 +248,95 @@ func TestDialAllowed_FailsClosedWithNoK8sClient(t *testing.T) {
 	}
 }
 
+// --- SSRF allowlist source-of-truth: Cilium IPAM podCIDRs, not Node.Spec.PodCIDRs ---
+
+// TestParseCIDRAllowlist_AdmitsRealCiliumPodIPRefusesEverythingElse grounds the sprint46B7
+// Validation cycle-2 security-lens fix in LIVE cluster state (read 2026-07-14 from the standing
+// KVM cluster): Node.Spec.PodCIDRs and CiliumNode.spec.ipam.podCIDRs are PERMUTED on this Cilium
+// cluster-pool substrate — pm-w2's Node.Spec.PodCIDRs=10.244.2.0/24, but pm-w2's pods are actually
+// allocated from Cilium's 10.244.1.0/24 (the restored redis pod in the failing live proof held
+// 10.244.1.203). nodePodCIDRAllowlist now keys on the Cilium block, so parseCIDRAllowlist of that
+// block MUST admit the real pod IP and refuse both the wrong Node.Spec /24 and any non-pod IP
+// (SSRF containment preserved). Derived from real cluster state, not an injected equality.
+func TestParseCIDRAllowlist_AdmitsRealCiliumPodIPRefusesEverythingElse(t *testing.T) {
+	// pm-w2's AUTHORITATIVE Cilium cluster-pool block (CiliumNode.spec.ipam.podCIDRs).
+	allow := parseCIDRAllowlist([]string{"10.244.1.0/24"})
+	if len(allow) != 1 {
+		t.Fatalf("parseCIDRAllowlist: expected 1 parsed CIDR, got %d", len(allow))
+	}
+	contains := func(ip string) bool {
+		parsed := net.ParseIP(ip)
+		for _, n := range allow {
+			if n.Contains(parsed) {
+				return true
+			}
+		}
+		return false
+	}
+	// The real restored-pod IP from the live proof — refused before this fix, must be admitted now.
+	if !contains("10.244.1.203") {
+		t.Fatalf("SSRF allowlist keyed on Cilium podCIDRs must ADMIT the real pm-w2 pod IP 10.244.1.203")
+	}
+	// The WRONG /24 Node.Spec.PodCIDRs named for pm-w2 — holds no real pods, must NOT be admitted.
+	if contains("10.244.2.203") {
+		t.Fatalf("SSRF allowlist must NOT admit 10.244.2.203 (pm-w2 Node.Spec /24 holds no Cilium-allocated pods)")
+	}
+	// Off-cluster / SSRF target — containment must hold.
+	if contains("8.8.8.8") {
+		t.Fatalf("SSRF allowlist must NEVER admit an off-cluster IP (containment bypass)")
+	}
+}
+
+// TestParseCIDRAllowlist_FailsClosedOnEmptyOrGarbage asserts the fail-CLOSED contract at the parse
+// layer: a nil/empty/unparsable podCIDRs list (absent or unreadable CiliumNode) yields an empty
+// allowlist so dialAllowed refuses every dial — never a Node.Spec.PodCIDRs fallback (invariant #10).
+func TestParseCIDRAllowlist_FailsClosedOnEmptyOrGarbage(t *testing.T) {
+	for _, in := range [][]string{nil, {}, {"not-a-cidr"}, {"10.244.1.5"}} {
+		if got := parseCIDRAllowlist(in); len(got) != 0 {
+			t.Fatalf("parseCIDRAllowlist(%v): expected empty (fail-closed) allowlist, got %d entries", in, len(got))
+		}
+	}
+}
+
 func TestDialAllowed_RejectsNonIPHost(t *testing.T) {
 	s := &AgentServer{}
 	err := s.dialAllowed(context.Background(), "not-an-ip:5432")
 	if err == nil {
 		t.Fatalf("dialAllowed: expected refusal for a non-IP host, got nil error")
+	}
+}
+
+// --- dialAllowedForServiceContinuity (ADR-0352 D1.2): scoped SSRF-allowlist variant ---
+
+// TestDialAllowedForServiceContinuity_PermitsExactExpectedClusterIP asserts the ADR-0352 D1.2
+// scoped-allowlist exception: an address outside the pod-CIDR allowlist (a Service ClusterIP,
+// e.g. 10.96.0.0/12) is permitted ONLY when it matches expectedClusterIP exactly.
+func TestDialAllowedForServiceContinuity_PermitsExactExpectedClusterIP(t *testing.T) {
+	s := &AgentServer{}
+	err := s.dialAllowedForServiceContinuity(context.Background(), "10.96.0.10:6379", "10.96.0.10")
+	if err != nil {
+		t.Fatalf("dialAllowedForServiceContinuity: expected the exact expected ClusterIP to be permitted, got: %v", err)
+	}
+}
+
+// TestDialAllowedForServiceContinuity_RefusesMismatchedAddress proves this is NOT a CIDR-range
+// widening: an address that does not equal expectedClusterIP (even a different Service CIDR IP)
+// is refused. The ADR-0325 SSRF containment property must survive for every non-exact address.
+func TestDialAllowedForServiceContinuity_RefusesMismatchedAddress(t *testing.T) {
+	s := &AgentServer{}
+	err := s.dialAllowedForServiceContinuity(context.Background(), "10.96.0.99:6379", "10.96.0.10")
+	if err == nil {
+		t.Fatalf("dialAllowedForServiceContinuity: expected refusal — address does not match expectedClusterIP (no CIDR-range widening permitted)")
+	}
+}
+
+// TestDialAllowedForServiceContinuity_RefusesWhenExpectedClusterIPEmpty proves the guard does
+// not silently degrade to "any address is fine" when the caller forgets to supply
+// expectedClusterIP — it must fail closed exactly like plain dialAllowed.
+func TestDialAllowedForServiceContinuity_RefusesWhenExpectedClusterIPEmpty(t *testing.T) {
+	s := &AgentServer{}
+	err := s.dialAllowedForServiceContinuity(context.Background(), "10.96.0.10:6379", "")
+	if err == nil {
+		t.Fatalf("dialAllowedForServiceContinuity: expected refusal when expectedClusterIP is empty (fail closed, no silent bypass)")
 	}
 }

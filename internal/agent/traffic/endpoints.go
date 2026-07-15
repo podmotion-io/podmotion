@@ -16,6 +16,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
@@ -144,6 +146,25 @@ func (m *EndpointSliceManager) HasEndpointForIP(ctx context.Context, namespace, 
 	return len(slices) > 0, nil
 }
 
+// ServiceNameForIP (ADR-0352 D1.2) returns the owning Service name for the EndpointSlice
+// containing ip, read via the standard discoveryv1.LabelServiceName label — the only
+// Service-linkage mechanism this codebase has (PodMigrationSpec carries no ServiceName
+// field, VERIFIED against api/v1alpha1/podmigration_types.go). Returns "" (not an error)
+// when no EndpointSlice with ip carries the label yet — the caller (controller) treats
+// that as "not yet resolvable" and requeues, exactly like any other convergent primitive.
+func (m *EndpointSliceManager) ServiceNameForIP(ctx context.Context, namespace, ip string) (string, error) {
+	slices, err := m.findSlicesWithIP(ctx, namespace, ip)
+	if err != nil {
+		return "", err
+	}
+	for _, sl := range slices {
+		if name := sl.Labels[discoveryv1.LabelServiceName]; name != "" {
+			return name, nil
+		}
+	}
+	return "", nil
+}
+
 func (m *EndpointSliceManager) findSlicesWithIP(ctx context.Context, namespace, ip string) ([]discoveryv1.EndpointSlice, error) {
 	list := &discoveryv1.EndpointSliceList{}
 	if err := m.client.List(ctx, list,
@@ -240,6 +261,95 @@ func (m *EndpointSliceManager) DrainSource(ctx context.Context, namespace, sourc
 		}
 	}
 	return nil
+}
+
+// RemoveByTargetRefUIDs removes, from every EndpointSlice in namespace, any endpoint whose
+// TargetRef.UID is in uids (ADR-0350 D1: the reaped replacement pods' UIDs, source of truth,
+// handed out of deleteReplacementPod's return value — never re-resolved here). UID-keyed, not
+// IP- or name-keyed: a same-named or same-IP successor pod must never be matched.
+//
+// Each per-slice write is a bounded compare-and-set: retry.RetryOnConflict(retry.DefaultRetry, …)
+// re-fetches and reapplies the filter on 409 (ADR-0350 D3). On retry-budget exhaustion for any
+// slice, this returns immediately with that slice's error — the caller (ensureReplacementEndpoints
+// Removed) is responsible for the D6 fail-closed signal and for withholding RolledBack=True; this
+// method does not itself fall back to any inferred/async mechanism (invariant #10).
+//
+// Idempotent: a UID already absent from a slice is a no-op for that slice (no write issued).
+func (m *EndpointSliceManager) RemoveByTargetRefUIDs(ctx context.Context, namespace string, uids map[types.UID]bool) (int, error) {
+	if len(uids) == 0 {
+		return 0, nil
+	}
+	list := &discoveryv1.EndpointSliceList{}
+	if err := m.client.List(ctx, list, client.InNamespace(namespace)); err != nil {
+		return 0, fmt.Errorf("listing EndpointSlices: %w", err)
+	}
+
+	updated := 0
+	for i := range list.Items {
+		name := list.Items[i].Name
+		if !sliceHasAnyTargetRefUID(&list.Items[i], uids) {
+			continue // cheap pre-check on the already-fetched list; avoids a wasted Get+CAS
+		}
+		wrote := false
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &discoveryv1.EndpointSlice{}
+			if err := m.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, fresh); err != nil {
+				return err
+			}
+			before := len(fresh.Endpoints)
+			fresh.Endpoints = filterEndpointsByTargetRefUID(fresh.Endpoints, uids)
+			if len(fresh.Endpoints) == before {
+				return nil // already absent by the time we re-fetched — idempotent no-op
+			}
+			wrote = true
+			return m.client.Update(ctx, fresh)
+		}); err != nil {
+			return updated, fmt.Errorf("removing reaped replacement UIDs from EndpointSlice %s: %w", name, err)
+		}
+		if wrote {
+			updated++
+		}
+	}
+	return updated, nil
+}
+
+// HasAnyTargetRefUID reports whether any EndpointSlice in namespace still carries an endpoint
+// whose TargetRef.UID is in uids (ADR-0350 D1.3 confirm-absence read — the write-then-verify
+// step, categorically different from inferring a peer controller's convergence).
+func (m *EndpointSliceManager) HasAnyTargetRefUID(ctx context.Context, namespace string, uids map[types.UID]bool) (bool, error) {
+	if len(uids) == 0 {
+		return false, nil
+	}
+	list := &discoveryv1.EndpointSliceList{}
+	if err := m.client.List(ctx, list, client.InNamespace(namespace)); err != nil {
+		return false, fmt.Errorf("listing EndpointSlices: %w", err)
+	}
+	for i := range list.Items {
+		if sliceHasAnyTargetRefUID(&list.Items[i], uids) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func sliceHasAnyTargetRefUID(sl *discoveryv1.EndpointSlice, uids map[types.UID]bool) bool {
+	for _, ep := range sl.Endpoints {
+		if ep.TargetRef != nil && uids[ep.TargetRef.UID] {
+			return true
+		}
+	}
+	return false
+}
+
+func filterEndpointsByTargetRefUID(eps []discoveryv1.Endpoint, uids map[types.UID]bool) []discoveryv1.Endpoint {
+	out := eps[:0]
+	for _, ep := range eps {
+		if ep.TargetRef != nil && uids[ep.TargetRef.UID] {
+			continue
+		}
+		out = append(out, ep)
+	}
+	return out
 }
 
 // NodeName sets the NodeName on the destination endpoint across all slices.
