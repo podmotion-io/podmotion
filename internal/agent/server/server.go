@@ -6421,22 +6421,28 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		}
 	}
 
-	// Resolve the container root PID from the pod UID stored during PrepareSource.
+	// Resolve the container root PID from the pod UID. The freshly-fetched CR's
+	// spec.SourcePodUID (fetched live above, not merely on restart) is authoritative — the
+	// in-memory map (written once by PrepareSource, never evicted mid-migration) is a fallback
+	// ONLY for when no k8sClient is wired (test/stub paths). CheckpointRequest carries no PodUid
+	// field of its own to prefer, unlike ArmZeroWindow/DisarmZeroWindow — the CR is the fresh
+	// source of truth here (sprint46B9 pre-work diagnosis).
 	s.migrationPodUIDMu.RLock()
-	podUID := s.migrationPodUID[req.MigrationName]
+	cachedPodUID := s.migrationPodUID[req.MigrationName]
 	s.migrationPodUIDMu.RUnlock()
-
-	// ADR-0118: if the in-memory map missed (e.g. the agent restarted between PrepareSource
-	// and Checkpoint), recover the pod UID from the CR's spec.sourcePodUID.
-	if podUID == "" && s.k8sClient != nil {
+	podUID := cachedPodUID
+	if s.k8sClient != nil {
 		if pm.Spec.SourcePodUID == "" {
 			return nil, fmt.Errorf("checkpoint: SourcePodUID is empty in CR — " +
 				"controller has not completed Validating yet")
 		}
-		log.Info("Checkpoint: podUID not in memory map — recovering from CR spec.sourcePodUID",
-			"migration", req.MigrationName, "uid", pm.Spec.SourcePodUID)
-		podUID = pm.Spec.SourcePodUID
-		// Repopulate the map so subsequent calls in this agent session skip the CR fallback.
+		var stale bool
+		podUID, stale = authoritativePodUID(cachedPodUID, pm.Spec.SourcePodUID)
+		if stale {
+			log.Info("Checkpoint: stale migrationPodUID cache detected — preferring fresh CR spec.SourcePodUID",
+				"migration", req.MigrationName, "cachedUID", cachedPodUID, "freshUID", pm.Spec.SourcePodUID)
+		}
+		// Repopulate the map so subsequent calls in this agent session see the current value.
 		s.migrationPodUIDMu.Lock()
 		s.migrationPodUID[req.MigrationName] = podUID
 		s.migrationPodUIDMu.Unlock()
@@ -7142,6 +7148,9 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 			s.destWorkloadImageMu.Lock()
 			delete(s.destWorkloadImage, req.MigrationName)
 			s.destWorkloadImageMu.Unlock()
+			s.destHostVethMu.Lock()
+			delete(s.destHostVeth, req.MigrationName)
+			s.destHostVethMu.Unlock()
 
 			restoreConfirmed = true
 			return &agentpb.RestoreResponse{Success: true}, nil
@@ -7338,6 +7347,9 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		s.destWorkloadImageMu.Lock()
 		delete(s.destWorkloadImage, req.MigrationName)
 		s.destWorkloadImageMu.Unlock()
+		s.destHostVethMu.Lock()
+		delete(s.destHostVeth, req.MigrationName)
+		s.destHostVethMu.Unlock()
 
 		restoreConfirmed = true
 		return &agentpb.RestoreResponse{
@@ -7441,6 +7453,9 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	s.destWorkloadImageMu.Lock()
 	delete(s.destWorkloadImage, req.MigrationName)
 	s.destWorkloadImageMu.Unlock()
+	s.destHostVethMu.Lock()
+	delete(s.destHostVeth, req.MigrationName)
+	s.destHostVethMu.Unlock()
 
 	restoreConfirmed = true
 	return &agentpb.RestoreResponse{
@@ -8046,6 +8061,22 @@ func (s *AgentServer) runAppProbe(ctx context.Context, req *agentpb.VerifyTCPReq
 func (s *AgentServer) Abort(_ context.Context, req *agentpb.AbortRequest) (*agentpb.AbortResponse, error) {
 	log.Info("Abort called", "migration", req.MigrationName, "reason", req.Reason)
 
+	// Evict this migration's source-side identity/state on the failure path — the mirror of
+	// DisarmZeroWindow's success-path eviction. Without this, a migration name reused after an
+	// abort (a retried CR, or a test harness) resolves stale state from the aborted attempt.
+	// pendingResumePIDs is included here too: its only other eviction site is deep inside a
+	// success-path branch (~server.go:2100), so an abort between Restore recording an entry and
+	// that branch running would otherwise leak it.
+	s.migrationPodUIDMu.Lock()
+	delete(s.migrationPodUID, req.MigrationName)
+	s.migrationPodUIDMu.Unlock()
+	s.migrationSeqSnapshotsMu.Lock()
+	delete(s.migrationSeqSnapshots, req.MigrationName)
+	s.migrationSeqSnapshotsMu.Unlock()
+	s.pendingResumePIDsMu.Lock()
+	delete(s.pendingResumePIDs, req.MigrationName)
+	s.pendingResumePIDsMu.Unlock()
+
 	// Thaw any frozen source PID before aborting CRIU. If LeaveStopped=true left the
 	// source process in SIGSTOP after a successful dump, the source must be SIGCONTed
 	// here so the workload resumes on the source node (ADR-0012 rollback atomicity).
@@ -8569,6 +8600,23 @@ func checksumDir(dir string) (string, int64) {
 // DisarmZeroWindow before the watchdog fires an emergency disarm.
 const zwWatchdogMargin = 500 * time.Millisecond
 
+// authoritativePodUID resolves the pod UID for a per-migration RPC, given the agent's
+// migrationPodUID cache and a freshly-resolved value from the caller (the controller's live pod
+// read on ArmZeroWindow/DisarmZeroWindow, or the freshly-fetched CR's spec.SourcePodUID on
+// Checkpoint). The fresh value always wins when non-empty: it reflects the CURRENT pod
+// incarnation, whereas the cache — written once by PrepareSource and never evicted mid-migration
+// — is a crash-recovery fallback only, and can be stale for a migration name reused across pod
+// incarnations (sprint46B9 pre-work diagnosis: a retried CR, or this repo's own live-proof test
+// harness, reusing one migration name across separate redis pods). Returns the UID to use and
+// whether a stale, disagreeing cache value was found, so the caller can log a diagnostic instead
+// of silently swapping.
+func authoritativePodUID(cachedUID, freshUID string) (podUID string, stale bool) {
+	if freshUID == "" {
+		return cachedUID, false
+	}
+	return freshUID, cachedUID != "" && cachedUID != freshUID
+}
+
 // ArmZeroWindow implements MigrationAgentServiceServer.ArmZeroWindow.
 // It polls tcpi_unacked==0 for all TCP sockets of the source pod before returning armed=true,
 // ensuring no in-flight bytes are in the send buffer when FinalFreeze fires (ADR-0049).
@@ -8577,11 +8625,20 @@ const zwWatchdogMargin = 500 * time.Millisecond
 func (s *AgentServer) ArmZeroWindow(ctx context.Context, req *agentpb.ArmZeroWindowRequest) (*agentpb.ArmZeroWindowResponse, error) {
 	log.Info("ArmZeroWindow: arming zero-window hold", "migration", req.MigrationName, "podUID", req.PodUid)
 
+	// The caller-supplied UID is authoritative: the controller resolves it fresh from the
+	// live source pod on every reconcile (podmigration_controller.go ~756-760). The cached
+	// migrationPodUID map (written once by PrepareSource, never evicted mid-migration) is a
+	// crash-recovery fallback ONLY — it must never override a fresh value the caller supplies,
+	// or a migration name reused across pod incarnations (a retried CR, or this repo's own
+	// live-proof test harness) resolves a dead PID left over from a prior incarnation instead
+	// of the live one (sprint46B9 pre-work diagnosis).
 	s.migrationPodUIDMu.RLock()
-	podUID := s.migrationPodUID[req.MigrationName]
+	cachedPodUID := s.migrationPodUID[req.MigrationName]
 	s.migrationPodUIDMu.RUnlock()
-	if podUID == "" && req.PodUid != "" {
-		podUID = req.PodUid
+	podUID, stale := authoritativePodUID(cachedPodUID, req.PodUid)
+	if stale {
+		log.Info("ArmZeroWindow: stale migrationPodUID cache detected — preferring fresh caller-supplied UID",
+			"migration", req.MigrationName, "cachedUID", cachedPodUID, "freshUID", req.PodUid)
 	}
 
 	// Resolve source pod veth ifindex. On darwin/stub resolveVethIfindex returns (0, nil).
@@ -8747,11 +8804,14 @@ func (s *AgentServer) DisarmZeroWindow(_ context.Context, req *agentpb.DisarmZer
 		}, nil
 	}
 
+	// See ArmZeroWindow: the caller-supplied UID must win over the cache for the same reason.
 	s.migrationPodUIDMu.RLock()
-	podUID := s.migrationPodUID[req.MigrationName]
+	cachedPodUID := s.migrationPodUID[req.MigrationName]
 	s.migrationPodUIDMu.RUnlock()
-	if podUID == "" {
-		podUID = req.PodUid
+	podUID, stale := authoritativePodUID(cachedPodUID, req.PodUid)
+	if stale {
+		log.Info("DisarmZeroWindow: stale migrationPodUID cache detected — preferring fresh caller-supplied UID",
+			"migration", req.MigrationName, "cachedUID", cachedPodUID, "freshUID", req.PodUid)
 	}
 
 	ifindex, err := resolveVethIfindex(podUID)
@@ -8788,6 +8848,19 @@ func (s *AgentServer) DisarmZeroWindow(_ context.Context, req *agentpb.DisarmZer
 	}
 	log.Info("DisarmZeroWindow: hold disarmed", "migration", req.MigrationName,
 		"holdDurationMs", holdMs, "disarmedAtNs", disarmedAtNs)
+
+	// DisarmZeroWindow is the last source-agent RPC that reads migrationPodUID /
+	// migrationSeqSnapshots in a successful migration — evict here, not on the
+	// destination-side Restore path (a different AgentServer process on a different node)
+	// and not on ReleaseCheckpoint (which fires earlier in this same migration, before this
+	// handler runs, and would delete the entry out from under this very read).
+	s.migrationPodUIDMu.Lock()
+	delete(s.migrationPodUID, req.MigrationName)
+	s.migrationPodUIDMu.Unlock()
+	s.migrationSeqSnapshotsMu.Lock()
+	delete(s.migrationSeqSnapshots, req.MigrationName)
+	s.migrationSeqSnapshotsMu.Unlock()
+
 	return &agentpb.DisarmZeroWindowResponse{
 		Disarmed:       true,
 		DisarmedAtNs:   disarmedAtNs,
