@@ -114,7 +114,7 @@ func TestReadRestoredPIDFromPidfile_NonPositivePIDRejected(t *testing.T) {
 	}
 }
 
-// TestReadRestoredPIDFromPidfile_ExitsFastOnProcessDeath is the brittle-chain-timeout
+// TestReadRestoredPIDFromPidfile_ExitsFastOnProcessDeath is the fast-fail-timeout
 // regression test: the pidfile
 // never appears AND the CRIU/wrapper process (per pollFn) has already exited. The loop must fail
 // immediately with ErrRestoredPIDNotFound rather than waiting out the full (here, long) backstop

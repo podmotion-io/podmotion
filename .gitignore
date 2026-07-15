@@ -140,3 +140,5 @@ docs/WORKSTREAM-*.md
 docs/design/PREAUTHOR-GATE-DEADEND-ANALYSIS.md
 docs/design/DEV-PHASE-INTERDEP-HARDENING.md
 docs/design/SPRINT-CONVERGENCE-POSTMORTEM.md
+docs/corveth.js
+docs/personas/k8s-oss-developer.md

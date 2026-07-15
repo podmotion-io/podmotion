@@ -18,6 +18,7 @@ rules:
   resources:
   - persistentvolumeclaims
   - resourcequotas
+  - services
   verbs:
   - get
   - list
@@ -130,6 +131,7 @@ rules:
   - cilium.io
   resources:
   - ciliumendpoints
+  - ciliumnodes
   verbs:
   - get
   - list

@@ -157,7 +157,7 @@ func TestAbortAtFreezeWindowResumesSourceAndNeverDeletesIt(t *testing.T) {
 	if fresh.Status.Phase != pmv1.MigrationPhaseFailed {
 		t.Errorf("abort at freeze window did not land Failed; got phase=%q", fresh.Status.Phase)
 	}
-	if !meta.IsStatusConditionTrue(fresh.Status.Conditions, "RolledBack") {
+	if !meta.IsStatusConditionTrue(fresh.Status.Conditions, pmv1.ConditionRolledBack) {
 		t.Errorf("RolledBack condition not set True after rollback — source-restored-to-live-state not recorded")
 	}
 	if meta.IsStatusConditionTrue(fresh.Status.Conditions, conditionTrafficVerified) {
