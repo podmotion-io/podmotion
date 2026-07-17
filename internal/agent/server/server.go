@@ -961,7 +961,7 @@ func (s *AgentServer) JoinNsRestore(migrationName, namespace, checkpointDir, ima
 		// enforceRestoreOrderingInvariant with deferResume=true: confirms SocketsLive but does
 		// NOT send SIGCONT. The restored tree stays in SIGSTOP; PID is recorded in
 		// pendingResumePIDs for InjectIPHandoff to fire SIGCONT after datapath confirmation.
-		_, resumedAt, orderErr := enforceRestoreOrderingInvariant(pid, migrationName, expectedSocketCount, true)
+		_, resumedAt, orderErr := enforceRestoreOrderingInvariant(joinNsRestoreCtx, pid, migrationName, expectedSocketCount, true)
 		if orderErr != nil {
 			log.Error(orderErr, "JoinNsRestore: ordering invariant FAILED — SIGCONT withheld; "+
 				"NRI callback will return error → containerd marks container failed → operator requeues (ADR-0144 NB-2)",
@@ -1255,8 +1255,8 @@ func (e *ReattachVolumeNotYetPublishedError) Error() string {
 // empty), the "never/label-missing" branch stays terminal: a HostTarget=="" mount is appended so
 // buildCRIURestoreArgs' guard (server.go ~3266) fails closed with "replacement pod not found by
 // label".
-func (s *AgentServer) resolveReattachMounts(migrationName string) ([]reattachMount, error) {
-	return s.resolveReattachMountsImpl(migrationName, false)
+func (s *AgentServer) resolveReattachMounts(ctx context.Context, migrationName string) ([]reattachMount, error) {
+	return s.resolveReattachMountsImpl(ctx, migrationName, false)
 }
 
 // pvcIsTier0RWX reports whether a PVC classifies as Tier0 (ReadWriteMany re-attach) storage — the
@@ -1282,11 +1282,17 @@ func pvcIsTier0RWX(pvc *corev1.PersistentVolumeClaim) bool {
 // returns the retryable sentinel for a not-yet-published volume) and reattachMountsUnresolvedForTerminal
 // (terminalOnBudget=true, promotes the not-yet mount to a HostTarget=="" entry so the terminal
 // buildCRIURestoreArgs guard fails closed once the wait budget is spent).
-func (s *AgentServer) resolveReattachMountsImpl(migrationName string, terminalOnBudget bool) ([]reattachMount, error) {
+//
+// ADR-0354 D2c: the host-target resolution below (resolveKubeletVolumeHostPath -> kubeletVolumeGlobFn
+// -> nsenterCmd) is a broker exec that funnels Client.do, so its ctx must derive from the caller's
+// real migration/restore ctx, never a fresh context.Background(). callerCtx is bounded here to the
+// existing 5s per-call ceiling via context.WithTimeout(callerCtx, 5*time.Second), which can only
+// TIGHTEN the effective budget (never widen it) — same clamp discipline as brokerExecBudget (D2).
+func (s *AgentServer) resolveReattachMountsImpl(callerCtx context.Context, migrationName string, terminalOnBudget bool) ([]reattachMount, error) {
 	if s.k8sClient == nil || migrationName == "" {
 		return nil, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(callerCtx, 5*time.Second)
 	defer cancel()
 
 	pm, ok := s.lookupPodMigration(ctx, migrationName)
@@ -1423,8 +1429,16 @@ func (s *AgentServer) resolveReattachMountsImpl(migrationName string, terminalOn
 // HostTarget=="" so buildCRIURestoreArgs' terminal guard fires with its actionable
 // "reattach host target unresolved" error (never the broken 1:1 map). Used only by
 // resolveReattachMountsWaiting on ctx expiry — the "never" branch.
-func (s *AgentServer) reattachMountsUnresolvedForTerminal(migrationName string) []reattachMount {
-	mounts, _ := s.resolveReattachMountsImpl(migrationName, true)
+//
+// ADR-0354 D3 pattern: this fires PRECISELY because the caller's forward ctx has already expired
+// (resolveReattachMountsWaiting's ctx.Done() branch), so resolveReattachMountsImpl's nsenterCmd-backed
+// host-target read must NOT be bound to that already-Done ctx (which would abort every broker exec
+// instantly and always resolve to HostTarget==""). Same primitive as the D3 rollback leg and the D2b
+// Signal() abort leg: sever cancellation from the expired forward deadline via context.WithoutCancel,
+// then re-bound with a small budget (the existing 5s ceiling resolveReattachMountsImpl already
+// applies) so a wedged broker exec on this terminal leg still cannot hang indefinitely.
+func (s *AgentServer) reattachMountsUnresolvedForTerminal(ctx context.Context, migrationName string) []reattachMount {
+	mounts, _ := s.resolveReattachMountsImpl(context.WithoutCancel(ctx), migrationName, true)
 	return mounts
 }
 
@@ -1434,7 +1448,7 @@ func (s *AgentServer) reattachMountsUnresolvedForTerminal(migrationName string) 
 // guard (buildCRIURestoreArgs refuses the broken 1:1 map when HostTarget=="").
 func (s *AgentServer) resolveReattachMountsWaiting(ctx context.Context, migrationName string) ([]reattachMount, error) {
 	for {
-		m, err := s.resolveReattachMounts(migrationName)
+		m, err := s.resolveReattachMounts(ctx, migrationName)
 		var notYet *ReattachVolumeNotYetPublishedError
 		if !errors.As(err, &notYet) {
 			return m, err // resolved, no-mounts, or a real error
@@ -1444,7 +1458,7 @@ func (s *AgentServer) resolveReattachMountsWaiting(ctx context.Context, migratio
 			// Budget spent: convert to the terminal path. Rebuild the mount list with the not-yet
 			// mount promoted to a HostTarget=="" entry so buildCRIURestoreArgs' existing guard
 			// fails closed (never the 1:1 map) with an actionable message.
-			return s.reattachMountsUnresolvedForTerminal(migrationName), nil
+			return s.reattachMountsUnresolvedForTerminal(ctx, migrationName), nil
 		case <-time.After(1 * time.Second):
 		}
 	}
@@ -4743,7 +4757,7 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 			// the recorded dataplane interface name ("eth0" for the pod sandbox netns), the SAME
 			// value captureRestoredVethMAC reads back — so the bind-prep uses one source of truth,
 			// never a fresh "eth0" literal (DR-4).
-			p, ifname, rerr := recordAuthoritativeRestoreNetns(context.Background(), migrationName, sandboxID)
+			p, ifname, rerr := recordAuthoritativeRestoreNetns(ctx, migrationName, sandboxID)
 			if rerr != nil {
 				return 0, nil, fmt.Errorf("resolve replacement pod sandbox netns: %w", rerr)
 			}
@@ -7619,7 +7633,16 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		}
 		s.destMigrationNetnsMu.Unlock()
 		if hasNs {
-			if teardownErr := network.TeardownMigrationNetns(context.Background(), ns); teardownErr != nil {
+			// ADR-0354 round-5 sweep: network.TeardownMigrationNetns -> netnsbroker.Client.Teardown
+			// funnels the same Client.do(ctx) as the other broker-exec surfaces (D5's predicate). This
+			// is a fail-closed rollback leg (restore-failure cleanup on the Restore RPC path, which DOES
+			// have a real caller ctx in scope at 7573), so it uses the D3 primitive — severed from the
+			// forward ctx (which may already be Done, the reason this leg is running) and hard-bounded
+			// by rollbackExecBudget — instead of an unbounded context.Background().
+			teardownCtx, teardownCancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackExecBudget)
+			teardownErr := network.TeardownMigrationNetns(teardownCtx, ns)
+			teardownCancel()
+			if teardownErr != nil {
 				log.Error(teardownErr, "GC-10: TeardownMigrationNetns warn-only on restore-failure rollback", "migration", req.MigrationName)
 			} else {
 				log.Info("GC-10: dest migration netns torn down on restore-failure rollback", "migration", req.MigrationName)
@@ -7950,7 +7973,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 			// fires the deferred SIGCONT as its final action. When no TCP connections are
 			// expected, enforceRestoreOrderingInvariant resumes inline (deferResume ignored).
 			deferResume := len(req.SeqSnapshots) > 0
-			socketsLiveAt, resumedAt, orderErr := enforceRestoreOrderingInvariant(pid, req.MigrationName, len(req.SeqSnapshots), deferResume)
+			socketsLiveAt, resumedAt, orderErr := enforceRestoreOrderingInvariant(ctx, pid, req.MigrationName, len(req.SeqSnapshots), deferResume)
 			if orderErr != nil {
 				log.Error(orderErr, "Restore: ordering invariant FAILED — SIGCONT withheld, failing restore for rollback",
 					"migration", req.MigrationName, "pid", pid)
@@ -9961,17 +9984,23 @@ func (s *AgentServer) emitExternalMountDroppedEvent(ctx context.Context, migrati
 // direct peer=podmotion-agent path would be permitted (that label is UNVERIFIED against
 // a live source workload — capture owed to the Sprint-44 live baseline), so the broker
 // is the single resume owner for both the restored tree and the source tree.
-func brokerResumeRestoredPID(pid int) error {
+// ADR-0354 round-5 sweep: netnsbroker.Client.SignalPID funnels the same Client.do(ctx) as the
+// other broker-exec surfaces (D5's predicate). Both live call sites (enforceRestoreOrderingInvariant,
+// reached from joinNsRestore's NRI entry point AND the gRPC Restore handler) have a real caller ctx
+// in scope, so it is threaded through here instead of rooting a fresh context.Background(). The 30s
+// per-call ceiling is preserved via remainingOrCeiling's tighten-only clamp (D2 discipline).
+func brokerResumeRestoredPID(ctx context.Context, pid int) error {
 	startTime, err := readProcStartTime(int32(pid))
 	if err != nil {
 		return fmt.Errorf("read restored pid %d starttime for broker resume: %w", pid, err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	budget := remainingOrCeiling(ctx, 30*time.Second)
+	sigCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
-	return netnsbroker.NewClient().SignalPID(ctx, pid, int(syscall.SIGCONT), startTime)
+	return netnsbroker.NewClient().SignalPID(sigCtx, pid, int(syscall.SIGCONT), startTime)
 }
 
-func enforceRestoreOrderingInvariant(pid int, migrationName string, expectedCount int, deferResume bool) (time.Time, time.Time, error) {
+func enforceRestoreOrderingInvariant(ctx context.Context, pid int, migrationName string, expectedCount int, deferResume bool) (time.Time, time.Time, error) {
 	// If the restore was not TCP-stateful (no expected connections), skip socket
 	// polling and resume immediately — the invariant only applies to TCP migrations.
 	// (deferResume is irrelevant here: with no TCP sockets there is no seq_delta to
@@ -9982,7 +10011,7 @@ func enforceRestoreOrderingInvariant(pid int, migrationName string, expectedCoun
 			"migration", migrationName, "pid", pid)
 		// ADR-0312: the restored tree runs under containerd's default AppArmor profile;
 		// the confined agent's own SIGCONT is DENIED. Delegate to the unconfined broker.
-		if err := brokerResumeRestoredPID(pid); err != nil {
+		if err := brokerResumeRestoredPID(ctx, pid); err != nil {
 			return now, time.Time{}, fmt.Errorf("SIGCONT pid=%d: %w", pid, err)
 		}
 		resumedAt := time.Now()
@@ -10043,7 +10072,7 @@ func enforceRestoreOrderingInvariant(pid int, migrationName string, expectedCoun
 			)
 			// ADR-0312: delegate the cross-profile resume to the unconfined broker
 			// (the confined agent's SIGCONT to the restored tree is AppArmor-DENIED).
-			if err := brokerResumeRestoredPID(pid); err != nil {
+			if err := brokerResumeRestoredPID(ctx, pid); err != nil {
 				return socketsLiveAt, time.Time{}, fmt.Errorf("SIGCONT pid=%d: %w", pid, err)
 			}
 			resumedAt := time.Now()

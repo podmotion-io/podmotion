@@ -118,7 +118,7 @@ func TestResolveReattachMounts_ResolvesHostTargetByLabelWhenStatusEmpty(t *testi
 	}
 	s := newFakeAgentServerWithCoreObjects(t, pm, pvc, replPod)
 
-	mounts, err := s.resolveReattachMounts(migName)
+	mounts, err := s.resolveReattachMounts(context.Background(), migName)
 	if err != nil {
 		t.Fatalf("resolveReattachMounts returned error with a resolved host target: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestResolveReattachMounts_WaitsThenResolvesWhenVolumeNotYetPublished(t *tes
 	s := newFakeAgentServerWithCoreObjects(t, pm, pvc, replPod)
 
 	// (i) single-shot returns the retryable sentinel, not a broken mount.
-	mounts, err := s.resolveReattachMounts(migName)
+	mounts, err := s.resolveReattachMounts(context.Background(), migName)
 	var notYet *ReattachVolumeNotYetPublishedError
 	if !errors.As(err, &notYet) {
 		t.Fatalf("expected ReattachVolumeNotYetPublishedError on the first (unpublished) probe; got mounts=%+v err=%v", mounts, err)
@@ -362,7 +362,7 @@ func TestResolveReattachMounts_InTreeNFSShapeResolvesEndToEnd(t *testing.T) {
 	pm, pvc, replPod := reattachTestFixture(migName, replUID, pvName, containerPath)
 	s := newFakeAgentServerWithCoreObjects(t, pm, pvc, replPod)
 
-	mounts, err := s.resolveReattachMounts(migName)
+	mounts, err := s.resolveReattachMounts(context.Background(), migName)
 	if err != nil {
 		t.Fatalf("resolveReattachMounts errored on a published in-tree NFS mount: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestResolveReattachMounts_ExcludesNonTier0RWOPVC(t *testing.T) {
 	pvc.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
 	s := newFakeAgentServerWithCoreObjects(t, pm, pvc, replPod)
 
-	mounts, err := s.resolveReattachMounts(migName)
+	mounts, err := s.resolveReattachMounts(context.Background(), migName)
 	if err != nil {
 		t.Fatalf("resolveReattachMounts returned error for a non-Tier0 PVC (expected clean exclusion): %v", err)
 	}
