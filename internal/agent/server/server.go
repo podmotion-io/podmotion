@@ -5109,16 +5109,21 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	}
 	pid, err = readRestoredPIDFromPidfile(pidfilePath, pidfileBudget, pidfilePoll)
 	if err != nil {
+		// ADR-0354 round 6 (D7 anti-conflation): a caller-deadline abort and a genuine
+		// pidfile-resolution failure are mutually exclusive causes and must record mutually
+		// exclusive metrics — matching how the other three D7 legs (broker_cmd, broker_criu_poll_cgroup,
+		// netns_exec) already keep BrokerExecDeadlineAbortsTotal and MigrationsFailedTotal disjoint.
 		if pidfileCtxAborted || ctx.Err() != nil {
 			metrics.BrokerExecDeadlineAbortsTotal.WithLabelValues("broker_criu_poll_pidfile").Inc()
 			log.Info("ADR-0354 D2b/D7: pidfile-resolution wait aborted on caller-deadline enforcement",
 				"migration", migrationName, "ctxErr", ctx.Err())
+		} else {
+			// Fail loud — never fall back to comm-scan or cgroup-diff (ADR-0228 NRI/gRPC symmetry).
+			// Surface the CRIU restore.log tail: a missing pidfile is usually the DOWNSTREAM symptom
+			// of a restore that aborted earlier (e.g. mount-v2 open_tree on an external mount), and the
+			// real cause is only in restore.log — not in this wrapper message.
+			metrics.MigrationsFailedTotal.WithLabelValues("restore_pidfile_missing").Inc()
 		}
-		// Fail loud — never fall back to comm-scan or cgroup-diff (ADR-0228 NRI/gRPC symmetry).
-		// Surface the CRIU restore.log tail: a missing pidfile is usually the DOWNSTREAM symptom
-		// of a restore that aborted earlier (e.g. mount-v2 open_tree on an external mount), and the
-		// real cause is only in restore.log — not in this wrapper message.
-		metrics.MigrationsFailedTotal.WithLabelValues("restore_pidfile_missing").Inc()
 		logTail := restoreLogTail(restoreLogPath, 4096)
 		return 0, nil, fmt.Errorf("resolve restored PID via CRIU --pidfile: %w\ncriu restore.log tail:\n%s", err, logTail)
 	}
