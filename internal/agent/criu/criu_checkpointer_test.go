@@ -96,6 +96,50 @@ func TestDumpOptions_TcpEstablishedTier(t *testing.T) {
 	}
 }
 
+// TestCRIUTCPDumpFlags_SkipInFlightBothPaths pins the fix for the cycle-2 live-proof
+// checkpoint failure. With a real held redis connection the raw CRIU dump collected an
+// ESTABLISHED socket but aborted on a co-resident in-flight socket (criu/sk-inet.c:185
+// "inet: In-flight connection") because the established/preservation path passed
+// --tcp-established WITHOUT --skip-in-flight. --skip-in-flight must appear on BOTH the
+// established (preserve) and the cold (close) dump paths so a single un-snapshottable
+// in-flight socket cannot take the whole dump — and the held connection — down with it.
+func TestCRIUTCPDumpFlags_SkipInFlightBothPaths(t *testing.T) {
+	rows := []struct {
+		name           string
+		tcpEstablished bool
+		wantContains   []string
+		wantAbsent     []string
+	}{
+		{
+			name:           "established_preserve_path",
+			tcpEstablished: true,
+			wantContains:   []string{"--tcp-established", "--skip-in-flight"},
+			wantAbsent:     []string{"--tcp-close"},
+		},
+		{
+			name:           "cold_close_path",
+			tcpEstablished: false,
+			wantContains:   []string{"--tcp-close", "--skip-in-flight"},
+			wantAbsent:     []string{"--tcp-established"},
+		},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			joined := strings.Join(criu.ExportedCRIUTCPDumpFlags(r.tcpEstablished), " ")
+			for _, w := range r.wantContains {
+				if !strings.Contains(joined, w) {
+					t.Errorf("expected %q in dump TCP flags; got: %s", w, joined)
+				}
+			}
+			for _, w := range r.wantAbsent {
+				if strings.Contains(joined, w) {
+					t.Errorf("did not expect %q in dump TCP flags; got: %s", w, joined)
+				}
+			}
+		})
+	}
+}
+
 // TestParseTCPImageEntries_InetskLines verifies that parseTCPImageEntries correctly
 // counts inetsk/tcp image lines and "Unsupported socket" errors from a CRIU dump log.
 // This is the M23 unit-level check for the log-parsing path that the integration test

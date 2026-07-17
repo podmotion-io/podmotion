@@ -223,6 +223,16 @@ cmd_deploy_podmotion() {
   done
   for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
     echo "  -- import into $ip"
+    # A re-deploy within the same sprint reuses the same $TAG (by design — see
+    # the TAG provenance note above). `ctr images import` overwriting an
+    # already-present tag's digest is undocumented/unverified behavior on this
+    # containerd version, and the tag-presence check below only proves the tag
+    # string exists, not that it points at the digest we just built (this was
+    # confirmed live 2026-07-14: a same-tag re-deploy left a stale binary
+    # running despite a clean deploy + rollout restart). Remove the tag first
+    # so there is no ambiguity about overwrite semantics — the import that
+    # follows is then the ONLY thing that can make the tag resolve.
+    nsh "$ip" "sudo ctr -n k8s.io images rm '$OP_IMG' '$AGENT_IMG' >/dev/null 2>&1 || true"
     docker save "$OP_IMG"    | nsh "$ip" "sudo ctr -n k8s.io images import -"
     docker save "$AGENT_IMG" | nsh "$ip" "sudo ctr -n k8s.io images import -"
     # Verify each tag actually landed in this node's k8s.io namespace.
@@ -252,6 +262,17 @@ cmd_deploy_podmotion() {
     --set scheduler.enabled=false \
     --set installCRDs=false \
     --set operator.featureGates="TCPPreservation=true"
+
+  # A re-deploy within the same sprint reuses the same $TAG (see the image
+  # import step above), so the rendered Deployment/DaemonSet spec is often
+  # byte-identical to what's already applied — helm then sees NO diff and
+  # creates no new pods, silently leaving the OLD binary running even though
+  # the image tag on the nodes now points at freshly-built content. Force a
+  # restart unconditionally so every deploy-podmotion call is guaranteed to
+  # produce fresh pods, not just a "diff detected" one (confirmed live
+  # 2026-07-14 as the root cause of a stale-binary false-negative gate).
+  echo "==> Forcing rollout restart (same-tag deploys are otherwise a silent no-op)..."
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system rollout restart deploy/podmotion-operator ds/podmotion-agent
 
   echo "==> Waiting for rollout (failure/timeout is a real error, not swallowed)..."
   KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system rollout status deploy/podmotion-operator --timeout=180s
@@ -625,8 +646,14 @@ cmd_cutover() {
     local confs
     confs=$(nsh "$ip" "sudo ls /etc/cni/net.d/" 2>/dev/null || echo "UNKNOWN")
     echo "  -- $ip: $confs"
-    if echo "$confs" | grep -qi flannel; then
-      echo "ERROR: node $ip still has a flannel CNI conflist present after cutover." >&2
+    # Only files with a kubelet-recognized CNI extension (.conf/.conflist/.json) are
+    # ever read by the CNI plugin manager to select the active network. Cilium's own
+    # install-cni step disables the old Flannel config by renaming it to a
+    # *.cilium_bak suffix rather than deleting it (kept as a rollback artifact) — that
+    # rename IS the authoritative "inactive" marker, so a substring match on the
+    # filename false-positives on it. Check only the extensions kubelet actually scans.
+    if echo "$confs" | grep -Ei '\.(conf|conflist|json)$' | grep -qi flannel; then
+      echo "ERROR: node $ip still has an ACTIVE flannel CNI conflist present after cutover." >&2
       exit 1
     fi
   done

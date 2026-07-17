@@ -32,6 +32,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	"github.com/podmotion-io/podmotion/internal/agent/netnsbroker"
 )
 
 // validCheckpointRef rejects any ref that is not a plain DNS-label-safe identifier.
@@ -42,6 +43,29 @@ var validCheckpointRef = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{0,61}[a-z0-9]$`
 
 var log = logf.Log.WithName("nri-plugin")
 
+// nriPluginRequestTimeout is the real containerd NRI plugin_request_timeout, GROUNDED live
+// (ADR-0351 G0.3, docs/sprints/sprint46B7/g0-probe-adr0351-transcript.md — `containerd config
+// dump` on pm-w1, 2026-07-15) — not assumed. This ONE value pins the three previously
+// contradictory in-tree comments this constant replaces ("60s required on all nodes"; "2s on
+// the standing containerd 2.2.1 substrate"; "default 30s"). D4.1.
+const nriPluginRequestTimeout = 2 * time.Second
+
+// antiSpoofVerifyBudget bounds HandleStartContainer's synchronous PodMigration-CR anti-spoof
+// verify loop (ADR-0351 D4.2). HandleStartContainer runs UNDER containerd's synchronous
+// nriPluginRequestTimeout — a loop that can still be mid-retry when that budget expires means
+// containerd drops the plugin connection entirely, forcing EVERY migration onto the raw-CRIU
+// fallback (where the D1 cgroup-anchor primitive never executes at all, not just late). Bounded
+// to well under nriPluginRequestTimeout (not merely under it) so the handler can return and
+// containerd can still process the plugin's response before its own deadline fires. Do NOT
+// widen nriPluginRequestTimeout to make room for a longer loop instead (D5.2/scope [9] — a
+// longer timeout fixes nothing about the underlying phase-ordering race this loop tolerates).
+const antiSpoofVerifyBudget = 800 * time.Millisecond
+
+// antiSpoofVerifyPollInterval is the re-probe cadence inside antiSpoofVerifyBudget. Short
+// enough that at least one retry fits inside the budget above (unlike the retired 1s interval,
+// which left room for zero retries inside a 2s containerd deadline).
+const antiSpoofVerifyPollInterval = 100 * time.Millisecond
+
 // PluginName is the NRI plugin identifier registered with containerd.
 const PluginName = "podmotion"
 
@@ -51,17 +75,17 @@ const PluginIndex = "10"
 
 // ContainerEvent mirrors the subset of the NRI ContainerAdjustment event we care about.
 type ContainerEvent struct {
-	ID          string            `json:"id"`
-	Name        string            `json:"name"`
-	Namespace   string            `json:"namespace"`
-	Pod         string            `json:"pod"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+	Pod       string `json:"pod"`
 	// PodUID is the replacement pod's Kubernetes pod UID (informational/logging).
-	PodUID      string            `json:"podUID,omitempty"`
+	PodUID string `json:"podUID,omitempty"`
 	// SandboxID is the containerd sandbox (pause container) ID from the NRI pod sandbox
 	// object (pod.GetId()). It is unambiguous per pod and is used to resolve the sandbox
 	// network namespace via the containerd sandbox API for ADR-0122 --net-fd CRIU restore.
-	SandboxID   string            `json:"sandboxID,omitempty"`
-	Labels      map[string]string `json:"labels,omitempty"`
+	SandboxID string            `json:"sandboxID,omitempty"`
+	Labels    map[string]string `json:"labels,omitempty"`
 	// Annotations carries pod annotations forwarded by the NRI runtime. In real NRI v2,
 	// pod annotations appear here. The JSON stub must include them to test the restore path.
 	Annotations map[string]string `json:"annotations,omitempty"`
@@ -69,6 +93,17 @@ type ContainerEvent struct {
 	// record (ctr containers info) at StartContainer time. Used by setupRestoreOverlayfs
 	// to launch a placeholder container without needing config.json in the checkpoint dir.
 	ImageName string `json:"imageName,omitempty"`
+	// ContainerCgroupsPath is the migrated container's OWN cgroup path, read directly from
+	// container.GetLinux().GetCgroupsPath() (NRI LinuxContainer.CgroupsPath, proto bytes,5).
+	// ADR-0351 D1: this is the authoritative restore-path cgroup-anchor target — zero query,
+	// zero poll, zero retry. Live-verified populated (G0, BD-0): a systemd cgroup-driver slice
+	// token of the form "<slice>.slice:cri-containerd:<containerID>" on this substrate.
+	ContainerCgroupsPath string `json:"containerCgroupsPath,omitempty"`
+	// PodCgroupParent is the pod's parent slice, read from pod.GetLinux().GetCgroupParent()
+	// (NRI LinuxPodSandbox.CgroupParent, proto bytes,3). ADR-0351 D2.3/D2.4: used ONLY as a
+	// validation bound (reject an anchor target that equals or escapes it) — NEVER a write
+	// target (writing a PID into a non-leaf cgroup with children EBUSYs, cgroup v2).
+	PodCgroupParent string `json:"podCgroupParent,omitempty"`
 }
 
 // Plugin is the NRI lifecycle hook handler.
@@ -92,8 +127,12 @@ type Plugin struct {
 	nodeName string
 }
 
-// New creates a Plugin. onStopping and onStartContainer may be nil (stub mode).
-// k8sClient and nodeName are used for PodMigration CR verification; pass nil/empty for tests.
+// New creates a Plugin. onStopping and onStartContainer may both be nil (stub mode). k8sClient
+// and nodeName are used for PodMigration CR verification; pass nil/empty for tests.
+// ADR-0351 D3.1: onSandboxPausePID/onSandboxRemoved params retired with the pause-PID
+// poll/classify/retry apparatus they fed — the cgroup-anchor primitive (D1) reads the
+// container's own cgroup path directly off the event already threaded through
+// onStartContainer; there is no side-map to write back or evict.
 func New(
 	onStopping func(ctx context.Context, event ContainerEvent) error,
 	onStartContainer func(ctx context.Context, event ContainerEvent, checkpointRef string) error,
@@ -177,9 +216,13 @@ func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent)
 	// the deadline expires. A spoofed/absent CR never enters an accepted phase, so this still
 	// hard-blocks on timeout with the same blocking error.
 	if p.k8sClient != nil {
-		// verifyTimeout(45s) + verifyInterval(1s) must sit under containerd
-		// plugin_request_timeout (60s required on all nodes; default 30s fails the retry budget).
-		verifyDeadline := time.Now().Add(45 * time.Second)
+		// ADR-0351 D4.2: verifyTimeout(antiSpoofVerifyBudget) + verifyInterval
+		// (antiSpoofVerifyPollInterval) are bounded WELL under the GROUNDED real
+		// nriPluginRequestTimeout (G0.3 — 2s on this substrate, not the previously-assumed
+		// 60s/30s) so this synchronous loop cannot overrun containerd's own deadline and get
+		// the plugin connection dropped (which would force the raw-CRIU fallback and skip the
+		// D1 cgroup-anchor primitive entirely).
+		verifyDeadline := time.Now().Add(antiSpoofVerifyBudget)
 		var verifyErr error
 		for time.Now().Before(verifyDeadline) {
 			verifyErr = p.verifyPodMigration(ctx, event.Namespace, checkpointRef)
@@ -194,7 +237,7 @@ func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent)
 			select {
 			case <-ctx.Done():
 				return fmt.Errorf("NRI StartContainer: context cancelled during phase-wait: %w", ctx.Err())
-			case <-time.After(1 * time.Second):
+			case <-time.After(antiSpoofVerifyPollInterval):
 			}
 		}
 		if verifyErr != nil {
@@ -316,9 +359,10 @@ func (p *Plugin) HandlePostStartContainer(_ context.Context, event ContainerEven
 		"checkpointRef", checkpointRef,
 	)
 
-	// The inbound (now-discarded) context is containerd's PER-EVENT context, bounded by the NRI
-	// plugin_request_timeout (2s on the standing containerd 2.2.1 substrate — NOT the 60s the
-	// prior comment assumed). It is the source of truth for "how long containerd will block the
+	// The inbound (now-discarded) context is containerd's PER-EVENT context, bounded by
+	// nriPluginRequestTimeout (ADR-0351 D4.1 — GROUNDED at 2s on this substrate, G0.3; NOT the
+	// 60s/30s prior comments elsewhere in this file assumed before being pinned to this one
+	// value). It is the source of truth for "how long containerd will block the
 	// container start waiting on this plugin" — it is NOT a budget for CRIU restore. Running the
 	// 50s holder-quiescent barrier and the multi-second CRIU restore on that context means the
 	// select at waitForHolderQuiescent hits Done() at ~2s EVERY time, the handler returns a
@@ -492,10 +536,11 @@ type nriAdapter struct {
 // Called after runc creates container namespaces but before the container init executes.
 // If the pod carries podmotion.io/checkpoint-ref, CRIU restore is triggered.
 //
-// Timeout: containerd's plugin_request_timeout governs this context (default 30s).
-// M18.5 spike measured actual CRIU restore at ~200–400ms (health-check on ESTAB socket).
-// 30s >> 400ms — safe margin. If restore ever exceeds ~10s, containerd config must be
-// updated: [plugins."io.containerd.nri.v1.nri"] plugin_request_timeout = "60s".
+// Timeout: containerd's plugin_request_timeout governs this synchronous context — GROUNDED at
+// nriPluginRequestTimeout (2s on this substrate, ADR-0351 G0.3), not the previously-assumed
+// 30s/60s. CRIU restore itself does NOT run synchronously here — ADR-0198 Rule F defers the
+// holder-quiescent barrier + CRIU restore to PostStartContainer's independent restoreCtx, which
+// this 2s budget does not govern (see HandlePostStartContainer doc comment below).
 func (a *nriAdapter) StartContainer(ctx context.Context, pod *nriapi.PodSandbox, container *nriapi.Container) error {
 	// ADR-0119 D2: defensive nil guard. The NRI bridge can deliver a start event with a
 	// nil or incomplete sandbox/container (the source of the plugin.go panic). Treat it as
@@ -520,6 +565,9 @@ func (a *nriAdapter) PostStartContainer(ctx context.Context, pod *nriapi.PodSand
 	if pod == nil || container == nil {
 		return nil
 	}
+	// ADR-0351 D3.1: the D5-c PodSandbox.Pid write-back is retired along with the pause-PID
+	// apparatus it fed — the cgroup-anchor primitive (D1) reads container.GetLinux().GetCgroupsPath()
+	// directly off buildContainerEvent's own event, so there is nothing to capture here anymore.
 	return a.plugin.HandlePostStartContainer(ctx, buildContainerEvent(pod, container))
 }
 
@@ -537,6 +585,14 @@ func buildContainerEvent(pod *nriapi.PodSandbox, container *nriapi.Container) Co
 		Labels:      container.GetLabels(),
 		Annotations: pod.GetAnnotations(),
 		ImageName:   fetchContainerImage(container.GetId()),
+		// ADR-0351 D1.1: read the container's OWN cgroup path directly off the NRI hook
+		// payload already delivered to this callback — zero query, zero poll (G0-verified live
+		// on pm-w1/pm-w2, 2026-07-15: both fields populated; see g0-probe-adr0351-transcript.md).
+		// Nil-safe: GetLinux() may be nil on either side; the generated getters return "" on a
+		// nil receiver, never panic.
+		ContainerCgroupsPath: container.GetLinux().GetCgroupsPath(),
+		// PodCgroupParent is used ONLY as a D2.3/D2.4 validation bound — never a write target.
+		PodCgroupParent: pod.GetLinux().GetCgroupParent(),
 	}
 	// Also merge container-level annotations (containerd may forward them on either).
 	if cAnnotations := container.GetAnnotations(); len(cAnnotations) > 0 {
@@ -575,6 +631,7 @@ func fetchContainerImage(containerID string) string {
 // StopContainer implements stub.StopContainerInterface.
 // Called when a container is stopping; used for pre-dump trigger (M5).
 func (a *nriAdapter) StopContainer(ctx context.Context, pod *nriapi.PodSandbox, container *nriapi.Container) ([]*nriapi.ContainerUpdate, error) {
+	// ADR-0351 D3.1: the D5-c eviction call is retired with the map it bounded.
 	event := ContainerEvent{
 		ID:          container.GetId(),
 		Name:        container.GetName(),
@@ -651,9 +708,12 @@ func (p *Plugin) Run(ctx context.Context) error {
 // deadline expires.
 //
 // Quiescence is determined by the presence of the holder-ready sentinel file at
-//   /proc/<holderPID>/root/run/podmotion/holder-ready
+//
+//	/proc/<holderPID>/root/run/podmotion/holder-ready
+//
 // OR (for scratch rootfs where /proc traversal is unreliable) by the holder's stdout token
-//   "podmotion-holder ready" observable in the agent log (emitted by cmd/holder/main.go).
+//
+//	"podmotion-holder ready" observable in the agent log (emitted by cmd/holder/main.go).
 //
 // Because the NRI StartContainer hook fires BEFORE the container init process begins executing,
 // the barrier polls with a short interval (200 ms) until the sentinel appears or the timeout
@@ -706,15 +766,29 @@ func waitForHolderQuiescent(ctx context.Context, event ContainerEvent, timeout t
 	// The container PID is the init PID of the container; it appears under /proc once the
 	// container runtime has created the cgroup and forked the init process.
 	for time.Now().Before(deadline) {
-		// Transport (i): sentinel file. Find the container's init PID by scanning /proc/*/cgroup.
-		pid := findContainerInitPID(event.ID)
-		if pid > 0 {
-			sentinelPath := fmt.Sprintf("/proc/%d/root/%s", pid, holderReadySentinel)
-			if _, err := os.Stat(sentinelPath); err == nil {
-				log.Info("holder-quiescent barrier satisfied (sentinel file)",
-					"container", event.ID, "pid", pid, "sentinelPath", sentinelPath)
-				return nil
-			}
+		// Transport (i): holder-ready sentinel file, observed via the unconfined
+		// netns-broker. Reading the sentinel means dereferencing
+		// /proc/<holderPID>/root/run/podmotion/holder-ready inside the restore-target
+		// container. Opening another container's /proc/<pid>/root routes through a
+		// ptrace_may_access gate that the de-privileged agent's `podmotion-agent`
+		// AppArmor profile DENIES against the holder's cri-containerd.apparmor.d peer
+		// profile (the exact `apparmor DENIED operation="ptrace" ... requested_mask="read"`
+		// signature — CAP_SYS_PTRACE does NOT bypass AppArmor mediation). A direct
+		// agent-side os.Stat therefore fails EACCES on EVERY poll, so this transport
+		// was silently dead and the barrier always timed out at 50s, forcing the
+		// gRPC/raw-CRIU fallback (where the ADR-0351 cgroup anchor is skipped and the
+		// restored process is never made pod-visible). Delegate the observation to the
+		// unconfined broker — the same ptrace-delegation class as ResolveVeth /
+		// signal_pid — which resolves the holder PID and stats the sentinel itself.
+		// A transient broker error is non-fatal: log it and fall through to the next
+		// transport / poll.
+		if ready, berr := netnsbroker.NewClient().HolderSentinelReady(ctx, event.ID); berr != nil {
+			log.Info("holder-quiescent barrier: broker sentinel observation errored (will retry next poll)",
+				"container", event.ID, "error", berr.Error())
+		} else if ready {
+			log.Info("holder-quiescent barrier satisfied (sentinel file via netns-broker)",
+				"container", event.ID, "name", event.Name)
+			return nil
 		}
 
 		// Transport (ii): stdout token. Observe the holder container's CRI stdout log for the
@@ -786,39 +860,10 @@ func containerInList(name, csv string) bool {
 	return false
 }
 
-// findContainerInitPID scans /proc for the init PID of the container with the given containerID.
-// It reads /proc/<pid>/cgroup and looks for a cgroup entry containing the container ID string.
-// Returns 0 if not found.
-func findContainerInitPID(containerID string) int {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return 0
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		pid := 0
-		for _, c := range e.Name() {
-			if c < '0' || c > '9' {
-				pid = -1
-				break
-			}
-			pid = pid*10 + int(c-'0')
-		}
-		if pid <= 0 {
-			continue
-		}
-		cgroupData, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
-		if err != nil {
-			continue
-		}
-		if strings.Contains(string(cgroupData), containerID) {
-			return pid
-		}
-	}
-	return 0
-}
+// (findContainerInitPID was retired: the holder-ready sentinel is now observed via
+// the unconfined netns-broker's holder_sentinel op, which resolves the holder PID
+// and stats the sentinel in one unconfined process — the confined agent's direct
+// /proc/<pid>/root stat was AppArmor-ptrace-denied on every poll, silently dead.)
 
 // WriteRegistrationConfig writes the NRI plugin config file to the NRI config dir.
 // containerd reads this to discover and exec the plugin.

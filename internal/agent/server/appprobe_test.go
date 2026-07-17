@@ -116,7 +116,71 @@ func TestPgProbe_ErrorResponseIsFailure(t *testing.T) {
 	}
 }
 
-func TestPgProbe_AuthRequiredIsFailure(t *testing.T) {
+// fakePgAuthFirstReply drives one side of a net.Pipe: reads the StartupMessage, then writes a
+// single Authentication message ('R') with the given authtype and optional trailing payload
+// (e.g. an MD5 salt or a SASL mechanism list) as its ONLY reply — never authenticating,
+// never sending ReadyForQuery. It models a real server's first post-startup wire frame.
+func fakePgAuthFirstReply(t *testing.T, conn net.Conn, authType uint32, extra []byte) {
+	t.Helper()
+	hdr := make([]byte, 4)
+	if _, err := readFullTest(conn, hdr); err != nil {
+		return
+	}
+	mlen := binary.BigEndian.Uint32(hdr)
+	body := make([]byte, mlen-4)
+	_, _ = readFullTest(conn, body)
+
+	payload := make([]byte, 0, 4+len(extra))
+	payload = binary.BigEndian.AppendUint32(payload, authType)
+	payload = append(payload, extra...)
+	buf := make([]byte, 0, 5+len(payload))
+	buf = append(buf, 'R')
+	buf = binary.BigEndian.AppendUint32(buf, uint32(4+len(payload)))
+	buf = append(buf, payload...)
+	_, _ = conn.Write(buf)
+}
+
+// TestPgProbe_AuthChallengeIsLiveness is the ADR-0325 round-2 correction (sprint46B9): a
+// password-protected Postgres replies to the credential-free StartupMessage with a genuine
+// authentication CHALLENGE. A wire-correct challenge can only come from a live postmaster past
+// canAcceptConnections and a real protocol-v3 backend, so it is PROOF of liveness — the probe
+// must PASS (it still never authenticates). Covers AuthenticationCleartextPassword (3),
+// AuthenticationMD5Password (5 + 4-byte salt), and AuthenticationSASL (10 + mechanism list) —
+// the three shapes a real postgres:16-alpine emits for md5/scram/cleartext pg_hba entries.
+func TestPgProbe_AuthChallengeIsLiveness(t *testing.T) {
+	cases := []struct {
+		name     string
+		authType uint32
+		extra    []byte
+	}{
+		{"CleartextPassword", 3, nil},
+		{"MD5Password", 5, []byte{0xde, 0xad, 0xbe, 0xef}},
+		{"SASL", 10, append([]byte("SCRAM-SHA-256"), 0x00, 0x00)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				fakePgAuthFirstReply(t, server, tc.authType, tc.extra)
+			}()
+
+			err := pgProbe(context.Background(), client, "", 2*time.Second)
+			<-done
+			if err != nil {
+				t.Fatalf("pgProbe: a genuine %s auth challenge proves a live Postgres and must PASS (probe still never authenticates), got error: %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// TestPgProbe_MalformedAuthMessageIsFailure keeps the fail-closed guard: an 'R' message whose
+// body is too short to hold an int32 authtype is garbage, not a live Postgres — must FAIL.
+func TestPgProbe_MalformedAuthMessageIsFailure(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -132,20 +196,36 @@ func TestPgProbe_AuthRequiredIsFailure(t *testing.T) {
 		body := make([]byte, mlen-4)
 		_, _ = readFullTest(server, body)
 
-		// AuthenticationCleartextPassword: type 'R', authtype=3 (non-zero => must fail).
-		payload := make([]byte, 4)
-		binary.BigEndian.PutUint32(payload, 3)
-		buf := make([]byte, 0, 9)
-		buf = append(buf, 'R')
-		buf = binary.BigEndian.AppendUint32(buf, uint32(4+len(payload)))
-		buf = append(buf, payload...)
+		// 'R' with a 2-byte body (< 4) — cannot carry an authtype.
+		buf := []byte{'R', 0, 0, 0, 6, 0x01, 0x02}
 		_, _ = server.Write(buf)
 	}()
 
 	err := pgProbe(context.Background(), client, "", 2*time.Second)
 	<-done
 	if err == nil {
-		t.Fatalf("pgProbe: expected AuthRequired failure (probe must never authenticate), got nil error")
+		t.Fatalf("pgProbe: a malformed Authentication message (body < 4 bytes) must FAIL closed, got nil error")
+	}
+}
+
+// TestPgProbe_AuthContinuationAsFirstReplyIsFailure keeps a fail-closed guard: a continuation
+// subtype (11 = SASLContinue) can never legitimately be a server's FIRST reply — a peer that
+// leads with one is not a healthy handshake and must FAIL, not be mistaken for liveness.
+func TestPgProbe_AuthContinuationAsFirstReplyIsFailure(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fakePgAuthFirstReply(t, server, 11, []byte("server-first-message"))
+	}()
+
+	err := pgProbe(context.Background(), client, "", 2*time.Second)
+	<-done
+	if err == nil {
+		t.Fatalf("pgProbe: an auth continuation subtype (11) as the FIRST reply must FAIL closed, got nil error")
 	}
 }
 
@@ -248,10 +328,95 @@ func TestDialAllowed_FailsClosedWithNoK8sClient(t *testing.T) {
 	}
 }
 
+// --- SSRF allowlist source-of-truth: Cilium IPAM podCIDRs, not Node.Spec.PodCIDRs ---
+
+// TestParseCIDRAllowlist_AdmitsRealCiliumPodIPRefusesEverythingElse grounds the sprint46B7
+// Validation cycle-2 security-lens fix in LIVE cluster state (read 2026-07-14 from the standing
+// KVM cluster): Node.Spec.PodCIDRs and CiliumNode.spec.ipam.podCIDRs are PERMUTED on this Cilium
+// cluster-pool substrate — pm-w2's Node.Spec.PodCIDRs=10.244.2.0/24, but pm-w2's pods are actually
+// allocated from Cilium's 10.244.1.0/24 (the restored redis pod in the failing live proof held
+// 10.244.1.203). nodePodCIDRAllowlist now keys on the Cilium block, so parseCIDRAllowlist of that
+// block MUST admit the real pod IP and refuse both the wrong Node.Spec /24 and any non-pod IP
+// (SSRF containment preserved). Derived from real cluster state, not an injected equality.
+func TestParseCIDRAllowlist_AdmitsRealCiliumPodIPRefusesEverythingElse(t *testing.T) {
+	// pm-w2's AUTHORITATIVE Cilium cluster-pool block (CiliumNode.spec.ipam.podCIDRs).
+	allow := parseCIDRAllowlist([]string{"10.244.1.0/24"})
+	if len(allow) != 1 {
+		t.Fatalf("parseCIDRAllowlist: expected 1 parsed CIDR, got %d", len(allow))
+	}
+	contains := func(ip string) bool {
+		parsed := net.ParseIP(ip)
+		for _, n := range allow {
+			if n.Contains(parsed) {
+				return true
+			}
+		}
+		return false
+	}
+	// The real restored-pod IP from the live proof — refused before this fix, must be admitted now.
+	if !contains("10.244.1.203") {
+		t.Fatalf("SSRF allowlist keyed on Cilium podCIDRs must ADMIT the real pm-w2 pod IP 10.244.1.203")
+	}
+	// The WRONG /24 Node.Spec.PodCIDRs named for pm-w2 — holds no real pods, must NOT be admitted.
+	if contains("10.244.2.203") {
+		t.Fatalf("SSRF allowlist must NOT admit 10.244.2.203 (pm-w2 Node.Spec /24 holds no Cilium-allocated pods)")
+	}
+	// Off-cluster / SSRF target — containment must hold.
+	if contains("8.8.8.8") {
+		t.Fatalf("SSRF allowlist must NEVER admit an off-cluster IP (containment bypass)")
+	}
+}
+
+// TestParseCIDRAllowlist_FailsClosedOnEmptyOrGarbage asserts the fail-CLOSED contract at the parse
+// layer: a nil/empty/unparsable podCIDRs list (absent or unreadable CiliumNode) yields an empty
+// allowlist so dialAllowed refuses every dial — never a Node.Spec.PodCIDRs fallback (invariant #10).
+func TestParseCIDRAllowlist_FailsClosedOnEmptyOrGarbage(t *testing.T) {
+	for _, in := range [][]string{nil, {}, {"not-a-cidr"}, {"10.244.1.5"}} {
+		if got := parseCIDRAllowlist(in); len(got) != 0 {
+			t.Fatalf("parseCIDRAllowlist(%v): expected empty (fail-closed) allowlist, got %d entries", in, len(got))
+		}
+	}
+}
+
 func TestDialAllowed_RejectsNonIPHost(t *testing.T) {
 	s := &AgentServer{}
 	err := s.dialAllowed(context.Background(), "not-an-ip:5432")
 	if err == nil {
 		t.Fatalf("dialAllowed: expected refusal for a non-IP host, got nil error")
+	}
+}
+
+// --- dialAllowedForServiceContinuity (ADR-0352 D1.2): scoped SSRF-allowlist variant ---
+
+// TestDialAllowedForServiceContinuity_PermitsExactExpectedClusterIP asserts the ADR-0352 D1.2
+// scoped-allowlist exception: an address outside the pod-CIDR allowlist (a Service ClusterIP,
+// e.g. 10.96.0.0/12) is permitted ONLY when it matches expectedClusterIP exactly.
+func TestDialAllowedForServiceContinuity_PermitsExactExpectedClusterIP(t *testing.T) {
+	s := &AgentServer{}
+	err := s.dialAllowedForServiceContinuity(context.Background(), "10.96.0.10:6379", "10.96.0.10")
+	if err != nil {
+		t.Fatalf("dialAllowedForServiceContinuity: expected the exact expected ClusterIP to be permitted, got: %v", err)
+	}
+}
+
+// TestDialAllowedForServiceContinuity_RefusesMismatchedAddress proves this is NOT a CIDR-range
+// widening: an address that does not equal expectedClusterIP (even a different Service CIDR IP)
+// is refused. The ADR-0325 SSRF containment property must survive for every non-exact address.
+func TestDialAllowedForServiceContinuity_RefusesMismatchedAddress(t *testing.T) {
+	s := &AgentServer{}
+	err := s.dialAllowedForServiceContinuity(context.Background(), "10.96.0.99:6379", "10.96.0.10")
+	if err == nil {
+		t.Fatalf("dialAllowedForServiceContinuity: expected refusal — address does not match expectedClusterIP (no CIDR-range widening permitted)")
+	}
+}
+
+// TestDialAllowedForServiceContinuity_RefusesWhenExpectedClusterIPEmpty proves the guard does
+// not silently degrade to "any address is fine" when the caller forgets to supply
+// expectedClusterIP — it must fail closed exactly like plain dialAllowed.
+func TestDialAllowedForServiceContinuity_RefusesWhenExpectedClusterIPEmpty(t *testing.T) {
+	s := &AgentServer{}
+	err := s.dialAllowedForServiceContinuity(context.Background(), "10.96.0.10:6379", "")
+	if err == nil {
+		t.Fatalf("dialAllowedForServiceContinuity: expected refusal when expectedClusterIP is empty (fail closed, no silent bypass)")
 	}
 }

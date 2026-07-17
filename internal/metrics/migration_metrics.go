@@ -125,6 +125,36 @@ var (
 		},
 		[]string{"migration"},
 	)
+
+	// ReplacementEndpointRemovalExhaustedTotal counts ADR-0350 D3/D6 retry-budget exhaustion
+	// events on the replacement-endpoint-removal happens-before gate. Incremented once per
+	// exhausted reconcile attempt, labeled by the mode-distinguishing reason so a genuinely
+	// stuck replacement pod (ReplacementPodUndeletable) is trend-distinguishable from transient
+	// EndpointSlice CAS contention (ReplacementEndpointRemovalContended).
+	// Labels: migration_name, namespace, reason
+	ReplacementEndpointRemovalExhaustedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "podmotion",
+			Name:      "replacement_endpoint_removal_exhausted_total",
+			Help:      "Count of ADR-0350 replacement-endpoint-removal retry-budget exhaustion events, labeled by failure mode reason.",
+		},
+		[]string{"migration_name", "namespace", "reason"},
+	)
+
+	// CgroupAnchorOutcomeTotal counts ADR-0351 (D3.1a retargeted G10) cgroup-anchor primitive
+	// outcomes at the joinNsRestore anchor gate — REPLACES SandboxPausePIDWaitOutcomeTotal, whose
+	// producer (sandboxPausePIDWaiting) is deleted in the same diff. No "polls" dimension: the
+	// primitive is zero-query (D1.2), so a "polls>1 = race exercised" label has nothing to measure
+	// anymore.
+	// Labels: outcome ("anchored" | "skipped-no-nri-cgroup-path" | "failed-closed-resolve" | "failed-closed-write")
+	CgroupAnchorOutcomeTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "podmotion",
+			Name:      "cgroup_anchor_outcome_total",
+			Help:      "Count of ADR-0351 cgroup-anchor primitive outcomes at the joinNsRestore anchor gate, labeled by outcome.",
+		},
+		[]string{"outcome"},
+	)
 )
 
 func init() {
@@ -137,5 +167,7 @@ func init() {
 		ZeroWindowHoldRuleReassertTotal,
 		ZeroWindowHoldRuleReassertSuppressedTotal,
 		ShmemPagemapGuardFiredTotal,
+		ReplacementEndpointRemovalExhaustedTotal,
+		CgroupAnchorOutcomeTotal,
 	)
 }

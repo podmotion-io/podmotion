@@ -20,10 +20,14 @@ package server
 
 // zerowindow_linux_test.go — regression tests for ADR-0049 Amendment D fail-closed contract.
 //
-// Three properties verified:
+// Properties verified:
 //   A2: armZeroWindowBPF returns a typed error on ArmZeroWindowHold failure under Strict.
 //   C3: armZeroWindowBPF returns a typed error on ifindex==0 under Strict.
 //   BE: armZeroWindowBPF returns nil (degrade) on the same failures under BestEffort/None.
+//   RM: resolveVethIfindex returns a TYPED ERROR on a read-mechanism failure (no host PID
+//       sharing the pod netns), so the Strict caller reports an accurate resolution failure
+//       instead of the false terminal "non-veth CNI" verdict — while the empty/cold-path input
+//       still returns (0, nil) without error.
 
 import (
 	"context"
@@ -126,5 +130,40 @@ func TestArmZeroWindowBPF_BestEffortDegradesContinues(t *testing.T) {
 				t.Errorf("expected nil (degrade) under %q when ifindex==0, got: %v", mode, err)
 			}
 		})
+	}
+}
+
+// TestResolveVethIfindex_ReadMechanismFailureReturnsTypedError verifies RM:
+// a pod UID with no matching host process (no sandbox/container PID sharing its netns) is a
+// READ-MECHANISM failure, not an authoritative "no veth peer". resolveVethIfindex must return
+// a non-nil typed error (ifindex 0) so the Strict ArmZeroWindow caller fails closed with an
+// accurate reason rather than the false "ifindex=0 (non-veth CNI)" verdict. This pins the
+// distinction against a regression back to the previous swallow-to-(0, nil) behavior, which
+// mislabeled a veth-substrate resolution failure as a terminal CNI capability gap.
+func TestResolveVethIfindex_ReadMechanismFailureReturnsTypedError(t *testing.T) {
+	// A UID that cannot appear in any /proc/<pid>/cgroup on the test host, so both
+	// FindSandboxPID and FindContainerPID fail and the netns cannot be entered at all.
+	idx, err := resolveVethIfindex("pm-nonexistent-pod-uid-zzzz-0000000000000000")
+	if err == nil {
+		t.Fatal("expected a non-nil typed error on a read-mechanism failure (unresolvable pod netns PID); got nil — this is the swallow-to-(0,nil) regression that mislabels the failure as a non-veth CNI")
+	}
+	if idx != 0 {
+		t.Errorf("expected ifindex 0 alongside the error, got %d", idx)
+	}
+	if !strings.Contains(err.Error(), "veth ifindex unresolvable") {
+		t.Errorf("error should identify the read-mechanism failure class, got: %q", err.Error())
+	}
+}
+
+// TestResolveVethIfindex_EmptyPodUIDNoError verifies the stub/cold path is preserved: an empty
+// pod UID returns (0, nil) without error — it must NOT be reclassified as a read-mechanism
+// failure (the None/BestEffort cold path relies on the (0, nil) degrade).
+func TestResolveVethIfindex_EmptyPodUIDNoError(t *testing.T) {
+	idx, err := resolveVethIfindex("")
+	if err != nil {
+		t.Errorf("expected (0, nil) for empty podUID (cold path), got err: %v", err)
+	}
+	if idx != 0 {
+		t.Errorf("expected ifindex 0 for empty podUID, got %d", idx)
 	}
 }

@@ -67,10 +67,19 @@ func resolveVethIfindex(podUID string) (uint32, error) {
 	// sandbox PID cannot be found (both share the netns pre-freeze).
 	pid, err := FindSandboxPID(podUID)
 	if err != nil || pid == 0 {
+		sandboxErr := err
 		pid, err = FindContainerPID(podUID)
 		if err != nil || pid == 0 {
-			log.Info("resolveVethIfindex: no sandbox or container PID for pod (netns unresolvable)", "podUID", podUID)
-			return 0, nil
+			// READ-MECHANISM FAILURE — NOT an authoritative "no veth peer". No host PID shares
+			// the pod netns, so we cannot even enter it to read eth0's peer ifindex. This is the
+			// "the read mechanism itself failed" race class and must be reported truthfully:
+			// previously this returned (0, nil), which armZeroWindowBPF then mislabeled as the
+			// terminal "ifindex=0 (CNI unsupported / non-veth CNI)" verdict on a veth substrate
+			// (Cilium lxc*, Flannel/kind) where the peer demonstrably exists. Return a typed
+			// error so the Strict caller distinguishes a transient/config resolution failure
+			// from a genuine non-veth CNI (ADR-0049 Amendment D fail-closed contract).
+			log.Info("resolveVethIfindex: no sandbox or container PID for pod (netns PID unresolvable — read-mechanism failure, not non-veth CNI)", "podUID", podUID)
+			return 0, fmt.Errorf("veth ifindex unresolvable: no sandbox or container PID sharing pod %s netns (sandbox lookup: %v; container lookup: %v)", podUID, sandboxErr, err)
 		}
 	}
 
@@ -88,21 +97,34 @@ func resolveVethIfindex(podUID string) (uint32, error) {
 	defer cancel()
 	r := netnsbroker.NewClient().ResolveVeth(ctx, int(pid))
 	if r.SpawnErr != nil {
+		// READ-MECHANISM FAILURE — the netns-broker sidecar could not run the resolve at all
+		// (sidecar down, socket missing, spawn error). This says nothing about whether a veth
+		// peer exists; do not let it collapse to the "non-veth CNI" verdict. Typed error so the
+		// Strict caller fails closed with an accurate, diagnosable reason (ADR-0049 Amendment D).
 		log.Info("resolveVethIfindex: broker resolve_veth failed",
 			"pid", pid, "podUID", podUID, "err", r.SpawnErr)
-		return 0, nil
+		return 0, fmt.Errorf("veth ifindex unresolvable: netns-broker resolve_veth spawn failed for pod %s pid %d: %w", podUID, pid, r.SpawnErr)
 	}
 	if r.ExitCode != 0 {
+		// READ-MECHANISM FAILURE — the broker ran but `ip link show eth0` inside the pod netns
+		// exited non-zero (e.g. transient netns state). Not an authoritative "no veth"; surface
+		// it as a typed error rather than the false non-veth-CNI terminal verdict.
 		log.Info("resolveVethIfindex: ip link show eth0 in pod netns failed",
 			"pid", pid, "podUID", podUID, "exitCode", r.ExitCode, "output", strings.TrimSpace(string(r.Combined)))
-		return 0, nil
+		return 0, fmt.Errorf("veth ifindex unresolvable: netns-exec 'ip link show eth0' exited %d for pod %s pid %d: %s", r.ExitCode, podUID, pid, strings.TrimSpace(string(r.Combined)))
 	}
 	out := r.Stdout
 
 	// parseVethPeerIndex extracts N from "eth0@if<N>" in the ip -o link output.
+	//
+	// This is the ONLY authoritative "no veth peer" path: the broker ran, `ip link show eth0`
+	// exited 0 (so eth0 EXISTS in the pod netns), yet its link line carries no "@if<N>" peer —
+	// i.e. eth0 is genuinely not a veth (macvlan/ipvlan/SR-IOV/non-veth CNI). Only this case may
+	// return (0, nil) so the caller maps it to the terminal "non-veth CNI unsupported" verdict.
+	// All earlier bail-outs are read-mechanism failures and now return a typed error instead.
 	peerIdx := parseVethPeerIndex(string(out))
 	if peerIdx <= 0 {
-		log.Info("resolveVethIfindex: no eth0@if<N> peer index in ip output",
+		log.Info("resolveVethIfindex: eth0 present but no @if<N> veth peer index — authoritative non-veth interface",
 			"pid", pid, "podUID", podUID, "output", strings.TrimSpace(string(out)))
 		return 0, nil
 	}

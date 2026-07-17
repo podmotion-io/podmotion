@@ -21,6 +21,36 @@
 # pmpass, trust/no-auth, for the throwaway pm-db-test namespace only. The
 # value is passed via env (PGPASSWORD), never baked into the image layer,
 # and this fixture must not be copied outside test/fixtures/db-migration-test/.
+#
+# ADR-0335 Decision item 1 extension (this revision): the script below drops
+# `set -eu` (a non-zero psql exit must not kill the loop — restartPolicy is
+# Never, so a fatal exit means no further iterations at all) in favor of a
+# continuous polling/logging loop that runs for the full migration window
+# and classifies every iteration into one of three markers written to stdout
+# (and therefore captured into the persisted transcript per Decision item 5):
+#
+#   MODE-OK   — query succeeded AND the returned source-identity marker
+#               (inet_server_addr()/pg_backend_pid()) matches whichever pod
+#               (source or destination) is the CURRENT expected identity for
+#               that point in the window; a normal successful read.
+#   MODE-A    — query succeeded but returned a STALE source-identity marker
+#               (i.e. still answering as the source pod's backend after the
+#               destination pod is expected to have taken over) — the
+#               stale-read failure mode.
+#   MODE-B    — query was REFUSED or timed out — the refused/timeout failure
+#               mode. Non-fatal: caught, logged, loop continues.
+#
+# Identity is captured once as SOURCE_PID/SOURCE_ADDR (first successful
+# iteration) and again as DEST_PID/DEST_ADDR (first iteration whose identity
+# differs from the source baseline) — both persisted to stdout so an external
+# transcript-processing step (Decision item 2(e)/(f), Network Architect
+# condition) can cross-reference the observed flip against the Endpoints
+# flip timestamp. Classification of "stale" (MODE-A) vs "ok-but-different"
+# is necessarily approximate from inside this single client loop — this
+# script reports every observed identity plus a running current/baseline
+# comparison; the definitive stale-vs-genuine-cutover verdict per Decision
+# item 2(f) is made by the external verifier cross-referencing this log
+# against the Endpoints targetRef flip timestamp, not by this script alone.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -44,14 +74,65 @@ spec:
       value: pmuser
     - name: PGPASSWORD
       value: pmpass
+    - name: WINDOW_SECS
+      value: "300"
+    - name: INTERVAL_SECS
+      value: "2"
     command:
     - /bin/sh
     - -c
     - |
-      set -eu
-      echo "postgres-live-client: reading marker row via Service DNS ($PGHOST:$PGPORT)"
-      psql -X -A -t -c "SELECT name, value, updated FROM counters ORDER BY name;"
-      echo "postgres-live-client: read complete"
+      # NOTE: no `set -e` — a single psql failure must not terminate the
+      # loop (restartPolicy: Never means no further iterations would run).
+      set -u
+
+      echo "postgres-live-client: polling via Service DNS ($PGHOST:$PGPORT) for ${WINDOW_SECS}s, interval ${INTERVAL_SECS}s"
+
+      SOURCE_PID=""
+      SOURCE_ADDR=""
+      DEST_PID=""
+      DEST_ADDR=""
+      END_TS=$(( $(date +%s) + WINDOW_SECS ))
+      ITER=0
+
+      while [ "$(date +%s)" -lt "$END_TS" ]; do
+        ITER=$((ITER + 1))
+        NOW=$(date +%s)
+
+        OUT=$(psql -X -A -t -F'|' \
+          -c "SELECT inet_server_addr(), pg_backend_pid(), name, value, updated FROM counters ORDER BY name;" \
+          2>&1)
+        RC=$?
+
+        if [ "$RC" -ne 0 ]; then
+          echo "MODE-B ts=${NOW} iter=${ITER} refused-or-timeout: ${OUT}"
+        else
+          ADDR=$(printf '%s\n' "$OUT" | head -n1 | cut -d'|' -f1)
+          PID=$(printf '%s\n' "$OUT" | head -n1 | cut -d'|' -f2)
+
+          if [ -z "$SOURCE_PID" ]; then
+            SOURCE_PID="$PID"
+            SOURCE_ADDR="$ADDR"
+            echo "MODE-OK ts=${NOW} iter=${ITER} baseline-source-identity addr=${ADDR} pid=${PID} rows: ${OUT}"
+          elif [ "$PID" = "$SOURCE_PID" ] && [ -z "$DEST_PID" ]; then
+            echo "MODE-OK ts=${NOW} iter=${ITER} still-source addr=${ADDR} pid=${PID} rows: ${OUT}"
+          elif [ -z "$DEST_PID" ]; then
+            DEST_PID="$PID"
+            DEST_ADDR="$ADDR"
+            echo "MODE-OK ts=${NOW} iter=${ITER} first-destination-identity addr=${ADDR} pid=${PID} (source was addr=${SOURCE_ADDR} pid=${SOURCE_PID}) rows: ${OUT}"
+          elif [ "$PID" = "$DEST_PID" ]; then
+            echo "MODE-OK ts=${NOW} iter=${ITER} destination-steady addr=${ADDR} pid=${PID} rows: ${OUT}"
+          elif [ "$PID" = "$SOURCE_PID" ]; then
+            echo "MODE-A ts=${NOW} iter=${ITER} stale-read-after-cutover addr=${ADDR} pid=${PID} (expected destination pid=${DEST_PID}) rows: ${OUT}"
+          else
+            echo "MODE-OK ts=${NOW} iter=${ITER} new-unexpected-identity addr=${ADDR} pid=${PID} rows: ${OUT}"
+          fi
+        fi
+
+        sleep "$INTERVAL_SECS"
+      done
+
+      echo "postgres-live-client: polling window complete iterations=${ITER} source_pid=${SOURCE_PID} source_addr=${SOURCE_ADDR} dest_pid=${DEST_PID} dest_addr=${DEST_ADDR}"
     resources:
       requests:
         memory: "32Mi"

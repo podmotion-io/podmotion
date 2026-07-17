@@ -83,7 +83,7 @@ func TestRestoreBranch1_MACFlowsToReportRestoreConfirmed(t *testing.T) {
 	// Track that joinNsRestoreFn was called.
 	joinNsCalled := false
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount) (int, []ExternalMountDroppedInfo, error) {
+	joinNsRestoreFn = func(_ context.Context, migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount, containerCgroupsPath, podCgroupParent, preservedSourceIP string) (int, []ExternalMountDroppedInfo, error) {
 		joinNsCalled = true
 		return 99999, nil, nil
 	}
@@ -123,13 +123,13 @@ func TestRestoreBranch2_MACFlowsToReportRestoreConfirmed(t *testing.T) {
 
 	// Stub patchCheckpointImagesFn — Branch 2 calls this; without stub it would exec Python.
 	origPatch := patchCheckpointImagesFn
-	patchCheckpointImagesFn = func(_ string, _ []string, _ []string) error { return nil }
+	patchCheckpointImagesFn = func(_ string, _ []string, _ []string, _ map[string]string) error { return nil }
 	defer func() { patchCheckpointImagesFn = origPatch }()
 
 	// Track that joinNsRestoreFn was called.
 	joinNsCalled := false
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount) (int, []ExternalMountDroppedInfo, error) {
+	joinNsRestoreFn = func(_ context.Context, migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount, containerCgroupsPath, podCgroupParent, preservedSourceIP string) (int, []ExternalMountDroppedInfo, error) {
 		joinNsCalled = true
 		return 99999, nil, nil
 	}
@@ -167,7 +167,7 @@ func TestJoinNsRestore_ReturnsMACToCaller(t *testing.T) {
 
 	// Stub joinNsRestoreFn — avoids real CRIU subprocess.
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount) (int, []ExternalMountDroppedInfo, error) {
+	joinNsRestoreFn = func(_ context.Context, migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount, containerCgroupsPath, podCgroupParent, preservedSourceIP string) (int, []ExternalMountDroppedInfo, error) {
 		return 99999, nil, nil
 	}
 	defer func() { joinNsRestoreFn = origJoin }()
@@ -192,8 +192,11 @@ func TestJoinNsRestore_ReturnsMACToCaller(t *testing.T) {
 	s.destWorkloadImageMu.Lock()
 	s.destWorkloadImage["test-nri-migration"] = "docker.io/library/redis:7-alpine"
 	s.destWorkloadImageMu.Unlock()
-	// JoinNsRestore signature: (migrationName, checkpointDir, imageName, containerID, sandboxID, tcpPreservationMode)
-	_, gotMAC, err := s.JoinNsRestore("test-nri-migration", "/tmp/fake-checkpoint", "", "", "", "None")
+	// JoinNsRestore signature: (migrationName, namespace, checkpointDir, imageName, containerID, sandboxID, containerCgroupsPath, podCgroupParent, tcpPreservationMode)
+	// namespace="default" is a test-only placeholder — this test injects a nil k8sClient, so
+	// ReportRestoreConfirmed's namespace-gated k8s patch (folded into JoinNsRestore by ADR-0353
+	// R4) is a no-op and the namespace value itself is not asserted on.
+	_, gotMAC, err := s.JoinNsRestore("test-nri-migration", "default", "/tmp/fake-checkpoint", "", "", "", "", "", "None")
 	if err != nil {
 		t.Fatalf("JoinNsRestore returned unexpected error: %v", err)
 	}
@@ -217,7 +220,7 @@ func TestRestoreBranch1_StrictFailsWhenNoK8sClient(t *testing.T) {
 	defer func() { readReplVethMACFn = orig }()
 
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount) (int, []ExternalMountDroppedInfo, error) {
+	joinNsRestoreFn = func(_ context.Context, migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount, containerCgroupsPath, podCgroupParent, preservedSourceIP string) (int, []ExternalMountDroppedInfo, error) {
 		return 12345, nil, nil
 	}
 	defer func() { joinNsRestoreFn = origJoin }()

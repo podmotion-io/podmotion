@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -103,18 +104,33 @@ func buildResumeFn(ctx context.Context, f *FaultFixture, pmNN types.NamespacedNa
 // PatchCRCondition is a convenience helper that patches an arbitrary condition
 // on the PodMigration status. Used by chaos scenarios that need to simulate
 // operator-set conditions (e.g., StorageCutoverTimeout).
+//
+// Retries a bounded number of times on optimistic-lock conflicts: chaos
+// scenarios that exercise a concurrently-writing simulated reconciler (e.g.
+// FS-093's sync-point protocol) can otherwise race a legitimate concurrent
+// status writer and fail spuriously rather than on a real defect.
 func PatchCRCondition(ctx context.Context, f *FaultFixture, pmNN types.NamespacedName, condType, reason, message string, status metav1.ConditionStatus) error {
-	var pm pmv1.PodMigration
-	if err := f.Client.Get(ctx, pmNN, &pm); err != nil {
-		return fmt.Errorf("PatchCRCondition Get: %w", err)
+	var lastErr error
+	for attempt := 0; attempt < 10; attempt++ {
+		var pm pmv1.PodMigration
+		if err := f.Client.Get(ctx, pmNN, &pm); err != nil {
+			return fmt.Errorf("PatchCRCondition Get: %w", err)
+		}
+		base := pm.DeepCopy()
+		meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
+			Type:               condType,
+			Status:             status,
+			Reason:             reason,
+			Message:            message,
+			LastTransitionTime: metav1.Now(),
+		})
+		lastErr = f.Client.Status().Patch(ctx, &pm, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+		if lastErr == nil {
+			return nil
+		}
+		if !apierrors.IsConflict(lastErr) {
+			return lastErr
+		}
 	}
-	base := pm.DeepCopy()
-	meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
-		Type:               condType,
-		Status:             status,
-		Reason:             reason,
-		Message:            message,
-		LastTransitionTime: metav1.Now(),
-	})
-	return f.Client.Status().Patch(ctx, &pm, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	return fmt.Errorf("PatchCRCondition: exhausted retries on conflict: %w", lastErr)
 }

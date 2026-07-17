@@ -929,3 +929,96 @@ func TestStrictMigrationVisitsOverlayHandoffAndDisengageHold(t *testing.T) {
 		}
 	}
 }
+
+// TestDisengageHoldReadsOverlayReadyFromConditions is the regression for the sprint46B4
+// live-proof cycle-2 wedge: a live redis Strict migration reached phase=DisengageHold with
+// VXLANFDBUpdated=True, Restored=True and Status.SourceConntrackArmed=true — every input the
+// ADR-0049 post-restore barrier needs — yet hung for the full 120s cap because reconcileDisengageHold
+// re-derived the barrier by re-issuing a live ConfirmOverlayReady RPC that requeued every 5s and
+// never set OverlayReady (docs/sprints/sprint46B4/live-proof-c2-transcript.txt).
+//
+// This test drives reconcileDisengageHold with that EXACT condition set and a nil AgentPool (the
+// live re-probe is unreachable). Under the old brittle-chain code the barrier block returned a
+// bare RequeueAfter without ever setting OverlayReady — an unbounded wedge. Under the ADR-0352 /
+// invariant-#10 primitive it reads the source-of-truth write-backs and sets OverlayReady=True with
+// no live RPC. Note it deliberately does NOT pre-seed RelayProgramsLoaded (the fast-path condition
+// TestStrictMigrationVisitsOverlayHandoffAndDisengageHold uses), because that pre-seed short-circuits
+// the barrier at the top of reconcileDisengageHold and is exactly why the wedge slipped prior gates.
+func TestDisengageHoldReadsOverlayReadyFromConditions(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := pmv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme pmv1: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme corev1: %v", err)
+	}
+	now := metav1.Now()
+	cond := func(typ string) metav1.Condition {
+		return metav1.Condition{Type: typ, Status: metav1.ConditionTrue, Reason: "PreSeeded",
+			Message: "live-proof cycle-2 state", LastTransitionTime: now}
+	}
+
+	newPM := func(name string, conds []metav1.Condition, srcConntrack bool) *pmv1.PodMigration {
+		return &pmv1.PodMigration{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: pmv1.PodMigrationSpec{
+				PodName:             "redis-src",
+				PodNamespace:        "default",
+				TCPPreservationMode: pmv1.TCPPreservationModeStrict,
+				RollbackOnFailure:   true,
+				TargetNodeName:      "pm-w2",
+			},
+			Status: pmv1.PodMigrationStatus{
+				Phase:               pmv1.MigrationPhaseDisengageHold,
+				Conditions:          conds,
+				SourceNodeName:      "pm-w1",
+				DestinationNodeName: "pm-w2",
+				SourceConntrackArmed: srcConntrack,
+			},
+		}
+	}
+
+	t.Run("all_inputs_present_sets_OverlayReady_without_live_rpc", func(t *testing.T) {
+		pm := newPM("live-proof-c2-mig1",
+			[]metav1.Condition{
+				cond(string(pmv1.ConditionVXLANFDBUpdated)), // B/C/D + dest-E, confirmed pre-restore
+				cond(conditionRestored),                     // F: CRIU restore complete
+			}, true /* SourceConntrackArmed: source-E axis */)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(pm).WithStatusSubresource(pm).Build()
+		// AgentPool intentionally nil: the retired live re-probe would be unreachable here.
+		r := &PodMigrationReconciler{Client: fakeClient, Scheme: scheme}
+
+		if _, err := r.reconcileDisengageHold(context.Background(), pm); err != nil {
+			t.Fatalf("reconcileDisengageHold returned error: %v", err)
+		}
+		if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionOverlayReady) {
+			t.Fatalf("OverlayReady was not set True from source-of-truth conditions — the barrier wedge is NOT fixed; conditions=%+v",
+				pm.Status.Conditions)
+		}
+	})
+
+	t.Run("missing_input_fails_closed_not_wedged", func(t *testing.T) {
+		// VXLANFDBUpdated absent → an upstream invariant is missing. The primitive must fail
+		// CLOSED (bounded, invariant #8), never infinite-requeue at the barrier.
+		pm := newPM("live-proof-c2-migX",
+			[]metav1.Condition{cond(conditionRestored)}, true)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(pm).WithStatusSubresource(pm).Build()
+		r := &PodMigrationReconciler{Client: fakeClient, Scheme: scheme}
+
+		if _, err := r.reconcileDisengageHold(context.Background(), pm); err != nil {
+			t.Fatalf("reconcileDisengageHold (fail-closed) returned error: %v", err)
+		}
+		// The fail-closed branch must set OverlayReady=False with the BarrierInputsAbsent reason
+		// and route to rollback — NOT the old brittle-chain behaviour of a bare RequeueAfter that
+		// leaves OverlayReady entirely absent and re-probes forever (the unbounded wedge).
+		oc := meta.FindStatusCondition(pm.Status.Conditions, pmv1.ConditionOverlayReady)
+		if oc == nil {
+			t.Fatalf("OverlayReady absent — the barrier silently requeued instead of failing closed (invariant #8)")
+		}
+		if oc.Status != metav1.ConditionFalse || oc.Reason != "BarrierInputsAbsent" {
+			t.Fatalf("expected OverlayReady=False/BarrierInputsAbsent on missing input, got %s/%s", oc.Status, oc.Reason)
+		}
+	})
+}
