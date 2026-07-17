@@ -116,7 +116,71 @@ func TestPgProbe_ErrorResponseIsFailure(t *testing.T) {
 	}
 }
 
-func TestPgProbe_AuthRequiredIsFailure(t *testing.T) {
+// fakePgAuthFirstReply drives one side of a net.Pipe: reads the StartupMessage, then writes a
+// single Authentication message ('R') with the given authtype and optional trailing payload
+// (e.g. an MD5 salt or a SASL mechanism list) as its ONLY reply — never authenticating,
+// never sending ReadyForQuery. It models a real server's first post-startup wire frame.
+func fakePgAuthFirstReply(t *testing.T, conn net.Conn, authType uint32, extra []byte) {
+	t.Helper()
+	hdr := make([]byte, 4)
+	if _, err := readFullTest(conn, hdr); err != nil {
+		return
+	}
+	mlen := binary.BigEndian.Uint32(hdr)
+	body := make([]byte, mlen-4)
+	_, _ = readFullTest(conn, body)
+
+	payload := make([]byte, 0, 4+len(extra))
+	payload = binary.BigEndian.AppendUint32(payload, authType)
+	payload = append(payload, extra...)
+	buf := make([]byte, 0, 5+len(payload))
+	buf = append(buf, 'R')
+	buf = binary.BigEndian.AppendUint32(buf, uint32(4+len(payload)))
+	buf = append(buf, payload...)
+	_, _ = conn.Write(buf)
+}
+
+// TestPgProbe_AuthChallengeIsLiveness is the ADR-0325 round-2 correction (sprint46B9): a
+// password-protected Postgres replies to the credential-free StartupMessage with a genuine
+// authentication CHALLENGE. A wire-correct challenge can only come from a live postmaster past
+// canAcceptConnections and a real protocol-v3 backend, so it is PROOF of liveness — the probe
+// must PASS (it still never authenticates). Covers AuthenticationCleartextPassword (3),
+// AuthenticationMD5Password (5 + 4-byte salt), and AuthenticationSASL (10 + mechanism list) —
+// the three shapes a real postgres:16-alpine emits for md5/scram/cleartext pg_hba entries.
+func TestPgProbe_AuthChallengeIsLiveness(t *testing.T) {
+	cases := []struct {
+		name     string
+		authType uint32
+		extra    []byte
+	}{
+		{"CleartextPassword", 3, nil},
+		{"MD5Password", 5, []byte{0xde, 0xad, 0xbe, 0xef}},
+		{"SASL", 10, append([]byte("SCRAM-SHA-256"), 0x00, 0x00)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				fakePgAuthFirstReply(t, server, tc.authType, tc.extra)
+			}()
+
+			err := pgProbe(context.Background(), client, "", 2*time.Second)
+			<-done
+			if err != nil {
+				t.Fatalf("pgProbe: a genuine %s auth challenge proves a live Postgres and must PASS (probe still never authenticates), got error: %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// TestPgProbe_MalformedAuthMessageIsFailure keeps the fail-closed guard: an 'R' message whose
+// body is too short to hold an int32 authtype is garbage, not a live Postgres — must FAIL.
+func TestPgProbe_MalformedAuthMessageIsFailure(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -132,20 +196,36 @@ func TestPgProbe_AuthRequiredIsFailure(t *testing.T) {
 		body := make([]byte, mlen-4)
 		_, _ = readFullTest(server, body)
 
-		// AuthenticationCleartextPassword: type 'R', authtype=3 (non-zero => must fail).
-		payload := make([]byte, 4)
-		binary.BigEndian.PutUint32(payload, 3)
-		buf := make([]byte, 0, 9)
-		buf = append(buf, 'R')
-		buf = binary.BigEndian.AppendUint32(buf, uint32(4+len(payload)))
-		buf = append(buf, payload...)
+		// 'R' with a 2-byte body (< 4) — cannot carry an authtype.
+		buf := []byte{'R', 0, 0, 0, 6, 0x01, 0x02}
 		_, _ = server.Write(buf)
 	}()
 
 	err := pgProbe(context.Background(), client, "", 2*time.Second)
 	<-done
 	if err == nil {
-		t.Fatalf("pgProbe: expected AuthRequired failure (probe must never authenticate), got nil error")
+		t.Fatalf("pgProbe: a malformed Authentication message (body < 4 bytes) must FAIL closed, got nil error")
+	}
+}
+
+// TestPgProbe_AuthContinuationAsFirstReplyIsFailure keeps a fail-closed guard: a continuation
+// subtype (11 = SASLContinue) can never legitimately be a server's FIRST reply — a peer that
+// leads with one is not a healthy handshake and must FAIL, not be mistaken for liveness.
+func TestPgProbe_AuthContinuationAsFirstReplyIsFailure(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fakePgAuthFirstReply(t, server, 11, []byte("server-first-message"))
+	}()
+
+	err := pgProbe(context.Background(), client, "", 2*time.Second)
+	<-done
+	if err == nil {
+		t.Fatalf("pgProbe: an auth continuation subtype (11) as the FIRST reply must FAIL closed, got nil error")
 	}
 }
 

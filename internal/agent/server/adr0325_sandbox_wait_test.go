@@ -212,7 +212,7 @@ func TestRestore_StrictSandboxAppearsAfterRace_PassesGate(t *testing.T) {
 	var joinCalled int32
 	var gotSandboxID string
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(_ context.Context, migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount, containerCgroupsPath, podCgroupParent string) (int, []ExternalMountDroppedInfo, error) {
+	joinNsRestoreFn = func(_ context.Context, migName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount, containerCgroupsPath, podCgroupParent, preservedSourceIP string) (int, []ExternalMountDroppedInfo, error) {
 		atomic.StoreInt32(&joinCalled, 1)
 		gotSandboxID = sandboxID
 		return 0, nil, errors.New("stub-join-stop: gate-passed marker")

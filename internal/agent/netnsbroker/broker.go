@@ -110,6 +110,13 @@ var migrationUIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,127}$`)
 //     bounded metacharacter-free component.
 var netnsPathRe = regexp.MustCompile(`^(?:/run/netns|/var/run/netns)/[A-Za-z0-9_.-]{1,64}$`)
 
+// containerIDRe validates the holder_sentinel op's ContainerID. containerd/CRI
+// container IDs are lowercase hex; accept the general alphanumeric container-token
+// shape (bounded length, no path/traversal characters) since the value is used
+// only as a substring to match against /proc/<pid>/cgroup content — never as a
+// filesystem path (the sentinel path is fixed server-side).
+var containerIDRe = regexp.MustCompile(`^[a-zA-Z0-9]{8,128}$`)
+
 // validateNetnsPath enforces all four SR-4 properties (ADR-0346 D4 a-d) on a
 // client-supplied NetnsPath (the srcPID<=0 branch only). It is the sole gate
 // before netnsPath reaches any nsenter --net= invocation.
@@ -144,7 +151,7 @@ func validateNetnsPath(netnsPath string) error {
 
 // Request is the JSON wire request accepted on the broker socket.
 type Request struct {
-	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal" | "signal_pid" | "resolve_veth" | "netns_exec" | "netns_exec_start"
+	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal" | "signal_pid" | "resolve_veth" | "holder_sentinel" | "netns_exec" | "netns_exec_start"
 	// MigrationUID names the per-migration netns dir. Validated by migrationUIDRe.
 	// Required on create/teardown; ignored on exec*.
 	MigrationUID string `json:"migrationUID"`
@@ -220,6 +227,21 @@ type Request struct {
 	// before being used verbatim as the nsenter --net= target. SrcPID takes
 	// precedence when both are supplied.
 	NetnsPath string `json:"netnsPath,omitempty"`
+
+	// ContainerID (holder_sentinel op) is the containerd container ID of the
+	// replacement pod's restore-target (holder-running) container. The de-privileged
+	// SD-1 agent cannot itself observe the holder-ready sentinel: reading it means
+	// dereferencing /proc/<holderPID>/root/run/podmotion/holder-ready, and opening
+	// another container's /proc/<pid>/root routes through a ptrace_may_access gate
+	// that the narrow `podmotion-agent` AppArmor profile denies (it permits
+	// ptrace-read only against peer=unconfined; the holder runs under
+	// cri-containerd.apparmor.d) — the exact `apparmor DENIED operation="ptrace"`
+	// signature (identical class to resolve_veth/signal_pid). The unconfined,
+	// hostPID broker resolves the holder init PID from this container ID (a plain
+	// /proc/<pid>/cgroup substring scan — not ptrace-gated) and stats the sentinel
+	// at a FIXED server-side relative path, so a client never supplies a filesystem
+	// path (no traversal surface). Validated by containerIDRe.
+	ContainerID string `json:"containerID,omitempty"`
 }
 
 // Response is the JSON wire response. Error is "" on success.
@@ -254,6 +276,13 @@ type Response struct {
 	// against the exec_start snapshot to detect the restored workload (ADR-0128
 	// new-entrant liveness signal, relocated to the broker cgroup).
 	CgroupPIDs []int `json:"cgroupPIDs,omitempty"`
+
+	// Found (holder_sentinel op only): true when the holder-ready sentinel exists
+	// inside the resolved holder container's root (the holder has parked and
+	// signalled quiescence). false is a valid, non-error negative — the barrier
+	// keeps polling — and is reported with Error=="". A broker-side failure
+	// (unresolvable container ID validation, etc.) sets Error instead.
+	Found bool `json:"found,omitempty"`
 }
 
 // netnsPathFor returns the broker-computed bind target for a migrationUID.
@@ -442,6 +471,12 @@ func Handle(req Request) Response {
 		// de-privileged agent's behalf (the agent's AppArmor profile denies the
 		// ptrace-read needed to open another pod's /proc/<pid>/ns/net).
 		return doResolveVeth(req.SrcPID)
+	case "holder_sentinel":
+		// Observe the holder-quiescent sentinel inside the restore-target
+		// container's root on the de-privileged agent's behalf: the agent's
+		// AppArmor profile denies the ptrace-read needed to dereference another
+		// container's /proc/<pid>/root (the exact same class as resolve_veth).
+		return doHolderSentinel(req.ContainerID)
 	case "netns_exec":
 		// ADR-0326: run an allowlisted ("ip" or the broker's own pinned self path)
 		// command inside the target pod's NET namespace, run-to-completion.
@@ -456,7 +491,7 @@ func Handle(req Request) Response {
 		// exactly as they do exec_start children (ADR-0326 Decision item 4).
 		return doNetnsExecStart(req.SrcPID, req.NetnsPath, req.Argv)
 	default:
-		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal|signal_pid|resolve_veth|netns_exec|netns_exec_start)", req.Op))
+		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal|signal_pid|resolve_veth|holder_sentinel|netns_exec|netns_exec_start)", req.Op))
 	}
 }
 
@@ -635,6 +670,79 @@ func doResolveVeth(srcPID int) Response {
 		Stderr:   stderr.Bytes(),
 		Combined: combined.Bytes(),
 	}
+}
+
+// holderReadySentinelRelPath is the FIXED, server-pinned relative path (under the
+// resolved container's root) of the holder-quiescent sentinel written by
+// cmd/holder (/run/podmotion/holder-ready). It is a constant so a client never
+// supplies any part of the privileged read path — the only client-supplied value
+// is the container ID, matched as a substring against /proc/<pid>/cgroup.
+const holderReadySentinelRelPath = "run/podmotion/holder-ready"
+
+// doHolderSentinel resolves the restore-target container's holder init PID from
+// the supplied container ID and reports whether the holder-ready sentinel exists
+// inside that container's root. It runs the whole /proc-crossing observation in
+// the unconfined broker because the confined `podmotion-agent` profile denies the
+// ptrace-read that dereferencing /proc/<pid>/root requires (see the ContainerID
+// field doc + resolve_veth/signal_pid for the identical delegation class).
+//
+// A missing sentinel — OR a not-yet-resolvable container PID — is a valid negative
+// (Found:false, Error:""), not a failure: the barrier polls until the holder parks
+// or its own deadline fires. Error is set only on a malformed container ID.
+func doHolderSentinel(containerID string) Response {
+	if !containerIDRe.MatchString(containerID) {
+		return Response{Error: fmt.Sprintf("holder_sentinel: containerID %q is not a valid container token", containerID)}
+	}
+	pid := findContainerInitPIDByCgroup(containerID)
+	if pid <= 0 {
+		// Container process not visible yet (StartContainer fired, entrypoint not
+		// forked, or the cgroup entry not populated). Keep polling.
+		return Response{Found: false}
+	}
+	sentinelPath := fmt.Sprintf("/proc/%d/root/%s", pid, holderReadySentinelRelPath)
+	if _, err := os.Stat(sentinelPath); err == nil {
+		return Response{Found: true}
+	}
+	return Response{Found: false}
+}
+
+// findContainerInitPIDByCgroup scans /proc for a process whose cgroup membership
+// contains containerID and returns its PID (0 if none). Reading /proc/<pid>/cgroup
+// is a plain procfs read (NOT ptrace-mediated), so it succeeds even under the
+// confined agent — but it is done here so the resolve + the ptrace-gated
+// /proc/<pid>/root stat that follows both live in the one unconfined process. The
+// broker is hostPID:true, so /proc enumerates every host process; a cgroup-ns
+// relativized path still contains the full cri-containerd-<id>.scope leaf, so the
+// substring match holds.
+func findContainerInitPIDByCgroup(containerID string) int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid := 0
+		for _, c := range e.Name() {
+			if c < '0' || c > '9' {
+				pid = -1
+				break
+			}
+			pid = pid*10 + int(c-'0')
+		}
+		if pid <= 0 {
+			continue
+		}
+		cgroupData, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(cgroupData), containerID) {
+			return pid
+		}
+	}
+	return 0
 }
 
 // nsenterNetNs builds an *exec.Cmd that runs `nsenter --net=/proc/<pid>/ns/net --

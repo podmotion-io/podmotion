@@ -148,3 +148,65 @@ func findDeadPID(t *testing.T) int {
 	_ = cmd.Wait()
 	return pid
 }
+
+// TestHandleHolderSentinel locks in the properties of the holder_sentinel broker op:
+// it validates the client-supplied container ID (rejecting anything with path/
+// traversal characters), reports a not-yet-resolvable container as a NON-error
+// negative (Found:false, Error:""), and — because the sentinel path is fixed
+// server-side — takes no client-supplied filesystem path. This op exists because
+// the confined agent's direct /proc/<holderPID>/root stat is AppArmor-ptrace-denied;
+// the unconfined broker performs the resolve + stat on its behalf.
+func TestHandleHolderSentinel(t *testing.T) {
+	t.Run("rejects malformed container IDs (no path/traversal chars)", func(t *testing.T) {
+		for _, cid := range []string{"", "../../etc/passwd", "abc/def", "has space", "a", "short", "bad!id", "/proc/1/root"} {
+			resp := Handle(Request{Op: "holder_sentinel", ContainerID: cid})
+			if resp.Error == "" {
+				t.Fatalf("containerID %q: expected validation rejection, got success (%+v)", cid, resp)
+			}
+			if !strings.Contains(resp.Error, "holder_sentinel") {
+				t.Fatalf("containerID %q: error %q should mention holder_sentinel", cid, resp.Error)
+			}
+			if resp.Found {
+				t.Fatalf("containerID %q: a rejected request must not report Found:true", cid)
+			}
+		}
+	})
+
+	t.Run("unresolvable container is a non-error negative", func(t *testing.T) {
+		// A syntactically valid but non-existent container ID: no process cgroup
+		// contains it, so the broker cannot resolve a PID. This is Found:false with
+		// NO Error — the barrier keeps polling rather than aborting.
+		cid := "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+		resp := Handle(Request{Op: "holder_sentinel", ContainerID: cid})
+		if resp.Error != "" {
+			t.Fatalf("unresolvable container: expected non-error negative, got Error %q", resp.Error)
+		}
+		if resp.Found {
+			t.Fatalf("unresolvable container: expected Found:false, got true")
+		}
+	})
+
+	t.Run("takes no client-supplied path (fixed sentinel rel path)", func(t *testing.T) {
+		// The op reads ONLY the ContainerID; the sentinel path is the server-pinned
+		// constant. A poisoned NetnsPath/Argv must be ignored entirely.
+		resp := Handle(Request{
+			Op:          "holder_sentinel",
+			ContainerID: "deadbeefdeadbeefdeadbeefdeadbeef",
+			NetnsPath:   "/run/netns/../../etc",
+			Argv:        []string{"/bin/sh", "-c", "touch /tmp/pwned"},
+		})
+		if resp.Error != "" {
+			t.Fatalf("valid container token must not error on ignored NetnsPath/Argv, got %q", resp.Error)
+		}
+		if resp.Found {
+			t.Fatalf("unresolvable container must be Found:false regardless of ignored fields")
+		}
+	})
+
+	t.Run("unknown op error names holder_sentinel", func(t *testing.T) {
+		resp := Handle(Request{Op: "bogus"})
+		if resp.Error == "" || !strings.Contains(resp.Error, "holder_sentinel") {
+			t.Fatalf("unknown-op error should list holder_sentinel, got %q", resp.Error)
+		}
+	})
+}
