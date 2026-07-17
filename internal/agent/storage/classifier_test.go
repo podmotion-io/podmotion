@@ -346,6 +346,69 @@ func TestStorageClassifier_PostgresPGDataOnRWX_ReachesTier0(t *testing.T) {
 	}
 }
 
+// TestStorageClassifier_Tier1_LonghornRWX is the regression guard for the
+// live-gate stall (2026-07-17): a Longhorn-backed StorageClass ("longhorn-migratable",
+// provisioner driver.longhorn.io) genuinely supports live migration via its own
+// dual-engine mechanism even when the PVC's accessMode is ReadWriteMany. Before this
+// fix, the classifier checked accessModes for RWX FIRST and short-circuited to
+// TierRWX (generic Tier0 re-attach) before ever inspecting the StorageClass, so this
+// PVC was misrouted into the Longhorn-incompatible generic path and hit a Longhorn
+// CSI "invalid controller count 2" error during a live test. A Longhorn-backed
+// StorageClass must route to TierLonghorn regardless of accessMode.
+func TestStorageClassifier_Tier1_LonghornRWX(t *testing.T) {
+	pvc := makePVC("lh-rwx-pvc", "default", "longhorn-migratable",
+		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
+	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+	pod := makePodWithPVC("default", "lh-rwx-pvc")
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(newScheme()).
+		WithObjects(pvc, sc).
+		Build()
+
+	classifier := storage.NewStorageClassifier(fakeClient)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(clsfs) != 1 {
+		t.Fatalf("expected 1 classification, got %d", len(clsfs))
+	}
+	if clsfs[0].Tier != storage.TierLonghorn {
+		t.Errorf("expected TierLonghorn (1) for a Longhorn-backed RWX PVC, got %d (reason=%q)",
+			clsfs[0].Tier, clsfs[0].Reason)
+	}
+}
+
+// TestStorageClassifier_Tier1_LonghornRWX_AnnotationOnly covers a Longhorn
+// StorageClass identified only via a longhorn.io/* annotation (not the provisioner
+// string) still routes RWX to TierLonghorn ahead of the generic RWX check.
+func TestStorageClassifier_Tier1_LonghornRWX_AnnotationOnly(t *testing.T) {
+	pvc := makePVC("lh-rwx-annot-pvc", "default", "lh-annot-sc",
+		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
+	sc := makeSC("lh-annot-sc", "some.other.provisioner", map[string]string{
+		"longhorn.io/last-applied-configmap": "unused",
+	})
+	pod := makePodWithPVC("default", "lh-rwx-annot-pvc")
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(newScheme()).
+		WithObjects(pvc, sc).
+		Build()
+
+	classifier := storage.NewStorageClassifier(fakeClient)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(clsfs) != 1 {
+		t.Fatalf("expected 1 classification, got %d", len(clsfs))
+	}
+	if clsfs[0].Tier != storage.TierLonghorn {
+		t.Errorf("expected TierLonghorn (1) for a Longhorn-annotated RWX StorageClass, got %d", clsfs[0].Tier)
+	}
+}
+
 func TestLonghornStubMigrator_EmitsReadyImmediately(t *testing.T) {
 	stub := &storage.LonghornStubMigrator{}
 
