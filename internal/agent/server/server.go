@@ -816,7 +816,7 @@ func setConditionOnPM(pm *pmv1.PodMigration, condType string, status metav1.Cond
 // enforces, rather than an arbitrary or re-guessed number.
 const restoreInvariantBudget = 120 * time.Second
 
-func (s *AgentServer) JoinNsRestore(migrationName, namespace, checkpointDir, imageName, containerID, sandboxID, containerCgroupsPath, podCgroupParent, tcpPreservationMode string) (int, string, error) {
+func (s *AgentServer) JoinNsRestore(ctx context.Context, migrationName, namespace, checkpointDir, imageName, containerID, sandboxID, containerCgroupsPath, podCgroupParent, tcpPreservationMode string) (int, string, error) {
 	// ADR-0353 R2/R3: acquire the single-owner in-flight restore claim before driving CRIU. A
 	// second actor (the gRPC Restore fallback) racing this same migration MUST NOT proceed —
 	// decline with the TRANSIENT-RETRY ErrRestoreInFlight and leave this owner as sole authority.
@@ -892,25 +892,24 @@ func (s *AgentServer) JoinNsRestore(migrationName, namespace, checkpointDir, ima
 	// block used to derive is retired along with sandboxPausePIDWaiting itself — the cgroup-anchor
 	// primitive is a zero-query, zero-poll, zero-retry read of event data already in hand, so no
 	// ctx budget is needed for it.
-	// ADR-0354 DR-2: joinNsRestoreFn still takes a ctx parameter (other call sites thread the
-	// real gRPC/restore ctx they were given). The NRI ContainerEvent path that reaches
-	// JoinNsRestore genuinely has no caller ctx to thread — NRI is a synchronous hook callback,
-	// not a ctx-bearing RPC, so there is no upstream deadline/cancellation to propagate (unlike
-	// the gRPC Restore handler's primary and raw-CRIU-fallback drives, which DO have one). Rather
-	// than rooting on a bare context.Background() with no ceiling of its own (the same defect
-	// class this ADR retires elsewhere), construct a BOUNDED ctx here from the authoritative
-	// restore/migration deadline (restoreInvariantBudget, constitutional invariant #8 — the same
-	// 120s live-migration cap already cited at server.go's replacementSandboxWaitBudget and
-	// throughout internal/controller/podmigration_controller.go's invariant-#8 completion-budget
-	// gate) so every broker exec (D2/D2b/D2c) this call drives is still deadline-bound, just off
-	// a locally-constructed ceiling instead of an inherited one. This CANNOT widen any existing
-	// bound (there was none here before) and is strictly tighter than the prior unbounded
-	// Background() root.
+	// ADR-0354 round 7 (Fix 1): the prior comment here claimed the NRI ContainerEvent path
+	// "genuinely has no caller ctx to thread." That assumption is WRONG — the NRI plugin
+	// (internal/agent/nri/plugin.go) constructs a real, correctly-bounded
+	// restoreCtx = context.WithTimeout(context.Background(), 90*time.Second) and passes it into
+	// OnStartContainer; cmd/agent/main.go's OnStartContainer closure receives that ctx as its
+	// first parameter and now threads it here instead of discarding it. So JoinNsRestore DOES
+	// have a real upstream deadline to observe. The umbrella ctx below is now derived from that
+	// real, passed-in ctx (not context.Background()) via the same tighten-only clamp pattern
+	// used elsewhere in this ADR (D2's min-clamp): the effective deadline is
+	// min(90s from the NRI plugin, restoreInvariantBudget) rather than a disconnected local
+	// 120s budget. restoreInvariantBudget remains the outer ceiling for any caller (present or
+	// future) whose ctx carries no deadline of its own, or a longer one than 120s — it can only
+	// tighten, never widen, the effective bound.
 	//
 	// This umbrella ctx is constructed HERE — ahead of the reattach-mount wait below — so that
 	// reCtx (ADR-0354 round 6 fix) can derive from it as a child budget instead of independently
 	// rooting on context.Background(). See the reCtx comment below.
-	joinNsRestoreCtx, joinNsRestoreCancel := context.WithTimeout(context.Background(), restoreInvariantBudget)
+	joinNsRestoreCtx, joinNsRestoreCancel := context.WithTimeout(ctx, restoreInvariantBudget)
 	defer joinNsRestoreCancel()
 	// Resolve shared/re-attach PVC mount paths (Tier0 RWX) so patchCheckpointImages preserves them
 	// and CRIU re-attaches them on restore instead of P-0193-1 hard-stopping their open file fds.

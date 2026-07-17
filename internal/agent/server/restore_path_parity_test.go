@@ -196,7 +196,11 @@ func TestJoinNsRestore_ReturnsMACToCaller(t *testing.T) {
 	// namespace="default" is a test-only placeholder — this test injects a nil k8sClient, so
 	// ReportRestoreConfirmed's namespace-gated k8s patch (folded into JoinNsRestore by ADR-0353
 	// R4) is a no-op and the namespace value itself is not asserted on.
-	_, gotMAC, err := s.JoinNsRestore("test-nri-migration", "default", "/tmp/fake-checkpoint", "", "", "", "", "", "None")
+	// ADR-0354 round 7: JoinNsRestore now takes a leading ctx. This test harness has no real
+	// upstream NRI/gRPC ctx to thread (it drives JoinNsRestore directly, not through the NRI
+	// plugin), so context.Background() is used deliberately — this is a test-only call site,
+	// not a live production path.
+	_, gotMAC, err := s.JoinNsRestore(context.Background(), "test-nri-migration", "default", "/tmp/fake-checkpoint", "", "", "", "", "", "None")
 	if err != nil {
 		t.Fatalf("JoinNsRestore returned unexpected error: %v", err)
 	}
