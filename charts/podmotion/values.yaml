@@ -10,6 +10,11 @@ operator:
   # Passed as --feature-gates=<value> to the manager binary.
   # Example: "TCPPreservation=true,GPUMigration=false"
   featureGates: "TCPPreservation=true"
+  # longhornManagerURL is the base URL of the Longhorn Manager HTTP API, used by the
+  # Tier1 storage migrator for dual-engine live migration (replica add/poll/detach/attach).
+  # Passed as --longhorn-manager-url=<value> to the manager binary. Defaults to the
+  # standard in-cluster Longhorn service address; override for non-standard installs.
+  longhornManagerURL: "http://longhorn-backend.longhorn-system.svc.cluster.local:9500"
   resources:
     requests:
       cpu: 100m
