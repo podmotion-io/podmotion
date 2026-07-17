@@ -48,7 +48,7 @@ func TestRestoreInFlightSingleOwner_NotYetAliveRace(t *testing.T) {
 	defer func() { joinNsRestoreFn = origJoin }()
 
 	origMAC := readReplVethMACFn
-	readReplVethMACFn = func(int, string, string) (string, error) { return "aa:bb:cc:dd:ee:ff", nil }
+	readReplVethMACFn = func(context.Context, int, string, string) (string, error) { return "aa:bb:cc:dd:ee:ff", nil }
 	defer func() { readReplVethMACFn = origMAC }()
 
 	s := New("test-node", &criu.StubCheckpointer{}, nil)

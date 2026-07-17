@@ -91,7 +91,7 @@ func TestRestoreBranch1_MACFlowsToReportRestoreConfirmed(t *testing.T) {
 
 	// Stub readReplVethMACFn — proves the production symbol is wired correctly.
 	origMAC := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
+	readReplVethMACFn = func(_ context.Context, pid int, netnsPath, ifname string) (string, error) {
 		return "aa:bb:cc:dd:ee:ff", nil
 	}
 	defer func() { readReplVethMACFn = origMAC }()
@@ -137,7 +137,7 @@ func TestRestoreBranch2_MACFlowsToReportRestoreConfirmed(t *testing.T) {
 
 	// Stub readReplVethMACFn — proves the production symbol is wired correctly.
 	origMAC := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
+	readReplVethMACFn = func(_ context.Context, pid int, netnsPath, ifname string) (string, error) {
 		return "aa:bb:cc:dd:ee:ff", nil
 	}
 	defer func() { readReplVethMACFn = origMAC }()
@@ -174,7 +174,7 @@ func TestJoinNsRestore_ReturnsMACToCaller(t *testing.T) {
 
 	// Stub readReplVethMACFn — returns the expected MAC.
 	origMAC := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
+	readReplVethMACFn = func(_ context.Context, pid int, netnsPath, ifname string) (string, error) {
 		return wantMAC, nil
 	}
 	defer func() { readReplVethMACFn = origMAC }()
@@ -214,7 +214,7 @@ func TestRestoreBranch1_StrictFailsWhenNoK8sClient(t *testing.T) {
 
 	// Stub readReplVethMACFn to return an error — simulates MAC resolution failure.
 	orig := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
+	readReplVethMACFn = func(_ context.Context, pid int, netnsPath, ifname string) (string, error) {
 		return "", errors.New("stub: MAC resolution failed")
 	}
 	defer func() { readReplVethMACFn = orig }()
