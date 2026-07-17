@@ -75,7 +75,7 @@ func TestResolveReattachMounts_ResolvesHostTargetByLabelWhenStatusEmpty(t *testi
 	// Stub the on-host glob: return the kubelet dir ONLY for the labelled replacement pod's UID.
 	orig := kubeletVolumeGlobFn
 	t.Cleanup(func() { kubeletVolumeGlobFn = orig })
-	kubeletVolumeGlobFn = func(uid, pv string) string {
+	kubeletVolumeGlobFn = func(_ context.Context, uid, pv string) string {
 		if uid == replUID && pv == pvName {
 			return wantHost
 		}
@@ -118,7 +118,7 @@ func TestResolveReattachMounts_ResolvesHostTargetByLabelWhenStatusEmpty(t *testi
 	}
 	s := newFakeAgentServerWithCoreObjects(t, pm, pvc, replPod)
 
-	mounts, err := s.resolveReattachMounts(migName)
+	mounts, err := s.resolveReattachMounts(context.Background(), migName)
 	if err != nil {
 		t.Fatalf("resolveReattachMounts returned error with a resolved host target: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestResolveReattachMounts_WaitsThenResolvesWhenVolumeNotYetPublished(t *tes
 	calls := 0
 	orig := kubeletVolumeGlobFn
 	t.Cleanup(func() { kubeletVolumeGlobFn = orig })
-	kubeletVolumeGlobFn = func(uid, pv string) string {
+	kubeletVolumeGlobFn = func(_ context.Context, uid, pv string) string {
 		mu.Lock()
 		defer mu.Unlock()
 		calls++
@@ -222,7 +222,7 @@ func TestResolveReattachMounts_WaitsThenResolvesWhenVolumeNotYetPublished(t *tes
 	s := newFakeAgentServerWithCoreObjects(t, pm, pvc, replPod)
 
 	// (i) single-shot returns the retryable sentinel, not a broken mount.
-	mounts, err := s.resolveReattachMounts(migName)
+	mounts, err := s.resolveReattachMounts(context.Background(), migName)
 	var notYet *ReattachVolumeNotYetPublishedError
 	if !errors.As(err, &notYet) {
 		t.Fatalf("expected ReattachVolumeNotYetPublishedError on the first (unpublished) probe; got mounts=%+v err=%v", mounts, err)
@@ -302,7 +302,7 @@ func TestResolveReattachMountsWaiting_BudgetExhausted_FailsClosed(t *testing.T) 
 
 	orig := kubeletVolumeGlobFn
 	t.Cleanup(func() { kubeletVolumeGlobFn = orig })
-	kubeletVolumeGlobFn = func(uid, pv string) string { return "" } // never published
+	kubeletVolumeGlobFn = func(_ context.Context, uid, pv string) string { return "" } // never published
 
 	pm, pvc, replPod := reattachTestFixture(migName, replUID, pvName, containerPath)
 	s := newFakeAgentServerWithCoreObjects(t, pm, pvc, replPod)
@@ -352,7 +352,7 @@ func TestResolveReattachMounts_InTreeNFSShapeResolvesEndToEnd(t *testing.T) {
 	// End-to-end through the label path: glob returns the in-tree NFS dir for the labelled repl UID.
 	orig := kubeletVolumeGlobFn
 	t.Cleanup(func() { kubeletVolumeGlobFn = orig })
-	kubeletVolumeGlobFn = func(uid, pv string) string {
+	kubeletVolumeGlobFn = func(_ context.Context, uid, pv string) string {
 		if uid == replUID && pv == pvName {
 			return wantHost
 		}
@@ -362,7 +362,7 @@ func TestResolveReattachMounts_InTreeNFSShapeResolvesEndToEnd(t *testing.T) {
 	pm, pvc, replPod := reattachTestFixture(migName, replUID, pvName, containerPath)
 	s := newFakeAgentServerWithCoreObjects(t, pm, pvc, replPod)
 
-	mounts, err := s.resolveReattachMounts(migName)
+	mounts, err := s.resolveReattachMounts(context.Background(), migName)
 	if err != nil {
 		t.Fatalf("resolveReattachMounts errored on a published in-tree NFS mount: %v", err)
 	}
@@ -404,7 +404,7 @@ func TestResolveReattachMounts_ExcludesNonTier0RWOPVC(t *testing.T) {
 	// unresolved host target. If the gate were absent this would resolve to a re-attach mount.
 	orig := kubeletVolumeGlobFn
 	t.Cleanup(func() { kubeletVolumeGlobFn = orig })
-	kubeletVolumeGlobFn = func(uid, pv string) string {
+	kubeletVolumeGlobFn = func(_ context.Context, uid, pv string) string {
 		if uid == replUID && pv == pvName {
 			return published
 		}
@@ -416,7 +416,7 @@ func TestResolveReattachMounts_ExcludesNonTier0RWOPVC(t *testing.T) {
 	pvc.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
 	s := newFakeAgentServerWithCoreObjects(t, pm, pvc, replPod)
 
-	mounts, err := s.resolveReattachMounts(migName)
+	mounts, err := s.resolveReattachMounts(context.Background(), migName)
 	if err != nil {
 		t.Fatalf("resolveReattachMounts returned error for a non-Tier0 PVC (expected clean exclusion): %v", err)
 	}

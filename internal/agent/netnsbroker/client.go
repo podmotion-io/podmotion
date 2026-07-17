@@ -36,6 +36,17 @@ func NewClient() *Client {
 	}
 }
 
+// NewClientForTesting returns a Client dialing socketPath instead of the production
+// SocketPath (ADR-0354 D6 test-injection seam). SocketPath is an unexported struct field
+// and the production default (const SocketPath, /run/podmotion/netns-broker.sock) requires
+// root to bind, so cross-package regression tests (internal/agent/server) need a way to
+// point brokerCmd/brokerCriuCmd/resolveReplVethPeer at a fake, test-owned broker listener
+// exercising the SAME do()/wire-protocol code this Client uses in production — never a
+// re-implementation of the transport. Not called by any non-test production code path.
+func NewClientForTesting(socketPath string, dialTimeout, opTimeout time.Duration) *Client {
+	return &Client{socketPath: socketPath, dialTimeout: dialTimeout, opTimeout: opTimeout}
+}
+
 func (c *Client) path() string {
 	if c.socketPath != "" {
 		return c.socketPath
@@ -306,6 +317,17 @@ func (c *Client) do(ctx context.Context, req Request) (Response, error) {
 	}
 	defer conn.Close()
 
+	// ADR-0354 DR-1: DialContext only observes ctx cancellation during the dial
+	// itself — once connected, nothing previously re-checked ctx.Done(), so a
+	// cancelled caller ctx (Abort, errgroup-cancel) could not unblock a wedged
+	// write/read; it ran to the opTimeout/deadline clamp below instead. This
+	// watcher re-deadlines the conn the moment ctx is cancelled, so the blocking
+	// read at ReadBytes below is cut at cancel latency, not the clamp. Client-side
+	// and cancellation-only: no wire message, broker-side code, socket path, or
+	// allowlist change.
+	cancelStop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer cancelStop()
+
 	deadline := time.Now().Add(c.opTimeout)
 	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
 		deadline = dl
@@ -318,11 +340,17 @@ func (c *Client) do(ctx context.Context, req Request) (Response, error) {
 	}
 	b = append(b, '\n')
 	if _, err := conn.Write(b); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return Response{}, fmt.Errorf("write request: %w", ctxErr)
+		}
 		return Response{}, fmt.Errorf("write request: %w", err)
 	}
 
 	line, err := bufio.NewReader(conn).ReadBytes('\n')
 	if err != nil && len(line) == 0 {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return Response{}, fmt.Errorf("read response: %w", ctxErr)
+		}
 		return Response{}, fmt.Errorf("read response: %w", err)
 	}
 	var resp Response

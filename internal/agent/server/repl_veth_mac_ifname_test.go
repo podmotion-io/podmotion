@@ -101,7 +101,7 @@ func TestFinalizeNetnsPath_ResolvedMigrationNetnsReturnsPmdst0Ifname(t *testing.
 // finalizeNetnsPath handed "pmdst0" to the read → empty MAC → Strict fail-closed.
 func TestFinalizeRestore_SandboxNetnsStrictDoesNotFailClosed(t *testing.T) {
 	orig := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
+	readReplVethMACFn = func(_ context.Context, pid int, netnsPath, ifname string) (string, error) {
 		if ifname == "eth0" {
 			return "aa:bb:cc:dd:ee:ff", nil
 		}
@@ -134,7 +134,7 @@ func TestFinalizeRestore_SandboxNetnsStrictDoesNotFailClosed(t *testing.T) {
 func TestFinalizeRestore_PassesIfnameToMACRead(t *testing.T) {
 	var gotIfname string
 	orig := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
+	readReplVethMACFn = func(_ context.Context, pid int, netnsPath, ifname string) (string, error) {
 		gotIfname = ifname
 		return "aa:bb:cc:dd:ee:ff", nil
 	}
@@ -175,7 +175,7 @@ func TestFinalizeRestore_WriteBack_CaptureLatchesValue_NoReReadOnReinvocation(t 
 	var captureReadPID int
 	captureReadNetnsPath := "SENTINEL"
 	orig := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
+	readReplVethMACFn = func(_ context.Context, pid int, netnsPath, ifname string) (string, error) {
 		reads++
 		if reads == 1 {
 			captureReadPID, captureReadNetnsPath = pid, netnsPath
@@ -191,7 +191,7 @@ func TestFinalizeRestore_WriteBack_CaptureLatchesValue_NoReReadOnReinvocation(t 
 	// joinNsRestore recorded the authoritative pod-sandbox netns handle (ADR-0325 / R1) ...
 	storeResolvedNetnsPath(migration, "/var/run/netns/cni-writeback", "eth0")
 	// ... and, the instant CRIU brought the process up, captured the MAC from the process's OWN netns.
-	captureRestoredVethMAC(migration, 7777, "")
+	captureRestoredVethMAC(context.Background(), migration, 7777, "")
 
 	// The capture read the process's OWN netns by SrcPID (pid>0), NOT the recorded bind PATH — the
 	// bind-path read is the exact one that returned empty for ~75s on the live substrate.

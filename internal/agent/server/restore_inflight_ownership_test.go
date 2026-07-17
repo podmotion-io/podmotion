@@ -48,7 +48,7 @@ func TestRestoreInFlightSingleOwner_NotYetAliveRace(t *testing.T) {
 	defer func() { joinNsRestoreFn = origJoin }()
 
 	origMAC := readReplVethMACFn
-	readReplVethMACFn = func(int, string, string) (string, error) { return "aa:bb:cc:dd:ee:ff", nil }
+	readReplVethMACFn = func(context.Context, int, string, string) (string, error) { return "aa:bb:cc:dd:ee:ff", nil }
 	defer func() { readReplVethMACFn = origMAC }()
 
 	s := New("test-node", &criu.StubCheckpointer{}, nil)
@@ -66,7 +66,10 @@ func TestRestoreInFlightSingleOwner_NotYetAliveRace(t *testing.T) {
 		defer wg.Done()
 		// NRI path — k8sClient is nil so ReportRestoreConfirmed inside JoinNsRestore is a
 		// non-fatal no-op path per its own nil-guard; the test only asserts CRIU-call symmetry.
-		_, _, _ = s.JoinNsRestore(migName, "default", "/tmp/does-not-matter", "", "container-1", "sandbox-1", "", "", "None")
+		// ADR-0354 round 7: JoinNsRestore now takes a leading ctx; this test harness has no real
+		// upstream NRI ctx to thread (it drives JoinNsRestore directly, not through the NRI
+		// plugin), so context.Background() is used deliberately — test-only, not a live path.
+		_, _, _ = s.JoinNsRestore(context.Background(), migName, "default", "/tmp/does-not-matter", "", "container-1", "sandbox-1", "", "", "None")
 	}()
 
 	<-entered // wait until the NRI restore is genuinely mid-CRIU (claim held, not confirmed)

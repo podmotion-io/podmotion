@@ -510,7 +510,12 @@ func main() {
 			// ADR-0351 D1.2: pass the NRI-carried cgroup fields straight through as parameters —
 			// no query, no poll, no side-map. event.ContainerCgroupsPath/PodCgroupParent were
 			// populated directly off the NRI hook payload in buildContainerEvent (plugin.go).
-			pid, replVethMAC, err := agentSrv.JoinNsRestore(checkpointRef, migrationNamespace, checkpointDir, event.ImageName, event.ID, event.SandboxID, event.ContainerCgroupsPath, event.PodCgroupParent, tcpPreservationMode)
+			// ADR-0354 round 7 (Fix 1): thread the real ctx this closure already receives from
+			// the NRI plugin (internal/agent/nri/plugin.go's restoreCtx, a genuine 90s-bounded
+			// upstream deadline) instead of discarding it. JoinNsRestore now derives its umbrella
+			// budget from this ctx (min(90s, restoreInvariantBudget)) rather than an unbounded
+			// context.Background() that was disconnected from any real caller deadline.
+			pid, replVethMAC, err := agentSrv.JoinNsRestore(ctx, checkpointRef, migrationNamespace, checkpointDir, event.ImageName, event.ID, event.SandboxID, event.ContainerCgroupsPath, event.PodCgroupParent, tcpPreservationMode)
 			if err != nil {
 				log.Error(err, "NRI CRIU restore failed", "container", event.ID)
 				return err
