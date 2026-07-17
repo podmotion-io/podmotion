@@ -68,6 +68,13 @@ rules:
   - apiGroups: [cilium.io]
     resources: [ciliumendpoints]
     verbs: [get, list, watch]
+  # Storage tier classification (StorageClassifier, internal/agent/storage) resolves each
+  # PVC's StorageClass to decide TierRWX vs TierLonghorn vs TierCephRBD vs TierSnapshotRsync.
+  # Cluster-scoped: StorageClass is a cluster-scoped resource. Without this the classifier's
+  # StorageClass lookup is forbidden and every PVC falls through to TierBlocked.
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses]
+    verbs: [get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
