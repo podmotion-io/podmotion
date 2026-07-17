@@ -221,3 +221,48 @@ func parseHex32(s string) (uint32, error) {
 	}
 	return uint32(v), nil
 }
+
+// IsIntraPodLoopback reports whether the TCP 4-tuple identified by (srcIP, dstIP)
+// is an intra-pod loopback connection: BOTH endpoints are on the loopback range
+// (127.0.0.0/8 for IPv4, ::1 for IPv6).
+//
+// Such a connection has both ends inside the pod's own network namespace — it has
+// no external peer. During a pod migration CRIU checkpoints and restores both ends
+// atomically (or neither), so its continuity is guaranteed by the restore itself and
+// NEVER by TCP sequence-number preservation against a surviving external peer. These
+// connections are therefore categorically outside the TCP sequence-continuity
+// contract and must not enter the continuity inventory:
+//
+//   - They are typically ephemeral kubelet exec/TCP health-probe connections (e.g.
+//     a `redis-cli ping` readiness probe → 127.0.0.1:6379) that are re-established
+//     every probe interval, so the specific ephemeral client port captured at the
+//     freeze instant is gone after restore.
+//   - Capturing one at freeze is an intermittent race against the probe cadence; the
+//     captured-but-unrestorable loopback tuple then scores as an unmatched connection
+//     in VerifyTCP and rolls back an otherwise-successful Strict migration.
+//
+// Requiring BOTH ends to be loopback is the fail-safe direction: a real held client
+// connection always has a non-loopback remote peer and is therefore never filtered.
+// This is a MIGRATION POLICY, not a fact about the socket table — the low-level
+// enumerators (SocketInventory, ExportTCPRepairState) still report every socket
+// honestly; callers building a continuity inventory apply this scoping themselves.
+func IsIntraPodLoopback(srcIP, dstIP net.IP) bool {
+	return srcIP != nil && dstIP != nil && srcIP.IsLoopback() && dstIP.IsLoopback()
+}
+
+// FilterMigratableTCP returns the subset of entries whose TCP continuity across a pod
+// migration is meaningful — i.e. every ESTABLISHED socket EXCEPT intra-pod loopback
+// connections (see IsIntraPodLoopback). The returned slice is a fresh allocation; the
+// input is not mutated. Returns nil when no migratable entries remain (the caller's
+// fail-closed / non-vacuity logic then treats the migration as having no held
+// connections to preserve, which is the correct outcome for a probe-only pod).
+func FilterMigratableTCP(entries []SocketEntry) []SocketEntry {
+	var out []SocketEntry
+	for _, e := range entries {
+		if IsIntraPodLoopback(e.SrcIP, e.DstIP) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}

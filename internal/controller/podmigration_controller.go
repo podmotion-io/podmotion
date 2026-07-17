@@ -722,9 +722,30 @@ func (r *PodMigrationReconciler) reconcileZeroWindowArm(ctx context.Context, pm 
 	}
 
 	if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeNone {
-		log.Info("ZeroWindowArm: skipped (TCPPreservationMode=None)", "migration", pm.Name)
-		setCondition(pm, pmv1.ConditionZeroWindowArmed, metav1.ConditionTrue,
-			"Skipped", "TCPPreservationMode=None: zero-window hold not required")
+		// ConditionZeroWindowArmed is NOT a mere phase-completion marker like the other
+		// None-mode "Skipped" conditions (SocketInventoryComplete, DestinationNetnsReady,
+		// VXLANFDBUpdated, IPHandoffInjected) — it is ALSO the fail-closed antecedent of the
+		// single source-teardown gate (SourceTeardownBlockReason / disarmZeroWindowOnFailurePath):
+		// "if a real TC-BPF hold was armed, teardown is blocked until it is confirmed disarmed."
+		// In None mode NO hold is ever armed (there is no frozen source socket to protect), so
+		// the honest value is FALSE, not True-with-reason-Skipped. Recording True here was a
+		// convention-collision bug: it made the teardown gate's antecedent fire on a mode that
+		// never arms a hold, and the ONLY producer of ZeroWindowDisarmed=True is
+		// reconcileDisengageHold — which the None-mode legacy completion tail
+		// (reconcileRestoringNRI -> MigrationPhaseVerifying -> reconcileVerifying, which routes
+		// only Strict onward to DisengageHold) never traverses. The result was a permanent
+		// deleteSourcePodIfSafe SAFETY BLOCK ("ZeroWindowArmed=True but ZeroWindowDisarmed is not
+		// True") that wedged phase=Verifying past the completion budget into a fail-closed
+		// rollback, even though the restore, traffic, and liveness had all verified. Setting
+		// FALSE makes the antecedent honest so the gate is vacuously satisfied for None on EVERY
+		// route (modern DisengageHold spine AND legacy Verifying tail) with no papering-over
+		// disarm marker required — matching the contract the gate and its falsifiable test
+		// (source_teardown_test.go "None_ArmedFalse_Allowed") already assume. The doc comments on
+		// SourceTeardownBlockReason and disarmZeroWindowOnFailurePath ("in None/BestEffort mode
+		// where ZeroWindowArmed is never set True") are now accurate rather than aspirational.
+		log.Info("ZeroWindowArm: skipped (TCPPreservationMode=None) — recording ZeroWindowArmed=False (no hold armed; keeps the source-teardown gate antecedent honest)", "migration", pm.Name)
+		setCondition(pm, pmv1.ConditionZeroWindowArmed, metav1.ConditionFalse,
+			"Skipped", "TCPPreservationMode=None: no zero-window hold armed — nothing to disarm; source-teardown gate antecedent stays False")
 		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1202,6 +1223,31 @@ func (r *PodMigrationReconciler) reconcileTCPVerifying(ctx context.Context, pm *
 	vtcpReq := &agentpb.VerifyTCPRequest{
 		MigrationName: pm.Name,
 		PodUid:        string(replForVerify.UID),
+	}
+	// Thread the source-freeze TCP sequence snapshots (captured at Checkpoint and persisted in
+	// pm.Status.TCPSeqSnapshots) into the VerifyTCP request. Without this the destination agent's
+	// VerifyTCP fails closed with "source SeqSnapshots absent": it resolves the source snapshots
+	// from its per-migration migrationSeqSnapshots map, but that map is written ONLY on the gRPC
+	// join-ns Restore path (server.go). The live North Star restore runs through the NRI
+	// JoinNsRestore hook (cmd/agent/main.go) — and any gRPC Restore that follows takes the
+	// ADR-0228 idempotent-confirm early return — so on the live path the map is NEVER populated
+	// and VerifyTCP has no source snapshots to compare against even though this controller holds
+	// them in status. pm.Status is the restart-durable source of truth and is populated identically
+	// for the NRI and gRPC restore paths, so passing it via SourceSeqSnapshots (which VerifyTCP
+	// already consults as a fallback when its stored map is empty, server.go) makes verification
+	// restore-path-agnostic. This does NOT weaken the fail-closed guard: if no connection was
+	// inventoried at freeze, TCPSeqSnapshots is empty and the guard still fires for a live dest
+	// connection.
+	for _, snap := range pm.Status.TCPSeqSnapshots {
+		vtcpReq.SourceSeqSnapshots = append(vtcpReq.SourceSeqSnapshots, &agentpb.SeqSnapshot{
+			SrcIp:    snap.SrcIP,
+			SrcPort:  snap.SrcPort,
+			DstIp:    snap.DstIP,
+			DstPort:  snap.DstPort,
+			SndNxt:   snap.SndNxt,
+			RcvNxt:   snap.RcvNxt,
+			TsRecent: snap.TsRecent,
+		})
 	}
 	if pm.Spec.ApplicationProbe != nil {
 		vtcpReq.AppProbeProtocol = string(pm.Spec.ApplicationProbe.Protocol)

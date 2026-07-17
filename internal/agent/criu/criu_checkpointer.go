@@ -106,6 +106,29 @@ type CRIUCheckpointer struct {
 	mu              sync.Mutex
 	activeCriu      *gocriu.Criu  // non-nil while a dump/restore is in progress
 	removedNetLinks []removedLink // links deleted pre-dump for restore-side recreation
+
+	// pidLocks serializes CRIU seize operations (pre-dump / dump) against a given
+	// target process tree. CRIU seizes the tree with PTRACE_SEIZE + PTRACE_INTERRUPT
+	// (compel infect.c); the kernel permits exactly ONE tracer per task, so two CRIU
+	// processes launched against the same root PID collide — the loser fails with
+	// "Unable to interrupt task: <pid> (Operation not permitted)" (EPERM) and aborts
+	// the whole dump. Callers above the checkpointer (the controller's pre-copy loop,
+	// the migration estimator's probe pre-dump) can each independently drive a
+	// pre-dump for the same source container, so this is a substrate-level invariant,
+	// not something any single caller can guarantee: the checkpointer OWNS CRIU, so it
+	// owns "one CRIU seize per process tree at a time." Keyed by PID (not global) so
+	// two DIFFERENT pods on the same node still checkpoint concurrently. A PID is only
+	// reused after the prior task fully exits, by which point no CRIU op holds its
+	// lock, so a stale entry is harmless.
+	pidLocks sync.Map // map[int32]*sync.Mutex
+}
+
+// lockForPID returns the per-PID serialization mutex, creating it on first use. The
+// returned mutex guards the CRIU seize window for that process tree so concurrent
+// pre-dump/dump invocations against the same PID cannot collide on PTRACE_SEIZE.
+func (c *CRIUCheckpointer) lockForPID(pid int32) *sync.Mutex {
+	m, _ := c.pidLocks.LoadOrStore(pid, &sync.Mutex{})
+	return m.(*sync.Mutex)
 }
 
 // NewCRIUCheckpointer returns a CRIUCheckpointer that invokes the CRIU binary
@@ -259,6 +282,16 @@ func (c *CRIUCheckpointer) PreDump(ctx context.Context, opts PreDumpOptions) (Ch
 		args = append(args, "--prev-images-dir", rel)
 	}
 
+	// Serialize the CRIU seize against this process tree: a concurrent pre-dump/dump
+	// for the same PID would collide on PTRACE_SEIZE and fail with EPERM ("Unable to
+	// interrupt task"). Held for the duration of the CRIU child so no second CRIU op
+	// can seize the tree until this one has detached. See pidLocks.
+	if opts.Pid != 0 {
+		pidLock := c.lockForPID(opts.Pid)
+		pidLock.Lock()
+		defer pidLock.Unlock()
+	}
+
 	// Run CRIU pre-dump. Under SD-1 this runs in the host mount namespace via the
 	// netns-broker + podmotion-criu-wrapper (host CRIU binary → host glibc); on
 	// kind/dev/tests it execs directly in the agent container. runCRIUCLI handles both.
@@ -301,6 +334,14 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	if opts.Pid == 0 {
 		return CheckpointResult{}, fmt.Errorf("criu dump: Pid is 0 — caller must resolve the container root PID before calling Dump")
 	}
+
+	// Serialize the CRIU seize against this process tree (see pidLocks). A pre-dump
+	// round for the same PID may still be finishing when the final Dump is issued; the
+	// two would otherwise collide on PTRACE_SEIZE and abort the dump with EPERM. Held
+	// across the ptrace preflight and the CRIU dump child.
+	pidLock := c.lockForPID(opts.Pid)
+	pidLock.Lock()
+	defer pidLock.Unlock()
 
 	logger := logf.FromContext(ctx)
 
