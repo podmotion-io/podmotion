@@ -888,19 +888,6 @@ func (s *AgentServer) JoinNsRestore(migrationName, namespace, checkpointDir, ima
 		// pod spec). Fail-close rather than substitute a wrong image (gate-11 lesson, ADR-0215).
 		return 0, "", fmt.Errorf("ADR-0217: restore image unresolved — NRI event, PrepareDestinationNetns cache, and replacement pod spec all empty for migration %s", migrationName)
 	}
-	// Resolve shared/re-attach PVC mount paths (Tier0 RWX) so patchCheckpointImages preserves them
-	// and CRIU re-attaches them on restore instead of P-0193-1 hard-stopping their open file fds.
-	// The replacement pod is a paused placeholder created ~5s before restore; its RWX volume may not
-	// be published in the destination kubelet's mount table at the instant this NRI restore fires, so
-	// bounded-wait on the kubelet-published mount rather than emitting a broken 1:1 map. Budget is
-	// 85s — kept just under the 90s outer NRI restoreCtx so the wait yields to the outer deadline.
-	// (JoinNsRestore takes no ctx param; the budget is derived here to keep the diff minimal.)
-	reCtx, reCancel := context.WithTimeout(context.Background(), 85*time.Second)
-	reattachMounts, reErr := s.resolveReattachMountsWaiting(reCtx, migrationName)
-	reCancel()
-	if reErr != nil {
-		return 0, "", reErr
-	}
 	// ADR-0351 D3.1/D1.2: the pause-PID bounded-wait ceiling (sandboxPausePIDWaitSubCap) this
 	// block used to derive is retired along with sandboxPausePIDWaiting itself — the cgroup-anchor
 	// primitive is a zero-query, zero-poll, zero-retry read of event data already in hand, so no
@@ -919,8 +906,31 @@ func (s *AgentServer) JoinNsRestore(migrationName, namespace, checkpointDir, ima
 	// a locally-constructed ceiling instead of an inherited one. This CANNOT widen any existing
 	// bound (there was none here before) and is strictly tighter than the prior unbounded
 	// Background() root.
+	//
+	// This umbrella ctx is constructed HERE — ahead of the reattach-mount wait below — so that
+	// reCtx (ADR-0354 round 6 fix) can derive from it as a child budget instead of independently
+	// rooting on context.Background(). See the reCtx comment below.
 	joinNsRestoreCtx, joinNsRestoreCancel := context.WithTimeout(context.Background(), restoreInvariantBudget)
 	defer joinNsRestoreCancel()
+	// Resolve shared/re-attach PVC mount paths (Tier0 RWX) so patchCheckpointImages preserves them
+	// and CRIU re-attaches them on restore instead of P-0193-1 hard-stopping their open file fds.
+	// The replacement pod is a paused placeholder created ~5s before restore; its RWX volume may not
+	// be published in the destination kubelet's mount table at the instant this NRI restore fires, so
+	// bounded-wait on the kubelet-published mount rather than emitting a broken 1:1 map. Budget is
+	// 85s — kept just under the 90s outer NRI restoreCtx so the wait yields to the outer deadline.
+	// ADR-0354 round 6: reCtx now derives from the umbrella joinNsRestoreCtx (constructed just
+	// above) instead of independently rooting on context.Background(). This composes correctly:
+	// reCtx still gets its own 85s sub-budget for the reattach-mount wait specifically, AND it now
+	// correctly observes the umbrella restoreInvariantBudget (120s) ctx if it is ever
+	// cancelled/expires early — closing the "sibling Background()-rooted ctx hidden behind three
+	// wrapper layers" gap (Client.do broker exec via resolveReattachMountsWaiting ->
+	// resolveReattachMountsImpl -> resolveKubeletVolumeHostPath -> kubeletVolumeGlobFn).
+	reCtx, reCancel := context.WithTimeout(joinNsRestoreCtx, 85*time.Second)
+	reattachMounts, reErr := s.resolveReattachMountsWaiting(reCtx, migrationName)
+	reCancel()
+	if reErr != nil {
+		return 0, "", reErr
+	}
 	// ADR-0355 D2/D3: read the authoritative preserved source IP (pm.Spec.SourcePodIP — the same
 	// field SingleHomeRestoredPod single-homes on) and thread it into joinNsRestore so the pre-CRIU
 	// bind-prep can make it locally bindable before soccr's bind() on an established-TCP restore.
