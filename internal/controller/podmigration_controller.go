@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -179,6 +180,11 @@ type PodMigrationReconciler struct {
 	// CNIMobilitySelector. Nil in unit tests — the Cilium-readiness branch is skipped
 	// (fail-closed at the call site, not here) when nil.
 	DynamicClient dynamic.Interface
+	// KubeClient is the typed clientset threaded into CNIMobilitySelector for handoff
+	// strategies that need it (currently CalicoHandoff.WaitForWorkloadEndpointReady polls
+	// the destination pod via the typed Pods().Get API). Nil in unit tests — the
+	// Calico-readiness branch is skipped (fail-closed at the call site, not here) when nil.
+	KubeClient kubernetes.Interface
 	// GPUCheckpointer handles NVIDIA CUDA context checkpoint/restore.
 	// Only called when GPUMigration feature gate is enabled and the pod has GPU resources.
 	// Defaults to GPUCheckpointerStub when nil (so GPU-unaware environments are unaffected).
@@ -4243,55 +4249,64 @@ func (r *PodMigrationReconciler) injectIPHandoff(ctx context.Context, pm *pmv1.P
 		fmt.Sprintf("OLD pod IP %s installed at replacement pod (ADR-0210 non-gating pre-check)", pm.Spec.SourcePodIP))
 
 	// Cross-node dataplane reachability of the preserved IP — the Strict source-teardown gate
-	// (api/v1alpha1/source_teardown.go: DataplaneReachabilityVerified=True). On a Cilium
-	// cross-node destination this is established from cilium-agent's authoritative CiliumEndpoint
-	// status (tryEstablishCiliumDataplaneReachability); same-node/non-Cilium fall back to the
-	// ADR-0210 producer below.
-	if res, err, done, handled := r.tryEstablishCiliumDataplaneReachability(ctx, pm, destNode); handled {
+	// (api/v1alpha1/source_teardown.go: DataplaneReachabilityVerified=True). On a Cilium or
+	// Calico cross-node destination this is established from the CNI's own authoritative
+	// readiness signal (tryEstablishDataplaneReachability, dispatched via CNIMobilitySelector);
+	// same-node or a CNI without an authoritative producer falls back to the ADR-0210 producer.
+	if res, err, done, handled := r.tryEstablishDataplaneReachability(ctx, pm, destNode); handled {
 		if !done {
 			return res, err, false
 		}
 		return ctrl.Result{}, nil, true
 	}
 
-	// Same-node (ADR-0237 vacuous) or non-Cilium destination: fall back to the ADR-0210 producer.
+	// Same-node (ADR-0237 vacuous) or a CNI with no authoritative producer wired: fall back to
+	// the ADR-0210 producer.
 	if res, err, done := r.verifyDataplaneReachability(ctx, pm, destNode); !done {
 		return res, err, false
 	}
 	return ctrl.Result{}, nil, true
 }
 
-// tryEstablishCiliumDataplaneReachability establishes the Strict cross-node source-teardown gate
-// (DataplaneReachabilityVerified) from cilium-agent's AUTHORITATIVE CiliumEndpoint status instead
-// of the ADR-0210 source-node nonce round-trip.
+// tryEstablishDataplaneReachability establishes the Strict cross-node source-teardown gate
+// (DataplaneReachabilityVerified) from the destination CNI's own AUTHORITATIVE readiness
+// write-back instead of the ADR-0210 source-node nonce round-trip.
 //
 // SUBSTRATE ROOT CAUSE (sprint46B2, decoded from source — see docs/sprints/sprint46B2/
 // live-proof-cycle2.md): the ADR-0210 producer establishes the condition with a nonce round-trip
 // dialed FROM the source-node agent (ProbeDataplaneReachability, server.go: net.Dialer.DialContext
 // + `ip route get`) TO the preserved IP. But ADR-0012 holds the SOURCE pod alive on the SOURCE
 // node with that exact IP until this very condition is True, so on the source node the preserved
-// IP resolves to the still-alive LOCAL held pod (Cilium endpointRoutes installs a /32 to the local
-// lxc veth), NOT across the geneve overlay to the destination. The dial is delivered locally to the
+// IP resolves to the still-alive LOCAL held pod (e.g. Cilium endpointRoutes installs a /32 to the
+// local lxc veth), NOT across the overlay to the destination. The dial is delivered locally to the
 // old pod (which is not the nonce echo listener), the round-trip can NEVER match, and the migration
 // wedges at CutoverComplete forever (invariant #8 breach). This is structurally identical to the
 // ADR-0237 same-node deadlock — the source-node vantage is blind to cross-node reachability of an
 // IP it still hosts locally. It is not KVM flakiness; the ADR-0210 loopback corpus cannot exhibit it.
 //
 // FIX (invariant #10 / SUBSTRATE-PRIMITIVE BIAS: read the authoritative write-back, retire the
-// inference chain). On a Cilium destination doing a CROSS-node migration, establish the gate from
-// cilium-agent's OWN CiliumEndpoint status — the source of truth that the preserved IP has been
-// programmed onto the replacement endpoint on the destination node (state=ready, identity!=0, AND
-// status.networking.addressing advertises the preserved IP). cilium-agent is the sole writer
-// (un-synthesizable by our agents — the same anti-spoof property the nonce round-trip reached for)
-// and the read is not confounded by the held source pod. This ELEVATES the ADR-0322 primitive to be
-// the gate producer and RETIRES the ADR-0210 source-node probe on this path.
+// inference chain). On a CROSS-node migration this dispatches through CNIMobilitySelector (rather
+// than a hardcoded Cilium-only string check) to the destination CNI's own IPHandoffStrategy and, for
+// the CNIs with an authoritative readiness producer wired today, establishes the gate from THAT
+// CNI's source of truth:
+//   - Cilium: cilium-agent's own CiliumEndpoint status (state=ready, identity!=0, AND
+//     status.networking.addressing advertises the preserved IP — ConfirmEndpointOwnsPreservedIP).
+//   - Calico: Felix's own WorkloadEndpoint readiness signal (WaitForWorkloadEndpointReady).
 //
-// Returns handled=false ONLY for a same-node or non-Cilium destination, signalling the caller to
-// fall back to verifyDataplaneReachability (same-node vacuous per ADR-0237; non-Cilium nonce
-// round-trip — the source-node-vantage limitation applies to a per-CNI Calico read as follow-up).
+// Both are un-synthesizable by our agents (the same anti-spoof property the nonce round-trip
+// reached for) and neither read is confounded by the held source pod. This ELEVATES those
+// per-CNI primitives to be the gate producer and RETIRES the ADR-0210 source-node probe on these
+// paths. Cilium's behavior is UNCHANGED by this generalization — same CNI match, same
+// CiliumHandoff call, same reasons, same conditions — only the dispatch mechanism (selector
+// instead of a hardcoded string check) and the function name differ.
+//
+// Returns handled=false for a same-node destination, OR a cross-node destination whose CNI has no
+// authoritative producer wired yet (OVN-K, Flannel, unknown), signalling the caller to fall back to
+// verifyDataplaneReachability (same-node vacuous per ADR-0237; non-authoritative CNI nonce
+// round-trip — the source-node-vantage limitation applies to those CNIs as follow-up work).
 // When handled=true the caller must honor (res,err,done): done=true means the gate was set True;
 // done=false means fail-closed (condition set False, requeue, source held per ADR-0012).
-func (r *PodMigrationReconciler) tryEstablishCiliumDataplaneReachability(ctx context.Context, pm *pmv1.PodMigration, destNode string) (ctrl.Result, error, bool, bool) {
+func (r *PodMigrationReconciler) tryEstablishDataplaneReachability(ctx context.Context, pm *pmv1.PodMigration, destNode string) (ctrl.Result, error, bool, bool) {
 	log := logf.FromContext(ctx)
 
 	cniPlugin, cniErr := r.resolveDestCNIPlugin(ctx, destNode)
@@ -4306,12 +4321,30 @@ func (r *PodMigrationReconciler) tryEstablishCiliumDataplaneReachability(ctx con
 	}
 
 	crossNode := pm.Status.SourceNodeName != "" && pm.Status.SourceNodeName != destNode
-	if !crossNode || !strings.Contains(strings.ToLower(cniPlugin), "cilium") {
-		// Same-node or non-Cilium: caller falls back to verifyDataplaneReachability.
+	if !crossNode {
+		// Same-node: caller falls back to verifyDataplaneReachability (ADR-0237 vacuous path).
 		return ctrl.Result{}, nil, false, false
 	}
 
-	ch := &iphandoff.CiliumHandoff{DynamicClient: r.DynamicClient}
+	selector := &iphandoff.CNIMobilitySelector{KubeClient: r.KubeClient, DynamicClient: r.DynamicClient}
+	switch h := selector.Select(ctx, cniPlugin).(type) {
+	case *iphandoff.CiliumHandoff:
+		return r.establishCiliumDataplaneReachability(ctx, pm, h)
+	case *iphandoff.CalicoHandoff:
+		return r.establishCalicoDataplaneReachability(ctx, pm, h)
+	default:
+		// OVN-K / Flannel / unknown: no authoritative producer wired yet. Caller falls back to
+		// verifyDataplaneReachability.
+		return ctrl.Result{}, nil, false, false
+	}
+}
+
+// establishCiliumDataplaneReachability is the Cilium branch of tryEstablishDataplaneReachability,
+// unchanged in behavior from the pre-generalization tryEstablishCiliumDataplaneReachability: same
+// ConfirmEndpointOwnsPreservedIP call, same reason mapping, same conditions.
+func (r *PodMigrationReconciler) establishCiliumDataplaneReachability(ctx context.Context, pm *pmv1.PodMigration, ch *iphandoff.CiliumHandoff) (ctrl.Result, error, bool, bool) {
+	log := logf.FromContext(ctx)
+
 	node, ceErr := ch.ConfirmEndpointOwnsPreservedIP(ctx, pm.Spec.PodNamespace, pm.Status.ReplacementPodName, pm.Spec.SourcePodIP)
 	if ceErr != nil {
 		reason := pmv1.ReasonCiliumEndpointNotReady
@@ -4336,6 +4369,36 @@ func (r *PodMigrationReconciler) tryEstablishCiliumDataplaneReachability(ctx con
 	setCondition(pm, pmv1.ConditionDataplaneReachabilityVerified, metav1.ConditionTrue, pmv1.ReasonCiliumDataplaneProgrammed,
 		fmt.Sprintf("cilium-agent programmed preserved IP %s onto replacement endpoint %s on node %s (authoritative CiliumEndpoint read; ADR-0322 primitive, ADR-0210 source-node nonce round-trip retired — structurally blind while source held per ADR-0012)",
 			pm.Spec.SourcePodIP, pm.Status.ReplacementPodName, node))
+	if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+		return ctrl.Result{}, sErr, false, true
+	}
+	return ctrl.Result{}, nil, true, true
+}
+
+// establishCalicoDataplaneReachability is the Calico branch of tryEstablishDataplaneReachability,
+// mirroring establishCiliumDataplaneReachability's structure but backed by
+// CalicoHandoff.WaitForWorkloadEndpointReady — the authoritative "Felix programmed the dataplane"
+// read for a Calico destination (analogous to ConfirmEndpointOwnsPreservedIP for Cilium). Without
+// this producer a cross-node Calico migration would fall through to the ADR-0210 nonce round-trip,
+// which is structurally blind to cross-node reachability while the source pod is held (see the
+// tryEstablishDataplaneReachability doc comment).
+func (r *PodMigrationReconciler) establishCalicoDataplaneReachability(ctx context.Context, pm *pmv1.PodMigration, ch *iphandoff.CalicoHandoff) (ctrl.Result, error, bool, bool) {
+	log := logf.FromContext(ctx)
+
+	if wepErr := ch.WaitForWorkloadEndpointReady(ctx, pm.Spec.PodNamespace, pm.Status.ReplacementPodName); wepErr != nil {
+		log.Error(wepErr, "injectIPHandoff: authoritative Calico WorkloadEndpoint read did not confirm the destination endpoint is active — blocking (fail-closed)", "migration", pm.Name)
+		setCondition(pm, pmv1.ConditionDataplaneReachabilityVerified, metav1.ConditionFalse, pmv1.ReasonCalicoWorkloadEndpointNotReady, wepErr.Error())
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr, false, true
+		}
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil, false, true
+	}
+
+	log.Info("injectIPHandoff: cross-node DataplaneReachability established from authoritative Calico WorkloadEndpoint readiness (ADR-0210 source-node probe retired on this path)",
+		"migration", pm.Name, "preservedIP", pm.Spec.SourcePodIP, "replacementPod", pm.Status.ReplacementPodName)
+	setCondition(pm, pmv1.ConditionDataplaneReachabilityVerified, metav1.ConditionTrue, pmv1.ReasonCalicoDataplaneProgrammed,
+		fmt.Sprintf("Calico WorkloadEndpoint for replacement pod %s is active (authoritative WEP read; ADR-0210 source-node nonce round-trip retired — structurally blind while source held per ADR-0012)",
+			pm.Status.ReplacementPodName))
 	if sErr := r.statusUpdate(ctx, pm); sErr != nil {
 		return ctrl.Result{}, sErr, false, true
 	}
