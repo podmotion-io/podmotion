@@ -10,6 +10,7 @@ package storage_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -241,5 +242,83 @@ func TestLonghornMigrator_PreStage_FullResolutionAndSync(t *testing.T) {
 	}
 	if pct != 100 {
 		t.Errorf("expected 100%% sync once replica mode=RW, got %d", pct)
+	}
+}
+
+// TestLonghornMigrator_PreStage_SkipsAddReplicaWhenDestAlreadyHealthy is the
+// regression test for the sprint48 addDestReplica bug: the destination node
+// already has a healthy replica (volume has 3 replicas total, spread across
+// 3 nodes), so PreStage must NOT call updateReplicaCount at all — the old
+// code called it unconditionally with a hardcoded replicaCount:2, which
+// shrank an already-correct 3-replica volume down to 2.
+func TestLonghornMigrator_PreStage_SkipsAddReplicaWhenDestAlreadyHealthy(t *testing.T) {
+	const (
+		namespace = "default"
+		pvcName   = "postgres-pgdata"
+		pvName    = "pvc-d39ce436-401d-4f20-ad4b-c64a736bde20"
+		destNode  = "pm-w2"
+	)
+
+	var postCalls int32
+	var mu sync.Mutex
+	var postBodies []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/volumes/"+pvName {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			// Volume already has 3 healthy replicas, one on each node,
+			// including the migration destination.
+			fmt.Fprintf(w, `{"name":%q,"state":"attached","robustness":"healthy","replicas":[`+
+				`{"name":"r1","nodeID":"pm-cp1","mode":"RW","running":true},`+
+				`{"name":"r2","nodeID":"pm-w1","mode":"RW","running":true},`+
+				`{"name":"r3","nodeID":%q,"mode":"RW","running":true}`+
+				`]}`, pvName, destNode)
+		case http.MethodPost:
+			b, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			postCalls++
+			postBodies = append(postBodies, string(b))
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer srv.Close()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1: %v", err)
+	}
+	pvc := makeBoundPVC(namespace, pvcName, pvName)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pvc).Build()
+
+	mig := storage.NewLonghornMigrator(srv.URL, c)
+
+	opts := storage.MigrationOptions{
+		MigrationName:   "mig-4",
+		PodNamespace:    namespace,
+		DestinationNode: destNode,
+		Classifications: []storage.TierClassification{
+			{Tier: storage.TierLonghorn, PVCName: pvcName},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := mig.PreStage(ctx, opts); err != nil {
+		t.Fatalf("PreStage returned error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if postCalls != 0 {
+		t.Errorf("expected PreStage to skip updateReplicaCount when destination already has a healthy replica, got %d POST call(s) with bodies %v", postCalls, postBodies)
 	}
 }
