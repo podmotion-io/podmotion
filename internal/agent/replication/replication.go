@@ -10,6 +10,7 @@ package replication
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -36,6 +37,25 @@ type ReplicationManager struct {
 	Client client.Client
 	// AgentPool provides per-node gRPC connections to source agents.
 	AgentPool *agentclient.AgentClientPool
+
+	// inFlight is a single-flight guard keyed by PodMigration UID. The controller
+	// launches RunPreCopyLoop in a goroutine whenever the MemorySynced condition is
+	// still absent (podmigration_controller.go reconcilePreCopyMemory: `memoryCond ==
+	// nil`). That guard is a LAGGING signal — MemorySynced is only written when the
+	// loop concludes — so the burst of reconciles that fire in the first second of the
+	// PreCopyMemory phase (each triggered by a peer status write: storage pre-stage,
+	// network arm, etc.) every see `memoryCond == nil` and each launch ANOTHER loop
+	// goroutine. Multiple loops then issue PreDumpRound(round=0) for the SAME source
+	// container PID concurrently; the concurrent `criu pre-dump` processes race to
+	// PTRACE_SEIZE the same tree and all but one fail with compel infect.c:131
+	// "Unable to interrupt task: <pid> (Operation not permitted)" -> cr-dump.c:1922
+	// "Pre-dumping FAILED" -> exit 1. The controller then (mis)reads that as a genuine
+	// pre-dump failure and force-freezes with roundsCompleted=0. This map makes the
+	// launch idempotent per migration: exactly one loop runs for a given UID; a
+	// concurrent second launch is a no-op that returns immediately. The entry is
+	// cleared when the loop returns so a genuinely re-driven migration (new UID, or a
+	// re-reconcile after the prior loop has fully concluded) can run again.
+	inFlight sync.Map // map[types.UID]struct{}
 }
 
 // RunPreCopyLoop executes the full Mirror → Iterative Sync → Convergence loop.
@@ -59,6 +79,23 @@ func (r *ReplicationManager) RunPreCopyLoop(
 
 	if r.AgentPool == nil {
 		return fmt.Errorf("ReplicationManager.AgentPool is nil — cannot run pre-copy via RPC")
+	}
+
+	// Single-flight: at most one pre-copy loop per migration UID. The controller may
+	// launch this goroutine several times in quick succession before the first one
+	// writes MemorySynced (see the inFlight field comment); without this guard those
+	// concurrent loops issue overlapping PreDumpRound RPCs for the same source PID and
+	// the racing `criu pre-dump` processes collide on PTRACE_SEIZE, failing all but one
+	// round and forcing a spurious force-freeze. LoadOrStore is the atomic
+	// check-and-set: the first caller stores its sentinel and proceeds; any concurrent
+	// caller sees loaded==true and returns without touching CRIU.
+	flightKey := pm.UID
+	if flightKey != "" {
+		if _, loaded := r.inFlight.LoadOrStore(flightKey, struct{}{}); loaded {
+			log.Info("pre-copy loop already in flight for this migration — skipping duplicate launch")
+			return nil
+		}
+		defer r.inFlight.Delete(flightKey)
 	}
 
 	sourceNode := pm.Status.SourceNodeName

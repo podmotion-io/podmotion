@@ -27,15 +27,15 @@ import (
 
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/go-logr/logr"
-	k8sruntime "k8s.io/apimachinery/pkg/runtime"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	corev1 "k8s.io/api/core/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -47,6 +47,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/seccomp"
 	"github.com/podmotion-io/podmotion/internal/agent/server"
 	agenttls "github.com/podmotion-io/podmotion/internal/agent/tls"
+	"github.com/podmotion-io/podmotion/internal/buildinfo"
 )
 
 const tmpfsMagic = 0x01021994
@@ -318,6 +319,16 @@ func main() {
 
 	log.Info("PodMotion agent starting", "node", nodeName)
 
+	// Surface the authoritative build identity so a live-migration proof run can be
+	// bound to the exact source tree this binary was built from, instead of inferring
+	// artifact/source correspondence structurally after the fact. A dirty build is
+	// flagged explicitly: its identity is not pinned to a commit.
+	prov := buildinfo.Read()
+	log.Info("build provenance", prov.LogValues()...)
+	if prov.Dirty {
+		log.Info("WARNING: agent built from a working tree with uncommitted changes — build identity is NOT pinned to a commit; a proof artifact must record this and be rebuilt from a committed tree to establish artifact/source correspondence")
+	}
+
 	// Load mTLS config from cert-manager-provisioned secret mount.
 	// Falls back to insecure if certs are not present (dev/kind environment).
 	tlsCfg, err := agenttls.LoadServerConfig(
@@ -490,28 +501,22 @@ func main() {
 			// NOT call ReadReplVethMAC independently (path-independent contract, ADR-0133 D3).
 			// E1 Condition 2: SingleHomeRestoredPod is called inside finalizeRestore; do not
 			// call it independently here.
-			pid, replVethMAC, err := agentSrv.JoinNsRestore(checkpointRef, checkpointDir, event.ImageName, event.ID, event.SandboxID, tcpPreservationMode)
+			// ADR-0353 R4/D6: ReportRestoreConfirmed is now called INSIDE JoinNsRestore itself
+			// (server-side critical section), not here — the deferred releaseRestore inside
+			// JoinNsRestore must fire AFTER the terminal confirm, never before, so the
+			// single-owner claim release never straddles the server<->main package boundary.
+			// This closure passes migrationNamespace (already resolved above) into JoinNsRestore
+			// and no longer calls ReportRestoreConfirmed independently.
+			// ADR-0351 D1.2: pass the NRI-carried cgroup fields straight through as parameters —
+			// no query, no poll, no side-map. event.ContainerCgroupsPath/PodCgroupParent were
+			// populated directly off the NRI hook payload in buildContainerEvent (plugin.go).
+			pid, replVethMAC, err := agentSrv.JoinNsRestore(checkpointRef, migrationNamespace, checkpointDir, event.ImageName, event.ID, event.SandboxID, event.ContainerCgroupsPath, event.PodCgroupParent, tcpPreservationMode)
 			if err != nil {
 				log.Error(err, "NRI CRIU restore failed", "container", event.ID)
 				return err
 			}
-			log.Info("NRI CRIU restore complete", "container", event.ID, "restoredPID", pid,
-				"replVethMAC", replVethMAC)
-
-			// ADR-0120 D3: propagate authoritative restore confirmation back to the
-			// PodMigration CR. The migration name equals the checkpoint-ref; the CR
-			// namespace was already resolved above (before JoinNsRestore) for tcpPreservationMode.
-			// Use a fresh context: the NRI handler context (ctx) is cancelled
-			// when the NRI socket disconnects during CRIU restore, which would
-			// cause the k8s patch to hit "context deadline exceeded".
-			reportCtx, reportCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer reportCancel()
-
-			if err := agentSrv.ReportRestoreConfirmed(reportCtx, checkpointRef, migrationNamespace, int32(pid), replVethMAC); err != nil {
-				log.Error(err, "NRI CRIU restore: failed to report confirmation to CR — controller poll will time out",
-					"migration", checkpointRef, "namespace", migrationNamespace)
-				return err
-			}
+			log.Info("NRI CRIU restore complete (ReportRestoreConfirmed reported server-side, ADR-0353 R4)",
+				"container", event.ID, "restoredPID", pid, "replVethMAC", replVethMAC)
 			return nil
 		},
 	).WithK8sVerification(k8sClient, nodeName)

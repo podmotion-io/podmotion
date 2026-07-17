@@ -11,7 +11,7 @@ rules:
     resources: [events]
     verbs: [create, patch, update]
   - apiGroups: [""]
-    resources: [nodes, persistentvolumeclaims]
+    resources: [nodes, persistentvolumeclaims, services]
     verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [pods]
@@ -80,6 +80,13 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: [nodes]
+    verbs: [get, list, watch]
+  # SSRF pod-CIDR allowlist (nodePodCIDRAllowlist, server.go — ADR-0325) keys on the AUTHORITATIVE
+  # Cilium cluster-pool IPAM per-node block (CiliumNode.spec.ipam.podCIDRs), NOT Node.Spec.PodCIDRs
+  # (proven to diverge from Cilium's real allocation on this substrate). Without get on ciliumnodes
+  # the read fails and the allowlist falls CLOSED (empty), refusing every application probe.
+  - apiGroups: [cilium.io]
+    resources: [ciliumnodes]
     verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [pods]

@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	"github.com/podmotion-io/podmotion/internal/agent/traffic"
 )
 
 // ─── G8: Storage cutover timeout and quiescence hook failure ──────────────────
@@ -397,4 +398,90 @@ func waitForAnyTerminal(ctx context.Context, f *FaultFixture, pmNN types.Namespa
 		case <-time.After(terminalPollInterval):
 		}
 	}
+}
+
+// ─── FS-093: Postgres/Tier0 rollback-cleanliness guard (ADR-0344 Decision B) ──
+//
+// Three injection points, built on the working FaultFixture/WaitForSyncPoint
+// chaos-harness pattern already used by RunFS016-RunFS019b (NOT FS-092, which
+// does not compile at HEAD — see ADR-0344 Context §3/§5). Asserts EndpointSlice
+// intactness via HasEndpointForIP directly rather than depending on
+// AssertSourceServiceEndpointIntact/RemoveSourceIfVerified/RunFS092, none of
+// which exist in non-test/compiling code today.
+//
+// FS093Variant selects which of the three injection points RunFS093 exercises.
+type FS093Variant int
+
+const (
+	// FS093PreRemountConfirmation injects the fault between phase entry and
+	// StorageHandoffReady returning source_readonly:true.
+	FS093PreRemountConfirmation FS093Variant = iota
+	// FS093PostRemountPreRestore injects the fault after the source is
+	// read-only but before destination CRIU restore completes.
+	FS093PostRemountPreRestore
+	// FS093Verifying injects the fault during the Verifying phase (mirrors the
+	// kill/delay pattern used by RunFS016/RunFS017).
+	FS093Verifying
+)
+
+// RunFS093 exercises FS-093: the postgres/Tier0-specific rollback-cleanliness
+// fault scenario (ADR-0344 Decision A + Decision B).
+//
+// For all three variants it additionally asserts single-action rollback: the
+// only phase transition driven after fault injection is the reconciler's own
+// initiateRollback -> MigrationPhaseRollingBack -> terminal path.
+func RunFS093(ctx context.Context, f *FaultFixture, pmNN types.NamespacedName, sourceNamespace, sourceIP string, variant FS093Variant) error {
+	var syncPoint string
+	switch variant {
+	case FS093PreRemountConfirmation:
+		syncPoint = "post-checkpoint-transfer"
+	case FS093PostRemountPreRestore:
+		syncPoint = "post-checkpoint-transfer"
+	case FS093Verifying:
+		syncPoint = "post-freeze"
+	default:
+		return fmt.Errorf("FS-093: unknown variant %d", variant)
+	}
+
+	resume, err := WaitForSyncPoint(ctx, f, pmNN, syncPoint)
+	if err != nil {
+		return fmt.Errorf("FS-093 WaitForSyncPoint(%s): %w", syncPoint, err)
+	}
+
+	reason := fmt.Sprintf("chaos: FS-093 fault injected (variant=%d)", variant)
+	if patchErr := PatchCRCondition(ctx, f, pmNN,
+		"StorageCutoverTimeout", "FS093FaultInjected", reason, metav1.ConditionTrue,
+	); patchErr != nil {
+		resume()
+		return fmt.Errorf("FS-093 inject fault: %w", patchErr)
+	}
+	resume()
+
+	// Single-action rollback: waitForTerminalFailure only observes the
+	// reconciler's own initiateRollback -> RollingBack/Failed transition — no
+	// second manual remediation step is performed by this helper.
+	if err := waitForTerminalFailure(ctx, f, pmNN); err != nil {
+		return fmt.Errorf("FS-093 failure assertion: %w", err)
+	}
+
+	esMgr := traffic.NewEndpointSliceManager(f.Client)
+	hasEP, epErr := esMgr.HasEndpointForIP(ctx, sourceNamespace, sourceIP)
+	if epErr != nil {
+		return fmt.Errorf("FS-093 HasEndpointForIP: %w", epErr)
+	}
+	if !hasEP {
+		return fmt.Errorf("FS-093: source IP %s no longer present on Service EndpointSlices after fault injection", sourceIP)
+	}
+
+	if variant == FS093PreRemountConfirmation {
+		if err := AssertNoDestinationMountCreated(ctx, f, pmNN); err != nil {
+			return fmt.Errorf("FS-093 (pre-remount-confirmation variant): %w", err)
+		}
+	}
+
+	if err := AssertSourceStorageWriteRestored(ctx, f, pmNN); err != nil {
+		return fmt.Errorf("FS-093: %w", err)
+	}
+
+	return nil
 }

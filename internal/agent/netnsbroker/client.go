@@ -57,19 +57,8 @@ func (c *Client) Create(ctx context.Context, migrationUID string, srcPID int) (s
 	return resp.Path, nil
 }
 
-// ExecResult is the outcome of a broker host-mount-ns exec. It mirrors what the
-// agent would have gotten from running `nsenter --mount=/proc/1/ns/mnt -- <argv>`
-// itself: ExitCode is the command's exit status, Stdout/Stderr/Combined are the
-// captured streams. SpawnErr is non-nil ONLY when the broker could not run the
-// command at all (validation reject, nsenter spawn failure) — a non-zero ExitCode
-// is NOT a SpawnErr.
-type ExecResult struct {
-	ExitCode int
-	Stdout   []byte
-	Stderr   []byte
-	Combined []byte
-	SpawnErr error
-}
+// ExecResult is now defined in types.go (ADR-0346 D6 — shared with the
+// non-linux stub in broker_other.go).
 
 // Exec asks the privileged broker to run an allowlisted command in the HOST mount
 // namespace (ADR-0231). The de-privileged SD-1 agent cannot itself enter the host
@@ -226,6 +215,72 @@ func (c *Client) ResolveVeth(ctx context.Context, srcPID int) ExecResult {
 		Stderr:   resp.Stderr,
 		Combined: resp.Combined,
 	}
+}
+
+// HolderSentinelReady asks the unconfined broker whether the holder-quiescent
+// sentinel (/run/podmotion/holder-ready) has been written inside the restore-target
+// container identified by containerID. The de-privileged SD-1 agent cannot observe
+// it directly: dereferencing /proc/<holderPID>/root routes through a ptrace_may_access
+// gate that the `podmotion-agent` AppArmor profile denies against the holder's
+// cri-containerd.apparmor.d peer profile — the same delegation class as ResolveVeth.
+// A false return with a nil error is a valid negative (holder not yet parked / PID
+// not yet resolvable); the caller keeps polling. A non-nil error means the broker
+// was unreachable or rejected the request.
+func (c *Client) HolderSentinelReady(ctx context.Context, containerID string) (bool, error) {
+	resp, err := c.do(ctx, Request{Op: "holder_sentinel", ContainerID: containerID})
+	if err != nil {
+		return false, fmt.Errorf("netns-broker holder_sentinel %s: %w", containerID, err)
+	}
+	if resp.Error != "" {
+		return false, fmt.Errorf("netns-broker holder_sentinel %s: %s", containerID, resp.Error)
+	}
+	return resp.Found, nil
+}
+
+// NetnsExec asks the privileged broker to run an allowlisted ("ip" or the self
+// sentinel) command inside the target pod's NET namespace, run-to-completion
+// (ADR-0346). Exactly one of srcPID (a live PID, takes precedence) or
+// netnsPath (a /run/netns|/var/run/netns bind path) must resolve — see
+// broker-side D2. Fail-closed (D6): SpawnErr is set on any
+// broker-unreachable/rejected case; never a silent zero-value success.
+func (c *Client) NetnsExec(ctx context.Context, srcPID int, netnsPath string, argv ...string) ExecResult {
+	resp, err := c.do(ctx, Request{Op: "netns_exec", SrcPID: srcPID, NetnsPath: netnsPath, Argv: argv})
+	if err != nil {
+		return ExecResult{ExitCode: -1, SpawnErr: fmt.Errorf("netns-broker netns_exec %v: %w", argv, err)}
+	}
+	if resp.Error != "" {
+		return ExecResult{ExitCode: -1, SpawnErr: fmt.Errorf("netns-broker netns_exec %v: %s", argv, resp.Error)}
+	}
+	exit := 0
+	if resp.ExitCode != nil {
+		exit = *resp.ExitCode
+	}
+	return ExecResult{
+		ExitCode: exit,
+		Stdout:   resp.Stdout,
+		Stderr:   resp.Stderr,
+		Combined: resp.Combined,
+	}
+}
+
+// NetnsExecStart asks the privileged broker to spawn an allowlisted command
+// DETACHED inside the target pod's NET namespace and returns its host PID
+// (ADR-0346) — used by the __inetns_echo listener, which must outlive the
+// originating RPC. Reap/signal via the existing ExecPoll/ExecSignal (unchanged).
+// Fail-closed (D6): a non-nil error is returned on any broker-unreachable/
+// rejected case; never a zero-value "success" PID.
+func (c *Client) NetnsExecStart(ctx context.Context, srcPID int, netnsPath string, argv ...string) (int, error) {
+	resp, err := c.do(ctx, Request{Op: "netns_exec_start", SrcPID: srcPID, NetnsPath: netnsPath, Argv: argv})
+	if err != nil {
+		return 0, fmt.Errorf("netns-broker netns_exec_start %v: %w", argv, err)
+	}
+	if resp.Error != "" {
+		return 0, fmt.Errorf("netns-broker netns_exec_start %v: %s", argv, resp.Error)
+	}
+	if resp.WrapperPID <= 0 {
+		return 0, fmt.Errorf("netns-broker netns_exec_start %v: broker returned no wrapper PID", argv)
+	}
+	return resp.WrapperPID, nil
 }
 
 // Teardown requests unmount+removal of the per-migration netns. Idempotent broker-side.

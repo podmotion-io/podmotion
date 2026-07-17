@@ -172,11 +172,15 @@ build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
 
 .PHONY: build-linux
+# ADR-0352 D6(c)/DR-8(c): the manager/agent targets build from a PACKAGE/DIRECTORY pattern
+# (./cmd, ./cmd/agent), not a .go file-list argument — Go's toolchain silently omits ALL
+# vcs.* build settings for a file-list build regardless of GOFLAGS/-buildvcs, which makes
+# internal/buildinfo's readback report "unknown" forever and D6(c) permanently VOID.
 build-linux: ## Build operator and agent for linux/arm64 and linux/amd64 (no cgo)
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/podmotion-manager-arm64 ./cmd/main.go
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/podmotion-manager-amd64 ./cmd/main.go
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/podmotion-agent-arm64 ./cmd/agent/main.go
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/podmotion-agent-amd64 ./cmd/agent/main.go
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/podmotion-manager-arm64 ./cmd
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/podmotion-manager-amd64 ./cmd
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/podmotion-agent-arm64 ./cmd/agent
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/podmotion-agent-amd64 ./cmd/agent
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/podmotion-criu-wrapper-arm64 ./cmd/criu-wrapper/main.go
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/podmotion-criu-wrapper-amd64 ./cmd/criu-wrapper/main.go
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/podmotion-holder-arm64 ./cmd/holder/main.go

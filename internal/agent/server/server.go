@@ -37,6 +37,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -215,6 +217,15 @@ type AgentServer struct {
 	// on kernel ≥5.9 and the no-op stub otherwise.
 	ebpfMgr network.EBPFManager
 
+	// livenessSustainPasses / livenessSustainInterval configure the ADR-0325 SUSTAINED
+	// workload-liveness primitive (sprint46B9). runAppProbe requires this many CONSECUTIVE
+	// application-probe passes, each separated by this interval, before it reports the
+	// workload live — closing the "answered the handshake for one instant" gap that let a
+	// crash-looping backend flip WorkloadLivenessVerified=True. Zero values fall back to
+	// defaultLivenessSustainPasses / defaultLivenessSustainInterval (see resolveSustain).
+	livenessSustainPasses   int
+	livenessSustainInterval time.Duration
+
 	// migrationPodUID stores pod UID keyed by migration name, populated by PrepareSource.
 	// Used by Checkpoint to resolve the container root PID via /proc cgroup scan.
 	migrationPodUIDMu sync.RWMutex
@@ -279,7 +290,7 @@ type AgentServer struct {
 // New constructs an AgentServer with the given Checkpointer implementation.
 // k8sClient may be nil; when set the Checkpoint handler will update MigrationCheckpoint CRs.
 func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentServer {
-	return &AgentServer{
+	s := &AgentServer{
 		checkpointer:          cp,
 		nodeName:              nodeName,
 		k8sClient:             k8sClient,
@@ -293,6 +304,7 @@ func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentS
 		destWorkloadImage:     make(map[string]string),
 		destMigrationNetns:    make(map[string]*network.MigrationNetns),
 	}
+	return s
 }
 
 // EnsureXDPBridgeLoaded delegates to the embedded eBPFManager to load and pin
@@ -308,17 +320,257 @@ var readReplVethMACFn = ReadReplVethMAC
 
 // joinNsRestoreFn is the production implementation of joinNsRestore.
 // Overridable in tests to stub out the actual CRIU subprocess invocation.
-// Signature: (migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool) (int, []ExternalMountDroppedInfo, error)
+// Signature: (ctx context.Context, migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount, containerCgroupsPath, podCgroupParent, preservedSourceIP string) (int, []ExternalMountDroppedInfo, error)
+// ADR-0351 D1.2: containerCgroupsPath/podCgroupParent are two of the trailing params — the
+// NRI-carried cgroup-anchor fields, threaded through as plain data from THREE call sites (the
+// exported AgentServer.JoinNsRestore NRI wrapper, which has real values; both gRPC Restore
+// branches, which pass "" — no NRI event on that path, see the anchor call site's comment for why
+// that is a documented skip, not a silent gap).
+// ADR-0355 D3: preservedSourceIP is the trailing param — pm.Spec.SourcePodIP, read by the caller
+// (which holds s.k8sClient) and threaded down so the pre-CRIU bind-prep gate can make it locally
+// bindable before soccr's bind() (see prepPreservedSourceAddrForRestore, D1/D3).
 var joinNsRestoreFn = joinNsRestore
+
+// ADR-0355 D1/D3 preserved-source-IP bind-prep primitives.
+//
+// errInvalidPreservedSourceIP is the sentinel returned (wrapped) when a NON-EMPTY preservedSourceIP
+// is not a valid IPv4 at the D3 insertion point — the DR-15 fail-closed condition, kept
+// errors.Is-testable (D5 test 1). The load-bearing assertion is the metric increment + the
+// return-before-CRIU, not the error text.
+var errInvalidPreservedSourceIP = errors.New("preserved source IP is not valid IPv4")
+
+// brokerNetnsExecFn is the seam over netnsbroker.NewClient().NetnsExec used by
+// addPreservedSourceAddr (D1) AND SingleHomeRestoredPod (D4) for all their netns-scoped `ip` ops.
+// Overridden in the helper-shape test (D5 test 2) to capture (srcPID, netnsPath, argv) and assert
+// the broker delegation — no in-process unix.Setns — and in the D4 scope-awareness test (D5 test 5b)
+// to simulate the eth0 address list and capture the oldIP/24 scope-global add.
+var brokerNetnsExecFn = func(ctx context.Context, srcPID int, netnsPath string, argv ...string) netnsbroker.ExecResult {
+	return netnsbroker.NewClient().NetnsExec(ctx, srcPID, netnsPath, argv...)
+}
+
+// addPreservedSourceAddrFn is the seam over addPreservedSourceAddr used by the joinNsRestore
+// bind-prep gate. Overridden in the joinNsRestore-level gating test (D5 test 1) to count calls and
+// capture args. Same idiom as joinNsRestoreFn/readReplVethMACFn/resolveNetnsFromSandboxFn.
+var addPreservedSourceAddrFn = addPreservedSourceAddr
+
+// singleHomeRestoredPodFn is the seam over (*AgentServer).SingleHomeRestoredPod so finalizeRestore's
+// D4 liveness + fail-closed behavior is unit-testable through the real finalizeRestore entry
+// (D5 test 5 — a direct SingleHomeRestoredPod call is explicitly NOT accepted as the liveness proof,
+// ADR-0355 DR-7). Production value delegates straight to the method.
+var singleHomeRestoredPodFn = func(s *AgentServer, ctx context.Context, migrationName, namespace string, pid int) error {
+	return s.SingleHomeRestoredPod(ctx, migrationName, namespace, pid)
+}
+
+// procNetnsPID parses "/proc/<N>/ns/net" → (N, true); anything else → (0, false). Used by
+// addPreservedSourceAddr to map joinNsRestore's petnsPath onto the broker's two-form target
+// contract: the broker's validateNetnsPath REJECTS /proc paths by design (SR-4 containment), so a
+// raw /proc/<pid>/ns/net target (the ADR-0325 inode-mapping fallback) MUST go through srcPID, while
+// the usual /var/run/netns/cni-<id> bind path goes through netnsPath.
+func procNetnsPID(netnsTarget string) (int, bool) {
+	const prefix = "/proc/"
+	const suffix = "/ns/net"
+	if !strings.HasPrefix(netnsTarget, prefix) || !strings.HasSuffix(netnsTarget, suffix) {
+		return 0, false
+	}
+	mid := netnsTarget[len(prefix) : len(netnsTarget)-len(suffix)]
+	if mid == "" || strings.Contains(mid, "/") {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(mid)
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, true
+}
+
+// addPreservedSourceAddr makes ip locally bindable — an IPv4 /32, scope host — on ifname inside the
+// RESTORE-TARGET netns, so CRIU's soccr bind() of the checkpointed TCP_ESTABLISHED socket finds
+// inet_addr_type()==RTN_LOCAL for the preserved source IP (fixes soccr.c:499 EADDRNOTAVAIL).
+//
+// SPONSOR DIRECTIVE (2026-07-15, ADR-0355 D1): the netns entry + address programming are DELEGATED
+// to the unconfined netns broker (ADR-0348 fail-closed) — NEVER an in-process unix.Setns / raw
+// netlink RTM_NEWADDR on the main agent. This is byte-for-byte the delegation SingleHomeRestoredPod
+// already uses for its sibling `ip addr add`/`ip addr del` on this same restore path. `scope host`
+// (never selected as an outbound/ARP source) and the /32 prefixlen (a DIFFERENT kernel ifa key from
+// any CNI-assigned <ip>/24 scope-global primary, so it never displaces it) give the required
+// properties. Idempotent via `ip addr replace` (RTM_NEWADDR|NLM_F_REPLACE|NLM_F_CREATE at the
+// iproute2 level): re-issuing the SAME /32 scope-host add returns success, not EEXIST; a pin-honored
+// <ip>/24 scope-global primary is a different ifa key and is NOT touched.
+//
+// netnsTarget is joinNsRestore's petnsPath — the SAME value CRIU joins via --join-ns net:<path>.
+// ip is already-validated IPv4 (the caller rejects non-IPv4 before this — D3); a defensive
+// To4()==nil check here still errors rather than mis-forming the command. Fail-closed on
+// r.SpawnErr != nil (broker-unreachable/rejected) or r.ExitCode != 0.
+func addPreservedSourceAddr(ctx context.Context, netnsTarget, ifname string, ip net.IP) error {
+	if ip.To4() == nil {
+		return fmt.Errorf("addPreservedSourceAddr: %v is not IPv4", ip)
+	}
+	var srcPID int
+	var netnsPath string
+	if pid, ok := procNetnsPID(netnsTarget); ok {
+		srcPID = pid // /proc/<pid>/ns/net → broker srcPID form
+	} else {
+		netnsPath = netnsTarget // /var/run/netns/cni-<id> (or /run/netns/<name>) → broker netnsPath form
+	}
+	// argv[0]=="ip" is the ONLY thing the broker's netnsExecAllowlist checks; the subcommand is
+	// unrestricted, exactly as SingleHomeRestoredPod's `ip addr add`/`del` rely on.
+	r := brokerNetnsExecFn(ctx, srcPID, netnsPath,
+		"ip", "-4", "addr", "replace", ip.String()+"/32", "scope", "host", "dev", ifname)
+	if r.SpawnErr != nil {
+		return fmt.Errorf("addPreservedSourceAddr: netns broker exec (ip addr replace %s/32 scope host dev %s): %w", ip, ifname, r.SpawnErr)
+	}
+	if r.ExitCode != 0 {
+		return fmt.Errorf("addPreservedSourceAddr: ip addr replace %s/32 scope host dev %s: exit %d (%s)",
+			ip, ifname, r.ExitCode, strings.TrimSpace(string(r.Combined)))
+	}
+	return nil
+}
+
+// prepPreservedSourceAddrForRestore is the ADR-0355 D3 pre-CRIU bind-prep gate, extracted from
+// joinNsRestore's sandboxID branch so the gating decision is unit-testable without the joinNsRestore
+// monolith's real patchCheckpointImages/overlay/CRIU I/O (D5 test 1). It runs ONLY when there is a
+// non-empty preservedSourceIP AND the checkpoint captured an established TCP connection
+// (checkpointHasEstablishedTCP) — so it never fires for cold (None) or connectionless migrations.
+//
+// FAIL-CLOSED on BOTH new branches, each incrementing the SAME distinct
+// restore_preserved_source_addr_bind_prep reason (matching the sibling joinNsRestore failure
+// branches) and returning an error the caller propagates BEFORE buildCRIURestoreArgs/CRIU:
+//   - DR-15: a non-empty but unparseable / non-IPv4 preservedSourceIP (no silent fall-through to
+//     soccr.c:499), mirroring SingleHomeRestoredPod's own parsed==nil||To4()==nil convention.
+//   - a broker addPreservedSourceAddr failure.
+//
+// A nil return means "no prep needed" (gate not met) or "prep succeeded". The caller is confined to
+// the petnsPath != "" (sandboxID != "") branch, so netnsPath here is always the joined netns and
+// ifname is the authoritative recorded value (recordAuthoritativeRestoreNetns), never a fresh
+// "eth0" literal (DR-4).
+func prepPreservedSourceAddrForRestore(ctx context.Context, migrationName, checkpointDir, netnsPath, ifname, preservedSourceIP string) error {
+	if preservedSourceIP == "" || !checkpointHasEstablishedTCP(checkpointDir) {
+		return nil
+	}
+	ip := net.ParseIP(preservedSourceIP)
+	if ip == nil || ip.To4() == nil {
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_preserved_source_addr_bind_prep").Inc()
+		log.Error(fmt.Errorf("unparseable preservedSourceIP"), "joinNsRestore: preserved source IP is not a valid IPv4 — cannot make bindable before CRIU restore; failing closed (ADR-0355 D3/DR-15)",
+			"migration", migrationName, "preservedSourceIP", preservedSourceIP)
+		return fmt.Errorf("preserved source IP %q is not a valid IPv4 — cannot make bindable before CRIU restore (ADR-0355 D3, fail-closed): %w", preservedSourceIP, errInvalidPreservedSourceIP)
+	}
+	if aerr := addPreservedSourceAddrFn(ctx, netnsPath, ifname, ip); aerr != nil {
+		metrics.MigrationsFailedTotal.WithLabelValues("restore_preserved_source_addr_bind_prep").Inc()
+		return fmt.Errorf("make preserved source IP %s bindable in pod-sandbox netns before CRIU restore (broker-delegated, ADR-0355 D1): %w", preservedSourceIP, aerr)
+	}
+	log.Info("joinNsRestore: preserved source IP made bindable in pod-sandbox netns before CRIU restore (ADR-0355 D1, broker-delegated)",
+		"migration", migrationName, "ifname", ifname, "preservedSourceIP", preservedSourceIP, "netnsPath", netnsPath)
+	return nil
+}
+
+// resolvePreservedSourceIP reads pm.Spec.SourcePodIP (the authoritative preserved source IP — the
+// SAME field SingleHomeRestoredPod single-homes on, so D1's pre-CRIU /32 and the post-CRIU /24
+// backfill cannot diverge; ADR-0355 D2 same-value invariant) for the named migration. It is NOT a
+// cache map: a fresh API-server read that cannot go stale on migration-name reuse. Returns "" when
+// the CR is unavailable/unreadable or the field is empty — the bind-prep gate treats "" as "no
+// preserved-IP prep needed."
+func (s *AgentServer) resolvePreservedSourceIP(ctx context.Context, namespace, migrationName string) string {
+	if s.k8sClient == nil || namespace == "" || migrationName == "" {
+		return ""
+	}
+	pm := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: migrationName}, pm); err != nil {
+		log.Info("resolvePreservedSourceIP: get PodMigration failed — no preserved-IP bind-prep (ADR-0355 D2)",
+			"migration", migrationName, "namespace", namespace, "err", err)
+		return ""
+	}
+	return strings.TrimSpace(pm.Spec.SourcePodIP)
+}
+
+// resolvePreservedSourceIPForMigration is the gRPC-path variant of resolvePreservedSourceIP that
+// resolves the namespace itself (the RestoreRequest proto carries no namespace field) via the same
+// resolveNamespaceForMigration the gRPC path already trusts post-finalize. Returns "" on any miss.
+func (s *AgentServer) resolvePreservedSourceIPForMigration(ctx context.Context, migrationName string) string {
+	if s.k8sClient == nil {
+		return ""
+	}
+	return s.resolvePreservedSourceIP(ctx, s.resolveNamespaceForMigration(ctx, migrationName), migrationName)
+}
+
+// ADR-0353: restoreClaim is the single-owner in-flight restore claim record. owner is "NRI" or
+// "gRPC" — the two actors that can drive a CRIU restore into the destination pod/netns.
+type restoreClaim struct {
+	owner     string
+	startedAt time.Time
+}
+
+// ADR-0353: restoreClaimsMu guards restoreClaims.
+var restoreClaimsMu sync.Mutex
+
+// ADR-0353 R1: restoreClaims is the authoritative in-process ownership registry, keyed by bare
+// migrationName (not "<namespace>/<name>" as the ADR text literally says: namespace is not
+// available at the claim point on the gRPC path without a new, currently-nonexistent hard-fail
+// precondition, and every sibling per-migration map on AgentServer — migrationPodUID,
+// migrationSeqSnapshots, pendingResumePIDs, destHostVeth, destWorkloadImage, destMigrationNetns —
+// already keys by bare migrationName). Package-level, not an AgentServer field,
+// because joinNsRestore is a deliberately receiver-less free function (D4/G5, see the
+// joinNsRestoreFn var above for the same constraint). Sound
+// because there is exactly one AgentServer per process (ADR-0353 D1, cmd/agent/main.go:409) so
+// "package-level" and "per-agent-instance" coincide.
+var restoreClaims = make(map[string]*restoreClaim)
+
+// ADR-0353 R3/R5: ErrRestoreInFlight is returned when a second actor finds the single-owner
+// in-flight restore claim already held by another owner for this migration. It is
+// TRANSIENT-RETRY: the in-flight restore may still confirm. Callers MUST NOT treat this as a
+// terminal failure and MUST NOT zeroize the checkpoint tmpfs images dir on this return.
+var ErrRestoreInFlight = errors.New("restore already in flight for this migration under another owner")
+
+// claimRestore atomically acquires the ADR-0353 single-owner in-flight restore claim for
+// migrationName (R3, test-and-set under restoreClaimsMu). Returns true if acquired (no existing
+// claim existed); false if a claim is already held by a DIFFERENT owner (existing claim is left
+// untouched — the caller MUST NOT proceed to drive CRIU). Re-entrant calls are treated as a fresh
+// acquire failure too — this ADR does not define re-entrant claims; no call site needs them, each
+// of the three call sites acquires exactly once per restore attempt.
+func claimRestore(migrationName, owner string) bool {
+	restoreClaimsMu.Lock()
+	defer restoreClaimsMu.Unlock()
+	if _, held := restoreClaims[migrationName]; held {
+		return false
+	}
+	restoreClaims[migrationName] = &restoreClaim{owner: owner, startedAt: time.Now()}
+	return true
+}
+
+// releaseRestore releases the ADR-0353 claim for migrationName (R4/R6). Idempotent — safe to call
+// even when no claim is held, so a defer can call this unconditionally on every return path
+// without checking whether the acquire actually succeeded upstream.
+func releaseRestore(migrationName string) {
+	restoreClaimsMu.Lock()
+	defer restoreClaimsMu.Unlock()
+	delete(restoreClaims, migrationName)
+}
+
+// isRestoreClaimed is the ADR-0353 R2 entry-assertion read: reports whether a claim is currently
+// held for migrationName. Read-only — never acquires or mutates. Used exclusively by the
+// joinNsRestoreFn entry assertion (joinNsRestore, below) to fail loud if a future call site
+// bypasses claimRestore.
+func isRestoreClaimed(migrationName string) bool {
+	restoreClaimsMu.Lock()
+	defer restoreClaimsMu.Unlock()
+	_, held := restoreClaims[migrationName]
+	return held
+}
+
+// resolveNetnsFromSandboxFn is the production implementation of ResolveNetnsFromSandbox.
+// Overridable in tests (R1 CI pin, ADR-0349 test (d)) to avoid a real containerd/ctr dependency.
+var resolveNetnsFromSandboxFn = ResolveNetnsFromSandbox
 
 // restoreResult is the shared finalization result populated by finalizeRestore.
 // All restore paths (NRI + both gRPC Restore branches) return this struct so that
 // MAC population and SingleHomeRestoredPod parity are path-independent (E1, ADR-0133 D3,
 // ADR-0137/0138).
 type restoreResult struct {
-	pid         int
-	netnsPath   string
-	mac         string
+	pid       int
+	netnsPath string
+	mac       string
+	// singleHomed is true when SingleHomeRestoredPod completed the ADR-0137/0138 single-home backfill
+	// on eth0 (stripped non-OLD addresses, assigned oldIP/24 scope-global + the destination
+	// gateway/default/reverse-path routes) — the routable form the deferred SIGCONT resumes onto.
 	singleHomed bool
 }
 
@@ -329,16 +581,64 @@ type restoreResult struct {
 // Condition 3). For None/BestEffort: an empty MAC records a queryable CR-status condition and
 // continues. Returns the populated restoreResult; callers must pass result.mac to
 // ReportRestoreConfirmed.
-func (s *AgentServer) finalizeRestore(ctx context.Context, pid int, netnsPath, ifname, migrationName, namespace, tcpPreservationMode string) (restoreResult, error) {
+func (s *AgentServer) finalizeRestore(ctx context.Context, pid int, netnsPath, ifname, migrationName, namespace, tcpPreservationMode, checkpointDir string) (restoreResult, error) {
 	result := restoreResult{
 		pid:       pid,
 		netnsPath: netnsPath,
 	}
 
-	// Condition 1: call readReplVethMACFn (= ReadReplVethMAC in production; injectable in tests).
-	// ifname is the interface to read inside netnsPath — "pmdst0" for a PrepareDestinationNetns
-	// migration netns, "eth0" for the pod-sandbox / PID-fallback netns (see finalizeNetnsPath).
-	mac, macErr := readReplVethMACFn(pid, netnsPath, ifname)
+	// Condition 1: resolve the replacement pod's dataplane MAC.
+	//
+	// SECURITY WRITE-BACK (ADR-0349 — Security Reviewer, sprint46B2 validation cycle 1). The MAC is
+	// an AUTHORITATIVE at-restore-time CAPTURE taken from the restored process's OWN netns
+	// (captureRestoredVethMAC, invoked by joinNsRestore the instant CRIU brings the process up) and
+	// WRITTEN BACK into the per-migration record. finalizeRestore SERVES that VALUE — it does NOT
+	// re-enter a recorded netns PATH after the fact. The live-proof
+	// (docs/sprints/sprint46B2/live-proof-cycle1.md) falsified the record-a-pointer / re-read-the-path
+	// design: the controller re-invoked Restore ~25 times over ~75s, each re-reading `eth0` against
+	// the recorded /var/run/netns/cni-<id> handle via the broker's path-mode nsenter and getting
+	// empty — even though the restored pod was reachable at its pod IP — the exact poll-and-hope
+	// brittle chain invariant #10 forbids. The SrcPID entry the capture uses (/proc/<pid>/ns/net, the
+	// same one the restore lo-up uses successfully) is the reliable one and the true source of truth
+	// for where CRIU actually placed the process.
+	//
+	// ifname is the interface to read — "pmdst0" for a PrepareDestinationNetns migration netns,
+	// "eth0" for the pod-sandbox netns (see finalizeNetnsPath / the recorded handle).
+	//
+	// Security invariants preserved:
+	//   R2 — the capture and the residual read below both enter the restored process's OWN netns by
+	//        SrcPID; ReadReplVethMAC constructs the /proc/<pid>/ns/net entry through the BROKER (the
+	//        agent never spawns nsenter directly), so the historical agent-side AppArmor /proc denial
+	//        cannot recur — proven live (the lo-up on this same entry succeeds; zero nsenter denials,
+	//        criterion 3). No recorded bind PATH is ever re-read for the MAC.
+	//   R4 — net.ParseMAC validates at the producer (in the capture and here); a malformed value
+	//        fails closed under Strict at READ time, not as a late InjectIPHandoff requeue.
+	//   R3/D3 — an empty capture drives the EXISTING Strict fail-closed branch below; the value is
+	//        never sourced from Status.ReplVethMAC. The broker containment gate is untouched.
+	mac := s.resolvedNetnsMAC(migrationName)
+	var macErr error
+	if mac == "" {
+		// No at-restore capture was latched for this migration: the idempotent-confirm re-entry
+		// where joinNsRestore did not run in THIS RPC, a direct unit call, or a host-network / None
+		// cold restore with no eth0. Read the restored process's OWN netns directly (SrcPID —
+		// /proc/<pid>/ns/net through the broker; NEVER a recorded bind PATH, NEVER a guessed ifname,
+		// NEVER Status.ReplVethMAC), then apply the same producer-side validation + write-back.
+		readIfname := ifname
+		if readIfname == "" {
+			readIfname = "eth0"
+		}
+		mac, macErr = readReplVethMACFn(pid, "", readIfname)
+		if macErr == nil && mac != "" {
+			if _, perr := net.ParseMAC(mac); perr != nil {
+				macErr = fmt.Errorf("replVethMAC unparseable %q: %w", mac, perr)
+				mac = ""
+			} else if netnsPath != "" {
+				// Latch the authoritative capture so re-invocations serve the VALUE (R5 idempotent
+				// write-back; no-op when no gate-readable handle was recorded).
+				storeResolvedNetnsMAC(migrationName, mac)
+			}
+		}
+	}
 	result.mac = mac
 
 	// Condition 3: fail-closed on Strict/Full for empty MAC; degrade on None/BestEffort.
@@ -346,6 +646,13 @@ func (s *AgentServer) finalizeRestore(ctx context.Context, pid int, netnsPath, i
 		mode := tcpPreservationMode
 		if mode == "Strict" || mode == "Full" {
 			reason := "replVethMAC empty after restore — MAC resolution failed (path-independent contract violation)"
+			if netnsPath == "" {
+				// R3 (ADR-0349): distinct, greppable cause. finalizeNetnsPath found no
+				// gate-readable Tier-1 record — this is NOT a transient read failure against a
+				// known-good netns, it is "no source of truth was ever recorded." Status/event
+				// consumers must be able to tell the two apart (D8).
+				reason = fmt.Sprintf("no authoritative restored netns recorded for migration %s", migrationName)
+			}
 			log.Error(macErr, "finalizeRestore: "+reason, "migration", migrationName, "mode", mode)
 			return result, fmt.Errorf("finalizeRestore [%s]: %s", mode, reason)
 		}
@@ -375,16 +682,57 @@ func (s *AgentServer) finalizeRestore(ctx context.Context, pid int, netnsPath, i
 	}
 
 	// Condition 2: SingleHomeRestoredPod parity — call on ALL paths (gRPC and NRI).
-	if s.k8sClient != nil && namespace != "" && pid > 0 {
-		if shErr := s.SingleHomeRestoredPod(ctx, migrationName, namespace, pid); shErr != nil {
-			log.Error(shErr, "finalizeRestore: SingleHomeRestoredPod failed (ADR-0137) — pod may remain dual-homed",
+	//
+	// ADR-0355 D4: make the ADR-0138 routable /24 backfill ACTUALLY RUN on every live restore. All
+	// four production callers historically passed namespace="" (the guard left the backfill DEAD), so
+	// resolve the authoritative namespace here (resolveNamespaceForMigration — migrationName-keyed,
+	// API-server authoritative, the SAME resolver the gRPC path already trusts post-finalize) when the
+	// caller supplied none. SingleHomeRestoredPod then strips non-OLD eth0 addresses and assigns
+	// oldIP/24 scope-global + the destination gateway/default/reverse-path routes (the ADR-0137/0138
+	// contract), composing with D1's pre-CRIU /32 scope-host so eth0 ends restore in a routable form.
+	//
+	// establishedTCP is the SINGLE source-of-truth "did D1 add a /32" signal — the exact gate D1/D3
+	// use (checkpointHasEstablishedTCP), NOT the tcpPreservationMode string (there is no "Full" mode,
+	// and a connectionless Strict restore has no held socket to strand while a BestEffort
+	// established-TCP restore DOES). On an established-TCP restore a backfill FAILURE (or an unresolved
+	// namespace that prevents the backfill) is fail-closed (DR-14): D1's non-routable /32 is present
+	// and, without the /24 backfill, the deferred SIGCONT would resume the ESTABLISHED socket onto a
+	// non-routable /32 (the H3' silent stranding) — so we fail the restore instead.
+	establishedTCP := checkpointHasEstablishedTCP(checkpointDir)
+	shNamespace := namespace
+	if shNamespace == "" && s.k8sClient != nil {
+		shNamespace = s.resolveNamespaceForMigration(ctx, migrationName)
+	}
+	if s.k8sClient != nil && shNamespace != "" && pid > 0 {
+		if shErr := singleHomeRestoredPodFn(s, ctx, migrationName, shNamespace, pid); shErr != nil {
+			if establishedTCP {
+				// FAIL CLOSED (DR-14): D1's non-routable /32 is present and the routable /24 backfill
+				// FAILED — resuming the ESTABLISHED socket onto the /32 is the H3' silent stranding,
+				// strictly worse than the crash D1 fixes. Return an error so the restore FAILS: no
+				// deferred SIGCONT ever fires (InjectIPHandoff is a separate later RPC, reached only on
+				// restore success), the frozen tree is torn down by rollback, and the source pod is
+				// preserved (ADR-0012, invariant #1). Mirrors the MAC fail-closed already in this function.
+				log.Error(shErr, "finalizeRestore: SingleHomeRestoredPod backfill failed on established-TCP restore — replacement would strand on non-routable /32; failing closed (ADR-0355 D4/DR-14, ADR-0012 inv #1 — source preserved)",
+					"migration", migrationName, "restoredPID", pid)
+				return result, fmt.Errorf("finalizeRestore: SingleHomeRestoredPod backfill failed on established-TCP restore (ADR-0355 D4, DR-14 fail-closed): %w", shErr)
+			}
+			// Connectionless / non-established-TCP: no D1 /32 was added, so there is nothing to strand
+			// on — keep the pre-existing tolerable behavior (log loud, non-fatal; pod may remain
+			// dual-homed on its CNI IP). Source pod preserved per ADR-0012 either way.
+			log.Error(shErr, "finalizeRestore: SingleHomeRestoredPod failed (ADR-0137) — pod may remain dual-homed (non-established-TCP, non-fatal)",
 				"migration", migrationName, "restoredPID", pid)
-			// Non-fatal: log loud; source pod preserved per ADR-0012.
 		} else {
 			result.singleHomed = true
 			log.Info("finalizeRestore: replacement pod single-homed on OLD IP (ADR-0137/0138)",
 				"migration", migrationName, "restoredPID", pid)
 		}
+	} else if s.k8sClient != nil && shNamespace == "" && establishedTCP {
+		// Namespace UNRESOLVED on an established-TCP restore: the /24 backfill cannot run and D1's /32
+		// is present → the same strand. Also fail-closed (DR-14), not a silent/loud skip — a skip here
+		// is indistinguishable from H3' at SIGCONT time.
+		err := fmt.Errorf("finalizeRestore: namespace unresolved for established-TCP restore — OLD-IP /24 backfill cannot run, replacement would strand on non-routable /32 (ADR-0355 D4/DR-14/H3', ADR-0012 inv #1 — source preserved)")
+		log.Error(err, "finalizeRestore: failing closed on unresolved namespace", "migration", migrationName)
+		return result, err
 	}
 
 	return result, nil
@@ -441,9 +789,27 @@ func setConditionOnPM(pm *pmv1.PodMigration, condType string, status metav1.Cond
 // restored tree resumes (ADR-0012).
 //
 // Returns (pid, mac, error) where mac is the replacement pod's eth0 MAC (E1 Condition 1).
-// The NRI caller must pass mac directly to ReportRestoreConfirmed; it must NOT call
-// ReadReplVethMAC independently.
-func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, containerID, sandboxID, tcpPreservationMode string) (int, string, error) {
+// namespace is the PodMigration CR's namespace (ADR-0353 R4/D6): JoinNsRestore now calls
+// ReportRestoreConfirmed itself on the terminal success path, so it needs namespace to do so —
+// the caller must resolve it the same way it always did before passing it here. The NRI caller
+// must pass mac directly to ReportRestoreConfirmed; it must NOT call ReadReplVethMAC independently.
+// containerCgroupsPath/podCgroupParent are the ADR-0351 D1 NRI-carried cgroup-anchor fields —
+// read directly off the event by the caller (cmd/agent/main.go), threaded here as plain
+// parameters (no query, no poll, no side-map) and passed through to joinNsRestore.
+func (s *AgentServer) JoinNsRestore(migrationName, namespace, checkpointDir, imageName, containerID, sandboxID, containerCgroupsPath, podCgroupParent, tcpPreservationMode string) (int, string, error) {
+	// ADR-0353 R2/R3: acquire the single-owner in-flight restore claim before driving CRIU. A
+	// second actor (the gRPC Restore fallback) racing this same migration MUST NOT proceed —
+	// decline with the TRANSIENT-RETRY ErrRestoreInFlight and leave this owner as sole authority.
+	if !claimRestore(migrationName, "NRI") {
+		log.Info("JoinNsRestore: restore already in flight for this migration under another owner — declining (ADR-0353 R3)",
+			"migration", migrationName)
+		return 0, "", ErrRestoreInFlight
+	}
+	// ADR-0353 R4: release on every terminal exit — success and every failure/error return —
+	// via defer so no early return leaks the claim. ReportRestoreConfirmed is folded into this
+	// function below (D6) so the release below never fires before the terminal confirm.
+	defer releaseRestore(migrationName)
+
 	strictMode := tcpPreservationMode == string(pmv1.TCPPreservationModeStrict)
 	s.destHostVethMu.RLock()
 	storedVeth := s.destHostVeth[migrationName]
@@ -503,7 +869,18 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 	if reErr != nil {
 		return 0, "", reErr
 	}
-	pid, droppedMounts, err := joinNsRestoreFn(migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode, reattachMounts)
+	// ADR-0351 D3.1/D1.2: the pause-PID bounded-wait ceiling (sandboxPausePIDWaitSubCap) this
+	// block used to derive is retired along with sandboxPausePIDWaiting itself — the cgroup-anchor
+	// primitive is a zero-query, zero-poll, zero-retry read of event data already in hand, so no
+	// ctx budget is needed for it. joinNsRestoreFn still takes a ctx parameter (other call sites
+	// thread the real one); the NRI wrapper passes context.Background() since it has no ceiling of
+	// its own to express here.
+	// ADR-0355 D2/D3: read the authoritative preserved source IP (pm.Spec.SourcePodIP — the same
+	// field SingleHomeRestoredPod single-homes on) and thread it into joinNsRestore so the pre-CRIU
+	// bind-prep can make it locally bindable before soccr's bind() on an established-TCP restore.
+	// Empty (no CR / empty field) → the bind-prep gate is a no-op.
+	preservedSourceIP := s.resolvePreservedSourceIP(context.Background(), namespace, migrationName)
+	pid, droppedMounts, err := joinNsRestoreFn(context.Background(), migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode, reattachMounts, containerCgroupsPath, podCgroupParent, preservedSourceIP)
 	if err != nil {
 		// ADR-0193 P-0193-4 / S1: emit a Warning CRIUImageInconsistency Kubernetes Event on the
 		// PodMigration CR when the P-0193-1 hard-stop fires. The event message carries only
@@ -556,17 +933,44 @@ func (s *AgentServer) JoinNsRestore(migrationName, checkpointDir, imageName, con
 	}
 
 	// E1 Condition 1: resolve the netns path and call finalizeRestore so MAC is populated
-	// path-independently. Namespace is not available here (no CR fetch in JoinNsRestore);
-	// pass empty string — finalizeRestore will skip the k8s condition patch but still
-	// populate mac and call SingleHomeRestoredPod.
+	// path-independently.
+	// ADR-0355 D4: namespace IS available here — it is a JoinNsRestore parameter, populated by the
+	// NRI caller (cmd/agent/main.go) — so pass it (not the prior ""), which makes the ADR-0138 /24
+	// backfill in SingleHomeRestoredPod live on the NRI path; in the common case namespace is
+	// non-empty and the resolveNamespaceForMigration fallback inside finalizeRestore never fires.
+	// checkpointDir is threaded so finalizeRestore can read the checkpointHasEstablishedTCP
+	// fail-closed gate (DR-14). The prior "Namespace is not available here" comment was false.
 	// ADR-0308 follow-up: use finalizeNetnsPath so that if ResolvedNetnsPath was not recorded
 	// (parity with the gRPC fallback path), MAC resolution falls back to the PrepareDestinationNetns
 	// bind mount rather than the ptrace'd /proc/<pid>/ns/net path AppArmor denies.
 	netnsPath, macIfname := s.finalizeNetnsPath(migrationName)
-	fr, frErr := s.finalizeRestore(context.Background(), pid, netnsPath, macIfname, migrationName, "", tcpPreservationMode)
+	fr, frErr := s.finalizeRestore(context.Background(), pid, netnsPath, macIfname, migrationName, namespace, tcpPreservationMode, checkpointDir)
 	if frErr != nil {
 		// Strict/Full fail-closed: propagate.
 		return 0, "", frErr
+	}
+
+	// ADR-0353 R4/D6: ReportRestoreConfirmed is consolidated here (moved from
+	// cmd/agent/main.go, outside the server package) so the deferred releaseRestore above fires
+	// AFTER the terminal confirm, not before — the release must never straddle the server<->main
+	// package boundary. A second actor entering the not-yet-alive window at ANY point up to and
+	// including this confirm now observes the claim.
+	//
+	// Gated identically to the gRPC path's ReportRestoreConfirmed call sites — non-fatal on
+	// failure: a nil k8sClient or unresolved namespace no longer fails the NRI restore outright,
+	// matching the gRPC path's existing parity and relying on the gRPC Restore idempotent-confirm
+	// branch as the retry-safe reconciler if the CR patch is missed here.
+	if s.k8sClient != nil && namespace != "" {
+		reportCtx, reportCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		rcErr := s.ReportRestoreConfirmed(reportCtx, migrationName, namespace, int32(pid), fr.mac)
+		reportCancel()
+		if rcErr != nil {
+			log.Error(rcErr, "JoinNsRestore: ReportRestoreConfirmed failed (non-fatal — gRPC Restore idempotent-confirm branch will reconcile)",
+				"migration", migrationName, "namespace", namespace)
+		}
+	} else {
+		log.Info("JoinNsRestore: k8sClient nil or namespace unresolved — ReportRestoreConfirmed skipped",
+			"migration", migrationName, "namespace", namespace)
 	}
 	return pid, fr.mac, nil
 }
@@ -665,8 +1069,10 @@ func (s *AgentServer) resolveImageFromReplacementPod(migrationName string) strin
 }
 
 // reattachMount is one shared/re-attach (Tier0) volume mount preserved across a migration.
-// ContainerPath is the in-container mountPath (== the CRIU ext_key recorded by ctr checkpoint,
-// the source of truth the patch classifier keys on). HostTarget is the path — visible in the
+// ContainerPath is the in-container mountPath (== the mountpoints-image MOUNTPOINT the patch
+// classifier keys the re-attach preservation on — NOT the CRIU ext_key, which is the constant
+// literal "CRIU:AUTOGENERATED" for every auto-detected external and thus useless for matching).
+// HostTarget is the path — visible in the
 // destination HOST mount namespace where CRIU runs via nsenter — that CRIU binds the mount FROM
 // on restore (the kubelet-mounted volume dir of the replacement pod). ContainerPath alone drives
 // the patch's KEEP decision; the (ContainerPath, HostTarget) pair drives the restore-side
@@ -689,6 +1095,27 @@ func reattachContainerPaths(ms []reattachMount) []string {
 	return paths
 }
 
+// reattachHostTargets projects a []reattachMount into a {ContainerPath: HostTarget} map — the
+// argv[5] the patch script uses to rewrite each preserved re-attach mount's recorded root/source
+// (the SOURCE-node kubelet volume path baked in at dump) to the DESTINATION kubelet volume dir.
+// CRIU restores an auto-detected external (ext_key="CRIU:AUTOGENERATED") by binding from mi->source
+// directly and bypasses --ext-mount-map (criu/mount.c get_mp_root, 4.2), so rewriting the recorded
+// source in the image is the only way to point a cross-node re-attach at the destination volume.
+// Entries with an empty HostTarget are omitted (no rewrite; buildCRIURestoreArgs fail-closes on
+// them). Returns nil for an empty input so json.Marshal emits an empty object downstream.
+func reattachHostTargets(ms []reattachMount) map[string]string {
+	if len(ms) == 0 {
+		return nil
+	}
+	m := make(map[string]string, len(ms))
+	for _, rm := range ms {
+		if rm.ContainerPath != "" && rm.HostTarget != "" {
+			m[rm.ContainerPath] = rm.HostTarget
+		}
+	}
+	return m
+}
+
 // replacementPodLabelKey is the label the controller stamps on the replacement pod at creation
 // time (podmigration_controller.go). It equals the PodMigration name. It is the authoritative,
 // race-free way to find the replacement pod on the destination node — unlike
@@ -696,7 +1123,7 @@ func reattachContainerPaths(ms []reattachMount) []string {
 // restore time (the replacement pod is created ~5s before restore runs and the status write races
 // the agent's cached read). This mirrors the image-resolution hardening (resolveImageFromMCP):
 // prefer a source of truth that does not depend on a Status field being populated at the exact
-// instant the agent reads it (primitive over brittle chain).
+// instant the agent reads it (reads the authoritative value instead of inferring it).
 const replacementPodLabelKey = "podmotion.io/migration-name"
 
 // resolveReplacementPod finds the replacement pod for a migration by the authoritative
@@ -752,13 +1179,16 @@ func (e *ReattachVolumeNotYetPublishedError) Error() string {
 
 // resolveReattachMounts returns the shared/re-attach (Tier0 RWX) PVC mounts of the migrating pod,
 // each as an (in-container path, destination host-target path) pair. These are legitimate,
-// restorable EXTERNAL mounts: `ctr tasks checkpoint` records a PVC-backed volume as an external
-// mountpoints entry (ext_key = the in-container mountPath), and the workload holds open file
-// handles on it (e.g. PostgreSQL WAL/relation files under /var/lib/postgresql/data). Such a mount
-// must be PRESERVED across the checkpoint-image patch (kept in kept_mnt_ids so its files.img REG
-// fds classify consistent, NOT dropped-and-orphaned into the P-0193-1 hard-stop) and re-attached on
-// restore via --ext-mount-map <containerPath>:<hostTarget>. This is the "RWX re-attach" storage
-// tier — no data bytes move; the same volume is visible on both nodes.
+// restorable EXTERNAL mounts: the checkpoint records a PVC-backed volume as an external mountpoints
+// entry whose MOUNTPOINT is the in-container mountPath (its ext_key is the constant literal
+// "CRIU:AUTOGENERATED" — CRIU's auto-external marker — NOT the path), and the workload holds open
+// file handles on it (e.g. PostgreSQL WAL/relation files under /var/lib/postgresql/data). Such a
+// mount must be PRESERVED across the checkpoint-image patch (kept in kept_mnt_ids so its files.img
+// REG fds classify consistent, NOT dropped-and-orphaned into the P-0193-1 hard-stop) and re-attached
+// on restore via --ext-mount-map <containerPath>:<hostTarget>. The patch keys the preservation on
+// the mountpoint == ContainerPath (patch_checkpoint_script.go); the restore-side --ext-mount-map
+// keys on the same mountpoint. This is the "RWX re-attach" storage tier — no data bytes move; the
+// same volume is visible on both nodes.
 //
 // The in-container path comes from the pod spec (not a hardcoded workload path): every
 // container volumeMount whose named volume resolves to a PVC. The HOST TARGET is the kubelet volume
@@ -781,6 +1211,25 @@ func (e *ReattachVolumeNotYetPublishedError) Error() string {
 // label".
 func (s *AgentServer) resolveReattachMounts(migrationName string) ([]reattachMount, error) {
 	return s.resolveReattachMountsImpl(migrationName, false)
+}
+
+// pvcIsTier0RWX reports whether a PVC classifies as Tier0 (ReadWriteMany re-attach) storage — the
+// ONLY tier eligible for the checkpoint-image re-attach mount-path rewrite. It mirrors the Tier0
+// determination in internal/agent/storage.classifier: a ReadWriteMany access mode maps to Tier0
+// regardless of provisioner. Every other access mode (ReadWriteOnce / ReadOnlyMany /
+// ReadWriteOncePod) resolves to a higher tier — Longhorn dual-engine, Ceph RBD live, or
+// snapshot+rsync — each of which owns its replication/consistency handoff and must NOT be re-attached
+// by rewriting the recorded mount source to the destination kubelet volume dir.
+func pvcIsTier0RWX(pvc *corev1.PersistentVolumeClaim) bool {
+	if pvc == nil {
+		return false
+	}
+	for _, am := range pvc.Spec.AccessModes {
+		if am == corev1.ReadWriteMany {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveReattachMountsImpl is the shared body behind resolveReattachMounts (terminalOnBudget=false,
@@ -808,7 +1257,7 @@ func (s *AgentServer) resolveReattachMountsImpl(migrationName string, terminalOn
 	// construction (same spec). Resolve it by the migration-name LABEL (the source of truth the
 	// controller stamps at replacement-pod creation) rather than pm.Status.ReplacementPodName,
 	// which is frequently read back empty at restore time — the defect that produced the broken
-	// 1:1 container-path ext-mount-map (primitive over brittle chain). Fall back to the
+	// 1:1 container-path ext-mount-map (reads the authoritative value instead of inferring it). Fall back to the
 	// status field only if the label lookup finds nothing, then to the source pod for the
 	// in-container path set (host-target resolution then no-ops and buildCRIURestoreArgs
 	// fail-closes on the unresolved host target).
@@ -842,8 +1291,18 @@ func (s *AgentServer) resolveReattachMountsImpl(migrationName string, terminalOn
 		return nil, nil
 	}
 
-	// Resolve each claim → PV name (the leaf dir under the kubelet volumes dir) once.
+	// Resolve each claim → PV name (the leaf dir under the kubelet volumes dir) once, and record
+	// whether the claim classifies as Tier0 (ReadWriteMany re-attach) storage. Only Tier0 PVCs are
+	// re-attach-eligible: the checkpoint-image mount-path rewrite (patchCheckpointImages) points a
+	// preserved external mount at the destination kubelet volume dir, which is correct ONLY when the
+	// same volume is concurrently visible on both nodes (RWX, zero data movement). A non-RWX PVC
+	// (Longhorn dual-engine, Ceph RBD live, snapshot-rsync — typically ReadWriteOnce) has its own
+	// replication/consistency handoff; treating it as a re-attach mount would silently bind the
+	// destination volume dir over CRIU's recorded source and bypass that handoff entirely. The Tier0
+	// test mirrors internal/agent/storage.classifier (a ReadWriteMany access mode maps to Tier0
+	// regardless of provisioner).
 	claimToPV := make(map[string]string)
+	claimIsTier0 := make(map[string]bool)
 	for _, claim := range pvcVolToClaim {
 		if _, done := claimToPV[claim]; done {
 			continue
@@ -851,6 +1310,7 @@ func (s *AgentServer) resolveReattachMountsImpl(migrationName string, terminalOn
 		pvc := &corev1.PersistentVolumeClaim{}
 		if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: claim, Namespace: podNs}, pvc); err == nil {
 			claimToPV[claim] = pvc.Spec.VolumeName
+			claimIsTier0[claim] = pvcIsTier0RWX(pvc)
 		}
 	}
 
@@ -869,6 +1329,14 @@ func (s *AgentServer) resolveReattachMountsImpl(migrationName string, terminalOn
 		for _, m := range mnts {
 			claim, isPVC := pvcVolToClaim[m.Name]
 			if !isPVC {
+				continue
+			}
+			// Tier gate (fail-closed against mis-classification): a PVC-backed mount is re-attach
+			// eligible ONLY if it classifies as Tier0 (ReadWriteMany re-attach). Excluding a non-Tier0
+			// PVC here keeps it out of reattach_mount_paths, so patch_checkpoint_script leaves its
+			// recorded mount source alone (the pre-existing non-Tier0 handling) rather than rewriting
+			// it as a cross-node re-attach mount.
+			if !claimIsTier0[claim] {
 				continue
 			}
 			cp := filepath.Clean(m.MountPath)
@@ -1097,20 +1565,33 @@ func (s *AgentServer) ReportRestoreConfirmed(ctx context.Context, migrationName,
 	return nil
 }
 
-// SingleHomeRestoredPod implements ADR-0137 (single-home variant): after CRIU restore and the
-// ADR-0128 cgroup move, before ReportRestoreConfirmed, it removes the CNI-assigned NEW Flannel IP
-// from the replacement pod's eth0, leaving only the CRIU-restored OLD pod IP (pm.Spec.SourcePodIP).
+// SingleHomeRestoredPod single-homes the CRIU-restored replacement pod onto the preserved OLD source
+// IP (pm.Spec.SourcePodIP), programming eth0 into the ADR-0138 routable form the deferred SIGCONT
+// resumes onto. ADR-0355 D4 makes this backfill ACTUALLY RUN on every live restore (its four
+// finalizeRestore callers formerly passed namespace="", leaving it dead) and composes it with D1's
+// pre-CRIU /32 scope-host add. It:
 //
-// Background (Sprint 26 blocker B6): the replacement pod is dual-homed — eth0 carries both the new
-// Flannel IP (e.g. 10.244.1.94) and the CRIU-restored OLD IP (e.g. 10.244.0.94). The competing
-// connected subnet makes the destination kernel classify VXLAN-decapped transit traffic for the OLD
-// IP as local-input (RTN_LOCAL) and drop it. Removing the new Flannel IP eliminates the conflict so
-// the kernel delivers transit traffic for the OLD IP at L2 to the pod veth via the ADR-0133 D2 neigh.
+//  1. lists eth0's IPv4 addresses (broker-delegated `ip -o -4 addr show`, ADR-0348);
+//  2. STRIPS every non-OLD address (single-home), deriving the destination gateway from a stripped
+//     address whose /24 differs from the OLD IP's /24;
+//  3. ASSIGNS oldIP/24 scope-global if not already present as a scope-GLOBAL address — ADR-0355 D4
+//     part 3 makes `oldSeen` scope-aware so D1's oldIP/32 scope-host artifact does NOT suppress the
+//     /24 add (an oldIP/32 scope host is never stripped, but only a scope-GLOBAL oldIP counts as
+//     already-single-homed);
+//  4. installs the destination gateway link route + onlink default + the ADR-0139 D2 reverse-path
+//     route to the source CIDR;
+//  5. verifies eth0 carries the OLD IP and only the OLD IP (both the D1 /32 scope-host and the /24
+//     scope-global are the OLD IP, so both pass).
 //
-// No netlink dependency (vishvananda/netlink is not in go.mod; ADR-0045 forbids adding it): we reuse
-// the in-tree nsenter+ip idiom already used by ReadReplVethMAC and the joinNsRestore lo-up. We only
-// ever DELETE eth0 IPv4 addresses that are not the (validated) OLD IP — never add. Idempotent; an
-// already-absent address is tolerated. Empty SourcePodIP → no-op (legacy/cold path unaffected).
+// Empty SourcePodIP → no-op (legacy/cold path unaffected). A failure here is fail-closed on an
+// established-TCP restore at the finalizeRestore call site (DR-14): without the routable /24, the
+// SIGCONT would resume the ESTABLISHED socket onto D1's non-routable /32 (the H3' strand).
+//
+// SUBSTRATE NOTE (ADR-0355 Consequences / DR-5, ADR-0330): the gateway derivation and cni0-oriented
+// routes here are from the Flannel flat-overlay lineage. Their interaction with Cilium's own
+// CiliumEndpoint/ipcache accounting for the stripped CNI-assigned primary is explicitly UNRECONCILED
+// by ADR-0355 and DEFERRED to its DR-5 live proof + ADR-0330 (a real Cilium ipcache substrate) — not
+// re-decided in this function. See ADR-0355 §Consequences and the sprint46B9 DR-5 live proof.
 func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, namespace string, pid int) error {
 	if s.k8sClient == nil {
 		return fmt.Errorf("SingleHomeRestoredPod: no k8s client available on agent server")
@@ -1139,50 +1620,126 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 
 	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
 
-	// List eth0 IPv4 addresses inside the pod netns. `ip -o -4 addr show eth0` is netns-scoped
-	// via nsenter --net (sysfs/`cat` would read the HOST's interfaces — see ReadReplVethMAC).
-	out, err := exec.Command("nsenter", "--net="+netnsPath,
-		"ip", "-o", "-4", "addr", "show", "eth0").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("SingleHomeRestoredPod: list eth0 addrs in netns %s: %w (%s)",
-			netnsPath, err, strings.TrimSpace(string(out)))
+	// List eth0's IPv4 addresses inside the pod netns. `ip -o -4 addr show eth0` is netns-scoped via
+	// nsenter --net (sysfs/`cat` would read the HOST's interfaces — see ReadReplVethMAC). ADR-0348:
+	// routed through the netns broker (fail-closed) via the brokerNetnsExecFn seam.
+	r1 := brokerNetnsExecFn(ctx, pid, "", "ip", "-o", "-4", "addr", "show", "eth0")
+	if r1.SpawnErr != nil {
+		return fmt.Errorf("SingleHomeRestoredPod: netns exec failed: list eth0 addrs in netns %s: %w",
+			netnsPath, r1.SpawnErr)
 	}
-	addrs := parseEth0IPv4Addrs(string(out))
-	log.Info("SingleHomeRestoredPod: eth0 addresses before single-home (ADR-0137)",
+	if r1.ExitCode != 0 {
+		return fmt.Errorf("SingleHomeRestoredPod: list eth0 addrs in netns %s: exit %d (%s)",
+			netnsPath, r1.ExitCode, strings.TrimSpace(string(r1.Combined)))
+	}
+	addrs := parseEth0IPv4Addrs(string(r1.Combined))
+	log.Info("SingleHomeRestoredPod: eth0 addresses before single-home (ADR-0137/0138)",
 		"migration", migrationName, "restoredPID", pid, "oldIP", oldIP, "addrs", addrs)
 
-	// ADR-0138: the join-ns CRIU restore does NOT replay the checkpoint's inet addr/route
-	// config into the pod netns — at this point eth0 carries ONLY the new Flannel IP and no
-	// OLD-CIDR route. So we must ASSIGN the OLD IP and the destination cni0-gateway routes,
-	// not assume CRIU restored them (ADR-0137's disproven premise). Derive the destination
-	// cni0 gateway from the on-eth0 Flannel IP (host octet -> 1, e.g. 10.244.1.95 -> 10.244.1.1);
-	// fall back to the OLD-IP gateway if no Flannel IP is present.
+	// ADR-0352 Strict DUAL-HOME (sprint46B9 regression fix): the preserved-IP pin need NOT be
+	// honored — under Cilium cluster-pool IPAM the restored pod is legitimately assigned a FRESH
+	// dest-local CNI IP that is NOT oldIP, and that fresh IP appears on eth0 as a non-OLD
+	// scope-GLOBAL address. THAT address is the pod's real, Cilium-programmed, cluster-routable
+	// identity: the k8s Status.PodIP the controller builds the WorkloadLivenessVerified probe
+	// target from (podmigration_controller.go destPodIP := destPod.Status.PodIP), the address the
+	// Service endpoint routes to, and the address dialAllowedForMigrationProbe admits
+	// (migrationRestoredWorkloadIP — one source of truth, invariant #10). Single-homing onto oldIP
+	// STRIPS that primary and makes the pod unreachable at the very IP everything probes and routes
+	// to — the exact sprint46B9 failure ("Redis probe TCP connect to <freshCNIIP>:6379 failed:
+	// connect: no route to host", sustained 240s, rollback), while TCPSequenceContinuityVerified
+	// stayed True (the held socket restore itself was never the problem).
+	//
+	// So when a non-OLD scope-global primary is present we DUAL-HOME, not single-home: KEEP the CNI
+	// primary as the routable identity AND keep oldIP present (D1's /32 scope-host, which soccr bound
+	// the held ESTABLISHED socket to). The held socket egresses via the intact CNI default route with
+	// src=oldIP; held-connection continuity is proven by TCPSequenceContinuityVerified and client
+	// reachability by the Service ClusterIP — neither needs the pod re-homed onto oldIP. We STRIP and
+	// re-home (the ADR-0138 backfill below) ONLY when no foreign scope-global primary exists (the pin
+	// WAS honored, i.e. oldIP is itself the CNI primary, or a legacy replay left oldIP as the sole
+	// address). The signal is the pod's OWN eth0 address set — a local source of truth with no
+	// dependency on Status.PodIP having propagated yet.
+	dualHomePrimary := ""
+	for _, a := range addrs {
+		ipOnly := a.CIDR
+		if i := strings.IndexByte(ipOnly, '/'); i >= 0 {
+			ipOnly = ipOnly[:i]
+		}
+		if ipOnly != oldIP && a.Scope == "global" {
+			dualHomePrimary = ipOnly
+			break
+		}
+	}
+	if dualHomePrimary != "" {
+		// DUAL-HOME: keep the CNI primary AND oldIP; do not strip, do not re-home, do not rewrite the
+		// (correct, CNI-provided) routes. Verify routability for the DR-14 fail-closed contract: a
+		// scope-global primary must be present (it is — dualHomePrimary) and oldIP must be present on
+		// eth0 (D1's /32 scope-host, or a scope-global oldIP). If oldIP is somehow absent the held
+		// socket would strand — fail closed rather than resume onto a missing bind address.
+		oldPresent := false
+		for _, a := range addrs {
+			ipOnly := a.CIDR
+			if i := strings.IndexByte(ipOnly, '/'); i >= 0 {
+				ipOnly = ipOnly[:i]
+			}
+			if ipOnly == oldIP {
+				oldPresent = true
+				break
+			}
+		}
+		if !oldPresent {
+			return fmt.Errorf("SingleHomeRestoredPod: dual-home — OLD IP %s absent from eth0 (D1 /32 bind missing); held socket would strand (addrs %v)", oldIP, addrs)
+		}
+		log.Info("SingleHomeRestoredPod: dual-homed restored pod — kept CNI primary + preserved OLD IP (ADR-0352 Strict, sprint46B9 fix; pin not honored, no single-home strip)",
+			"migration", migrationName, "restoredPID", pid, "oldIP", oldIP, "cniPrimary", dualHomePrimary, "addrs", addrs)
+		return nil
+	}
+
+	// ADR-0138: the join-ns CRIU restore does NOT replay the checkpoint's inet addr/route config
+	// into the pod netns — at this point eth0 carries the new CNI IP (and, from ADR-0355 D1, the
+	// preserved OLD IP as a /32 scope host). Single-home onto the OLD IP: STRIP every NON-OLD
+	// address, deriving the destination gateway from the on-eth0 CNI IP (host octet -> 1); then
+	// ASSIGN oldIP/24 scope-global and the destination gateway/default routes.
+	//
+	// ADR-0355 D4 part 3 (scope-aware oldSeen): a scope-host /32 for the OLD IP is the D1 CRIU-bind
+	// artifact — NEVER strip it, and do NOT let it suppress the /24 scope-global add; only a
+	// scope-GLOBAL OLD-IP address counts as "already single-homed".
 	oldSeen := false
 	var delErrs []string
 	cni0Gateway := gatewayForIP(oldIP) // fallback
-	for _, cidr := range addrs {
+	for _, a := range addrs {
+		cidr := a.CIDR
 		ipOnly := cidr
 		if i := strings.IndexByte(cidr, '/'); i >= 0 {
 			ipOnly = cidr[:i]
 		}
 		if ipOnly == oldIP {
-			oldSeen = true
+			// Never strip an OLD-IP address. Only a scope-GLOBAL OLD IP suppresses the /24 add
+			// (ADR-0355 D4 part 3) — a scope-host /32 (the D1 artifact) must NOT.
+			if a.Scope == "global" {
+				oldSeen = true
+			}
 			continue
 		}
-		// This is the new Flannel IP (or any other non-OLD address). The DESTINATION cni0
-		// gateway must be derived from the address whose /24 is the destination node's pod
-		// CIDR — i.e. an address NOT in the OLD IP's /24. A stale address in the OLD IP's own
-		// /24 (e.g. a leftover from a prior restore) would otherwise yield the dead SOURCE
-		// gateway (10.244.0.1) and break the pod's return path (probe/AC1 fail). Only adopt a
-		// gateway from an out-of-OLD-/24 address; keep the OLD-/24 fallback otherwise.
+		// This is the new CNI IP (or any other non-OLD address). Derive the DESTINATION gateway from
+		// an address whose /24 is NOT the OLD IP's /24 (an OLD-/24 leftover would yield the dead
+		// SOURCE gateway and break the pod's return path); keep the OLD-/24 fallback otherwise.
 		if cidr24ForIP(ipOnly) != cidr24ForIP(oldIP) {
 			if gw := gatewayForIP(ipOnly); gw != "" {
 				cni0Gateway = gw
 			}
 		}
-		// Strip it so the pod is single-homed on the OLD IP.
-		delOut, delErr := exec.Command("nsenter", "--net="+netnsPath,
-			"ip", "addr", "del", cidr, "dev", "eth0").CombinedOutput()
+		// Strip it so the pod is single-homed on the OLD IP (ADR-0348 broker-delegated).
+		delR := brokerNetnsExecFn(ctx, pid, "", "ip", "addr", "del", cidr, "dev", "eth0")
+		var delOut []byte
+		var delErr error
+		if delR.SpawnErr != nil {
+			delErr = fmt.Errorf("netns exec failed: %w", delR.SpawnErr)
+		} else if delR.ExitCode != 0 {
+			delOut = delR.Combined
+			delErr = fmt.Errorf("exit %d", delR.ExitCode)
+		} else {
+			delOut = delR.Combined
+		}
 		if delErr != nil {
 			msg := strings.TrimSpace(string(delOut))
 			// Idempotent: tolerate an already-absent address.
@@ -1199,11 +1756,21 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 			"migration", migrationName, "restoredPID", pid, "removed", cidr, "reason", "not OLD IP")
 	}
 
-	// ADR-0138 step 2: ASSIGN the OLD IP to eth0 if not already present (idempotent: tolerate
-	// EEXIST). This replaces ADR-0137's invalid assumption that CRIU restored it.
+	// ADR-0138 step 2: ASSIGN oldIP/24 scope-global to eth0 if no scope-global OLD IP is already
+	// present (idempotent: tolerate EEXIST). This replaces ADR-0137's invalid assumption that CRIU
+	// restored it, and is NOT suppressed by D1's oldIP/32 scope-host artifact (scope-aware oldSeen).
 	if !oldSeen {
-		addOut, addErr := exec.Command("nsenter", "--net="+netnsPath,
-			"ip", "addr", "add", oldIP+"/24", "dev", "eth0").CombinedOutput()
+		addR := brokerNetnsExecFn(ctx, pid, "", "ip", "addr", "add", oldIP+"/24", "dev", "eth0")
+		var addOut []byte
+		var addErr error
+		if addR.SpawnErr != nil {
+			addErr = fmt.Errorf("netns exec failed: %w", addR.SpawnErr)
+		} else if addR.ExitCode != 0 {
+			addOut = addR.Combined
+			addErr = fmt.Errorf("exit %d", addR.ExitCode)
+		} else {
+			addOut = addR.Combined
+		}
 		if addErr != nil {
 			msg := strings.TrimSpace(string(addOut))
 			if strings.Contains(strings.ToLower(msg), "exists") {
@@ -1217,40 +1784,35 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 		}
 	}
 
-	// ADR-0138 step 3: add a link route to the destination cni0 gateway and an onlink default
-	// via it, so the pod can reply to host-originated (AC1) and cross-node (AC4) traffic that
-	// arrives via cni0. The OLD /24 is foreign to the destination cni0 subnet, so without this
-	// the pod has no return path off its own /24 ("Network is unreachable").
+	// ADR-0138 step 3: add a link route to the destination gateway and an onlink default via it, so
+	// the pod can reply to host-originated (AC1) and cross-node (AC4) traffic. ADR-0139 D2: a
+	// reverse-path route to the source CIDR via the gateway so replies to the source node egress
+	// instead of ARPing on-link. All broker-delegated (ADR-0348), all idempotent.
 	if cni0Gateway != "" {
-		// link route to the gateway (idempotent)
-		if rOut, rErr := exec.Command("nsenter", "--net="+netnsPath,
-			"ip", "route", "add", cni0Gateway, "dev", "eth0").CombinedOutput(); rErr != nil {
-			msg := strings.TrimSpace(string(rOut))
+		if linkR := brokerNetnsExecFn(ctx, pid, "", "ip", "route", "add", cni0Gateway, "dev", "eth0"); linkR.SpawnErr != nil {
+			log.Info("SingleHomeRestoredPod: warning — add gateway link route", "gw", cni0Gateway, "err", linkR.SpawnErr, "op", "netns_exec")
+		} else if linkR.ExitCode != 0 {
+			msg := strings.TrimSpace(string(linkR.Combined))
 			if !strings.Contains(strings.ToLower(msg), "exists") {
-				log.Info("SingleHomeRestoredPod: warning — add gateway link route", "gw", cni0Gateway, "err", rErr, "output", msg)
+				log.Info("SingleHomeRestoredPod: warning — add gateway link route", "gw", cni0Gateway, "err", fmt.Errorf("exit %d", linkR.ExitCode), "output", msg)
 			}
 		}
-		// onlink default via the gateway (replace if present)
-		if rOut, rErr := exec.Command("nsenter", "--net="+netnsPath,
-			"ip", "route", "replace", "default", "via", cni0Gateway, "dev", "eth0", "onlink").CombinedOutput(); rErr != nil {
-			log.Info("SingleHomeRestoredPod: warning — set onlink default route", "gw", cni0Gateway, "err", rErr, "output", strings.TrimSpace(string(rOut)))
+		if defR := brokerNetnsExecFn(ctx, pid, "", "ip", "route", "replace", "default", "via", cni0Gateway, "dev", "eth0", "onlink"); defR.SpawnErr != nil {
+			log.Info("SingleHomeRestoredPod: warning — set onlink default route", "gw", cni0Gateway, "err", defR.SpawnErr, "op", "netns_exec")
+		} else if defR.ExitCode != 0 {
+			log.Info("SingleHomeRestoredPod: warning — set onlink default route", "gw", cni0Gateway, "err", fmt.Errorf("exit %d", defR.ExitCode), "output", strings.TrimSpace(string(defR.Combined)))
 		} else {
 			log.Info("SingleHomeRestoredPod: installed cni0-gateway routes (ADR-0138)",
 				"migration", migrationName, "restoredPID", pid, "gateway", cni0Gateway)
 		}
-
-		// ADR-0139 Decision 2 (reverse path, blocker B8): the OLD IP's connected /24
-		// (10.244.0.0/24) makes the pod treat the SOURCE node's pod CIDR — including the
-		// source VTEP IP 10.244.0.0 — as on-link, so replies ARP `who-has 10.244.0.0` and
-		// never egress. Force replies to the source CIDR via the destination cni0 gateway
-		// (which routes them over VXLAN back to pm-control) instead of on-link ARP. The
-		// source CIDR is the /24 of the OLD IP. `ip route replace` is inherently idempotent.
 		srcNodeCIDR := cidr24ForIP(oldIP)
 		if srcNodeCIDR != "" {
-			if rOut, rErr := exec.Command("nsenter", "--net="+netnsPath,
-				"ip", "route", "replace", srcNodeCIDR, "via", cni0Gateway, "dev", "eth0").CombinedOutput(); rErr != nil {
+			if revR := brokerNetnsExecFn(ctx, pid, "", "ip", "route", "replace", srcNodeCIDR, "via", cni0Gateway, "dev", "eth0"); revR.SpawnErr != nil {
 				log.Info("SingleHomeRestoredPod: warning — set reverse-path route (ADR-0139 D2)",
-					"srcNodeCIDR", srcNodeCIDR, "gw", cni0Gateway, "err", rErr, "output", strings.TrimSpace(string(rOut)))
+					"srcNodeCIDR", srcNodeCIDR, "gw", cni0Gateway, "err", revR.SpawnErr, "op", "netns_exec")
+			} else if revR.ExitCode != 0 {
+				log.Info("SingleHomeRestoredPod: warning — set reverse-path route (ADR-0139 D2)",
+					"srcNodeCIDR", srcNodeCIDR, "gw", cni0Gateway, "err", fmt.Errorf("exit %d", revR.ExitCode), "output", strings.TrimSpace(string(revR.Combined)))
 			} else {
 				log.Info("SingleHomeRestoredPod: installed reverse-path route to source CIDR via cni0 gateway (ADR-0139 D2)",
 					"migration", migrationName, "restoredPID", pid, "srcNodeCIDR", srcNodeCIDR, "gateway", cni0Gateway)
@@ -1258,14 +1820,17 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 		}
 	}
 
-	// Verify: only the OLD IP should remain on eth0.
-	verifyOut, verifyErr := exec.Command("nsenter", "--net="+netnsPath,
-		"ip", "-o", "-4", "addr", "show", "eth0").CombinedOutput()
-	if verifyErr != nil {
-		return fmt.Errorf("SingleHomeRestoredPod: verify eth0 addrs in netns %s: %w (%s)",
-			netnsPath, verifyErr, strings.TrimSpace(string(verifyOut)))
+	// Verify: only the OLD IP should remain on eth0. ADR-0348 broker-delegated.
+	verifyR := brokerNetnsExecFn(ctx, pid, "", "ip", "-o", "-4", "addr", "show", "eth0")
+	if verifyR.SpawnErr != nil {
+		return fmt.Errorf("SingleHomeRestoredPod: netns exec failed: verify eth0 addrs in netns %s: %w",
+			netnsPath, verifyR.SpawnErr)
 	}
-	remaining := parseEth0IPv4Addrs(string(verifyOut))
+	if verifyR.ExitCode != 0 {
+		return fmt.Errorf("SingleHomeRestoredPod: verify eth0 addrs in netns %s: exit %d (%s)",
+			netnsPath, verifyR.ExitCode, strings.TrimSpace(string(verifyR.Combined)))
+	}
+	remaining := parseEth0IPv4Addrs(string(verifyR.Combined))
 	log.Info("SingleHomeRestoredPod: eth0 addresses after single-home (ADR-0138 AC5)",
 		"migration", migrationName, "restoredPID", pid, "oldIP", oldIP, "remaining", remaining, "gateway", cni0Gateway)
 
@@ -1273,9 +1838,11 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 		return fmt.Errorf("SingleHomeRestoredPod: failed to remove %d address(es): %s",
 			len(delErrs), strings.Join(delErrs, "; "))
 	}
-	// AC5: eth0 must carry the OLD IP and only the OLD IP.
+	// AC5: eth0 must carry the OLD IP and only the OLD IP (both the D1 /32 scope-host and the /24
+	// scope-global are the OLD IP, so both pass).
 	oldPresent := false
-	for _, cidr := range remaining {
+	for _, a := range remaining {
+		cidr := a.CIDR
 		ipOnly := cidr
 		if i := strings.IndexByte(cidr, '/'); i >= 0 {
 			ipOnly = cidr[:i]
@@ -1294,7 +1861,8 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 
 // gatewayForIP returns the ".1" gateway address of the /24 containing ip (e.g. "10.244.1.95"
 // -> "10.244.1.1"). Returns "" if ip is not a valid IPv4. Used to derive the destination cni0
-// bridge gateway from the new Flannel IP (ADR-0138).
+// bridge gateway from the new CNI IP (ADR-0138). SUBSTRATE NOTE (ADR-0355/ADR-0330): the ".1"
+// derivation is Flannel-oriented; its correctness on Cilium is deferred to the DR-5 live proof.
 func gatewayForIP(ip string) string {
 	parsed := net.ParseIP(ip)
 	if parsed == nil {
@@ -1322,17 +1890,34 @@ func cidr24ForIP(ip string) string {
 	return fmt.Sprintf("%d.%d.%d.0/24", v4[0], v4[1], v4[2])
 }
 
-// parseEth0IPv4Addrs extracts the "A.B.C.D/N" tokens from `ip -o -4 addr show eth0` output.
-// Each line looks like: "2: eth0    inet 10.244.0.94/24 brd ... scope global eth0\\ ...".
-// Returns the addresses in CIDR form (suitable to pass straight back to `ip addr del`).
-func parseEth0IPv4Addrs(out string) []string {
-	var addrs []string
+// eth0Addr is one IPv4 address parsed from `ip -o -4 addr show eth0`, retaining BOTH the CIDR AND
+// the scope token ("global"/"host"/"link"). The scope is load-bearing for SingleHomeRestoredPod's
+// reachability check (ADR-0355 follow-up): a scope-GLOBAL address is the CNI-assigned routable
+// primary (== Status.PodIP, the reachability the liveness probe/Service require), whereas a
+// scope-HOST /32 (the D1 CRIU-bind artifact for the preserved OLD IP) is deliberately NOT counted
+// as a routable primary — a pod carrying only scope-host addresses would strand.
+type eth0Addr struct {
+	CIDR  string
+	Scope string
+}
+
+// parseEth0IPv4Addrs extracts the (CIDR, scope) pairs from `ip -o -4 addr show eth0` output.
+// Each -o (oneline) line looks like: "2: eth0    inet 10.244.0.94/24 brd ... scope global eth0 ...".
+func parseEth0IPv4Addrs(out string) []eth0Addr {
+	var addrs []eth0Addr
 	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(line)
-		for i := 0; i < len(fields)-1; i++ {
-			if fields[i] == "inet" {
-				addrs = append(addrs, fields[i+1])
+		var cidr, scope string
+		for i := 0; i < len(fields); i++ {
+			if fields[i] == "inet" && i+1 < len(fields) {
+				cidr = fields[i+1]
 			}
+			if fields[i] == "scope" && i+1 < len(fields) {
+				scope = fields[i+1]
+			}
+		}
+		if cidr != "" {
+			addrs = append(addrs, eth0Addr{CIDR: cidr, Scope: scope})
 		}
 	}
 	return addrs
@@ -1359,32 +1944,47 @@ func ReadReplVethMAC(pid int, sandboxNetnsPath, ifname string) (string, error) {
 	if ifname == "" {
 		ifname = "eth0"
 	}
-	var attempts []string
+	// ADR-0348: each attempt is either a stable sandbox bind-mount path (routed to the broker
+	// as NetnsPath, validated broker-side by netnsPathRe) or a live PID (routed as SrcPID, the
+	// broker derives /proc/<pid>/ns/net itself) — never both for the same attempt (D3).
+	type attempt struct {
+		label     string // for error messages only
+		netnsPath string // non-empty => broker NetnsPath attempt
+		pid       int    // >0 => broker SrcPID attempt
+	}
+	var attempts []attempt
 	if sandboxNetnsPath != "" {
-		attempts = append(attempts, sandboxNetnsPath)
+		attempts = append(attempts, attempt{label: sandboxNetnsPath, netnsPath: sandboxNetnsPath})
 	}
 	if pid > 0 {
-		attempts = append(attempts, "/proc/"+strconv.Itoa(pid)+"/ns/net")
+		attempts = append(attempts, attempt{label: "/proc/" + strconv.Itoa(pid) + "/ns/net", pid: pid})
 	}
 	if len(attempts) == 0 {
 		return "", fmt.Errorf("ReadReplVethMAC: no netns source (pid=%d, sandboxNetnsPath=%q)", pid, sandboxNetnsPath)
 	}
+	// ADR-0348: no context.Context is threaded through this exported free function (its
+	// signature is fixed by readReplVethMACFn's test-injection contract, used across multiple
+	// pre-existing test files) — use context.Background() for the broker call.
+	ctx := context.Background()
 	var lastErr error
-	for _, netnsArg := range attempts {
+	for _, a := range attempts {
 		// Read the MAC via `ip link` (netlink, net-namespace-scoped) — NOT
 		// `cat /sys/class/net/<ifname>/address`. nsenter --net changes only the network
 		// namespace, leaving the host's /sys mount in place, so reading sysfs would
 		// return the HOST's interfaces, not the pod netns's. `ip -o link show <ifname>`
 		// queries the kernel via rtnetlink scoped to the entered netns.
-		out, err := exec.Command("nsenter", "--net="+netnsArg,
-			"ip", "-o", "link", "show", ifname).CombinedOutput()
-		if err != nil {
-			lastErr = fmt.Errorf("ReadReplVethMAC: nsenter %s ip link show %s: %w (%s)", netnsArg, ifname, err, strings.TrimSpace(string(out)))
+		r := netnsbroker.NewClient().NetnsExec(ctx, a.pid, a.netnsPath, "ip", "-o", "link", "show", ifname)
+		if r.SpawnErr != nil {
+			lastErr = fmt.Errorf("ReadReplVethMAC: netns exec failed via %s ip link show %s: %w", a.label, ifname, r.SpawnErr)
 			continue
 		}
-		mac := parseLinkEther(string(out))
+		if r.ExitCode != 0 {
+			lastErr = fmt.Errorf("ReadReplVethMAC: nsenter %s ip link show %s: %w (%s)", a.label, ifname, fmt.Errorf("exit %d", r.ExitCode), strings.TrimSpace(string(r.Combined)))
+			continue
+		}
+		mac := parseLinkEther(string(r.Combined))
 		if mac == "" {
-			lastErr = fmt.Errorf("ReadReplVethMAC: no link/ether in `ip link show %s` output via %s: %s", ifname, netnsArg, strings.TrimSpace(string(out)))
+			lastErr = fmt.Errorf("ReadReplVethMAC: no link/ether in `ip link show %s` output via %s: %s", ifname, a.label, strings.TrimSpace(string(r.Combined)))
 			continue
 		}
 		return mac, nil
@@ -1404,102 +2004,228 @@ func parseLinkEther(out string) string {
 	return ""
 }
 
-// resolvedNetnsPaths caches the netns path CRIU joined per migration (ADR-0133), so the NRI
-// restore callback can read eth0's MAC from the exact pod netns rather than the restored
-// PID's own ns/net (which can transiently resolve to the host netns post-restore).
+// resolvedNetns records, per migration, the exact netns path AND the interface name CRIU
+// joined on restore (ADR-0133), so the restore callback can read the replacement pod's replVeth
+// MAC from the exact netns+interface CRIU joined rather than the restored PID's own ns/net
+// (which can transiently resolve to the host netns post-restore).
+//
+// The ifname is load-bearing and MUST be recorded here rather than inferred downstream. Two
+// different restore targets are possible and they expose DIFFERENT interfaces:
+//   - ADR-0325 pod-sandbox-netns join (--join-ns net:<pod-sandbox>): the CNI-wired pod netns,
+//     whose dataplane interface is "eth0".
+//   - agent-staged migration netns (--join-ns net:<destNetnsFd>): holds only "lo" and the
+//     migration veth peer network.MigrationVethPeer ("pmdst0"), never "eth0".
+//
+// joinNsRestore is the only component that knows which of these it joined, so it is the source
+// of truth for the interface name. Recording it here (instead of finalizeNetnsPath re-deriving
+// "pmdst0" from the mere presence of a resolved path) is the fix for the live Strict
+// fail-closed: ADR-0325 retargeted the join from the migration netns to the pod sandbox netns
+// (eth0), but finalizeNetnsPath still hardcoded "pmdst0", so `ip link show pmdst0` inside the
+// pod sandbox netns returned "device does not exist" → empty MAC → "replVethMAC empty after
+// restore" (sprint46 live-proof cycle 2).
+type resolvedNetns struct {
+	path   string
+	ifname string
+	// mac is the authoritative replacement-pod dataplane MAC CAPTURED at restore time inside
+	// (path, ifname) and WRITTEN BACK here, so finalizeRestore reads it as a source-of-truth
+	// VALUE rather than re-reading the recorded path on every reconcile. Empty until the first
+	// successful at-restore capture latches it (ADR-0349 security write-back — Security Reviewer,
+	// sprint46B2 validation cycle 1; retires the invariant-#10 recorded-path re-read that the
+	// live-proof falsified). Never sourced from Status.ReplVethMAC (ADR-0349 D3) — it is the
+	// agent's own kernel read.
+	mac string
+}
+
 var (
 	resolvedNetnsPathsMu sync.RWMutex
-	resolvedNetnsPaths   = map[string]string{}
+	resolvedNetnsPaths   = map[string]resolvedNetns{}
 )
 
-func storeResolvedNetnsPath(migrationName, path string) {
+// storeResolvedNetnsPath records the netns path AND the dataplane interface name CRIU joined for
+// migrationName. ifname is the interface INSIDE that netns whose MAC the replVeth handoff reads:
+// "eth0" for a pod sandbox netns (ADR-0325), network.MigrationVethPeer ("pmdst0") for the
+// agent-staged migration netns. An empty ifname defaults to "eth0" (the pod-sandbox convention).
+func storeResolvedNetnsPath(migrationName, path, ifname string) {
 	if migrationName == "" || path == "" {
 		return
 	}
+	if ifname == "" {
+		ifname = "eth0"
+	}
 	resolvedNetnsPathsMu.Lock()
-	resolvedNetnsPaths[migrationName] = path
+	resolvedNetnsPaths[migrationName] = resolvedNetns{path: path, ifname: ifname}
 	resolvedNetnsPathsMu.Unlock()
+}
+
+// storeResolvedNetnsMAC writes back the authoritative dataplane MAC captured AT restore time for
+// migrationName — the source-of-truth VALUE finalizeRestore serves on subsequent invocations
+// instead of re-reading the recorded netns path (ADR-0349 security write-back — Security Reviewer,
+// sprint46B2 validation cycle 1). It is deliberately a no-op when no (path, ifname) handle was
+// recorded first: a MAC has no netns to belong to without its authoritative record, and
+// fabricating a bare-MAC entry would let a value leak across migrations. Idempotent: repeated
+// identical write-backs converge (R5). Callers MUST have already net.ParseMAC-validated the value
+// (R4); this function does not re-validate.
+func storeResolvedNetnsMAC(migrationName, mac string) {
+	if migrationName == "" || mac == "" {
+		return
+	}
+	resolvedNetnsPathsMu.Lock()
+	defer resolvedNetnsPathsMu.Unlock()
+	rec, ok := resolvedNetnsPaths[migrationName]
+	if !ok || rec.path == "" {
+		return
+	}
+	rec.mac = mac
+	resolvedNetnsPaths[migrationName] = rec
+}
+
+// restoredVethMACCaptureBudget / -Interval bound how long captureRestoredVethMAC waits for the
+// CNI-wired dataplane interface to become visible in the restored process's netns before giving up.
+// vars (not consts) so tests can shrink them. Sized well under the 120s live-migration hard bound
+// (invariant #8): in practice the veth is already present the instant CRIU brings the process up
+// (the lo-up on the SAME netns entry succeeds first), so the loop returns on the first read; the
+// budget only matters for the narrow CNI-programming window and for a genuine host-network absence.
+var (
+	restoredVethMACCaptureBudget   = 10 * time.Second
+	restoredVethMACCaptureInterval = 500 * time.Millisecond
+)
+
+// captureRestoredVethMAC is the ADR-0349 authoritative AT-RESTORE-TIME MAC capture (Security
+// Reviewer, sprint46B2 validation cycle 1). At the moment CRIU has brought the restored process up
+// (joinNsRestore calls it right after the loopback-up, on the SAME netns entry), it reads the
+// replacement pod's dataplane-interface MAC from the restored process's OWN network namespace and
+// WRITES IT BACK into the per-migration record (storeResolvedNetnsMAC). finalizeRestore then serves
+// that VALUE; it never re-enters a recorded netns PATH after the fact.
+//
+// Why the process's OWN netns (SrcPID) and NOT the recorded bind path: the recorded
+// /var/run/netns/cni-<id> handle and the restored process's netns are the SAME namespace, but they
+// differ in ACCESS METHOD. The broker's path-mode nsenter EvalSymlink-resolves the bind and, on the
+// live substrate, returned empty `ip link show eth0` for ~75s across ~25 controller re-invocations
+// even though the pod was reachable at its pod IP (docs/sprints/sprint46B2/live-proof-cycle1.md). The
+// SrcPID entry (/proc/<pid>/ns/net, routed through the broker — the agent never spawns nsenter
+// directly) is the reliable one: it is exactly what the lo-up uses successfully, with zero AppArmor
+// nsenter denials (live-proof criterion 3). Reading the process's own namespace is also the true
+// source of truth for "where did CRIU actually put this process," immune to a recorded path going
+// stale or unresolvable. This retires the invariant-#10 record-a-pointer / re-read-the-path brittle
+// chain the review panel rejected, in favor of one authoritative capture keyed on the process itself.
+//
+// storeResolvedNetnsMAC is a no-op unless a (path, ifname) handle was recorded first, so this only
+// latches on a MAC-handoff restore (a pod dataplane netns was joined); host-network / None cold
+// restores have no eth0 and latch nothing. The bounded wait (invariant #8) tolerates the narrow
+// window where the CNI veth is not yet visible; every attempt reads the SAME source of truth (the
+// process's own netns), never a fallback chain to a different access method.
+func captureRestoredVethMAC(migrationName string, pid int, ifname string) {
+	if migrationName == "" || pid <= 0 {
+		return
+	}
+	if ifname == "" {
+		// Default to the interface joinNsRestore recorded for this migration
+		// (recordAuthoritativeRestoreNetns records "eth0" for the pod sandbox netns) so the capture
+		// reads whatever CRIU actually joined, never a hardcoded guess; eth0 if nothing recorded.
+		resolvedNetnsPathsMu.RLock()
+		ifname = resolvedNetnsPaths[migrationName].ifname
+		resolvedNetnsPathsMu.RUnlock()
+		if ifname == "" {
+			ifname = "eth0"
+		}
+	}
+	deadline := time.Now().Add(restoredVethMACCaptureBudget)
+	for {
+		// SrcPID entry: netnsPath == "" so ReadReplVethMAC constructs ONLY the pid attempt
+		// (/proc/<pid>/ns/net via the broker) — the restored process's own netns, never a bind path.
+		mac, err := readReplVethMACFn(pid, "", ifname)
+		if err == nil && mac != "" {
+			if _, perr := net.ParseMAC(mac); perr == nil {
+				storeResolvedNetnsMAC(migrationName, mac) // R4-validated; no-op if no handle recorded
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(restoredVethMACCaptureInterval)
+	}
+}
+
+// recordAuthoritativeRestoreNetns implements ADR-0349 R1: the single point where a
+// non-host-network restore records the (path, ifname) handle that finalizeNetnsPath's Tier 1
+// reads back (storeResolvedNetnsPath). Extracted out of joinNsRestore so the record-or-not
+// decision is unit-testable without a real CRIU/ctr/nsenter dependency (test (d)).
+//
+// sandboxID == "" is the legitimate no-record case (branch 1: no MAC-handoff requirement, see
+// joinNsRestore's caller-side ADR-0325 gate) — returns ("", "", nil).
+// sandboxID != "" resolves the pod sandbox netns and records it with ifname "eth0" (branch 2,
+// the live Strict/BestEffort path, server.go:4023 pre-extraction). A resolution error is
+// returned to the caller, which MUST fail the restore rather than substitute a guess.
+func recordAuthoritativeRestoreNetns(ctx context.Context, migrationName, sandboxID string) (path, ifname string, err error) {
+	if sandboxID == "" {
+		return "", "", nil
+	}
+	netnsFd, resolvedPath, rerr := resolveNetnsFromSandboxFn(ctx, nil, sandboxID)
+	if rerr != nil {
+		return "", "", rerr
+	}
+	// ADR-0125: the fd existed only for the B2 inode cross-check inside ResolveNetnsFromSandbox.
+	// Close it now; CRIU joins by path, not by inherited fd.
+	_ = netnsFd.Close()
+	storeResolvedNetnsPath(migrationName, resolvedPath, "eth0")
+	return resolvedPath, "eth0", nil
 }
 
 // ResolvedNetnsPath returns the netns path CRIU joined for migrationName, or "" if unknown.
 func (s *AgentServer) ResolvedNetnsPath(migrationName string) string {
 	resolvedNetnsPathsMu.RLock()
 	defer resolvedNetnsPathsMu.RUnlock()
-	return resolvedNetnsPaths[migrationName]
+	return resolvedNetnsPaths[migrationName].path
+}
+
+// resolvedNetnsIfname returns the dataplane interface name CRIU joined for migrationName (the
+// interface whose MAC the replVeth handoff reads), or "" if unknown. Keyed on the value
+// joinNsRestore recorded — never inferred from the netns kind.
+func (s *AgentServer) resolvedNetnsIfname(migrationName string) string {
+	resolvedNetnsPathsMu.RLock()
+	defer resolvedNetnsPathsMu.RUnlock()
+	return resolvedNetnsPaths[migrationName].ifname
+}
+
+// resolvedNetnsMAC returns the authoritative dataplane MAC captured AT restore time and written
+// back for migrationName (ADR-0349 security write-back), or "" if nothing has been captured yet.
+// finalizeRestore consumes this VALUE directly to avoid re-reading the recorded netns path on
+// every reconcile (invariant #10). This is the agent's own kernel read, never Status.ReplVethMAC.
+func (s *AgentServer) resolvedNetnsMAC(migrationName string) string {
+	resolvedNetnsPathsMu.RLock()
+	defer resolvedNetnsPathsMu.RUnlock()
+	return resolvedNetnsPaths[migrationName].mac
 }
 
 // finalizeNetnsPath resolves the sandbox-netns path handed to ReadReplVethMAC (via
-// finalizeRestore) for migrationName, preferring the value CRIU actually joined
-// (ResolvedNetnsPath) and falling back to the agent-created bind mount recorded by
-// PrepareDestinationNetns.
+// finalizeRestore) for migrationName.
 //
-// ADR-0308 follow-up: on the raw-CRIU / gRPC fallback path the controller invokes the
-// Restore RPC with req.DestNetnsFd=="" (see "cold migration passes empty string" below).
-// joinNsRestore therefore never records ResolvedNetnsPath (it only does so on the
-// destNetnsFd!="" and sandboxID branches), so ResolvedNetnsPath is empty here and
-// finalizeRestore falls through to ReadReplVethMAC via nsenter --net=/proc/<pid>/ns/net —
-// which the AppArmor podmotion-agent profile denies (no ptrace-read against the restored
-// workload's profile), yielding "replVethMAC empty after restore". PrepareDestinationNetns
-// still ran on this path (Strict/BestEffort always pre-stage the dest netns), and its
-// broker-created bind mount /run/podmotion/netns/pm-mig-<uid>/bind is stored on
-// destMigrationNetns[migrationName].NetnsPath. Reusing that exact path (never a rederived
-// literal) routes ReadReplVethMAC through the bind-mount branch: no ptrace, no AppArmor
-// denial.
-//
-// It returns BOTH the netns path AND the interface name to read inside it. This second
-// return value is load-bearing: every non-empty path this function returns is a
-// PrepareDestinationNetns MIGRATION netns, whose only interfaces are "lo" and the migration
-// veth peer network.MigrationVethPeer ("pmdst0") — NOT "eth0". This holds for both branches:
-//   - the ResolvedNetnsPath branch records the value joinNsRestore joined, which on the
-//     destNetnsFd path is exactly ns.NetnsPath (DestNetnsFd = PrepareDestinationNetns's
-//     ns.NetnsPath — see netns_linux.go), i.e. the pmdst0 migration netns; and
-//   - the destMigrationNetns bind branch is ns.NetnsPath directly.
-//
-// So reading "eth0" inside either returns "device does not exist" → empty MAC → Strict
-// fail-closed. That is the residual live failure the ADR-0308 bind routing hit even though it
-// correctly selected the bind path. The fix names the actual interface (pmdst0) for the
-// migration netns. Returns ("", "eth0") when neither source is available (host-network / no
-// pre-staged netns), in which case finalizeRestore falls back to the PID path — the restored
-// process's OWN sandbox netns, where the pod interface IS "eth0".
+// ADR-0349 R2: Tier-1-only resolution. The three inference/guess fallback tiers that used to
+// live here (an in-memory destMigrationNetns bind-mount guess, a reconstructed canonical
+// on-disk bind path, and a PID-terminal that fed the AppArmor-denied /proc/<pid>/ns/net read)
+// are retired as unreachable-by-construction: R1 guarantees every non-host-network MAC-handoff
+// (Strict/BestEffort) restore already has a gate-readable Tier-1 record
+// (recordAuthoritativeRestoreNetns / storeResolvedNetnsPath), so the fallback tiers existed only
+// to paper over a record that is now pinned by CI (test (d)). Returning the ifname read back
+// from the source of truth — never inferred from the presence of a path — remains load-bearing:
+// post-ADR-0325 the default restore joins the pod SANDBOX netns (--join-ns net:<pod-sandbox>),
+// whose dataplane interface is "eth0"; joinNsRestore records whichever it actually joined.
 func (s *AgentServer) finalizeNetnsPath(migrationName string) (netnsPath, ifname string) {
 	if p := s.ResolvedNetnsPath(migrationName); p != "" {
-		return p, network.MigrationVethPeer
+		// Source of truth: joinNsRestore recorded BOTH the path and the interface it actually
+		// joined for this migration (recordAuthoritativeRestoreNetns / storeResolvedNetnsPath).
+		// Read that ifname back — never infer it from the presence of a resolved path (ADR-0325
+		// retargeted the join from the agent-staged migration netns to the pod sandbox netns;
+		// hardcoding an ifname here was the sprint46 cycle-2 live regression).
+		return p, s.resolvedNetnsIfname(migrationName)
 	}
-	s.destMigrationNetnsMu.RLock()
-	ns := s.destMigrationNetns[migrationName]
-	s.destMigrationNetnsMu.RUnlock()
-	if ns != nil && ns.NetnsPath != "" {
-		// Only hand CRIU/ReadReplVethMAC a bind path that actually exists at this point in
-		// the flow; a torn-down or never-created bind would just re-fail nsenter. Gate on
-		// os.Stat so a missing bind falls back safely to the PID path in finalizeRestore.
-		if _, statErr := os.Stat(ns.NetnsPath); statErr == nil {
-			log.Info("finalizeNetnsPath: ResolvedNetnsPath empty (raw-CRIU/DestNetnsFd-empty path) — using PrepareDestinationNetns bind mount for MAC read (ADR-0308 follow-up)",
-				"migration", migrationName, "bindPath", ns.NetnsPath, "ifname", network.MigrationVethPeer)
-			return ns.NetnsPath, network.MigrationVethPeer
-		}
-		log.Info("finalizeNetnsPath: stored dest-netns bind path does not exist; trying canonical on-disk bind path",
-			"migration", migrationName, "bindPath", ns.NetnsPath)
-	}
-	// Both volatile pointers (ResolvedNetnsPath and destMigrationNetns) are empty here. This is
-	// the confirmed live-failure residual: on the raw-CRIU/gRPC fallback the in-memory
-	// destMigrationNetns entry can be gone even though PrepareDestinationNetns's bind mount is
-	// still on disk — either the dest agent restarted between prewarm and the ~60s-later fallback
-	// (wiping the in-memory map), or a prior failed fallback attempt ran the GC-10 teardown that
-	// deletes the map entry. In both cases the durable /run/podmotion/netns/pm-mig-<uid>/bind
-	// artifact still exists. Reconstruct that canonical path deterministically (source of truth =
-	// the broker's path shape, network.MigrationNetnsBindPath) and os.Stat-gate it. This keeps the
-	// MAC read on the bind-mount branch (ifname pmdst0, no ptrace) instead of dropping to the
-	// ("", "eth0") PID path, which reads the restored process's /proc/<pid>/ns/net via nsenter and
-	// is denied by the podmotion-agent AppArmor profile — the "replVethMAC empty" Strict
-	// fail-closed observed 2026-07-10.
-	if canonical := network.MigrationNetnsBindPath(migrationName); canonical != "" {
-		if _, statErr := os.Stat(canonical); statErr == nil {
-			log.Info("finalizeNetnsPath: in-memory netns pointers empty — resolved canonical on-disk bind mount for MAC read (restart/teardown-durable path)",
-				"migration", migrationName, "bindPath", canonical, "ifname", network.MigrationVethPeer)
-			return canonical, network.MigrationVethPeer
-		}
-	}
-	log.Info("finalizeNetnsPath: all bind-mount sources exhausted (ResolvedNetnsPath, in-memory destMigrationNetns, canonical on-disk bind) — falling back to PID path (\"\", \"eth0\"); this is the branch that reaches the AppArmor-denied nsenter read",
+	// R3 (ADR-0349): no gate-readable netns was recorded for this migration. Return the empty
+	// value that drives the EXISTING Strict fail-closed branch (finalizeRestore, server.go:344-
+	// 350) — do NOT guess an ifname, do NOT reconstruct a canonical bind path, do NOT fall back
+	// to Status.ReplVethMAC. finalizeRestore emits the distinct R3 fail-closed string when it
+	// observes netnsPath == "" here.
+	log.Info("finalizeNetnsPath: no authoritative restored netns recorded — no gate-readable Tier 1 record for this migration",
 		"migration", migrationName)
 	return "", "eth0"
 }
@@ -1740,56 +2466,76 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 	// SIGCONT to the cross-node signal would deadlock (the cross-node dial needs a live listener
 	// inside the resumed tree). QA-A1 consumer re-point: the resume gate is unconditioned on the
 	// removed self-loop signal.
-	{
-		s.pendingResumePIDsMu.Lock()
-		resumePID, hasPending := s.pendingResumePIDs[req.MigrationName]
-		if hasPending {
-			delete(s.pendingResumePIDs, req.MigrationName)
-		}
-		s.pendingResumePIDsMu.Unlock()
-		if hasPending && resumePID > 0 {
-			socketsLiveAt := time.Now()
-			// ADR-0312: the restored tree runs under containerd's default AppArmor
-			// profile (a runtime-defined peer label, e.g. runc); the confined main
-			// agent's own profile DENIES this cross-profile SIGCONT (apparmor DENIED
-			// operation="signal" signal=cont). Delegate the resume to the unconfined
-			// netns-broker, which AppArmor does not mediate for signals regardless of
-			// the target label. The restored tree has been held in SIGSTOP continuously
-			// since JoinNsRestore recorded it, so its PID cannot have been reused; read
-			// field 22 (starttime) now and pass it so the broker re-verifies identity
-			// before the kill (PID-reuse guard, mirrors frozen_source_registry.go).
-			resumeStartTime, stErr := readProcStartTime(int32(resumePID))
-			if stErr != nil {
-				// Cannot establish PID-reuse identity — re-record and retry on requeue
-				// rather than signal blind (the broker would reject a 0 starttime anyway).
-				s.pendingResumePIDsMu.Lock()
-				s.pendingResumePIDs[req.MigrationName] = resumePID
-				s.pendingResumePIDsMu.Unlock()
-				log.Error(stErr, "InjectIPHandoff: deferred SIGCONT deferred — could not read restored PID starttime, will retry on requeue (ADR-0312)",
-					"migration", req.MigrationName, "pid", resumePID)
-			} else if err := netnsbroker.NewClient().SignalPID(ctx, resumePID, int(syscall.SIGCONT), resumeStartTime); err != nil {
-				// Re-record so a requeue can retry; do not fail the handoff (source held).
-				s.pendingResumePIDsMu.Lock()
-				s.pendingResumePIDs[req.MigrationName] = resumePID
-				s.pendingResumePIDsMu.Unlock()
-				log.Error(err, "InjectIPHandoff: deferred SIGCONT FAILED via broker — restored tree still stopped, will retry on requeue (ADR-0142 D3 / ADR-0312)",
-					"migration", req.MigrationName, "pid", resumePID)
-			} else {
-				resumedAt := time.Now()
-				log.Info("InjectIPHandoff: deferred SIGCONT sent — restored tree resumed after datapath ready (ADR-0142 D3, seq_delta=0)",
-					"migration", req.MigrationName, "pid", resumePID, "resumedAt", resumedAt.UnixNano())
-				if s.k8sClient != nil {
-					if setErr := s.setOrderingConditions(req.MigrationName, resumePID, socketsLiveAt, resumedAt); setErr != nil {
-						log.Error(setErr, "InjectIPHandoff: failed to set ordering conditions after deferred SIGCONT", "migration", req.MigrationName)
-					}
-				}
-			}
-		}
-	}
+	// ADR-0142 D3: fire the deferred SIGCONT for the --leave-stopped restored tree. Retained here for
+	// the BestEffort / legacy-8-phase paths that still route through InjectIPHandoff; under ADR-0352
+	// the Strict completion path retired injectIPHandoff and resumes via the VerifyTCP liveness path
+	// instead (see resumeDeferredRestoredProcess). Idempotent — whichever fires first wins.
+	s.resumeDeferredRestoredProcess(ctx, req.MigrationName)
 
 	log.Info("InjectIPHandoff: handoff injected (ADR-0133 D2)", "migration", req.MigrationName,
 		"oldPodIP", req.OldPodIp, "destVTEPMAC", resp.DestVtepMac, "probeOk", resp.ProbeOk)
 	return resp, nil
+}
+
+// resumeDeferredRestoredProcess fires the ADR-0142 D3 deferred SIGCONT for a Strict restore that
+// JoinNsRestore left in SIGSTOP via --leave-stopped (recorded in pendingResumePIDs). It is
+// idempotent — the pending entry is consumed on a successful resume, and re-recorded on a transient
+// failure so a later call retries — and safe to call from every point in the Strict completion flow
+// that requires the restored workload to actually be running.
+//
+// ADR-0352 (sprint46B9 regression fix): the Strict completion path RETIRED injectIPHandoff (the
+// controller no longer issues the InjectIPHandoff RPC for Strict — the retired OLD-IP preservation
+// inference), which used to be the SOLE trigger for this SIGCONT. Left unresumed, the restored redis
+// stays frozen: it completes the TCP handshake at the kernel but the SIGSTOPped process never answers
+// the wire-protocol probe (respPing → i/o timeout), so WorkloadLivenessVerified fails and the
+// migration rolls back at the completion deadline (observed live: restored tree in state `T`, probe
+// "read tcp ...->:6379: i/o timeout"). The resume is now driven from the VerifyTCP AppProbeOnly
+// (liveness) path, which the Strict ServiceVerifying phase issues AFTER TCPVerifying established
+// seq-continuity (from the frozen snapshots) and DisengageHold disarmed the zero-window hold — so the
+// ADR-0142 "resume only into a live datapath" ordering is preserved, keyed on the ADR-0352
+// Service-continuity datapath instead of the retired OLD-IP inference. BestEffort/None never record a
+// pending PID (no --leave-stopped), so this is a no-op for them.
+func (s *AgentServer) resumeDeferredRestoredProcess(ctx context.Context, migrationName string) {
+	s.pendingResumePIDsMu.Lock()
+	resumePID, hasPending := s.pendingResumePIDs[migrationName]
+	if hasPending {
+		delete(s.pendingResumePIDs, migrationName)
+	}
+	s.pendingResumePIDsMu.Unlock()
+	if !hasPending || resumePID <= 0 {
+		return
+	}
+	socketsLiveAt := time.Now()
+	// ADR-0312: the restored tree runs under containerd's default AppArmor profile; the confined main
+	// agent's own profile DENIES a cross-profile SIGCONT (apparmor DENIED operation="signal"
+	// signal=cont). Delegate the resume to the unconfined netns-broker. The tree has been in SIGSTOP
+	// continuously since JoinNsRestore recorded it, so its PID cannot have been reused; read field 22
+	// (starttime) and pass it so the broker re-verifies identity before the kill (PID-reuse guard).
+	resumeStartTime, stErr := readProcStartTime(int32(resumePID))
+	if stErr != nil {
+		s.pendingResumePIDsMu.Lock()
+		s.pendingResumePIDs[migrationName] = resumePID
+		s.pendingResumePIDsMu.Unlock()
+		log.Error(stErr, "resumeDeferredRestoredProcess: could not read restored PID starttime — will retry on requeue (ADR-0312)",
+			"migration", migrationName, "pid", resumePID)
+		return
+	}
+	if err := netnsbroker.NewClient().SignalPID(ctx, resumePID, int(syscall.SIGCONT), resumeStartTime); err != nil {
+		s.pendingResumePIDsMu.Lock()
+		s.pendingResumePIDs[migrationName] = resumePID
+		s.pendingResumePIDsMu.Unlock()
+		log.Error(err, "resumeDeferredRestoredProcess: deferred SIGCONT FAILED via broker — restored tree still stopped, will retry on requeue (ADR-0142 D3 / ADR-0312)",
+			"migration", migrationName, "pid", resumePID)
+		return
+	}
+	resumedAt := time.Now()
+	log.Info("resumeDeferredRestoredProcess: deferred SIGCONT sent — restored tree resumed (ADR-0142 D3, seq_delta=0; ADR-0352 Strict resume no longer gated on the retired injectIPHandoff)",
+		"migration", migrationName, "pid", resumePID, "resumedAt", resumedAt.UnixNano())
+	if s.k8sClient != nil {
+		if setErr := s.setOrderingConditions(migrationName, resumePID, socketsLiveAt, resumedAt); setErr != nil {
+			log.Error(setErr, "resumeDeferredRestoredProcess: failed to set ordering conditions after deferred SIGCONT", "migration", migrationName)
+		}
+	}
 }
 
 // CleanupSourceIPHandoff removes the stale ARP/neighbor entries for the OLD pod IP on the
@@ -1933,12 +2679,20 @@ func (s *AgentServer) resolveNamespaceForMigration(ctx context.Context, migratio
 // No netlink dependency (ADR-0045): reuses the in-tree nsenter+ip exec idiom.
 func resolveReplVethPeer(replPID int) (string, error) {
 	netnsPath := fmt.Sprintf("/proc/%d/ns/net", replPID)
-	out, err := exec.Command("nsenter", "--net="+netnsPath,
-		"ip", "-o", "link", "show", "eth0").CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("resolveReplVethPeer: ip link show eth0 in netns %s: %w (%s)",
-			netnsPath, err, strings.TrimSpace(string(out)))
+	// ADR-0348: routed through the netns broker (fail-closed), SrcPID (replPID is always a live
+	// PID here, not a stable bind-mount path — see the D3 discussion in ADR-0348 §3). No
+	// context.Context is threaded through this function's fixed signature — see ReadReplVethMAC's
+	// identical note.
+	r := netnsbroker.NewClient().NetnsExec(context.Background(), replPID, "", "ip", "-o", "link", "show", "eth0")
+	if r.SpawnErr != nil {
+		return "", fmt.Errorf("resolveReplVethPeer: netns exec failed: ip link show eth0 in netns %s: %w",
+			netnsPath, r.SpawnErr)
 	}
+	if r.ExitCode != 0 {
+		return "", fmt.Errorf("resolveReplVethPeer: ip link show eth0 in netns %s: %w (%s)",
+			netnsPath, fmt.Errorf("exit %d", r.ExitCode), strings.TrimSpace(string(r.Combined)))
+	}
+	out := r.Combined
 	peerIdx := parseVethPeerIndex(string(out))
 	if peerIdx <= 0 {
 		return "", fmt.Errorf("resolveReplVethPeer: no eth0@if<N> peer index in: %s", strings.TrimSpace(string(out)))
@@ -3216,9 +3970,11 @@ print(json.dumps(results))
 		if stdPod[e.Mountpoint] {
 			continue
 		}
-		// Shared/re-attach PVC volumes (Tier0 RWX) are preserved in the image and mapped by PATH in
-		// buildCRIURestoreArgs (<mountpoint>:<mountpoint>) — the destination pod mounts the identical
-		// volume. Covered, so skip without a numeric /dev/null clobber or an unmapped fail-loud.
+		// Shared/re-attach PVC volumes (Tier0 RWX) are preserved in the image and re-attached by
+		// rewriting the recorded mount source to the destination kubelet volume dir in
+		// patchCheckpointImages (CRIU binds mi->source directly for the AUTOGENERATED external and
+		// bypasses --ext-mount-map). The destination pod mounts the identical RWX volume. Covered, so
+		// skip without a numeric /dev/null clobber or an unmapped fail-loud.
 		if reattach[e.Mountpoint] {
 			continue
 		}
@@ -3366,28 +4122,42 @@ print(json.dumps(uniq))
 // quota change is reflected in GOMAXPROCS), but the held fd does NOT follow a cgroup
 // MOVE. Therefore, so that the inherited fd reflects the destination pod's real quota
 // after moveProcessToPodCgroup relocates the process, we open the file from the
-// DESTINATION POD's own cgroup subtree (resolved via the sandbox pause PID) whenever a
-// sandboxID is available. When it is not (or resolution fails) we fall back to the
-// recorded image path if it exists on the destination, and finally to the cgroup-v2
-// root cpu.max — the restore still advances past files-reg.c:2353 in every case (S1).
-func resolveInheritCgroupSource(recordedPath, sandboxID string) string {
+// CONTAINER's own cgroup subtree whenever the NRI-carried containerCgroupsPath is
+// available (ADR-0351 D3.2 — re-pointed off the retired sandboxPausePIDOnce+cgroupV2Path
+// pause-PID chain onto the same D2 resolveCgroupAnchorTarget primitive the real anchor uses,
+// so this best-effort GOMAXPROCS caller and the anchor never disagree on which cgroup is the
+// destination's real scope). When it is not available (or resolution fails) we fall back to
+// the recorded image path if it exists on the destination, and finally to the cgroup-v2 root
+// cpu.max — the restore still advances past files-reg.c:2353 in every case (S1). Best-effort:
+// this value is NOT load-bearing for restore correctness (only for GOMAXPROCS accuracy), so it
+// keeps its existing non-fatal fallback chain — it just no longer resolves a pause PID to get
+// there.
+func resolveInheritCgroupSource(recordedPath, containerCgroupsPath, podCgroupParent string) string {
 	base := filepath.Base(recordedPath) // e.g. "cpu.max" — preserve the controller file name
-	if sandboxID != "" {
-		if pausePID, err := sandboxPausePID(sandboxID); err == nil {
-			if podCgroup, cerr := cgroupV2Path(pausePID); cerr == nil {
-				cand := filepath.Join("/sys/fs/cgroup", podCgroup, base)
-				if _, serr := os.Stat(cand); serr == nil {
-					return cand
-				}
+	if containerCgroupsPath != "" {
+		if anchorTarget, err := resolveCgroupAnchorTarget(containerCgroupsPath, podCgroupParent); err == nil {
+			cand := filepath.Join(cgroupFsRoot, anchorTarget, base)
+			if _, serr := os.Stat(cand); serr == nil {
+				return cand
 			}
 		}
 	}
 	if _, err := os.Stat(recordedPath); err == nil {
 		return recordedPath
 	}
-	return filepath.Join("/sys/fs/cgroup", base)
+	return filepath.Join(cgroupFsRoot, base)
 }
 
+// NON-REGRESSION (ADR-0346 D8): the ADR-0348 twelve-site re-point of the direct-agent
+// `nsenter --net=` calls onto the netns broker does NOT reorder the external-mount reattach
+// (the Tier0-RWX postgres re-attach, emitted here as --ext-mount-map entries) relative to CRIU
+// restore. open_tree for those ext-mounts is performed by `criu restore` ITSELF, inside the child
+// process this function's argv launches; every broker-delegated netns-exec on the restore path
+// (joinNsRestore's lo-up at ~server.go:4245, ReadReplVethMAC, resolveReplVethPeer, and the
+// ADR-0200/0210 probe/echo) runs only AFTER that CRIU child returns (buildCRIURestoreArgs ->
+// exec CRIU -> reap -> post-restore netns-exec). The re-point changes WHO runs nsenter (broker vs
+// confined agent), never WHEN open_tree runs relative to CRIU return — so the postgres reattach
+// ordering the next milestone rides on is preserved.
 func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath, hostVethName string, strictMode bool, reattachMountPaths []reattachMount) ([]string, error) {
 	// Choose --tcp-established whenever the checkpoint actually captured an established
 	// TCP connection (presence of a tcp-stream-*.img), NOT merely when a pre-staged
@@ -3463,31 +4233,28 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		"-v4",
 		"-o", restoreLogPath,
 	}
-	// Shared/re-attach PVC volumes (Tier0 RWX): the source recorded each as an external mount
-	// (ext_key == the in-container mountPath) and patchCheckpointImages PRESERVED it in the image.
-	// Map <containerPath>:<hostTarget> where hostTarget is the destination kubelet volume dir the
-	// replacement pod already mounted — CRIU runs in the HOST mount ns and cannot see the
-	// in-container path (it exists only inside the replacement pod's mount ns), so a 1:1
-	// container:container map fails "open_tree ... No such file or directory". The host kubelet dir
-	// is the same live NFS/CSI data, so CRIU re-attaches exactly the bytes the restored process
-	// holds open (e.g. PostgreSQL WAL/relation files). No data bytes move; "RWX re-attach" tier.
-	// FAIL CLOSED on an unresolved host target. The prior behavior fell back to a 1:1
-	// <containerPath>:<containerPath> map when HostTarget was empty. CRIU runs in the HOST mount
-	// namespace, where the in-container path does not exist, so that map aborts the restore with
-	// "open_tree ... No such file or directory" BEFORE the pidfile is written — surfacing only as
-	// the misleading "restored PID not found" symptom downstream. For a Tier0 RWX re-attach mount
-	// the host target is a precondition, not a best-effort hint: if it is unresolved we stop here
-	// with an actionable error instead of emitting a known-broken map (fail closed on a
-	// missing source of truth, do not guess).
+	// Shared/re-attach PVC volumes (Tier0 RWX): the source recorded each as an AUTODETECTED external
+	// mount (ext_key == CRIU's constant "CRIU:AUTOGENERATED"), and patchCheckpointImages PRESERVED it
+	// in the image AND rewrote its recorded root/source to the destination kubelet volume dir (the
+	// replacement pod's already-mounted volume). That image rewrite is the ACTUAL re-attach mechanism:
+	// CRIU restores an autodetected external by binding from mi->source directly (get_mp_root in
+	// criu/mount.c 4.2), and it BYPASSES --ext-mount-map for AUTODETECTED_MOUNT entries — so a
+	// restore-side "--ext-mount-map <containerPath>:<hostTarget>" (or any mnt_id/ext_key form) is INERT
+	// and is deliberately NOT emitted here (emitting it caused the postgres None/PreCopy wall: it read
+	// as "handled" while CRIU silently open_tree()'d the un-rewritten SOURCE-node path and ENOENT'd at
+	// mount-v2.c:319). This loop stays as the FAIL-CLOSED precondition gate: an unresolved host target
+	// means the patch could not rewrite the source, so we stop here with an actionable error BEFORE
+	// CRIU is ever invoked — never restore a mount whose recorded source only exists on the source
+	// node. (The rewrite itself needs the mnt_id from the post-patch image, which only the patch has;
+	// this function sees only (containerPath, hostTarget) and validates their resolution.)
 	for _, m := range reattachMountPaths {
 		if m.ContainerPath == "" {
 			continue
 		}
 		if m.HostTarget == "" {
-			return nil, fmt.Errorf("reattach host target unresolved for %s: the destination kubelet volume dir for this re-attach (Tier0 RWX) mount could not be resolved (replacement pod not found by label %s, or its kubelet volume dir not yet mounted); refusing to emit the broken 1:1 container-path ext-mount-map that would abort CRIU restore with open_tree ENOENT",
+			return nil, fmt.Errorf("reattach host target unresolved for %s: the destination kubelet volume dir for this re-attach (Tier0 RWX) mount could not be resolved (replacement pod not found by label %s, or its kubelet volume dir not yet mounted); refusing to restore a checkpoint whose recorded external source was not rewritten to a destination path (CRIU would open_tree the source-node path and abort with ENOENT)",
 				m.ContainerPath, replacementPodLabelKey)
 		}
-		args = append(args, "--ext-mount-map", fmt.Sprintf("%s:%s", m.ContainerPath, m.HostTarget))
 	}
 	if destNetnsFd != "" {
 		args = append(args, "--join-ns", "net:"+destNetnsFd)
@@ -3539,6 +4306,41 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 // restoredPidfileName is the basename CRIU writes the restored root PID to (see --pidfile
 // in buildCRIURestoreArgs). It lives in the restore dataDir (host-visible ext4).
 const restoredPidfileName = "restored.pid"
+
+// restoreDevNode is one OCI-standard character device node the restore rootfs must carry so
+// CRIU's reopen-by-PATH of a workload fd whose backing file is /dev/<name> (files-reg.c:2353)
+// succeeds. See joinNsRestore's provisioning loop for the grounding (pm-w2 restore.log, sprint46).
+type restoreDevNode struct {
+	rel          string // path relative to the rootfs root, e.g. "dev/null" (no leading slash — CRIU openat is root-relative)
+	major, minor int    // fixed Linux device numbers (Documentation/admin-guide/devices.txt)
+	required     bool   // true => fail CLOSED if creation fails (a workload fd is backed by it)
+}
+
+// standardRestoreDevNodes is the workload-agnostic OCI default device-node set (runc
+// defaultDevices) that a container overlay image lacks: an image ships an EMPTY /dev, and the
+// runtime-managed /dev tmpfs is not part of the host-mount-ns bundle rootfs we restore into. Only
+// /dev/null is `required`: CRIU aborts the ENTIRE restore before writing --pidfile when a workload
+// fd (e.g. redis fd 0) reopens /dev/null by path and it is absent (decoded live on pm-w2, sprint46
+// live-proof cycle 1). The rest are best-effort (log-and-continue).
+var standardRestoreDevNodes = []restoreDevNode{
+	{rel: "dev/null", major: 1, minor: 3, required: true},
+	{rel: "dev/zero", major: 1, minor: 5},
+	{rel: "dev/full", major: 1, minor: 7},
+	{rel: "dev/random", major: 1, minor: 8},
+	{rel: "dev/urandom", major: 1, minor: 9},
+	{rel: "dev/tty", major: 5, minor: 0},
+}
+
+// devNodeMknodShellCmd returns the idempotent shell command (run via the privileged netns broker's
+// allowlisted "sh") that creates one device node at <rootfsDir>/<node.rel>. `umask 0000` defeats
+// the broker umask so `-m 666` yields exactly crw-rw-rw- (matching the host nodes); the `[ -e ]`
+// guard makes it idempotent so an NRI bundle whose runtime already populated /dev is left
+// untouched. Pure (string-only) so the provisioning contract is unit-testable without a broker /
+// mknod round-trip — the coverage that was absent when the missing /dev/null aborted cycle 1.
+func devNodeMknodShellCmd(rootfsDir string, node restoreDevNode) string {
+	p := filepath.Join(rootfsDir, node.rel)
+	return fmt.Sprintf("umask 0000; [ -e %q ] || mknod -m 666 %q c %d %d", p, p, node.major, node.minor)
+}
 
 // copyDirAll copies all regular files (non-recursive into subdirs is fine for CRIU image dirs
 // which are flat) from src to dst. dst is created with 0o700 if it doesn't exist.
@@ -3617,7 +4419,20 @@ func copyFile(src, dst string) error {
 // reattachMountPaths are the shared/re-attach PVC mounts (resolveReattachMounts): they are
 // preserved as external mounts through patchCheckpointImages (keyed on ContainerPath) and
 // re-attached on restore via --ext-mount-map <ContainerPath>:<HostTarget>. Empty for stateless.
-func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount) (int, []ExternalMountDroppedInfo, error) {
+// ctx is unused by the cgroup-anchor gate as of ADR-0351 D1.2 (the retired sandboxPausePIDWaiting
+// was its only ctx-consuming caller in this function) — kept in the signature because all three
+// live call sites already thread one and a future consumer may need it; Go permits an unused
+// parameter without error.
+func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName, containerID, destNetnsFd, sandboxID, storedHostVeth string, strictMode bool, reattachMountPaths []reattachMount, containerCgroupsPath, podCgroupParent, preservedSourceIP string) (int, []ExternalMountDroppedInfo, error) {
+	// ADR-0353 R2: joinNsRestoreFn is the sole CRIU-restore chokepoint — every live call site
+	// (the NRI path via (*AgentServer).JoinNsRestore, and the gRPC Restore handler's primary and
+	// raw-CRIU-fallback drives) MUST acquire the single-owner in-flight restore claim
+	// (claimRestore) before reaching this function. This is the self-checking invariant that
+	// catches any FUTURE call site that bypasses the primitive — fail loud instead of silently
+	// allowing a second concurrent CRIU-restore drive into the same destination.
+	if !isRestoreClaimed(migrationName) {
+		panic(fmt.Sprintf("joinNsRestore: entered for migration %q with no restore claim held — ADR-0353 R2 invariant violated (a call site is bypassing claimRestore)", migrationName))
+	}
 	// Gate30: use the host-side veth name stored during PrepareDestinationNetns rather than
 	// re-deriving from migrationName.  Re-derivation diverges when the controller passes a
 	// pod UID to PrepareDestinationNetns and a migration name to Restore.
@@ -3682,7 +4497,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// the files.img↔mountpoints consistency invariant (ADR-0193 P-0193-1).
 	// inheritFdNamesForPatch is the same set that buildCRIURestoreArgs will pass via --inherit-fd
 	// (C-R3-1 single source of truth — no independent recomputation).
-	droppedMounts, patchErr := patchCheckpointImages(checkpointDir, inheritFdNamesForPatch, reattachContainerPaths(reattachMountPaths))
+	droppedMounts, patchErr := patchCheckpointImages(checkpointDir, inheritFdNamesForPatch, reattachContainerPaths(reattachMountPaths), reattachHostTargets(reattachMountPaths))
 	if patchErr != nil {
 		return 0, nil, fmt.Errorf("patch checkpoint images: %w", patchErr)
 	}
@@ -3782,6 +4597,51 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 			log.Error(err, "setupRootfsFiles: touch failed (non-fatal)", "file", f, "out", string(out))
 		}
 	}
+	// Populate the restore rootfs /dev with the OCI-standard device nodes before CRIU restore.
+	//
+	// GROUNDING (decoded live on pm-w2, sprint46 live-proof cycle 1 — NOT inferred):
+	// /var/lib/podmotion/restore/redis-live-strict/data/restore.log ended with
+	//   1: Error (criu/files-reg.c:2353): Can't open file dev/null on restore: No such file or directory
+	//   1: Error (criu/files.c:1221): Unable to open fd=0 id=0x5
+	//   Error (criu/cr-restore.c:2324): Restoring FAILED.
+	// CRIU dumped the workload's fd 0 as a REG-file open of path "/dev/null" (image fd table:
+	// FD 0 -> id 0x5 type 1/REG). On restore CRIU reopens that backing file by PATH relative to
+	// --root <rootfsDir> (openat(root, "dev/null")). A container's /dev is a runtime-managed tmpfs
+	// the OCI runtime (runc defaultDevices) populates with these nodes at container-create time; it
+	// is NOT part of the overlay image and is NOT mounted into the host-mount-ns view of the bundle
+	// rootfs we restore into — so /dev is empty here, the reopen ENOENTs, and CRIU ABORTS the whole
+	// restore at ~0.8s BEFORE it writes --pidfile. That abort surfaced only as the misleading
+	// downstream "restored process PID not found ... pidfile never appeared" symptom (the real cause
+	// is the restore.log tail the caller appends). This is the classic kind->KVM substrate exposure:
+	// kind's node /dev differed; the standing KVM containerd bundle leaves /dev unpopulated.
+	//
+	// FIX (general primitive, workload-agnostic — covers every workload with a /dev-backed fd, not
+	// just this redis fd 0): create the standard char device nodes so CRIU's reopen-by-path succeeds.
+	// mknod requires CAP_MKNOD, which the SD-1 de-privileged agent (privileged:false) does not hold —
+	// so it is DELEGATED to the privileged broker via the already-allowlisted "sh" host-mount-ns exec
+	// (execAllowlist, ADR-0231/0346), the SAME mechanism the mkdir/touch scaffolding above uses; no
+	// allowlist widening. `umask 0000` defeats the broker umask so -m 666 yields exactly 0666 (match
+	// the host nodes: crw-rw-rw-). Idempotent ([ -e ] guard) so an NRI bundle whose runtime already
+	// populated /dev is left untouched. Major/minor are the fixed Linux mem/tty device numbers
+	// (Documentation/admin-guide/devices.txt), verified against pm-w2 /dev.
+	// The node list + command builder are extracted to package scope (standardRestoreDevNodes /
+	// devNodeMknodShellCmd) so the provisioning contract is unit-testable — see restore_devnode_test.go.
+	for _, n := range standardRestoreDevNodes {
+		p := filepath.Join(rootfsDir, n.rel)
+		out, err := nsenterCmd("sh", "-c", devNodeMknodShellCmd(rootfsDir, n)).CombinedOutput()
+		if err == nil {
+			continue
+		}
+		if n.required {
+			// /dev/null is the load-bearing node: CRIU reopens fd 0/1/2's /dev/null backing by path
+			// under --root and aborts the ENTIRE restore before writing --pidfile if it is absent (the
+			// decoded pm-w2 failure). Fail CLOSED here with the real cause rather than letting the
+			// restore proceed and re-surface as the downstream "restored PID not found" symptom.
+			metrics.MigrationsFailedTotal.WithLabelValues("restore_devnull_create").Inc()
+			return 0, nil, fmt.Errorf("create required restore-rootfs device node %s (CRIU aborts reopening a workload fd backed by it without it): %w\n%s", p, err, string(out))
+		}
+		log.Error(err, "setupRootfsDevNodes: mknod failed (non-fatal)", "path", p, "out", string(out))
+	}
 	// Step 4: CRIU restore — standalone rootfs.
 	//
 	// ADR-0125 (supersedes ADR-0122 §3): on the stateless (destNetnsFd-empty) path, resolve the
@@ -3797,43 +4657,52 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// never see the marker. /var/lib/podmotion uses ext4 and is accessible from both.
 	restoreLogPath := filepath.Join(dataDir, "restore.log")
 	_ = os.WriteFile(restoreLogPath, nil, 0o644)
+	// ADR-0349: the destNetnsFd != "" else-block that used to live here is DELETED (dead code —
+	// all three joinNsRestore call sites pass destNetnsFd="" literally, so the branch never
+	// executed; its comment claiming it "executes for every Strict-mode migration" was false).
+	// destNetnsFd stays a live parameter (used above for hostVethName and below for
+	// buildCRIURestoreArgs) — only the dead record-and-join branch is removed (D10, scope item 5).
 	var petnsPath string
 	if destNetnsFd == "" {
 		if sandboxID == "" {
-			// tcpPreservationMode=None on the gRPC Restore path: no sandbox ID is supplied
-			// because the operator does not pass one (RestoreRequest has no sandbox_id field).
-			// For cold migration (no TCP state to preserve) the --join-ns net:<path> is not
-			// required — petnsPath stays empty and buildCRIURestoreArgs omits --join-ns.
-			// The NRI hook path always supplies a sandboxID; this branch is only hit on the
-			// fallback gRPC Restore path used in kind/dev clusters with tcpPreservationMode=None.
-			log.Info("joinNsRestore: no sandboxID and no destNetnsFd — skipping netns join (tcpPreservationMode=None cold path)",
+			// tcpPreservationMode=None on the gRPC Restore path (or any path where
+			// s.k8sClient == nil at the caller and no self-resolve was attempted — see
+			// docs/sprints/sprint46B2/template-adr-1.md §0.2 for the precise gating): no
+			// sandbox ID is supplied. For cold migration (no TCP state to preserve) the
+			// --join-ns net:<path> is not required — petnsPath stays empty and
+			// buildCRIURestoreArgs omits --join-ns. The NRI hook path always supplies a
+			// sandboxID (cmd/agent/main.go -> event.SandboxID); a Strict/BestEffort gRPC
+			// restore with a live k8sClient fails closed upstream (ADR-0325 gate,
+			// server.go:6587-6591 / 6774-6778) before ever reaching this branch with a live pid.
+			log.Info("joinNsRestore: no sandboxID and no destNetnsFd — skipping netns join",
 				"migration", migrationName)
 		} else {
-			// B1: resolve via the containerd sandbox API (unambiguous per pod, no /proc comm scan).
-			// B2: ResolveNetnsFromSandbox opens the netns path and cross-checks fd/path inodes.
-			netnsFd, resolvedPath, rerr := ResolveNetnsFromSandbox(context.Background(), nil, sandboxID)
+			// ADR-0325 / ADR-0349 R1: resolve + record the pod sandbox netns as the single
+			// authoritative source finalizeNetnsPath's Tier 1 reads back. Extracted to
+			// recordAuthoritativeRestoreNetns so it is table-driven-testable (test (d)).
+			// ADR-0355 D3: capture the authoritative ifname (previously discarded as `_`) — it is
+			// the recorded dataplane interface name ("eth0" for the pod sandbox netns), the SAME
+			// value captureRestoredVethMAC reads back — so the bind-prep uses one source of truth,
+			// never a fresh "eth0" literal (DR-4).
+			p, ifname, rerr := recordAuthoritativeRestoreNetns(context.Background(), migrationName, sandboxID)
 			if rerr != nil {
 				return 0, nil, fmt.Errorf("resolve replacement pod sandbox netns: %w", rerr)
 			}
-			// ADR-0125: the fd existed only for the B2 inode cross-check. Close it now; CRIU joins by
-			// path, not by inherited fd.
-			_ = netnsFd.Close()
-			petnsPath = resolvedPath
-			// ADR-0133: stash the exact netns path CRIU joined so the NRI callback can read the
-			// replacement pod's eth0 MAC from it (the restored PID's own /proc/<pid>/ns/net can
-			// transiently resolve to the host netns right after CRIU exits).
-			storeResolvedNetnsPath(migrationName, petnsPath)
+			petnsPath = p
 			log.Info("joinNsRestore: joining replacement pod netns via --join-ns net:<path> (ADR-0125)",
 				"sandboxID", sandboxID, "netnsPath", petnsPath)
+
+			// ADR-0355 D1/D3: BEFORE buildCRIURestoreArgs/CRIU, make the preserved source IP locally
+			// bindable (scope-host /32, broker-delegated) inside the netns CRIU will join, so soccr's
+			// bind() of the checkpointed TCP_ESTABLISHED socket finds RTN_LOCAL and does not fail with
+			// soccr.c:499 EADDRNOTAVAIL. Structurally confined to this petnsPath != "" branch (a netns
+			// was actually joined). Self-gated on preservedSourceIP != "" && checkpointHasEstablishedTCP
+			// and fail-closed (before CRIU) on a malformed IP (DR-15) or a broker-add failure. ctx is
+			// joinNsRestore's own context parameter, in scope here.
+			if perr := prepPreservedSourceAddrForRestore(ctx, migrationName, checkpointDir, petnsPath, ifname, preservedSourceIP); perr != nil {
+				return 0, nil, perr
+			}
 		}
-	} else {
-		// ADR (this fix): on the destNetnsFd != "" branch — the one that actually executes for
-		// every Strict-mode migration via the gRPC Restore call sites (5833, 6003) — destNetnsFd
-		// is already the agent-owned bind-mount path (sourced end-to-end from
-		// PrepareDestinationNetns via the controller and RestoreRequest.DestNetnsFd). Record it
-		// the same way the sandboxID branch above records petnsPath, so the NRI callback / MAC
-		// resolution reads the agent-created bind netns instead of ptrace'd /proc/<pid>/ns/net.
-		storeResolvedNetnsPath(migrationName, destNetnsFd)
 	}
 
 	criuArgs, err := buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secretsDir, restoreLogPath, destNetnsFd, petnsPath, hostVethName, strictMode, reattachMountPaths)
@@ -3954,7 +4823,7 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 				"fd", c.Fd, "path", c.Path)
 			continue
 		}
-		src := resolveInheritCgroupSource(c.Path, sandboxID)
+		src := resolveInheritCgroupSource(c.Path, containerCgroupsPath, podCgroupParent)
 		cgroupFdMapArgs = append(cgroupFdMapArgs, fmt.Sprintf("--cgroup-fd=%d:%s", c.Fd, src))
 		// CRIU files-reg.c:2611 stores rfi->path = rfe->name+1 (no leading slash).
 		// --inherit-fd key must match exactly — strip the leading '/'. ADR-0188.
@@ -4143,38 +5012,65 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// depth: reject the impossible case where the pidfile PID coincides with the wrapper PID.
 	if pid == criuWrapperPID {
 		metrics.MigrationsFailedTotal.WithLabelValues("restore_pid_equals_wrapper").Inc()
+		// ADR-0351 G5: a live restored process already exists at this point — reap it (and its
+		// holder) on every post-PID-live terminal leg so a fail-closed abort never leaves a
+		// destination ghost. holderPID is passed explicitly (never re-derived from /proc
+		// ancestry) precisely so this degenerate pid==criuWrapperPID leg cannot walk past the
+		// wrapper into the broker's own process tree — see reapRestoredProcessTree's doc comment.
+		reapRestoredProcessTreeFn(pid, criuWrapperPID)
 		return 0, nil, fmt.Errorf("pidfile-reported PID %d equals the CRIU wrapper (holder) PID — refusing to trust", pid)
 	}
 	if verr := verifyRestoredPIDAlive(pid, 100*time.Millisecond); verr != nil {
 		metrics.MigrationsFailedTotal.WithLabelValues("restore_pid_dead").Inc()
+		reapRestoredProcessTreeFn(pid, criuWrapperPID) // ADR-0351 G5
 		return 0, nil, fmt.Errorf("ADR-0228 Invariant 1: %w", verr)
 	}
 	log.Info("joinNsRestore: resolved restored PID via CRIU --pidfile (authoritative primitive)",
 		"pid", pid, "pidfile", pidfilePath, "migration", migrationName)
 
-	// ADR-0128: cgroup placement requires a pod sandbox to anchor to, so it is the ONE step that
-	// still legitimately depends on sandboxID (it is NOT retired). On the NRI path (sandboxID set)
-	// --manage-cgroups=ignore leaves the restored tree in the broker/launcher cgroup, so move it
-	// into the pod's sandbox cgroup for containerd/k8s to manage. The gRPC/--join-ns path has no
-	// pod sandbox (sandboxID == "") and therefore no pod cgroup to move into — this step is
-	// skipped. PID resolution above is identical on both paths regardless.
-	if sandboxID != "" {
-		// Resolve the pod's sandbox cgroup path from the pause PID (same anchor as ADR-0123 D2).
-		pausePID, perr := sandboxPausePID(sandboxID)
-		if perr != nil {
-			return 0, nil, fmt.Errorf("ADR-0128: resolve pause PID for sandbox %s: %w", sandboxID, perr)
+	// ADR-0128/ADR-0351 D2: cgroup placement requires a pod sandbox to anchor to, so it is the
+	// ONE step that still legitimately depends on sandboxID (it is NOT retired). On the NRI path
+	// (sandboxID set) --manage-cgroups=ignore leaves the restored tree in the broker/launcher
+	// cgroup, so move it into the CONTAINER's OWN cgroup scope (ADR-0351 D2.1 — never the
+	// pause/sandbox scope Defect 2 identified) for containerd/k8s to manage. The gRPC/--join-ns
+	// path has no pod sandbox (sandboxID == "") and therefore no pod cgroup to move into — that
+	// case is unchanged, still skipped.
+	//
+	// ADR-0351 D1.2/D2: containerCgroupsPath=="" with sandboxID!="" is a SEPARATE, DISTINCT case
+	// from sandboxID=="" — verified against live source this pass (server.go
+	// resolvePodNetnsSandboxWaiting/ADR-0325) that the gRPC restore path DOES resolve a real,
+	// non-empty sandboxID via its own self-resolve mechanism, NOT only the NRI path as originally
+	// assumed. That path has no NRI ContainerEvent and therefore no NRI-carried cgroup value.
+	// Reintroducing a ctr/containerd query here to backfill it would be exactly the brittle-chain
+	// pattern this ADR retires (invariant #10) — so this leg SKIPS the anchor (identical
+	// "no pod cgroup to move into" effect as sandboxID=="") rather than either (a) reintroducing a
+	// query, or (b) fail-closed-reaping every gRPC-path restore that resolves a sandbox, which
+	// would be a severe regression relative to the pre-ADR-0351 pause-PID-derived anchor that
+	// DID cover this path. Tracked, not silently claimed closed — same discipline as the BD-8
+	// whole-tree-containment gap: the gRPC/raw-CRIU fallback path's cgroup anchoring is a KNOWN,
+	// RECORDED gap (no longer covered, where it used to be, via the retired pause-PID mechanism)
+	// pending a named follow-up ADR addressing per-container cgroup resolution on the non-NRI path.
+	if sandboxID != "" && containerCgroupsPath == "" {
+		logCgroupAnchorOutcome(migrationName, "skipped-no-nri-cgroup-path", nil)
+		log.Info("joinNsRestore: sandboxID present but no NRI-carried containerCgroupsPath (raw-CRIU/gRPC restore path) — cgroup anchor SKIPPED, restored process stays in broker cgroup (ADR-0351 D2, tracked gap — see follow-up ADR)",
+			"pid", pid, "sandboxID", sandboxID, "migration", migrationName)
+	} else if sandboxID != "" {
+		// ADR-0351 D2.1-D2.4: resolve + confine the NRI-carried container cgroup path — pure,
+		// zero-query, zero-poll, zero-retry (D1.4/BD-2).
+		anchorTarget, aerr := resolveCgroupAnchorTarget(containerCgroupsPath, podCgroupParent)
+		if aerr != nil {
+			reapRestoredProcessTreeFn(pid, criuWrapperPID) // ADR-0351 G5
+			logCgroupAnchorOutcome(migrationName, "failed-closed-resolve", aerr)
+			return 0, nil, fmt.Errorf("ADR-0351: resolve cgroup anchor for sandbox %s: %w", sandboxID, aerr)
 		}
-		podCgroup, cerr := cgroupV2Path(pausePID)
-		if cerr != nil {
-			return 0, nil, fmt.Errorf("ADR-0128: read pod cgroup from pause PID %d (sandbox %s): %w",
-				pausePID, sandboxID, cerr)
+		if merr := moveProcessToPodCgroup(pid, anchorTarget); merr != nil {
+			reapRestoredProcessTreeFn(pid, criuWrapperPID) // ADR-0351 G5
+			logCgroupAnchorOutcome(migrationName, "failed-closed-write", merr)
+			return 0, nil, fmt.Errorf("ADR-0351: move restored PID %d into cgroup %s: %w", pid, anchorTarget, merr)
 		}
-		// Move the restored tree root into the pod cgroup (single cgroup.procs write moves the group).
-		if merr := moveProcessToPodCgroup(pid, podCgroup); merr != nil {
-			return 0, nil, fmt.Errorf("ADR-0128: move restored PID %d into pod cgroup %s: %w", pid, podCgroup, merr)
-		}
-		log.Info("joinNsRestore: moved restored process into pod cgroup (ADR-0128)",
-			"pid", pid, "podCgroup", podCgroup, "sandboxID", sandboxID)
+		logCgroupAnchorOutcome(migrationName, "anchored", nil)
+		log.Info("joinNsRestore: moved restored process into container's OWN cgroup (ADR-0351 D2, corrects ADR-0128 Defect 2 wrong-scope)",
+			"pid", pid, "containerScope", anchorTarget, "sandboxID", sandboxID)
 	}
 	log.Info("joinNsRestore: found restored process", "pid", pid)
 
@@ -4182,11 +5078,24 @@ func joinNsRestore(migrationName, checkpointDir, imageName, containerID, destNet
 	// using the PID resolved from the pod cgroup (never the CRIU PID). On the cold path this
 	// is the CNI-wired pod netns (lo is normally already up); on the TCP-stateful path it is the
 	// pre-staged migration netns. Idempotent either way.
-	if out, err := exec.Command("nsenter",
-		fmt.Sprintf("--net=/proc/%d/ns/net", pid), "--",
-		"ip", "link", "set", "lo", "up",
-	).CombinedOutput(); err != nil {
-		log.Info("joinNsRestore: warning — failed to bring up loopback", "err", err, "output", string(out))
+	// ADR-0348: routed through the netns broker (fail-closed), SrcPID. No context.Context is
+	// threaded through joinNsRestore's fixed signature (shared by both the NRI and gRPC restore
+	// paths) — use context.Background(), matching ReadReplVethMAC/resolveReplVethPeer.
+	if r := netnsbroker.NewClient().NetnsExec(context.Background(), pid, "", "ip", "link", "set", "lo", "up"); r.SpawnErr != nil {
+		log.Info("joinNsRestore: warning — failed to bring up loopback", "err", r.SpawnErr, "op", "netns_exec")
+	} else if r.ExitCode != 0 {
+		log.Info("joinNsRestore: warning — failed to bring up loopback", "err", fmt.Errorf("exit %d", r.ExitCode), "output", string(r.Combined))
+	}
+
+	// ADR-0349 (Security Reviewer, sprint46B2 validation cycle 1): capture the authoritative
+	// replVethMAC NOW — the instant CRIU has brought the restored process up — from the process's OWN
+	// netns (the SAME denial-free SrcPID broker entry the lo-up just used) and write it back for
+	// finalizeRestore to serve as a VALUE. This replaces the post-hoc recorded-bind-path re-read that
+	// returned empty for ~75s live (live-proof-cycle1) even though the pod was reachable at its pod
+	// IP. Gated on petnsPath != "" — a pod dataplane netns was joined (the MAC-handoff case);
+	// host-network / None cold restores join no eth0-bearing netns and latch nothing.
+	if petnsPath != "" {
+		captureRestoredVethMAC(migrationName, pid, "")
 	}
 
 	success = true
@@ -4228,6 +5137,20 @@ const (
 	inetnsProbeExitOtherErr = 66 // any other dial error — failure
 )
 
+// netnsSelfExecFn / netnsSelfExecStartFn are the broker-delegated SELF-PATH exec seams for the two
+// in-netns primitives that re-execute this agent's own binary (ADR-0200 __inetns_probe /
+// ADR-0210 __inetns_echo). They default to the real netns-broker client calls; they exist so a
+// server-package test can capture the transmitted Argv and prove the ADR-0346 D3/D5 self-path
+// sentinel (netnsbroker.NetnsExecSelfToken) is what these sites send — NEVER a live
+// os.Executable()/"/proc/self/exe" path, which the broker's exact-match allowlist rejects
+// (discharge req 11). Same package-var test-seam idiom already used by joinNsRestoreFn.
+var netnsSelfExecFn = func(ctx context.Context, replPID int, netnsPath string, argv ...string) netnsbroker.ExecResult {
+	return netnsbroker.NewClient().NetnsExec(ctx, replPID, netnsPath, argv...)
+}
+var netnsSelfExecStartFn = func(ctx context.Context, replPID int, netnsPath string, argv ...string) (int, error) {
+	return netnsbroker.NewClient().NetnsExecStart(ctx, replPID, netnsPath, argv...)
+}
+
 // probeOldIPInPodNetns performs the ADR-0200 D1 reachability probe by re-executing this same
 // agent binary's __inetns_probe helper INSIDE the replacement pod's network namespace via the
 // established in-tree nsenter --net=/proc/<replPID>/ns/net idiom (the same idiom used by
@@ -4235,40 +5158,44 @@ const (
 // no netlink/new external dependency). Dialing the OLD IP:7 from where the IP is owned returns
 // RST (ECONNREFUSED) → ProbeOk=true (ADR-0200 D3: port :7 and RST=success are unchanged).
 // Returns (probeOk, probeOutput) mirroring the prior in-process dial's contract exactly.
-func probeOldIPInPodNetnsImpl(replPID int, oldPodIP string) (bool, string) {
-	netnsPath := fmt.Sprintf("/proc/%d/ns/net", replPID)
-	self, err := os.Executable()
-	if err != nil {
-		self = "/proc/self/exe"
+// ADR-0348 (D2, D5a, D4): routed through the netns broker (fail-closed), SrcPID. This is the
+// sync (non-detached) probe site — do NOT map it to NetnsExecStart (it is a synchronous,
+// classification-bearing call, not a fire-and-forget listener). The broker's ExecResult.ExitCode
+// MUST carry the __inetns_probe child's real exit code (nsenter-propagated, not broker-collapsed)
+// for inetnsProbeExitRefused (64) to be observably distinguishable from inetnsProbeExitTimeout
+// (65) here — see doNetnsExec in internal/agent/netnsbroker/broker.go.
+func probeOldIPInPodNetnsImpl(ctx context.Context, replPID int, oldPodIP string) (bool, string) {
+	// ADR-0346 D3/D5: transmit the fixed self-path sentinel as argv[0], NEVER os.Executable()/
+	// "/proc/self/exe". The broker's exact-match netnsExecAllowlist keys on NetnsExecSelfToken and
+	// substitutes its OWN pinned self path server-side; a live binary path is not in the allowlist,
+	// so it is rejected ("not in broker allowlist"), r.SpawnErr fires, and the probe fails closed on
+	// every call — the datapath-dead regression discharge req 11 guards against.
+	// netns broker exec: <broker-self-binary> __inetns_probe <oldIP> 7, run inside the pod netns.
+	r := netnsSelfExecFn(ctx, replPID, "", netnsbroker.NetnsExecSelfToken, "__inetns_probe", oldPodIP, "7")
+	if r.SpawnErr != nil {
+		// D4: broker unreachable -> fail closed, advisory-only probe returns false (matches
+		// the prior local exec-launch-failure behavior).
+		return false, fmt.Sprintf("ADR-0200: in-netns probe exec failed: %v", r.SpawnErr)
 	}
-	// nsenter --net=<pod netns> <agent-binary> __inetns_probe <oldIP> 7
-	cmd := exec.Command("nsenter", "--net="+netnsPath, self, "__inetns_probe", oldPodIP, "7")
-	out, runErr := cmd.CombinedOutput()
-	output := strings.TrimSpace(string(out))
-	if runErr == nil {
+	output := strings.TrimSpace(string(r.Combined))
+	switch r.ExitCode {
+	case inetnsProbeExitSuccess:
 		// Exit 0 — SYN-ACK success.
 		return true, output
+	case inetnsProbeExitRefused:
+		// RST / ECONNREFUSED — the kernel in the pod netns answered: IP is live (success),
+		// identical to the host-netns isConnRefused()==true classification it replaces.
+		return true, output
+	case inetnsProbeExitTimeout:
+		return false, output
+	default:
+		return false, output
 	}
-	var exitErr *exec.ExitError
-	if errors.As(runErr, &exitErr) {
-		switch exitErr.ExitCode() {
-		case inetnsProbeExitRefused:
-			// RST / ECONNREFUSED — the kernel in the pod netns answered: IP is live (success),
-			// identical to the host-netns isConnRefused()==true classification it replaces.
-			return true, output
-		case inetnsProbeExitTimeout:
-			return false, output
-		default:
-			return false, output
-		}
-	}
-	// Could not even launch nsenter / the helper — treat as failure (deferred to requeue).
-	return false, fmt.Sprintf("ADR-0200: in-netns probe exec failed: %v (%s)", runErr, output)
 }
 
 // probeOldIPInPodNetns is the AgentServer method seam (overridable in tests).
-func (s *AgentServer) probeOldIPInPodNetns(_ context.Context, replPID int, oldPodIP string) (bool, string) {
-	return probeOldIPInPodNetnsImpl(replPID, oldPodIP)
+func (s *AgentServer) probeOldIPInPodNetns(ctx context.Context, replPID int, oldPodIP string) (bool, string) {
+	return probeOldIPInPodNetnsImpl(ctx, replPID, oldPodIP)
 }
 
 // ProbeDataplaneReachability is the ADR-0210 cross-node dataplane probe. It is called by
@@ -4378,22 +5305,25 @@ func (s *AgentServer) StartReachabilityEcho(ctx context.Context, req *agentpb.St
 	if ttl <= 0 {
 		ttl = 15
 	}
-	self, err := os.Executable()
-	if err != nil {
-		self = "/proc/self/exe"
-	}
-	netnsPath := fmt.Sprintf("/proc/%d/ns/net", replPID)
-	// Launch the in-netns echo listener detached — it serves for ttl seconds then exits.
-	cmd := exec.Command("nsenter", "--net="+netnsPath, self, "__inetns_echo",
+	// ADR-0348 (D2, D4): launch the in-netns echo listener detached, routed through the netns
+	// broker's NetnsExecStart (SrcPID) — it serves for ttl seconds then exits. Reap is handled by
+	// the broker's existing asyncExecReg/doExecPoll/doExecSignal machinery (ADR-0346 D1); do not
+	// re-add a local `go func(){ cmd.Wait() }()`.
+	// ADR-0346 D3/D5: transmit the fixed self-path sentinel as argv[0], NEVER os.Executable()/
+	// "/proc/self/exe" — the broker exact-matches NetnsExecSelfToken and substitutes its own pinned
+	// self path server-side; a live binary path is rejected, startErr fires, and the listener never
+	// starts (Started=false) on every call, the dead-datapath regression discharge req 11 guards.
+	_, startErr := netnsSelfExecStartFn(ctx, replPID, "", netnsbroker.NetnsExecSelfToken, "__inetns_echo",
 		req.ListenIp, fmt.Sprintf("%d", req.ListenPort), req.Nonce, fmt.Sprintf("%d", ttl))
-	if startErr := cmd.Start(); startErr != nil {
+	if startErr != nil {
+		// D4: broker-unreachable -> Started MUST be false. Never true when no listener actually
+		// started -- a downstream bug could otherwise misread the absence as a real listener.
 		resp.Started = false
-		resp.Detail = fmt.Sprintf("ADR-0210: failed to start in-netns echo listener: %v", startErr)
-		log.Error(startErr, "StartReachabilityEcho: launch failed (ADR-0210)", "migration", req.MigrationName)
+		resp.Detail = fmt.Sprintf("ADR-0210: netns exec failed: %v", startErr)
+		log.Error(startErr, "StartReachabilityEcho: launch failed (ADR-0210)", "migration", req.MigrationName,
+			"op", "netns_exec_start")
 		return resp, nil
 	}
-	// Reap the helper asynchronously so it does not become a zombie.
-	go func() { _ = cmd.Wait() }()
 	resp.Started = true
 	resp.Detail = fmt.Sprintf("ADR-0210: in-netns nonce-echo listener started on %s:%d (replPID=%d, ttl=%ds)",
 		req.ListenIp, req.ListenPort, replPID, ttl)
@@ -4417,16 +5347,252 @@ func isConnRefused(err error) bool {
 	return false
 }
 
-// moveProcessToPodCgroup implements ADR-0128: moves pid into the pod's sandbox cgroup by writing
-// it to <podCgroupPath>/cgroup.procs under /sys/fs/cgroup. A single cgroup.procs write moves the
-// whole thread group of the leader; the CRIU-restored tree shares one cgroup, so moving the root
-// migrates the group. podCgroupPath is the cgroup v2 path (e.g. "/kubepods.slice/.../...scope").
+// cgroupFsRoot is the host cgroup v2 mount point the agent writes cgroup.procs under. A package
+// var (not a bare constant) so resolveCgroupAnchorTarget's confinement check and
+// moveProcessToPodCgroup's write path cannot drift apart (ADR-0351 D2.4/BD-10) while still being
+// overridable in tests to point at a fixture tree instead of a real host /sys/fs/cgroup.
+var cgroupFsRoot = "/sys/fs/cgroup"
+
+// isSliceToken reports whether containerCgroupsPath is a systemd cgroup-driver slice token
+// ("<slice>.slice:<runtime-prefix>:<id>", 3 colon-separated fields) rather than a raw
+// /sys/fs/cgroup-relative filesystem path. ADR-0351 D2.2, shape GROUNDED live (G0.2,
+// docs/sprints/sprint46B7/g0-probe-adr0351-transcript.md): on this substrate
+// container.GetLinux().GetCgroupsPath() always arrives in this form
+// ("kubepods-burstable-pod<uid>.slice:cri-containerd:<containerID>"), never a raw path — but the
+// check is written generically (colon-count + a leading path separator disqualifies) so a future
+// cgroupfs-driver substrate that DOES deliver a raw path degrades to a no-op passthrough instead
+// of misparsing.
+func isSliceToken(containerCgroupsPath string) bool {
+	if strings.HasPrefix(containerCgroupsPath, "/") {
+		return false
+	}
+	return strings.Count(containerCgroupsPath, ":") == 2
+}
+
+// expandSliceToken expands a systemd cgroup-driver slice token
+// ("<slice>.slice:<runtime-prefix>:<id>") to its real cgroup v2 filesystem leaf, relative to
+// cgroupFsRoot — e.g. "kubepods-burstable-podX.slice:cri-containerd:abc" expands to
+// "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podX.slice/cri-containerd-abc.scope".
+// This is the standard systemd slice-unit nesting expansion (each hyphen-delimited segment of the
+// slice name is its own nested ".slice" unit — the same algorithm runc's cgroups/systemd package
+// uses), applied to the LIVE shape G0.2 captured (D2.2) — verified this pass to be byte-identical
+// to the independently-carried PodCgroupParent field for the matching pod, which is the strongest
+// available cross-check without a second live probe.
+func expandSliceToken(containerCgroupsPath string) (string, error) {
+	parts := strings.SplitN(containerCgroupsPath, ":", 3)
+	if len(parts) != 3 {
+		return "", fmt.Errorf("ADR-0351: malformed slice token %q: expected 3 colon-separated fields", containerCgroupsPath)
+	}
+	sliceName, runtimePrefix, id := parts[0], parts[1], parts[2]
+	if runtimePrefix == "" || id == "" {
+		return "", fmt.Errorf("ADR-0351: malformed slice token %q: empty runtime prefix or id", containerCgroupsPath)
+	}
+	slicePath, err := expandSystemdSlice(sliceName)
+	if err != nil {
+		return "", fmt.Errorf("ADR-0351: expand slice %q: %w", sliceName, err)
+	}
+	return slicePath + "/" + runtimePrefix + "-" + id + ".scope", nil
+}
+
+// expandSystemdSlice expands a systemd slice unit name (e.g.
+// "kubepods-burstable-podX.slice") into its full nested cgroupfs path (e.g.
+// "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podX.slice"). Pure string
+// manipulation, no I/O.
+func expandSystemdSlice(sliceName string) (string, error) {
+	const suffix = ".slice"
+	if !strings.HasSuffix(sliceName, suffix) {
+		return "", fmt.Errorf("slice name %q does not end in %q", sliceName, suffix)
+	}
+	trimmed := strings.TrimSuffix(sliceName, suffix)
+	if trimmed == "" {
+		return "", fmt.Errorf("slice name %q has no content before %q", sliceName, suffix)
+	}
+	segments := strings.Split(trimmed, "-")
+	var path, prefix strings.Builder
+	for _, seg := range segments {
+		if seg == "" {
+			return "", fmt.Errorf("slice name %q has an empty '-'-delimited segment", sliceName)
+		}
+		if prefix.Len() > 0 {
+			prefix.WriteByte('-')
+		}
+		prefix.WriteString(seg)
+		path.WriteByte('/')
+		path.WriteString(prefix.String())
+		path.WriteString(suffix)
+	}
+	return path.String(), nil
+}
+
+// resolveCgroupAnchorTarget implements ADR-0351 D2: turns the NRI-carried containerCgroupsPath
+// into the confined, write-safe cgroup v2 leaf path (relative to cgroupFsRoot, matching
+// moveProcessToPodCgroup's existing contract), or a fail-closed error. Pure function apart from
+// the filepath.EvalSymlinks confinement check (D2.4) — no exec, no query, no poll, no retry
+// (D1.4/BD-2 — TestCgroupAnchor_NoQueryNoPoll polices this).
+//
+// containerCgroupsPath: the raw NRI-carried value — a systemd slice token on the G0.2-grounded
+//
+//	live shape (may be a raw /sys/fs/cgroup-relative path on some other substrate; isSliceToken
+//	degrades to a passthrough in that case, per D2.2).
+//
+// podCgroupParent: the NRI-carried pod parent slice, used ONLY as a D2.3 validation bound — NEVER
+//
+//	a write target (writing into a non-leaf cgroup with children EBUSYs on cgroup v2).
+func resolveCgroupAnchorTarget(containerCgroupsPath, podCgroupParent string) (string, error) {
+	if containerCgroupsPath == "" {
+		return "", fmt.Errorf("ADR-0351: empty ContainerCgroupsPath — fail closed (G0 precondition violated live)")
+	}
+	leaf := containerCgroupsPath
+	if isSliceToken(leaf) {
+		var err error
+		leaf, err = expandSliceToken(leaf)
+		if err != nil {
+			return "", fmt.Errorf("ADR-0351: expand slice token %q: %w", containerCgroupsPath, err)
+		}
+	}
+
+	// ADR-0351 D2.4/BD-10: real path-confinement via EvalSymlinks + prefix check — NOT lexical
+	// filepath.Clean alone (which does not defeat ".." traversal composed with filepath.Join, and
+	// never resolves symlinks). Reject anything that does not canonicalize under
+	// cgroupFsRoot/kubepods.
+	candidate := filepath.Join(cgroupFsRoot, leaf)
+	resolved, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return "", fmt.Errorf("ADR-0351: resolve cgroup leaf %q: %w", candidate, err)
+	}
+	if !strings.HasPrefix(resolved, filepath.Join(cgroupFsRoot, "kubepods")) {
+		return "", fmt.Errorf("ADR-0351: cgroup leaf %q resolves to %q, outside %s/kubepods* — refusing (path-confinement, BD-10)",
+			containerCgroupsPath, resolved, cgroupFsRoot)
+	}
+
+	// ADR-0351 D2.3: never anchor at the parent slice itself (cgroup v2 no-internal-process rule
+	// — writing a PID into a cgroup that has child cgroups returns EBUSY). Compare the resolved
+	// leaf against the resolved parent when PodCgroupParent is populated.
+	if podCgroupParent != "" {
+		parentCandidate := filepath.Join(cgroupFsRoot, podCgroupParent)
+		if parentResolved, perr := filepath.EvalSymlinks(parentCandidate); perr == nil && resolved == parentResolved {
+			return "", fmt.Errorf("ADR-0351: cgroup anchor target %q equals the pod PARENT slice %q — refusing (cgroup v2 no-internal-process rule, D2.3)",
+				resolved, parentResolved)
+		}
+	}
+
+	// moveProcessToPodCgroup joins its argument onto cgroupFsRoot itself — return the leaf
+	// RELATIVE to cgroupFsRoot so that contract is unchanged for its one call site.
+	rel := strings.TrimPrefix(resolved, cgroupFsRoot)
+	return rel, nil
+}
+
+// moveProcessToPodCgroup implements ADR-0128/ADR-0351 D2: moves pid into the container's own
+// cgroup by writing it to <podCgroupPath>/cgroup.procs under /sys/fs/cgroup. A single
+// cgroup.procs write moves the whole thread group of the leader; the CRIU-restored tree shares
+// one cgroup, so moving the root migrates the group (whole-tree containment is scoped to that
+// property — see ADR-0351 D2.6/BD-8 for the multi-process/descendant-TGID gap, not changed by
+// this ADR). podCgroupPath is the cgroup v2 path (e.g. "/kubepods.slice/.../...scope").
 func moveProcessToPodCgroup(pid int, podCgroupPath string) error {
 	procsPath := filepath.Join("/sys/fs/cgroup", podCgroupPath, "cgroup.procs")
 	if err := os.WriteFile(procsPath, []byte(strconv.Itoa(pid)), 0o644); err != nil {
 		return fmt.Errorf("write PID %d to %s: %w", pid, procsPath, err)
 	}
 	return nil
+}
+
+// reapRestoredProcessTreeFn is the production implementation of reapRestoredProcessTree.
+// Overridable in tests (mirrors joinNsRestoreFn/sandboxIDForPodUIDFn) so the ADR-0351 G5
+// no-ghost-on-fail-closed assertions can spy on the reap without a real host cgroupfs.
+var reapRestoredProcessTreeFn = reapRestoredProcessTree
+
+// reapRestoredProcessTree implements ADR-0351 G5: on every post-PID-live terminal leg inside
+// joinNsRestore, the already-restored process tree MUST be reaped before returning the error, or
+// a fail-closed abort leaves a destination ghost. Traced this pass: the pre-ADR-0351 error returns
+// after the PID is live (server.go, was 4472/4476/4491/4495/4500) were bare `return 0, nil, err`
+// that neither reap pid nor even surface it to the caller (the PID return position is 0), so no
+// upstream Restore() unwind can reap it — the handle exists only as this function's own `pid`
+// local, so the reap MUST be local and mandatory.
+//
+// ADR-0351 G5 REVISED (sprint46B7 round 2 — corrects a cross-migration reap / broker-suicide
+// defect found in the round-1 landing). Round 1 resolved the tree to reap via cgroupV2Path(pid)
+// and wrote "1" to that cgroup's cgroup.kill — but because --manage-cgroups=ignore parks the
+// restored tree in the netns-broker's OWN cgroup (netnsbroker/broker.go:843-867 —
+// brokerCgroupPIDs reads the BROKER's own "/proc/self/cgroup", not a per-migration scope), pid
+// and holderPID are co-resident there with the broker daemon itself AND with every concurrent
+// migration's restored/parked tree. Writing cgroup.kill to that shared cgroup SIGKILLs the broker
+// daemon and every other concurrent restore on the node, not just this migration's ghost — a
+// node-global blast radius on a leg that must be scoped to exactly one migration.
+//
+// The fix replaces the shared-cgroup-wide kill with a precise walk of the KERNEL's own process
+// hierarchy — the authoritative primitive, not an inference: holderPID (the CRIU/wrapper process,
+// passed explicitly by the caller — see joinNsRestore's criuWrapperPID, never re-derived from
+// /proc ancestry, which would misresolve in the degenerate pid==criuWrapperPID leg) stays the
+// restored root's OS parent after restore (server.go ~4477, "stays as the foreground workload
+// parent"), so collectProcessTree(holderPID) — a direct read of /proc/<tgid>/task/<tgid>/children,
+// the kernel's own child-enumeration file, populated because CONFIG_CHECKPOINT_RESTORE=y is this
+// project's own mandatory kernel requirement (CLAUDE.md "Key kernel requirements") — enumerates
+// holderPID, pid, and every descendant of pid in one pass, with NOTHING that belongs to the broker
+// daemon or a sibling migration ever a member of that set (holderPID's only child in a restore is
+// this migration's own restored root). Every enumerated PID is then SIGKILLed directly — no
+// cgroup write, no shared state touched.
+func reapRestoredProcessTree(pid int, holderPID int) {
+	victims := collectProcessTree(holderPID)
+	if !containsPID(victims, pid) {
+		// Defensive: if the holder's own child enumeration somehow missed pid (e.g. it already
+		// reparented), still make sure pid's own subtree is reaped explicitly — never rely on the
+		// holder-rooted walk alone to cover the one PID this call exists to reap.
+		victims = append(victims, collectProcessTree(pid)...)
+	}
+	killed := 0
+	for _, v := range victims {
+		if err := syscall.Kill(v, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			log.Error(err, "ADR-0351 G5: SIGKILL failed for restored-tree member — process may be left running", "pid", v, "root", pid, "holder", holderPID)
+			continue
+		}
+		killed++
+	}
+	log.Info("ADR-0351 G5: reaped restored process tree on fail-closed terminal leg", "pid", pid, "holder", holderPID, "killed", killed, "total", len(victims))
+}
+
+// containsPID reports whether pid appears in pids.
+func containsPID(pids []int, pid int) bool {
+	for _, p := range pids {
+		if p == pid {
+			return true
+		}
+	}
+	return false
+}
+
+// collectProcessTree enumerates root and every descendant TGID via the kernel's own
+// /proc/<tgid>/task/<tgid>/children primitive — a direct read of the kernel's process hierarchy,
+// not an inferred/polled scan of every PID on the host. This file is populated only under
+// CONFIG_CHECKPOINT_RESTORE=y, which this project already mandates (CLAUDE.md "Key kernel
+// requirements" — the same config gate CRIU itself needs), so the primitive is always available
+// on a substrate this agent can run CRIU restores on at all. Enumeration completes fully BEFORE
+// any kill is issued by the caller, so a PID exiting mid-walk cannot truncate the collected set.
+// Best-effort past a read error on any one node (the process may have already exited) — the
+// already-collected result is returned as-is rather than aborting the whole walk.
+func collectProcessTree(root int) []int {
+	seen := map[int]bool{}
+	queue := []int{root}
+	var all []int
+	for len(queue) > 0 {
+		p := queue[0]
+		queue = queue[1:]
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		all = append(all, p)
+		childrenPath := fmt.Sprintf("/proc/%d/task/%d/children", p, p)
+		data, err := os.ReadFile(childrenPath)
+		if err != nil {
+			continue
+		}
+		for _, tok := range strings.Fields(string(data)) {
+			if cpid, cerr := strconv.Atoi(tok); cerr == nil {
+				queue = append(queue, cpid)
+			}
+		}
+	}
+	return all
 }
 
 // removeStalePidfile deletes a leftover restored-PID pidfile from a prior attempt of the same
@@ -4665,59 +5831,68 @@ func procStatStateChar(pid int) (byte, error) {
 	return fields[0][0], nil
 }
 
-// cgroupV2Path returns the unified cgroup v2 path (the "0::<path>" entry) for pid from
-// /proc/<pid>/cgroup. Returns an error if the file cannot be read (e.g. the PID has exited) or
-// has no unified entry.
-// cgroupV2Path returns the host-ABSOLUTE cgroup v2 path of pid (the 0:: line of
-// /proc/<pid>/cgroup), e.g. "/kubepods.slice/.../cri-containerd-<id>.scope".
-//
-// ADR-0128 fix: the value MUST be read in the HOST cgroup namespace. The agent main
-// container runs in its own cgroup namespace, so reading /proc/<pausePID>/cgroup locally
-// renders the line RELATIVE to the agent's own cgroupns root — the shared kubepods.slice
-// ancestry is stripped and replaced with "../.." escapes (observed:
-// "/../../kubepods-burstable-pod<uid>.slice/cri-containerd-<id>.scope"). Joined with
-// /sys/fs/cgroup that collapses to a nonexistent path and the ADR-0128 cgroup.procs move
-// fails with ENOENT. The pause PID's cgroup is read via the privileged netns-broker sidecar
-// (nsenterCmd), which runs in the HOST cgroup namespace and therefore returns the true
-// absolute path that resolves under the host /sys/fs/cgroup the agent mounts.
-func cgroupV2Path(pid int) (string, error) {
-	out, err := nsenterCmd("cat", fmt.Sprintf("/proc/%d/cgroup", pid)).Output()
+// cgroupV2Path (the ADR-0128-era pause-PID-derived cgroup lookup) is REMOVED as of ADR-0351 G5
+// round 2 (sprint46B7): its sole remaining caller was the round-1 reapRestoredProcessTree, which
+// wrote "1" to this resolved cgroup's cgroup.kill — but that cgroup is the netns-broker daemon's
+// OWN shared cgroup under --manage-cgroups=ignore (netnsbroker/broker.go:843-867), so the write
+// SIGKILLed the broker and every concurrent migration's restored tree on the node, not just this
+// migration's ghost (cross-migration reap / broker-suicide). reapRestoredProcessTree now walks the
+// kernel's own process hierarchy (collectProcessTree, below) instead of resolving or writing to
+// any cgroup, so this lookup has no remaining purpose. See reapRestoredProcessTree's doc comment
+// for the full defect history.
+
+// logCgroupAnchorOutcome emits the ADR-0351 D3.1a RETARGETED G10 structured log + metric on the
+// cgroup-anchor primitive's success and every terminal leg — REPLACES the deleted
+// logSandboxPausePIDOutcome/"sandboxPausePIDWaiting outcome" producer (D3.3/BD-9: the deleted
+// pause-PID apparatus's outcome log had NO surviving producer once that apparatus was retired).
+// No "polls" field: the primitive is zero-query (D1.2), so the retired "polls>1 = race
+// exercised" evidence is void — the pause-PID race it measured no longer exists. Consumed
+// read-only by the D2.6 live proof (leg="nri-cgroup-anchor" identifies the NRI primary path
+// executed, not the raw-CRIU fallback) and by ADR-0352's D6(f)/DR-15 (re-pointed, BD-9).
+func logCgroupAnchorOutcome(migrationName, outcome string, err error) {
+	log.Info("ADR-0351: cgroup-anchor outcome",
+		"migration", migrationName, "leg", "nri-cgroup-anchor", "outcome", outcome)
 	if err != nil {
-		return "", fmt.Errorf("read /proc/%d/cgroup via host cgroupns: %w", pid, err)
+		log.Error(err, "ADR-0351: cgroup-anchor outcome detail", "migration", migrationName)
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if strings.HasPrefix(line, "0::") {
-			return strings.TrimPrefix(line, "0::"), nil
-		}
-	}
-	return "", fmt.Errorf("no cgroup v2 (0::) entry in /proc/%d/cgroup", pid)
+	metrics.CgroupAnchorOutcomeTotal.WithLabelValues(outcome).Inc()
 }
 
-// sandboxPausePID resolves the host PID of the pause/sandbox container identified by sandboxID
-// via `ctr --namespace k8s.io tasks list`. The sandbox ID is the pause container's containerd
-// task ID (from the NRI pod sandbox object, pod.GetId()), so its PID is the task's PID.
-func sandboxPausePID(sandboxID string) (int, error) {
-	out, err := nsenterCmd("/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "list").Output()
-	if err != nil {
-		return 0, fmt.Errorf("ctr tasks list: %w", err)
-	}
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines[1:] { // skip header
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		if fields[0] != sandboxID {
-			continue
-		}
-		pid, convErr := strconv.Atoi(fields[1])
-		if convErr != nil || pid == 0 {
-			return 0, fmt.Errorf("sandbox %s task has invalid PID %q", sandboxID, fields[1])
-		}
-		return pid, nil
-	}
-	return 0, fmt.Errorf("sandbox %s not found in ctr tasks list (pause container may have exited)", sandboxID)
+// ReplacementSandboxNotYetCreatedError is a RETRYABLE sentinel — the pod-netns-join analogue of
+// ReattachVolumeNotYetPublishedError. resolveSandboxIDForMigration returns it when the replacement
+// pod is resolved (its UID is known via the authoritative podmotion.io/migration-name label) but the
+// destination kubelet has NOT yet created its containerd sandbox (pause container): the pod-sandbox
+// netns the ADR-0325 restore gate must join exists LATER, not never. The replacement pod is
+// NodeName-pinned to the destination node (createReplacementPod), so its sandbox materializes
+// asynchronously a few seconds after the scheduling gate is removed — a one-shot ctr lookup at
+// restore-dispatch time legitimately races the kubelet (grounded: live-proof-cycle1, the pm-w2
+// sandbox was present ~6s after the replacement pod appeared, still before the migration reached
+// terminal Failed). resolvePodNetnsSandboxWaiting bounded-waits on this sentinel (the real
+// kubelet-driven sandbox edge); every other resolution failure — no replacement pod at all, no UID,
+// a hard ctr/containerd error — stays terminal and fails the gate closed, preserving "refuse to
+// restore into a detached/non-pod namespace" (invariant preservation; a "not yet" vs "never" split,
+// never a guess).
+type ReplacementSandboxNotYetCreatedError struct {
+	PodUID             string
+	ReplacementPodName string
 }
+
+func (e *ReplacementSandboxNotYetCreatedError) Error() string {
+	return fmt.Sprintf("replacement pod sandbox not yet created: no containerd sandbox for replacement pod %s (uid=%s) present on the destination node yet", e.ReplacementPodName, e.PodUID)
+}
+
+// replacementSandboxWaitBudget bounds how long the ADR-0325 restore gate waits for the replacement
+// pod's real sandbox netns to appear before failing closed. It is a var (not const) so tests can
+// shrink it to exercise the budget-spent fail-closed leg without a real wait. Sized well under the
+// 120s live-migration hard bound (constitutional invariant #8): the sandbox appears in ~6s on the
+// standing KVM substrate and this gate is reached only after checkpoint, so 60s leaves ample
+// headroom while never approaching the migration cap. The incoming RPC ctx still caps it
+// (context.WithTimeout takes the min), so a shorter operator deadline wins.
+var replacementSandboxWaitBudget = 60 * time.Second
+
+// replacementSandboxPollInterval is the re-probe cadence for the sandbox bounded-wait (var for tests),
+// matching resolveReattachMountsWaiting's 1s kubelet-edge cadence.
+var replacementSandboxPollInterval = 1 * time.Second
 
 // resolveSandboxIDForMigration is the ADR-0306 item (a) agent-side self-resolve helper used
 // when RestoreRequest.sandbox_id is empty. It reads the PodMigration CR (via
@@ -4742,7 +5917,7 @@ func (s *AgentServer) resolveSandboxIDForMigration(ctx context.Context, migratio
 	}
 	// Resolve the replacement pod by the migration-name LABEL (source of truth stamped by the
 	// controller at creation) rather than pm.Status.ReplacementPodName, which frequently reads
-	// back empty at restore time (primitive over brittle chain). Fall back to the status
+	// back empty at restore time (reads the authoritative value instead of inferring it). Fall back to the status
 	// field only if the label lookup finds nothing.
 	pod := s.resolveReplacementPod(ctx, migrationName, podNs)
 	if pod == nil {
@@ -4759,57 +5934,114 @@ func (s *AgentServer) resolveSandboxIDForMigration(ctx context.Context, migratio
 	if pod.UID == "" {
 		return "", fmt.Errorf("resolveSandboxIDForMigration: replacement pod %s/%s has no UID", podNs, pod.Name)
 	}
-	sandboxID, err := sandboxIDForPodUID(string(pod.UID))
+	sandboxID, err := sandboxIDForPodUIDFn(string(pod.UID))
 	if err != nil {
+		// The replacement pod is resolved (its UID is known via the authoritative migration-name
+		// label), but the ctr query found no containerd sandbox for it yet — the destination kubelet
+		// has not created the pause container at this instant. That is the benign "not yet" race edge
+		// (errNoSandboxForPodUID), NOT a detached/unresolvable namespace: surface the RETRYABLE
+		// sentinel so resolvePodNetnsSandboxWaiting bounded-waits for the real sandbox netns rather
+		// than failing the ADR-0325 gate closed on a race it wins within the migration budget. A hard
+		// ctr error (containerd down, binary missing) is NOT errNoSandboxForPodUID and stays terminal.
+		if errors.Is(err, errNoSandboxForPodUID) {
+			return "", &ReplacementSandboxNotYetCreatedError{PodUID: string(pod.UID), ReplacementPodName: pod.Name}
+		}
 		return "", fmt.Errorf("resolveSandboxIDForMigration: %w", err)
 	}
 	return sandboxID, nil
 }
 
-// resolvePodNetnsSandbox is the universal pod-netns-integration entry point (ADR-0325) for the
-// gRPC Restore path. It decides which sandbox ID (if any) joinNsRestore should use to join the
-// restored process into its pod's network namespace:
+// resolvePodNetnsSandboxOnce is the single-shot universal pod-netns-integration read (ADR-0325) for
+// the gRPC Restore path. It decides which sandbox ID (if any) joinNsRestore should use to join the
+// restored process into its pod's network namespace, and returns the CLASSIFIED error alongside
+// (sandboxID, attempted) so resolvePodNetnsSandboxWaiting can distinguish a RETRYABLE
+// "sandbox-not-created-yet" race (ReplacementSandboxNotYetCreatedError) from a terminal failure:
 //
-//   - destNetnsFd != "" (Strict/BestEffort pre-staged path): the agent-owned bind-mount netns
-//     is already plumbed end-to-end from PrepareDestinationNetns; joinNsRestore joins THAT via
-//     --join-ns net:<destNetnsFd> and ignores sandboxID. Return "" — no self-resolve needed.
-//   - destNetnsFd == "" (cold path — None, or BestEffort/Strict that declared no pre-staged
-//     netns): resolve the replacement pod's real sandbox (pause-container) netns via the SAME
-//     restart-durable source-of-truth the idempotent-confirm path uses
-//     (resolveSandboxIDForMigration → replacement-pod UID → containerd sandbox label). This is
-//     what makes pod-netns join UNIVERSAL: the cold path used to skip the join and leave the
-//     workload in a detached placeholder petns (unreachable at the pod IP). Returns "" on
-//     failure so the caller fails closed rather than restoring into a detached namespace.
+//   - destNetnsFd == "" (cold path — None, or BestEffort/Strict): resolve the replacement pod's real
+//     sandbox (pause-container) netns via the restart-durable source-of-truth the idempotent-confirm
+//     path uses (resolveSandboxIDForMigration → replacement-pod UID → containerd sandbox label). This
+//     is what makes pod-netns join UNIVERSAL: the cold path used to skip the join and leave the
+//     workload in a detached placeholder petns (unreachable at the pod IP). Returns "" on failure so
+//     the caller fails closed rather than restoring into a detached namespace.
 //
-// Gated on s.k8sClient != nil, consistent with every other k8s-backed self-resolve/fail-closed
-// gate on this path (finalizeRestore's ReportRestoreConfirmed side effects, the idempotent
-// confirm path above): without a running k8s client there is no source of truth to resolve the
-// replacement pod's sandbox from, so self-resolve cannot even be attempted — that is a missing
-// operator connection, not evidence of a detached namespace. In that case resolvePodNetnsSandbox
-// returns ("", false) and the caller falls back to its pre-ADR-0325 behavior (no pod-netns join
-// attempted) rather than failing the restore closed. When s.k8sClient != nil, resolution failure
-// IS evidence-bearing (the source of truth was consulted and came back empty/erroring) and the
-// caller fails closed as designed.
-func (s *AgentServer) resolvePodNetnsSandbox(ctx context.Context, migrationName string) (sandboxID string, attempted bool) {
+// Gated on s.k8sClient != nil, consistent with every other k8s-backed self-resolve/fail-closed gate
+// on this path: without a running k8s client there is no source of truth to resolve the replacement
+// pod's sandbox from, so self-resolve cannot even be attempted — that is a missing operator
+// connection, not evidence of a detached namespace. In that case it returns ("", false, nil) and the
+// caller falls back to its pre-ADR-0325 behavior (no pod-netns join attempted) rather than failing
+// the restore closed. When s.k8sClient != nil, resolution failure IS evidence-bearing (the source of
+// truth was consulted and came back empty/erroring) and the caller fails closed as designed.
+func (s *AgentServer) resolvePodNetnsSandboxOnce(ctx context.Context, migrationName string) (sandboxID string, attempted bool, err error) {
 	if s.k8sClient == nil {
 		log.Info("resolvePodNetnsSandbox: no k8sClient — skipping pod-netns self-resolve (ADR-0325); restore proceeds without pod-netns join",
 			"migration", migrationName)
-		return "", false
+		return "", false, nil
 	}
-	id, err := s.resolveSandboxIDForMigration(ctx, migrationName)
-	if err != nil {
-		log.Error(err, "resolvePodNetnsSandbox: pod-sandbox self-resolve failed (ADR-0325) — pod-netns join cannot proceed", "migration", migrationName)
-		return "", true
+	id, rerr := s.resolveSandboxIDForMigration(ctx, migrationName)
+	if rerr != nil {
+		log.Error(rerr, "resolvePodNetnsSandbox: pod-sandbox self-resolve failed (ADR-0325) — pod-netns join cannot proceed", "migration", migrationName)
+		return "", true, rerr
 	}
 	log.Info("resolvePodNetnsSandbox: pod-netns join will use self-resolved replacement pod sandbox (ADR-0325)",
 		"migration", migrationName, "sandboxID", id)
-	return id, true
+	return id, true, nil
 }
+
+// resolvePodNetnsSandboxWaiting is the bounded-wait form of the ADR-0325 pod-netns self-resolve used
+// by the live restore gate. It mirrors resolveReattachMountsWaiting exactly — the sibling
+// kubelet-edge wait already on this Restore path (server.go ~L952) — retrying the source-of-truth
+// read (does the replacement pod's containerd sandbox exist on this node?) while AND ONLY WHILE the
+// failure is the RETRYABLE ReplacementSandboxNotYetCreatedError, until the sandbox appears or the
+// budget is spent.
+//
+// This is NOT a poll-and-guess fallback tier (invariant #10): it reads ONE authoritative value (the
+// pod sandbox in containerd) at the correct time — after the destination kubelet's asynchronous
+// sandbox-creation edge — exactly as resolveReattachMountsWaiting waits for the kubelet mount edge.
+// Every non-retryable outcome (resolved; no k8sClient; no replacement pod at all; no UID; a hard
+// ctr/containerd error) returns immediately with the unchanged (sandboxID, attempted) semantics, so
+// the gate's fail-closed invariant — "refuse to restore into a detached/non-pod namespace" — is
+// preserved: a genuinely-detached or unresolvable namespace never becomes a wait, and a sandbox that
+// never materializes within the bound still fails closed.
+func (s *AgentServer) resolvePodNetnsSandboxWaiting(ctx context.Context, migrationName string) (sandboxID string, attempted bool) {
+	waitCtx, cancel := context.WithTimeout(ctx, replacementSandboxWaitBudget)
+	defer cancel()
+	for {
+		id, att, err := s.resolvePodNetnsSandboxOnce(waitCtx, migrationName)
+		var notYet *ReplacementSandboxNotYetCreatedError
+		if !errors.As(err, &notYet) {
+			return id, att // resolved, no-client, or a terminal error → caller's existing gate logic
+		}
+		select {
+		case <-waitCtx.Done():
+			// Budget spent: the replacement pod's sandbox never materialized within the bound. Fail
+			// closed exactly as the one-shot gate did (attempted=true, empty id) — a sandbox that
+			// never appears IS the detached/non-pod-namespace condition the ADR-0325 gate guards.
+			log.Info("resolvePodNetnsSandboxWaiting: replacement pod sandbox did not appear within wait budget (ADR-0325) — failing closed",
+				"migration", migrationName, "budget", replacementSandboxWaitBudget.String())
+			return "", true
+		case <-time.After(replacementSandboxPollInterval):
+		}
+	}
+}
+
+// errNoSandboxForPodUID is returned by sandboxIDForPodUID when the ctr query SUCCEEDS but no
+// containerd sandbox exists for the pod UID yet — the destination kubelet has not created the
+// replacement pod's pause container at this instant. It is deliberately distinct from a ctr command
+// error (containerd down, binary missing): the empty-result case is the benign "not yet" race edge
+// the ADR-0325 restore gate must bounded-wait on, NOT a detached/unresolvable namespace. Callers
+// classify it via errors.Is to build the retryable ReplacementSandboxNotYetCreatedError sentinel.
+var errNoSandboxForPodUID = errors.New("no sandbox container found for pod uid")
+
+// sandboxIDForPodUIDFn is the production implementation of sandboxIDForPodUID. It is a package var
+// so the ADR-0325 bounded-wait tests can inject a sandbox that appears only after N polls (modelling
+// the real kubelet-driven sandbox-creation edge) without a live containerd.
+var sandboxIDForPodUIDFn = sandboxIDForPodUID
 
 // sandboxIDForPodUID resolves the containerd sandbox (pause container) task ID for the given
 // pod UID via `ctr --namespace k8s.io containers list`, filtering by the io.kubernetes.pod.uid
-// label. Mirrors the existing ctr-based lookup idiom (sandboxPausePID/sandboxNetnsPath) — no
-// new external binary dependency.
+// label. Mirrors the existing ctr-based lookup idiom (sandboxNetnsPath) — no
+// new external binary dependency. Returns errNoSandboxForPodUID (wrapped) when the query succeeds
+// but no sandbox exists yet, so callers can distinguish that retryable race from a hard ctr error.
 func sandboxIDForPodUID(podUID string) (string, error) {
 	out, err := nsenterCmd("/usr/local/bin/ctr", "--namespace", "k8s.io", "containers", "list",
 		"-q", "labels.\"io.kubernetes.pod.uid\"=="+podUID).Output()
@@ -4823,7 +6055,7 @@ func sandboxIDForPodUID(podUID string) (string, error) {
 			return id, nil
 		}
 	}
-	return "", fmt.Errorf("no sandbox container found for pod uid %s", podUID)
+	return "", fmt.Errorf("%w %s", errNoSandboxForPodUID, podUID)
 }
 
 // patchCheckpointImages modifies the CRIU image files in checkpointDir to remove entries
@@ -4837,8 +6069,8 @@ func sandboxIDForPodUID(podUID string) (string, error) {
 // Tests can replace this variable to inject failures without requiring real CRIU images.
 // The function variable wraps patchCheckpointImages; it discards the dropped-mounts info
 // (callers that need events use patchCheckpointImages directly).
-var patchCheckpointImagesFn = func(checkpointDir string, inheritFdNames []string, reattachMountPaths []string) error {
-	_, err := patchCheckpointImages(checkpointDir, inheritFdNames, reattachMountPaths)
+var patchCheckpointImagesFn = func(checkpointDir string, inheritFdNames []string, reattachMountPaths []string, reattachHostTargets map[string]string) error {
+	_, err := patchCheckpointImages(checkpointDir, inheritFdNames, reattachMountPaths, reattachHostTargets)
 	return err
 }
 
@@ -5022,7 +6254,7 @@ if len(sys.argv) >= 2 and sys.argv[1] == '--classify-selftest':
 // Idempotent: backs up originals as *.orig on first call; subsequent calls are no-ops.
 // Returns (droppedMounts, error). droppedMounts is non-nil when B-2 external drops fired
 // successfully; callers should emit CRIUExternalMountDropped Normal events for each entry.
-func patchCheckpointImages(checkpointDir string, inheritFdNames []string, reattachMountPaths []string) ([]ExternalMountDroppedInfo, error) {
+func patchCheckpointImages(checkpointDir string, inheritFdNames []string, reattachMountPaths []string, reattachHostTargets map[string]string) ([]ExternalMountDroppedInfo, error) {
 	// Write the patch script to a temp file and run it with the system python3 + pycriu.
 	// containerdMaskedPaths is injected as a JSON argv so the patch step consumes the same
 	// single source of truth as buildMaskedPathExtMountArgs (ADR-0124 R2 / AC6) — no divergent
@@ -5049,6 +6281,19 @@ func patchCheckpointImages(checkpointDir string, inheritFdNames []string, reatta
 	if err != nil {
 		return nil, fmt.Errorf("marshal reattach mount paths: %w", err)
 	}
+	// argv[5]: shared/re-attach PVC host targets {containerPath: destination kubelet volume dir}. The
+	// patch rewrites each preserved re-attach mount's recorded root/source (the SOURCE-node kubelet
+	// path baked in at dump) to this destination path so CRIU auto-binds the destination volume on a
+	// cross-node restore (CRIU binds mi->source directly for AUTODETECTED_MOUNT externals — it
+	// bypasses --ext-mount-map, so the recorded source is the only lever). Normalize nil→{} so
+	// json.Marshal emits "{}" not "null" (the script does dict.get on it).
+	if reattachHostTargets == nil {
+		reattachHostTargets = map[string]string{}
+	}
+	reattachHostTargetsJSON, err := json.Marshal(reattachHostTargets)
+	if err != nil {
+		return nil, fmt.Errorf("marshal reattach host targets: %w", err)
+	}
 	// The single REG-fd classifier (classifyRegFdPy) is prepended verbatim so the main pass and
 	// the consistency re-check below both call the one classify_reg_fd() abstraction.
 	// assemblePatchScript() is the SINGLE SOURCE OF TRUTH for the assembled patch script (H-19):
@@ -5064,8 +6309,9 @@ func patchCheckpointImages(checkpointDir string, inheritFdNames []string, reatta
 		return nil, fmt.Errorf("write patch script: %w", err)
 	}
 	defer os.Remove(scriptPath)
-	// argv[1]=checkpointDir argv[2]=maskedJSON argv[3]=inheritJSON (C-R3-1) argv[4]=reattachJSON.
-	cmd := exec.Command("python3", scriptPath, checkpointDir, string(maskedJSON), string(inheritJSON), string(reattachJSON))
+	// argv[1]=checkpointDir argv[2]=maskedJSON argv[3]=inheritJSON (C-R3-1) argv[4]=reattachJSON
+	// argv[5]=reattachHostTargetsJSON (destination kubelet dirs for the cross-node source rewrite).
+	cmd := exec.Command("python3", scriptPath, checkpointDir, string(maskedJSON), string(inheritJSON), string(reattachJSON), string(reattachHostTargetsJSON))
 	cmd.Env = append(os.Environ(), "PYTHONPATH=/usr/lib/python3/dist-packages")
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
@@ -5596,22 +6842,28 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		}
 	}
 
-	// Resolve the container root PID from the pod UID stored during PrepareSource.
+	// Resolve the container root PID from the pod UID. The freshly-fetched CR's
+	// spec.SourcePodUID (fetched live above, not merely on restart) is authoritative — the
+	// in-memory map (written once by PrepareSource, never evicted mid-migration) is a fallback
+	// ONLY for when no k8sClient is wired (test/stub paths). CheckpointRequest carries no PodUid
+	// field of its own to prefer, unlike ArmZeroWindow/DisarmZeroWindow — the CR is the fresh
+	// source of truth here (sprint46B9 pre-work diagnosis).
 	s.migrationPodUIDMu.RLock()
-	podUID := s.migrationPodUID[req.MigrationName]
+	cachedPodUID := s.migrationPodUID[req.MigrationName]
 	s.migrationPodUIDMu.RUnlock()
-
-	// ADR-0118: if the in-memory map missed (e.g. the agent restarted between PrepareSource
-	// and Checkpoint), recover the pod UID from the CR's spec.sourcePodUID.
-	if podUID == "" && s.k8sClient != nil {
+	podUID := cachedPodUID
+	if s.k8sClient != nil {
 		if pm.Spec.SourcePodUID == "" {
 			return nil, fmt.Errorf("checkpoint: SourcePodUID is empty in CR — " +
 				"controller has not completed Validating yet")
 		}
-		log.Info("Checkpoint: podUID not in memory map — recovering from CR spec.sourcePodUID",
-			"migration", req.MigrationName, "uid", pm.Spec.SourcePodUID)
-		podUID = pm.Spec.SourcePodUID
-		// Repopulate the map so subsequent calls in this agent session skip the CR fallback.
+		var stale bool
+		podUID, stale = authoritativePodUID(cachedPodUID, pm.Spec.SourcePodUID)
+		if stale {
+			log.Info("Checkpoint: stale migrationPodUID cache detected — preferring fresh CR spec.SourcePodUID",
+				"migration", req.MigrationName, "cachedUID", cachedPodUID, "freshUID", pm.Spec.SourcePodUID)
+		}
+		// Repopulate the map so subsequent calls in this agent session see the current value.
 		s.migrationPodUIDMu.Lock()
 		s.migrationPodUID[req.MigrationName] = podUID
 		s.migrationPodUIDMu.Unlock()
@@ -5692,7 +6944,11 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 				if tcpEstablished {
 					if ctrPID, pidErr := FindContainerPID(podUID); pidErr == nil {
 						if sockEntries, invErr := network.SocketInventory(ctrPID); invErr == nil {
-							for _, e := range sockEntries {
+							// Same migratable-connection scoping as the raw-CRIU path above:
+							// exclude intra-pod loopback health-probe connections so they never
+							// enter the source-of-truth "expected" set (see FilterMigratableTCP).
+							migratable := network.FilterMigratableTCP(sockEntries)
+							for _, e := range migratable {
 								ctrSeqSnapshots = append(ctrSeqSnapshots, &agentpb.SeqSnapshot{
 									SrcIp:    e.SrcIP.String(),
 									SrcPort:  uint32(e.SrcPort),
@@ -5704,7 +6960,8 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 								})
 							}
 							log.Info("Checkpoint: socket inventory (ctr path)", "migration", req.MigrationName,
-								"connections", len(ctrSeqSnapshots))
+								"connections", len(ctrSeqSnapshots),
+								"loopbackExcluded", len(sockEntries)-len(migratable))
 						}
 					}
 				}
@@ -5763,7 +7020,19 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 			log.Error(repairErr, "Checkpoint: TCP_REPAIR export failed — continuing without SeqSnapshot (ADR-0156 D4)",
 				"pid", containerPID)
 		} else {
-			for _, e := range repairEntries {
+			// Scope the freeze inventory to MIGRATABLE connections before it becomes the
+			// source-of-truth "expected" set. Intra-pod loopback connections (both ends on
+			// 127.0.0.0/8 / ::1) are the pod's own exec/TCP health-probe traffic (e.g. a
+			// redis-cli readiness ping → 127.0.0.1:6379): they have no external peer, CRIU
+			// restores both ends atomically, and their ephemeral client port is gone after
+			// restore — so a loopback tuple captured at the freeze instant is structurally
+			// unmatchable in VerifyTCP and rolls back an otherwise-successful Strict migration
+			// (an intermittent race vs the probe cadence). They are categorically outside the
+			// TCP sequence-continuity contract; excluding them HERE means every downstream
+			// consumer inherits the correct scope: expectedCount (enforceRestoreOrderingInvariant),
+			// PM_SEQ_XLAT seeding, VerifyTCP's ConnectionsExpected, and the seq_delta metrics.
+			migratable := network.FilterMigratableTCP(repairEntries)
+			for _, e := range migratable {
 				seqSnapshots = append(seqSnapshots, &agentpb.SeqSnapshot{
 					SrcIp:    e.SrcIP.String(),
 					SrcPort:  uint32(e.SrcPort),
@@ -5776,7 +7045,8 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 			}
 			log.Info("Checkpoint: TCP_REPAIR socket state exported (ADR-0156 D4, GC-27)",
 				"migration", req.MigrationName, "pid", containerPID,
-				"connections", len(seqSnapshots))
+				"connections", len(seqSnapshots),
+				"loopbackExcluded", len(repairEntries)-len(migratable))
 		}
 	}
 
@@ -5798,13 +7068,36 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 		ImagesDir:      imagesDir,
 		Pid:            containerPID,
 		TcpEstablished: tcpEstablished,
-		// LeaveStopped keeps the source process in SIGSTOP after the dump so no new
-		// TCP data is sent while the destination is restoring (M23 ordering invariant).
-		// Only set for TCP-stateful migrations — stateless migrations resume normally.
+		// LeaveStopped keeps the source process in SIGSTOP after the dump so it cannot
+		// run (or be restarted) between the freeze and source teardown. This is required
+		// for ALL modes, not just TCP-stateful:
+		//
+		//   - TCP-stateful (M23 ordering invariant): no new TCP data is sent while the
+		//     destination is restoring.
+		//   - Storage-sharing migrations (Tier0 RWX re-attach — e.g. postgres on an
+		//     nfs-shared PVC): the source and destination pods mount the SAME live data
+		//     directory. If the source is instead KILLED after the dump (CRIU's default
+		//     disposition with neither --leave-running nor --leave-stopped), the source
+		//     container's main process exits, kubelet's restartPolicy restarts the
+		//     container, and a FRESH source workload boots and re-acquires the shared
+		//     data directory (postgres: crash-recovery + a new postmaster.pid data-dir
+		//     lock). That live source then collides with the CRIU-restored destination on
+		//     the same on-disk state — two postmasters over one PGDATA — and the restored
+		//     destination loses the data directory it was migrated onto and dies (observed:
+		//     restored postgres briefly serves one query, then the reclaiming source wins
+		//     and the destination shuts down; roundsCompleted looked fine but the DB was
+		//     dead). Leaving the source SIGSTOPped means the container never exits, kubelet
+		//     never restarts it, and nothing reclaims the shared directory until the source
+		//     pod is torn down post-cutover.
+		//
+		// This STRENGTHENS source preservation (ADR-0012): a stopped source is fully
+		// recoverable via the thaw machinery below, whereas a killed+kubelet-restarted
+		// source is an uncontrolled second workload.
 		// CRITICAL: Every error/rollback path that follows a successful LeaveStopped dump
-		// MUST call thawFrozenSource(migrationName) so the source is never permanently
-		// frozen. registerFrozenSource is called immediately after a successful dump.
-		LeaveStopped: tcpEstablished,
+		// MUST thaw the source (Rollbacker.Rollback source-resume / Abort → thawFrozenSource /
+		// the ADR-0216 durable-record startup orphan reconcile) so the source is never
+		// permanently frozen. registerFrozenSource is called immediately after the dump.
+		LeaveStopped: true,
 	})
 
 	// SD-4: ptrace is no longer expected once Dump returns (success or failure) — close the
@@ -5819,7 +7112,12 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 	// This ensures that any subsequent error return (SeedRelayFromSnapshots failure,
 	// ordering invariant failure, transfer failure, controller crash handled by watchdog)
 	// can thaw the source via Abort or the frozen-source watchdog.
-	if err == nil && tcpEstablished && containerPID != 0 {
+	// Register for ALL modes now that LeaveStopped is unconditional (above): the source
+	// is left in SIGSTOP regardless of TCP preservation, so every mode needs the
+	// frozen-source record that the rollback/Abort/startup-reconcile thaw paths key on.
+	// Gating this on tcpEstablished (as before) would leave a None-mode source frozen with
+	// NO thaw record — a source-preservation violation.
+	if err == nil && containerPID != 0 {
 		s.registerFrozenSource(req.MigrationName, containerPID)
 	}
 
@@ -6079,6 +7377,20 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		imagesDir = fmt.Sprintf("/run/podmotion/checkpoints/%s/final", req.MigrationName)
 	}
 
+	// ADR-0353 R2/R3/R5: acquire the single-owner in-flight restore claim BEFORE any
+	// zeroize-eligible branch (the nearest one is the restoreConfirmed-gated defer registered
+	// just below) and before any CRIU-restore drive. This also covers the idempotent-confirm
+	// short-circuit further down (no CRIU drive there, but R6 treats "another actor's restore
+	// attempt currently in flight for this same migration" as the exact concurrent-drive hazard
+	// this lock exists for). Declining here preserves the checkpoint images (no zeroize has run
+	// yet) and returns the TRANSIENT-RETRY codes.Aborted status.
+	if !claimRestore(req.MigrationName, "gRPC") {
+		log.Info("Restore: restore already in flight for this migration under another owner — declining (ADR-0353 R3/R5)",
+			"migration", req.MigrationName)
+		return nil, status.Error(codes.Aborted, ErrRestoreInFlight.Error())
+	}
+	defer releaseRestore(req.MigrationName)
+
 	// 0700: checkpoint images contain process memory and secrets.
 	if mkErr := os.MkdirAll(imagesDir, 0o700); mkErr != nil {
 		log.Info("Restore: cannot create images dir, proceeding to fallback", "err", mkErr)
@@ -6277,7 +7589,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 
 			// Parity with the terminal success path: populate MAC + SingleHomeRestoredPod.
 			netnsPath, macIfname := s.finalizeNetnsPath(req.MigrationName)
-			fr, frErr := s.finalizeRestore(ctx, priorPID, netnsPath, macIfname, req.MigrationName, "", req.TcpPreservationMode)
+			fr, frErr := s.finalizeRestore(ctx, priorPID, netnsPath, macIfname, req.MigrationName, "", req.TcpPreservationMode, imagesDir)
 			if frErr != nil {
 				log.Error(frErr, "Restore: finalizeRestore failed on idempotent confirm path (Strict/Full fail-closed)", "migration", req.MigrationName)
 				return &agentpb.RestoreResponse{Success: false, ErrorMessage: frErr.Error()}, nil
@@ -6303,6 +7615,9 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 			s.destWorkloadImageMu.Lock()
 			delete(s.destWorkloadImage, req.MigrationName)
 			s.destWorkloadImageMu.Unlock()
+			s.destHostVethMu.Lock()
+			delete(s.destHostVeth, req.MigrationName)
+			s.destHostVethMu.Unlock()
 
 			restoreConfirmed = true
 			return &agentpb.RestoreResponse{Success: true}, nil
@@ -6359,13 +7674,23 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		// carries the source pod's /32 old IP with no CNI routing — restoring into it left the
 		// workload alive but unreachable at the new pod IP. This is not a poll-and-hope: the
 		// sandbox ID derives deterministically from the pod UID. Fail-closed on resolution failure.
-		joinSandboxID, sandboxAttempted := s.resolvePodNetnsSandbox(ctx, req.MigrationName)
+		joinSandboxID, sandboxAttempted := s.resolvePodNetnsSandboxWaiting(ctx, req.MigrationName)
 		if joinSandboxID == "" && sandboxAttempted {
 			msg := fmt.Sprintf("Restore: pod-netns integration failed for migration %s: could not resolve replacement pod sandbox netns (ADR-0325) — refusing to restore into a detached/non-pod namespace", req.MigrationName)
 			log.Info(msg, "migration", req.MigrationName)
 			return &agentpb.RestoreResponse{Success: false, ErrorMessage: msg}, nil
 		}
-		pid, droppedMnts, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", "", joinSandboxID, storedVeth, false, reattachMounts)
+		// ADR-0351 D3.1: pass the incoming gRPC Restore handler ctx — the operator-set restore-RPC
+		// deadline D_restore is the real budget source on this path; no new derivation needed.
+		// ADR-0351 D1.2/D2: this gRPC path has no NRI ContainerEvent, so there is no per-container
+		// cgroup value to thread — passed empty. joinSandboxID CAN still be non-empty here
+		// (ADR-0325 self-resolve), so the anchor gate's containerCgroupsPath=="" leg (documented at
+		// the anchor call site, server.go) applies: the cgroup-anchor step is skipped rather than
+		// fail-closed, a tracked gap (see the anchor call site's comment for the full rationale).
+		// ADR-0355 D2/D3: resolve the authoritative preserved source IP (pm.Spec.SourcePodIP) and
+		// thread it into joinNsRestore for the pre-CRIU bind-prep. "" (no CR / empty field) → no-op.
+		preservedSourceIP := s.resolvePreservedSourceIPForMigration(ctx, req.MigrationName)
+		pid, droppedMnts, joinErr := joinNsRestoreFn(ctx, req.MigrationName, imagesDir, storedWorkloadImage, "", "", joinSandboxID, storedVeth, false, reattachMounts, "", "", preservedSourceIP)
 		// SD-4: CRIU restore has returned — ptrace is no longer expected. Close the window on
 		// the happy path immediately (the deferred close above is the fallback for early returns).
 		_ = seccomp.PtraceWindowClose(req.MigrationName)
@@ -6468,7 +7793,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		// on this gRPC path (parity with NRI path — Condition 2).
 		// Unconditional: finalizeRestore always runs (MAC resolution + Strict/Full fail-closed applies even without k8s client).
 		netnsPath, macIfname := s.finalizeNetnsPath(req.MigrationName)
-		fr, frErr := s.finalizeRestore(ctx, pid, netnsPath, macIfname, req.MigrationName, "", req.TcpPreservationMode)
+		fr, frErr := s.finalizeRestore(ctx, pid, netnsPath, macIfname, req.MigrationName, "", req.TcpPreservationMode, imagesDir)
 		if frErr != nil {
 			log.Error(frErr, "Restore: finalizeRestore failed (Strict/Full fail-closed)", "migration", req.MigrationName)
 			return &agentpb.RestoreResponse{Success: false, ErrorMessage: frErr.Error()}, nil
@@ -6492,6 +7817,9 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		s.destWorkloadImageMu.Lock()
 		delete(s.destWorkloadImage, req.MigrationName)
 		s.destWorkloadImageMu.Unlock()
+		s.destHostVethMu.Lock()
+		delete(s.destHostVeth, req.MigrationName)
+		s.destHostVethMu.Unlock()
 
 		restoreConfirmed = true
 		return &agentpb.RestoreResponse{
@@ -6524,7 +7852,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	if rawReErr != nil {
 		return nil, fmt.Errorf("resolve re-attach mounts: %w", rawReErr)
 	}
-	if patchErr := patchCheckpointImagesFn(imagesDir, nil, reattachContainerPaths(rawReattachMounts)); patchErr != nil {
+	if patchErr := patchCheckpointImagesFn(imagesDir, nil, reattachContainerPaths(rawReattachMounts), reattachHostTargets(rawReattachMounts)); patchErr != nil {
 		if req.TcpPreservationMode == "Strict" {
 			// Strict: fail closed. The controller will initiate rollback.
 			log.Error(patchErr, "Restore: patchCheckpointImages failed under Strict — aborting restore (ADR-0049 Amendment D A1)", "migration", req.MigrationName)
@@ -6546,13 +7874,19 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// the restored process serves at its pod IP regardless of tcpPreservationMode. The synthetic
 	// migration netns (req.DestNetnsFd) is deliberately NOT joined (old-IP preservation is out of
 	// scope). See the config.json branch for the full rationale. Fail-closed on resolution failure.
-	joinSandboxID2, sandboxAttempted2 := s.resolvePodNetnsSandbox(ctx, req.MigrationName)
+	joinSandboxID2, sandboxAttempted2 := s.resolvePodNetnsSandboxWaiting(ctx, req.MigrationName)
 	if joinSandboxID2 == "" && sandboxAttempted2 {
 		msg := fmt.Sprintf("Restore: pod-netns integration failed for migration %s: could not resolve replacement pod sandbox netns (ADR-0325) — refusing to restore into a detached/non-pod namespace", req.MigrationName)
 		log.Info(msg, "migration", req.MigrationName)
 		return nil, fmt.Errorf("%s", msg)
 	}
-	rawPID, droppedMnts2, joinErr := joinNsRestoreFn(req.MigrationName, imagesDir, storedWorkloadImage, "", "", joinSandboxID2, storedVeth2, false, rawReattachMounts)
+	// ADR-0351 D3.1: same rationale as the config.json branch above — pass the incoming gRPC
+	// Restore handler ctx (D_restore).
+	// ADR-0351 D1.2/D2: same rationale as the primary gRPC branch above — no NRI event on this
+	// raw-CRIU fallback path, so no cgroup value to thread; the anchor gate skips (tracked gap).
+	// ADR-0355 D2/D3: same pre-CRIU bind-prep threading as the config.json branch above.
+	preservedSourceIP2 := s.resolvePreservedSourceIPForMigration(ctx, req.MigrationName)
+	rawPID, droppedMnts2, joinErr := joinNsRestoreFn(ctx, req.MigrationName, imagesDir, storedWorkloadImage, "", "", joinSandboxID2, storedVeth2, false, rawReattachMounts, "", "", preservedSourceIP2)
 	for _, d := range droppedMnts2 {
 		s.emitExternalMountDroppedEvent(context.Background(), req.MigrationName, d)
 	}
@@ -6567,7 +7901,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// on the raw CRIU fallback path (Conditions 1, 2, 3).
 	// Unconditional: finalizeRestore always runs (MAC resolution + Strict/Full fail-closed applies even without k8s client).
 	netnsPath2, macIfname2 := s.finalizeNetnsPath(req.MigrationName)
-	fr2, frErr2 := s.finalizeRestore(ctx, result.PID, netnsPath2, macIfname2, req.MigrationName, "", req.TcpPreservationMode)
+	fr2, frErr2 := s.finalizeRestore(ctx, result.PID, netnsPath2, macIfname2, req.MigrationName, "", req.TcpPreservationMode, imagesDir)
 	if frErr2 != nil {
 		log.Error(frErr2, "Restore (raw CRIU path): finalizeRestore failed (Strict/Full fail-closed)", "migration", req.MigrationName)
 		return &agentpb.RestoreResponse{Success: false, ErrorMessage: frErr2.Error()}, nil
@@ -6591,6 +7925,9 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	s.destWorkloadImageMu.Lock()
 	delete(s.destWorkloadImage, req.MigrationName)
 	s.destWorkloadImageMu.Unlock()
+	s.destHostVethMu.Lock()
+	delete(s.destHostVeth, req.MigrationName)
+	s.destHostVethMu.Unlock()
 
 	restoreConfirmed = true
 	return &agentpb.RestoreResponse{
@@ -6661,6 +7998,12 @@ func (s *AgentServer) VerifyTCP(ctx context.Context, req *agentpb.VerifyTCPReque
 			resp.Verified = true
 			return resp, nil
 		}
+		// ADR-0352 Strict (sprint46B9 fix): resume the --leave-stopped restored tree BEFORE probing.
+		// The Strict completion path retired injectIPHandoff, the former sole trigger for the ADR-0142
+		// deferred SIGCONT, so without this the frozen process completes the TCP handshake at the
+		// kernel but never answers the wire probe (i/o timeout → false liveness failure → rollback).
+		// No-op for BestEffort/None (no pending PID) and idempotent across the sustained-probe requeues.
+		s.resumeDeferredRestoredProcess(ctx, req.MigrationName)
 		probeErr := s.runAppProbe(ctx, req)
 		if probeErr != nil {
 			resp.Verified = false
@@ -6716,6 +8059,14 @@ func (s *AgentServer) VerifyTCP(ctx context.Context, req *agentpb.VerifyTCPReque
 			FailureReason: fmt.Sprintf("VerifyTCP: socket inventory failed on destination pid=%d: %v", pid, invErr),
 		}, nil
 	}
+	// Scope the destination observation to the SAME migratable-connection class as the
+	// source "expected" set (sourceSnaps was captured loopback-free at freeze). Without
+	// this, a fresh intra-pod loopback health probe that happens to be ESTABLISHED at
+	// verify time would (a) be mistaken for a migrated connection in the match loop and
+	// (b) — when the pod held no real connections (len(sourceSnaps)==0) — trip the
+	// absence-of-evidence fail-closed guard below with a misleading message. Filtering
+	// keeps expected/observed comparing like-with-like; it does NOT weaken the guard.
+	destEntries = network.FilterMigratableTCP(destEntries)
 
 	// If no source snapshots are available and there are ESTABLISHED connections on the
 	// destination, fail CLOSED. An empty snapshot set means either:
@@ -6867,11 +8218,29 @@ func absDiffU32(a, b uint32) uint32 {
 	return d
 }
 
-// nodePodCIDRAllowlist returns the cached []*net.IPNet parsed from this node's
-// Node.Spec.PodCIDRs (ADR-0325 SSRF containment). Nil-safe: k8sClient==nil or an empty/
-// unparsable PodCIDRs list yields an EMPTY slice, which makes dialAllowed fail CLOSED
-// (refuse), never open. Never hardcode a CIDR literal — Flannel's 10.244.0.0/16 breaks the
-// moment the CNI changes (scope item #1, Cilium handoff).
+// ciliumNodePodCIDRGVK is the cilium.io/v2 CiliumNode resource — cluster-scoped, named after
+// the Kubernetes node. It is read as unstructured via the controller-runtime client because the
+// typed clientset does not compile in cilium.io/v2 (see cmd/main.go: no scheme registered for it).
+var ciliumNodePodCIDRGVK = schema.GroupVersionKind{Group: "cilium.io", Version: "v2", Kind: "CiliumNode"}
+
+// nodePodCIDRAllowlist returns the cached []*net.IPNet of this node's pod IPs — the SSRF
+// containment reference dialAllowed enforces (ADR-0325). It reads the AUTHORITATIVE allocator,
+// CiliumNode.spec.ipam.podCIDRs (the Cilium cluster-pool IPAM per-node block), NOT
+// Node.Spec.PodCIDRs. On a Cilium cluster-pool cluster the two DISAGREE: kube's node-ipam
+// controller writes Node.Spec.PodCIDRs, but Cilium runs its own IPAM and hands pod IPs out of
+// CiliumNode.spec.ipam.podCIDRs, so real pods do NOT live in Node.Spec.PodCIDRs. Verified live on
+// the standing cluster (2026-07-14): pm-w2 Node.Spec.PodCIDRs=10.244.2.0/24 while pm-w2's pods are
+// allocated from Cilium 10.244.1.0/24 (every node is permuted). Keying the allowlist on
+// Node.Spec.PodCIDRs therefore refuses every legitimate local pod IP AND admits a /24 that holds
+// none — an SSRF control reading a field the CNI ignores. This reads the source of truth the CNI
+// actually allocates from (invariant #10 / SUBSTRATE-PRIMITIVE: read the allocator's write-back,
+// do not key on a field it does not own).
+//
+// Fail-CLOSED, NO fallback: k8sClient==nil, an absent/unreadable CiliumNode, or an empty/
+// unparsable podCIDRs list yields an EMPTY slice, which makes dialAllowed refuse every dial. It
+// does NOT fall back to Node.Spec.PodCIDRs — that field is proven to diverge on this substrate, so
+// a fallback would be a brittle chain re-admitting the wrong /24 (invariant #10). Never hardcode a
+// CIDR literal.
 func (s *AgentServer) nodePodCIDRAllowlist(ctx context.Context) []*net.IPNet {
 	s.podCIDRAllowlistMu.RLock()
 	cached := s.podCIDRAllowlist
@@ -6879,20 +8248,43 @@ func (s *AgentServer) nodePodCIDRAllowlist(ctx context.Context) []*net.IPNet {
 	if cached != nil {
 		return cached
 	}
-	var out []*net.IPNet
-	if s.k8sClient != nil && s.nodeName != "" {
-		nodeObj := &corev1.Node{}
-		if err := s.k8sClient.Get(ctx, client.ObjectKey{Name: s.nodeName}, nodeObj); err == nil {
-			for _, cidr := range nodeObj.Spec.PodCIDRs {
-				if _, ipnet, perr := net.ParseCIDR(cidr); perr == nil {
-					out = append(out, ipnet)
-				}
-			}
-		}
-	}
+	out := parseCIDRAllowlist(s.ciliumNodePodCIDRs(ctx))
 	s.podCIDRAllowlistMu.Lock()
 	s.podCIDRAllowlist = out
 	s.podCIDRAllowlistMu.Unlock()
+	return out
+}
+
+// ciliumNodePodCIDRs reads this node's Cilium cluster-pool IPAM per-node pod CIDRs from the
+// cilium.io/v2 CiliumNode CR (spec.ipam.podCIDRs) via the controller-runtime client as
+// unstructured. Returns nil on any failure so the caller falls CLOSED (empty allowlist). Reads
+// the CR named for this node; requires get on ciliumnodes.cilium.io (podmotion-agent-role).
+func (s *AgentServer) ciliumNodePodCIDRs(ctx context.Context) []string {
+	if s.k8sClient == nil || s.nodeName == "" {
+		return nil
+	}
+	cn := &unstructured.Unstructured{}
+	cn.SetGroupVersionKind(ciliumNodePodCIDRGVK)
+	if err := s.k8sClient.Get(ctx, client.ObjectKey{Name: s.nodeName}, cn); err != nil {
+		return nil
+	}
+	cidrs, _, err := unstructured.NestedStringSlice(cn.Object, "spec", "ipam", "podCIDRs")
+	if err != nil {
+		return nil
+	}
+	return cidrs
+}
+
+// parseCIDRAllowlist parses CIDR strings into []*net.IPNet, skipping any that do not parse. Pure
+// and side-effect-free so the SSRF allowlist admission logic is unit-testable against real cluster
+// CIDR values without a live CiliumNode read.
+func parseCIDRAllowlist(cidrs []string) []*net.IPNet {
+	var out []*net.IPNet
+	for _, cidr := range cidrs {
+		if _, ipnet, perr := net.ParseCIDR(cidr); perr == nil {
+			out = append(out, ipnet)
+		}
+	}
 	return out
 }
 
@@ -6917,22 +8309,230 @@ func (s *AgentServer) dialAllowed(ctx context.Context, address string) error {
 	return fmt.Errorf("NonPodCIDRRefused: %s is outside the node pod-CIDR allowlist", ip)
 }
 
+// dialAllowedForMigrationTarget (ADR-0352 D1.2) is the SINGLE authoritative dial-authorization
+// primitive for an application probe. It admits address iff EITHER (a) address's IP is within
+// this node's pod-CIDR allowlist (the ADR-0325 SSRF containment — same-node/normal probes
+// are unaffected), OR (b) address's IP EXACTLY equals one of the migration's own authoritative,
+// independently-resolved out-of-pod-CIDR expected targets — the Service ClusterIP
+// (expected_cluster_ip) and/or the PRESERVED pod IP (expected_pod_ip). Both classes are
+// outside the DESTINATION node's own pod-CIDR by design (a Service ClusterIP lives in the
+// Service CIDR; a preserved cross-node pod IP lives in the SOURCE node's pod-CIDR), so the
+// unmodified pod-CIDR allowlist alone would ALWAYS reject them with NonPodCIDRRefused —
+// silently masquerading the ClusterIP round-trip as "failed" and, structurally, making the
+// Strict workload-liveness gate unreachable for every preserved-IP cross-node migration.
+// Each expected IP is a value the CALLING migration's controller independently resolved from a
+// DIFFERENT source of truth than address (the real Service object / spec.sourcePodIP vs. the
+// live pod-status read used to build AppProbeAddress); requiring an EXACT match is a deliberate
+// belt-and-suspenders check against a construction bug threading an unrelated address. This is
+// NEVER a CIDR-range widening — only these exact IP(s) are permitted, per request. It replaces
+// the prior per-path carve-outs with ONE source-of-truth-keyed authorization (invariant #10).
+func (s *AgentServer) dialAllowedForMigrationTarget(ctx context.Context, address string, expectedIPs ...string) error {
+	if err := s.dialAllowed(ctx, address); err == nil {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	ip := net.ParseIP(host)
+	if ip != nil {
+		for _, exp := range expectedIPs {
+			if exp == "" {
+				continue
+			}
+			if expIP := net.ParseIP(exp); expIP != nil && ip.Equal(expIP) {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("NonPodCIDRRefused: address %q is outside the node pod-CIDR allowlist and matches none of this migration's authoritative expected target IPs (ClusterIP/preserved pod IP)", address)
+}
+
+// dialAllowedForServiceContinuity (ADR-0352 D1.2) is the Service-continuity ClusterIP entry
+// point, retained as a named seam for its unit tests. It is a thin wrapper over the unified
+// dialAllowedForMigrationTarget primitive: admit the pod-CIDR allowlist OR exactly
+// expectedClusterIP. All authorization policy lives in the one primitive.
+func (s *AgentServer) dialAllowedForServiceContinuity(ctx context.Context, address, expectedClusterIP string) error {
+	return s.dialAllowedForMigrationTarget(ctx, address, expectedClusterIP)
+}
+
+// migrationRestoredWorkloadIP reads the AUTHORITATIVE IP the restored workload actually answers on
+// for migrationName: the REPLACEMENT pod's own Status.PodIP, read directly from the k8s API — the
+// SAME source of truth the controller uses to build the ADR-0325 WorkloadLivenessVerified probe
+// target (reconcileServiceVerifying: destPodIP := destPod.Status.PodIP, podmigration_controller.go
+// ~1491/1555). Keying the dial-authorization on THIS value makes the probe target and the dial-auth
+// admit ONE identical fact by construction, read from ONE source of truth (invariant #10) — closing
+// the sprint46B7 cycle-2 divergence where the controller probed destPod.Status.PodIP while the agent
+// admitted a DIFFERENT field.
+//
+// It DELIBERATELY does NOT read Spec.SourcePodIP (the retired cycle-1 key). Spec.SourcePodIP is the
+// migration's REQUESTED preserved IP. Under ADR-0352 the Strict completion path is the Service-
+// continuity model (ServiceContinuityVerified + WorkloadLivenessVerified); the preserved-IP-on-
+// endpoint gate (ConfirmEndpointOwnsPreservedIP, reached via injectIPHandoff) is RETIRED from Strict
+// (podmigration_controller.go D3), so cluster-pool IPAM may legitimately assign the replacement pod
+// a FRESH destination-local IP that is NOT Spec.SourcePodIP (the ipam.cilium.io/ip pin need not be
+// honored for Strict to complete). The controller probes that fresh IP; admitting Spec.SourcePodIP
+// instead refused the very address under probe (live-proof cycle-2: admitted 10.244.0.63, probe
+// target 10.244.1.203 refused). When the pin IS honored the two are equal, so reading the
+// replacement pod's Status.PodIP is correct in BOTH cases — it is strictly the authoritative "IP the
+// restored workload answers on".
+//
+// Resolves the replacement pod by the race-free migration-name LABEL (resolveReplacementPod — the
+// same primitive the restore path uses), falling back to Status.ReplacementPodName only if the label
+// lookup finds nothing. Returns "" if the CR, the replacement pod, or its Status.PodIP cannot be
+// resolved (the caller then falls closed on the plain pod-CIDR allowlist), so a construction bug or
+// hostile caller threading an unrelated address cannot self-authorize.
+func (s *AgentServer) migrationRestoredWorkloadIP(ctx context.Context, migrationName string) string {
+	if s.k8sClient == nil || migrationName == "" {
+		return ""
+	}
+	pm, ok := s.lookupPodMigration(ctx, migrationName)
+	if !ok {
+		return ""
+	}
+	podNs := pm.Spec.PodNamespace
+	if podNs == "" {
+		podNs = pm.Namespace
+	}
+	replPod := s.resolveReplacementPod(ctx, migrationName, podNs)
+	if replPod == nil {
+		// Label race: fall back to the Status field (same pattern as resolveReattachMountsImpl).
+		if replName := pm.Status.ReplacementPodName; replName != "" {
+			p := &corev1.Pod{}
+			if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: replName, Namespace: podNs}, p); err == nil {
+				replPod = p
+			}
+		}
+	}
+	if replPod == nil {
+		return ""
+	}
+	return replPod.Status.PodIP
+}
+
+// dialAllowedForMigrationProbe (sprint46B7 Validation cycle-1 fix) is the SINGLE authoritative
+// dial-authorization entrypoint for every VerifyTCP application probe (ADR-0325 SSRF containment).
+// It replaces the prior split in runAppProbe where a Service-continuity probe got the ADR-0352
+// D1.2 ClusterIP carve-out but the sibling ADR-0325 WorkloadLivenessVerified probe fell through to
+// plain dialAllowed — which admits ONLY the destination node's own pod-CIDR. That destination-CIDR
+// allowlist is the WRONG reference for the replacement pod's liveness probe on a cross-node
+// migration: the controller probes the replacement pod's actual Status.PodIP, which is NOT
+// guaranteed to sit in this node's Node.Spec.PodCIDRs (under Cilium cluster-pool the real allocator
+// is the CiliumNode block, which can diverge from Node.Spec.PodCIDRs), so the plain path fails
+// CLOSED with NonPodCIDRRefused on the NORMAL case of the very feature under test — leaving Strict
+// completion structurally unreachable (WorkloadLivenessVerified never goes True, so the
+// livenessOK && ServiceContinuityVerified advance guard never fires).
+//
+// This primitive admits the target ONLY when it is an IP this migration AUTHORITATIVELY owns, each
+// established from a source-of-truth read — never a CIDR-range widening, never AppProbeAddress on
+// trust alone (a buggy/hostile caller threading an unrelated address still fails closed):
+//
+//	(a) the destination node's pod-CIDR allowlist (ordinary same-node / Mode=None new-IP case),
+//	    unchanged ADR-0325 SSRF semantics;
+//	(b) the IP the restored workload authoritatively answers on — the REPLACEMENT pod's own
+//	    Status.PodIP, read by req.MigrationName from the SAME k8s source of truth the controller uses
+//	    to build the probe target (migrationRestoredWorkloadIP). This is the sprint46B7 cycle-2 fix:
+//	    it makes the dial-auth admit the exact IP the controller probes, closing the prior divergence
+//	    where the agent instead admitted Spec.SourcePodIP (which cluster-pool IPAM may not have put
+//	    on the pod); or
+//	(c) the expected Service ClusterIP the controller independently resolved (ADR-0352 D1.2),
+//	    delegated unchanged to dialAllowedForServiceContinuity so that landed carve-out and its
+//	    unit contract remain the authority for the ClusterIP case.
+func (s *AgentServer) dialAllowedForMigrationProbe(ctx context.Context, req *agentpb.VerifyTCPRequest) error {
+	address := req.AppProbeAddress
+	// (a) ordinary pod-CIDR allowlist — unchanged ADR-0325 SSRF semantics, fast path.
+	if err := s.dialAllowed(ctx, address); err == nil {
+		return nil
+	}
+	host, _, splitErr := net.SplitHostPort(address)
+	if splitErr != nil {
+		host = address
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("NonPodCIDRRefused: address %q host %q is not a valid IP", address, host)
+	}
+	// (b) the IP the restored workload authoritatively answers on = the REPLACEMENT pod's own
+	// Status.PodIP, read from the SAME k8s source of truth the controller used to build the probe
+	// target (destPod.Status.PodIP). This closes the sprint46B7 cycle-2 divergence: the controller
+	// probes the replacement pod's actual (possibly fresh, dest-local) IP, so the dial-auth must
+	// admit THAT exact IP — not Spec.SourcePodIP, which under ADR-0352 Strict need not be the IP the
+	// pod ended up with (preserved-IP-on-endpoint gate retired; cluster-pool IPAM may hand a fresh
+	// IP). Exact-match only, re-derived independently by the agent, so a hostile/buggy caller
+	// threading an unrelated AppProbeAddress still fails closed (SSRF containment preserved).
+	if restoredIP := s.migrationRestoredWorkloadIP(ctx, req.MigrationName); restoredIP != "" {
+		if rip := net.ParseIP(restoredIP); rip != nil && rip.Equal(ip) {
+			return nil
+		}
+	}
+	// (c) expected Service ClusterIP (ADR-0352 D1.2) — delegate to the existing scoped guard so its
+	// belt-and-suspenders check and unit contract remain the authority for the ClusterIP case.
+	if req.ExpectedClusterIp != "" {
+		return s.dialAllowedForServiceContinuity(ctx, address, req.ExpectedClusterIp)
+	}
+	return fmt.Errorf("NonPodCIDRRefused: %s is outside the node pod-CIDR allowlist and is neither this migration's preserved pod IP nor its expected Service ClusterIP", ip)
+}
+
 // runAppProbe (ADR-0325) issues a real wire-protocol application probe. This is now a
 // METHOD on *AgentServer (previously a free function) so it can read this node's identity
 // to derive the pod-CIDR SSRF allowlist. Both VerifyTCP call sites (the AppProbeOnly branch
 // and the full-verification tail) route through it and inherit the CIDR guard and the real
 // protocol bodies.
 func (s *AgentServer) runAppProbe(ctx context.Context, req *agentpb.VerifyTCPRequest) error {
+	// ADR-0325 / ADR-0352 D1.2 / sprint46B7 Validation cycle-2 fix: route EVERY app probe through
+	// the single authoritative migration-aware dial-authorization primitive. It admits the
+	// destination node's pod-CIDR (ordinary case), the IP the restored workload authoritatively
+	// answers on — the replacement pod's own Status.PodIP, the SAME value the controller builds the
+	// probe target from (the cross-node liveness case, where cluster-pool IPAM may assign a fresh
+	// dest-local IP the plain destination-CIDR allowlist does not contain), and the expected Service
+	// ClusterIP (Service-continuity round-trip). Replaces the prior split where the liveness branch
+	// fell through to plain dialAllowed and refused the replacement pod's probe IP.
+	//
+	// The address is fixed for the whole sustained window, so authorize ONCE up front rather than
+	// on every attempt.
+	if err := s.dialAllowedForMigrationProbe(ctx, req); err != nil {
+		return err
+	}
+
+	// ADR-0325 round-3 (sprint46B9): SUSTAINED verification. Instead of a single instantaneous
+	// probe (which a crash-looping backend passes at the exact instant it happens to answer the
+	// handshake), require N consecutive passes over a real interval. Each attempt re-dials and
+	// re-probes the backend's CURRENT state via runAppProbeOnce; a flapping backend fails a later
+	// attempt on connection-refused and never reports live. Both VerifyTCP call sites — the
+	// AppProbeOnly branch (WorkloadLivenessVerified) and the full-verification tail (AppProbeOk,
+	// which feeds TrafficVerified/ServiceContinuity) — inherit this hardening for free.
+	passes, interval := s.resolveSustain()
+	return sustainedProbe(ctx, passes, interval, func(attemptCtx context.Context) error {
+		return s.runAppProbeOnce(attemptCtx, req)
+	})
+}
+
+// resolveSustain returns the configured sustained-liveness parameters, falling back to the
+// package defaults when the AgentServer fields are unset (the zero value, e.g. &AgentServer{}).
+func (s *AgentServer) resolveSustain() (int, time.Duration) {
+	passes := s.livenessSustainPasses
+	if passes < 1 {
+		passes = defaultLivenessSustainPasses
+	}
+	interval := s.livenessSustainInterval
+	if interval <= 0 {
+		interval = defaultLivenessSustainInterval
+	}
+	return passes, interval
+}
+
+// runAppProbeOnce issues exactly ONE wire-protocol application probe (a single dial + protocol
+// exchange) with its own per-probe timeout. It is the single-shot body that sustainedProbe
+// invokes repeatedly; the SSRF dial-authorization is performed once by the caller (runAppProbe),
+// so this method never dials an unauthorized address (every attempt targets the same authorized
+// req.AppProbeAddress).
+func (s *AgentServer) runAppProbeOnce(ctx context.Context, req *agentpb.VerifyTCPRequest) error {
 	timeout := time.Duration(req.AppProbeTimeoutS) * time.Second
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-
-	if err := s.dialAllowed(ctx, req.AppProbeAddress); err != nil {
-		return err
-	}
 
 	switch strings.ToUpper(req.AppProbeProtocol) {
 	case "TCP":
@@ -6982,6 +8582,22 @@ func (s *AgentServer) runAppProbe(ctx context.Context, req *agentpb.VerifyTCPReq
 
 func (s *AgentServer) Abort(_ context.Context, req *agentpb.AbortRequest) (*agentpb.AbortResponse, error) {
 	log.Info("Abort called", "migration", req.MigrationName, "reason", req.Reason)
+
+	// Evict this migration's source-side identity/state on the failure path — the mirror of
+	// DisarmZeroWindow's success-path eviction. Without this, a migration name reused after an
+	// abort (a retried CR, or a test harness) resolves stale state from the aborted attempt.
+	// pendingResumePIDs is included here too: its only other eviction site is deep inside a
+	// success-path branch (~server.go:2100), so an abort between Restore recording an entry and
+	// that branch running would otherwise leak it.
+	s.migrationPodUIDMu.Lock()
+	delete(s.migrationPodUID, req.MigrationName)
+	s.migrationPodUIDMu.Unlock()
+	s.migrationSeqSnapshotsMu.Lock()
+	delete(s.migrationSeqSnapshots, req.MigrationName)
+	s.migrationSeqSnapshotsMu.Unlock()
+	s.pendingResumePIDsMu.Lock()
+	delete(s.pendingResumePIDs, req.MigrationName)
+	s.pendingResumePIDsMu.Unlock()
 
 	// Thaw any frozen source PID before aborting CRIU. If LeaveStopped=true left the
 	// source process in SIGSTOP after a successful dump, the source must be SIGCONTed
@@ -7506,6 +9122,23 @@ func checksumDir(dir string) (string, int64) {
 // DisarmZeroWindow before the watchdog fires an emergency disarm.
 const zwWatchdogMargin = 500 * time.Millisecond
 
+// authoritativePodUID resolves the pod UID for a per-migration RPC, given the agent's
+// migrationPodUID cache and a freshly-resolved value from the caller (the controller's live pod
+// read on ArmZeroWindow/DisarmZeroWindow, or the freshly-fetched CR's spec.SourcePodUID on
+// Checkpoint). The fresh value always wins when non-empty: it reflects the CURRENT pod
+// incarnation, whereas the cache — written once by PrepareSource and never evicted mid-migration
+// — is a crash-recovery fallback only, and can be stale for a migration name reused across pod
+// incarnations (sprint46B9 pre-work diagnosis: a retried CR, or this repo's own live-proof test
+// harness, reusing one migration name across separate redis pods). Returns the UID to use and
+// whether a stale, disagreeing cache value was found, so the caller can log a diagnostic instead
+// of silently swapping.
+func authoritativePodUID(cachedUID, freshUID string) (podUID string, stale bool) {
+	if freshUID == "" {
+		return cachedUID, false
+	}
+	return freshUID, cachedUID != "" && cachedUID != freshUID
+}
+
 // ArmZeroWindow implements MigrationAgentServiceServer.ArmZeroWindow.
 // It polls tcpi_unacked==0 for all TCP sockets of the source pod before returning armed=true,
 // ensuring no in-flight bytes are in the send buffer when FinalFreeze fires (ADR-0049).
@@ -7514,17 +9147,48 @@ const zwWatchdogMargin = 500 * time.Millisecond
 func (s *AgentServer) ArmZeroWindow(ctx context.Context, req *agentpb.ArmZeroWindowRequest) (*agentpb.ArmZeroWindowResponse, error) {
 	log.Info("ArmZeroWindow: arming zero-window hold", "migration", req.MigrationName, "podUID", req.PodUid)
 
+	// The caller-supplied UID is authoritative: the controller resolves it fresh from the
+	// live source pod on every reconcile (podmigration_controller.go ~756-760). The cached
+	// migrationPodUID map (written once by PrepareSource, never evicted mid-migration) is a
+	// crash-recovery fallback ONLY — it must never override a fresh value the caller supplies,
+	// or a migration name reused across pod incarnations (a retried CR, or this repo's own
+	// live-proof test harness) resolves a dead PID left over from a prior incarnation instead
+	// of the live one (sprint46B9 pre-work diagnosis).
 	s.migrationPodUIDMu.RLock()
-	podUID := s.migrationPodUID[req.MigrationName]
+	cachedPodUID := s.migrationPodUID[req.MigrationName]
 	s.migrationPodUIDMu.RUnlock()
-	if podUID == "" && req.PodUid != "" {
-		podUID = req.PodUid
+	podUID, stale := authoritativePodUID(cachedPodUID, req.PodUid)
+	if stale {
+		log.Info("ArmZeroWindow: stale migrationPodUID cache detected — preferring fresh caller-supplied UID",
+			"migration", req.MigrationName, "cachedUID", cachedPodUID, "freshUID", req.PodUid)
 	}
 
-	// Resolve source pod veth ifindex. On darwin/stub resolveVethIfindex returns 0 without error.
-	ifindex, err := resolveVethIfindex(podUID)
-	if err != nil {
-		log.Info("ArmZeroWindow: veth ifindex resolution failed (stub path)", "migration", req.MigrationName, "err", err)
+	// Resolve source pod veth ifindex. On darwin/stub resolveVethIfindex returns (0, nil).
+	// On Linux it now returns a TYPED ERROR when the read mechanism itself failed (no host PID
+	// sharing the pod netns, netns-broker spawn error, or a non-zero netns-exec) — distinct from
+	// the authoritative (0, nil) "eth0 present but not a veth" non-veth-CNI signal.
+	ifindex, rerr := resolveVethIfindex(podUID)
+	if rerr != nil {
+		// The veth ifindex read mechanism FAILED — this is NOT the terminal "non-veth CNI"
+		// capability gap. On a veth CNI (Cilium lxc*, Flannel/kind) the peer demonstrably
+		// exists; a resolution failure here is the "the read mechanism itself failed" race
+		// class and must be reported truthfully, not mislabeled by armZeroWindowBPF(ifindex==0)
+		// as "CNI unsupported (non-veth CNI path)". Under Strict we still fail CLOSED
+		// (Armed=false — no false-green), but with an accurate, diagnosable BlockingReason that
+		// names the real failing sub-path instead of libeling the CNI (ADR-0049 Amendment D).
+		if req.TcpPreservationMode == "Strict" {
+			log.Error(rerr, "ArmZeroWindow: veth ifindex resolution failed under Strict — failing closed (read-mechanism failure, NOT non-veth CNI)",
+				"migration", req.MigrationName, "podUID", podUID)
+			return &agentpb.ArmZeroWindowResponse{
+				Armed:          false,
+				BlockingReason: fmt.Sprintf("veth ifindex resolution failed (read mechanism — not a non-veth CNI): %v", rerr),
+			}, nil
+		}
+		// None/BestEffort: degrade-and-continue (the hold is a protective optimisation, not
+		// required for seq_delta=0 correctness). ifindex is 0 here; armZeroWindowBPF is a no-op
+		// under these modes.
+		log.Info("ArmZeroWindow: veth ifindex resolution failed — degrading (BestEffort/None; hold is optional)",
+			"migration", req.MigrationName, "podUID", podUID, "err", rerr)
 	}
 
 	// Arm the TC-BPF zero-window hold. On non-Linux this is a no-op stub.
@@ -7662,11 +9326,14 @@ func (s *AgentServer) DisarmZeroWindow(_ context.Context, req *agentpb.DisarmZer
 		}, nil
 	}
 
+	// See ArmZeroWindow: the caller-supplied UID must win over the cache for the same reason.
 	s.migrationPodUIDMu.RLock()
-	podUID := s.migrationPodUID[req.MigrationName]
+	cachedPodUID := s.migrationPodUID[req.MigrationName]
 	s.migrationPodUIDMu.RUnlock()
-	if podUID == "" {
-		podUID = req.PodUid
+	podUID, stale := authoritativePodUID(cachedPodUID, req.PodUid)
+	if stale {
+		log.Info("DisarmZeroWindow: stale migrationPodUID cache detected — preferring fresh caller-supplied UID",
+			"migration", req.MigrationName, "cachedUID", cachedPodUID, "freshUID", req.PodUid)
 	}
 
 	ifindex, err := resolveVethIfindex(podUID)
@@ -7703,6 +9370,19 @@ func (s *AgentServer) DisarmZeroWindow(_ context.Context, req *agentpb.DisarmZer
 	}
 	log.Info("DisarmZeroWindow: hold disarmed", "migration", req.MigrationName,
 		"holdDurationMs", holdMs, "disarmedAtNs", disarmedAtNs)
+
+	// DisarmZeroWindow is the last source-agent RPC that reads migrationPodUID /
+	// migrationSeqSnapshots in a successful migration — evict here, not on the
+	// destination-side Restore path (a different AgentServer process on a different node)
+	// and not on ReleaseCheckpoint (which fires earlier in this same migration, before this
+	// handler runs, and would delete the entry out from under this very read).
+	s.migrationPodUIDMu.Lock()
+	delete(s.migrationPodUID, req.MigrationName)
+	s.migrationPodUIDMu.Unlock()
+	s.migrationSeqSnapshotsMu.Lock()
+	delete(s.migrationSeqSnapshots, req.MigrationName)
+	s.migrationSeqSnapshotsMu.Unlock()
+
 	return &agentpb.DisarmZeroWindowResponse{
 		Disarmed:       true,
 		DisarmedAtNs:   disarmedAtNs,
@@ -8136,7 +9816,12 @@ func enforceRestoreOrderingInvariant(pid int, migrationName string, expectedCoun
 			continue
 		}
 		lastErr = nil
-		lastCount = len(sockEntries)
+		// Count only MIGRATABLE sockets. expectedCount = len(SeqSnapshots) was captured
+		// loopback-free at freeze, so the observed count must exclude intra-pod loopback
+		// too: a fresh kubelet health probe on the restored pod is not one of the migrated
+		// sockets this liveness gate waits for, and must not satisfy the count before the
+		// real held socket is actually restored (which would release SIGCONT prematurely).
+		lastCount = len(network.FilterMigratableTCP(sockEntries))
 		if lastCount >= expectedCount {
 			// Confirmed: at least expectedCount ESTABLISHED sockets observed.
 			socketsLiveAt := time.Now()

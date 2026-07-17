@@ -611,6 +611,26 @@ message VerifyTCPRequest {
   // ALL TCPPreservationMode values (including None, which never calls VerifyTCP
   // for sequence continuity).
   bool   app_probe_only          = 8;
+  // ADR-0352 D1.2: expected_cluster_ip, when non-empty, marks this as a Service-
+  // continuity ClusterIP round-trip probe. app_probe_address MUST be
+  // "<expected_cluster_ip>:<port>". The agent's dialAllowedForServiceContinuity guard
+  // permits EXACTLY this one IP (in addition to the normal pod-CIDR allowlist) — never
+  // a CIDR-range widening — tied to the one Service the calling migration's controller
+  // independently resolved (ADR-0325 SSRF containment stays intact for every other
+  // caller of dialAllowed; this is a scoped, single-IP, per-request exception).
+  string expected_cluster_ip     = 9;
+  // ADR-0352 D1.2 (liveness-path completion): expected_pod_ip, when non-empty, is the
+  // migration's authoritative PRESERVED pod IP (the source pod's IP, recorded in the CR at
+  // migration start as spec.sourcePodIP). A cross-node IP-preserving restore lands the
+  // restored pod HOLDING the SOURCE node's pod-CIDR IP, which is OUTSIDE the destination
+  // node's own pod-CIDR allowlist — so the plain dialAllowed guard would ALWAYS reject the
+  // ADR-0325 workload-liveness probe (NonPodCIDRRefused) on the NORMAL cross-node case,
+  // wedging Strict completion. Exactly like expected_cluster_ip, the agent admits EXACTLY
+  // this one IP (belt-and-suspenders: app_probe_address host MUST equal it) in addition to
+  // the normal pod-CIDR allowlist — never a CIDR-range widening. The controller resolves it
+  // independently (spec.sourcePodIP) from a DIFFERENT source of truth than app_probe_address
+  // (the live pod-status read), so a construction bug threading an unrelated address is caught.
+  string expected_pod_ip         = 10;
 }
 
 message VerifyTCPResponse {

@@ -20,6 +20,9 @@ const (
 	// TCPPreservationModeStrict requires full TCP sequence continuity. If
 	// TCPSequenceContinuityVerified=False after restore, the operator triggers hard rollback.
 	// See ADR-0019 Amendment A.
+	// ADR-0352 D1.4: Strict guarantees Kubernetes Service-level continuity (ClusterIP +
+	// Ready EndpointSlice membership) — it does NOT guarantee the replacement pod retains
+	// the source pod's IP address or MAC (cluster-pool IPAM assigns a fresh dest-local IP).
 	TCPPreservationModeStrict TCPPreservationMode = "Strict"
 	// TCPPreservationModeBestEffort attempts TCP preservation but emits a warning condition
 	// instead of rolling back when TCPSequenceContinuityVerified=False.
@@ -339,6 +342,28 @@ const (
 	// The CONTROLLER is the authority that flips this condition, based on the nonce
 	// round-trip — never a self-asserted ProbeOk boolean from a single agent.
 	ConditionDataplaneReachabilityVerified = "DataplaneReachabilityVerified"
+	// ConditionServiceContinuityVerified (ADR-0352) is the authoritative Service-continuity
+	// signal, produced from two source-of-truth reads (not inference): the replacement
+	// endpoint is a Ready member of the target Service's EndpointSlice (D1.1, made real by
+	// the D0.1 write-back — traffic.EndpointSliceManager.MarkDestinationReady), AND a real
+	// client round-trip to the Service ClusterIP succeeds (D1.2). True only when both hold.
+	// Absent/Unknown MUST NOT veto (no probe has run yet, or None mode, which never produces
+	// this condition). False is set only affirmatively — workload is live yet the replacement
+	// is not Ready-enrolled after a bounded window, or the round-trip affirmatively failed.
+	// Replaces ConditionDataplaneReachabilityVerified as the Strict-mode source-teardown
+	// discharge signal on the Strict completion path only (api/v1alpha1/source_teardown.go);
+	// DataplaneReachabilityVerified is preserved as the live cross-mode fail-closed veto for
+	// BestEffort/None (ADR-0352 D2.2 option b).
+	// ADR-0352 D1.4: Strict now guarantees Kubernetes Service-level continuity (ClusterIP +
+	// Ready EndpointSlice membership) — it does NOT guarantee the replacement pod retains the
+	// source pod's IP address or MAC (cluster-pool IPAM assigns a fresh dest-local IP).
+	ConditionServiceContinuityVerified = "ServiceContinuityVerified"
+	// Note (ADR-0352 B8-DR-8a): the legacy status.conditions entry named "TrafficVerified" is
+	// a control-flow token on the NRI/legacy Strict completion path ONLY — it is NOT a Strict
+	// teardown-safety predicate. The Strict source-teardown gate keys exclusively on
+	// {ServiceContinuityVerified, TCPSequenceContinuityVerified, WorkloadLivenessVerified}
+	// (api/v1alpha1/source_teardown.go:SourceTeardownBlockReason). Do not read
+	// TrafficVerified=True as "teardown-safe" under Strict.
 	// ConditionWorkloadLivenessVerified is set by reconcileServiceVerifying (ADR-0325) from a
 	// real wire-protocol application probe (Postgres v3 handshake+SELECT, Redis RESP PING/PONG,
 	// HTTP GET requiring a genuine [200,300) response with redirect-refusal) issued via
@@ -377,6 +402,34 @@ const (
 	// ConditionIPReclaimSourceTornDown are True (ADR-0244 / NR-BLOCK-2). Distinct from
 	// ConditionCni0CleanupVerified, which is scoped only to CUTOVER_COMPLETE objects.
 	ConditionIPReclaimComplete = "IPReclaimComplete"
+	// ConditionSourceStorageWriteRestored: NAME IS ASPIRATIONAL — READ THIS BEFORE
+	// TREATING True AS A STORAGE GUARANTEE (ADR-0344 sign-off finding, 2026-07-12).
+	//
+	// As implemented today this condition is CONNECTIVITY-ONLY. For Tier0 (RWX)
+	// migrations it is set True once the source agent's gRPC connection is
+	// reachable (restoreSourceStorageIfNeeded, internal/controller/podmigration_controller.go).
+	// There is no remount-rw RPC on the wire for the rollback direction, so
+	// True here does NOT confirm the source volume is actually writable, does
+	// NOT confirm the destination volume is unmounted, and does NOT by itself
+	// close the concurrent-writer/split-brain window described in ADR-0344
+	// Context §1/§2 (two backends able to write the same PGDATA mount). See
+	// docs/security/SECURITY-DEBT-LEDGER.md for the full tracked-debt
+	// writeup and resolution path.
+	//
+	// BINDING RULE: no consumer — including ADR-0344 Decision A's deferred
+	// second-SIGCONT gate in ReconcileOrphanedFrozenSources — may treat
+	// ConditionSourceStorageWriteRestored=True as proof the concurrent-writer
+	// window is closed until a real remount-rw RPC exists on the wire and
+	// restoreSourceStorageIfNeeded actually calls it and awaits confirmation.
+	// Until then, treat True as "source agent reachable, remount state
+	// unverified" only (reason SourceAgentReachableRemountUnverified).
+	//
+	// The RollingBack phase handler observes this condition before resuming
+	// (SIGCONT-ing) the frozen source process (ADR-0007 remount-handoff
+	// protocol, ADR-0344 Decision A.2). For non-Tier0 migrations this is set
+	// True immediately (same-reconcile no-op) since there is no shared-mount
+	// hazard to guard against.
+	ConditionSourceStorageWriteRestored = "SourceStorageWriteRestored"
 	// ConditionIPReclaimVerified records the VerifyCleanup(IP_RECLAIM) bounded-retry outcome
 	// (3 attempts, 2s/4s/8s), same fail-open posture as ConditionCni0CleanupVerified
 	// (ADR-0241 item 1 precedent). False (reason CleanupLeakExhausted) on retry-budget
@@ -395,6 +448,28 @@ const (
 	// requeue, so real orphaned objects were silently left behind (Sprint 42 FS-048). This
 	// provenance condition is never cleared once set and is the authoritative sweep predicate.
 	ConditionReclaimObjectsInstalled = "ReclaimObjectsInstalled"
+	// ConditionRolledBack is True when the source pod has been resumed to live state after a
+	// failed/aborted migration and — as of ADR-0350 — only after every reaped replacement
+	// pod's endpoint has been confirmed absent from all EndpointSlices in the namespace (the
+	// happens-before split-brain guard). Single-sited write at podmigration_controller.go:4658.
+	ConditionRolledBack = "RolledBack"
+	// ConditionFailed is True when the migration has terminated in hard failure
+	// (podmigration_controller.go:4888, failMigration). Distinct from ConditionRolledBack —
+	// failMigration reaps the replacement pod best-effort but does NOT gate on or set
+	// ConditionRolledBack (ADR-0350 arch_b finding: the two deleteReplacementPod call sites
+	// terminate in different conditions).
+	ConditionFailed = "Failed"
+	// ConditionReplacementEndpointsRemoved is the ADR-0350 D6 observability signal for the
+	// removal-confirm state. True (reason ReplacementEndpointsAbsent) records the audited
+	// happens-before predecessor of RolledBack=True, set from the same in-memory confirm
+	// result in the same reconcile. False on retry-budget exhaustion (D3), with a
+	// mode-distinguishing reason: ReplacementPodUndeletable (any reaped pod's delete was not
+	// confirmed — a stuck finalizer/rejecting webhook, actionable) or
+	// ReplacementEndpointRemovalContended (transient EndpointSlice CAS contention, normally
+	// self-clearing). The exhaustion path is fail-CLOSED: RolledBack=True is withheld and the
+	// reconcile requeues (mirrors, but inverts the disposition of, CleanupLeakExhausted at
+	// podmigration_controller.go:3700-3714, which is fail-open).
+	ConditionReplacementEndpointsRemoved = "ReplacementEndpointsRemoved"
 )
 
 // Reason vocabulary for the ADR-0322 Cilium ipcache/CiliumEndpoint handoff branch,
@@ -412,6 +487,24 @@ const (
 	// resolved (fetch error or empty value) on a destination that must be treated as
 	// Cilium-capable; fail-closed rather than silently skipping the readiness check.
 	ReasonCNISignalUnresolved = "CNISignalUnresolved"
+	// ReasonCiliumDataplaneProgrammed: POSITIVE reason. cilium-agent's own CiliumEndpoint
+	// status write-back confirms the replacement endpoint on the destination node is
+	// state=="ready" with a non-zero identity AND its status.networking.addressing
+	// advertises the preserved SourcePodIP. This is the AUTHORITATIVE cross-node dataplane
+	// fact read directly from the CNI's source of truth (ADR-0322 primitive), and it RETIRES
+	// the ADR-0210 source-node nonce round-trip on the Cilium cross-node path — that probe is
+	// structurally blind while ADR-0012 holds the source pod alive with the same IP on the
+	// source node (the source node delivers the preserved IP to its own local held pod, never
+	// across the overlay to the destination), so it can never converge and is not a valid
+	// signal. See injectIPHandoff.
+	ReasonCiliumDataplaneProgrammed = "CiliumDataplaneProgrammed"
+	// ReasonPreservedIPNotOnEndpoint: the replacement pod's CiliumEndpoint reached ready with
+	// an identity, but cilium-agent's status.networking.addressing does NOT advertise the
+	// preserved SourcePodIP — the ipam.cilium.io/ip pin was not honored (e.g. cluster-pool
+	// per-node /24 blocks reject a foreign IP; ADR-0324 P-VERIFY-C). Fail-closed: the IP did
+	// not actually move to the destination, so the cross-node dataplane gate must NOT be
+	// credited. Surfaced as a specific, actionable condition instead of a silent wedge.
+	ReasonPreservedIPNotOnEndpoint = "PreservedIPNotOnCiliumEndpoint"
 )
 
 // PreCopyStats records metrics from the iterative pre-copy phase.
@@ -492,8 +585,10 @@ type PodMigrationStatus struct {
 	// +optional
 	DataIntact *bool `json:"dataIntact,omitempty"`
 
-	// CRIURestoreConfirmed is set to true by the NRI plugin after JoinNsRestore
-	// completes successfully, confirming memory images were replayed.
+	// CRIURestoreConfirmed is set to true by the destination agent's
+	// AgentServer.ReportRestoreConfirmed (internal/agent/server/server.go), which persists it
+	// via a Status().Patch after a successful CRIU restore, confirming memory images were
+	// replayed. NOT set directly by the NRI plugin (ADR-0352 DR-13-class correction).
 	// +optional
 	CRIURestoreConfirmed *bool `json:"criuRestoreConfirmed,omitempty"`
 
