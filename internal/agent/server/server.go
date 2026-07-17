@@ -8812,7 +8812,7 @@ func (s *AgentServer) runAppProbeOnce(ctx context.Context, req *agentpb.VerifyTC
 	}
 }
 
-func (s *AgentServer) Abort(_ context.Context, req *agentpb.AbortRequest) (*agentpb.AbortResponse, error) {
+func (s *AgentServer) Abort(ctx context.Context, req *agentpb.AbortRequest) (*agentpb.AbortResponse, error) {
 	log.Info("Abort called", "migration", req.MigrationName, "reason", req.Reason)
 
 	// Evict this migration's source-side identity/state on the failure path — the mirror of
@@ -8852,7 +8852,19 @@ func (s *AgentServer) Abort(_ context.Context, req *agentpb.AbortRequest) (*agen
 		}
 		s.destMigrationNetnsMu.Unlock()
 		if hasNs {
-			if teardownErr := network.TeardownMigrationNetns(context.Background(), ns); teardownErr != nil {
+			// ADR-0354 round 6: this is the Abort handler's twin of the Restore handler's GC-10
+			// teardown (server.go ~7646, fixed in round 5) — the identical wrapper was missed here.
+			// network.TeardownMigrationNetns -> netnsbroker.Client.Teardown funnels the same
+			// Client.do(ctx) as the other broker-exec surfaces (D5's predicate). This is a
+			// fail-closed rollback leg (dest-netns cleanup on the Abort RPC path, which now has a
+			// real caller ctx in scope via the named ctx param above), so it uses the D3 primitive
+			// — severed from the forward ctx (which may already be Done, the reason this leg is
+			// running) and hard-bounded by rollbackExecBudget — instead of an unbounded
+			// context.Background().
+			teardownCtx, teardownCancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackExecBudget)
+			teardownErr := network.TeardownMigrationNetns(teardownCtx, ns)
+			teardownCancel()
+			if teardownErr != nil {
 				log.Error(teardownErr, "GC-10: TeardownMigrationNetns warn-only on Abort", "migration", req.MigrationName)
 			} else {
 				log.Info("GC-10: dest migration netns torn down on Abort", "migration", req.MigrationName)
