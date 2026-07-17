@@ -145,14 +145,16 @@ func (sc *StorageClassifier) classifyPVC(ctx context.Context, namespace, name st
 		return TierClassification{}, fmt.Errorf("get pvc: %w", err)
 	}
 
-	// ReadWriteMany always maps to Tier0 regardless of storage provider.
+	// Note whether the PVC requests ReadWriteMany, but do NOT short-circuit on
+	// it yet: a Longhorn-backed StorageClass must be checked FIRST, because
+	// Longhorn's own dual-engine live migration is required even for an RWX
+	// Longhorn volume — routing it into the generic Tier0 re-attach path
+	// instead causes a Longhorn CSI failure ("invalid controller count 2").
+	isRWX := false
 	for _, am := range pvc.Spec.AccessModes {
 		if am == corev1.ReadWriteMany {
-			return TierClassification{
-				Tier:    TierRWX,
-				Reason:  "ReadWriteMany access mode — re-attach only",
-				PVCName: name,
-			}, nil
+			isRWX = true
+			break
 		}
 	}
 
@@ -165,6 +167,28 @@ func (sc *StorageClassifier) classifyPVC(ctx context.Context, namespace, name st
 	if scName != "" {
 		sc2 := &storagev1.StorageClass{}
 		if err := sc.client.Get(ctx, client.ObjectKey{Name: scName}, sc2); err == nil {
+			// Longhorn-backed StorageClass takes priority over the generic RWX
+			// check regardless of accessMode — Longhorn supports live migration
+			// via its own dual-engine mechanism, so a Longhorn RWX PVC must
+			// still go to TierLonghorn, not the generic RWX/Tier0 path.
+			if isLonghornStorageClass(sc2) {
+				return TierClassification{
+					Tier:         TierLonghorn,
+					Reason:       reasonForTier(TierLonghorn, sc2.Provisioner),
+					PVCName:      name,
+					StorageClass: scName,
+				}, nil
+			}
+
+			if isRWX {
+				return TierClassification{
+					Tier:         TierRWX,
+					Reason:       "ReadWriteMany access mode — re-attach only",
+					PVCName:      name,
+					StorageClass: scName,
+				}, nil
+			}
+
 			tier := classifyByStorageClass(sc2)
 			return TierClassification{
 				Tier:         tier,
@@ -173,7 +197,19 @@ func (sc *StorageClassifier) classifyPVC(ctx context.Context, namespace, name st
 				StorageClass: scName,
 			}, nil
 		}
-		// If StorageClass not found, fall through to Tier3 (generic RWO snapshot+rsync).
+		// If StorageClass not found, fall through to the RWX check and then
+		// Tier3 (generic RWO snapshot+rsync) below.
+	}
+
+	// Non-Longhorn (or unresolved-StorageClass) RWX volume — e.g. NFS/CephFS
+	// shared storage — maps to Tier0 generic re-attach.
+	if isRWX {
+		return TierClassification{
+			Tier:         TierRWX,
+			Reason:       "ReadWriteMany access mode — re-attach only",
+			PVCName:      name,
+			StorageClass: scName,
+		}, nil
 	}
 
 	return TierClassification{
@@ -190,14 +226,8 @@ func (sc *StorageClassifier) classifyPVC(ctx context.Context, namespace, name st
 func classifyByStorageClass(sc *storagev1.StorageClass) StorageTier {
 	p := sc.Provisioner
 
-	// Longhorn: driver.longhorn.io or any longhorn.io/* annotation
-	if strings.Contains(p, "longhorn.io") {
+	if isLonghornStorageClass(sc) {
 		return TierLonghorn
-	}
-	for k := range sc.Annotations {
-		if strings.HasPrefix(k, "longhorn.io/") {
-			return TierLonghorn
-		}
 	}
 
 	// Ceph RBD via CSI
@@ -212,6 +242,24 @@ func classifyByStorageClass(sc *storagev1.StorageClass) StorageTier {
 	}
 
 	return TierSnapshotRsync
+}
+
+// isLonghornStorageClass reports whether the given StorageClass is backed by
+// Longhorn: driver.longhorn.io (or any longhorn.io/* provisioner) or any
+// longhorn.io/* annotation. This is read from the StorageClass object's own
+// Provisioner/Annotations fields rather than any hardcoded class name — a
+// class named e.g. "longhorn-migratable" is this repo's own naming choice,
+// not a universal identifier.
+func isLonghornStorageClass(sc *storagev1.StorageClass) bool {
+	if strings.Contains(sc.Provisioner, "longhorn.io") {
+		return true
+	}
+	for k := range sc.Annotations {
+		if strings.HasPrefix(k, "longhorn.io/") {
+			return true
+		}
+	}
+	return false
 }
 
 func reasonForTier(tier StorageTier, provisioner string) string {
