@@ -14,7 +14,9 @@ package controller
 // dialed FROM the source-node agent, but ADR-0012 holds the source pod alive on the source node
 // with the preserved IP, so the source node delivers that IP to its own local held pod and the
 // round-trip can never match (structurally, on any substrate — see
-// tryEstablishCiliumDataplaneReachability). The fix reads cilium-agent's authoritative CiliumEndpoint
+// tryEstablishDataplaneReachability, renamed from the original Cilium-only
+// tryEstablishCiliumDataplaneReachability when it was generalized to dispatch via
+// CNIMobilitySelector). The fix reads cilium-agent's authoritative CiliumEndpoint
 // status instead and retires the source-node probe on the Cilium cross-node path.
 //
 // These tests drive the CONTROLLER producer directly with AgentPool == nil — proving the condition
@@ -119,7 +121,7 @@ func TestTryEstablish_Cilium_CrossNode_ConfirmsFromAuthoritativeRead(t *testing.
 	r := reconcilerForDataplane(t, pm, ciliumNMC("pm-w2", "cilium"),
 		fakeCiliumEndpointObj("pm-live-proof-c2", replPod, "ready", 12345, "192.168.122.243", preservedIP))
 
-	res, err, done, handled := r.tryEstablishCiliumDataplaneReachability(context.Background(), pm, "pm-w2")
+	res, err, done, handled := r.tryEstablishDataplaneReachability(context.Background(), pm, "pm-w2")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -148,7 +150,7 @@ func TestTryEstablish_Cilium_WrongIP_FailsClosed(t *testing.T) {
 	r := reconcilerForDataplane(t, pm, ciliumNMC("pm-w2", "cilium"),
 		fakeCiliumEndpointObj("pm-live-proof-c2", replPod, "ready", 12345, "192.168.122.243", "10.244.2.99"))
 
-	_, _, done, handled := r.tryEstablishCiliumDataplaneReachability(context.Background(), pm, "pm-w2")
+	_, _, done, handled := r.tryEstablishDataplaneReachability(context.Background(), pm, "pm-w2")
 	if !handled {
 		t.Fatalf("Cilium cross-node destination must be handled")
 	}
@@ -164,18 +166,19 @@ func TestTryEstablish_Cilium_WrongIP_FailsClosed(t *testing.T) {
 	}
 }
 
-// TestTryEstablish_NonCilium_FallsThrough: a non-Cilium destination is not handled here — the caller
-// falls back to the ADR-0210 producer. No condition is set by this function.
-func TestTryEstablish_NonCilium_FallsThrough(t *testing.T) {
+// TestTryEstablish_NoAuthoritativeProducer_FallsThrough: a destination CNI with no authoritative
+// producer wired (Flannel — no IPHandoffStrategy readiness signal today) is not handled here — the
+// caller falls back to the ADR-0210 producer. No condition is set by this function.
+func TestTryEstablish_NoAuthoritativeProducer_FallsThrough(t *testing.T) {
 	pm := strictCrossNodePM("live-proof-c2-mig1", "10.244.1.178", "redis-src-m-5604a0fb")
 	r := reconcilerForDataplane(t, pm, ciliumNMC("pm-w2", "flannel"))
 
-	_, _, _, handled := r.tryEstablishCiliumDataplaneReachability(context.Background(), pm, "pm-w2")
+	_, _, _, handled := r.tryEstablishDataplaneReachability(context.Background(), pm, "pm-w2")
 	if handled {
-		t.Fatalf("non-Cilium destination must fall through (handled=false) to verifyDataplaneReachability")
+		t.Fatalf("a CNI with no authoritative producer wired must fall through (handled=false) to verifyDataplaneReachability")
 	}
 	if c := meta.FindStatusCondition(pm.Status.Conditions, string(pmv1.ConditionDataplaneReachabilityVerified)); c != nil {
-		t.Fatalf("non-Cilium fall-through must not set the condition here; got %+v", c)
+		t.Fatalf("fall-through must not set the condition here; got %+v", c)
 	}
 }
 
@@ -186,7 +189,7 @@ func TestTryEstablish_SameNode_FallsThrough(t *testing.T) {
 	pm.Status.SourceNodeName = "pm-w2" // src == dest -> same node
 	r := reconcilerForDataplane(t, pm, ciliumNMC("pm-w2", "cilium"))
 
-	_, _, _, handled := r.tryEstablishCiliumDataplaneReachability(context.Background(), pm, "pm-w2")
+	_, _, _, handled := r.tryEstablishDataplaneReachability(context.Background(), pm, "pm-w2")
 	if handled {
 		t.Fatalf("same-node migration must fall through (handled=false) to the ADR-0237 vacuous path")
 	}
