@@ -758,16 +758,35 @@ YAML
 # Cilium remnants (if present — DaemonSet/namespace, NOT the Cilium code
 # paths in this script, which are left untouched), and kube-proxy (Calico's
 # standard dataplane needs kube-proxy, so kube-proxy is NOT removed here —
-# unlike the Cilium cutover, which supersedes it). Finally confirms each
-# node's /etc/cni/net.d contains exactly the Calico conflist as the active
-# config. Idempotent and safe to re-run. Does NOT modify cmd_cutover,
-# cmd_provision_cilium, cmd_provision_cilium_multipool, or cmd_reset_cluster.
-# VMs never touched.
+# unlike the Cilium cutover, which supersedes it).
+#
+# Removing the Cilium/Flannel Kubernetes API objects does NOT remove the
+# files Cilium's/Flannel's own install-cni init containers already wrote to
+# each host's /etc/cni/net.d/ — those persist on disk independently, so a
+# per-node SSH cleanup step is required (step [3/4] below). Two host-level
+# conditions have been observed on this standing cluster and both are
+# handled: (a) a leftover ACTIVE (non-.cilium_bak) cilium/flannel conflist
+# left behind after the k8s objects are gone, which must be removed so it
+# stops shadowing Calico's, and (b) Cilium's install-cni logic renames
+# *any* pre-existing conflist it finds to a *.cilium_bak suffix before
+# writing its own active file — including, if Calico was provisioned
+# before Cilium's objects were deleted, Calico's OWN conflist. That leaves
+# Calico's real conflist sitting inactive as e.g.
+# "10-calico.conflist.cilium_bak", so simply deleting the stale Cilium file
+# would leave the node with NO active CNI conflist at all. Step [3/4]
+# restores it (strips the .cilium_bak suffix) only when no active Calico
+# conflist is already present, and never touches genuine Flannel/Cilium
+# backups. Finally step [4/4] confirms each node's /etc/cni/net.d contains
+# exactly the Calico conflist as the active config. Idempotent and safe to
+# re-run. Does NOT modify cmd_cutover, cmd_provision_cilium,
+# cmd_provision_cilium_multipool, or cmd_reset_cluster. VMs never touched
+# (no virsh destroy/undefine — only files under /etc/cni/net.d/ on each
+# node are touched, via SSH).
 cmd_cutover_calico() {
   assert_no_vm_destruction
   load_ips
 
-  echo "==> [1/3] Confirming Calico is Ready on all nodes before removing the previously-active CNI..."
+  echo "==> [1/4] Confirming Calico is Ready on all nodes before removing the previously-active CNI..."
   local ready desired
   ready=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CALICO_NAMESPACE" get ds calico-node -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
   desired=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CALICO_NAMESPACE" get ds calico-node -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo -1)
@@ -777,7 +796,7 @@ cmd_cutover_calico() {
   fi
   echo "  -- calico-node DaemonSet Ready: $ready/$desired"
 
-  echo "==> [2/3] Removing the previously-active CNI's remnants (Flannel and/or Cilium, whichever is present)..."
+  echo "==> [2/4] Removing the previously-active CNI's remnants (Flannel and/or Cilium, whichever is present)..."
   if KUBECONFIG="$KUBECONFIG_OUT" kubectl get ns kube-flannel >/dev/null 2>&1; then
     echo "  -- removing Flannel remnants"
     KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-flannel delete daemonset kube-flannel-ds --ignore-not-found
@@ -793,8 +812,58 @@ cmd_cutover_calico() {
     echo "  -- no active Cilium DaemonSet present"
   fi
 
-  echo "==> [3/3] Verifying each node's CNI conf dir contains only the Calico conflist..."
-  local ip confs
+  echo "==> [3/4] Cleaning up stale previously-active-CNI conflist files left on-disk on each node (K8s object deletion above does not remove these)..."
+  # Deliberately narrow: only ever removes a file matching *cilium*.conflist or
+  # *flannel*.conflist that is NOT already a .cilium_bak/.bak backup (i.e. would
+  # still be read by the CNI plugin manager), and only ever restores Calico's own
+  # conflist from a *calico*.conflist.cilium_bak backup when no active Calico
+  # conflist is already present. Never touches any other file in the directory
+  # (genuine Flannel .cilium_bak backups, calico-kubeconfig, etc. are preserved).
+  local cni_cleanup_script
+  cni_cleanup_script='
+set -e
+cd /etc/cni/net.d
+shopt -s nullglob
+echo "     -- before cleanup:"; sudo ls -la | sed "s/^/     /"
+for f in *cilium*.conflist *flannel*.conflist; do
+  case "$f" in
+    *.cilium_bak|*.bak) continue ;;
+  esac
+  echo "     -- removing stale active conflist: $f"
+  sudo rm -f -- "$f"
+done
+active_calico=0
+for f in *calico*.conflist; do
+  case "$f" in
+    *.cilium_bak|*.bak) continue ;;
+  esac
+  active_calico=1
+done
+if [[ "$active_calico" -eq 0 ]]; then
+  for f in *calico*.conflist.cilium_bak; do
+    newname="${f%.cilium_bak}"
+    echo "     -- restoring Calico conflist from backup: $f -> $newname"
+    sudo mv -f -- "$f" "$newname"
+  done
+fi
+# Remove stray calico-kubeconfig duplicates (e.g. calico-kubeconfig.bak/.orig)
+# left behind by a previous run. Never matches the canonical "calico-kubeconfig"
+# file itself (glob requires a further suffix), so the file the Calico
+# conflist references is never touched.
+for f in calico-kubeconfig.*; do
+  echo "     -- removing stray calico-kubeconfig duplicate: $f"
+  sudo rm -f -- "$f"
+done
+echo "     -- after cleanup:"; sudo ls -la | sed "s/^/     /"
+'
+  local ip
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    echo "  -- $ip: cleaning /etc/cni/net.d/"
+    nsh "$ip" "$cni_cleanup_script"
+  done
+
+  echo "==> [4/4] Verifying each node's CNI conf dir contains only the Calico conflist..."
+  local confs
   for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
     confs=$(nsh "$ip" "sudo ls /etc/cni/net.d/" 2>/dev/null || echo "UNKNOWN")
     echo "  -- $ip: $confs"
