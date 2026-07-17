@@ -4593,13 +4593,19 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	}
 
 	// On any error after this point: kill placeholder to release the rootfs mount.
+	// ADR-0354 D3: this is a fail-closed teardown that must still fire (and complete) even if
+	// the forward migration ctx is already Done/cancelled by the time this defer runs — binding
+	// to the raw ctx risks leaking a ghost placeholder container (invariant #3). Derive a bounded,
+	// cancel-detached ctx at the top of the defer, same primitive as brokerCriuCmd.Signal().
 	success := false
 	defer func() {
 		if success {
 			return
 		}
-		_ = nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
-		_ = nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "container", "rm", placeholderID).Run()
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackExecBudget)
+		defer cancel()
+		_ = nsenterCmd(rollbackCtx, "ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
+		_ = nsenterCmd(rollbackCtx, "ctr", "--namespace", "k8s.io", "container", "rm", placeholderID).Run()
 	}()
 
 	// Step 3: Create ext-mount-map target paths in the agent container's filesystem.
@@ -6822,12 +6828,19 @@ func setupRestoreOverlayfs(ctx context.Context, migrationName, checkpointDir, im
 	}
 
 	// Kill any stale placeholder from a previous attempt.
-	_ = nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
-	_ = nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "container", "rm", placeholderID).Run()
+	// ADR-0354 D3: this is a fail-closed ghost-container teardown (the placeholder is an orphan
+	// left by a prior cancelled/failed attempt) and must still fire even if the CURRENT forward
+	// ctx is already Done/cancelled by the time it runs — binding to the raw ctx risks leaking
+	// that ghost placeholder (invariant #3). Derive a bounded, cancel-detached ctx, same primitive
+	// as brokerCriuCmd.Signal() and the joinNsRestore placeholder-teardown defer.
+	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackExecBudget)
+	defer rollbackCancel()
+	_ = nsenterCmd(rollbackCtx, "ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
+	_ = nsenterCmd(rollbackCtx, "ctr", "--namespace", "k8s.io", "container", "rm", placeholderID).Run()
 	// Remove stale bundle dir left by containerd (containerd does not auto-clean on kill).
 	// This is necessary so containerd can create a fresh bundle with a properly mounted overlay.
 	// Use nsenterCmd since the agent container cannot access /run/containerd/... directly.
-	if out, err := nsenterCmd(ctx, "rm", "-rf", bundleDir).CombinedOutput(); err != nil {
+	if out, err := nsenterCmd(rollbackCtx, "rm", "-rf", bundleDir).CombinedOutput(); err != nil {
 		// Non-fatal — bundleDir may not exist; ctr run will create a fresh one.
 		log.Info("setupRestoreOverlayfs: rm stale bundleDir (non-fatal)", "dir", bundleDir, "err", err, "out", string(out))
 	}
