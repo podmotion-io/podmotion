@@ -348,6 +348,16 @@ var brokerNetnsExecFn = func(ctx context.Context, srcPID int, netnsPath string, 
 	return netnsbroker.NewClient().NetnsExec(ctx, srcPID, netnsPath, argv...)
 }
 
+// netnsBrokerClientFn is the seam over netnsbroker.NewClient() used by brokerCmd.result()
+// (D2), brokerCriuCmd.Start()/poll()/Signal() (D2b), resolveReplVethPeer, ReadReplVethMAC, and
+// joinNsRestore's loopback-up netns_exec (D2c) — every ADR-0354 broker-exec caller-deadline-
+// binding shim on this file. Mirrors the existing readReplVethMACFn/joinNsRestoreFn/
+// brokerNetnsExecFn indirection pattern. Production default is netnsbroker.NewClient (dials
+// the real root-owned socket); ADR-0354 D6 regression tests override it to point at a fake,
+// test-owned broker listener so brokerCmd/brokerCriuCmd/resolveReplVethPeer can be exercised
+// against a controllable transport without requiring root or a live broker sidecar.
+var netnsBrokerClientFn = netnsbroker.NewClient
+
 // addPreservedSourceAddrFn is the seam over addPreservedSourceAddr used by the joinNsRestore
 // bind-prep gate. Overridden in the joinNsRestore-level gating test (D5 test 1) to count calls and
 // capture args. Same idiom as joinNsRestoreFn/readReplVethMACFn/resolveNetnsFromSandboxFn.
@@ -2010,7 +2020,7 @@ func ReadReplVethMAC(ctx context.Context, pid int, sandboxNetnsPath, ifname stri
 		// namespace, leaving the host's /sys mount in place, so reading sysfs would
 		// return the HOST's interfaces, not the pod netns's. `ip -o link show <ifname>`
 		// queries the kernel via rtnetlink scoped to the entered netns.
-		r := netnsbroker.NewClient().NetnsExec(ctx, a.pid, a.netnsPath, "ip", "-o", "link", "show", ifname)
+		r := netnsBrokerClientFn().NetnsExec(ctx, a.pid, a.netnsPath, "ip", "-o", "link", "show", ifname)
 		if r.SpawnErr != nil {
 			lastErr = fmt.Errorf("ReadReplVethMAC: netns exec failed via %s ip link show %s: %w", a.label, ifname, r.SpawnErr)
 			continue
@@ -2721,7 +2731,7 @@ func resolveReplVethPeer(ctx context.Context, replPID int) (string, error) {
 	// ADR-0354 D2c: ctx is threaded from the sole caller, InjectIPHandoff, which carries the
 	// real request ctx — this is a FORWARD/best-effort op (idempotent, non-fatal on failure), so
 	// the binding is symmetric (no context.WithoutCancel; contrast D2b's Signal()).
-	r := netnsbroker.NewClient().NetnsExec(ctx, replPID, "", "ip", "-o", "link", "show", "eth0")
+	r := netnsBrokerClientFn().NetnsExec(ctx, replPID, "", "ip", "-o", "link", "show", "eth0")
 	if r.SpawnErr != nil {
 		if ctx.Err() != nil {
 			metrics.BrokerExecDeadlineAbortsTotal.WithLabelValues("netns_exec").Inc()
@@ -5158,7 +5168,7 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	// context.Background(). This is a FORWARD/idempotent op (bringing lo up is a no-op if already
 	// up), so the binding is symmetric — no context.WithoutCancel (contrast D2b's Signal()).
 	deadlineAborted := false
-	r := netnsbroker.NewClient().NetnsExec(ctx, pid, "", "ip", "link", "set", "lo", "up")
+	r := netnsBrokerClientFn().NetnsExec(ctx, pid, "", "ip", "link", "set", "lo", "up")
 	if r.SpawnErr != nil && ctx.Err() != nil {
 		deadlineAborted = true
 	}
@@ -6554,7 +6564,7 @@ func (b *brokerCmd) result() netnsbroker.ExecResult {
 	budget := brokerExecBudget(callerCtx)
 	ctx, cancel := context.WithTimeout(callerCtx, budget)
 	defer cancel()
-	result := netnsbroker.NewClient().Exec(ctx, budget, b.argv...)
+	result := netnsBrokerClientFn().Exec(ctx, budget, b.argv...)
 	if ctx.Err() != nil && result.SpawnErr != nil {
 		metrics.BrokerExecDeadlineAbortsTotal.WithLabelValues("broker_cmd").Inc()
 		log.Info("ADR-0354 D2/D7: broker exec aborted on caller-deadline enforcement, not a broker failure",
@@ -6675,7 +6685,7 @@ func (c *brokerCriuCmd) Start() error {
 	budget := brokerCriuOpBudget(c.ctx)
 	ctx, cancel := context.WithTimeout(c.ctx, budget)
 	defer cancel()
-	pid, err := netnsbroker.NewClient().ExecStart(ctx, c.argv...)
+	pid, err := netnsBrokerClientFn().ExecStart(ctx, c.argv...)
 	if err != nil {
 		return err
 	}
@@ -6692,7 +6702,7 @@ func (c *brokerCriuCmd) poll() (exited bool, exitCode int, cgroupPIDs []int, err
 	budget := brokerCriuOpBudget(c.ctx)
 	ctx, cancel := context.WithTimeout(c.ctx, budget)
 	defer cancel()
-	pr, perr := netnsbroker.NewClient().ExecPoll(ctx, c.wrapperPID)
+	pr, perr := netnsBrokerClientFn().ExecPoll(ctx, c.wrapperPID)
 	if perr != nil {
 		return false, 0, nil, perr
 	}
@@ -6715,7 +6725,7 @@ func (c *brokerCriuCmd) poll() (exited bool, exitCode int, cgroupPIDs []int, err
 func (c *brokerCriuCmd) Signal(sig int) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.ctx), rollbackExecBudget)
 	defer cancel()
-	return netnsbroker.NewClient().ExecSignal(ctx, c.wrapperPID, sig)
+	return netnsBrokerClientFn().ExecSignal(ctx, c.wrapperPID, sig)
 }
 
 // newBrokerCriuCmd builds a broker-backed CRIU wrapper command for the given argv, bound to

@@ -36,6 +36,17 @@ func NewClient() *Client {
 	}
 }
 
+// NewClientForTesting returns a Client dialing socketPath instead of the production
+// SocketPath (ADR-0354 D6 test-injection seam). SocketPath is an unexported struct field
+// and the production default (const SocketPath, /run/podmotion/netns-broker.sock) requires
+// root to bind, so cross-package regression tests (internal/agent/server) need a way to
+// point brokerCmd/brokerCriuCmd/resolveReplVethPeer at a fake, test-owned broker listener
+// exercising the SAME do()/wire-protocol code this Client uses in production — never a
+// re-implementation of the transport. Not called by any non-test production code path.
+func NewClientForTesting(socketPath string, dialTimeout, opTimeout time.Duration) *Client {
+	return &Client{socketPath: socketPath, dialTimeout: dialTimeout, opTimeout: opTimeout}
+}
+
 func (c *Client) path() string {
 	if c.socketPath != "" {
 		return c.socketPath
