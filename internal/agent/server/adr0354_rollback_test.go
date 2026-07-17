@@ -339,3 +339,92 @@ func execSignalCountingRecorder(received *int32, delay time.Duration) fakeBroker
 		writeFakeResponse(conn, netnsbroker.Response{ExitCode: intPtr(0)})
 	}
 }
+
+// signalPIDRecorder returns a fakeBrokerHandler that, on receiving a "signal_pid" request,
+// increments received, waits delay (respecting the harness's done channel), then responds
+// success (Response{}, Error == ""). Any other op gets an immediate exit-0 response. Mirrors
+// execSignalRecorder above, but for the signal_pid op Client.SignalPID sends (client.go:190) —
+// the wire op brokerSignalSourcePID's SIGCONT ultimately funnels.
+func signalPIDRecorder(received *int32, delay time.Duration) fakeBrokerHandler {
+	return func(conn net.Conn, req netnsbroker.Request, done <-chan struct{}) {
+		if req.Op != "signal_pid" {
+			writeFakeResponse(conn, netnsbroker.Response{ExitCode: intPtr(0)})
+			return
+		}
+		atomic.AddInt32(received, 1)
+		select {
+		case <-time.After(delay):
+		case <-done:
+			return
+		}
+		writeFakeResponse(conn, netnsbroker.Response{}) // signal_pid success: Error == ""
+	}
+}
+
+// TestBrokerSignalSourcePID_DeliversSignalUnderRollbackBudget_ForwardCtxDone is the ADR-0354
+// round 8 completeness regression test for the fourth D3/D2b-primitive leg landed on this
+// branch: the source-thaw SIGCONT (Abort -> thawFrozenSource -> thawSourcePID ->
+// brokerThawSourcePID -> brokerSignalSourcePID, server.go), which protects invariant #1 (the
+// source must survive rollback — ADR-0012). Modeled directly on
+// TestBrokerCriuSignal_DeliversKillUnderRollbackBudget_ForwardCtxDone (D6.7) and
+// TestRestoreRollbackLeg_BrokerExecBounded_ReleasesLock (D6.2) above: same fail-closed
+// precondition (the forward ctx is already Done — the exact state Abort's ctx is in by the time
+// the rollback SIGCONT fires), same fake-broker delivery-recording harness, same
+// rollbackExecBudget bound.
+//
+// Unlike the CRIU-wrapper Signal() leg (D2b) and the placeholder-teardown legs (D3), this leg's
+// only prior test (TestThawSourcePID_RoutesThroughBrokerNotDirectKill,
+// source_thaw_broker_test.go) drives thawSourcePID with a plain context.Background() that is
+// never Done — it proves the C-06 broker-routing contract but cannot observe the
+// WithoutCancel-vs-raw-ctx distinction brokerSignalSourcePID's own comment (server.go, "ADR-0354
+// round 7 (Fix 2)") describes. This test closes that gap directly against brokerSignalSourcePID.
+//
+// Asserts: (1) the SIGCONT (signal_pid) was still ATTEMPTED and DELIVERED despite the forward
+// ctx already being Done — not silently skipped, the same stop-here safety assertion D6.2 makes
+// for the CRIU-wrapper kill; (2) it returned comfortably within rollbackExecBudget, not the
+// leg's own asymmetric-primitive bound blown open into an unbounded/naive shape.
+//
+// Fails against a naive "just thread ctx directly" rewrite of brokerSignalSourcePID (the raw,
+// already-Done forward ctx makes Client.do's dial-time ctx.Done() check reject before ever
+// dialing — the fake broker never sees signal_pid at all, exactly the invariant-#1 regression
+// C-06/D2b/D3 exist to prevent); passes only with the landed
+// context.WithTimeout(context.WithoutCancel(ctx), rollbackExecBudget) binding.
+func TestBrokerSignalSourcePID_DeliversSignalUnderRollbackBudget_ForwardCtxDone(t *testing.T) {
+	var received int32
+	sock := startFakeBroker(t, signalPIDRecorder(&received, 50*time.Millisecond))
+	origFn := netnsBrokerClientFn
+	netnsBrokerClientFn = func() *netnsbroker.Client { return testBrokerClient(sock) }
+	defer func() { netnsBrokerClientFn = origFn }()
+
+	// The forward Abort/migration ctx is ALREADY Done — the exact precondition under which
+	// thawFrozenSource -> thawSourcePID -> brokerThawSourcePID -> brokerSignalSourcePID fires
+	// on the rollback leg in production.
+	forwardCtx, forwardCancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	forwardCancel()
+	time.Sleep(5 * time.Millisecond) // make sure the deadline has genuinely elapsed
+	if forwardCtx.Err() == nil {
+		t.Fatal("test setup invariant violated: forward ctx must already be Done")
+	}
+
+	const sourcePID = int32(424246)
+	const startTime = uint64(123456)
+
+	start := time.Now()
+	err := brokerSignalSourcePID(forwardCtx, sourcePID, startTime)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("brokerSignalSourcePID returned an error with the forward ctx already Done: %v "+
+			"— the source SIGCONT must still be DELIVERED (asymmetric primitive: WithoutCancel "+
+			"severs the Done-ness before deriving the bounded rollback ctx), not skipped, or the "+
+			"source can be left frozen forever (invariant #1 / ADR-0012)", err)
+	}
+	if atomic.LoadInt32(&received) != 1 {
+		t.Fatalf("fake broker never received signal_pid (got %d) — the source-thaw SIGCONT was "+
+			"skipped instead of attempted, exactly the invariant-#1 stop-here safety regression "+
+			"this test guards", received)
+	}
+	if elapsed >= rollbackExecBudget {
+		t.Fatalf("brokerSignalSourcePID took %v, want comfortably under rollbackExecBudget (%v)", elapsed, rollbackExecBudget)
+	}
+}

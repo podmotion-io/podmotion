@@ -9760,7 +9760,7 @@ func brokerThawSourcePID(ctx context.Context, pid int32) error {
 func brokerSignalSourcePID(ctx context.Context, pid int32, startTime uint64) error {
 	sigCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackExecBudget)
 	defer cancel()
-	return netnsbroker.NewClient().SignalPID(sigCtx, int(pid), int(syscall.SIGCONT), startTime)
+	return netnsBrokerClientFn().SignalPID(sigCtx, int(pid), int(syscall.SIGCONT), startTime)
 }
 
 // thawSourcePID resumes a source process that was left in SIGSTOP by LeaveStopped=true
