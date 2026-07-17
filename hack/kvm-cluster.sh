@@ -859,7 +859,12 @@ echo "     -- after cleanup:"; sudo ls -la | sed "s/^/     /"
   local ip
   for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
     echo "  -- $ip: cleaning /etc/cni/net.d/"
-    nsh "$ip" "$cni_cleanup_script"
+    # /etc/cni/net.d is root-owned (chad cannot even 'cd' into it), so the whole
+    # compound script must run as root in one go. sudo does not carry across
+    # shell operators like && or across a persistent 'cd' in a later command, so
+    # individual 'sudo rm'/'sudo mv' calls after an unprivileged 'cd' still fail —
+    # the entire script body is wrapped in a single 'sudo bash -c' invocation.
+    nsh "$ip" "sudo bash -c '$cni_cleanup_script'"
   done
 
   echo "==> [4/4] Verifying each node's CNI conf dir contains only the Calico conflist..."
