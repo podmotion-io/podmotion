@@ -142,3 +142,24 @@ docs/design/DEV-PHASE-INTERDEP-HARDENING.md
 docs/design/SPRINT-CONVERGENCE-POSTMORTEM.md
 docs/corveth.js
 docs/personas/k8s-oss-developer.md
+
+# Root-level session handoff log (may contain live host/IP details — same handling as docs/HANDOFF-*.md)
+/HANDOFF-LOG.md
+
+# Purpose-built sprint-engine scripts — local tooling only, same handling as docs/corveth.js
+# (carry internal process vocabulary at a path not covered by the codename exemption list)
+docs/corveth2.js
+docs/sprint46-finish.js
+
+# Legal/IP-protection drafts and internal design-decision records — never tracked, need
+# deliberate human review before ever entering the repo (same handling as AGENTIC_STRATEGY.md)
+docs/converged/
+docs/design/HUMAN-CHECKPOINT-MINIMIZATION-OPTIONS.md
+docs/design/quorum-transcripts/
+docs/security/EXPOSURE-FACTUAL-RECORD-2026-06-16.md
+docs/security/NO-ENABLING-DISCLOSURE-MEMO-2026-06-16.md
+docs/security/PRE-PUBLICATION-HISTORY-SCRUB-PLAN.md
+docs/security/PROVISIONAL-APPLICATION-BRIEF-2026-06-16.md
+docs/security/REASONABLE-MEASURES-DECLARATION-2026-06-16.md
+docs/security/SECURITY-DEBT-LEDGER.md
+docs/security/sprint44-integration-security-lens-validation.md
