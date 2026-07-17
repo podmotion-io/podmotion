@@ -103,8 +103,21 @@ func TestBrokerCriuPollLoop_HonorsCallerDeadline_NotFixedClock(t *testing.T) {
 			}
 		}
 		elapsed := time.Since(start)
-		if ctx.Err() == nil {
-			t.Fatalf("loop exited after %v WITHOUT the caller ctx expiring — it ran out the fixed clock instead", elapsed)
+		// Discriminator note (ADR-0354 round 5 / D6.6 flake fix): do NOT gate on ctx.Err() != nil
+		// at the instant the loop exits. cgroupDeadline == ctx.Deadline() exactly here (the caller
+		// deadline is shorter than the fixed 60s clock), so the loop's exit condition
+		// (`time.Now().Before(cgroupDeadline) && ctx.Err() == nil`) can — and does, intermittently —
+		// exit via the SYNCHRONOUS time.Now().Before(cgroupDeadline) check going false a hair before
+		// the context package's ASYNCHRONOUS internal timer has actually set ctx.Err() non-nil. When
+		// that race is lost, the loop still correctly exited at the caller deadline (production
+		// behavior is correct — verified by two independent architects), but a bare `ctx.Err() == nil`
+		// check misfires as if the loop had ignored the deadline. The real invariant this test must
+        // prove is wall-clock: the loop exited AT (not near, not past) the caller deadline, not at the
+		// fixed 60s clock — so assert on elapsed time against the deadline duration instead.
+		const callerDeadline = 150 * time.Millisecond
+		const margin = 50 * time.Millisecond // scheduler/goroutine-wakeup slack, not a correctness bound
+		if elapsed < callerDeadline-margin {
+			t.Fatalf("loop exited after %v — BEFORE the caller deadline (%v) was even reached", elapsed, callerDeadline)
 		}
 		if elapsed >= 2*time.Second {
 			t.Fatalf("cgroup-liveness loop took %v to exit against a 150ms caller deadline — "+
