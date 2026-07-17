@@ -155,6 +155,24 @@ var (
 		},
 		[]string{"outcome"},
 	)
+
+	// BrokerExecDeadlineAbortsTotal counts ADR-0354 D7 caller-deadline-enforcement aborts — a
+	// restore-path broker exec (funneling Client.do) that was aborted BECAUSE the caller's
+	// migration ctx deadline/cancellation fired, not because the broker or CRIU genuinely
+	// failed. Incremented ONLY on that specific exit — never on a broker-unreachable/rejected
+	// SpawnErr or a non-zero CRIU exit code (those keep their existing
+	// MigrationsFailedTotal.WithLabelValues("restore_...") labels) — so post-incident review can
+	// tell "the invariant-#8 guardrail fired as designed" from "the broker/CRIU actually failed"
+	// without string-matching an error message.
+	// Labels: leg ("broker_cmd" | "broker_criu_poll_cgroup" | "broker_criu_poll_pidfile" | "netns_exec")
+	BrokerExecDeadlineAbortsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "podmotion",
+			Name:      "broker_exec_deadline_aborts_total",
+			Help:      "Count of ADR-0354 caller-deadline-enforcement aborts on restore-path broker execs, labeled by the shim/leg that aborted.",
+		},
+		[]string{"leg"},
+	)
 )
 
 func init() {
@@ -169,5 +187,6 @@ func init() {
 		ShmemPagemapGuardFiredTotal,
 		ReplacementEndpointRemovalExhaustedTotal,
 		CgroupAnchorOutcomeTotal,
+		BrokerExecDeadlineAbortsTotal,
 	)
 }
