@@ -109,14 +109,14 @@ func TestCaptureRestoredVethMAC_ReadsProcessOwnNetns_NotRecordedBindPath(t *test
 	var capPID = -1 // sentinel; overwritten by the spy
 	capNetnsPath := "SENTINEL"
 	origMAC := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
+	readReplVethMACFn = func(_ context.Context, pid int, netnsPath, ifname string) (string, error) {
 		capPID, capNetnsPath = pid, netnsPath
 		return "aa:bb:cc:dd:ee:ff", nil
 	}
 	defer func() { readReplVethMACFn = origMAC }()
 
 	// The at-restore capture reads the restored process's OWN netns (SrcPID), never a bind path.
-	captureRestoredVethMAC(migration, 4242, "")
+	captureRestoredVethMAC(context.Background(), migration, 4242, "")
 	if capPID != 4242 {
 		t.Errorf("capture invoked readReplVethMACFn with pid=%d, want 4242 — the MAC is captured from the restored process's OWN netns (SrcPID /proc/<pid>/ns/net), the denial-free entry the lo-up uses", capPID)
 	}
@@ -150,7 +150,7 @@ func TestCaptureRestoredVethMAC_SucceedsWhereBindPathReadFails_LiveProofCycle1Re
 	const wantMAC = "02:42:ac:11:00:1a"
 
 	origMAC := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
+	readReplVethMACFn = func(_ context.Context, pid int, netnsPath, ifname string) (string, error) {
 		if netnsPath != "" {
 			// Bind-path (path-mode) read — the live substrate returned empty here for ~75s.
 			return "", nil
@@ -168,7 +168,7 @@ func TestCaptureRestoredVethMAC_SucceedsWhereBindPathReadFails_LiveProofCycle1Re
 	storeResolvedNetnsPath(migration, "/var/run/netns/cni-cycle1", "eth0")
 
 	// joinNsRestore runs the at-restore capture the instant CRIU brings the process up.
-	captureRestoredVethMAC(migration, 9001, "")
+	captureRestoredVethMAC(context.Background(), migration, 9001, "")
 
 	netnsPath, ifname := s.finalizeNetnsPath(migration)
 	fr, err := s.finalizeRestore(context.Background(), 9001, netnsPath, ifname, migration, "", "Strict", "")
@@ -189,7 +189,7 @@ func TestCaptureRestoredVethMAC_SucceedsWhereBindPathReadFails_LiveProofCycle1Re
 func TestFinalizeRestore_Strict_FailClosed_OnUnrecordableNetns(t *testing.T) {
 	origMAC := readReplVethMACFn
 	var procAttemptPID = -1
-	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
+	readReplVethMACFn = func(_ context.Context, pid int, netnsPath, ifname string) (string, error) {
 		procAttemptPID = pid
 		return "", errors.New("stub: no netns source")
 	}
@@ -241,7 +241,7 @@ func TestFinalizeRestore_Strict_FailClosed_OnUnrecordableNetns(t *testing.T) {
 // "no authoritative restored netns" string (D8: the two strings must never collide).
 func TestFinalizeRestore_Strict_FailClosed_OnMalformedMAC(t *testing.T) {
 	origMAC := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
+	readReplVethMACFn = func(_ context.Context, pid int, netnsPath, ifname string) (string, error) {
 		return "not-a-mac", nil
 	}
 	defer func() { readReplVethMACFn = origMAC }()

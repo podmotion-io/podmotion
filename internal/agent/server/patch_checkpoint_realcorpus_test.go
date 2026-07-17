@@ -48,6 +48,7 @@ package server
 // skips rather than assert a shape the substrate cannot honestly produce.
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -589,24 +590,24 @@ func TestResolveKubeletVolumeHostPath_GlobContract(t *testing.T) {
 	t.Cleanup(func() { kubeletVolumeGlobFn = orig })
 
 	// Empty inputs → "" without consulting the host.
-	if got := resolveKubeletVolumeHostPath("", "pv"); got != "" {
+	if got := resolveKubeletVolumeHostPath(context.Background(), "", "pv"); got != "" {
 		t.Errorf("empty replUID: got %q, want \"\"", got)
 	}
-	if got := resolveKubeletVolumeHostPath("uid", ""); got != "" {
+	if got := resolveKubeletVolumeHostPath(context.Background(), "uid", ""); got != "" {
 		t.Errorf("empty pvName: got %q, want \"\"", got)
 	}
 
 	// Resolved single match is returned verbatim.
-	kubeletVolumeGlobFn = func(replUID, pvName string) string {
+	kubeletVolumeGlobFn = func(_ context.Context, replUID, pvName string) string {
 		if replUID == "u1" && pvName == "pvc-1" {
 			return "/var/lib/kubelet/pods/u1/volumes/kubernetes.io~nfs/pvc-1"
 		}
 		return ""
 	}
-	if got := resolveKubeletVolumeHostPath("u1", "pvc-1"); got != "/var/lib/kubelet/pods/u1/volumes/kubernetes.io~nfs/pvc-1" {
+	if got := resolveKubeletVolumeHostPath(context.Background(), "u1", "pvc-1"); got != "/var/lib/kubelet/pods/u1/volumes/kubernetes.io~nfs/pvc-1" {
 		t.Errorf("resolved host path mismatch: got %q", got)
 	}
-	if got := resolveKubeletVolumeHostPath("u2", "pvc-1"); got != "" {
+	if got := resolveKubeletVolumeHostPath(context.Background(), "u2", "pvc-1"); got != "" {
 		t.Errorf("no-match must return \"\"; got %q", got)
 	}
 }
