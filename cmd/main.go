@@ -275,7 +275,7 @@ func main() {
 	// before a destination replica has actually been created — silent data loss on any
 	// Longhorn-backed volume. Ceph RBD and SnapshotRsync stay on their stub defaults here;
 	// this sprint's live testing only exercised and confirmed the Longhorn path.
-	storageMgr.RegisterMigrator(storage.TierLonghorn, storage.NewLonghornMigrator(longhornManagerURL))
+	storageMgr.RegisterMigrator(storage.TierLonghorn, storage.NewLonghornMigrator(longhornManagerURL, mgr.GetClient()))
 
 	// ADR-0322: dynamic client for the Cilium CiliumEndpoint readiness poll
 	// (cilium.io/v2 is a CRD, not compiled into the typed clientset).

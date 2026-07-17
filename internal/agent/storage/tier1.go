@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -44,14 +46,41 @@ type LonghornMigrator struct {
 	// ManagerURL is the base URL of the Longhorn Manager, e.g. http://longhorn-frontend.longhorn-system:80
 	ManagerURL string
 	HTTPClient *http.Client
+	// client is used to resolve each PVC's bound PersistentVolume name — the
+	// actual Longhorn volume name — rather than assuming it equals the PVC's
+	// own name (only true for statically-provisioned volumes; dynamically
+	// provisioned PVCs are bound to a PV named e.g. "pvc-d39ce436-...", which
+	// is what the Longhorn Manager API actually keys volumes by).
+	client client.Client
 }
 
-// NewLonghornMigrator returns a production Longhorn migrator.
-func NewLonghornMigrator(managerURL string) *LonghornMigrator {
+// NewLonghornMigrator returns a production Longhorn migrator. c is used to
+// resolve each PVC's bound PersistentVolume name (see resolveVolumeName).
+func NewLonghornMigrator(managerURL string, c client.Client) *LonghornMigrator {
 	return &LonghornMigrator{
 		ManagerURL: strings.TrimRight(managerURL, "/"),
 		HTTPClient: &http.Client{Timeout: 30 * time.Second},
+		client:     c,
 	}
+}
+
+// resolveVolumeName returns the Longhorn volume name for a PVC — the name of
+// the PersistentVolume it is bound to (spec.volumeName), NOT the PVC's own
+// name. Longhorn volumes are keyed by PV name; for dynamically-provisioned
+// PVCs (the common case) the PV name is generated (e.g.
+// "pvc-d39ce436-...") and differs from the PVC name, so using the PVC name
+// directly causes the Longhorn Manager API to 404 on an otherwise-healthy
+// volume.
+func (m *LonghornMigrator) resolveVolumeName(ctx context.Context, namespace, pvcName string) (string, error) {
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := m.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: pvcName}, pvc); err != nil {
+		return "", fmt.Errorf("get pvc %s: %w", pvcName, err)
+	}
+	if pvc.Spec.VolumeName == "" {
+		return "", fmt.Errorf("pvc %s has no bound PersistentVolume (spec.volumeName empty, phase=%s)",
+			pvcName, pvc.Status.Phase)
+	}
+	return pvc.Spec.VolumeName, nil
 }
 
 // Tier returns TierLonghorn.
@@ -67,7 +96,10 @@ func (m *LonghornMigrator) PreStage(ctx context.Context, opts MigrationOptions) 
 			continue
 		}
 
-		volumeName := clsf.PVCName // Longhorn volume name == PVC name by convention
+		volumeName, err := m.resolveVolumeName(ctx, opts.PodNamespace, clsf.PVCName)
+		if err != nil {
+			return fmt.Errorf("tier1: resolve volume name for pvc %s: %w", clsf.PVCName, err)
+		}
 
 		if err := m.verifyVolume(ctx, volumeName); err != nil {
 			return fmt.Errorf("tier1: volume verify %s: %w", volumeName, err)
@@ -100,7 +132,11 @@ func (m *LonghornMigrator) SyncPercent(ctx context.Context, opts MigrationOption
 			continue
 		}
 		found = true
-		pct, err := m.replicaSyncPercent(ctx, clsf.PVCName, opts.DestinationNode)
+		volumeName, err := m.resolveVolumeName(ctx, opts.PodNamespace, clsf.PVCName)
+		if err != nil {
+			return 0, fmt.Errorf("tier1: resolve volume name for pvc %s: %w", clsf.PVCName, err)
+		}
+		pct, err := m.replicaSyncPercent(ctx, volumeName, opts.DestinationNode)
 		if err != nil {
 			return 0, err
 		}
@@ -125,7 +161,10 @@ func (m *LonghornMigrator) Cutover(ctx context.Context, opts MigrationOptions) e
 			continue
 		}
 
-		volumeName := clsf.PVCName
+		volumeName, err := m.resolveVolumeName(ctx, opts.PodNamespace, clsf.PVCName)
+		if err != nil {
+			return fmt.Errorf("tier1: resolve volume name for pvc %s: %w", clsf.PVCName, err)
+		}
 
 		log.Info("detaching volume from source node", "volume", volumeName, "src", opts.SourceNode)
 		if err := m.detachFromNode(ctx, volumeName, opts.SourceNode); err != nil {
