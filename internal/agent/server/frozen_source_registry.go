@@ -35,6 +35,7 @@ package server
 // original process is gone ⇒ the record is stale ⇒ delete it, never signal.
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -201,7 +202,12 @@ func ReconcileOrphanedFrozenSources() (thawed int) {
 		// unconfined broker forecloses that hazard. rec.StartTimeTicks is the recorded
 		// PID-reuse identity (verified matched above); pass it so the broker re-checks
 		// before signalling.
-		if thawErr := brokerSignalSourcePID(rec.PID, rec.StartTimeTicks); thawErr == nil {
+		// ADR-0354 round 7: this is the agent-startup reconcile path (called from
+		// cmd/agent/main.go before any RPC/Abort ctx exists) — there is genuinely no
+		// caller ctx to thread here, so context.Background() is used deliberately.
+		// brokerSignalSourcePID still hard-bounds this via context.WithoutCancel(ctx)
+		// + rollbackExecBudget, so the call cannot hang indefinitely regardless.
+		if thawErr := brokerSignalSourcePID(context.Background(), rec.PID, rec.StartTimeTicks); thawErr == nil {
 			thawed++
 		}
 		_ = os.Remove(path)

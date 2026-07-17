@@ -8834,7 +8834,7 @@ func (s *AgentServer) Abort(ctx context.Context, req *agentpb.AbortRequest) (*ag
 	// source process in SIGSTOP after a successful dump, the source must be SIGCONTed
 	// here so the workload resumes on the source node (ADR-0012 rollback atomicity).
 	// This is idempotent — if the source was never frozen, this is a no-op.
-	s.thawFrozenSource(req.MigrationName)
+	s.thawFrozenSource(ctx, req.MigrationName)
 
 	// GC-10 (ADR-0173): tear down the pre-staged destination migration netns on the
 	// NRI/operator-driven restore-failure path. The ADR-0168 Restore defer never fires
@@ -9735,12 +9735,12 @@ func (s *AgentServer) ConfirmOverlayReady(ctx context.Context, req *agentpb.Conf
 // between freeze and thaw. A read failure means the process is already gone (nothing
 // to thaw); the broker refuses on a starttime mismatch. Idempotent: SIGCONT to an
 // already-running process is harmless.
-func brokerThawSourcePID(pid int32) error {
+func brokerThawSourcePID(ctx context.Context, pid int32) error {
 	startTime, err := readProcStartTime(pid)
 	if err != nil {
 		return fmt.Errorf("read source pid %d starttime for broker thaw: %w", pid, err)
 	}
-	return brokerSignalSourcePID(pid, startTime)
+	return brokerSignalSourcePID(ctx, pid, startTime)
 }
 
 // brokerSignalSourcePID is the single broker call-site for a source-tree SIGCONT
@@ -9749,10 +9749,18 @@ func brokerThawSourcePID(pid int32) error {
 // startup-reconcile path) do not re-read /proc. The broker re-verifies the starttime
 // server-side before signalling and rejects a zero starttime, so this fails closed on
 // a lost identity rather than signalling a possibly-reused PID.
-func brokerSignalSourcePID(pid int32, startTime uint64) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// ADR-0354 round 7 (Fix 2): this is a fail-OPEN source-resume operation on the
+// Abort rollback leg (invariant #1: the source must survive if rollback happens) —
+// it must still fire even if the forward Abort ctx is already Done. So it does NOT
+// bind to the raw caller ctx (which would make do() compute a past deadline and skip
+// the SIGCONT if Abort's ctx has already expired/cancelled); it uses the same
+// asymmetric D3/D2b primitive as the CRIU-wrapper Signal() kill and the dest-netns
+// teardown: severed from the (possibly expired) forward ctx via context.WithoutCancel,
+// still hard-bounded by the shared rollbackExecBudget.
+func brokerSignalSourcePID(ctx context.Context, pid int32, startTime uint64) error {
+	sigCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackExecBudget)
 	defer cancel()
-	return netnsbroker.NewClient().SignalPID(ctx, int(pid), int(syscall.SIGCONT), startTime)
+	return netnsbroker.NewClient().SignalPID(sigCtx, int(pid), int(syscall.SIGCONT), startTime)
 }
 
 // thawSourcePID resumes a source process that was left in SIGSTOP by LeaveStopped=true
@@ -9765,11 +9773,11 @@ func brokerSignalSourcePID(pid int32, startTime uint64) error {
 // AppArmor-DENIED against a containerd-default-profile source workload. Leaving the
 // source frozen would break invariant-1 / ADR-0012 (source must stay serving until
 // TrafficVerified=True), so a failed thaw is loudly logged for manual intervention.
-func thawSourcePID(pid int32, migrationName string) {
+func thawSourcePID(ctx context.Context, pid int32, migrationName string) {
 	if pid <= 0 {
 		return
 	}
-	if err := brokerThawSourcePID(pid); err != nil {
+	if err := brokerThawSourcePID(ctx, pid); err != nil {
 		log.Error(err, "thawSourcePID: broker SIGCONT to source PID failed — source may remain frozen, manual intervention may be required (C-06)",
 			"migration", migrationName, "sourcePID", pid)
 		return
@@ -9811,7 +9819,7 @@ func (s *AgentServer) clearFrozenSource(migrationName string) {
 
 // thawFrozenSource thaws the recorded frozen source PID for migrationName (if any)
 // and clears the record. Safe to call when no frozen source is registered.
-func (s *AgentServer) thawFrozenSource(migrationName string) {
+func (s *AgentServer) thawFrozenSource(ctx context.Context, migrationName string) {
 	s.frozenSourcePIDsMu.Lock()
 	pid, ok := s.frozenSourcePIDs[migrationName]
 	if ok {
@@ -9824,7 +9832,7 @@ func (s *AgentServer) thawFrozenSource(migrationName string) {
 	// clear it so startup reconcile does not later act on an already-handled entry.
 	removeFrozenSourceRecord(migrationName)
 	if ok {
-		thawSourcePID(pid, migrationName)
+		thawSourcePID(ctx, pid, migrationName)
 	}
 }
 
