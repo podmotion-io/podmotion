@@ -63,7 +63,7 @@ func TestRestoreAbortOnPatchFailure_Strict(t *testing.T) {
 
 	// Inject a failing patchCheckpointImagesFn for the duration of the test.
 	origFn := patchCheckpointImagesFn
-	patchCheckpointImagesFn = func(_ string, _ []string, _ []string) error { return patchErr }
+	patchCheckpointImagesFn = func(_ string, _ []string, _ []string, _ map[string]string) error { return patchErr }
 	t.Cleanup(func() { patchCheckpointImagesFn = origFn })
 
 	s := New("test-node", &criu.StubCheckpointer{}, nil)
@@ -104,7 +104,7 @@ func TestRestoreSkipPatchFailure_BestEffort(t *testing.T) {
 			patchErr := errors.New("PATCH_ERROR: unknown magic 0xdeadbeef")
 
 			origFn := patchCheckpointImagesFn
-			patchCheckpointImagesFn = func(_ string, _ []string, _ []string) error { return patchErr }
+			patchCheckpointImagesFn = func(_ string, _ []string, _ []string, _ map[string]string) error { return patchErr }
 			t.Cleanup(func() { patchCheckpointImagesFn = origFn })
 
 			s := New("test-node", &criu.StubCheckpointer{}, nil)

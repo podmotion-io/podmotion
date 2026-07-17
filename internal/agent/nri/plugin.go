@@ -32,6 +32,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	"github.com/podmotion-io/podmotion/internal/agent/netnsbroker"
 )
 
 // validCheckpointRef rejects any ref that is not a plain DNS-label-safe identifier.
@@ -765,15 +766,29 @@ func waitForHolderQuiescent(ctx context.Context, event ContainerEvent, timeout t
 	// The container PID is the init PID of the container; it appears under /proc once the
 	// container runtime has created the cgroup and forked the init process.
 	for time.Now().Before(deadline) {
-		// Transport (i): sentinel file. Find the container's init PID by scanning /proc/*/cgroup.
-		pid := findContainerInitPID(event.ID)
-		if pid > 0 {
-			sentinelPath := fmt.Sprintf("/proc/%d/root/%s", pid, holderReadySentinel)
-			if _, err := os.Stat(sentinelPath); err == nil {
-				log.Info("holder-quiescent barrier satisfied (sentinel file)",
-					"container", event.ID, "pid", pid, "sentinelPath", sentinelPath)
-				return nil
-			}
+		// Transport (i): holder-ready sentinel file, observed via the unconfined
+		// netns-broker. Reading the sentinel means dereferencing
+		// /proc/<holderPID>/root/run/podmotion/holder-ready inside the restore-target
+		// container. Opening another container's /proc/<pid>/root routes through a
+		// ptrace_may_access gate that the de-privileged agent's `podmotion-agent`
+		// AppArmor profile DENIES against the holder's cri-containerd.apparmor.d peer
+		// profile (the exact `apparmor DENIED operation="ptrace" ... requested_mask="read"`
+		// signature — CAP_SYS_PTRACE does NOT bypass AppArmor mediation). A direct
+		// agent-side os.Stat therefore fails EACCES on EVERY poll, so this transport
+		// was silently dead and the barrier always timed out at 50s, forcing the
+		// gRPC/raw-CRIU fallback (where the ADR-0351 cgroup anchor is skipped and the
+		// restored process is never made pod-visible). Delegate the observation to the
+		// unconfined broker — the same ptrace-delegation class as ResolveVeth /
+		// signal_pid — which resolves the holder PID and stats the sentinel itself.
+		// A transient broker error is non-fatal: log it and fall through to the next
+		// transport / poll.
+		if ready, berr := netnsbroker.NewClient().HolderSentinelReady(ctx, event.ID); berr != nil {
+			log.Info("holder-quiescent barrier: broker sentinel observation errored (will retry next poll)",
+				"container", event.ID, "error", berr.Error())
+		} else if ready {
+			log.Info("holder-quiescent barrier satisfied (sentinel file via netns-broker)",
+				"container", event.ID, "name", event.Name)
+			return nil
 		}
 
 		// Transport (ii): stdout token. Observe the holder container's CRI stdout log for the
@@ -845,39 +860,10 @@ func containerInList(name, csv string) bool {
 	return false
 }
 
-// findContainerInitPID scans /proc for the init PID of the container with the given containerID.
-// It reads /proc/<pid>/cgroup and looks for a cgroup entry containing the container ID string.
-// Returns 0 if not found.
-func findContainerInitPID(containerID string) int {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return 0
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		pid := 0
-		for _, c := range e.Name() {
-			if c < '0' || c > '9' {
-				pid = -1
-				break
-			}
-			pid = pid*10 + int(c-'0')
-		}
-		if pid <= 0 {
-			continue
-		}
-		cgroupData, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
-		if err != nil {
-			continue
-		}
-		if strings.Contains(string(cgroupData), containerID) {
-			return pid
-		}
-	}
-	return 0
-}
+// (findContainerInitPID was retired: the holder-ready sentinel is now observed via
+// the unconfined netns-broker's holder_sentinel op, which resolves the holder PID
+// and stats the sentinel in one unconfined process — the confined agent's direct
+// /proc/<pid>/root stat was AppArmor-ptrace-denied on every poll, silently dead.)
 
 // WriteRegistrationConfig writes the NRI plugin config file to the NRI config dir.
 // containerd reads this to discover and exec the plugin.

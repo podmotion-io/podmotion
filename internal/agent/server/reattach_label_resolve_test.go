@@ -129,19 +129,21 @@ func TestResolveReattachMounts_ResolvesHostTargetByLabelWhenStatusEmpty(t *testi
 		t.Fatalf("host target NOT resolved by label: got %q, want %q (this is the Sprint-44 root cause — empty host target → broken 1:1 map)", mounts[0].HostTarget, wantHost)
 	}
 
-	// End-to-end: the emitted CRIU args must map to the HOST path, never the 1:1 container path.
+	// End-to-end: the resolved host target is applied by rewriting the checkpoint image's recorded
+	// source to it (patchCheckpointImages) — CRIU binds mi->source directly for an AUTODETECTED_MOUNT
+	// and bypasses --ext-mount-map. So buildCRIURestoreArgs must NOT emit an inert path-form map, and
+	// the resolved host target must be projected into the patch's host-target map (its real consumer).
 	args, err := buildCRIURestoreArgs(
 		"/ckpt", "/rootfs", "/data", "/termlog", "/secrets", "/restore.log",
 		"", "/var/run/netns/cni-x", "", false, mounts)
 	if err != nil {
 		t.Fatalf("buildCRIURestoreArgs returned error with a resolved host target: %v", err)
 	}
-	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "--ext-mount-map "+containerPath+":"+wantHost) {
-		t.Errorf("expected ext-mount-map to host path; got: %s", joined)
+	if joined := strings.Join(args, " "); strings.Contains(joined, "--ext-mount-map "+containerPath+":") {
+		t.Errorf("must NOT emit an inert path-form re-attach ext-mount-map for %s (CRIU bypasses it for autodetected externals); got: %s", containerPath, joined)
 	}
-	if strings.Contains(joined, "--ext-mount-map "+containerPath+":"+containerPath) {
-		t.Errorf("must NOT emit the broken 1:1 container-path map; got: %s", joined)
+	if ht := reattachHostTargets(mounts); ht[containerPath] != wantHost {
+		t.Errorf("resolved host target must be projected into the patch host-target map: got %q, want %q", ht[containerPath], wantHost)
 	}
 }
 
@@ -234,19 +236,20 @@ func TestResolveReattachMounts_WaitsThenResolvesWhenVolumeNotYetPublished(t *tes
 		t.Fatalf("waiter did not converge to the resolved leaf: got %+v, want [{%s %s}]", mounts, containerPath, wantLeaf)
 	}
 
-	// (iii) buildCRIURestoreArgs emits the ext-mount-map to the leaf, never the 1:1 map.
+	// (iii) The resolved leaf is applied via the image source-rewrite (patchCheckpointImages), not a
+	// restore-side --ext-mount-map (CRIU bypasses it for the autodetected external). buildCRIURestoreArgs
+	// must NOT emit an inert path-form map; the leaf must land in the patch's host-target map.
 	args, err := buildCRIURestoreArgs(
 		"/ckpt", "/rootfs", "/data", "/termlog", "/secrets", "/restore.log",
 		"", "/var/run/netns/cni-x", "", false, mounts)
 	if err != nil {
 		t.Fatalf("buildCRIURestoreArgs errored on resolved mounts: %v", err)
 	}
-	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "--ext-mount-map "+containerPath+":"+wantLeaf) {
-		t.Errorf("expected ext-mount-map to the resolved leaf; got: %s", joined)
+	if joined := strings.Join(args, " "); strings.Contains(joined, "--ext-mount-map "+containerPath+":") {
+		t.Errorf("must NOT emit an inert path-form re-attach ext-mount-map for %s (CRIU bypasses it for autodetected externals); got: %s", containerPath, joined)
 	}
-	if strings.Contains(joined, "--ext-mount-map "+containerPath+":"+containerPath) {
-		t.Errorf("must NOT emit the broken 1:1 container-path map; got: %s", joined)
+	if ht := reattachHostTargets(mounts); ht[containerPath] != wantLeaf {
+		t.Errorf("resolved leaf must be projected into the patch host-target map: got %q, want %q", ht[containerPath], wantLeaf)
 	}
 }
 
@@ -367,12 +370,13 @@ func TestResolveReattachMounts_InTreeNFSShapeResolvesEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildCRIURestoreArgs errored on the resolved in-tree NFS mount: %v", err)
 	}
-	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "--ext-mount-map "+containerPath+":"+wantHost) {
-		t.Errorf("expected ext-mount-map to the in-tree NFS host dir; got: %s", joined)
+	// The in-tree NFS host dir is applied via the image source-rewrite (patchCheckpointImages), not a
+	// restore-side --ext-mount-map (CRIU bypasses it for the autodetected external).
+	if joined := strings.Join(args, " "); strings.Contains(joined, "--ext-mount-map "+containerPath+":") {
+		t.Errorf("must NOT emit an inert path-form re-attach ext-mount-map for %s (CRIU bypasses it for autodetected externals); got: %s", containerPath, joined)
 	}
-	if strings.Contains(joined, "--ext-mount-map "+containerPath+":"+containerPath) {
-		t.Errorf("must NOT emit the broken 1:1 container-path map; got: %s", joined)
+	if ht := reattachHostTargets(mounts); ht[containerPath] != wantHost {
+		t.Errorf("resolved in-tree NFS host dir must be projected into the patch host-target map: got %q, want %q", ht[containerPath], wantHost)
 	}
 }
 
