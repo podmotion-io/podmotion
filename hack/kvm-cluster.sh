@@ -111,7 +111,17 @@ CALICO_VERSION="${CALICO_VERSION:-3.28.0}"
 CALICO_CHART_VERSION="${CALICO_CHART_VERSION:-$CALICO_VERSION}"
 CALICO_OPERATOR_NAMESPACE="${CALICO_OPERATOR_NAMESPACE:-tigera-operator}"
 CALICO_NAMESPACE="${CALICO_NAMESPACE:-calico-system}"
-CALICO_OPERATOR_IMG="${CALICO_OPERATOR_IMG:-quay.io/tigera/operator:v${CALICO_VERSION}}"
+# The Tigera Operator versions ITSELF independently of the Calico release it
+# ships (confirmed against charts/tigera-operator/values.yaml pinned to the
+# projectcalico/calico v3.28.0 tag: tigeraOperator.version there is v1.34.0,
+# not v3.28.0). Using CALICO_VERSION for the operator tag produces a
+# reference that has never existed on quay.io ("failed to resolve reference
+# ...: not found") — this is the actual root cause of the operator
+# pre-import failure, not a missing docker-pull step. Keep this pinned
+# independently and bump it only alongside CALICO_VERSION, cross-checked
+# against that same upstream values.yaml file.
+CALICO_OPERATOR_VERSION="${CALICO_OPERATOR_VERSION:-1.34.0}"
+CALICO_OPERATOR_IMG="${CALICO_OPERATOR_IMG:-quay.io/tigera/operator:v${CALICO_OPERATOR_VERSION}}"
 CALICO_NODE_IMG="${CALICO_NODE_IMG:-docker.io/calico/node:v${CALICO_VERSION}}"
 CALICO_KUBE_CONTROLLERS_IMG="${CALICO_KUBE_CONTROLLERS_IMG:-docker.io/calico/kube-controllers:v${CALICO_VERSION}}"
 CALICO_CNI_IMG="${CALICO_CNI_IMG:-docker.io/calico/cni:v${CALICO_VERSION}}"
@@ -665,7 +675,7 @@ cmd_provision_calico() {
                "$CALICO_CNI_IMG" "$CALICO_CSI_IMG" "$CALICO_CSI_REGISTRAR_IMG"; do
       docker save "$img" | nsh "$ip" "sudo ctr -n k8s.io images import -"
     done
-    for tag in "operator:v${CALICO_VERSION}" "node:v${CALICO_VERSION}" \
+    for tag in "operator:v${CALICO_OPERATOR_VERSION}" "node:v${CALICO_VERSION}" \
                "kube-controllers:v${CALICO_VERSION}" "cni:v${CALICO_VERSION}" \
                "csi:v${CALICO_VERSION}" "node-driver-registrar:v${CALICO_VERSION}"; do
       if ! nsh "$ip" "sudo ctr -n k8s.io images ls -q | grep -q '${tag}'"; then
@@ -683,6 +693,7 @@ cmd_provision_calico() {
     --namespace "$CALICO_OPERATOR_NAMESPACE" --create-namespace \
     --set installation.enabled=false \
     --set tigeraOperator.image=tigera/operator \
+    --set tigeraOperator.version="v${CALICO_OPERATOR_VERSION}" \
     --set tigeraOperator.imagePullPolicy=IfNotPresent
 
   # Installation CR: single pool, non-strict-affinity (no nodeSelector), VXLAN
