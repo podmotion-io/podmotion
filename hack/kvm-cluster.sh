@@ -724,7 +724,26 @@ spec:
     # iptables/ipvs dataplane. NEVER set this to true (see header comment).
 YAML
 
-  echo "==> [3/3] Waiting for Calico to come up (rollout status on calico-node / calico-kube-controllers)..."
+  echo "==> [3/3] Waiting for the Tigera Operator to reconcile the Installation CR (namespace $CALICO_NAMESPACE)..."
+  # The Installation CR apply above only asks the Tigera Operator to act; the
+  # operator creates the $CALICO_NAMESPACE namespace (and everything in it)
+  # asynchronously as it reconciles. Running rollout-status before that
+  # namespace exists fails with a hard NotFound instead of waiting, so poll
+  # for the namespace first. Bounded wait, not a fixed sleep and not an
+  # infinite wait.
+  local waited=0
+  local calico_ns_timeout=120
+  until KUBECONFIG="$KUBECONFIG_OUT" kubectl get namespace "$CALICO_NAMESPACE" >/dev/null 2>&1; do
+    if (( waited >= calico_ns_timeout )); then
+      echo "ERROR: namespace $CALICO_NAMESPACE did not appear within ${calico_ns_timeout}s — Tigera Operator has not reconciled the Installation CR. Check 'kubectl -n $CALICO_OPERATOR_NAMESPACE logs deploy/tigera-operator'." >&2
+      exit 1
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  echo "  -- namespace $CALICO_NAMESPACE present after ${waited}s"
+
+  echo "==> Waiting for Calico to come up (rollout status on calico-node / calico-kube-controllers)..."
   KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CALICO_NAMESPACE" rollout status ds/calico-node --timeout=300s
   KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CALICO_NAMESPACE" rollout status deploy/calico-kube-controllers --timeout=300s
   echo "==> Calico ready. CNI swap done at the install layer; run cutover-calico to remove the previously-active CNI."
