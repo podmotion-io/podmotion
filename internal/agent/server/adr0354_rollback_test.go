@@ -166,3 +166,176 @@ func TestBrokerCriuSignal_DeliversKillUnderRollbackBudget_ForwardCtxDone(t *test
 			"not the old flat 30s clamp and not brokerExecTimeout's 5 minutes", elapsed, rollbackExecBudget, slack)
 	}
 }
+
+// TestJoinNsRestoreTeardown_BoundedByRollbackBudget_ForwardCtxDone is the ADR-0354 D3
+// completeness regression test for the two nsenterCmd placeholder-teardown sites landed on
+// this branch: joinNsRestore's placeholder-teardown defer (server.go, "On any error after this
+// point: kill placeholder to release the rootfs mount") and the sibling "kill any stale
+// placeholder from a previous attempt" cleanup block inside setupRestoreOverlayfs. Neither site
+// is independently callable (both are inline blocks, not their own functions), so — following
+// this file's own D6.8 convention in adr0354_netns_exec_test.go for the joinNsRestore
+// loopback-up netns_exec site — the exact rollbackCtx-derivation and nsenterCmd call sequence
+// is reproduced verbatim from server.go rather than re-implemented or paraphrased:
+//
+//	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackExecBudget)
+//	defer cancel()
+//	_ = nsenterCmd(rollbackCtx, "ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
+//	_ = nsenterCmd(rollbackCtx, "ctr", "--namespace", "k8s.io", "container", "rm", placeholderID).Run()
+//
+// Drives this sequence with the forward ctx ALREADY Done/cancelled before the block runs — the
+// exact precondition both fixed sites' comments call out ("must still fire even if the forward
+// migration ctx is already Done/cancelled by the time this defer runs"). Asserts both execs are
+// DELIVERED (not skipped) and complete comfortably inside rollbackExecBudget.
+//
+// This test fails against the pre-fix code, which bound these same two nsenterCmd calls
+// directly to the raw (already-Done) ctx instead of a WithoutCancel-derived rollbackCtx: with a
+// forward ctx that is already cancelled, brokerCmd.result()'s
+// context.WithTimeout(callerCtx, brokerExecBudget(callerCtx)) derives its own Done-ness from
+// the already-cancelled parent, so ctx.Done() is already closed before dial — Client.do's
+// dial-time ctx.Done() check (exercised directly below in the "raw ctx" subtest) rejects before
+// ever reaching the fake broker, and the exec is never attempted at all. Swap in `forwardCtx`
+// for `rollbackCtx` in the "fixed" subtest below to see it fail.
+func TestJoinNsRestoreTeardown_BoundedByRollbackBudget_ForwardCtxDone(t *testing.T) {
+	placeholderID := "pm-placeholder-adr0354-d3-completeness"
+
+	t.Run("fixed: rollbackCtx binding still delivers both teardown execs", func(t *testing.T) {
+		var received int32
+		sock := startFakeBroker(t, execSignalCountingRecorder(&received, 20*time.Millisecond))
+		origFn := netnsBrokerClientFn
+		netnsBrokerClientFn = func() *netnsbroker.Client { return testBrokerClient(sock) }
+		defer func() { netnsBrokerClientFn = origFn }()
+
+		// The forward migration ctx is ALREADY Done — the exact precondition under which the
+		// fail-closed placeholder-teardown fires in production.
+		forwardCtx, forwardCancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+		forwardCancel()
+		time.Sleep(5 * time.Millisecond)
+		if forwardCtx.Err() == nil {
+			t.Fatal("test setup invariant violated: forward ctx must already be Done")
+		}
+
+		start := time.Now()
+
+		// Verbatim reproduction of the fixed defer/cleanup block (server.go).
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(forwardCtx), rollbackExecBudget)
+		defer cancel()
+		killErr := nsenterCmd(rollbackCtx, "ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
+		rmErr := nsenterCmd(rollbackCtx, "ctr", "--namespace", "k8s.io", "container", "rm", placeholderID).Run()
+
+		elapsed := time.Since(start)
+
+		if killErr != nil {
+			t.Fatalf("task kill exec returned an error with the forward ctx already Done: %v — "+
+				"the teardown exec must still be DELIVERED (D3 asymmetry: WithoutCancel severs the "+
+				"Done-ness before deriving the bounded rollbackCtx)", killErr)
+		}
+		if rmErr != nil {
+			t.Fatalf("container rm exec returned an error with the forward ctx already Done: %v", rmErr)
+		}
+		if atomic.LoadInt32(&received) != 2 {
+			t.Fatalf("fake broker received %d exec ops, want 2 (task kill + container rm) — a "+
+				"teardown exec was skipped instead of attempted, exactly the D3 stop-here safety "+
+				"regression this test guards", received)
+		}
+		if elapsed >= rollbackExecBudget {
+			t.Fatalf("teardown execs took %v, want comfortably under rollbackExecBudget (%v)", elapsed, rollbackExecBudget)
+		}
+	})
+
+	t.Run("raw ctx (pre-fix shape): binding directly to the already-Done forward ctx never even dials", func(t *testing.T) {
+		var received int32
+		sock := startFakeBroker(t, execSignalCountingRecorder(&received, 20*time.Millisecond))
+		origFn := netnsBrokerClientFn
+		netnsBrokerClientFn = func() *netnsbroker.Client { return testBrokerClient(sock) }
+		defer func() { netnsBrokerClientFn = origFn }()
+
+		forwardCtx, forwardCancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+		forwardCancel()
+		time.Sleep(5 * time.Millisecond)
+
+		// This is the PRE-FIX shape: nsenterCmd bound directly to the raw forward ctx instead of
+		// a rollbackCtx. Demonstrates why the fix is necessary — the exec is never attempted.
+		killErr := nsenterCmd(forwardCtx, "ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
+
+		if killErr == nil {
+			t.Fatal("expected an error binding a teardown exec directly to an already-Done forward ctx")
+		}
+		if atomic.LoadInt32(&received) != 0 {
+			t.Fatalf("fake broker received %d exec ops against the raw already-Done ctx, want 0 — "+
+				"this subtest's premise (raw ctx binding never dials) is invalid if the broker saw a request", received)
+		}
+	})
+}
+
+// TestSetupRestoreOverlayfsStaleTeardown_BoundedByRollbackBudget_ForwardCtxDone is the sibling
+// ADR-0354 D3 completeness regression test for setupRestoreOverlayfs's "kill any stale
+// placeholder from a previous attempt" cleanup block, which additionally binds a third
+// nsenterCmd call ("rm", "-rf", bundleDir) to the same rollbackCtx — reproduced verbatim here
+// alongside the task-kill/container-rm pair. Same fail-closed precondition and assertions as
+// TestJoinNsRestoreTeardown_BoundedByRollbackBudget_ForwardCtxDone above.
+func TestSetupRestoreOverlayfsStaleTeardown_BoundedByRollbackBudget_ForwardCtxDone(t *testing.T) {
+	placeholderID := "pm-placeholder-adr0354-d3-completeness-overlayfs"
+	bundleDir := "/run/containerd/io.containerd.runtime.v2.task/k8s.io/" + placeholderID
+
+	var received int32
+	sock := startFakeBroker(t, execSignalCountingRecorder(&received, 20*time.Millisecond))
+	origFn := netnsBrokerClientFn
+	netnsBrokerClientFn = func() *netnsbroker.Client { return testBrokerClient(sock) }
+	defer func() { netnsBrokerClientFn = origFn }()
+
+	forwardCtx, forwardCancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	forwardCancel()
+	time.Sleep(5 * time.Millisecond)
+	if forwardCtx.Err() == nil {
+		t.Fatal("test setup invariant violated: forward ctx must already be Done")
+	}
+
+	start := time.Now()
+
+	// Verbatim reproduction of setupRestoreOverlayfs's stale-placeholder cleanup block
+	// (server.go), including the adjacent bundleDir rm -rf brought under the same rollbackCtx.
+	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(forwardCtx), rollbackExecBudget)
+	defer rollbackCancel()
+	killErr := nsenterCmd(rollbackCtx, "ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
+	rmContainerErr := nsenterCmd(rollbackCtx, "ctr", "--namespace", "k8s.io", "container", "rm", placeholderID).Run()
+	_, rmBundleErr := nsenterCmd(rollbackCtx, "rm", "-rf", bundleDir).CombinedOutput()
+
+	elapsed := time.Since(start)
+
+	if killErr != nil {
+		t.Fatalf("task kill exec returned an error with the forward ctx already Done: %v", killErr)
+	}
+	if rmContainerErr != nil {
+		t.Fatalf("container rm exec returned an error with the forward ctx already Done: %v", rmContainerErr)
+	}
+	if rmBundleErr != nil {
+		t.Fatalf("bundleDir rm -rf exec returned an error with the forward ctx already Done: %v", rmBundleErr)
+	}
+	if atomic.LoadInt32(&received) != 3 {
+		t.Fatalf("fake broker received %d exec ops, want 3 (task kill + container rm + rm -rf "+
+			"bundleDir) — a stale-teardown exec was skipped instead of attempted", received)
+	}
+	if elapsed >= rollbackExecBudget {
+		t.Fatalf("stale-teardown execs took %v, want comfortably under rollbackExecBudget (%v)", elapsed, rollbackExecBudget)
+	}
+}
+
+// execSignalCountingRecorder returns a fakeBrokerHandler that, on receiving any "exec" op,
+// increments received, waits delay (respecting the harness's done channel), then responds with
+// exit code 0. Used by the D3 completeness tests above, which drive plain nsenterCmd (Op
+// "exec") rather than execSignalRecorder's exec_signal-specific op.
+func execSignalCountingRecorder(received *int32, delay time.Duration) fakeBrokerHandler {
+	return func(conn net.Conn, req netnsbroker.Request, done <-chan struct{}) {
+		if req.Op != "exec" {
+			writeFakeResponse(conn, netnsbroker.Response{ExitCode: intPtr(0)})
+			return
+		}
+		atomic.AddInt32(received, 1)
+		select {
+		case <-time.After(delay):
+		case <-done:
+			return
+		}
+		writeFakeResponse(conn, netnsbroker.Response{ExitCode: intPtr(0)})
+	}
+}
