@@ -89,7 +89,10 @@ func TestResolveReattachMounts_ResolvesHostTargetByLabelWhenStatusEmpty(t *testi
 	}
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "postgres-pgdata", Namespace: "default"},
-		Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: pvName},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName:  pvName,
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}, // Tier0 re-attach
+		},
 	}
 	// The replacement pod carries the authoritative migration-name label (stamped by the
 	// controller) even though Status.ReplacementPodName was never persisted.
@@ -156,7 +159,10 @@ func reattachTestFixture(migName, replUID, pvName, containerPath string) (*pmv1.
 	}
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "postgres-pgdata", Namespace: "default"},
-		Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: pvName},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName:  pvName,
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}, // Tier0 re-attach
+		},
 	}
 	replPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -377,6 +383,85 @@ func TestResolveReattachMounts_InTreeNFSShapeResolvesEndToEnd(t *testing.T) {
 	}
 	if ht := reattachHostTargets(mounts); ht[containerPath] != wantHost {
 		t.Errorf("resolved in-tree NFS host dir must be projected into the patch host-target map: got %q, want %q", ht[containerPath], wantHost)
+	}
+}
+
+// TestResolveReattachMounts_ExcludesNonTier0RWOPVC is the storage-tier gate regression: a
+// PVC-backed mount that does NOT classify as Tier0 (here ReadWriteOnce — the shape a Longhorn
+// dual-engine or Ceph-RBD-live volume presents) must be EXCLUDED from the re-attach set even when
+// its kubelet volume dir IS published at restore time. Rewriting such a mount's recorded source to
+// the destination volume dir would bypass that tier's replication/consistency handoff silently; the
+// gate keeps it out of reattach_mount_paths so patch_checkpoint_script leaves it to the pre-existing
+// non-Tier0 handling. Before the gate this RWO PVC was treated identically to a Tier0 RWX mount.
+func TestResolveReattachMounts_ExcludesNonTier0RWOPVC(t *testing.T) {
+	const migName = "postgres-live-migration"
+	const replUID = "b1bffab8-74e2-4a8a-ad72-f6d5d5436fcb"
+	const pvName = "pvc-bbf8a46b"
+	const containerPath = "/var/lib/postgresql/data"
+	published := "/var/lib/kubelet/pods/" + replUID + "/volumes/kubernetes.io~csi/" + pvName + "/mount"
+
+	// The volume IS published — proves the exclusion is driven by the tier gate, not by an
+	// unresolved host target. If the gate were absent this would resolve to a re-attach mount.
+	orig := kubeletVolumeGlobFn
+	t.Cleanup(func() { kubeletVolumeGlobFn = orig })
+	kubeletVolumeGlobFn = func(uid, pv string) string {
+		if uid == replUID && pv == pvName {
+			return published
+		}
+		return ""
+	}
+
+	pm, pvc, replPod := reattachTestFixture(migName, replUID, pvName, containerPath)
+	// Override the fixture's default Tier0 RWX with ReadWriteOnce — a non-Tier0 (RWO) PVC.
+	pvc.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+	s := newFakeAgentServerWithCoreObjects(t, pm, pvc, replPod)
+
+	mounts, err := s.resolveReattachMounts(migName)
+	if err != nil {
+		t.Fatalf("resolveReattachMounts returned error for a non-Tier0 PVC (expected clean exclusion): %v", err)
+	}
+	if len(mounts) != 0 {
+		t.Fatalf("non-Tier0 (ReadWriteOnce) PVC mount must be EXCLUDED from the re-attach set; got %+v", mounts)
+	}
+
+	// The bounded waiter must agree — a non-Tier0 PVC never enters the not-yet-published retry loop
+	// and resolves immediately to an empty set.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	wm, werr := s.resolveReattachMountsWaiting(ctx, migName)
+	if werr != nil {
+		t.Fatalf("resolveReattachMountsWaiting errored for a non-Tier0 PVC: %v", werr)
+	}
+	if len(wm) != 0 {
+		t.Fatalf("waiter must also exclude the non-Tier0 PVC mount; got %+v", wm)
+	}
+}
+
+// TestPVCIsTier0RWX_AccessModeMatrix pins the Tier0 predicate to the classifier's rule: ONLY a
+// ReadWriteMany access mode is Tier0 re-attach; RWO / ROX / RWOP and the no-access-mode case are not.
+func TestPVCIsTier0RWX_AccessModeMatrix(t *testing.T) {
+	cases := []struct {
+		name  string
+		modes []corev1.PersistentVolumeAccessMode
+		want  bool
+	}{
+		{"rwx", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}, true},
+		{"rwx-among-others", []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany, corev1.ReadWriteMany}, true},
+		{"rwo", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, false},
+		{"rox", []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany}, false},
+		{"rwop", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod}, false},
+		{"none", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pvc := &corev1.PersistentVolumeClaim{Spec: corev1.PersistentVolumeClaimSpec{AccessModes: tc.modes}}
+			if got := pvcIsTier0RWX(pvc); got != tc.want {
+				t.Errorf("pvcIsTier0RWX(%v) = %v, want %v", tc.modes, got, tc.want)
+			}
+		})
+	}
+	if pvcIsTier0RWX(nil) {
+		t.Error("pvcIsTier0RWX(nil) must be false")
 	}
 }
 
