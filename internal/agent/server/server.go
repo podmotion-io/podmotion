@@ -627,7 +627,7 @@ func (s *AgentServer) finalizeRestore(ctx context.Context, pid int, netnsPath, i
 		if readIfname == "" {
 			readIfname = "eth0"
 		}
-		mac, macErr = readReplVethMACFn(pid, "", readIfname)
+		mac, macErr = readReplVethMACFn(ctx, pid, "", readIfname)
 		if macErr == nil && mac != "" {
 			if _, perr := net.ParseMAC(mac); perr != nil {
 				macErr = fmt.Errorf("replVethMAC unparseable %q: %w", mac, perr)
@@ -796,6 +796,16 @@ func setConditionOnPM(pm *pmv1.PodMigration, condType string, status metav1.Cond
 // containerCgroupsPath/podCgroupParent are the ADR-0351 D1 NRI-carried cgroup-anchor fields —
 // read directly off the event by the caller (cmd/agent/main.go), threaded here as plain
 // parameters (no query, no poll, no side-map) and passed through to joinNsRestore.
+// restoreInvariantBudget is the constitutional invariant-#8 live-migration cap (120s) — the
+// single, authoritative overall restore/migration deadline already cited throughout this
+// codebase (this file's replacementSandboxWaitBudget comment: "the 120s live-migration hard
+// bound (constitutional invariant #8)"; internal/controller/podmigration_controller.go's
+// invariant-#8 completion-budget gate; the "120s cap" reviewed at sprint46B7). It is named here
+// (not re-derived as a bare literal) so the NRI restore path — which has no caller-supplied ctx
+// to thread (ADR-0354 DR-2) — bounds itself against the SAME cap the rest of the system already
+// enforces, rather than an arbitrary or re-guessed number.
+const restoreInvariantBudget = 120 * time.Second
+
 func (s *AgentServer) JoinNsRestore(migrationName, namespace, checkpointDir, imageName, containerID, sandboxID, containerCgroupsPath, podCgroupParent, tcpPreservationMode string) (int, string, error) {
 	// ADR-0353 R2/R3: acquire the single-owner in-flight restore claim before driving CRIU. A
 	// second actor (the gRPC Restore fallback) racing this same migration MUST NOT proceed —
@@ -808,6 +818,18 @@ func (s *AgentServer) JoinNsRestore(migrationName, namespace, checkpointDir, ima
 	// ADR-0353 R4: release on every terminal exit — success and every failure/error return —
 	// via defer so no early return leaks the claim. ReportRestoreConfirmed is folded into this
 	// function below (D6) so the release below never fires before the terminal confirm.
+	//
+	// ADR-0354 D3/DR-3: this existing defer-based release already composes correctly with the new
+	// rollbackExecBudget bound — no additional machinery is needed. releaseRestore only runs AFTER
+	// this synchronous function (and everything it calls, including joinNsRestoreFn and any
+	// brokerCriuCmd.Signal() kill on the fail-closed leg) returns. Every blocking call inside that
+	// path is now itself bounded: forward broker/CRIU execs by min(remaining(ctx), their ceiling)
+	// (D2/D2b), and the abort-leg Signal() kill by rollbackExecBudget via
+	// context.WithTimeout(context.WithoutCancel(ctx), rollbackExecBudget) regardless of whether the
+	// forward ctx is already Done (D2b). So the longest this claim can be held past the forward
+	// ctx's expiry is bounded by rollbackExecBudget (plus whatever bounded forward work was still
+	// in flight) — the claim can never be held open for a wedged broker exec running out a stale
+	// 5-minute/30s Background() budget the way it could before this ADR.
 	defer releaseRestore(migrationName)
 
 	strictMode := tcpPreservationMode == string(pmv1.TCPPreservationModeStrict)
@@ -872,15 +894,29 @@ func (s *AgentServer) JoinNsRestore(migrationName, namespace, checkpointDir, ima
 	// ADR-0351 D3.1/D1.2: the pause-PID bounded-wait ceiling (sandboxPausePIDWaitSubCap) this
 	// block used to derive is retired along with sandboxPausePIDWaiting itself — the cgroup-anchor
 	// primitive is a zero-query, zero-poll, zero-retry read of event data already in hand, so no
-	// ctx budget is needed for it. joinNsRestoreFn still takes a ctx parameter (other call sites
-	// thread the real one); the NRI wrapper passes context.Background() since it has no ceiling of
-	// its own to express here.
+	// ctx budget is needed for it.
+	// ADR-0354 DR-2: joinNsRestoreFn still takes a ctx parameter (other call sites thread the
+	// real gRPC/restore ctx they were given). The NRI ContainerEvent path that reaches
+	// JoinNsRestore genuinely has no caller ctx to thread — NRI is a synchronous hook callback,
+	// not a ctx-bearing RPC, so there is no upstream deadline/cancellation to propagate (unlike
+	// the gRPC Restore handler's primary and raw-CRIU-fallback drives, which DO have one). Rather
+	// than rooting on a bare context.Background() with no ceiling of its own (the same defect
+	// class this ADR retires elsewhere), construct a BOUNDED ctx here from the authoritative
+	// restore/migration deadline (restoreInvariantBudget, constitutional invariant #8 — the same
+	// 120s live-migration cap already cited at server.go's replacementSandboxWaitBudget and
+	// throughout internal/controller/podmigration_controller.go's invariant-#8 completion-budget
+	// gate) so every broker exec (D2/D2b/D2c) this call drives is still deadline-bound, just off
+	// a locally-constructed ceiling instead of an inherited one. This CANNOT widen any existing
+	// bound (there was none here before) and is strictly tighter than the prior unbounded
+	// Background() root.
+	joinNsRestoreCtx, joinNsRestoreCancel := context.WithTimeout(context.Background(), restoreInvariantBudget)
+	defer joinNsRestoreCancel()
 	// ADR-0355 D2/D3: read the authoritative preserved source IP (pm.Spec.SourcePodIP — the same
 	// field SingleHomeRestoredPod single-homes on) and thread it into joinNsRestore so the pre-CRIU
 	// bind-prep can make it locally bindable before soccr's bind() on an established-TCP restore.
 	// Empty (no CR / empty field) → the bind-prep gate is a no-op.
-	preservedSourceIP := s.resolvePreservedSourceIP(context.Background(), namespace, migrationName)
-	pid, droppedMounts, err := joinNsRestoreFn(context.Background(), migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode, reattachMounts, containerCgroupsPath, podCgroupParent, preservedSourceIP)
+	preservedSourceIP := s.resolvePreservedSourceIP(joinNsRestoreCtx, namespace, migrationName)
+	pid, droppedMounts, err := joinNsRestoreFn(joinNsRestoreCtx, migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode, reattachMounts, containerCgroupsPath, podCgroupParent, preservedSourceIP)
 	if err != nil {
 		// ADR-0193 P-0193-4 / S1: emit a Warning CRIUImageInconsistency Kubernetes Event on the
 		// PodMigration CR when the P-0193-1 hard-stop fires. The event message carries only
@@ -944,7 +980,7 @@ func (s *AgentServer) JoinNsRestore(migrationName, namespace, checkpointDir, ima
 	// (parity with the gRPC fallback path), MAC resolution falls back to the PrepareDestinationNetns
 	// bind mount rather than the ptrace'd /proc/<pid>/ns/net path AppArmor denies.
 	netnsPath, macIfname := s.finalizeNetnsPath(migrationName)
-	fr, frErr := s.finalizeRestore(context.Background(), pid, netnsPath, macIfname, migrationName, namespace, tcpPreservationMode, checkpointDir)
+	fr, frErr := s.finalizeRestore(joinNsRestoreCtx, pid, netnsPath, macIfname, migrationName, namespace, tcpPreservationMode, checkpointDir)
 	if frErr != nil {
 		// Strict/Full fail-closed: propagate.
 		return 0, "", frErr
@@ -1344,7 +1380,7 @@ func (s *AgentServer) resolveReattachMountsImpl(migrationName string, terminalOn
 				continue
 			}
 			seen[cp] = true
-			host := resolveKubeletVolumeHostPath(replUID, claimToPV[claim])
+			host := resolveKubeletVolumeHostPath(ctx, replUID, claimToPV[claim])
 			if host == "" && replUID != "" && !terminalOnBudget {
 				// Replacement pod resolved but its kubelet volume is not yet published in the host
 				// mount table: capture it as the retryable "not yet" case rather than appending a
@@ -1469,14 +1505,14 @@ func parseKubeletMountFromMountinfo(mountinfo []byte, replUID, pvName string) st
 // not a proxy). The provisioner subdir (kubernetes.io~nfs, ~csi, …) is discovered, not hardcoded.
 // Overridable in tests. Returns "" when nothing resolves (the volume is not yet published, or the
 // pod/PV is wrong); a not-yet-published read is a legitimate bounded WAIT for the caller.
-var kubeletVolumeGlobFn = func(replUID, pvName string) string {
+var kubeletVolumeGlobFn = func(ctx context.Context, replUID, pvName string) string {
 	if replUID == "" || pvName == "" {
 		return ""
 	}
 	// Read the host mount table in the host mount namespace (broker-delegated nsenter) — the agent's
 	// own mount ns does not carry /var/lib/kubelet, and the de-privileged agent EPERMs on a local
 	// setns, so it MUST go through the broker.
-	out, err := nsenterCmd("/bin/sh", "-c", "cat /proc/self/mountinfo 2>/dev/null").Output()
+	out, err := nsenterCmd(ctx, "/bin/sh", "-c", "cat /proc/self/mountinfo 2>/dev/null").Output()
 	if err != nil {
 		return ""
 	}
@@ -1485,8 +1521,8 @@ var kubeletVolumeGlobFn = func(replUID, pvName string) string {
 
 // resolveKubeletVolumeHostPath returns the destination-host path CRIU binds the re-attach volume
 // FROM (the replacement pod's kubelet-mounted volume dir), or "" if it cannot be resolved.
-func resolveKubeletVolumeHostPath(replUID, pvName string) string {
-	return kubeletVolumeGlobFn(replUID, pvName)
+func resolveKubeletVolumeHostPath(ctx context.Context, replUID, pvName string) string {
+	return kubeletVolumeGlobFn(ctx, replUID, pvName)
 }
 
 // pvcBackedMountPaths extracts, from a pod spec, the set of container volumeMount mountPaths whose
@@ -1940,7 +1976,7 @@ func parseEth0IPv4Addrs(out string) []eth0Addr {
 //
 // sandboxNetnsPath may be empty (host-network or unresolved), in which case only the PID
 // path is attempted.
-func ReadReplVethMAC(pid int, sandboxNetnsPath, ifname string) (string, error) {
+func ReadReplVethMAC(ctx context.Context, pid int, sandboxNetnsPath, ifname string) (string, error) {
 	if ifname == "" {
 		ifname = "eth0"
 	}
@@ -1962,10 +1998,11 @@ func ReadReplVethMAC(pid int, sandboxNetnsPath, ifname string) (string, error) {
 	if len(attempts) == 0 {
 		return "", fmt.Errorf("ReadReplVethMAC: no netns source (pid=%d, sandboxNetnsPath=%q)", pid, sandboxNetnsPath)
 	}
-	// ADR-0348: no context.Context is threaded through this exported free function (its
-	// signature is fixed by readReplVethMACFn's test-injection contract, used across multiple
-	// pre-existing test files) — use context.Background() for the broker call.
-	ctx := context.Background()
+	// ADR-0354 D2c (bonus finding): ctx is now a leading parameter, threaded from the caller
+	// (finalizeRestore, which carries a real ctx — server.go:584 — and captureRestoredVethMAC,
+	// threaded in turn from joinNsRestore's ctx). Every attempt below funnels Client.do via
+	// NetnsExec, so this was a Background()-rooted broker exec of the same defect class D2c
+	// retires elsewhere on the restore path.
 	var lastErr error
 	for _, a := range attempts {
 		// Read the MAC via `ip link` (netlink, net-namespace-scoped) — NOT
@@ -2114,7 +2151,7 @@ var (
 // restores have no eth0 and latch nothing. The bounded wait (invariant #8) tolerates the narrow
 // window where the CNI veth is not yet visible; every attempt reads the SAME source of truth (the
 // process's own netns), never a fallback chain to a different access method.
-func captureRestoredVethMAC(migrationName string, pid int, ifname string) {
+func captureRestoredVethMAC(ctx context.Context, migrationName string, pid int, ifname string) {
 	if migrationName == "" || pid <= 0 {
 		return
 	}
@@ -2133,7 +2170,7 @@ func captureRestoredVethMAC(migrationName string, pid int, ifname string) {
 	for {
 		// SrcPID entry: netnsPath == "" so ReadReplVethMAC constructs ONLY the pid attempt
 		// (/proc/<pid>/ns/net via the broker) — the restored process's own netns, never a bind path.
-		mac, err := readReplVethMACFn(pid, "", ifname)
+		mac, err := readReplVethMACFn(ctx, pid, "", ifname)
 		if err == nil && mac != "" {
 			if _, perr := net.ParseMAC(mac); perr == nil {
 				storeResolvedNetnsMAC(migrationName, mac) // R4-validated; no-op if no handle recorded
@@ -2338,7 +2375,7 @@ func (s *AgentServer) InjectIPHandoff(ctx context.Context, req *agentpb.InjectIP
 		// resolution/setup failure is non-fatal so an otherwise-good handoff is not blocked;
 		// the source is held until TrafficVerified so a requeue re-asserts it (idempotent).
 		if replPID, pidErr := s.restoredPIDForMigration(ctx, req.MigrationName); pidErr == nil && replPID > 0 {
-			if vethPeer, vErr := resolveReplVethPeer(replPID); vErr != nil {
+			if vethPeer, vErr := resolveReplVethPeer(ctx, replPID); vErr != nil {
 				log.Error(vErr, "InjectIPHandoff: ADR-0139 could not resolve repl veth peer — tc redirect NOT installed (non-fatal)",
 					"migration", req.MigrationName, "replPID", replPID)
 			} else if vethPeer == "" {
@@ -2677,14 +2714,20 @@ func (s *AgentServer) resolveNamespaceForMigration(ctx context.Context, migratio
 // given the restored PID. Inside the pod netns `ip -o link show eth0` reports the peer's host
 // ifindex as `eth0@if<N>`; the host link with ifindex <N> (`ip -o link show`) is the veth peer.
 // No netlink dependency (ADR-0045): reuses the in-tree nsenter+ip exec idiom.
-func resolveReplVethPeer(replPID int) (string, error) {
+func resolveReplVethPeer(ctx context.Context, replPID int) (string, error) {
 	netnsPath := fmt.Sprintf("/proc/%d/ns/net", replPID)
 	// ADR-0348: routed through the netns broker (fail-closed), SrcPID (replPID is always a live
-	// PID here, not a stable bind-mount path — see the D3 discussion in ADR-0348 §3). No
-	// context.Context is threaded through this function's fixed signature — see ReadReplVethMAC's
-	// identical note.
-	r := netnsbroker.NewClient().NetnsExec(context.Background(), replPID, "", "ip", "-o", "link", "show", "eth0")
+	// PID here, not a stable bind-mount path — see the D3 discussion in ADR-0348 §3).
+	// ADR-0354 D2c: ctx is threaded from the sole caller, InjectIPHandoff, which carries the
+	// real request ctx — this is a FORWARD/best-effort op (idempotent, non-fatal on failure), so
+	// the binding is symmetric (no context.WithoutCancel; contrast D2b's Signal()).
+	r := netnsbroker.NewClient().NetnsExec(ctx, replPID, "", "ip", "-o", "link", "show", "eth0")
 	if r.SpawnErr != nil {
+		if ctx.Err() != nil {
+			metrics.BrokerExecDeadlineAbortsTotal.WithLabelValues("netns_exec").Inc()
+			log.Info("ADR-0354 D2c/D7: netns_exec (veth-peer resolve) aborted on caller-deadline enforcement",
+				"replPID", replPID, "ctxErr", ctx.Err())
+		}
 		return "", fmt.Errorf("resolveReplVethPeer: netns exec failed: ip link show eth0 in netns %s: %w",
 			netnsPath, r.SpawnErr)
 	}
@@ -3497,9 +3540,9 @@ func ResolveNetnsFromSandbox(ctx context.Context, containerdClient interface{}, 
 // (under the k8s.io namespace) and returns the path of its network namespace — the
 // spec.Linux.Namespaces entry whose Type == "network". Returns "" (no error) when the
 // sandbox shares the host network namespace (no path).
-func sandboxNetnsPath(_ context.Context, sandboxID string) (string, error) {
+func sandboxNetnsPath(ctx context.Context, sandboxID string) (string, error) {
 	// `ctr containers info` prints the container record including the OCI runtime Spec.
-	out, err := nsenterCmd("ctr", "--namespace", "k8s.io", "containers", "info", sandboxID).Output()
+	out, err := nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "containers", "info", sandboxID).Output()
 	if err != nil {
 		return "", fmt.Errorf("ctr containers info %s: %w", sandboxID, err)
 	}
@@ -3536,7 +3579,7 @@ func sandboxNetnsPath(_ context.Context, sandboxID string) (string, error) {
 			// path only if no bind mount matches (preserves prior behavior for CNIs that already
 			// hand back a bind path).
 			if strings.HasPrefix(ns.Path, "/proc/") && strings.HasSuffix(ns.Path, "/ns/net") {
-				if bind := resolveNetnsBindByProcPath(ns.Path); bind != "" {
+				if bind := resolveNetnsBindByProcPath(ctx, ns.Path); bind != "" {
 					log.Info("sandboxNetnsPath: mapped /proc/<pid>/ns/net to stable /var/run/netns bind by inode (ADR-0325)",
 						"sandboxID", sandboxID, "procPath", ns.Path, "bindPath", bind)
 					return bind, nil
@@ -3557,7 +3600,7 @@ func sandboxNetnsPath(_ context.Context, sandboxID string) (string, error) {
 // nsenterCmd (the agent's own mount namespace cannot see the host /proc/<pid> or the CNI's
 // /var/run/netns bind mounts). Returns "" when no bind mount matches (caller falls back to the
 // raw proc path). This is not a poll-and-hope: the netns inode is an exact kernel identity.
-func resolveNetnsBindByProcPath(procPath string) string {
+func resolveNetnsBindByProcPath(ctx context.Context, procPath string) string {
 	// Both the proc-path inode read and the /var/run/netns bind-mount scan run in ONE `sh -c`
 	// (the netns-broker's exec allowlist permits "sh" but not a bare "stat"; the shell invokes
 	// the node's real stat). The shell resolves the proc-path netns inode, then scans the
@@ -3568,7 +3611,7 @@ func resolveNetnsBindByProcPath(procPath string) string {
 			`for f in /var/run/netns/*; do i=$(stat -L -c %%i "$f" 2>/dev/null); `+
 			`if [ "$i" = "$want" ]; then printf '%%s\n' "$f"; break; fi; done`,
 		procPath)
-	matchOut, err := nsenterCmd("sh", "-c", script).Output()
+	matchOut, err := nsenterCmd(ctx, "sh", "-c", script).Output()
 	if err != nil {
 		log.Error(err, "resolveNetnsBindByProcPath: proc→bind inode scan failed", "procPath", procPath)
 		return ""
@@ -3685,8 +3728,8 @@ func ctrReportedDumpLogPath(out string) string {
 	return "/host-run" + strings.TrimPrefix(rest, "/run")
 }
 
-func FindContainerTaskID(podUID string) (string, error) {
-	out, err := nsenterCmd("/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "list").Output()
+func FindContainerTaskID(ctx context.Context, podUID string) (string, error) {
+	out, err := nsenterCmd(ctx, "/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "list").Output()
 	if err == nil {
 		lines := strings.Split(string(out), "\n")
 		for _, line := range lines[1:] { // skip header
@@ -3753,12 +3796,12 @@ func FindContainerTaskID(podUID string) (string, error) {
 // ctrCheckpoint calls `ctr --namespace k8s.io tasks checkpoint` for the given task,
 // writing CRIU images to imagesDir. Also copies config.json from the containerd
 // bundle directory into imagesDir so the destination can set up an OCI bundle for restore.
-func ctrCheckpoint(taskID, imagesDir string, tcpEstablished bool) (int64, error) {
+func ctrCheckpoint(ctx context.Context, taskID, imagesDir string, tcpEstablished bool) (int64, error) {
 	// 0700: checkpoint images contain verbatim process memory and must be root-only.
 	if err := os.MkdirAll(imagesDir, 0o700); err != nil {
 		return 0, fmt.Errorf("mkdir %s: %w", imagesDir, err)
 	}
-	cmd := nsenterCmd("/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "checkpoint",
+	cmd := nsenterCmd(ctx, "/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "checkpoint",
 		"--image-path", imagesDir, taskID)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -4468,9 +4511,9 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 
 	// Pull the image if not already present. Use nsenterCmd to run ctr in the host mount namespace
 	// (ctr is on the node, not in the agent container).
-	pullOut, _ := nsenterCmd("ctr", "--namespace", "k8s.io", "images", "ls", "-q").Output()
+	pullOut, _ := nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "images", "ls", "-q").Output()
 	if !strings.Contains(string(pullOut), imageName) {
-		if out, err := nsenterCmd("ctr", "--namespace", "k8s.io", "images", "pull", imageName).CombinedOutput(); err != nil {
+		if out, err := nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "images", "pull", imageName).CombinedOutput(); err != nil {
 			return 0, nil, fmt.Errorf("pull %s: %w\n%s", imageName, err, out)
 		}
 	}
@@ -4534,7 +4577,7 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	// container via the host-containerd-bundles volume mount.
 	// We use this pre-mounted rootfs directly to avoid nested overlay mount limitations.
 	placeholderID := "pm-placeholder-" + migrationName
-	rootfsDir, err := setupRestoreOverlayfs(migrationName, checkpointDir, imageName, containerID)
+	rootfsDir, err := setupRestoreOverlayfs(ctx, migrationName, checkpointDir, imageName, containerID)
 	if err != nil {
 		return 0, nil, fmt.Errorf("setup rootfs overlayfs: %w", err)
 	}
@@ -4545,8 +4588,8 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 		if success {
 			return
 		}
-		_ = nsenterCmd("ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
-		_ = nsenterCmd("ctr", "--namespace", "k8s.io", "container", "rm", placeholderID).Run()
+		_ = nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
+		_ = nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "container", "rm", placeholderID).Run()
 	}()
 
 	// Step 3: Create ext-mount-map target paths in the agent container's filesystem.
@@ -4578,7 +4621,7 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 		"run", "var/run/secrets/kubernetes.io/serviceaccount",
 	}
 	for _, d := range dirsToCreate {
-		if out, err := nsenterCmd("mkdir", "-p", filepath.Join(rootfsDir, d)).CombinedOutput(); err != nil {
+		if out, err := nsenterCmd(ctx, "mkdir", "-p", filepath.Join(rootfsDir, d)).CombinedOutput(); err != nil {
 			log.Error(err, "setupRootfsDirs: mkdir failed (non-fatal)", "dir", d, "out", string(out))
 		}
 	}
@@ -4593,7 +4636,7 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 		filepath.Join(rootfsDir, "etc/hosts"),
 	}
 	for _, f := range filesToCreate {
-		if out, err := nsenterCmd("sh", "-c", fmt.Sprintf("[ -e %q ] || touch %q", f, f)).CombinedOutput(); err != nil {
+		if out, err := nsenterCmd(ctx, "sh", "-c", fmt.Sprintf("[ -e %q ] || touch %q", f, f)).CombinedOutput(); err != nil {
 			log.Error(err, "setupRootfsFiles: touch failed (non-fatal)", "file", f, "out", string(out))
 		}
 	}
@@ -4628,7 +4671,7 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	// devNodeMknodShellCmd) so the provisioning contract is unit-testable — see restore_devnode_test.go.
 	for _, n := range standardRestoreDevNodes {
 		p := filepath.Join(rootfsDir, n.rel)
-		out, err := nsenterCmd("sh", "-c", devNodeMknodShellCmd(rootfsDir, n)).CombinedOutput()
+		out, err := nsenterCmd(ctx, "sh", "-c", devNodeMknodShellCmd(rootfsDir, n)).CombinedOutput()
 		if err == nil {
 			continue
 		}
@@ -4741,10 +4784,10 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	// fd at /proc/<pid>/ns/mnt (accessible from host mount namespace via nsenter), then
 	// use nsenter --mount=<ns> to run umount -l /sys inside it.
 	placeholderIDForUmount := "pm-placeholder-" + migrationName
-	if placeholderPIDOut, pidErr := nsenterCmd("ctr", "--namespace", "k8s.io", "tasks", "ls", "--quiet").Output(); pidErr == nil {
+	if placeholderPIDOut, pidErr := nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "tasks", "ls", "--quiet").Output(); pidErr == nil {
 		// `ctr task ls --quiet` lists running task IDs (not PIDs). Get the PID from `ctr task info`.
 		if strings.Contains(string(placeholderPIDOut), placeholderIDForUmount) {
-			if pidInfo, piErr := nsenterCmd("ctr", "--namespace", "k8s.io", "task", "ls").Output(); piErr == nil {
+			if pidInfo, piErr := nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "task", "ls").Output(); piErr == nil {
 				for _, line := range strings.Split(string(pidInfo), "\n") {
 					if strings.Contains(line, placeholderIDForUmount) {
 						fields := strings.Fields(line)
@@ -4849,7 +4892,7 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	// mechanism so the wrapper runs broker-side while the agent keeps the same async
 	// lifecycle it had with the local *exec.Cmd. brokerCriuCmd emulates the exact
 	// .Start()/poll()/.Pid() subset joinNsRestore used.
-	criuCmd := newBrokerCriuCmd(wrapperArgs...)
+	criuCmd := newBrokerCriuCmd(ctx, wrapperArgs...)
 	// ADR-0125: netns is joined by path (--join-ns net:<path>), not by an inherited fd.
 	// ADR-0181: no ExtraFiles — the wrapper owns fd delivery; the agent holds no cgroup fds.
 	// Capture CRIU's stderr: when CRIU fails before opening its -o logfile (e.g. arg/ext-mount
@@ -4902,8 +4945,16 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	var agentPIDsErr error
 	criuWrapperPID := criuCmd.Pid()
 	var workloadLive bool
+	// ADR-0354 D2b(iii): the cgroup-liveness wait is bounded by min(now+cgroupPollTimeout,
+	// ctx.Deadline()), not a fixed 60s clock divorced from the caller's migration deadline —
+	// this is the actual invariant-#8 overshoot fix (the fixed 60s + fixed 30s poll clocks
+	// were the concrete overshoot vector, not the per-RPC 30s bound in Start()/poll()). The
+	// loop also exits promptly on ctx.Err() (cancellation), not just deadline expiry.
 	cgroupDeadline := time.Now().Add(cgroupPollTimeout)
-	for time.Now().Before(cgroupDeadline) {
+	if dl, ok := ctx.Deadline(); ok && dl.Before(cgroupDeadline) {
+		cgroupDeadline = dl
+	}
+	for time.Now().Before(cgroupDeadline) && ctx.Err() == nil {
 		exited, exitCode, brokerCgroupPIDs, pollErr := criuCmd.poll()
 		if pollErr != nil {
 			// Broker round-trip failure is transient relative to the wrapper; retry on the
@@ -4952,6 +5003,15 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	}
 
 	if !workloadLive {
+		if ctx.Err() != nil {
+			// ADR-0354 D2b/D7: the loop exited on the CALLER's deadline/cancellation, not the
+			// local 60s fixed clock — record this distinctly from a genuine broker/CRIU failure
+			// so post-incident review can tell "the invariant-#8 guardrail fired as designed"
+			// from "CRIU actually never produced a live workload."
+			metrics.BrokerExecDeadlineAbortsTotal.WithLabelValues("broker_criu_poll_cgroup").Inc()
+			log.Info("ADR-0354 D2b/D7: cgroup-liveness poll loop aborted on caller-deadline enforcement",
+				"migration", migrationName, "ctxErr", ctx.Err())
+		}
 		stderrTail := strings.TrimSpace(criuStderr.String())
 		if len(stderrTail) > 4096 {
 			stderrTail = stderrTail[len(stderrTail)-4096:]
@@ -4993,12 +5053,27 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	}
 	var pid int
 	pidfilePath := filepath.Join(dataDir, restoredPidfileName)
+	// ADR-0354 D2b(iii): bound the pidfile-resolution wait by min(remaining(ctx), 30s) instead
+	// of a bare 30s literal divorced from the caller's migration deadline, and exit on
+	// ctx.Err() rather than running the fixed clock out. pidfileCtxAborted distinguishes a
+	// caller-deadline/cancel exit (D7) from a genuine "CRIU never wrote a pidfile" failure.
+	pidfileBudget := remainingOrCeiling(ctx, 30*time.Second)
+	pidfileCtxAborted := false
 	pidfilePoll := func() (bool, error) {
+		if ctx.Err() != nil {
+			pidfileCtxAborted = true
+			return true, nil
+		}
 		exited, _, _, perr := criuCmd.poll()
 		return exited, perr
 	}
-	pid, err = readRestoredPIDFromPidfile(pidfilePath, 30*time.Second, pidfilePoll)
+	pid, err = readRestoredPIDFromPidfile(pidfilePath, pidfileBudget, pidfilePoll)
 	if err != nil {
+		if pidfileCtxAborted || ctx.Err() != nil {
+			metrics.BrokerExecDeadlineAbortsTotal.WithLabelValues("broker_criu_poll_pidfile").Inc()
+			log.Info("ADR-0354 D2b/D7: pidfile-resolution wait aborted on caller-deadline enforcement",
+				"migration", migrationName, "ctxErr", ctx.Err())
+		}
 		// Fail loud — never fall back to comm-scan or cgroup-diff (ADR-0228 NRI/gRPC symmetry).
 		// Surface the CRIU restore.log tail: a missing pidfile is usually the DOWNSTREAM symptom
 		// of a restore that aborted earlier (e.g. mount-v2 open_tree on an external mount), and the
@@ -5078,10 +5153,21 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	// using the PID resolved from the pod cgroup (never the CRIU PID). On the cold path this
 	// is the CNI-wired pod netns (lo is normally already up); on the TCP-stateful path it is the
 	// pre-staged migration netns. Idempotent either way.
-	// ADR-0348: routed through the netns broker (fail-closed), SrcPID. No context.Context is
-	// threaded through joinNsRestore's fixed signature (shared by both the NRI and gRPC restore
-	// paths) — use context.Background(), matching ReadReplVethMAC/resolveReplVethPeer.
-	if r := netnsbroker.NewClient().NetnsExec(context.Background(), pid, "", "ip", "link", "set", "lo", "up"); r.SpawnErr != nil {
+	// ADR-0348: routed through the netns broker (fail-closed), SrcPID. ADR-0354 D2c: joinNsRestore
+	// DOES carry a real ctx — its first parameter — so this now threads it instead of rooting on
+	// context.Background(). This is a FORWARD/idempotent op (bringing lo up is a no-op if already
+	// up), so the binding is symmetric — no context.WithoutCancel (contrast D2b's Signal()).
+	deadlineAborted := false
+	r := netnsbroker.NewClient().NetnsExec(ctx, pid, "", "ip", "link", "set", "lo", "up")
+	if r.SpawnErr != nil && ctx.Err() != nil {
+		deadlineAborted = true
+	}
+	if deadlineAborted {
+		metrics.BrokerExecDeadlineAbortsTotal.WithLabelValues("netns_exec").Inc()
+		log.Info("ADR-0354 D2c/D7: netns_exec (loopback-up) aborted on caller-deadline enforcement",
+			"migration", migrationName, "ctxErr", ctx.Err())
+	}
+	if r.SpawnErr != nil {
 		log.Info("joinNsRestore: warning — failed to bring up loopback", "err", r.SpawnErr, "op", "netns_exec")
 	} else if r.ExitCode != 0 {
 		log.Info("joinNsRestore: warning — failed to bring up loopback", "err", fmt.Errorf("exit %d", r.ExitCode), "output", string(r.Combined))
@@ -5095,7 +5181,7 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	// IP. Gated on petnsPath != "" — a pod dataplane netns was joined (the MAC-handoff case);
 	// host-network / None cold restores join no eth0-bearing netns and latch nothing.
 	if petnsPath != "" {
-		captureRestoredVethMAC(migrationName, pid, "")
+		captureRestoredVethMAC(ctx, migrationName, pid, "")
 	}
 
 	success = true
@@ -5934,7 +6020,7 @@ func (s *AgentServer) resolveSandboxIDForMigration(ctx context.Context, migratio
 	if pod.UID == "" {
 		return "", fmt.Errorf("resolveSandboxIDForMigration: replacement pod %s/%s has no UID", podNs, pod.Name)
 	}
-	sandboxID, err := sandboxIDForPodUIDFn(string(pod.UID))
+	sandboxID, err := sandboxIDForPodUIDFn(ctx, string(pod.UID))
 	if err != nil {
 		// The replacement pod is resolved (its UID is known via the authoritative migration-name
 		// label), but the ctr query found no containerd sandbox for it yet — the destination kubelet
@@ -6042,8 +6128,8 @@ var sandboxIDForPodUIDFn = sandboxIDForPodUID
 // label. Mirrors the existing ctr-based lookup idiom (sandboxNetnsPath) — no
 // new external binary dependency. Returns errNoSandboxForPodUID (wrapped) when the query succeeds
 // but no sandbox exists yet, so callers can distinguish that retryable race from a hard ctr error.
-func sandboxIDForPodUID(podUID string) (string, error) {
-	out, err := nsenterCmd("/usr/local/bin/ctr", "--namespace", "k8s.io", "containers", "list",
+func sandboxIDForPodUID(ctx context.Context, podUID string) (string, error) {
+	out, err := nsenterCmd(ctx, "/usr/local/bin/ctr", "--namespace", "k8s.io", "containers", "list",
 		"-q", "labels.\"io.kubernetes.pod.uid\"=="+podUID).Output()
 	if err != nil {
 		return "", fmt.Errorf("ctr containers list for pod uid %s: %w", podUID, err)
@@ -6402,6 +6488,24 @@ const hostMntNS = "/proc/1/ns/mnt"
 // criu wrapper path) and is NOT subject to this timeout.
 const brokerExecTimeout = 5 * time.Minute
 
+// brokerCriuOpTimeout (ADR-0354 D2b) is the per-RPC upper clamp for a single
+// brokerCriuCmd Start()/poll() round-trip (exec_start / exec_poll). It is the promoted,
+// named form of the previous bare `30 * time.Second` literal — the value is unchanged,
+// only its role changes: it is now a CEILING combined with the caller ctx via
+// remainingOrCeiling (min(remaining(ctx), brokerCriuOpTimeout)), never a floor.
+const brokerCriuOpTimeout = 30 * time.Second
+
+// rollbackExecBudget (ADR-0354 D3/D2b) bounds every fail-closed rollback/abort broker exec —
+// the CRIU-wrapper Signal() kill (D2b) and the rollback cleanup execs (D3) — once the forward
+// migration ctx is already Done. It is deliberately SHORT relative to brokerExecTimeout/
+// brokerCriuOpTimeout: rollback is entered precisely because the forward budget was exhausted,
+// and ADR-0353's single-owner restore lock must not be held open by a wedged rollback exec.
+// 10s is chosen as comfortably above the broker's normal exec_signal/exec round-trip (well
+// under 1s on a healthy node, per the runtime-dependency audit) while staying an order of
+// magnitude below brokerCriuOpTimeout (30s) and two orders below brokerExecTimeout (5m) — short
+// enough that a rollback exec that blows this budget is unambiguously wedged, not just slow.
+const rollbackExecBudget = 10 * time.Second
+
 // brokerCmd is the run-to-completion shim returned by nsenterCmd. ADR-0231: the
 // SD-1 main agent cannot itself enter the host mount namespace (setns(CLONE_NEWNS)
 // requires CAP_SYS_ADMIN effective in the HOST init userns — only the privileged
@@ -6413,13 +6517,50 @@ const brokerExecTimeout = 5 * time.Minute
 // Output(), CombinedOutput(), Run(). The long-running CRIU wrapper is NOT routed
 // here (it needs a detached spawn + host PID) — see nsenterCriuWrapperStart.
 type brokerCmd struct {
+	ctx  context.Context
 	argv []string
 }
 
+// remainingOrCeiling returns the smaller of ctx's remaining budget and ceiling. When ctx
+// carries no deadline, the ceiling itself is returned (ADR-0354 D2/D2b: the ceiling is only
+// ever an upper clamp for a caller with no deadline, never a floor that widens a shorter
+// caller budget).
+func remainingOrCeiling(ctx context.Context, ceiling time.Duration) time.Duration {
+	if dl, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(dl); remaining < ceiling {
+			if remaining < 0 {
+				return 0
+			}
+			return remaining
+		}
+	}
+	return ceiling
+}
+
+// brokerExecBudget returns the D2 clamp for a brokerCmd exec: min(remaining(ctx),
+// brokerExecTimeout). This can only tighten, never widen, the effective ceiling.
+func brokerExecBudget(ctx context.Context) time.Duration {
+	return remainingOrCeiling(ctx, brokerExecTimeout)
+}
+
 func (b *brokerCmd) result() netnsbroker.ExecResult {
-	ctx, cancel := context.WithTimeout(context.Background(), brokerExecTimeout)
+	callerCtx := b.ctx
+	if callerCtx == nil {
+		// Defensive fallback only — every call site is required (D1/D6.3) to construct
+		// brokerCmd via nsenterCmd(ctx, ...), which always sets ctx. A nil here means a
+		// future call site bypassed nsenterCmd; do not silently root in Background().
+		callerCtx = context.Background()
+	}
+	budget := brokerExecBudget(callerCtx)
+	ctx, cancel := context.WithTimeout(callerCtx, budget)
 	defer cancel()
-	return netnsbroker.NewClient().Exec(ctx, brokerExecTimeout, b.argv...)
+	result := netnsbroker.NewClient().Exec(ctx, budget, b.argv...)
+	if ctx.Err() != nil && result.SpawnErr != nil {
+		metrics.BrokerExecDeadlineAbortsTotal.WithLabelValues("broker_cmd").Inc()
+		log.Info("ADR-0354 D2/D7: broker exec aborted on caller-deadline enforcement, not a broker failure",
+			"argv", b.argv, "ctxErr", ctx.Err())
+	}
+	return result
 }
 
 // Output returns stdout and, on non-zero exit, an error carrying the exit code —
@@ -6464,8 +6605,8 @@ func (b *brokerCmd) Run() error {
 // built a local `nsenter --mount=/proc/1/ns/mnt` *exec.Cmd, which the SD-1
 // de-privileged agent cannot execute (EPERM on setns). The call sites are
 // unchanged — they invoke .Output()/.CombinedOutput()/.Run() on the result.
-func nsenterCmd(args ...string) *brokerCmd {
-	return &brokerCmd{argv: args}
+func nsenterCmd(ctx context.Context, args ...string) *brokerCmd {
+	return &brokerCmd{ctx: ctx, argv: args}
 }
 
 // ADR-0234: the CRIU restore wrapper launch is now broker-delegated.
@@ -6510,6 +6651,11 @@ const brokerCriuWrapperPollInterval = 50 * time.Millisecond
 // agent cgroup. The diff logic (new entrant != pre-spawn snapshot, != wrapper PID,
 // != "criu" comm) is otherwise unchanged.
 type brokerCriuCmd struct {
+	// ctx is the caller's restore/migration ctx (ADR-0354 D2b), threaded from
+	// joinNsRestore's ctx parameter at construction (newBrokerCriuCmd). Start()/poll()
+	// derive their per-RPC budget from it; Signal() deliberately does NOT bind to it
+	// directly (see Signal's comment) — the asymmetric abort leg.
+	ctx        context.Context
 	argv       []string
 	wrapperPID int
 	Stderr     *bytes.Buffer
@@ -6517,9 +6663,17 @@ type brokerCriuCmd struct {
 
 func (c *brokerCriuCmd) Pid() int { return c.wrapperPID }
 
-// Start spawns the wrapper detached via the broker and records its host PID.
+// brokerCriuOpBudget returns the D2b clamp for a single Start()/poll() RPC:
+// min(remaining(ctx), brokerCriuOpTimeout). Tighten-only, same discipline as D2/D6.4.
+func brokerCriuOpBudget(ctx context.Context) time.Duration {
+	return remainingOrCeiling(ctx, brokerCriuOpTimeout)
+}
+
+// Start spawns the wrapper detached via the broker and records its host PID. Forward op —
+// bound to the caller ctx (ADR-0354 D2b), never context.Background().
 func (c *brokerCriuCmd) Start() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	budget := brokerCriuOpBudget(c.ctx)
+	ctx, cancel := context.WithTimeout(c.ctx, budget)
 	defer cancel()
 	pid, err := netnsbroker.NewClient().ExecStart(ctx, c.argv...)
 	if err != nil {
@@ -6532,9 +6686,11 @@ func (c *brokerCriuCmd) Start() error {
 // poll returns whether the wrapper has exited, its exit code (valid only when
 // exited), and the broker-cgroup PID set for the liveness diff. It also refreshes
 // the Stderr buffer from the broker-side capture so the failure path can surface
-// CRIU's stderr exactly as the local-nsenter path did.
+// CRIU's stderr exactly as the local-nsenter path did. Forward op — bound to the
+// caller ctx (ADR-0354 D2b), never context.Background().
 func (c *brokerCriuCmd) poll() (exited bool, exitCode int, cgroupPIDs []int, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	budget := brokerCriuOpBudget(c.ctx)
+	ctx, cancel := context.WithTimeout(c.ctx, budget)
 	defer cancel()
 	pr, perr := netnsbroker.NewClient().ExecPoll(ctx, c.wrapperPID)
 	if perr != nil {
@@ -6547,16 +6703,26 @@ func (c *brokerCriuCmd) poll() (exited bool, exitCode int, cgroupPIDs []int, err
 	return !pr.Running, pr.ExitCode, pr.CgroupPIDs, nil
 }
 
-// Signal asks the broker to deliver sig to the wrapper (Abort path).
+// Signal asks the broker to deliver sig to the wrapper (Abort/kill path). This is the
+// deliberately-ASYMMETRIC leg (ADR-0354 D2b): it is invoked precisely when c.ctx is already
+// Done() (operator Abort, or forward-deadline expiry), so binding it to c.ctx directly would
+// make do() compute an already-past deadline and fail the exec_signal RPC WITHOUT delivering
+// the kill — orphaning the CRIU wrapper AND the CRIU-restored process tree on the destination
+// (a destination ghost, invariant #3). context.WithoutCancel(c.ctx) severs the Done-ness of the
+// expired forward ctx while rollbackExecBudget still hard-bounds the kill, so it both (a) still
+// fires when the forward ctx is Done and (b) cannot hold ADR-0353's restore lock open past
+// rollbackExecBudget.
 func (c *brokerCriuCmd) Signal(sig int) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.ctx), rollbackExecBudget)
 	defer cancel()
 	return netnsbroker.NewClient().ExecSignal(ctx, c.wrapperPID, sig)
 }
 
-// newBrokerCriuCmd builds a broker-backed CRIU wrapper command for the given argv.
-func newBrokerCriuCmd(args ...string) *brokerCriuCmd {
-	return &brokerCriuCmd{argv: args, Stderr: &bytes.Buffer{}}
+// newBrokerCriuCmd builds a broker-backed CRIU wrapper command for the given argv, bound to
+// the caller's restore/migration ctx (ADR-0354 D2b) — threaded from joinNsRestore's ctx
+// parameter at the construction site.
+func newBrokerCriuCmd(ctx context.Context, args ...string) *brokerCriuCmd {
+	return &brokerCriuCmd{ctx: ctx, argv: args, Stderr: &bytes.Buffer{}}
 }
 
 // setupRestoreOverlayfs launches a temporary placeholder container (via nsenter in the host
@@ -6573,7 +6739,7 @@ func newBrokerCriuCmd(args ...string) *brokerCriuCmd {
 // containerID: when non-empty, the replacement container's own bundle rootfs is used directly
 // (it is already set up by containerd when NRI StartContainer fires). The placeholder container
 // path is only used as a fallback when containerID is empty (legacy gRPC restore path).
-func setupRestoreOverlayfs(migrationName, checkpointDir, imageName, containerID string) (string, error) {
+func setupRestoreOverlayfs(ctx context.Context, migrationName, checkpointDir, imageName, containerID string) (string, error) {
 	// ADR-0151: prefer the replacement container's own bundle rootfs over creating a placeholder.
 	// At NRI StartContainer time containerd has already mounted the overlay for the replacement
 	// container at this path. Using it directly avoids the placeholder overlay corruption problem:
@@ -6594,7 +6760,7 @@ func setupRestoreOverlayfs(migrationName, checkpointDir, imageName, containerID 
 					// layouts where test -d {usr,bin,lib,sbin} is a false negative. A mounted overlay
 					// with ≥1 top-level entry IS the real image rootfs (mirrors the placeholder path's
 					// own readiness check below). Use the SAME acceptance criterion on both paths.
-					lsOut, lsErr := nsenterCmd("ls", "-A", containerRootfs).Output()
+					lsOut, lsErr := nsenterCmd(ctx, "ls", "-A", containerRootfs).Output()
 					hasImageContent := lsErr == nil && len(strings.TrimSpace(string(lsOut))) > 0
 					if hasImageContent {
 						log.Info("setupRestoreOverlayfs: using replacement container bundle rootfs directly (ADR-0151)",
@@ -6638,7 +6804,7 @@ func setupRestoreOverlayfs(migrationName, checkpointDir, imageName, containerID 
 	// Use `ctr task ls --quiet` to check for a running task with the placeholder ID.
 	// A stale bundle dir (from a previous failed attempt) would have dirs but no running task
 	// and no overlay mount — do NOT accept it.
-	taskOut, _ := nsenterCmd("ctr", "--namespace", "k8s.io", "tasks", "ls", "--quiet").Output()
+	taskOut, _ := nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "tasks", "ls", "--quiet").Output()
 	placeholderRunning := strings.Contains(string(taskOut), placeholderID)
 	if placeholderRunning && hostOverlayMounted() {
 		log.Info("setupRestoreOverlayfs: placeholder rootfs already present (overlay confirmed)", "rootfs", rootfsDir)
@@ -6646,12 +6812,12 @@ func setupRestoreOverlayfs(migrationName, checkpointDir, imageName, containerID 
 	}
 
 	// Kill any stale placeholder from a previous attempt.
-	_ = nsenterCmd("ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
-	_ = nsenterCmd("ctr", "--namespace", "k8s.io", "container", "rm", placeholderID).Run()
+	_ = nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
+	_ = nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "container", "rm", placeholderID).Run()
 	// Remove stale bundle dir left by containerd (containerd does not auto-clean on kill).
 	// This is necessary so containerd can create a fresh bundle with a properly mounted overlay.
 	// Use nsenterCmd since the agent container cannot access /run/containerd/... directly.
-	if out, err := nsenterCmd("rm", "-rf", bundleDir).CombinedOutput(); err != nil {
+	if out, err := nsenterCmd(ctx, "rm", "-rf", bundleDir).CombinedOutput(); err != nil {
 		// Non-fatal — bundleDir may not exist; ctr run will create a fresh one.
 		log.Info("setupRestoreOverlayfs: rm stale bundleDir (non-fatal)", "dir", bundleDir, "err", err, "out", string(out))
 	}
@@ -6659,7 +6825,7 @@ func setupRestoreOverlayfs(migrationName, checkpointDir, imageName, containerID 
 	// Launch a placeholder container inside the host mount namespace so containerd prepares
 	// the overlayfs snapshot layers. nsenterCmd ensures ctr runs in the host mount namespace
 	// (necessary because containerd resolves temp paths like /tmp in the host namespace).
-	runOut, err := nsenterCmd("ctr", "--namespace", "k8s.io", "run",
+	runOut, err := nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "run",
 		"--detach", "--snapshotter", "overlayfs",
 		imageName, placeholderID, "sleep", "600",
 	).CombinedOutput()
@@ -6676,7 +6842,7 @@ func setupRestoreOverlayfs(migrationName, checkpointDir, imageName, containerID 
 			continue
 		}
 		// Overlay is mounted. Verify image content via nsenterCmd (runs in host namespace).
-		lsOut, lsErr := nsenterCmd("ls", rootfsDir).Output()
+		lsOut, lsErr := nsenterCmd(ctx, "ls", rootfsDir).Output()
 		if lsErr == nil && len(strings.TrimSpace(string(lsOut))) > 0 {
 			log.Info("setupRestoreOverlayfs: placeholder rootfs ready (overlay mounted + content verified)",
 				"rootfs", rootfsDir, "attempts", i+1)
@@ -6775,7 +6941,7 @@ func (s *AgentServer) PreDumpRound(_ context.Context, req *agentpb.PreDumpRoundR
 // When PODMOTION_MOCK_CRIU=true (dev/kind env var), a graceful fallback writes a mock
 // checkpoint manifest so the end-to-end flow can proceed without real CRIU support.
 // In production (PODMOTION_MOCK_CRIU unset), CRIU errors propagate up as failures.
-func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointRequest) (*agentpb.CheckpointResponse, error) {
+func (s *AgentServer) Checkpoint(ctx context.Context, req *agentpb.CheckpointRequest) (*agentpb.CheckpointResponse, error) {
 	log.Info("Checkpoint called", "migration", req.MigrationName)
 
 	// Stage on tmpfs (/run is a tmpfs mount on Linux) so checkpoint images containing
@@ -6886,7 +7052,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 	// CRIU images that runc can restore on the destination. Falls back to raw CRIU (go-criu)
 	// if the containerd task ID can't be found (non-k8s environments, tests).
 	if podUID != "" {
-		taskID, taskErr := FindContainerTaskID(podUID)
+		taskID, taskErr := FindContainerTaskID(ctx, podUID)
 		if taskErr == nil {
 			// ADR-0134: cache the resolved task ID so the raw-CRIU config.json staging step
 			// below can reuse it. After the raw CRIU dump runs with --tcp-established, the
@@ -6897,7 +7063,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 			resolvedTaskID = taskID
 			log.Info("Checkpoint: using containerd-native ctr checkpoint", "taskID", taskID)
 			freezeStart := time.Now()
-			sizeBytes, ctrErr := ctrCheckpoint(taskID, imagesDir, tcpEstablished)
+			sizeBytes, ctrErr := ctrCheckpoint(ctx, taskID, imagesDir, tcpEstablished)
 			freezeDurationMs := time.Since(freezeStart).Milliseconds()
 
 			if ctrErr != nil {
@@ -7210,7 +7376,7 @@ func (s *AgentServer) Checkpoint(_ context.Context, req *agentpb.CheckpointReque
 			stageTaskID := resolvedTaskID
 			var taskErr error
 			if stageTaskID == "" {
-				stageTaskID, taskErr = FindContainerTaskID(podUID)
+				stageTaskID, taskErr = FindContainerTaskID(ctx, podUID)
 			}
 			if taskErr == nil && stageTaskID != "" {
 				srcCfg := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s/config.json", stageTaskID)
@@ -7389,6 +7555,11 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 			"migration", req.MigrationName)
 		return nil, status.Error(codes.Aborted, ErrRestoreInFlight.Error())
 	}
+	// ADR-0354 D3/DR-3: same reasoning as JoinNsRestore's release (server.go ~821) — the
+	// rollbackExecBudget-bounded brokerCriuCmd.Signal() kill (D2b) and the tighten-only
+	// min(remaining(ctx), ceiling) forward broker execs (D2/D2b) mean this defer-based release
+	// already cannot be held open by a wedged broker exec past its bound. No additional lock
+	// machinery is added here.
 	defer releaseRestore(req.MigrationName)
 
 	// 0700: checkpoint images contain process memory and secrets.

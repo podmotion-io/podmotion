@@ -317,7 +317,7 @@ func TestParseEth0IPv4Addrs_RetainsScope(t *testing.T) {
 // boundary are observable without a real netns broker.
 func TestFinalizeRestore_D4_LivenessAndFailClosed(t *testing.T) {
 	origMAC := readReplVethMACFn
-	readReplVethMACFn = func(_ int, _, _ string) (string, error) { return "aa:bb:cc:dd:ee:ff", nil }
+	readReplVethMACFn = func(_ context.Context, _ int, _, _ string) (string, error) { return "aa:bb:cc:dd:ee:ff", nil }
 	defer func() { readReplVethMACFn = origMAC }()
 
 	newServerWithPM := func(t *testing.T, migration string) *AgentServer {

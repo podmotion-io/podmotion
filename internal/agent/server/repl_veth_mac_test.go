@@ -35,7 +35,7 @@ func TestJoinNsRestore_PopulatesMAC(t *testing.T) {
 
 	// Inject stub: always returns the expected MAC.
 	orig := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
+	readReplVethMACFn = func(_ context.Context, pid int, netnsPath, ifname string) (string, error) {
 		return wantMAC, nil
 	}
 	defer func() { readReplVethMACFn = orig }()
@@ -57,7 +57,7 @@ func TestJoinNsRestore_PopulatesMAC(t *testing.T) {
 // preserved because source deletion is gated on TrafficVerified=True.
 func TestJoinNsRestore_EmptyMACStrictFails(t *testing.T) {
 	orig := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
+	readReplVethMACFn = func(_ context.Context, pid int, netnsPath, ifname string) (string, error) {
 		return "", errors.New("stub: nsenter failed")
 	}
 	defer func() { readReplVethMACFn = orig }()
@@ -78,7 +78,7 @@ func TestJoinNsRestore_EmptyMACStrictFails(t *testing.T) {
 // queryable CR-status condition set by finalizeRestore (when k8s client is available).
 func TestJoinNsRestore_EmptyMACBestEffortDegrades(t *testing.T) {
 	orig := readReplVethMACFn
-	readReplVethMACFn = func(pid int, netnsPath, ifname string) (string, error) {
+	readReplVethMACFn = func(_ context.Context, pid int, netnsPath, ifname string) (string, error) {
 		return "", errors.New("stub: nsenter failed")
 	}
 	defer func() { readReplVethMACFn = orig }()

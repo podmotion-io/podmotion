@@ -85,7 +85,7 @@ func TestResolvePodNetnsSandboxWaiting_SandboxAppearsAfterRace_Resolves(t *testi
 
 	var calls int32
 	origFn := sandboxIDForPodUIDFn
-	sandboxIDForPodUIDFn = func(podUID string) (string, error) {
+	sandboxIDForPodUIDFn = func(_ context.Context, podUID string) (string, error) {
 		// Not-found for the first 3 probes (kubelet still creating the sandbox), then it appears —
 		// the exact errNoSandboxForPodUID edge resolveSandboxIDForMigration classifies as retryable.
 		if atomic.AddInt32(&calls, 1) <= 3 {
@@ -130,7 +130,7 @@ func TestResolvePodNetnsSandboxWaiting_SandboxNeverAppears_FailsClosed(t *testin
 	}()
 
 	origFn := sandboxIDForPodUIDFn
-	sandboxIDForPodUIDFn = func(string) (string, error) { return "", errNoSandboxForPodUID }
+	sandboxIDForPodUIDFn = func(context.Context, string) (string, error) { return "", errNoSandboxForPodUID }
 	defer func() { sandboxIDForPodUIDFn = origFn }()
 
 	start := time.Now()
@@ -159,7 +159,7 @@ func TestResolvePodNetnsSandboxWaiting_HardCtrError_FailsClosedImmediately(t *te
 
 	var calls int32
 	origFn := sandboxIDForPodUIDFn
-	sandboxIDForPodUIDFn = func(string) (string, error) {
+	sandboxIDForPodUIDFn = func(context.Context, string) (string, error) {
 		atomic.AddInt32(&calls, 1)
 		return "", errors.New("ctr containers list: connection refused") // containerd down — terminal
 	}
@@ -199,7 +199,7 @@ func TestRestore_StrictSandboxAppearsAfterRace_PassesGate(t *testing.T) {
 	// Sandbox missing on probe 1, present on probe 2 — the race.
 	var sbCalls int32
 	origFn := sandboxIDForPodUIDFn
-	sandboxIDForPodUIDFn = func(podUID string) (string, error) {
+	sandboxIDForPodUIDFn = func(_ context.Context, podUID string) (string, error) {
 		if atomic.AddInt32(&sbCalls, 1) < 2 {
 			return "", errNoSandboxForPodUID
 		}
