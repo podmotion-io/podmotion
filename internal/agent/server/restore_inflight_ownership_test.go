@@ -39,7 +39,7 @@ func TestRestoreInFlightSingleOwner_NotYetAliveRace(t *testing.T) {
 	entered := make(chan struct{})
 
 	origJoin := joinNsRestoreFn
-	joinNsRestoreFn = func(_ context.Context, _, _, _, _, _, _, _ string, _ bool, _ []reattachMount, _, _ string) (int, []ExternalMountDroppedInfo, error) {
+	joinNsRestoreFn = func(_ context.Context, _, _, _, _, _, _, _ string, _ bool, _ []reattachMount, _, _, _ string) (int, []ExternalMountDroppedInfo, error) {
 		atomic.AddInt32(&criuCallCount, 1)
 		close(entered) // signal the NRI call has entered CRIU (claim is held, not-yet-alive)
 		<-unblock      // hold the not-yet-alive window open until the test unblocks it
@@ -115,7 +115,7 @@ func TestJoinNsRestore_PanicsWithoutClaim(t *testing.T) {
 	// Call the real chokepoint function directly (bypassing claimRestore) to prove the entry
 	// assertion fires. Arguments beyond migrationName are irrelevant — the assertion is the
 	// very first statement in the function body.
-	_, _, _ = joinNsRestore(context.Background(), migName, "/tmp/does-not-matter", "", "", "", "", "", false, nil, "", "")
+	_, _, _ = joinNsRestore(context.Background(), migName, "/tmp/does-not-matter", "", "", "", "", "", false, nil, "", "", "")
 }
 
 // TestRestoreInFlight_ReleasedOnCompletionAndFailure is T2 (R4/R6): the claim is absent after a

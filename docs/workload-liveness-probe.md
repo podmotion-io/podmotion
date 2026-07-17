@@ -13,7 +13,7 @@ condition.
 
 | `spec.applicationProbe.protocol` | What "alive" means |
 |---|---|
-| `SQL` | A real PostgreSQL wire-protocol v3 handshake (StartupMessage, no password — the probe never authenticates) followed by a query (default `SELECT 1`, overridable via `query`). Success requires a genuine `RowDescription` + at least one `DataRow` + `CommandComplete` + `ReadyForQuery` sequence. |
+| `SQL` | A real PostgreSQL wire-protocol v3 handshake (StartupMessage, no password — the probe never authenticates). **Trust / no-auth server:** replies `AuthenticationOk`, and the probe then runs a query (default `SELECT 1`, overridable via `query`) requiring a genuine `RowDescription` + at least one `DataRow` + `CommandComplete` + `ReadyForQuery`. **Password-protected server:** replies with a genuine authentication *challenge* (`AuthenticationCleartextPassword`/`MD5Password`/`SASL`/…), which only a live postmaster past `canAcceptConnections` + a real protocol-v3 backend can frame — this is itself proof of liveness, so the probe PASSES there without authenticating. An `ErrorResponse` (`'E'`, including "the database system is starting up" `57P03`), a malformed auth message, or a continuation/unknown auth subtype as the first reply is a FAILURE. |
 | `Redis` (dispatched internally as `REDIS`) | A RESP-encoded `PING`, requiring the literal `+PONG\r\n` reply. |
 | `HTTP` | An HTTP GET (default path `/`, overridable via `query`) requiring a genuine `[200,300)` status. Redirects (3xx) are treated as failures — the client does not follow them. |
 | `TCP` | A bare TCP connect/close, for protocols with no richer handshake defined yet. |
@@ -53,9 +53,15 @@ fallback.
   dial any address outside this node's pod-CIDR allowlist, derived from `Node.Spec.PodCIDRs`. An
   unpopulated or unparseable allowlist (e.g. no Kubernetes client wired) fails **closed** —
   every dial is refused, never permitted by default.
-- **No credentials are ever sent.** The Postgres probe never sends a password and treats any
-  `AuthenticationXXX` response other than `AuthenticationOk` as a failure
-  (`AuthRequired`). No auth header is attached to the HTTP probe.
+- **No credentials are ever sent.** The Postgres probe never sends a password. A trust/no-auth
+  server (`AuthenticationOk`) is proven by the full `SELECT 1` query; a password-protected server
+  is proven by its genuine authentication *challenge* (a wire-correct challenge can only come from
+  a live postmaster + real backend, so it is affirmative liveness) — the probe stops at the
+  challenge as a PASS without ever authenticating. It never answers the challenge and holds no
+  credential material (`ApplicationProbeSpec` has no password field). No auth header is attached to
+  the HTTP probe. _(sprint46B9 round-3 correction: the earlier "auth challenge = `AuthRequired`
+  failure" disposition was a false negative on healthy password-protected Postgres and is
+  superseded — see ADR-0325 Decision item 1 amendment.)_
 
 ## Diagnosing a stuck `Verifying` phase
 
@@ -73,7 +79,8 @@ Reason values currently emitted by `reconcileServiceVerifying`:
 - `AmbiguousProbeDefault` — multiple container ports matched the heuristic; set
   `spec.applicationProbe` explicitly to disambiguate.
 - `ExplicitProbeFailed` / `DefaultedProbeFailed` — the probe RPC completed but the protocol
-  handshake/check failed (wrong credentials rejected, non-2xx HTTP, wrong PING reply, etc.).
+  handshake/check failed (Postgres `ErrorResponse` / server still starting up `57P03`, non-2xx
+  HTTP, wrong PING reply, etc.).
 - `ExplicitProbePassed` / `DefaultedProbePassed` — the probe succeeded.
 
 A stuck reconcile with no condition set at all (rather than a `False` condition) most often means

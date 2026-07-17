@@ -217,6 +217,26 @@ func (c *Client) ResolveVeth(ctx context.Context, srcPID int) ExecResult {
 	}
 }
 
+// HolderSentinelReady asks the unconfined broker whether the holder-quiescent
+// sentinel (/run/podmotion/holder-ready) has been written inside the restore-target
+// container identified by containerID. The de-privileged SD-1 agent cannot observe
+// it directly: dereferencing /proc/<holderPID>/root routes through a ptrace_may_access
+// gate that the `podmotion-agent` AppArmor profile denies against the holder's
+// cri-containerd.apparmor.d peer profile — the same delegation class as ResolveVeth.
+// A false return with a nil error is a valid negative (holder not yet parked / PID
+// not yet resolvable); the caller keeps polling. A non-nil error means the broker
+// was unreachable or rejected the request.
+func (c *Client) HolderSentinelReady(ctx context.Context, containerID string) (bool, error) {
+	resp, err := c.do(ctx, Request{Op: "holder_sentinel", ContainerID: containerID})
+	if err != nil {
+		return false, fmt.Errorf("netns-broker holder_sentinel %s: %w", containerID, err)
+	}
+	if resp.Error != "" {
+		return false, fmt.Errorf("netns-broker holder_sentinel %s: %s", containerID, resp.Error)
+	}
+	return resp.Found, nil
+}
+
 // NetnsExec asks the privileged broker to run an allowlisted ("ip" or the self
 // sentinel) command inside the target pod's NET namespace, run-to-completion
 // (ADR-0346). Exactly one of srcPID (a live PID, takes precedence) or
