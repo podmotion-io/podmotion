@@ -514,6 +514,42 @@ func detectCNI() string {
 	return "unknown"
 }
 
+// requiredBinaryForCNI maps a detected CNI plugin to the external binary its
+// IPHandoffStrategy implementation depends on being present on PATH. Only CNIs with
+// such a dependency have an entry; a CNI absent from this map has no startup binary
+// check (its handoff strategy has no such dependency today).
+//
+// calico -> calicoctl: CalicoHandoff.WaitForWorkloadEndpointReady (internal/agent/iphandoff/
+// calico.go) is documented as a stopgap that shells out via calicoctl until a direct CRD
+// client lands (M9); this check makes a missing calicoctl fail loud and immediate at agent
+// startup instead of surfacing as a confusing exec error mid-migration on the reconcile hot
+// path (tryEstablishDataplaneReachability in podmigration_controller.go).
+var requiredBinaryForCNI = map[string]string{
+	"calico": "calicoctl",
+}
+
+// PreflightRequiredCNIBinaries detects this node's CNI plugin (the same detectCNI used by
+// Register, honoring PODMOTION_CNI_OVERRIDE) and, if that CNI's IPHandoffStrategy depends on
+// an external binary being present on PATH, verifies it resolves via exec.LookPath.
+//
+// Fail-closed by design — mirrors the netnsbroker ADR-0347 A1 startup-pin pattern used for
+// nsenter/ip (internal/agent/netnsbroker/server.go Serve(): resolve required binaries once at
+// startup, from the trusted startup PATH, and fail loud before serving any request rather than
+// discovering the gap mid-operation. A missing required binary here must be a loud, immediate
+// agent startup failure, not a silent skip.
+func PreflightRequiredCNIBinaries() error {
+	cni := detectCNI()
+	bin, required := requiredBinaryForCNI[cni]
+	if !required {
+		return nil
+	}
+	if _, err := exec.LookPath(bin); err != nil {
+		return fmt.Errorf("PreflightRequiredCNIBinaries: detected CNI %q requires %q on PATH but it was not found (fail-closed — see internal/agent/iphandoff/calico.go WaitForWorkloadEndpointReady): %w",
+			cni, bin, err)
+	}
+	return nil
+}
+
 // ipMobilitySupported reports whether PodMotion's overlay FDB/VTEP handoff
 // (ADR-0048 eBPF XDP VTEP + ADR-0133 neighbor injection) can preserve pod IPs
 // on this CNI. A CNI match is a necessary condition but not sufficient: the overlay
