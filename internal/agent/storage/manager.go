@@ -9,7 +9,10 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -22,6 +25,39 @@ import (
 )
 
 const conditionStorageReadyForFreeze = "StorageReadyForFreeze"
+
+const (
+	// preStageMaxAttempts bounds the retry on a transient PreStage failure
+	// (e.g. the Longhorn Manager DNS name not yet resolvable right after a
+	// fresh agent pod restart). Bounded and small on purpose — this must not
+	// become an unbounded/exponential retry that eats the whole migration's
+	// completion budget.
+	preStageMaxAttempts = 3
+	// preStageRetryBackoff is a fixed short delay between PreStage retry
+	// attempts (not exponential-to-infinity).
+	preStageRetryBackoff = 3 * time.Second
+)
+
+// isTransientPreStageError reports whether err is a network/timeout-class
+// error worth a bounded retry — DNS not yet converged, connection refused
+// right after a fresh pod restart, dial/read timeouts — as opposed to a
+// permanent error (e.g. a real "volume not found" 404 from the Longhorn
+// Manager API). Retrying a permanent error only wastes the migration's
+// completion budget, so those must fail fast instead.
+func isTransientPreStageError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded)
+}
 
 // MigrationOptions carries context required by tier migrators.
 type MigrationOptions struct {
@@ -98,7 +134,7 @@ func NewStorageMigrationManager(c client.Client) *StorageMigrationManager {
 func NewStorageMigrationManagerWithProduction(c client.Client, cephDestPool, longhornManagerURL string) *StorageMigrationManager {
 	m := NewStorageMigrationManager(c)
 	if longhornManagerURL != "" {
-		m.Migrators[TierLonghorn] = NewLonghornMigrator(longhornManagerURL)
+		m.Migrators[TierLonghorn] = NewLonghornMigrator(longhornManagerURL, c)
 	}
 	m.Migrators[TierCephRBD] = NewCephRBDMigrator(cephDestPool)
 	m.Migrators[TierSnapshotRsync] = NewSnapshotRsyncMigrator(c)
@@ -179,9 +215,28 @@ func (m *StorageMigrationManager) RunPreStage(ctx context.Context, pm *pmv1.PodM
 	}
 
 	log.Info("starting storage pre-stage", "tier", highest.Tier, "reason", highest.Reason)
-	if err := migrator.PreStage(ctx, opts); err != nil {
+	var preStageErr error
+retryLoop:
+	for attempt := 1; attempt <= preStageMaxAttempts; attempt++ {
+		preStageErr = migrator.PreStage(ctx, opts)
+		if preStageErr == nil {
+			break
+		}
+		if attempt == preStageMaxAttempts || !isTransientPreStageError(preStageErr) {
+			break
+		}
+		log.Info("pre-stage failed with a transient error — retrying",
+			"tier", highest.Tier, "attempt", attempt, "maxAttempts", preStageMaxAttempts, "err", preStageErr)
+		select {
+		case <-ctx.Done():
+			preStageErr = ctx.Err()
+			break retryLoop
+		case <-time.After(preStageRetryBackoff):
+		}
+	}
+	if preStageErr != nil {
 		return m.patchStorageReady(ctx, pm, metav1.ConditionFalse, "PreStageFailed",
-			fmt.Sprintf("tier%d pre-stage: %v", highest.Tier, err))
+			fmt.Sprintf("tier%d pre-stage: %v", highest.Tier, preStageErr))
 	}
 
 	// PreStage succeeded — for Tier0 (RWX) this is sufficient.
