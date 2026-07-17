@@ -8,6 +8,7 @@ you may not use this file except in compliance with the License.
 package server
 
 import (
+	"context"
 	"os/exec"
 	"syscall"
 	"testing"
@@ -64,7 +65,10 @@ func TestThawSourcePID_RoutesThroughBrokerNotDirectKill(t *testing.T) {
 
 	// Attempt the thaw. With the broker route and no broker socket, this delivers no
 	// SIGCONT to the child; it logs an error and returns. It must NOT directly resume.
-	thawSourcePID(pid, "test-c06-source-thaw")
+	// ADR-0354 round 7: thawSourcePID now takes a leading ctx; this test harness has no
+	// real upstream Abort ctx to thread (it drives the thaw directly), so
+	// context.Background() is used deliberately — test-only, not a live path.
+	thawSourcePID(context.Background(), pid, "test-c06-source-thaw")
 
 	// Give any (erroneous) direct SIGCONT time to take effect, then assert the child is
 	// STILL stopped — i.e. thawSourcePID did NOT deliver a direct kill.
