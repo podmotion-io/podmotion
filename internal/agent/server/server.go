@@ -960,6 +960,11 @@ func (s *AgentServer) JoinNsRestore(ctx context.Context, migrationName, namespac
 	if reErr != nil {
 		return 0, "", reErr
 	}
+	// P-0193-1 (2026-07-18): fold in the podmotion-holder-bin scaffold mount so it is preserved and
+	// re-attached like a Tier1-Longhorn PVC, instead of being B-2-dropped and papered over with a
+	// REBIND_TO_ROOT that ENOENTs on a second-or-later migration (see doc on
+	// appendHolderScaffoldReattachMount).
+	reattachMounts = s.appendHolderScaffoldReattachMount(joinNsRestoreCtx, migrationName, reattachMounts)
 	// ADR-0355 D2/D3: read the authoritative preserved source IP (pm.Spec.SourcePodIP — the same
 	// field SingleHomeRestoredPod single-homes on) and thread it into joinNsRestore so the pre-CRIU
 	// bind-prep can make it locally bindable before soccr's bind() on an established-TCP restore.
@@ -1287,6 +1292,105 @@ func reattachHostTargets(ms []reattachMount) map[string]string {
 	return m
 }
 
+// podmotionHolderScaffoldContainerPath / podmotionHolderScaffoldVolumeName mirror the literals
+// kept independently in internal/controller/podmigration_controller.go (holderMountPath) and
+// internal/agent/storage/classifier.go (podmotionHolderVolumeName) — this package does not import
+// either (same cross-package-literal convention already used by classify_reg_fd's
+// podmotion_scaffold_mnt_ids doc comment in server.go/patch_checkpoint_script.go). All three
+// copies must stay in sync.
+const (
+	podmotionHolderScaffoldContainerPath = "/podmotion"
+	podmotionHolderScaffoldVolumeName    = "podmotion-holder-bin"
+)
+
+// resolveHolderScaffoldHostPathFn resolves the destination-host directory backing the replacement
+// pod's podmotion-holder-bin EmptyDir volume, or "" if it cannot be resolved. Overridable in tests.
+//
+// Unlike a PVC-backed re-attach mount (resolveKubeletVolumeHostPath), a plain EmptyDir is never
+// itself a separate entry in the HOST's mount table — it is a plain kubelet pod-dir that only
+// becomes a distinct mount inside the container's OWN mount namespace when the OCI runtime
+// bind-mounts it at container-create time. kubeletVolumeGlobFn's /proc/self/mountinfo scan would
+// therefore never find it. Presence is instead probed directly (broker exec `test -d`) against the
+// deterministic kubelet pod-volume path for the replacement pod's UID.
+var resolveHolderScaffoldHostPathFn = func(ctx context.Context, replUID string) string {
+	if replUID == "" {
+		return ""
+	}
+	path := fmt.Sprintf("/var/lib/kubelet/pods/%s/volumes/kubernetes.io~empty-dir/%s", replUID, podmotionHolderScaffoldVolumeName)
+	// The netns-broker's exec allowlist permits "sh" but not a bare "test" (see
+	// resolveNetnsBindByProcPath for the identical, already-established idiom) — the directory
+	// probe MUST go through `sh -c` or every call is unconditionally rejected with "exec: binary
+	// \"test\" not in broker allowlist" regardless of whether the target exists, which is exactly
+	// what made this a permanent silent no-op (P-0193-1, live-confirmed 2026-07-18).
+	if err := nsenterCmd(ctx, "sh", "-c", fmt.Sprintf("test -d %q", path)).Run(); err != nil {
+		return ""
+	}
+	return path
+}
+
+// appendHolderScaffoldReattachMount resolves the destination replacement pod's kubelet-managed
+// EmptyDir directory backing the podmotion-holder-bin scaffold mount (/podmotion) and, when
+// resolved, appends it to mounts as a preserved re-attach mount — the SAME mechanism already
+// proven for Tier0 RWX / Tier1-Longhorn PVCs (resolveReattachMounts doc; patch_checkpoint_script.go
+// reattach_mount_paths).
+//
+// Root cause (P-0193-1, live-confirmed 2026-07-18, nginx-live-mig2 second migration): on a
+// second-or-later migration the checkpointed SOURCE pod is itself a prior replacement pod, so its
+// process holds a REG fd open on its own holder binary at /podmotion/holder. Before this fix,
+// patchCheckpointImages treated /podmotion as an ordinary external mount and B-2-DROPPED it
+// entirely from the mountpoints image, then classify_reg_fd's REBIND_TO_ROOT special-case forced
+// the now-orphaned fd's mnt_id onto the container ROOT mount. At restore, CRIU's open_path() then
+// resolves the recorded name ("/podmotion/holder" stripped of the root mount's "/" prefix, i.e.
+// "podmotion/holder") against the ROOT mount's OWN dedicated root — a DIFFERENT vfsmount than the
+// /podmotion EmptyDir bind-mounted on top of it by the container runtime — so the lookup lands on
+// the pre-bind-mount placeholder directory and ENOENTs:
+//
+//	Error (criu/files-reg.c:2353): Can't open file podmotion/holder on restore: No such file or directory
+//
+// Preserving the mount (this fix) instead of dropping it means the REG fd's mnt_id classifies
+// KEEP (not orphaned at all — classify_reg_fd never even reaches the REBIND_TO_ROOT branch for
+// it), and CRIU restores it through the real, destination-freshly-provisioned /podmotion mount via
+// the standard --ext-mount-map <ext_key>:<host_target> path (buildCRIURestoreArgs'
+// reattachExtMountMap loop) — the identical mechanism already proven for the Tier1-Longhorn
+// literal-ext_key case (the mount.c:3141 fix; /podmotion's dump-time ext_key is the literal
+// "/podmotion", not CRIU's "CRIU:AUTOGENERATED" auto-detect constant, live-confirmed via the
+// CRIU_EXTERNAL_MOUNT_DROPPED event: {"mnt_id":2343,"ext_key":"/podmotion","source":"/dev/vda1"}).
+//
+// Returns mounts unchanged (no-op) when the replacement pod or its scaffold directory cannot be
+// resolved — patchCheckpointImages then falls back to its pre-existing B-2-drop +
+// REBIND_TO_ROOT handling for /podmotion, unchanged from before this fix, rather than blocking
+// restore on this specific enhancement.
+func (s *AgentServer) appendHolderScaffoldReattachMount(ctx context.Context, migrationName string, mounts []reattachMount) []reattachMount {
+	if s.k8sClient == nil || migrationName == "" {
+		return mounts
+	}
+	pm, ok := s.lookupPodMigration(ctx, migrationName)
+	if !ok {
+		return mounts
+	}
+	podNs := pm.Spec.PodNamespace
+	if podNs == "" {
+		podNs = pm.Namespace
+	}
+	replPod := s.resolveReplacementPod(ctx, migrationName, podNs)
+	if replPod == nil || replPod.UID == "" {
+		return mounts
+	}
+	host := resolveHolderScaffoldHostPathFn(ctx, string(replPod.UID))
+	if host == "" {
+		return mounts
+	}
+	return append(mounts, reattachMount{
+		ContainerPath: podmotionHolderScaffoldContainerPath,
+		HostTarget:    host,
+		// Reuses the Tier1-Longhorn label: both share the identical literal-ext_key restore
+		// mechanism (see doc above). The tier value is diagnostic-only (patch_checkpoint_script.go
+		// argv[6] doc) — it does not change which entries are preserved or how the source is
+		// rewritten, both of which are identical across tiers.
+		Tier: reattachTierTier1Longhorn,
+	})
+}
+
 // replacementPodLabelKey is the label the controller stamps on the replacement pod at creation
 // time (podmigration_controller.go). It equals the PodMigration name. It is the authoritative,
 // race-free way to find the replacement pod on the destination node — unlike
@@ -1327,6 +1431,82 @@ func (s *AgentServer) resolveReplacementPod(ctx context.Context, migrationName, 
 		match = p
 	}
 	return match
+}
+
+// resolvePriorMigrationRestoredPID detects whether the pod being checkpointed is ITSELF the
+// replacement pod created by a prior PodMigration (i.e. this is a second-or-later migration of
+// the same workload) and, if so, returns the real workload PID that prior migration's restore
+// recorded on this node.
+//
+// Root cause (P-0193-2, second-or-later-migration dump-side wrong-process-selection): on a
+// second-or-later migration, JoinNsRestore's restore of the PRIOR migration only joined the
+// freshly-CRIU-restored real workload process into the pod's network namespace by path
+// (--join-ns net:<nsPath>) — it never re-registered that process as containerd's tracked task-1
+// for the container. containerd's own task-tracking therefore still points at the
+// podmotion-inject-holder placeholder that started (and stayed parked) at pod creation, so both
+// FindContainerTaskID/ctr's containerd-task view AND the cgroup-scan-based FindContainerPID risk
+// selecting the placeholder rather than the real restored workload (both processes share the
+// same pod cgroup, and the placeholder — started first — has the lower PID that FindContainerPID
+// prefers). The result: the second migration's checkpoint silently captures the holder verbatim,
+// CRIU restore then "succeeds" at the restore layer, and the replacement pod fails liveness with
+// connection refused (nothing is listening) instead of failing restore outright.
+//
+// The prior migration's restore already recorded the REAL restored PID durably on its own
+// PodMigration CR's Status.RestoredPID (the same field the destination agent's fail-fast
+// liveness pre-check and ADR-0228 reachability echo already trust as ground truth) — this is a
+// K8s-API-persisted record, unlike the in-memory pendingResumePIDs map, so it survives an agent
+// restart between migrations. This pod is identifiable as a prior replacement pod by the same
+// authoritative podmotion.io/migration-name label (replacementPodLabelKey) the controller stamps
+// at replacement-pod creation and the agent already uses elsewhere (resolveReplacementPod) — its
+// value is the PRIOR migration's name.
+//
+// Returns (pid, priorMigrationName, true) only when the prior migration's recorded PID is
+// positively re-verified as still alive, in the same pod's cgroup, and not the pause container —
+// i.e. it is safe to trust directly. Returns (0, "", false) for a first-time migration (no label)
+// or when the recorded PID cannot be re-verified, in which case callers fall back to the
+// pre-existing containerd-task-trusting resolution unchanged.
+func (s *AgentServer) resolvePriorMigrationRestoredPID(ctx context.Context, podNamespace, podName, podUID string) (int32, string, bool) {
+	if s.k8sClient == nil || podNamespace == "" || podName == "" || podUID == "" {
+		return 0, "", false
+	}
+	pod := &corev1.Pod{}
+	getCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := s.k8sClient.Get(getCtx, types.NamespacedName{Name: podName, Namespace: podNamespace}, pod); err != nil {
+		return 0, "", false
+	}
+	priorMigName := pod.Labels[replacementPodLabelKey]
+	if priorMigName == "" {
+		// First-time migration: this pod was never a PodMotion replacement pod.
+		return 0, "", false
+	}
+	priorPM := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(getCtx, types.NamespacedName{Name: priorMigName, Namespace: podNamespace}, priorPM); err != nil {
+		log.Info("resolvePriorMigrationRestoredPID: prior migration CR not found — falling back to containerd-task resolution",
+			"priorMigration", priorMigName, "err", err)
+		return 0, "", false
+	}
+	pid := priorPM.Status.RestoredPID
+	if pid == 0 {
+		return 0, "", false
+	}
+	// Re-verify the recorded PID is still real: alive, in this pod's cgroup, not the pause
+	// container. A stale/reused PID must never be trusted blindly.
+	cgroupData, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		log.Info("resolvePriorMigrationRestoredPID: recorded restoredPID no longer alive — falling back to containerd-task resolution",
+			"priorMigration", priorMigName, "pid", pid, "err", err)
+		return 0, "", false
+	}
+	if !cgroupContainsPodUID(string(cgroupData), podUID) {
+		log.Info("resolvePriorMigrationRestoredPID: recorded restoredPID no longer in this pod's cgroup (reused PID) — falling back to containerd-task resolution",
+			"priorMigration", priorMigName, "pid", pid)
+		return 0, "", false
+	}
+	if isPauseContainer(int(pid)) {
+		return 0, "", false
+	}
+	return pid, priorMigName, true
 }
 
 // ReattachVolumeNotYetPublishedError is a RETRYABLE sentinel returned by resolveReattachMounts when
@@ -4326,6 +4506,68 @@ func resolveInheritCgroupSource(recordedPath, containerCgroupsPath, podCgroupPar
 	return filepath.Join(cgroupFsRoot, base)
 }
 
+// containerCgroupsPathFromBundleFn reads the same "cgroupsPath" field NRI's
+// container.GetLinux().GetCgroupsPath() carries (ADR-0351 D2.2), but sourced from the
+// containerd task bundle's own OCI runtime config.json instead of an NRI ContainerEvent. This is
+// the SAME on-disk field, read for a task the agent resolves itself via FindContainerTaskID —
+// not a re-derivation or a guess. Returns "" on any read/parse failure (caller degrades to the
+// pre-existing recorded-path/cgroup-root fallback chain, unchanged).
+var containerCgroupsPathFromBundleFn = func(taskID string) string {
+	data, err := os.ReadFile(filepath.Join(hostBundleDir(taskID), "config.json"))
+	if err != nil {
+		return ""
+	}
+	var cfg struct {
+		Linux struct {
+			CgroupsPath string `json:"cgroupsPath"`
+		} `json:"linux"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return ""
+	}
+	return cfg.Linux.CgroupsPath
+}
+
+// resolveContainerCgroupsPathForMigration is the gRPC Restore path's self-resolve for
+// containerCgroupsPath (P-0193-2, 2026-07-18). ADR-0351 D1.2/D2 threads containerCgroupsPath from
+// an NRI ContainerEvent on the NRI restore path; the gRPC Restore RPC (both the config.json and
+// raw-CRIU fallback branches) has no NRI event to carry it from and previously passed the literal
+// "" unconditionally — which starves resolveInheritCgroupSource's real-path branch (D2 anchor
+// target) and forces the recorded in-container path ("/sys/fs/cgroup/cpu.max") or the bare
+// cgroup-v2 root, neither of which has an actual cpu.max controller file, live-confirmed to
+// ENOENT the wrapper's open() and exit CRIU restore with status 127 on the fallback path only.
+//
+// Root cause is NOT two independently-diverged resolution functions: resolveInheritCgroupSource
+// is a single shared function whose containerCgroupsPath input the gRPC call sites simply never
+// populated. This resolves the SAME field NRI would have carried (see
+// containerCgroupsPathFromBundleFn) via the replacement pod's UID → real application-container
+// task ID (FindContainerTaskID, the established pause-container-excluding lookup) → that task's
+// own containerd bundle config.json. Returns "" (caller's pre-existing fallback chain, unchanged)
+// when the replacement pod, its task, or its bundle cannot be resolved — this is a best-effort
+// enhancement, not a new fail-closed gate.
+func (s *AgentServer) resolveContainerCgroupsPathForMigration(ctx context.Context, migrationName string) string {
+	if s.k8sClient == nil || migrationName == "" {
+		return ""
+	}
+	pm, ok := s.lookupPodMigration(ctx, migrationName)
+	if !ok {
+		return ""
+	}
+	podNs := pm.Spec.PodNamespace
+	if podNs == "" {
+		podNs = pm.Namespace
+	}
+	replPod := s.resolveReplacementPod(ctx, migrationName, podNs)
+	if replPod == nil || replPod.UID == "" {
+		return ""
+	}
+	taskID, err := FindContainerTaskID(ctx, string(replPod.UID))
+	if err != nil || taskID == "" {
+		return ""
+	}
+	return containerCgroupsPathFromBundleFn(taskID)
+}
+
 // NON-REGRESSION (ADR-0346 D8): the ADR-0348 twelve-site re-point of the direct-agent
 // `nsenter --net=` calls onto the netns broker does NOT reorder the external-mount reattach
 // (the Tier0-RWX postgres re-attach, emitted here as --ext-mount-map entries) relative to CRIU
@@ -6512,6 +6754,31 @@ def classify_reg_fd(entry, ctx):
         if root_mnt_id is None or root_mnt_id not in ctx['kept_mnt_ids']:
             return 'DECLINE'
         return 'REBIND_TO_ROOT'
+    # PodMotion's own holder-bin scaffold mount (the /podmotion emptyDir createReplacementPod
+    # injects into EVERY replacement pod — holderMountPath in
+    # internal/controller/podmigration_controller.go; kept as a literal set here rather than a
+    # shared import, same pattern as podmotionHolderVolumeName in
+    # internal/agent/storage/classifier.go — the two names/paths must stay in sync). On a SECOND
+    # (or later) migration the checkpointed SOURCE pod is itself a prior replacement pod, so its
+    # running process may hold a PLAIN-REG fd open on the holder binary itself (observed live:
+    # files.img fd name_leaf="holder" — the wrapper process's own executable). This mount is
+    # bind-mounted into the container, so CRIU auto-externals it exactly like a PVC and the B-2
+    # drop pass above orphans its mnt_id — which would otherwise hard-stop here even though the
+    # mount is not real workload data. It is safe to REBIND_TO_ROOT for the SAME reason the
+    # tmpfs/shm case above is safe (ADR-0311): the content does not need to survive the
+    # checkpoint. createReplacementPod's "podmotion-inject-holder" init container unconditionally
+    # recreates this volume and copies a byte-identical holder binary to the identical
+    # in-container path on EVERY replacement pod, before the main container starts — so by the
+    # time CRIU restore reopens this fd by its recorded absolute path, the destination's own
+    # freshly-provisioned /podmotion mount is already live in the restored mount tree. Guard is
+    # unweakened: only mnt_ids seeded from this specific well-known scaffold mountpoint qualify;
+    # every other externally-dropped mount (a real PV, a bind-mounted secret, etc.) still DECLINEs.
+    podmotion_scaffold_mnt_ids = ctx.get('podmotion_scaffold_mnt_ids') or set()
+    if mnt_id in podmotion_scaffold_mnt_ids:
+        root_mnt_id = ctx.get('root_mnt_id')
+        if root_mnt_id is None or root_mnt_id not in ctx['kept_mnt_ids']:
+            return 'DECLINE'
+        return 'REBIND_TO_ROOT'
     return 'DECLINE'
 
 # --classify-selftest: read {"ctx":{...},"entries":[...]} from stdin, print the action list.
@@ -6530,6 +6797,8 @@ if len(sys.argv) >= 2 and sys.argv[1] == '--classify-selftest':
         # ADR-0311 follow-up: mnt_id -> fstype (enum-name string) for all mountpoints entries.
         # JSON object keys arrive as strings; classify_reg_fd tolerates int-or-str lookup.
         'mnt_fstypes': _c.get('mnt_fstypes', {}) or {},
+        # PodMotion's own holder-bin scaffold mount mnt_ids (see classify_reg_fd doc above).
+        'podmotion_scaffold_mnt_ids': set(_c.get('podmotion_scaffold_mnt_ids', [])),
     }
     def _entry_type(e):
         reg = e.get('reg', {}) or {}
@@ -7308,11 +7577,30 @@ func (s *AgentServer) Checkpoint(ctx context.Context, req *agentpb.CheckpointReq
 	// raw-CRIU config.json staging step can reuse it without a second (racy) lookup (ADR-0134).
 	var resolvedTaskID string
 
+	// P-0193-2: if this pod is itself a prior migration's replacement pod, positively resolve the
+	// real restored workload PID that migration recorded (see resolvePriorMigrationRestoredPID
+	// doc) BEFORE trusting containerd's task view. When resolved, priorRestoredPID short-circuits
+	// both the ctr-native path below (containerd's task-1 for this container still points at the
+	// parked holder placeholder, not the real restored process) and the raw-CRIU FindContainerPID
+	// resolution further down, checkpointing the real workload directly instead.
+	var priorRestoredPID int32
+	if podUID != "" {
+		if pid, priorMigName, ok := s.resolvePriorMigrationRestoredPID(ctx, pm.Spec.PodNamespace, pm.Spec.PodName, podUID); ok {
+			priorRestoredPID = pid
+			log.Info("Checkpoint: source pod is a prior migration's replacement pod — targeting its real restored workload PID directly via raw CRIU, bypassing the containerd-task view (P-0193-2)",
+				"migration", req.MigrationName, "priorMigration", priorMigName, "restoredPID", pid)
+		}
+	}
+
 	// Try containerd-native checkpoint first (ctr tasks checkpoint).
 	// This handles all container namespaces correctly (network, mount, etc.) and produces
 	// CRIU images that runc can restore on the destination. Falls back to raw CRIU (go-criu)
 	// if the containerd task ID can't be found (non-k8s environments, tests).
-	if podUID != "" {
+	//
+	// Skipped when priorRestoredPID is set (P-0193-2 above): containerd's task-1 view is known
+	// stale on a second-or-later migration, so trusting it here would checkpoint the parked
+	// holder placeholder instead of the real workload.
+	if podUID != "" && priorRestoredPID == 0 {
 		taskID, taskErr := FindContainerTaskID(ctx, podUID)
 		if taskErr == nil {
 			// ADR-0134: cache the resolved task ID so the raw-CRIU config.json staging step
@@ -7416,7 +7704,15 @@ func (s *AgentServer) Checkpoint(ctx context.Context, req *agentpb.CheckpointReq
 	}
 
 	var containerPID int32
-	if podUID != "" {
+	if priorRestoredPID != 0 {
+		// P-0193-2: use the positively re-verified prior-migration restored PID directly — the
+		// cgroup-scan-based FindContainerPID below has the same containerd/parked-holder blind
+		// spot as FindContainerTaskID (both processes share the pod's cgroup, and the earlier-
+		// started holder placeholder has the lower PID FindContainerPID prefers).
+		containerPID = priorRestoredPID
+		log.Info("Checkpoint: using prior migration's recorded restored PID for raw CRIU dump (P-0193-2)",
+			"migration", req.MigrationName, "pid", containerPID)
+	} else if podUID != "" {
 		pid, pidErr := FindContainerPID(podUID)
 		if pidErr != nil {
 			log.Error(pidErr, "Checkpoint: failed to resolve container root PID", "migration", req.MigrationName, "podUID", podUID)
@@ -8102,6 +8398,9 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		if reErr != nil {
 			return nil, fmt.Errorf("resolve re-attach mounts: %w", reErr)
 		}
+		// P-0193-1 (2026-07-18): see appendHolderScaffoldReattachMount doc — same fold-in as the
+		// NRI join-ns restore path, for the gRPC Restore fallback.
+		reattachMounts = s.appendHolderScaffoldReattachMount(ctx, req.MigrationName, reattachMounts)
 		// UNIVERSAL POD-NETNS INTEGRATION (ADR-0325): joining the restored process into ITS
 		// pod's REAL network namespace (the CNI-wired sandbox netns that owns the new pod IP) is a
 		// property of the restore path, NOT of tcpPreservationMode. We resolve the replacement
@@ -8123,15 +8422,21 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		}
 		// ADR-0351 D3.1: pass the incoming gRPC Restore handler ctx — the operator-set restore-RPC
 		// deadline D_restore is the real budget source on this path; no new derivation needed.
-		// ADR-0351 D1.2/D2: this gRPC path has no NRI ContainerEvent, so there is no per-container
-		// cgroup value to thread — passed empty. joinSandboxID CAN still be non-empty here
-		// (ADR-0325 self-resolve), so the anchor gate's containerCgroupsPath=="" leg (documented at
-		// the anchor call site, server.go) applies: the cgroup-anchor step is skipped rather than
-		// fail-closed, a tracked gap (see the anchor call site's comment for the full rationale).
+		// P-0193-2 (2026-07-18): this gRPC path has no NRI ContainerEvent, but self-resolves the
+		// same containerCgroupsPath field NRI would have carried (see
+		// resolveContainerCgroupsPathForMigration doc) rather than passing "" unconditionally —
+		// that empty-string default starved resolveInheritCgroupSource's real cpu.max resolution
+		// and made restore fall back to the recorded in-container path / cgroup-v2 root, neither
+		// of which has an actual cpu.max file, live-confirmed to ENOENT the wrapper's open() and
+		// exit CRIU restore with status 127 on this fallback path (BUG2). podCgroupParent stays ""
+		// (an optional D2.3 validation bound, not required for correctness) — the ADR-0351 D1.2/D2
+		// cgroup-ANCHOR-move step (a separate, broader tracked gap from the one this fixes) still
+		// gates on it below and is unchanged by this fix.
+		containerCgroupsPathResolved := s.resolveContainerCgroupsPathForMigration(ctx, req.MigrationName)
 		// ADR-0355 D2/D3: resolve the authoritative preserved source IP (pm.Spec.SourcePodIP) and
 		// thread it into joinNsRestore for the pre-CRIU bind-prep. "" (no CR / empty field) → no-op.
 		preservedSourceIP := s.resolvePreservedSourceIPForMigration(ctx, req.MigrationName)
-		pid, droppedMnts, joinErr := joinNsRestoreFn(ctx, req.MigrationName, imagesDir, storedWorkloadImage, "", "", joinSandboxID, storedVeth, false, reattachMounts, "", "", preservedSourceIP)
+		pid, droppedMnts, joinErr := joinNsRestoreFn(ctx, req.MigrationName, imagesDir, storedWorkloadImage, "", "", joinSandboxID, storedVeth, false, reattachMounts, containerCgroupsPathResolved, "", preservedSourceIP)
 		// SD-4: CRIU restore has returned — ptrace is no longer expected. Close the window on
 		// the happy path immediately (the deferred close above is the fallback for early returns).
 		_ = seccomp.PtraceWindowClose(req.MigrationName)
@@ -8293,6 +8598,9 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	if rawReErr != nil {
 		return nil, fmt.Errorf("resolve re-attach mounts: %w", rawReErr)
 	}
+	// P-0193-1 (2026-07-18): see appendHolderScaffoldReattachMount doc — same fold-in as the other
+	// two restore paths, for the raw (non-config.json) gRPC Restore path.
+	rawReattachMounts = s.appendHolderScaffoldReattachMount(ctx, req.MigrationName, rawReattachMounts)
 	if patchErr := patchCheckpointImagesFn(imagesDir, nil, reattachContainerPaths(rawReattachMounts), reattachHostTargets(rawReattachMounts), reattachTier1ContainerPaths(rawReattachMounts)); patchErr != nil {
 		if req.TcpPreservationMode == "Strict" {
 			// Strict: fail closed. The controller will initiate rollback.
@@ -8323,11 +8631,15 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	}
 	// ADR-0351 D3.1: same rationale as the config.json branch above — pass the incoming gRPC
 	// Restore handler ctx (D_restore).
-	// ADR-0351 D1.2/D2: same rationale as the primary gRPC branch above — no NRI event on this
-	// raw-CRIU fallback path, so no cgroup value to thread; the anchor gate skips (tracked gap).
+	// P-0193-2 (2026-07-18): same rationale as the primary gRPC branch above — no NRI event on
+	// this raw-CRIU fallback path, but self-resolves containerCgroupsPath the same way (see
+	// resolveContainerCgroupsPathForMigration) instead of passing "" unconditionally (BUG2).
+	// podCgroupParent stays "" — same D2.3-optional-bound rationale as the config.json branch;
+	// the separate cgroup-anchor-move tracked gap is unchanged by this fix.
+	containerCgroupsPathResolved2 := s.resolveContainerCgroupsPathForMigration(ctx, req.MigrationName)
 	// ADR-0355 D2/D3: same pre-CRIU bind-prep threading as the config.json branch above.
 	preservedSourceIP2 := s.resolvePreservedSourceIPForMigration(ctx, req.MigrationName)
-	rawPID, droppedMnts2, joinErr := joinNsRestoreFn(ctx, req.MigrationName, imagesDir, storedWorkloadImage, "", "", joinSandboxID2, storedVeth2, false, rawReattachMounts, "", "", preservedSourceIP2)
+	rawPID, droppedMnts2, joinErr := joinNsRestoreFn(ctx, req.MigrationName, imagesDir, storedWorkloadImage, "", "", joinSandboxID2, storedVeth2, false, rawReattachMounts, containerCgroupsPathResolved2, "", preservedSourceIP2)
 	for _, d := range droppedMnts2 {
 		s.emitExternalMountDroppedEvent(context.Background(), req.MigrationName, d)
 	}

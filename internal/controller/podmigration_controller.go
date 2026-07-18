@@ -6226,6 +6226,50 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 		holderPullPolicy = corev1.PullIfNotPresent
 	}
 
+	// Strip any PodMotion-injected holder artifacts already present on the DEEP-COPIED spec
+	// before re-injecting fresh ones. sourcePod is not always a pristine, never-migrated pod:
+	// on a SECOND (or later) migration of the same workload, sourcePod IS the previous
+	// migration's replacement pod, which already carries the holderVolumeName emptyDir, the
+	// "podmotion-inject-holder" init container, and the holderMountPath VolumeMount on every
+	// main container from ITS OWN createReplacementPod call. Appending a second copy of each
+	// on top produces a Pod spec the API server rejects outright:
+	//   spec.volumes[N].name: Duplicate value: "podmotion-holder-bin"
+	//   spec.initContainers[N].name: Duplicate value: "podmotion-inject-holder"
+	//   spec.containers[0].volumeMounts[N].mountPath: Invalid value: "/podmotion": must be unique
+	// which silently strands the migration with Status.ReplacementPodName never set (reproduced
+	// live, sprint49: nginx-live-proof2-retry, operator log "failed to create replacement pod").
+	// Stripping by name/mountPath here — mirroring the selector-label strip above — makes
+	// replacement-pod creation idempotent regardless of how many times this workload has
+	// already been migrated.
+	filteredVolumes := make([]corev1.Volume, 0, len(spec.Volumes))
+	for _, v := range spec.Volumes {
+		if v.Name == holderVolumeName {
+			continue
+		}
+		filteredVolumes = append(filteredVolumes, v)
+	}
+	spec.Volumes = filteredVolumes
+
+	filteredInitContainers := make([]corev1.Container, 0, len(spec.InitContainers))
+	for _, c := range spec.InitContainers {
+		if c.Name == "podmotion-inject-holder" {
+			continue
+		}
+		filteredInitContainers = append(filteredInitContainers, c)
+	}
+	spec.InitContainers = filteredInitContainers
+
+	for i := range spec.Containers {
+		filteredMounts := make([]corev1.VolumeMount, 0, len(spec.Containers[i].VolumeMounts))
+		for _, m := range spec.Containers[i].VolumeMounts {
+			if m.Name == holderVolumeName || m.MountPath == holderMountPath {
+				continue
+			}
+			filteredMounts = append(filteredMounts, m)
+		}
+		spec.Containers[i].VolumeMounts = filteredMounts
+	}
+
 	// Inject the holder emptyDir volume onto the replacement pod spec.
 	spec.Volumes = append(spec.Volumes, corev1.Volume{
 		Name: holderVolumeName,
