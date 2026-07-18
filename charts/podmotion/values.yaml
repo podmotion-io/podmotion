@@ -48,6 +48,16 @@ agent:
   containerd:
     socketPath: /run/containerd/containerd.sock
     stateDir: /var/lib/containerd
+  # cni.extraConfDir: an additional host CNI conf directory to mount and scan, alongside
+  # the canonical /etc/cni/net.d that nmcregistrar.detectCNI() (internal/agent/nmcregistrar/
+  # registrar.go) checks by default. Needed because some distros do not populate the
+  # canonical path: k3s writes its embedded-Flannel conflist to
+  # /var/lib/rancher/k3s/agent/etc/cni/net.d/10-flannel.conflist instead, leaving
+  # /etc/cni/net.d empty, which otherwise makes detectCNI() report "unknown" and the NMC
+  # CR's spec.networkCapability.cniPlugin does not reflect ground truth. Empty string
+  # (default) disables the extra mount/scan — set for k3s deploys.
+  cni:
+    extraConfDir: ""
   # ADR-0299: the agent's host-namespace statfs (cmd/agent/main.go:99, via
   # /proc/1/root under hostPID) is denied by containerd's default AppArmor
   # profile (cri-containerd.apparmor.d) on substrates where that profile is
