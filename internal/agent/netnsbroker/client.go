@@ -197,6 +197,52 @@ func (c *Client) SignalPID(ctx context.Context, pid, sig int, expectedStarttime 
 	return nil
 }
 
+// KillSourcePID asks the privileged, UNCONFINED broker to deliver SIGKILL — and only
+// SIGKILL, hardcoded server-side, never a caller-selectable signal — to a source-tree PID
+// the broker never spawned (ADR-0356). This is deliberately a separate call/op from
+// SignalPID rather than SignalPID with syscall.SIGKILL: the broker's signal_pid op enforces
+// an SC-1 allowlist restricting it to EXACTLY SIGCONT/SIGSTOP specifically so a compromised
+// de-privileged agent cannot turn it into a general kill proxy (see doSignalPID's doc
+// comment) — widening that allowlist would weaken a real security boundary. Same PID-reuse
+// (starttime) guard as SignalPID: expectedStarttime==0 is rejected server-side.
+func (c *Client) KillSourcePID(ctx context.Context, pid int, expectedStarttime uint64) error {
+	resp, err := c.do(ctx, Request{Op: "kill_source_pid", SignalPID: pid, ExpectedStartTime: expectedStarttime})
+	if err != nil {
+		return fmt.Errorf("netns-broker kill_source_pid %d: %w", pid, err)
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("netns-broker kill_source_pid %d: %s", pid, resp.Error)
+	}
+	return nil
+}
+
+// ProcAlive asks the privileged, UNCONFINED broker to report whether pid is
+// alive (present under /proc and not a zombie), reading /proc/<pid>/stat in
+// the broker's own process rather than the de-privileged agent's. The main
+// agent's own read of another PID's /proc/<pid>/stat crosses a
+// ptrace_may_access gate that AppArmor mediates against the TARGET's peer
+// profile — for a CRIU-restored workload root that is the container runtime's
+// default profile (e.g. cri-containerd.apparmor.d), which the narrow
+// `podmotion-agent` profile's `ptrace (read)` grants (peer=podmotion-agent,
+// peer=unconfined) do NOT cover. A denied direct read is indistinguishable
+// from "the process exited" to a plain os.ReadFile caller, which previously
+// caused a live, healthy, just-restored workload to be misclassified as dead
+// (see doProcAlive's doc comment for the full ADR-0228/ADR-0351 G5 incident
+// this replaces). expectedStarttime, when non-zero, re-validates PID identity
+// the same way SignalPID does (0 skips the guard — used for the first read,
+// which has no prior starttime to compare against). The returned starttime
+// should be latched by the caller for any subsequent guarded re-check.
+func (c *Client) ProcAlive(ctx context.Context, pid int, expectedStarttime uint64) (alive bool, starttime uint64, err error) {
+	resp, err := c.do(ctx, Request{Op: "proc_alive", SignalPID: pid, ExpectedStartTime: expectedStarttime})
+	if err != nil {
+		return false, 0, fmt.Errorf("netns-broker proc_alive %d: %w", pid, err)
+	}
+	if resp.Error != "" {
+		return false, 0, fmt.Errorf("netns-broker proc_alive %d: %s", pid, resp.Error)
+	}
+	return resp.Alive, resp.StartTime, nil
+}
+
 // ResolveVeth asks the privileged broker to enter the pod's NETWORK namespace
 // (/proc/<srcPID>/ns/net) and run `ip -o link show eth0`, returning the raw ip(8)
 // output. The de-privileged SD-1 agent cannot do this itself: opening another

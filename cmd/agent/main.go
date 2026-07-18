@@ -28,6 +28,7 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -118,6 +119,15 @@ func init() {
 	// Without this registration, client.Create(&corev1.Event{}) fails with
 	// "no kind is registered for the type v1.Event in scheme".
 	utilruntime.Must(corev1.AddToScheme(scheme))
+	// classifyReattachTier (server.go) does a typed Get on storagev1.StorageClass to
+	// distinguish a Longhorn-backed re-attach (Tier1-Longhorn) from the generic RWX
+	// re-attach (Tier0 RWX). Without this registration the Get silently errors ("no kind
+	// registered for the type v1.StorageClass in scheme") and classifyReattachTier falls
+	// through to the access-mode-only check on EVERY call, so a Longhorn-backed RWX PVC is
+	// always mislabeled Tier0 RWX regardless of the classification logic being correct —
+	// this was the actual reason the mislabeling persisted even after RBAC on storageclasses
+	// was granted to the agent ClusterRole.
+	utilruntime.Must(storagev1.AddToScheme(scheme))
 }
 
 // brokerHostNSProcess adapts the netns-broker async exec ops (ExecPoll/ExecSignal —

@@ -161,7 +161,28 @@ func (m *LonghornMigrator) SyncPercent(ctx context.Context, opts MigrationOption
 }
 
 // Cutover detaches the volume from the source node and attaches it to the
-// destination. Called after the CRIU restore completes on the destination.
+// destination. Called by the controller from reconcileOverlayHandoff, after
+// the scheduling gate has already been removed (so the destination pod has
+// had a chance to schedule and kubelet has had a chance to mount the
+// volume — the real trigger for Longhorn's dual-engine collapse below) but
+// strictly before CRIU restore is permitted to run on the destination.
+//
+// NOTE (sprint49 root-cause finding): Longhorn's real dual-engine live
+// migration is driven entirely by the CSI attachment tickets on
+// volumeattachments.longhorn.io (spec.attachmentTickets, keyed by the
+// csi-attacher ticket type) — a second pod referencing the PVC on a
+// different node is what makes longhorn-manager populate
+// spec.migrationNodeID and start the second engine; that is a GET-only,
+// observable signal with no REST POST involved. The detachFromNode/
+// attachToNode calls below issue the legacy `?action=detach`/`?action=attach`
+// REST calls, which operate on a DIFFERENT ticket type and have been
+// confirmed (live cluster testing) to have no observed effect on that real
+// csi-attacher-driven attachment state for a migratable:true RWX Longhorn
+// volume. They are left in place rather than removed: they are harmless
+// (dead weight, not wrong), Tier2/Ceph-RBD and Tier3/snapshot-rsync still
+// need their own real Cutover actions through this same tier-agnostic
+// interface, and the actual gate that matters is AwaitSingleOwner below,
+// which polls the real GET-only replica-collapse signal.
 func (m *LonghornMigrator) Cutover(ctx context.Context, opts MigrationOptions) error {
 	log := logf.FromContext(ctx).WithValues("migration", opts.MigrationName, "tier", "Longhorn")
 
@@ -190,14 +211,31 @@ func (m *LonghornMigrator) Cutover(ctx context.Context, opts MigrationOptions) e
 }
 
 // AwaitSingleOwner polls the Longhorn Manager API until each Tier1 volume's
-// replica list has collapsed to exactly one RW/running replica, and that
-// replica sits on opts.DestinationNode — i.e. the dual-engine live-migration
-// pair Cutover's attach left in place has been torn down on the source side
-// by Longhorn's own migration-confirm/handoff step, and the CSI driver will
-// therefore see a single controller when the destination pod's NodeStageVolume
-// call lands (this is the general fix for the "invalid controller count 2"
-// class of error, expressed via Longhorn's real replica-state signal — never
-// a string match on the CSI error itself).
+// controller (engine) list has collapsed to exactly one running controller,
+// and that controller sits on opts.DestinationNode — i.e. the dual-engine
+// live-migration pair Cutover's attach left in place has been torn down on
+// the source side by Longhorn's own migration-confirm/handoff step, so the
+// CSI driver will see a single controller when the destination pod's
+// NodeStageVolume call lands (this is the general fix for the "invalid
+// controller count 2" class of error, expressed via Longhorn's real
+// controller-collapse signal — never a string match on the CSI error itself).
+//
+// sprint49 root-cause finding (live cluster verification, 2026-07-18):
+// this MUST poll the volume's "controllers" (engine) list, NOT its
+// "replicas" list. Longhorn's dual-engine live migration adds a SECOND
+// ENGINE on the destination node and later tears down the source engine —
+// it does not, and for an HA volume (numberOfReplicas>1, the normal case:
+// confirmed live against the longhorn-migratable StorageClass, which sets
+// numberOfReplicas=3) never does, change the underlying REPLICA count.
+// A healthy 3-replica volume keeps all 3 replicas RW/running on their 3
+// nodes for the volume's entire lifetime, migration included (confirmed
+// live: replicas on pm-cp1/pm-w1/pm-w2 all mode=RW running=true both before
+// and after a completed cutover) — polling for "replica count == 1" can
+// never be satisfied and times out every longhornSingleOwnerTimeout forever.
+// The real GET-only signal for "has the dual-engine pair collapsed back to
+// one" is the volume's controllers array (JSON field the live Longhorn
+// v1.9.1 Manager API actually returns, confirmed via GET
+// /v1/volumes/{name}): exactly one entry, running=true, hostId==destNode.
 func (m *LonghornMigrator) AwaitSingleOwner(ctx context.Context, opts MigrationOptions) error {
 	log := logf.FromContext(ctx).WithValues("migration", opts.MigrationName, "tier", "Longhorn")
 
@@ -224,22 +262,23 @@ func (m *LonghornMigrator) AwaitSingleOwner(ctx context.Context, opts MigrationO
 	return nil
 }
 
-// pollUntilSingleOwner polls fetchVolume until exactly one non-failed
-// RW/running replica exists and it is on destNode, or ctx is done (a timeout
-// or cancellation is returned as an error — fail closed, never requeue
-// forever).
+// pollUntilSingleOwner polls fetchVolume until exactly one running
+// controller (engine) exists and it is on destNode, or ctx is done (a
+// timeout or cancellation is returned as an error — fail closed, never
+// requeue forever). See the AwaitSingleOwner doc comment above for why this
+// checks the controller list rather than the replica list.
 func (m *LonghornMigrator) pollUntilSingleOwner(ctx context.Context, volumeName, destNode string) error {
 	for {
 		vol, err := m.fetchVolume(ctx, volumeName)
 		if err == nil {
 			owners := 0
 			destIsSingleOwner := false
-			for _, r := range vol.Replicas {
-				if r.FailedAt != "" || r.Mode != "RW" || !r.Running {
+			for _, c := range vol.Controllers {
+				if !c.Running {
 					continue
 				}
 				owners++
-				if r.NodeID == destNode {
+				if c.NodeID == destNode {
 					destIsSingleOwner = true
 				}
 			}
@@ -261,10 +300,25 @@ func (m *LonghornMigrator) pollUntilSingleOwner(ctx context.Context, volumeName,
 
 // longhornVolume is the subset of the Longhorn volume API response we care about.
 type longhornVolume struct {
-	Name       string            `json:"name"`
-	State      string            `json:"state"`
-	Robustness string            `json:"robustness"`
-	Replicas   []longhornReplica `json:"replicas"`
+	Name       string             `json:"name"`
+	State      string             `json:"state"`
+	Robustness string             `json:"robustness"`
+	Replicas   []longhornReplica  `json:"replicas"`
+	// Controllers is Longhorn's engine list — during dual-engine live
+	// migration this holds one entry per active engine (source + dest);
+	// once the source engine is torn down (migration confirmed) it
+	// collapses to exactly one entry. This is the real single-owner
+	// signal AwaitSingleOwner polls for — see pollUntilSingleOwner.
+	Controllers []longhornController `json:"controllers"`
+}
+
+type longhornController struct {
+	Name string `json:"name"`
+	// NodeID: Longhorn's real /v1/volumes/{name} response field for a
+	// controller's node is "hostId" (same field name as on replicas —
+	// see longhornReplica.NodeID for why the tag matters).
+	NodeID  string `json:"hostId"`
+	Running bool   `json:"running"`
 }
 
 type longhornReplica struct {

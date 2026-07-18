@@ -53,6 +53,21 @@ service MigrationAgentService {
   // pm.Status.CheckpointTransferred has been durably persisted. Idempotent: returns
   // success if the directory is already absent (handles controller-restart replay).
   rpc ReleaseCheckpoint(ReleaseCheckpointRequest) returns (ReleaseCheckpointResponse);
+  // KillFrozenSource delivers SIGKILL directly to the source process left in SIGSTOP by
+  // a LeaveStopped=true CRIU dump (see registerFrozenSource), via the same unconfined
+  // netns-broker path thawFrozenSource uses for SIGCONT. Unlike a Kubernetes pod delete
+  // (which always resumes a stopped container's init process — SIGCONT-then-signal — to
+  // run its stop sequence, giving app-level shutdown code a window to run and mutate
+  // on-disk state before the final SIGKILL lands), this terminates the STILL-STOPPED
+  // process straight from the kernel: SIGKILL is fatal to a stopped task without ever
+  // resuming it to userspace, so no application shutdown/cleanup code ever executes.
+  // Used by the ADR-0356 Tier1-Longhorn early source release, where the source and
+  // destination share the same underlying volume and any app-level shutdown hook that
+  // touches shared on-disk state (e.g. a database unlinking its own lock file) would
+  // corrupt state out from under the already-restored destination process. Idempotent:
+  // returns success if no frozen-source record exists for migration_name (e.g. it was
+  // already thawed or killed).
+  rpc KillFrozenSource(KillFrozenSourceRequest) returns (KillFrozenSourceResponse);
   // InjectIPHandoff installs neighbor/FDB entries on the DESTINATION node so the OLD
   // pod IP becomes reachable at the replacement pod's veth MAC (ADR-0133 Decision 2).
   // Called by the controller in reconcileVerifying after criuRestoreConfirmed=true and
@@ -326,6 +341,29 @@ message ReleaseCheckpointRequest {
 message ReleaseCheckpointResponse {
   bool   success = 1;
   string error   = 2;
+}
+
+message KillFrozenSourceRequest {
+  string migration_name = 1;
+  // pod_uid (optional): the source pod's UID, used as a fallback target when no
+  // frozen-source record exists for migration_name. Not every checkpoint path freezes
+  // the source into SIGSTOP (registerFrozenSource) — the containerd-native "ctr tasks
+  // checkpoint" fast path (Checkpoint's default branch, server.go) checkpoints WITHOUT
+  // stopping the container, so the source keeps running normally afterward exactly like
+  // the LeaveStopped=false case. Without this fallback, KillFrozenSource would silently
+  // no-op (Killed=false) for every ctr-native checkpoint and the unsafe graceful pod
+  // delete would still run, fully reintroducing the ADR-0356 race this RPC exists to
+  // close. When set, and no frozen-source record was found, the agent resolves the
+  // CURRENT container root PID for this pod UID and SIGKILLs that instead.
+  string pod_uid = 2;
+}
+message KillFrozenSourceResponse {
+  bool   success = 1;
+  string error   = 2;
+  // killed is true only when a frozen-source record was found and SIGKILL was actually
+  // delivered; false (with success=true) means there was nothing to kill (already
+  // thawed/killed/never frozen for this migration — a legitimate idempotent no-op).
+  bool   killed  = 3;
 }
 
 // ConfirmOverlayReadyRequest carries the barrier predicate inputs from the controller.
