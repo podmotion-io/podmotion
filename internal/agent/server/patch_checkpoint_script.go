@@ -20,7 +20,8 @@ package server
 
 // patchCheckpointScriptBody is the tail of the assembled patch script (everything after the
 // classify_reg_fd() classifier, which is prepended from classifyRegFdPy). It reads argv:
-//   argv[1]=checkpointDir argv[2]=containerdMaskedPaths(JSON) argv[3]=inheritFdNames(JSON).
+//
+//	argv[1]=checkpointDir argv[2]=containerdMaskedPaths(JSON) argv[3]=inheritFdNames(JSON).
 const patchCheckpointScriptBody = `
 import sys, os, shutil, glob, json
 import pycriu
@@ -176,6 +177,21 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     # fail-closed narrowing (ADR-0311 decision 1), not a regression, out of scope to widen here.
     # Disjoint by construction from any DROP_ROOT_FSTYPES(sysfs) match (TMPFS != sysfs).
     tmpfs_drop_mnt_ids = {e['mnt_id'] for e in img['entries'] if is_drop_root(e) and 'mnt_id' in e and e.get('fstype') == 'TMPFS'}
+
+    # PodMotion's own holder-bin scaffold mount, seeded by MOUNTPOINT (not by drop-pass
+    # membership — this mount is bind-mounted into the container, so it survives Phase A/B and is
+    # instead B-2-dropped below as an auto-detected external, same path as any PVC). "/podmotion"
+    # is holderMountPath (internal/controller/podmigration_controller.go) — kept as a literal here
+    # rather than a shared import, same pattern as podmotionHolderVolumeName in
+    # internal/agent/storage/classifier.go; the two must stay in sync. Built from the ORIGINAL
+    # (pre-drop) img['entries'] so the mnt_id is resolvable regardless of which pass drops it.
+    # See classify_reg_fd (classifyRegFdPy) for why REG fds backed by this mount are safe to
+    # REBIND_TO_ROOT instead of hard-stopping (P-0193-1): the mount's content — the holder binary
+    # — is unconditionally recreated fresh by createReplacementPod's "podmotion-inject-holder"
+    # init container on EVERY replacement pod, so it never needs to survive the checkpoint.
+    PODMOTION_SCAFFOLD_MOUNT_PATHS = {'/podmotion'}
+    podmotion_scaffold_mnt_ids = {e['mnt_id'] for e in img['entries']
+                                  if 'mnt_id' in e and e.get('mountpoint') in PODMOTION_SCAFFOLD_MOUNT_PATHS}
 
     # ADR-0311 follow-up (live-path fix): a COMPLETE mnt_id -> fstype map over EVERY mountpoints
     # entry in the ORIGINAL (pre-drop) image. classify_reg_fd keys the tmpfs/shm REG-fd rebind
@@ -566,6 +582,10 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
         # for non-directory REG orphan fds backed by a dropped tmpfs/shm mount (e.g. PostgreSQL
         # /dev/shm segments) instead of the previous unconditional DECLINE.
         'tmpfs_drop_mnt_ids': tmpfs_drop_mnt_ids,
+        # PodMotion's own holder-bin scaffold mnt_ids, seeded above (mountpoint-keyed, not
+        # fstype-keyed like tmpfs_drop_mnt_ids). Authorizes REBIND_TO_ROOT for the holder
+        # binary's own REG fd on a second-or-later migration (P-0193-1) instead of hard-stopping.
+        'podmotion_scaffold_mnt_ids': podmotion_scaffold_mnt_ids,
         # ADR-0311 follow-up: complete mnt_id->fstype map (pre-drop) so the tmpfs/shm rebind is
         # keyed on the actual mount FSTYPE rather than only the narrow drop-seed set — the live
         # PostgreSQL /dev/shm orphan (backing_mnt_id=943) was tmpfs-backed but never in that set.

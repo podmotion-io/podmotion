@@ -169,8 +169,8 @@ func TestClassifyRegFd_DirRebindTargetValidation(t *testing.T) {
 
 	cases := []struct {
 		name       string
-		rootMntID  any   // nil => key present but null; omitted below via missing flag
-		omitRoot   bool  // true => root_mnt_id key absent entirely
+		rootMntID  any  // nil => key present but null; omitted below via missing flag
+		omitRoot   bool // true => root_mnt_id key absent entirely
 		keptMntIDs []int
 		want       string
 	}{
@@ -310,6 +310,55 @@ func TestClassifyRegFd_SysfsOrphanDeclinesNoAliasing(t *testing.T) {
 	got := runClassifySelftest(t, ctx, []map[string]any{sysfsOrphanRegFd})
 	if got[0].Action != "DECLINE" {
 		t.Fatalf("sysfs orphan REG fd: got %q, want DECLINE (no aliasing with tmpfs_drop_mnt_ids)", got[0].Action)
+	}
+}
+
+// TestClassifyRegFd_PodmotionHolderBinRegRebind is the P-0193-1 regression fixture for the
+// second-migration holder-binary hard-stop, confirmed live 2026-07-18: a SECOND migration's
+// checkpointed source pod (itself a prior replacement pod) has a running process with a
+// PLAIN-REG fd open on its own executable, files.img name_leaf="holder", backed by the
+// podmotion-holder-bin scaffold mount's mnt_id. That mnt_id is B-2-dropped (bind-mounted into
+// the container, so CRIU auto-externals it like any PVC), orphaning the fd. Because the
+// scaffold mnt_id is seeded into podmotion_scaffold_mnt_ids, this now classifies
+// REBIND_TO_ROOT instead of the previous unconditional DECLINE hard-stop.
+func TestClassifyRegFd_PodmotionHolderBinRegRebind(t *testing.T) {
+	ctx := map[string]any{
+		"remap_ids":                  []int{},
+		"inherit_fd_names":           []string{},
+		"kept_mnt_ids":               []int{1},
+		"ext_drop_mnt_ids":           []int{2194},
+		"root_mnt_id":                1,
+		"tmpfs_drop_mnt_ids":         []int{},
+		"podmotion_scaffold_mnt_ids": []int{2194}, // mnt_id of the dropped /podmotion mount.
+	}
+	holderRegFd := reg(1, "/podmotion/holder", 2194, modeFile, false)
+	got := runClassifySelftest(t, ctx, []map[string]any{holderRegFd})
+	if got[0].Action != "REBIND_TO_ROOT" {
+		t.Fatalf("holder-bin REG fd: got action %q, want REBIND_TO_ROOT", got[0].Action)
+	}
+	if got[0].EntryType != "REG" {
+		t.Fatalf("holder-bin REG fd: got entry_type %q, want REG", got[0].EntryType)
+	}
+}
+
+// TestClassifyRegFd_NonScaffoldOrphanStillDeclines proves podmotion_scaffold_mnt_ids does not
+// widen the guard: an orphan REG fd whose mnt_id is NOT in podmotion_scaffold_mnt_ids (a real
+// persistent-data mount that happens to share the B-2-dropped/ext_drop_mnt_ids fate) still
+// hard-stops, exactly like TestClassifyRegFd_UnaccountedOrphanDeclines.
+func TestClassifyRegFd_NonScaffoldOrphanStillDeclines(t *testing.T) {
+	ctx := map[string]any{
+		"remap_ids":                  []int{},
+		"inherit_fd_names":           []string{},
+		"kept_mnt_ids":               []int{1},
+		"ext_drop_mnt_ids":           []int{2951},
+		"root_mnt_id":                1,
+		"tmpfs_drop_mnt_ids":         []int{},
+		"podmotion_scaffold_mnt_ids": []int{2194}, // disjoint from the orphan under test (2951).
+	}
+	dataRegFd := reg(53, "/var/lib/postgresql/data/base/1", 2951, modeFile, false)
+	got := runClassifySelftest(t, ctx, []map[string]any{dataRegFd})
+	if got[0].Action != "DECLINE" {
+		t.Fatalf("non-scaffold orphan REG fd: got %q, want DECLINE (no aliasing with podmotion_scaffold_mnt_ids)", got[0].Action)
 	}
 }
 
