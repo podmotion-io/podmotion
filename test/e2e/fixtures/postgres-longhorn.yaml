@@ -1,0 +1,108 @@
+# PostgreSQL source pod for sprint48 Longhorn-backed live migration proof.
+# Pinned to pm-w1; migrated to pm-w2.
+#
+# Modeled on test/fixtures/db-migration-test/postgres-src.yaml, but PGDATA is
+# backed by an RWX PVC on the 'longhorn-migratable' StorageClass instead of
+# nfs-shared. This is the fixture PodMotion's storage-tier classifier should
+# route through TierLonghorn (internal/agent/storage/classifier.go) via
+# dual-engine live migration (internal/agent/storage/tier1.go), NOT the Tier0
+# RWX re-attach path that the nfs-shared fixture exercises. accessMode is
+# ReadWriteMany to match the StorageClass (parameters.accessMode: rwx).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pm-db-longhorn-test
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pgdata
+  namespace: pm-db-longhorn-test
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: longhorn-migratable
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: pm-db-longhorn-test
+data:
+  init.sql: |
+    CREATE TABLE IF NOT EXISTS counters (
+      id      SERIAL PRIMARY KEY,
+      name    TEXT NOT NULL UNIQUE,
+      value   BIGINT NOT NULL DEFAULT 0,
+      updated TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    INSERT INTO counters (name, value) VALUES ('writes', 0) ON CONFLICT DO NOTHING;
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-src
+  namespace: pm-db-longhorn-test
+  labels:
+    app: postgres-live
+spec:
+  nodeName: pm-w1
+  containers:
+  - name: postgres
+    image: postgres:16-alpine
+    # See postgres-src.yaml (db-migration-test) for the rationale on sysv DSM —
+    # same CRIU-checkpoint-compatibility reasoning applies here.
+    args:
+    - "-c"
+    - "dynamic_shared_memory_type=sysv"
+    env:
+    - name: POSTGRES_DB
+      value: pmtest
+    - name: POSTGRES_USER
+      value: pmuser
+    - name: POSTGRES_PASSWORD
+      value: pmpass
+    - name: PGDATA
+      value: /var/lib/postgresql/data/pgdata
+    ports:
+    - containerPort: 5432
+    volumeMounts:
+    - name: data
+      mountPath: /var/lib/postgresql/data
+    - name: init
+      mountPath: /docker-entrypoint-initdb.d/init.sql
+      subPath: init.sql
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "100m"
+      limits:
+        memory: "256Mi"
+        cpu: "500m"
+    readinessProbe:
+      exec:
+        command: ["pg_isready", "-U", "pmuser", "-d", "pmtest"]
+      initialDelaySeconds: 5
+      periodSeconds: 2
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: postgres-pgdata
+  - name: init
+    configMap:
+      name: postgres-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-live-svc
+  namespace: pm-db-longhorn-test
+spec:
+  selector:
+    app: postgres-live
+  ports:
+  - port: 5432
+    targetPort: 5432
