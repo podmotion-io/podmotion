@@ -1796,17 +1796,41 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 	noneMode := pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeNone
 	livenessOK := probeProtocol == "" || meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionWorkloadLivenessVerified)
 
+	// Bugfix (found live this sprint): these three fast-path branches transition straight to
+	// CutoverComplete on their respective liveness/reachability predicate WITHOUT ever running
+	// the service-path verifier block below that actually sets conditionTrafficVerified=True.
+	// deleteSourcePodIfSafe (ADR-0012) requires TrafficVerified=True before it will delete the
+	// source pod, so taking one of these branches on the FIRST reconcile where the predicate
+	// becomes true — before TrafficVerified has ever been set — wedges CutoverComplete forever
+	// (source pod never deleted, migration never reaches phase=Complete). Each branch now sets
+	// conditionTrafficVerified=True itself, recording the real predicate that justified skipping
+	// the redundant verifier call, before transitioning.
 	if noneMode {
 		if livenessOK {
+			setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "WorkloadLivenessVerified",
+				"TCPPreservationMode=None: WorkloadLivenessVerified (ADR-0325) is the authoritative liveness proof; service-path verifier skipped")
+			if err := r.statusUpdate(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
 			return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
 		}
 	} else if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict {
 		// ADR-0352 D2.1: Strict now advances on ServiceContinuityVerified, not the retired
 		// DataplaneReachabilityVerified.
 		if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionServiceContinuityVerified) && livenessOK {
+			setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "ServiceContinuityVerified",
+				"TCPPreservationMode=Strict: ServiceContinuityVerified (ADR-0352 D1) established; service-path verifier skipped")
+			if err := r.statusUpdate(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
 			return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
 		}
 	} else if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionDataplaneReachabilityVerified) && livenessOK {
+		setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "DataplaneReachabilityVerified",
+			"TCPPreservationMode=BestEffort: DataplaneReachabilityVerified already established; service-path verifier skipped")
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
 	}
 
@@ -1936,7 +1960,7 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 // internal/agent/traffic/remove_source_if_verified_test.go) asserts the two entry points agree.
 // The predicate is:
 //   - Strict:      ServiceContinuityVerified=True (ADR-0352 Service-continuity gate) AND
-//                  TCPSequenceContinuityVerified=True.
+//     TCPSequenceContinuityVerified=True.
 //   - BestEffort:  TrafficVerified=True AND TCPSequenceContinuityVerified=True.
 //   - None:        TrafficVerified=True (legacy cold/stateless pre-check), AND
 //   - ALL modes:   additionally WorkloadLivenessVerified=True (ADR-0325).
