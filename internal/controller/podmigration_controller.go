@@ -1979,6 +1979,94 @@ func sourcePodDeletionBlockReason(mode pmv1.TCPPreservationMode, conditions []me
 //     The source pod is NOT deleted; the migration phase is untouched.
 //   - blocked=false → the gate permitted deletion and the source pod was deleted (or was already
 //     gone / not on the source node). The caller may proceed to finalization.
+//
+// earlyReleaseSourceForTier1Longhorn is the narrow, Tier1-Longhorn-only exception to ADR-0012
+// documented in ADR-0356 (docs/adr/0356-tier1-longhorn-early-source-release.md). It does
+// nothing for every other storage tier — ADR-0012's normal "never delete the source pod
+// before TrafficVerified=True" rule is completely unchanged for TierRWX, TierCephRBD,
+// TierSnapshotRsync, and pods with no PVCs at all.
+//
+// Why this exists: Longhorn's real collapse-to-single-owner mechanism for a
+// TierLonghorn-classified volume is driven by Kubernetes' own CSI attacher, which only
+// releases the source node's VolumeAttachment once no pod on that node references the PVC.
+// For this tier that functionally requires the source pod to be gone BEFORE the destination
+// pod can ever mount its volume — which gates CRIU restore, which gates TrafficVerified,
+// which is exactly the condition ADR-0012 says must be true before the source pod is
+// deleted. Neither side of that cycle can go first under ADR-0012's normal ordering; this
+// function is the one place that breaks it, for this tier only.
+//
+// Replacement safety guarantee (ADR-0356), checked immediately before deletion — not a
+// sleep/timeout guess, but two real, independently-verifiable substrate signals:
+//  1. pm.Status.CheckpointTransferred=True: the checkpoint has already passed the full
+//     ADR-SEC-B chain (sha256 wire-integrity hash, operator-signed manifest, exact
+//     per-file digest match on the destination node — internal/agent/server/server.go
+//     PutCheckpointTar) AND CRIU's own dump-time inventory.img presence check
+//     (internal/agent/criu/criu_checkpointer.go) already ran on the source before the tar
+//     was ever built. This proves a complete, intact, tamper-evident checkpoint is durably
+//     present on the destination node — the source pod is no longer the only copy of the
+//     process's state.
+//  2. The destination node's NodeMigrationCapacity.Status.Ready is re-read fresh (not
+//     stale scheduling-time data): the destination agent is alive and has itself already
+//     probed its own CRIU binary/kernel features successfully (internal/agent/nmcregistrar)
+//     right now, not merely at some earlier point in the migration.
+//
+// What this does NOT prove — stated plainly, not glossed over: neither signal proves the
+// destination pod is actually serving traffic, because that is causally impossible to prove
+// before the volume this function unblocks has even been mounted. ADR-0356 accepts this
+// explicitly: a Tier1-Longhorn migration that fails restore AFTER this point can no longer
+// live-resume the frozen source (it is deleted, and — verified against
+// internal/rollback/rollback.go's StubComputeRollback — the only rollback primitive is an
+// Abort RPC that SIGCONTs a still-running frozen PID, which no longer exists here). Recovery
+// becomes "recreate from the durably-verified checkpoint," a real but bounded-downtime path,
+// not zero-downtime live rollback. This narrows ADR-0012's guarantee for THIS TIER ONLY.
+func (r *PodMigrationReconciler) earlyReleaseSourceForTier1Longhorn(ctx context.Context, pm *pmv1.PodMigration) error {
+	log := logf.FromContext(ctx)
+
+	if pm.Status.StorageTier == nil || storage.StorageTier(*pm.Status.StorageTier) != storage.TierLonghorn {
+		return nil // not this tier — ADR-0012's normal ordering applies untouched.
+	}
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionTier1EarlySourceRelease) {
+		return nil // already done — idempotent no-op on every subsequent reconcile.
+	}
+	if !pm.Status.CheckpointTransferred {
+		// Should never be reached — the caller (reconcileTransferring) only invokes this
+		// after the CheckpointTransferred block above has run — but guard defensively
+		// rather than ever releasing the source without a durably-verified checkpoint.
+		return fmt.Errorf("ADR-0356: refusing early source release before CheckpointTransferred=True")
+	}
+
+	destNode := pm.Status.DestinationNodeName
+	if destNode == "" {
+		destNode = pm.Spec.TargetNodeName
+	}
+	destNMC, nmcErr := r.getNMC(ctx, destNode)
+	if nmcErr != nil {
+		return fmt.Errorf("ADR-0356: fetch destination NMC %s: %w", destNode, nmcErr)
+	}
+	if !destNMC.Status.Ready {
+		return fmt.Errorf("ADR-0356: destination NMC %s not Ready — refusing early source release", destNode)
+	}
+
+	sourcePod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+	if err == nil {
+		if sourcePod.Spec.NodeName == pm.Status.SourceNodeName {
+			log.Info("ADR-0356: deleting source pod early (Tier1-Longhorn) to release the CSI VolumeAttachment blocking destination mount",
+				"pod", pm.Spec.PodName, "node", pm.Status.SourceNodeName, "migration", pm.Name)
+			if delErr := r.Delete(ctx, sourcePod); delErr != nil && !apierrors.IsNotFound(delErr) {
+				return fmt.Errorf("ADR-0356: delete source pod: %w", delErr)
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("ADR-0356: get source pod: %w", err)
+	}
+
+	setCondition(pm, pmv1.ConditionTier1EarlySourceRelease, metav1.ConditionTrue, "Tier1LonghornEarlyRelease",
+		"ADR-0356: source pod released pre-restore (CheckpointTransferred verified durable+intact, destination NMC fresh-Ready) to unblock Longhorn's single-owner collapse; rollback for this migration is now checkpoint-recreate, not live-resume")
+	setCondition(pm, conditionSourcePodDeleted, metav1.ConditionTrue, "Tier1LonghornEarlyRelease",
+		"ADR-0356: source pod deleted early for Tier1-Longhorn storage cutover, ahead of TrafficVerified")
+	return r.statusUpdate(ctx, pm)
+}
+
 func (r *PodMigrationReconciler) deleteSourcePodIfSafe(ctx context.Context, pm *pmv1.PodMigration) (blocked bool, res ctrl.Result) {
 	log := logf.FromContext(ctx)
 
@@ -2990,6 +3078,16 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 				MigrationName: pm.Name,
 			})
 		}
+	}
+
+	// ADR-0356: for Tier1 (Longhorn) migratable volumes ONLY, release the source pod now —
+	// before the scheduling gate below makes the destination pod schedulable — instead of
+	// waiting for TrafficVerified (ADR-0012's normal rule). See earlyReleaseSourceForTier1Longhorn's
+	// doc comment and ADR-0356 for the full rationale; every other tier is untouched.
+	if err := r.earlyReleaseSourceForTier1Longhorn(ctx, pm); err != nil {
+		log.Error(err, "reconcileTransferring: ADR-0356 Tier1-Longhorn early source release not yet safe — requeuing",
+			"migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	// Remove the scheduling gate NOW — images are on the destination node so the
