@@ -20,7 +20,8 @@ package server
 
 // patchCheckpointScriptBody is the tail of the assembled patch script (everything after the
 // classify_reg_fd() classifier, which is prepended from classifyRegFdPy). It reads argv:
-//   argv[1]=checkpointDir argv[2]=containerdMaskedPaths(JSON) argv[3]=inheritFdNames(JSON).
+//
+//	argv[1]=checkpointDir argv[2]=containerdMaskedPaths(JSON) argv[3]=inheritFdNames(JSON).
 const patchCheckpointScriptBody = `
 import sys, os, shutil, glob, json
 import pycriu
@@ -31,7 +32,9 @@ null_ext_key_masked = set(json.loads(sys.argv[2]))
 # ADR-0193 C-R3-1: inherit-fd name set (slash-stripped, from same builder as buildCRIURestoreArgs).
 # Used by P-0193-1 to exclude inherited fds from the PLAIN-REG firing class.
 _raw_inherit = json.loads(sys.argv[3]); inherit_fd_names = set(_raw_inherit) if _raw_inherit is not None else set()
-# argv[4]: shared/re-attach PVC mount paths (Tier0 RWX). An external mountpoints entry whose
+# argv[4]: shared/re-attach PVC mount paths (Tier0 RWX, and Tier1-Longhorn once its own cutover has
+# collapsed to a single owner on the destination — see argv[6] below for the tier split). An
+# external mountpoints entry whose
 # MOUNTPOINT (the in-container mountPath) is in this set is a legitimate re-attachable volume the
 # destination pod mounts identically; it is PRESERVED (not B-2 dropped) so its files.img REG fds
 # classify consistent instead of orphaning into the P-0193-1 hard-stop. NOTE: the match is on the
@@ -56,6 +59,19 @@ reattach_mount_paths = set(_raw_reattach) if _raw_reattach is not None else set(
 # unresolved host target, so CRIU is never invoked with a source-node-only path).
 _raw_reattach_ht = json.loads(sys.argv[5]) if len(sys.argv) > 5 else {}
 reattach_host_targets = _raw_reattach_ht if isinstance(_raw_reattach_ht, dict) else {}
+# argv[6]: the SUBSET of argv[4] (reattach_mount_paths) that classified as Tier1-Longhorn
+# (server.go classifyReattachTier) rather than the generic Tier0 RWX re-attach. Both tiers are
+# preserved and rewritten through the IDENTICAL mechanism below (CRIU binds an AUTODETECTED_MOUNT
+# external from mi->source directly regardless of which tier produced the entry) — this set changes
+# NO behavior, it exists so the log/diagnostic lines below correctly say "Tier1-Longhorn" for a
+# Longhorn dual-engine re-attach instead of unconditionally reporting "Tier0 RWX cross-node" for
+# every re-attach mount, including one whose PVC's StorageClass is actually Longhorn-backed (see
+# server.go classifyReattachTier for why the prior AccessModes-only check mis-tagged this case:
+# PodMotion's own longhorn-migratable StorageClass is ReadWriteMany, so a Tier1-Longhorn PVC was
+# indistinguishable from a Tier0 RWX one by access mode alone).
+# argv[6] may be absent on an older caller — default to empty for backward compatibility.
+_raw_reattach_tier1 = json.loads(sys.argv[6]) if len(sys.argv) > 6 else []
+reattach_tier1_mount_paths = set(_raw_reattach_tier1) if _raw_reattach_tier1 is not None else set()
 
 def backup(path):
     orig = path + '.orig'
@@ -161,6 +177,21 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     # fail-closed narrowing (ADR-0311 decision 1), not a regression, out of scope to widen here.
     # Disjoint by construction from any DROP_ROOT_FSTYPES(sysfs) match (TMPFS != sysfs).
     tmpfs_drop_mnt_ids = {e['mnt_id'] for e in img['entries'] if is_drop_root(e) and 'mnt_id' in e and e.get('fstype') == 'TMPFS'}
+
+    # PodMotion's own holder-bin scaffold mount, seeded by MOUNTPOINT (not by drop-pass
+    # membership — this mount is bind-mounted into the container, so it survives Phase A/B and is
+    # instead B-2-dropped below as an auto-detected external, same path as any PVC). "/podmotion"
+    # is holderMountPath (internal/controller/podmigration_controller.go) — kept as a literal here
+    # rather than a shared import, same pattern as podmotionHolderVolumeName in
+    # internal/agent/storage/classifier.go; the two must stay in sync. Built from the ORIGINAL
+    # (pre-drop) img['entries'] so the mnt_id is resolvable regardless of which pass drops it.
+    # See classify_reg_fd (classifyRegFdPy) for why REG fds backed by this mount are safe to
+    # REBIND_TO_ROOT instead of hard-stopping (P-0193-1): the mount's content — the holder binary
+    # — is unconditionally recreated fresh by createReplacementPod's "podmotion-inject-holder"
+    # init container on EVERY replacement pod, so it never needs to survive the checkpoint.
+    PODMOTION_SCAFFOLD_MOUNT_PATHS = {'/podmotion'}
+    podmotion_scaffold_mnt_ids = {e['mnt_id'] for e in img['entries']
+                                  if 'mnt_id' in e and e.get('mountpoint') in PODMOTION_SCAFFOLD_MOUNT_PATHS}
 
     # ADR-0311 follow-up (live-path fix): a COMPLETE mnt_id -> fstype map over EVERY mountpoints
     # entry in the ORIGINAL (pre-drop) image. classify_reg_fd keys the tmpfs/shm REG-fd rebind
@@ -312,6 +343,11 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
         # token, /dev/shm, /etc/* file binds — none of which mount at a PVC path) is still dropped.
         if ext_key and mnt_id is not None and (mp in reattach_mount_paths or ext_key in reattach_mount_paths):
             reattach_kept_mnt_ids.add(mnt_id)
+            # Tier label for diagnostics only (argv[6]) — does NOT change which entries are preserved
+            # or how the source is rewritten below; both tiers share the identical mechanism (see
+            # argv[6] doc comment above for why a Longhorn re-attach must not be reported as Tier0 RWX).
+            _is_tier1 = mp in reattach_tier1_mount_paths
+            _tier_label = 'Tier1-Longhorn' if _is_tier1 else 'Tier0 RWX'
             host_target = reattach_host_targets.get(mp) or reattach_host_targets.get(ext_key)
             if host_target:
                 # Whole-volume re-attach (the common case, incl. the postgres gate workload): the
@@ -324,11 +360,35 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
                     if isinstance(_orig, str) and _orig:
                         _lead = len(_orig) - len(_orig.lstrip('/'))
                         e[_f] = ('/' * _lead) + host_target.lstrip('/')
-                print('mountpoints: re-attach mnt_id=%d mountpoint=%s root/source rewritten to destination kubelet dir %s (Tier0 RWX cross-node; CRIU binds mi->source directly for AUTODETECTED_MOUNT)' % (
-                    mnt_id, mp, host_target))
+                print('mountpoints: re-attach mnt_id=%d mountpoint=%s root/source rewritten to destination kubelet dir %s (%s cross-node; CRIU binds mi->source directly for AUTODETECTED_MOUNT)' % (
+                    mnt_id, mp, host_target, _tier_label))
+                # mount.c:3141 fix (Tier1-Longhorn "No mapping for <id>:(null) mountpoint"):
+                # the root/source rewrite above is the correct — and ONLY — restore lever for a
+                # TRUE CRIU AUTODETECTED_MOUNT external, whose ext_key is the CRIU-internal
+                # constant literal 'CRIU:AUTOGENERATED': get_mp_root() (criu/mount.c 4.2) special-
+                # cases that exact ext_key and binds from the recorded mi->source directly,
+                # bypassing --ext-mount-map entirely. That bypass was ground-truthed only against
+                # a Tier0 NFS PGDATA checkpoint (ext_key literally 'CRIU:AUTOGENERATED' — see
+                # server.go's reattachHostTargets doc). A Longhorn-backed PVC is mounted from a
+                # real, locally-resolvable block device (an attached Longhorn/iSCSI device
+                # formatted ext4/xfs) — the SAME topological shape CRIU records for ADR-0194's
+                # /data case (mnt_id 2951, source=/dev/nvme0n1p2, ext_key='/data', a LITERAL key,
+                # NOT 'CRIU:AUTOGENERATED'). For a literal ext_key, get_mp_root takes the OTHER
+                # branch: ext = ext_mount_lookup(me->ext_key); if (!ext) "No mapping for
+                # <id>:(null) mountpoint" — the exact wall live-proven against Tier1-Longhorn
+                # restore. So: whenever the entry's REAL on-disk ext_key (read here, not assumed)
+                # is anything other than the CRIU auto-detect constant, also emit a structured
+                # token so buildCRIURestoreArgs can supply the required
+                # --ext-mount-map <ext_key>:<host_target> for THIS entry's actual key. This is a
+                # no-op for the proven AUTODETECTED_MOUNT/Tier0 case (CRIU bypasses the map lookup
+                # for that branch, so an unused extra map entry changes nothing) and is the actual
+                # fix for the literal-ext_key/Tier1-Longhorn case.
+                if ext_key != 'CRIU:AUTOGENERATED':
+                    print('CRIU_REATTACH_EXT_MOUNT_MAP:{"mnt_id":%d,"mountpoint":"%s","ext_key":"%s","host_target":"%s"}' % (
+                        mnt_id, mp.replace('"', '\\"'), ext_key.replace('"', '\\"'), host_target.replace('"', '\\"')))
             kept_after_ext_drop.append(e)
-            print('mountpoints: preserving re-attach external mnt_id=%d mountpoint=%s ext_key=%s (Tier0 RWX)' % (
-                mnt_id, mp, ext_key))
+            print('mountpoints: preserving re-attach external mnt_id=%d mountpoint=%s ext_key=%s (%s)' % (
+                mnt_id, mp, ext_key, _tier_label))
             continue
         if ext_key and mnt_id is not None:
             # P-0194-1b re-entry guard (H2): before dropping, assert no kept entry references
@@ -522,6 +582,10 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
         # for non-directory REG orphan fds backed by a dropped tmpfs/shm mount (e.g. PostgreSQL
         # /dev/shm segments) instead of the previous unconditional DECLINE.
         'tmpfs_drop_mnt_ids': tmpfs_drop_mnt_ids,
+        # PodMotion's own holder-bin scaffold mnt_ids, seeded above (mountpoint-keyed, not
+        # fstype-keyed like tmpfs_drop_mnt_ids). Authorizes REBIND_TO_ROOT for the holder
+        # binary's own REG fd on a second-or-later migration (P-0193-1) instead of hard-stopping.
+        'podmotion_scaffold_mnt_ids': podmotion_scaffold_mnt_ids,
         # ADR-0311 follow-up: complete mnt_id->fstype map (pre-drop) so the tmpfs/shm rebind is
         # keyed on the actual mount FSTYPE rather than only the narrow drop-seed set — the live
         # PostgreSQL /dev/shm orphan (backing_mnt_id=943) was tmpfs-backed but never in that set.

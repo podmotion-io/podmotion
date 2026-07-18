@@ -39,6 +39,7 @@ import (
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -54,6 +55,9 @@ func newFakeAgentServerWithCoreObjects(t *testing.T, objs ...client.Object) *Age
 	}
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatalf("AddToScheme (corev1): %v", err)
+	}
+	if err := storagev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme (storagev1): %v", err)
 	}
 	builder := fake.NewClientBuilder().WithScheme(scheme)
 	if len(objs) > 0 {
@@ -138,7 +142,7 @@ func TestResolveReattachMounts_ResolvesHostTargetByLabelWhenStatusEmpty(t *testi
 	// the resolved host target must be projected into the patch's host-target map (its real consumer).
 	args, err := buildCRIURestoreArgs(
 		"/ckpt", "/rootfs", "/data", "/termlog", "/secrets", "/restore.log",
-		"", "/var/run/netns/cni-x", "", false, mounts)
+		"", "/var/run/netns/cni-x", "", false, mounts, nil)
 	if err != nil {
 		t.Fatalf("buildCRIURestoreArgs returned error with a resolved host target: %v", err)
 	}
@@ -247,7 +251,7 @@ func TestResolveReattachMounts_WaitsThenResolvesWhenVolumeNotYetPublished(t *tes
 	// must NOT emit an inert path-form map; the leaf must land in the patch's host-target map.
 	args, err := buildCRIURestoreArgs(
 		"/ckpt", "/rootfs", "/data", "/termlog", "/secrets", "/restore.log",
-		"", "/var/run/netns/cni-x", "", false, mounts)
+		"", "/var/run/netns/cni-x", "", false, mounts, nil)
 	if err != nil {
 		t.Fatalf("buildCRIURestoreArgs errored on resolved mounts: %v", err)
 	}
@@ -321,7 +325,7 @@ func TestResolveReattachMountsWaiting_BudgetExhausted_FailsClosed(t *testing.T) 
 	// buildCRIURestoreArgs must fail closed on the unresolved host target, never the 1:1 map.
 	if _, err := buildCRIURestoreArgs(
 		"/ckpt", "/rootfs", "/data", "/termlog", "/secrets", "/restore.log",
-		"", "/var/run/netns/cni-x", "", false, mounts); err == nil {
+		"", "/var/run/netns/cni-x", "", false, mounts, nil); err == nil {
 		t.Fatalf("expected buildCRIURestoreArgs to fail closed on unresolved host target; got nil error")
 	}
 }
@@ -372,7 +376,7 @@ func TestResolveReattachMounts_InTreeNFSShapeResolvesEndToEnd(t *testing.T) {
 
 	args, err := buildCRIURestoreArgs(
 		"/ckpt", "/rootfs", "/data", "/termlog", "/secrets", "/restore.log",
-		"", "/var/run/netns/cni-x", "", false, mounts)
+		"", "/var/run/netns/cni-x", "", false, mounts, nil)
 	if err != nil {
 		t.Fatalf("buildCRIURestoreArgs errored on the resolved in-tree NFS mount: %v", err)
 	}
@@ -437,31 +441,58 @@ func TestResolveReattachMounts_ExcludesNonTier0RWOPVC(t *testing.T) {
 	}
 }
 
-// TestPVCIsTier0RWX_AccessModeMatrix pins the Tier0 predicate to the classifier's rule: ONLY a
-// ReadWriteMany access mode is Tier0 re-attach; RWO / ROX / RWOP and the no-access-mode case are not.
-func TestPVCIsTier0RWX_AccessModeMatrix(t *testing.T) {
+// TestClassifyReattachTier_AccessModeMatrix pins the reattach-tier predicate to the classifier's
+// rule for PVCs with no StorageClass (or an unresolvable one): ONLY a ReadWriteMany access mode is
+// Tier0 RWX re-attach; RWO / ROX / RWOP and the no-access-mode case are not reattach-eligible at all.
+func TestClassifyReattachTier_AccessModeMatrix(t *testing.T) {
 	cases := []struct {
 		name  string
 		modes []corev1.PersistentVolumeAccessMode
-		want  bool
+		want  reattachTierKind
 	}{
-		{"rwx", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}, true},
-		{"rwx-among-others", []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany, corev1.ReadWriteMany}, true},
-		{"rwo", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, false},
-		{"rox", []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany}, false},
-		{"rwop", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod}, false},
-		{"none", nil, false},
+		{"rwx", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}, reattachTierTier0RWX},
+		{"rwx-among-others", []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany, corev1.ReadWriteMany}, reattachTierTier0RWX},
+		{"rwo", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, reattachTierNone},
+		{"rox", []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany}, reattachTierNone},
+		{"rwop", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod}, reattachTierNone},
+		{"none", nil, reattachTierNone},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			pvc := &corev1.PersistentVolumeClaim{Spec: corev1.PersistentVolumeClaimSpec{AccessModes: tc.modes}}
-			if got := pvcIsTier0RWX(pvc); got != tc.want {
-				t.Errorf("pvcIsTier0RWX(%v) = %v, want %v", tc.modes, got, tc.want)
+			if got := classifyReattachTier(context.Background(), nil, pvc); got != tc.want {
+				t.Errorf("classifyReattachTier(%v) = %v, want %v", tc.modes, got, tc.want)
 			}
 		})
 	}
-	if pvcIsTier0RWX(nil) {
-		t.Error("pvcIsTier0RWX(nil) must be false")
+	if got := classifyReattachTier(context.Background(), nil, nil); got != reattachTierNone {
+		t.Error("classifyReattachTier(nil) must be reattachTierNone")
+	}
+}
+
+// TestClassifyReattachTier_LonghornWinsOverRWX is the regression for the mis-tagging bug: a PVC
+// bound to a Longhorn-backed StorageClass (PodMotion's own longhorn-migratable class ships as
+// ReadWriteMany, RWX, so it can hold the volume dual-attached during Longhorn's dual-engine live
+// migration — see storage/tier1.go) must classify as Tier1-Longhorn, NOT Tier0 RWX, even though its
+// access mode alone would satisfy the RWX check. This mirrors
+// internal/agent/storage.classifier's real precedence (Longhorn StorageClass wins regardless of
+// access mode). Before this fix, classifyReattachTier's predecessor (pvcIsTier0RWX) checked ONLY
+// AccessModes and had no way to reach this distinction at all.
+func TestClassifyReattachTier_LonghornWinsOverRWX(t *testing.T) {
+	scName := "longhorn-migratable"
+	sc := &storagev1.StorageClass{
+		ObjectMeta:  metav1.ObjectMeta{Name: scName},
+		Provisioner: "driver.longhorn.io",
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+			StorageClassName: &scName,
+		},
+	}
+	fakeClient := newFakeAgentServerWithCoreObjects(t, sc).k8sClient
+	if got := classifyReattachTier(context.Background(), fakeClient, pvc); got != reattachTierTier1Longhorn {
+		t.Errorf("classifyReattachTier(Longhorn RWX PVC) = %v, want reattachTierTier1Longhorn", got)
 	}
 }
 

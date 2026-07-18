@@ -134,17 +134,17 @@ const (
 	// These replace the 8-phase pipeline for TCPPreservationMode=Strict/BestEffort.
 	// TCPPreservationMode=None degenerates through the subset of phases that apply
 	// to stateless workloads (SocketInventory and TCPVerifying are skipped).
-	MigrationPhaseSocketInventory        MigrationPhase = "SocketInventory"
-	MigrationPhaseDestinationPrewarm     MigrationPhase = "DestinationPrewarm"
-	MigrationPhasePreCopyMemory          MigrationPhase = "PreCopyMemory"
-	MigrationPhaseZeroWindowArm          MigrationPhase = "ZeroWindowArm"
+	MigrationPhaseSocketInventory         MigrationPhase = "SocketInventory"
+	MigrationPhaseDestinationPrewarm      MigrationPhase = "DestinationPrewarm"
+	MigrationPhasePreCopyMemory           MigrationPhase = "PreCopyMemory"
+	MigrationPhaseZeroWindowArm           MigrationPhase = "ZeroWindowArm"
 	MigrationPhaseFinalFreezeStateCapture MigrationPhase = "FinalFreezeStateCapture"
-	MigrationPhaseOverlayHandoff         MigrationPhase = "OverlayHandoff"
-	MigrationPhaseRestoreSocketReattach  MigrationPhase = "RestoreSocketReattach"
-	MigrationPhaseDisengageHold          MigrationPhase = "DisengageHold"
-	MigrationPhaseTCPVerifying           MigrationPhase = "TCPVerifying"
-	MigrationPhaseServiceVerifying       MigrationPhase = "ServiceVerifying"
-	MigrationPhaseCutoverComplete        MigrationPhase = "CutoverComplete"
+	MigrationPhaseOverlayHandoff          MigrationPhase = "OverlayHandoff"
+	MigrationPhaseRestoreSocketReattach   MigrationPhase = "RestoreSocketReattach"
+	MigrationPhaseDisengageHold           MigrationPhase = "DisengageHold"
+	MigrationPhaseTCPVerifying            MigrationPhase = "TCPVerifying"
+	MigrationPhaseServiceVerifying        MigrationPhase = "ServiceVerifying"
+	MigrationPhaseCutoverComplete         MigrationPhase = "CutoverComplete"
 )
 
 // AffinityMode controls how PodMotion handles hard nodeAffinity and nodeSelector rules
@@ -296,6 +296,41 @@ const (
 	// ConditionVXLANFDBUpdated is True when the two-sided AF_BRIDGE FDB and AF_INET
 	// neighbor entries have been injected on both nodes (ADR-0048).
 	ConditionVXLANFDBUpdated = "VXLANFDBUpdated"
+	// ConditionStorageCutoverComplete is True when the StorageMigrationManager's
+	// Cutover (detach source / attach destination) and AwaitSingleOwner (block
+	// until the migrated volume is in a single-owner, mountable state) have both
+	// completed successfully BEFORE CRIU restore is triggered on the destination.
+	// Gated in reconcileOverlayHandoff (gateStorageCutoverBeforeRestore), at the
+	// end of that phase, immediately before the phase transition into
+	// RestoreSocketReattach — the first phase in the NRI StartContainer hook's
+	// restore accept-set (nri/plugin.go verifyPhaseInAcceptSet). That is
+	// deliberately AFTER scheduling-gate removal (end of reconcileTransferring):
+	// tiers like Longhorn whose dual-engine collapse only begins once the
+	// destination pod is scheduled and kubelet mounts the volume would deadlock
+	// forever if gated any earlier (sprint49 finding — a prior placement before
+	// scheduling-gate removal produced exactly that deadlock live). This is what
+	// prevents CRIU restore from racing ahead of the destination storage engine
+	// actually being present/ready — a dual-attached/dual-owner volume (e.g.
+	// Longhorn's live-migration dual engine, Ceph RBD's prepare/execute pair)
+	// must collapse to a single owner on the destination node before restore is
+	// allowed to begin, not merely before the destination pod's volume mounts.
+	// Reason=CutoverFailed or AwaitSingleOwnerTimeout on False.
+	ConditionStorageCutoverComplete = "StorageCutoverComplete"
+	// ConditionTier1EarlySourceRelease is True when the source pod was deleted BEFORE
+	// TrafficVerified as the narrow, Tier1-Longhorn-only exception to ADR-0012 documented in
+	// ADR-0356. Longhorn's real single-owner collapse is driven by the Kubernetes CSI
+	// attacher, which only releases the source node's VolumeAttachment once no pod on that
+	// node references the PVC — for a Longhorn-classified (TierLonghorn) volume this
+	// functionally requires the source pod to be gone before the destination pod's own
+	// volume mount can ever succeed, which in turn gates restore and therefore
+	// TrafficVerified itself (ADR-0012's normal gate). ADR-0356 breaks that cycle for this
+	// tier ONLY by releasing the source pod immediately after CheckpointTransferred=True
+	// (a cryptographically-verified, durable checkpoint on the destination node — ADR-SEC-B)
+	// and a fresh destination-NMC-Ready check, in exchange for narrowing this tier's
+	// rollback guarantee from zero-downtime live-resume to checkpoint-guaranteed
+	// bounded-downtime recovery. Every other storage tier is untouched and keeps ADR-0012's
+	// full guarantee. Reason=Tier1LonghornEarlyRelease when True.
+	ConditionTier1EarlySourceRelease = "Tier1EarlySourceRelease"
 	// ConditionTCPSequenceContinuityVerified is True when all migrated connections
 	// have been confirmed to have seq_delta=0 post-restore (ADR-0049).
 	ConditionTCPSequenceContinuityVerified = "TCPSequenceContinuityVerified"
@@ -372,6 +407,21 @@ const (
 	// False/{ExplicitProbeFailed, DefaultedProbeFailed, AmbiguousProbeDefault}.
 	// Consumed additively by sourcePodDeletionBlockReason for ALL TCPPreservationMode values.
 	ConditionWorkloadLivenessVerified = "WorkloadLivenessVerified"
+	// ConditionWorkloadLivenessFirstPass is a staging condition set True the instant the FIRST
+	// real application probe (the same VerifyTCP(AppProbeOnly=true) call that produces
+	// ConditionWorkloadLivenessVerified) passes. ConditionWorkloadLivenessVerified is deliberately
+	// NOT set True on this first pass alone: a workload that dies shortly after CRIU restore (the
+	// documented gap — the restore process can crash 40-60s after an apparently-successful
+	// restore, e.g. Postgres killed by a subsequent internal fault) can still be alive during this
+	// narrow first-probe window, producing a false-positive liveness pass. reconcileServiceVerifying
+	// requires a SECOND real probe, issued no sooner than workloadLivenessStabilizationWindow after
+	// this condition's LastTransitionTime, to actually pass before ConditionWorkloadLivenessVerified
+	// is set True — a genuine second point-in-time health confirmation against the live workload,
+	// not a longer single wait. A failure on the second pass resets this condition to False so a
+	// later recovery must re-earn both passes. Reason vocabulary mirrors
+	// ConditionWorkloadLivenessVerified's {ExplicitProbePassed, DefaultedProbePassed} on True and
+	// {ReconfirmationFailed} on False.
+	ConditionWorkloadLivenessFirstPass = "WorkloadLivenessFirstPass"
 	// ConditionCni0CleanupVerified is set by reconcileVerifying after CleanupSourceIPHandoff
 	// (ADR-0241 item 1 / NR-BLOCK-1 CUTOVER_COMPLETE scope). True once VerifyCleanup confirms
 	// the cni0 neigh and cni0 host route for the OLD pod IP are both absent, within the
@@ -543,6 +593,27 @@ type DryRunEstimate struct {
 	BlockingReason string `json:"blockingReason,omitempty"`
 }
 
+// PVCTierClassification is the CRD-status mirror of internal/agent/storage.TierClassification
+// for a single PVC, persisted so later phases (Cutover/AwaitSingleOwner) can use a classification
+// computed while the source pod still existed, instead of re-fetching a pod that ADR-0356's
+// Tier1-Longhorn early release may have already deleted. Field values and meaning are identical
+// to internal/agent/storage.TierClassification (Tier: 0=RWX, 1=Longhorn, 2=CephRBD,
+// 3=SnapshotRsync, 4=Blocked) — kept as a separate type here rather than importing the storage
+// package to avoid an api/v1alpha1 -> internal/agent/storage dependency.
+type PVCTierClassification struct {
+	// Tier is the storage migration tier for this PVC (0=RWX, 1=Longhorn, 2=CephRBD, 3=SnapshotRsync, 4=Blocked).
+	Tier int32 `json:"tier"`
+	// Reason explains why this PVC was classified into Tier.
+	// +optional
+	Reason string `json:"reason,omitempty"`
+	// PVCName is the volume name as it appears in the pod's Spec.Volumes list, or the PVC
+	// claim name for volumes backed by a PersistentVolumeClaim.
+	PVCName string `json:"pvcName"`
+	// StorageClass is the PVC's storage class name, if any.
+	// +optional
+	StorageClass string `json:"storageClass,omitempty"`
+}
+
 // PodMigrationStatus defines the observed state of PodMigration.
 type PodMigrationStatus struct {
 	// Phase is the current migration phase.
@@ -618,6 +689,21 @@ type PodMigrationStatus struct {
 	// StorageTier is the detected storage migration tier (0=RWX, 1=Longhorn, 2=CephRBD, 3=SnapshotRsync, 4=Blocked).
 	// +optional
 	StorageTier *int32 `json:"storageTier,omitempty"`
+
+	// ClassifiedVolumes caches the per-PVC storage tier classification computed by
+	// StorageMigrationManager.RunPreStage while the source pod is still guaranteed to
+	// exist (PreMigrating phase). StorageMigrationManager.Cutover and AwaitSingleOwner
+	// (called later, from reconcileOverlayHandoff's gateStorageCutoverBeforeRestore) MUST
+	// read this cache instead of re-fetching and re-classifying the live source pod: for
+	// Tier1-Longhorn, ADR-0356 deliberately deletes the source pod right after
+	// CheckpointTransferred=True — well before Cutover runs — so a live re-fetch at Cutover
+	// time 404s every time (sprint49 live-proof finding: migration permanently stuck in
+	// OverlayHandoff with reason CutoverFailed / "get source pod: ... not found"). The PVC
+	// objects themselves are not deleted by ADR-0356 (only the pod is), so classification
+	// computed once from the live pod's volume list remains valid for the rest of the
+	// migration.
+	// +optional
+	ClassifiedVolumes []PVCTierClassification `json:"classifiedVolumes,omitempty"`
 
 	// TCPConnectionsPreserved is the number of TCP connections successfully migrated.
 	// +optional

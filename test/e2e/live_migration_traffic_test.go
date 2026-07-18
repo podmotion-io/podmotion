@@ -73,21 +73,8 @@ var _ = Describe("Live migration traffic continuity", Label("live-traffic"), Ord
 		}
 
 		By("waiting for nginx-live-src to be Ready on " + liveTrafficSrcNode)
-		Eventually(func() bool {
-			var pod corev1.Pod
-			if err := pmClient.Get(ctx, types.NamespacedName{Name: "nginx-live-src", Namespace: liveTrafficNS}, &pod); err != nil {
-				return false
-			}
-			if pod.Spec.NodeName != liveTrafficSrcNode {
-				return false
-			}
-			for _, c := range pod.Status.Conditions {
-				if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-					return true
-				}
-			}
-			return false
-		}, 2*time.Minute, 3*time.Second).Should(BeTrue(), "nginx-live-src must be Ready on "+liveTrafficSrcNode)
+		Expect(utils.WaitForPodReadyOnNode(ctx, pmClient, "nginx-live-src", liveTrafficNS, liveTrafficSrcNode,
+			2*time.Minute, 3*time.Second)).To(Succeed())
 
 		By("waiting for HAProxy deployment to be ready")
 		Eventually(func() bool {

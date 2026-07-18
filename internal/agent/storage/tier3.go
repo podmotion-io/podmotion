@@ -160,6 +160,15 @@ func (m *SnapshotRsyncMigrator) Cutover(ctx context.Context, opts MigrationOptio
 	return nil
 }
 
+// AwaitSingleOwner is a no-op for Tier3: rsync/snapshot-clone migration uses
+// a distinct PVC object per node (the destination PVC created in PreStage is
+// its own PersistentVolume, not a shared attachment on the same volume), so
+// there is no shared-attachment/dual-owner state to converge on — the source
+// and destination PVCs are simply two independent volumes the whole time.
+func (m *SnapshotRsyncMigrator) AwaitSingleOwner(_ context.Context, _ MigrationOptions) error {
+	return nil
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 func snapshotName(migrationName, pvcName string) string {
@@ -279,12 +288,15 @@ func (m *SnapshotRsyncMigrator) runRsync(ctx context.Context, src, dest string) 
 // SnapshotRsyncStubMigrator is used in unit tests and environments without
 // a storage provisioner. It emits ready after 200ms.
 type SnapshotRsyncStubMigrator struct {
-	PreStageCalled bool
-	CutoverCalled  bool
+	PreStageCalled         bool
+	CutoverCalled          bool
+	AwaitSingleOwnerCalled bool
 	// CreatedPVCs records the dest PVC names that would have been created.
 	CreatedPVCs []string
 	// InjectPreStageError causes PreStage to return an error.
 	InjectPreStageError error
+	// InjectAwaitSingleOwnerError causes AwaitSingleOwner to return this error.
+	InjectAwaitSingleOwnerError error
 }
 
 // Tier returns TierSnapshotRsync.
@@ -314,4 +326,10 @@ func (s *SnapshotRsyncStubMigrator) SyncPercent(_ context.Context, _ MigrationOp
 func (s *SnapshotRsyncStubMigrator) Cutover(_ context.Context, _ MigrationOptions) error {
 	s.CutoverCalled = true
 	return nil
+}
+
+// AwaitSingleOwner records the call and returns the injected error (nil by default).
+func (s *SnapshotRsyncStubMigrator) AwaitSingleOwner(_ context.Context, _ MigrationOptions) error {
+	s.AwaitSingleOwnerCalled = true
+	return s.InjectAwaitSingleOwnerError
 }

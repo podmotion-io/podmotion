@@ -75,18 +75,8 @@ var _ = Describe("Live database migration", Label("live-db"), Ordered, func() {
 		}
 
 		By("waiting for postgres-src to be Ready (up to 2 min)")
-		Eventually(func() bool {
-			var pod corev1.Pod
-			if err := pmClient.Get(ctx, types.NamespacedName{Name: "postgres-src", Namespace: dbTestNS}, &pod); err != nil {
-				return false
-			}
-			for _, c := range pod.Status.Conditions {
-				if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-					return true
-				}
-			}
-			return false
-		}, 2*time.Minute, 3*time.Second).Should(BeTrue(), "postgres-src must be Ready")
+		Expect(utils.WaitForPodReady(ctx, pmClient, "postgres-src", dbTestNS, 2*time.Minute, 3*time.Second)).
+			To(Succeed())
 
 		By("waiting for pgbouncer to be Ready")
 		Eventually(func() bool {

@@ -96,6 +96,11 @@ var methodPolicy = map[string]map[Role]bool{
 	agentpb.MigrationAgentService_PrepareDestinationNetns_FullMethodName: {RoleOperator: true},
 	agentpb.MigrationAgentService_ConfirmOverlayReady_FullMethodName:     {RoleOperator: true},
 	agentpb.MigrationAgentService_ReleaseCheckpoint_FullMethodName:       {RoleOperator: true},
+	// ADR-0356 (sprint49 fix): controller-driven direct SIGKILL of a still-SIGSTOPped source
+	// process, called on the source node before the ADR-0356 Tier1-Longhorn early pod delete.
+	// Absent from this map, deny-by-default (§2.2.3) would reject it even though the handler
+	// exists in server.go.
+	agentpb.MigrationAgentService_KillFrozenSource_FullMethodName: {RoleOperator: true},
 	agentpb.MigrationAgentService_Abort_FullMethodName:                   {RoleOperator: true},
 	agentpb.MigrationAgentService_ArmZeroWindow_FullMethodName:           {RoleOperator: true},
 	agentpb.MigrationAgentService_DisarmZeroWindow_FullMethodName:        {RoleOperator: true},

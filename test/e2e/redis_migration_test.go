@@ -74,21 +74,8 @@ var _ = Describe("Live Redis migration under load", Label("live-redis"), Ordered
 		}
 
 		By("waiting for redis-src to be Ready on " + redisSourceNode + " (up to 2 min)")
-		Eventually(func() bool {
-			var pod corev1.Pod
-			if err := pmClient.Get(ctx, types.NamespacedName{Name: redisSrcPod, Namespace: redisTestNS}, &pod); err != nil {
-				return false
-			}
-			if pod.Spec.NodeName != redisSourceNode {
-				return false
-			}
-			for _, c := range pod.Status.Conditions {
-				if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-					return true
-				}
-			}
-			return false
-		}, 2*time.Minute, 3*time.Second).Should(BeTrue(), "redis-src must be Ready on "+redisSourceNode)
+		Expect(utils.WaitForPodReadyOnNode(ctx, pmClient, redisSrcPod, redisTestNS, redisSourceNode,
+			2*time.Minute, 3*time.Second)).To(Succeed())
 
 		By("warming up INCR write load for 15s")
 		time.Sleep(15 * time.Second)

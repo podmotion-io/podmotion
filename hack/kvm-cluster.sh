@@ -61,7 +61,15 @@ PM_VMS=("$CP_VM" "${WORKER_VMS[@]}")
 # still attached on the source (Longhorn `migratable` volume mode). The disks are
 # attached to the standing VMs (non-destructive — attach only, never destroy).
 LH_DISK_SIZE="${LH_DISK_SIZE:-250G}"
-LH_IMG_DIR="${LH_IMG_DIR:-/var/lib/libvirt/images}"
+# /var/lib/libvirt/images is 711 root:root — chad cannot write there without
+# sudo, even though chad's own libvirt-group membership already grants full
+# virsh access to the running VMs (libvirtd runs as root and applies
+# dynamic_ownership at attach time, so the source image file does not need to
+# be pre-owned by libvirt-qemu). Using a directory chad already owns removes
+# the only genuine need for local sudo in this script (confirmed live
+# 2026-07-17 — see require_local_sudo()'s history in git log for the prior,
+# now-unnecessary, workaround).
+LH_IMG_DIR="${LH_IMG_DIR:-$KVM_DIR/longhorn-disks}"
 LH_DISK_TARGET="${LH_DISK_TARGET:-vdb}"          # new disk shows up as /dev/vdb in-guest
 LH_MOUNT="${LH_MOUNT:-/var/lib/longhorn}"
 LH_VERSION="${LH_VERSION:-v1.9.1}"               # current proven-stable Longhorn tag
@@ -129,6 +137,24 @@ CALICO_CSI_IMG="${CALICO_CSI_IMG:-docker.io/calico/csi:v${CALICO_VERSION}}"
 CALICO_CSI_REGISTRAR_IMG="${CALICO_CSI_REGISTRAR_IMG:-docker.io/calico/node-driver-registrar:v${CALICO_VERSION}}"
 CALICO_IPPOOL_NAME="${CALICO_IPPOOL_NAME:-default-ipv4-ippool}"
 
+# ── CNI leftover-residue registry ────────────────────────────────────────────
+# One row per CNI this project's matrix actually supports (Flannel/Cilium/Calico
+# per CLAUDE.md), used by cmd_reset_cluster's post-reset purge below. Each row is
+# "name|iface_prefixes(space-sep, glob-safe)|iptables_jump_or_chain_regex". A
+# future 4th CNI (or a Calico/Cilium version that adds a new interface/chain
+# prefix) is a one-line addition here, not a hand-edit of two separate embedded
+# shell blocks (confirmed live 2026-07-17: a hardcoded two-CNI list is exactly
+# the class of bug that silently repeats when a 3rd/4th CNI is added).
+#
+# Flannel is intentionally NOT a row: cni0/flannel.1 are the CURRENT/target
+# CNI's own interfaces in the reset-TO-Flannel path, not residue from a prior
+# CNI — adding it here would delete the interface the cluster is being reset
+# INTO. Flannel also installs no custom iptables chains (kube-proxy owns NAT).
+CNI_LEFTOVER_REGISTRY=(
+  "cilium|cilium_host cilium_net cilium_geneve|CILIUM"
+  "calico|vxlan.calico|cali-"
+)
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
@@ -161,6 +187,27 @@ assert_no_vm_destruction() {
   echo "SAFETY: this script never runs 'virsh destroy' or 'virsh undefine' on the standing VMs (${PM_VMS[*]}). The VMs are permanent infrastructure." >&2
 }
 
+# ── Precondition guard: local sudo must be non-interactively usable ──────────
+# Every remote (nsh) sudo call runs on the VMs, where passwordless sudo is
+# already provisioned for $SSH_USER — those are safe. cmd_provision_longhorn is
+# the one command that also shells out to LOCAL sudo (virsh attach-disk,
+# qemu-img create) on the host running this script, to manage libvirt disks.
+# A bare `sudo` with no cached credentials and no TTY (e.g. invoked from an
+# agent/non-interactive session) does not fail — it BLOCKS indefinitely waiting
+# on a password prompt nothing will ever answer (confirmed live 2026-07-17: a
+# provisioning run hung with no error output until killed). Fail fast instead,
+# with a clear, actionable message, before any local sudo call is attempted.
+require_local_sudo() {
+  if ! sudo -n true 2>/dev/null; then
+    echo "ERROR: this command needs local sudo (for virsh/qemu-img disk management)," >&2
+    echo "       but passwordless sudo is not available for this session (no TTY/cached" >&2
+    echo "       credentials). Run this command yourself in an interactive terminal where" >&2
+    echo "       you can enter your sudo password, e.g.:" >&2
+    echo "         $0 ${1:-<subcommand>}" >&2
+    exit 1
+  fi
+}
+
 cmd_verify() {
   load_ips
   echo "==> Verifying KVM kubeadm cluster (control-plane $CP1_IP)..."
@@ -181,6 +228,73 @@ cmd_reset_cluster() {
   for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
     echo "  -- reset $ip"
     nsh "$ip" "sudo kubeadm reset -f && sudo rm -rf /etc/cni/net.d \$HOME/.kube && sudo rm -rf /etc/kubernetes/manifests/*"
+  done
+
+  # kubeadm reset only clears /etc/cni/net.d — it does NOT remove the kernel-level
+  # network interfaces that Cilium/Calico's own daemonsets create directly via
+  # netlink (cilium_host/cilium_net/cilium_geneve, vxlan.calico). Those survive
+  # every reset and their routes collide with the next CNI's routes for the same
+  # pod CIDR (confirmed live 2026-07-17: a stale cilium_host route for 10.244.1.0/24
+  # silently shadowed cni0's real Flannel route on that same node, making every pod
+  # on the node unreachable — even from the node itself — with no error surfaced
+  # anywhere except a generic probe timeout). Sweep every prior-CNI leftover
+  # unconditionally, on every reset, regardless of which CNI is being reset FROM.
+  #
+  # Interface names and iptables jump/chain prefixes are pulled from
+  # CNI_LEFTOVER_REGISTRY (declared near the top of this script) instead of being
+  # hardcoded here, so a future 4th CNI (or a Calico/Cilium version bump that adds
+  # a new interface/chain prefix) is a one-line registry addition, not a hand-edit
+  # of this block.
+  local cni_ifaces="" cni_iptables_regex=""
+  local reg_row reg_name reg_ifaces reg_regex
+  for reg_row in "${CNI_LEFTOVER_REGISTRY[@]}"; do
+    IFS='|' read -r reg_name reg_ifaces reg_regex <<< "$reg_row"
+    cni_ifaces="$cni_ifaces $reg_ifaces"
+    if [[ -z "$cni_iptables_regex" ]]; then
+      cni_iptables_regex="$reg_regex"
+    else
+      cni_iptables_regex="$cni_iptables_regex|$reg_regex"
+    fi
+  done
+  cni_ifaces="${cni_ifaces# }"
+
+  echo "==> Purging leftover network interfaces from any prior CNI (${CNI_LEFTOVER_REGISTRY[*]%%|*}, from CNI_LEFTOVER_REGISTRY)..."
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    nsh "$ip" "for l in $cni_ifaces; do sudo ip link del \"\$l\" 2>/dev/null || true; done; sudo ip route flush proto 80 2>/dev/null || true"
+  done
+
+  # Same leftover-CNI-residue problem as above, but in iptables rather than
+  # netlink: Cilium/Calico each install their own chains (cali-*, CILIUM_*) into
+  # raw/mangle/filter/nat, hooked in ahead of kube-proxy's own rules, and
+  # kubeadm reset never removes them. Confirmed live 2026-07-17: a stray
+  # unconditional MASQUERADE rule left in cali-POSTROUTING (plus assorted
+  # Cilium TPROXY/NOTRACK rules in raw/mangle) caused intermittent DNS/Service
+  # ClusterIP routing failures hours into a Flannel-only cluster's life —
+  # exactly the class of "sometimes works" bug that's expensive to diagnose
+  # blind. Purge unconditionally on every reset, same as the interface sweep.
+  echo "==> Purging leftover iptables chains from any prior CNI (${CNI_LEFTOVER_REGISTRY[*]%%|*}, from CNI_LEFTOVER_REGISTRY)..."
+  local cni_iptables_purge
+  cni_iptables_purge='
+for table in raw mangle filter nat; do
+  iptables-legacy -t "$table" -S 2>/dev/null | grep -E "^-A" | grep -E -- "-j ('"$cni_iptables_regex"')" | sed "s/^-A/-D/" | while read -r cmd; do
+    iptables-legacy -t "$table" $cmd 2>/dev/null || true
+  done
+done
+for pass in 1 2 3; do
+  for table in raw mangle filter nat; do
+    for chain in $(iptables-legacy -t "$table" -S 2>/dev/null | grep -oE -- "-N ('"$cni_iptables_regex"')[^ ]+" | awk "{print \$2}"); do
+      iptables-legacy -t "$table" -F "$chain" 2>/dev/null || true
+    done
+  done
+done
+for table in raw mangle filter nat; do
+  for chain in $(iptables-legacy -t "$table" -S 2>/dev/null | grep -oE -- "-N ('"$cni_iptables_regex"')[^ ]+" | awk "{print \$2}"); do
+    iptables-legacy -t "$table" -X "$chain" 2>/dev/null || true
+  done
+done
+'
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    nsh "$ip" "sudo bash -c '$cni_iptables_purge'"
   done
 
   # Post-reset race guard: kubeadm reset disrupts containerd; restart it and wait for the
@@ -397,22 +511,25 @@ cmd_provision_shared_storage() {
 cmd_provision_longhorn() {
   assert_no_vm_destruction
   load_ips
+  mkdir -p "$LH_IMG_DIR"
 
   echo "==> [1/5] Ensure a $LH_DISK_SIZE $LH_DISK_TARGET disk on each VM (attach only — never destroy)..."
   local vm img
   for vm in "${PM_VMS[@]}"; do
     img="$LH_IMG_DIR/${vm}-longhorn.qcow2"
-    if sudo virsh domblklist "$vm" | awk '{print $1}' | grep -qx "$LH_DISK_TARGET"; then
+    if virsh domblklist "$vm" | awk '{print $1}' | grep -qx "$LH_DISK_TARGET"; then
       echo "  -- $vm already has $LH_DISK_TARGET; skipping create+attach"
       continue
     fi
-    if ! sudo test -f "$img"; then
+    if [[ ! -f "$img" ]]; then
       echo "  -- creating $img ($LH_DISK_SIZE)"
-      sudo qemu-img create -f qcow2 "$img" "$LH_DISK_SIZE"
-      sudo chown libvirt-qemu:kvm "$img"
+      qemu-img create -f qcow2 "$img" "$LH_DISK_SIZE"
     fi
     echo "  -- attaching $img to $vm as $LH_DISK_TARGET (persistent + live)"
-    sudo virsh attach-disk "$vm" "$img" "$LH_DISK_TARGET" \
+    # No chown needed: libvirtd runs as root and applies dynamic_ownership at
+    # attach time (Ubuntu default), so it re-owns the file for the qemu
+    # process itself — chad only needs to be able to create/read it first.
+    virsh attach-disk "$vm" "$img" "$LH_DISK_TARGET" \
       --driver qemu --subdriver qcow2 --targetbus virtio --persistent --live
   done
 
@@ -445,8 +562,35 @@ REMOTE
   # Let Longhorn also use the control-plane node's disk: tolerate the cp taint and
   # add the toleration to the longhorn-manager DaemonSet (the setting alone does not
   # patch the manager DS). Idempotent.
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" patch setting taint-toleration \
-    --type=merge -p '{"value":"node-role.kubernetes.io/control-plane:NoSchedule"}' || true
+  #
+  # The taint-toleration Setting object is only created by longhorn-manager itself
+  # after it starts, as part of seeding its default settings from its ConfigMap —
+  # there is a real race between "DaemonSet rollout reports Ready" and "the Setting
+  # CR actually exists yet." The old `|| true` here silently swallowed that race: a
+  # NotFound patch failure left the setting permanently empty, which made Longhorn's
+  # replica scheduler refuse to place ANY replica on pm-cp1 for EVERY future volume
+  # (not a transient error — durable and silent) even though pm-cp1's disk was
+  # perfectly healthy and schedulable. Confirmed live 2026-07-17: a volume stuck
+  # "degraded" from the moment it was created, unrelated to disk space or the disk's
+  # own Ready/Schedulable conditions. Retry with a real wait instead of swallowing.
+  local lh_patch_tries=0
+  until KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" patch setting taint-toleration \
+      --type=merge -p '{"value":"node-role.kubernetes.io/control-plane:NoSchedule"}' 2>/dev/null; do
+    lh_patch_tries=$((lh_patch_tries + 1))
+    if [[ $lh_patch_tries -ge 30 ]]; then
+      echo "ERROR: taint-toleration Setting never became patchable after 30 tries (~60s)." >&2
+      echo "       Longhorn replicas will silently refuse to schedule onto pm-cp1 without this." >&2
+      exit 1
+    fi
+    sleep 2
+  done
+  local lh_applied
+  lh_applied="$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" get setting taint-toleration -o jsonpath='{.value}')"
+  if [[ "$lh_applied" != "node-role.kubernetes.io/control-plane:NoSchedule" ]]; then
+    echo "ERROR: taint-toleration Setting patch reported success but value is '$lh_applied', not the expected toleration." >&2
+    exit 1
+  fi
+  echo "  -- taint-toleration setting confirmed: $lh_applied"
   KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" patch ds longhorn-manager --type=json \
     -p '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]' || true
   KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" rollout status ds/longhorn-manager --timeout=300s

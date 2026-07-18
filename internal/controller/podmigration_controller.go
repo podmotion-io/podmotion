@@ -64,6 +64,14 @@ import (
 const (
 	finalizerName = "migration.podmotion.io/finalizer"
 
+	// workloadLivenessStabilizationWindow is the minimum gap enforced between the FIRST passing
+	// application-liveness probe (staged on ConditionWorkloadLivenessFirstPass) and the SECOND,
+	// confirming probe that is required before ConditionWorkloadLivenessVerified is set True. It
+	// exists to catch a workload that dies shortly (observed live: 40-60s) after an apparently
+	// successful CRIU restore, which a single probe issued right after restore can miss entirely.
+	// This is a real second measurement point, not a longer single timeout.
+	workloadLivenessStabilizationWindow = 45 * time.Second
+
 	// Condition types used on PodMigration status.
 	conditionValidated                  = "Validated"
 	conditionCheckpointed               = "Checkpointed"
@@ -846,12 +854,93 @@ func (r *PodMigrationReconciler) reconcileFinalFreezeStateCapture(ctx context.Co
 		return r.reconcileCheckpointing(ctx, pm)
 	}
 
-	// Step 2: transfer. Advance once CheckpointTransferred=True.
-	if !pm.Status.CheckpointTransferred {
+	// Step 2: transfer + scheduling-gate removal. Advance once conditionSchedulingGateRemoved=True
+	// — the true terminal state of reconcileTransferring — not merely CheckpointTransferred.
+	//
+	// sprint49 finding: gating on CheckpointTransferred alone is a real durability bug.
+	// reconcileTransferring persists CheckpointTransferred=true partway through its own body
+	// (before earlyReleaseSourceForTier1Longhorn and scheduling-gate removal run), and can then
+	// return early (e.g. ADR-0356's early-release-not-yet-safe requeue) without ever reaching
+	// removeSchedulingGate on that same call. On the NEXT reconcile, checking only
+	// CheckpointTransferred here would see it already true and skip calling
+	// reconcileTransferring again entirely — silently abandoning the migration with the
+	// scheduling gate still in place and the destination pod stuck at PodSchedulingGated
+	// forever, while this function nonetheless advances the phase past it. Checking
+	// conditionSchedulingGateRemoved instead keeps re-entering reconcileTransferring (which is
+	// already idempotent — see its own CheckpointTransferred branch — so this costs nothing)
+	// until it has actually reached and completed gate removal.
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionSchedulingGateRemoved) {
 		return r.reconcileTransferring(ctx, pm)
 	}
 
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseOverlayHandoff)
+}
+
+// gateStorageCutoverBeforeRestore blocks the phase transition into RestoreSocketReattach —
+// the first phase in the NRI hook's restore accept-set (nri/plugin.go verifyPhaseInAcceptSet:
+// exactly {Restoring, RestoreSocketReattach, DisengageHold}) — until the destination storage
+// engine has actually collapsed to a single owner (StorageMgr.Cutover + AwaitSingleOwner).
+//
+// This must run and complete BEFORE transitionTo(RestoreSocketReattach) persists the new phase
+// to the API server, not merely before this function returns control to the controller-runtime
+// work queue: the NRI StartContainer hook is driven by an independent kubelet event and reads
+// pm.Status.Phase straight from the API server the instant the write lands — it does not wait
+// for, or care about, whether the controller's own next reconcile (reconcileRestoreSocketReattach
+// / reconcileRestoring) has even started running. A gate placed inside reconcileRestoring is
+// therefore too late (sprint49 live finding): phase is already RestoreSocketReattach by the time
+// that function runs, so the NRI hook's phase check already passes and restore may already be
+// racing ahead on a separate goroutine driven entirely by kubelet/containerd. This call site —
+// the last moment before that phase write — is the only place that actually gates the NRI path.
+//
+// Ordering: this MUST run after scheduling-gate removal (unconditional, end of
+// reconcileTransferring), never before. Longhorn's real dual-engine collapse
+// (tier1.go AwaitSingleOwner) only begins once the destination pod is actually SCHEDULED and
+// kubelet issues NodeStageVolume there — that is what makes longhorn-manager populate
+// spec.migrationNodeID and start the second engine. Gating AwaitSingleOwner before the
+// scheduling gate is removed is a permanent deadlock: it polls for a collapse that can never
+// start because the pod it needs mounted on the destination node was never allowed to schedule.
+// (This is exactly what the sprint49 live-proof run hit: a 2-minute AwaitSingleOwner timeout
+// with the destination Longhorn volume still "detached"/"unknown" — it never had a chance to
+// attach.) reconcileOverlayHandoff runs strictly after reconcileTransferring/scheduling-gate
+// removal in the phase graph, so by the time this gate runs the destination pod has had the
+// full OverlayHandoff phase's worth of time to schedule and mount.
+//
+// Returns ready=true once ConditionStorageCutoverComplete is True (including the case where
+// r.StorageMgr is nil — no storage manager wired, e.g. some unit tests — treated as a no-op
+// pass-through rather than a permanent block). ready=false means the caller must return the
+// given ctrl.Result (a bounded requeue) without transitioning the phase.
+func (r *PodMigrationReconciler) gateStorageCutoverBeforeRestore(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, bool, error) {
+	log := logf.FromContext(ctx)
+
+	if r.StorageMgr == nil {
+		return ctrl.Result{}, true, nil
+	}
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionStorageCutoverComplete) {
+		return ctrl.Result{}, true, nil
+	}
+
+	if err := r.StorageMgr.Cutover(ctx, pm); err != nil {
+		log.Error(err, "OverlayHandoff: storage cutover failed — requeuing before allowing the restore-eligible phase",
+			"migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, false, nil
+	}
+	if err := r.StorageMgr.AwaitSingleOwner(ctx, pm); err != nil {
+		log.Error(err, "OverlayHandoff: await-single-owner failed — requeuing before allowing the restore-eligible phase",
+			"migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, false, nil
+	}
+
+	// Cutover/AwaitSingleOwner patch ConditionStorageCutoverComplete on their own
+	// freshly-fetched copy of the CR (StorageMigrationManager.patchStorageCutover), not on
+	// this reconcile's in-memory pm. Re-fetch conditions here so the caller's subsequent
+	// statusUpdate/transitionTo calls — full Status replaces, not merges — don't clobber that
+	// just-written condition with the stale in-memory copy.
+	fresh := &pmv1.PodMigration{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(pm), fresh); err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("re-fetch PodMigration after storage cutover: %w", err)
+	}
+	pm.Status.Conditions = fresh.Status.Conditions
+	return ctrl.Result{}, true, nil
 }
 
 // reconcileOverlayHandoff injects the two-sided AF_BRIDGE FDB and AF_INET neighbor entries
@@ -860,6 +949,9 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 	log := logf.FromContext(ctx)
 
 	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionVXLANFDBUpdated) {
+		if res, ready, err := r.gateStorageCutoverBeforeRestore(ctx, pm); err != nil || !ready {
+			return res, err
+		}
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoreSocketReattach)
 	}
 
@@ -869,6 +961,9 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 			"Skipped", "TCPPreservationMode=None: overlay FDB injection not required")
 		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
+		}
+		if res, ready, err := r.gateStorageCutoverBeforeRestore(ctx, pm); err != nil || !ready {
+			return res, err
 		}
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoreSocketReattach)
 	}
@@ -958,6 +1053,9 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 	setCondition(pm, pmv1.ConditionVXLANFDBUpdated, metav1.ConditionTrue, "FDBConfirmed", msg)
 	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
+	}
+	if res, ready, err := r.gateStorageCutoverBeforeRestore(ctx, pm); err != nil || !ready {
+		return res, err
 	}
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoreSocketReattach)
 }
@@ -1562,6 +1660,21 @@ func (r *PodMigrationReconciler) ensureWorkloadLivenessVerified(ctx context.Cont
 		return true, ctrl.Result{}
 	}
 
+	// Second-pass gate (fixes the false-positive Complete gap found this sprint — see
+	// ConditionWorkloadLivenessFirstPass's doc comment and reconcileServiceVerifying's mirror of
+	// this same logic): a single passing probe is not sufficient proof of a stable, still-alive
+	// workload, since a workload can crash 40-60s after an apparently successful CRIU restore. Only
+	// set ConditionWorkloadLivenessVerified True after a SECOND real probe, issued no sooner than
+	// workloadLivenessStabilizationWindow after the first passing probe, also passes.
+	firstPass := meta.FindStatusCondition(pm.Status.Conditions, pmv1.ConditionWorkloadLivenessFirstPass)
+	awaitingSecondPass := firstPass != nil && firstPass.Status == metav1.ConditionTrue
+	if awaitingSecondPass {
+		elapsed := time.Since(firstPass.LastTransitionTime.Time)
+		if elapsed < workloadLivenessStabilizationWindow {
+			return false, ctrl.Result{RequeueAfter: workloadLivenessStabilizationWindow - elapsed}
+		}
+	}
+
 	if r.AgentPool == nil {
 		log.Error(nil, "ensureWorkloadLivenessVerified: AgentPool not wired — requeuing", "migration", pm.Name)
 		return false, ctrl.Result{RequeueAfter: 30 * time.Second}
@@ -1605,6 +1718,10 @@ func (r *PodMigrationReconciler) ensureWorkloadLivenessVerified(ctx context.Cont
 		if rpcErr == nil && vtcpResp != nil {
 			msg = vtcpResp.AppProbeError
 		}
+		if awaitingSecondPass {
+			setCondition(pm, pmv1.ConditionWorkloadLivenessFirstPass, metav1.ConditionFalse, "ReconfirmationFailed",
+				fmt.Sprintf("ADR-0325: second-pass workload-liveness probe (%s) against destination pod IP %s failed after the first pass had succeeded — workload died post-restore: %v / %s", probeProtocol, destPodIP, rpcErr, msg))
+		}
 		setWorkloadLivenessCondition(pm, false, reasonPrefix+"ProbeFailed",
 			fmt.Sprintf("ADR-0325: workload-liveness probe (%s) against destination pod IP %s failed: %v / %s", probeProtocol, destPodIP, rpcErr, msg))
 		if err := r.statusUpdate(ctx, pm); err != nil {
@@ -1612,12 +1729,20 @@ func (r *PodMigrationReconciler) ensureWorkloadLivenessVerified(ctx context.Cont
 		}
 		return false, ctrl.Result{RequeueAfter: 15 * time.Second}
 	}
-	setWorkloadLivenessCondition(pm, true, reasonPrefix+"ProbePassed",
-		fmt.Sprintf("ADR-0325: workload-liveness probe (%s) against destination pod IP %s passed", probeProtocol, destPodIP))
+	if awaitingSecondPass {
+		setWorkloadLivenessCondition(pm, true, reasonPrefix+"ProbePassed",
+			fmt.Sprintf("ADR-0325: workload-liveness probe (%s) against destination pod IP %s passed on second, stabilization-window-delayed confirmation", probeProtocol, destPodIP))
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return false, ctrl.Result{}
+		}
+		return true, ctrl.Result{}
+	}
+	setCondition(pm, pmv1.ConditionWorkloadLivenessFirstPass, metav1.ConditionTrue, reasonPrefix+"ProbePassed",
+		fmt.Sprintf("ADR-0325: workload-liveness probe (%s) against destination pod IP %s passed first pass; awaiting second confirmation in %s", probeProtocol, destPodIP, workloadLivenessStabilizationWindow))
 	if err := r.statusUpdate(ctx, pm); err != nil {
 		return false, ctrl.Result{}
 	}
-	return true, ctrl.Result{}
+	return false, ctrl.Result{RequeueAfter: workloadLivenessStabilizationWindow}
 }
 
 // reconcileServiceVerifying runs HTTP/endpoint readiness checks (the existing service-layer verifier).
@@ -1669,6 +1794,28 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 	case !alreadyVerified:
 		// Idempotency guard: only skip the RPC when WorkloadLivenessVerified is already
 		// True on this reconcile's read — always re-run otherwise.
+		//
+		// Second-pass gate (fixes the false-positive Complete gap found this sprint): a workload
+		// can crash 40-60s AFTER a genuinely successful CRIU restore (observed live: Postgres
+		// killed by an internal fault shortly after restore, while this exact single SQL/TCP probe
+		// happened to catch it in its narrow alive window). A single passing probe is therefore not
+		// sufficient proof of a stable, still-alive workload. ConditionWorkloadLivenessFirstPass
+		// stages the first pass; ConditionWorkloadLivenessVerified (the condition every downstream
+		// teardown/completion gate keys on) is only set True after a SECOND real probe, issued no
+		// sooner than workloadLivenessStabilizationWindow after the first pass, ALSO passes. This is
+		// a second genuine health confirmation against the live workload — not a longer wait/sleep
+		// that merely narrows the odds of catching a death (CLAUDE.md SUBSTRATE-PRIMITIVE BIAS).
+		firstPass := meta.FindStatusCondition(pm.Status.Conditions, pmv1.ConditionWorkloadLivenessFirstPass)
+		awaitingSecondPass := firstPass != nil && firstPass.Status == metav1.ConditionTrue
+		if awaitingSecondPass {
+			elapsed := time.Since(firstPass.LastTransitionTime.Time)
+			if elapsed < workloadLivenessStabilizationWindow {
+				// Do not re-probe yet: the point of the gate is a probe issued LATER in time, not
+				// more frequent probing now — re-probing early would just re-observe the same
+				// narrow alive window the first pass already did.
+				return ctrl.Result{RequeueAfter: workloadLivenessStabilizationWindow - elapsed}, nil
+			}
+		}
 		if r.AgentPool == nil {
 			log.Error(nil, "ServiceVerifying: AgentPool not wired — requeuing", "migration", pm.Name)
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -1715,6 +1862,14 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 			if rpcErr == nil && vtcpResp != nil {
 				msg = vtcpResp.AppProbeError
 			}
+			if awaitingSecondPass {
+				// The second, later probe is what actually caught the death: reset the staged
+				// first pass so a later recovery must re-earn BOTH passes, and keep
+				// WorkloadLivenessVerified False/never-set so no downstream gate reads a
+				// false-positive Complete.
+				setCondition(pm, pmv1.ConditionWorkloadLivenessFirstPass, metav1.ConditionFalse, "ReconfirmationFailed",
+					fmt.Sprintf("ServiceVerifying: ADR-0325 second-pass workload-liveness probe (%s) failed after the first pass had succeeded — workload died post-restore: %v / %s", probeProtocol, rpcErr, msg))
+			}
 			setWorkloadLivenessCondition(pm, false, reasonPrefix+"ProbeFailed",
 				fmt.Sprintf("ServiceVerifying: ADR-0325 workload-liveness probe (%s) failed: %v / %s", probeProtocol, rpcErr, msg))
 			if err := r.statusUpdate(ctx, pm); err != nil {
@@ -1722,11 +1877,26 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 			}
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
-		setWorkloadLivenessCondition(pm, true, reasonPrefix+"ProbePassed",
-			fmt.Sprintf("ServiceVerifying: ADR-0325 workload-liveness probe (%s) passed", probeProtocol))
+		if awaitingSecondPass {
+			// Second real probe, issued after the stabilization window, also passed: the workload
+			// has now been independently confirmed alive at two distinct points in time. Only now
+			// is ConditionWorkloadLivenessVerified — the condition every teardown/completion gate
+			// keys on — set True.
+			setWorkloadLivenessCondition(pm, true, reasonPrefix+"ProbePassed",
+				fmt.Sprintf("ServiceVerifying: ADR-0325 workload-liveness probe (%s) passed on second, stabilization-window-delayed confirmation", probeProtocol))
+			if err := r.statusUpdate(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
+			break
+		}
+		// First pass: stage it and require the second, later, independent confirmation above
+		// before ConditionWorkloadLivenessVerified is ever set True.
+		setCondition(pm, pmv1.ConditionWorkloadLivenessFirstPass, metav1.ConditionTrue, reasonPrefix+"ProbePassed",
+			fmt.Sprintf("ServiceVerifying: ADR-0325 workload-liveness probe (%s) passed first pass; awaiting second confirmation in %s", probeProtocol, workloadLivenessStabilizationWindow))
 		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
 		}
+		return ctrl.Result{RequeueAfter: workloadLivenessStabilizationWindow}, nil
 	}
 
 	// ADR-0352 D0.1: WorkloadLivenessVerified has just been (re-)established above (or was
@@ -1796,17 +1966,41 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 	noneMode := pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeNone
 	livenessOK := probeProtocol == "" || meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionWorkloadLivenessVerified)
 
+	// Bugfix (found live this sprint): these three fast-path branches transition straight to
+	// CutoverComplete on their respective liveness/reachability predicate WITHOUT ever running
+	// the service-path verifier block below that actually sets conditionTrafficVerified=True.
+	// deleteSourcePodIfSafe (ADR-0012) requires TrafficVerified=True before it will delete the
+	// source pod, so taking one of these branches on the FIRST reconcile where the predicate
+	// becomes true — before TrafficVerified has ever been set — wedges CutoverComplete forever
+	// (source pod never deleted, migration never reaches phase=Complete). Each branch now sets
+	// conditionTrafficVerified=True itself, recording the real predicate that justified skipping
+	// the redundant verifier call, before transitioning.
 	if noneMode {
 		if livenessOK {
+			setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "WorkloadLivenessVerified",
+				"TCPPreservationMode=None: WorkloadLivenessVerified (ADR-0325) is the authoritative liveness proof; service-path verifier skipped")
+			if err := r.statusUpdate(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
 			return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
 		}
 	} else if pm.Spec.TCPPreservationMode == pmv1.TCPPreservationModeStrict {
 		// ADR-0352 D2.1: Strict now advances on ServiceContinuityVerified, not the retired
 		// DataplaneReachabilityVerified.
 		if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionServiceContinuityVerified) && livenessOK {
+			setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "ServiceContinuityVerified",
+				"TCPPreservationMode=Strict: ServiceContinuityVerified (ADR-0352 D1) established; service-path verifier skipped")
+			if err := r.statusUpdate(ctx, pm); err != nil {
+				return ctrl.Result{}, err
+			}
 			return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
 		}
 	} else if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionDataplaneReachabilityVerified) && livenessOK {
+		setCondition(pm, conditionTrafficVerified, metav1.ConditionTrue, "DataplaneReachabilityVerified",
+			"TCPPreservationMode=BestEffort: DataplaneReachabilityVerified already established; service-path verifier skipped")
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return ctrl.Result{}, err
+		}
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCutoverComplete)
 	}
 
@@ -1936,7 +2130,7 @@ func (r *PodMigrationReconciler) reconcileServiceVerifying(ctx context.Context, 
 // internal/agent/traffic/remove_source_if_verified_test.go) asserts the two entry points agree.
 // The predicate is:
 //   - Strict:      ServiceContinuityVerified=True (ADR-0352 Service-continuity gate) AND
-//                  TCPSequenceContinuityVerified=True.
+//     TCPSequenceContinuityVerified=True.
 //   - BestEffort:  TrafficVerified=True AND TCPSequenceContinuityVerified=True.
 //   - None:        TrafficVerified=True (legacy cold/stateless pre-check), AND
 //   - ALL modes:   additionally WorkloadLivenessVerified=True (ADR-0325).
@@ -1955,6 +2149,145 @@ func sourcePodDeletionBlockReason(mode pmv1.TCPPreservationMode, conditions []me
 //     The source pod is NOT deleted; the migration phase is untouched.
 //   - blocked=false → the gate permitted deletion and the source pod was deleted (or was already
 //     gone / not on the source node). The caller may proceed to finalization.
+//
+// earlyReleaseSourceForTier1Longhorn is the narrow, Tier1-Longhorn-only exception to ADR-0012
+// documented in ADR-0356 (docs/adr/0356-tier1-longhorn-early-source-release.md). It does
+// nothing for every other storage tier — ADR-0012's normal "never delete the source pod
+// before TrafficVerified=True" rule is completely unchanged for TierRWX, TierCephRBD,
+// TierSnapshotRsync, and pods with no PVCs at all.
+//
+// Why this exists: Longhorn's real collapse-to-single-owner mechanism for a
+// TierLonghorn-classified volume is driven by Kubernetes' own CSI attacher, which only
+// releases the source node's VolumeAttachment once no pod on that node references the PVC.
+// For this tier that functionally requires the source pod to be gone BEFORE the destination
+// pod can ever mount its volume — which gates CRIU restore, which gates TrafficVerified,
+// which is exactly the condition ADR-0012 says must be true before the source pod is
+// deleted. Neither side of that cycle can go first under ADR-0012's normal ordering; this
+// function is the one place that breaks it, for this tier only.
+//
+// Replacement safety guarantee (ADR-0356), checked immediately before deletion — not a
+// sleep/timeout guess, but two real, independently-verifiable substrate signals:
+//  1. pm.Status.CheckpointTransferred=True: the checkpoint has already passed the full
+//     ADR-SEC-B chain (sha256 wire-integrity hash, operator-signed manifest, exact
+//     per-file digest match on the destination node — internal/agent/server/server.go
+//     PutCheckpointTar) AND CRIU's own dump-time inventory.img presence check
+//     (internal/agent/criu/criu_checkpointer.go) already ran on the source before the tar
+//     was ever built. This proves a complete, intact, tamper-evident checkpoint is durably
+//     present on the destination node — the source pod is no longer the only copy of the
+//     process's state.
+//  2. The destination node's NodeMigrationCapacity.Status.Ready is re-read fresh (not
+//     stale scheduling-time data): the destination agent is alive and has itself already
+//     probed its own CRIU binary/kernel features successfully (internal/agent/nmcregistrar)
+//     right now, not merely at some earlier point in the migration.
+//
+// What this does NOT prove — stated plainly, not glossed over: neither signal proves the
+// destination pod is actually serving traffic, because that is causally impossible to prove
+// before the volume this function unblocks has even been mounted. ADR-0356 accepts this
+// explicitly: a Tier1-Longhorn migration that fails restore AFTER this point can no longer
+// live-resume the frozen source (it is deleted, and — verified against
+// internal/rollback/rollback.go's StubComputeRollback — the only rollback primitive is an
+// Abort RPC that SIGCONTs a still-running frozen PID, which no longer exists here). Recovery
+// becomes "recreate from the durably-verified checkpoint," a real but bounded-downtime path,
+// not zero-downtime live rollback. This narrows ADR-0012's guarantee for THIS TIER ONLY.
+func (r *PodMigrationReconciler) earlyReleaseSourceForTier1Longhorn(ctx context.Context, pm *pmv1.PodMigration) error {
+	log := logf.FromContext(ctx)
+
+	if pm.Status.StorageTier == nil || storage.StorageTier(*pm.Status.StorageTier) != storage.TierLonghorn {
+		return nil // not this tier — ADR-0012's normal ordering applies untouched.
+	}
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionTier1EarlySourceRelease) {
+		return nil // already done — idempotent no-op on every subsequent reconcile.
+	}
+	if !pm.Status.CheckpointTransferred {
+		// Should never be reached — the caller (reconcileTransferring) only invokes this
+		// after the CheckpointTransferred block above has run — but guard defensively
+		// rather than ever releasing the source without a durably-verified checkpoint.
+		return fmt.Errorf("ADR-0356: refusing early source release before CheckpointTransferred=True")
+	}
+
+	destNode := pm.Status.DestinationNodeName
+	if destNode == "" {
+		destNode = pm.Spec.TargetNodeName
+	}
+	destNMC, nmcErr := r.getNMC(ctx, destNode)
+	if nmcErr != nil {
+		return fmt.Errorf("ADR-0356: fetch destination NMC %s: %w", destNode, nmcErr)
+	}
+	if !destNMC.Status.Ready {
+		return fmt.Errorf("ADR-0356: destination NMC %s not Ready — refusing early source release", destNode)
+	}
+
+	sourcePod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+	if err == nil {
+		if sourcePod.Spec.NodeName == pm.Status.SourceNodeName {
+			// The source process is left in SIGSTOP after the final freeze dump
+			// (LeaveStopped=true, internal/agent/server/server.go) specifically so it is
+			// fully recoverable rather than killed-and-kubelet-restarted. A plain
+			// Kubernetes pod delete does NOT safely tear down a stopped container: the
+			// container runtime's own stop sequence resumes (SIGCONT) a stopped init
+			// process before signalling it — even with GracePeriodSeconds(0), SIGTERM is
+			// still delivered and the now-running process gets a real (if short) window
+			// to execute its OWN application-level shutdown code before the follow-up
+			// SIGKILL lands. For a workload that manages its own on-disk lock/state file
+			// in PGDATA (e.g. PostgreSQL's postmaster.pid), that graceful shutdown
+			// unlinks the lock file as its last act — and because this tier's PGDATA is
+			// the SAME Longhorn volume the destination is about to (or has already
+			// started to) mount, that unlink lands on the shared volume out from under
+			// the CRIU-restored destination process, which resumes expecting the lock
+			// file to still exist exactly as it was at checkpoint time. PostgreSQL treats
+			// a missing postmaster.pid as an external "please shut down now" signal and
+			// immediately, cleanly self-terminates — with zero OOM/signal/dmesg trace,
+			// since nothing external killed it (confirmed live: sprint49 Tier1-Longhorn
+			// postgres proof — the restored destination postmaster logged "could not open
+			// file postmaster.pid" / "data directory lock file is invalid" and
+			// self-terminated seconds after a clean CRIU restore).
+			//
+			// The correct primitive is KillFrozenSource: deliver SIGKILL directly to the
+			// STILL-STOPPED source PID via the source agent's broker (mirrors the
+			// existing thaw-on-rollback SIGCONT primitive, but kills instead of resuming).
+			// SIGKILL is fatal to a stopped task without ever resuming it to userspace, so
+			// the source's own shutdown/cleanup code never runs at all — not a narrower
+			// race window, a real elimination of the race. Only fall back to a plain pod
+			// delete (best-effort object cleanup) if the source agent is unreachable or
+			// the kill RPC itself fails; in that case surface the error so the caller
+			// requeues and retries rather than silently deleting a possibly-still-live
+			// source pod through the unsafe path.
+			srcAgent, agentErr := r.AgentPool.ForNode(ctx, pm.Status.SourceNodeName)
+			if agentErr != nil {
+				return fmt.Errorf("ADR-0356: connect to source agent %s for KillFrozenSource: %w", pm.Status.SourceNodeName, agentErr)
+			}
+			killResp, killErr := srcAgent.KillFrozenSource(ctx, &agentpb.KillFrozenSourceRequest{
+				MigrationName: pm.Name,
+				// PodUid: explicit fallback target for the (common) case where Checkpoint
+				// used the containerd-native "ctr tasks checkpoint" fast path, which never
+				// registers a frozen-source record. Passed explicitly (not left to the
+				// agent's own in-memory migrationPodUID cache alone) so this still works
+				// across an agent restart between checkpoint and this call.
+				PodUid: string(sourcePod.UID),
+			})
+			if killErr != nil || killResp == nil || !killResp.Success {
+				return fmt.Errorf("ADR-0356: KillFrozenSource on source agent %s failed: %v / %v", pm.Status.SourceNodeName, killErr, killResp)
+			}
+			log.Info("ADR-0356: frozen source process killed (SIGKILL, still-stopped) before deleting source pod",
+				"pod", pm.Spec.PodName, "node", pm.Status.SourceNodeName, "migration", pm.Name, "killed", killResp.Killed)
+
+			log.Info("ADR-0356: deleting source pod early (Tier1-Longhorn) to release the CSI VolumeAttachment blocking destination mount",
+				"pod", pm.Spec.PodName, "node", pm.Status.SourceNodeName, "migration", pm.Name)
+			if delErr := r.Delete(ctx, sourcePod, client.GracePeriodSeconds(0)); delErr != nil && !apierrors.IsNotFound(delErr) {
+				return fmt.Errorf("ADR-0356: delete source pod: %w", delErr)
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("ADR-0356: get source pod: %w", err)
+	}
+
+	setCondition(pm, pmv1.ConditionTier1EarlySourceRelease, metav1.ConditionTrue, "Tier1LonghornEarlyRelease",
+		"ADR-0356: source pod released pre-restore (CheckpointTransferred verified durable+intact, destination NMC fresh-Ready) to unblock Longhorn's single-owner collapse; rollback for this migration is now checkpoint-recreate, not live-resume")
+	setCondition(pm, conditionSourcePodDeleted, metav1.ConditionTrue, "Tier1LonghornEarlyRelease",
+		"ADR-0356: source pod deleted early for Tier1-Longhorn storage cutover, ahead of TrafficVerified")
+	return r.statusUpdate(ctx, pm)
+}
+
 func (r *PodMigrationReconciler) deleteSourcePodIfSafe(ctx context.Context, pm *pmv1.PodMigration) (blocked bool, res ctrl.Result) {
 	log := logf.FromContext(ctx)
 
@@ -2968,8 +3301,38 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 		}
 	}
 
-	// Remove the scheduling gate NOW — images are on the destination node so the
-	// NRI StartContainer hook can find them at /run/podmotion/checkpoints/<ref>/final.
+	// ADR-0356: for Tier1 (Longhorn) migratable volumes ONLY, release the source pod now —
+	// before the scheduling gate below makes the destination pod schedulable — instead of
+	// waiting for TrafficVerified (ADR-0012's normal rule). See earlyReleaseSourceForTier1Longhorn's
+	// doc comment and ADR-0356 for the full rationale; every other tier is untouched.
+	if err := r.earlyReleaseSourceForTier1Longhorn(ctx, pm); err != nil {
+		log.Error(err, "reconcileTransferring: ADR-0356 Tier1-Longhorn early source release not yet safe — requeuing",
+			"migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// sprint49 finding: the storage-cutover gate (StorageMgr.Cutover/AwaitSingleOwner) does
+	// NOT belong here, before scheduling-gate removal. Longhorn's real dual-engine collapse
+	// (tier1.go AwaitSingleOwner) can only begin once the destination pod is actually
+	// SCHEDULED and kubelet issues NodeStageVolume there — that is what makes
+	// longhorn-manager populate spec.migrationNodeID and start the second engine in the
+	// first place. Removing the scheduling gate is the ONLY thing that lets the scheduler
+	// bind the destination pod to its node. Gating AwaitSingleOwner before gate-removal is a
+	// permanent deadlock: it polls forever for a collapse that can never start, because the
+	// pod it needs mounted is still held at PodSchedulingGated. (Confirmed live: the gate
+	// timed out at 2 minutes with the destination Longhorn volume still "detached"/"unknown"
+	// — it never had a chance to attach.) The real gate now lives at the end of
+	// reconcileOverlayHandoff, immediately before the phase transition into
+	// RestoreSocketReattach — see gateStorageCutoverBeforeRestore's doc comment for why that
+	// is the correct (and only correct) place: it is the exact boundary the NRI
+	// StartContainer hook's own phase check (nri/plugin.go verifyPhaseInAcceptSet) enforces,
+	// so gating there blocks BOTH the NRI-triggered restore and the direct/legacy RPC path
+	// uniformly, without deadlocking the storage collapse this gate depends on.
+	//
+	// Remove the scheduling gate NOW — images are on the destination node, so the
+	// NRI StartContainer hook can find the checkpoint at
+	// /run/podmotion/checkpoints/<ref>/final once CRIU restore is actually permitted to run
+	// (gated separately, later, in reconcileOverlayHandoff).
 	// Removing earlier (post-Checkpoint, pre-Transfer) would race the NRI hook against
 	// the PutCheckpointTar delivery, causing a CRIU restore failure on a cold destination.
 	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionSchedulingGateRemoved) {
@@ -3187,6 +3550,18 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 	}
 	log.Info("PrepareDestination OK", "migration", pm.Name, "destNode", destNode,
 		"ipReserved", prepDestResp.IpReserved, "storageReady", prepDestResp.StorageReady)
+
+	// No storage-cutover gate here (sprint49): by the time reconcileRestoring runs, phase is
+	// already RestoreSocketReattach or later, which is EXACTLY the accept-set the NRI
+	// StartContainer hook's own phase check enforces (nri/plugin.go verifyPhaseInAcceptSet) —
+	// a gate placed here would be too late to block the NRI path (that hook fires from an
+	// independent kubelet event the instant the phase write lands in etcd, not when this Go
+	// function happens to run) and was in fact unreachable on the common NRI path anyway,
+	// since the NRI branch above (replForRestore != nil) returns before reaching this point.
+	// The real, single gate lives in reconcileOverlayHandoff — see
+	// gateStorageCutoverBeforeRestore — which runs strictly before the phase transition into
+	// RestoreSocketReattach, so ConditionStorageCutoverComplete is already True by the time
+	// either this function or the NRI hook can trigger restore.
 
 	// Restore: CRIU restores the process tree from the checkpoint images on the destination
 	// node. checkpoint_ref carries the full images-dir path so the agent uses it directly
@@ -5025,7 +5400,22 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 	setCondition(pm, pmv1.ConditionReplacementEndpointsRemoved, metav1.ConditionTrue, "ReplacementEndpointsAbsent", "")
 
 	pm.Status.Phase = pmv1.MigrationPhaseFailed
-	setCondition(pm, pmv1.ConditionRolledBack, metav1.ConditionTrue, "RollbackComplete", "Source pod restored to live state")
+	// Status-honesty fix (sprint49): "Source pod restored to live state" is only true when
+	// the source pod was still alive (frozen, never deleted — ADR-0012's normal guarantee) and
+	// Rollbacker.Rollback thawed it in place. ADR-0356's Tier1-Longhorn early source release
+	// deletes the source pod BEFORE this phase can ever be reached for that migration, so
+	// r.Rollbacker.Rollback's ComputeRollback thaw step has nothing to thaw — Rollback()
+	// returns success as a no-op, not because a live pod was resumed. Report that honestly:
+	// this is a real bounded-downtime outage recovered via the source pod's owning controller
+	// (e.g. a ReplicaSet) recreating a fresh replacement, not a live-resume.
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionTier1EarlySourceRelease) {
+		setCondition(pm, pmv1.ConditionRolledBack, metav1.ConditionTrue, "RollbackCompleteBoundedDowntime",
+			"ADR-0356 Tier1-Longhorn early source release had already deleted the source pod before rollback "+
+				"ran — no live pod existed to resume. Recovery is bounded-downtime (checkpoint-guaranteed via the "+
+				"source pod's owning controller recreating a fresh replacement), not a zero-downtime live-resume.")
+	} else {
+		setCondition(pm, pmv1.ConditionRolledBack, metav1.ConditionTrue, "RollbackComplete", "Source pod restored to live state")
+	}
 	// M26: emit flow_loss counter at Failed (all TCP connections inventoried are treated as lost).
 	pmmetrics.MigrationFlowLossTotal.WithLabelValues(pm.Name, pm.Namespace).Add(
 		float64(len(pm.Status.TCPSeqSnapshots)),
@@ -5834,6 +6224,50 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	holderPullPolicy := corev1.PullPolicy(os.Getenv("AGENT_IMAGE_PULL_POLICY"))
 	if holderPullPolicy == "" {
 		holderPullPolicy = corev1.PullIfNotPresent
+	}
+
+	// Strip any PodMotion-injected holder artifacts already present on the DEEP-COPIED spec
+	// before re-injecting fresh ones. sourcePod is not always a pristine, never-migrated pod:
+	// on a SECOND (or later) migration of the same workload, sourcePod IS the previous
+	// migration's replacement pod, which already carries the holderVolumeName emptyDir, the
+	// "podmotion-inject-holder" init container, and the holderMountPath VolumeMount on every
+	// main container from ITS OWN createReplacementPod call. Appending a second copy of each
+	// on top produces a Pod spec the API server rejects outright:
+	//   spec.volumes[N].name: Duplicate value: "podmotion-holder-bin"
+	//   spec.initContainers[N].name: Duplicate value: "podmotion-inject-holder"
+	//   spec.containers[0].volumeMounts[N].mountPath: Invalid value: "/podmotion": must be unique
+	// which silently strands the migration with Status.ReplacementPodName never set (reproduced
+	// live, sprint49: nginx-live-proof2-retry, operator log "failed to create replacement pod").
+	// Stripping by name/mountPath here — mirroring the selector-label strip above — makes
+	// replacement-pod creation idempotent regardless of how many times this workload has
+	// already been migrated.
+	filteredVolumes := make([]corev1.Volume, 0, len(spec.Volumes))
+	for _, v := range spec.Volumes {
+		if v.Name == holderVolumeName {
+			continue
+		}
+		filteredVolumes = append(filteredVolumes, v)
+	}
+	spec.Volumes = filteredVolumes
+
+	filteredInitContainers := make([]corev1.Container, 0, len(spec.InitContainers))
+	for _, c := range spec.InitContainers {
+		if c.Name == "podmotion-inject-holder" {
+			continue
+		}
+		filteredInitContainers = append(filteredInitContainers, c)
+	}
+	spec.InitContainers = filteredInitContainers
+
+	for i := range spec.Containers {
+		filteredMounts := make([]corev1.VolumeMount, 0, len(spec.Containers[i].VolumeMounts))
+		for _, m := range spec.Containers[i].VolumeMounts {
+			if m.Name == holderVolumeName || m.MountPath == holderMountPath {
+				continue
+			}
+			filteredMounts = append(filteredMounts, m)
+		}
+		spec.Containers[i].VolumeMounts = filteredMounts
 	}
 
 	// Inject the holder emptyDir volume onto the replacement pod spec.

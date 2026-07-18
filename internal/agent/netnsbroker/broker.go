@@ -151,7 +151,7 @@ func validateNetnsPath(netnsPath string) error {
 
 // Request is the JSON wire request accepted on the broker socket.
 type Request struct {
-	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal" | "signal_pid" | "resolve_veth" | "holder_sentinel" | "netns_exec" | "netns_exec_start"
+	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal" | "signal_pid" | "kill_source_pid" | "proc_alive" | "resolve_veth" | "holder_sentinel" | "netns_exec" | "netns_exec_start"
 	// MigrationUID names the per-migration netns dir. Validated by migrationUIDRe.
 	// Required on create/teardown; ignored on exec*.
 	MigrationUID string `json:"migrationUID"`
@@ -283,6 +283,15 @@ type Response struct {
 	// keeps polling — and is reported with Error=="". A broker-side failure
 	// (unresolvable container ID validation, etc.) sets Error instead.
 	Found bool `json:"found,omitempty"`
+
+	// Alive (proc_alive op only): true when the target PID is present under
+	// /proc and NOT a zombie/dead task. A false reading is a genuine "the
+	// process is gone or a zombie", never a permission artifact — see doProcAlive.
+	Alive bool `json:"alive,omitempty"`
+	// StartTime (proc_alive op only): field 22 of /proc/<pid>/stat at the moment
+	// of this check, returned so the CALLER can capture it as the ExpectedStartTime
+	// for a later re-check (PID-reuse guard), mirroring signal_pid's own guard.
+	StartTime uint64 `json:"startTime,omitempty"`
 }
 
 // netnsPathFor returns the broker-computed bind target for a migrationUID.
@@ -466,6 +475,22 @@ func Handle(req Request) Response {
 		// the broker never spawned) so AppArmor does not mediate the cross-profile
 		// resume. Signal allowlist + PID-reuse (starttime) guard enforced here.
 		return doSignalPID(req.SignalPID, req.Signal, req.ExpectedStartTime)
+	case "kill_source_pid":
+		// ADR-0356: terminate a source-tree PID the broker never spawned. Deliberately
+		// a SEPARATE op from signal_pid rather than widening its SC-1 SIGCONT/SIGSTOP
+		// allowlist to include SIGKILL — that allowlist exists specifically to keep
+		// signal_pid from becoming a general kill proxy for a compromised de-privileged
+		// agent (see signalPIDAllowed's doc comment). This op sends EXACTLY SIGKILL,
+		// hardcoded server-side — the client cannot select a signal at all, only invoke
+		// "terminate this PID-reuse-identified process" — so it adds no new "signal an
+		// arbitrary PID with an arbitrary signal" surface. Same PID-reuse (starttime)
+		// guard as signal_pid.
+		return doKillSourcePID(req.SignalPID, req.ExpectedStartTime)
+	case "proc_alive":
+		// Report liveness of a PID the broker never spawned (the CRIU-restored
+		// workload root) without delivering any signal. See doProcAlive for why
+		// this cannot be done in-process by the de-privileged agent.
+		return doProcAlive(req.SignalPID, req.ExpectedStartTime)
 	case "resolve_veth":
 		// Enter the pod's NET namespace and read eth0's veth peer ifindex on the
 		// de-privileged agent's behalf (the agent's AppArmor profile denies the
@@ -491,7 +516,7 @@ func Handle(req Request) Response {
 		// exactly as they do exec_start children (ADR-0326 Decision item 4).
 		return doNetnsExecStart(req.SrcPID, req.NetnsPath, req.Argv)
 	default:
-		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal|signal_pid|resolve_veth|holder_sentinel|netns_exec|netns_exec_start)", req.Op))
+		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal|signal_pid|kill_source_pid|proc_alive|resolve_veth|holder_sentinel|netns_exec|netns_exec_start)", req.Op))
 	}
 }
 
@@ -1175,6 +1200,90 @@ func doSignalPID(pid, signal int, expectedStartTime uint64) Response {
 		return Response{Error: fmt.Sprintf("signal_pid: kill(%d, %d): %v", pid, signal, err)}
 	}
 	return Response{}
+}
+
+// doKillSourcePID delivers SIGKILL — and ONLY SIGKILL, hardcoded, never client-selectable
+// — to a source-tree PID the broker never spawned (ADR-0356). See the kill_source_pid case
+// in Handle for why this is a separate op from signal_pid rather than an addition to its
+// SC-1 SIGCONT/SIGSTOP allowlist.
+//
+// Used by the ADR-0356 Tier1-Longhorn early source release to terminate the source process
+// directly at the kernel level — whether it is currently SIGSTOPped (a LeaveStopped=true
+// dump) or still normally running (the containerd-native ctr-checkpoint fast path, which
+// does not stop the container) — BEFORE the source pod is deleted through Kubernetes. A
+// plain pod delete resumes/signals the container through the normal app-level shutdown
+// path, giving a workload that manages its own on-disk lock/state file (e.g. PostgreSQL's
+// postmaster.pid) on a volume SHARED with the already-restored destination a window to
+// corrupt that shared state; SIGKILL delivered here never reaches any application signal
+// handler.
+//
+// Same PID-reuse (starttime) guard as doSignalPID: expectedStartTime==0 is rejected, and a
+// live/expected starttime mismatch means the PID has been reused by an unrelated process —
+// refuse to signal rather than kill the wrong thing.
+func doKillSourcePID(pid int, expectedStartTime uint64) Response {
+	if pid <= 0 {
+		return Response{Error: fmt.Sprintf("kill_source_pid: pid %d must be positive", pid)}
+	}
+	if expectedStartTime == 0 {
+		return Response{Error: fmt.Sprintf("kill_source_pid: no expected starttime supplied for pid %d — refusing to kill without a PID-reuse identity", pid)}
+	}
+	liveStart, err := procStartTime(pid)
+	if err != nil {
+		return Response{Error: fmt.Sprintf("kill_source_pid: read starttime for pid %d (process gone?): %v", pid, err)}
+	}
+	if liveStart != expectedStartTime {
+		return Response{Error: fmt.Sprintf("kill_source_pid: pid %d starttime mismatch (expected %d, live %d) — PID reused, refusing to kill", pid, expectedStartTime, liveStart)}
+	}
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		return Response{Error: fmt.Sprintf("kill_source_pid: kill(%d, SIGKILL): %v", pid, err)}
+	}
+	return Response{}
+}
+
+// doProcAlive reports whether pid is alive (present under /proc and not a
+// zombie), reading /proc/<pid>/stat directly in the broker's own UNCONFINED
+// process. This exists because the confined main agent's own read of
+// /proc/<restoredPID>/stat for a CRIU-restored workload root crosses a
+// ptrace_may_access kernel gate that AppArmor mediates under the "ptrace"
+// class against the TARGET's peer profile (the workload runs under
+// containerd's default profile, e.g. cri-containerd.apparmor.d — never
+// podmotion-agent or unconfined, the only two peers this profile's narrow
+// `ptrace (read)` grants cover). A denied read previously surfaced to the
+// caller as a plain os.ReadFile error — indistinguishable from "the process
+// genuinely exited" — so ADR-0228's liveness gate (verifyRestoredPIDAlive)
+// silently misclassified a live, healthy, just-restored workload as dead and
+// triggered its fail-closed reap (ADR-0351 G5), SIGKILLing the very process
+// the restore had just succeeded in bringing up. The broker is unconfined
+// (privileged:true, no AppArmor profile — same reasoning as ResolveVeth /
+// holder_sentinel / signal_pid above), so its read of the target's /proc/<pid>
+// entries is never subject to this mediation: a false reading here can only
+// come from the process actually being gone, exactly the semantics
+// verifyRestoredPIDAlive needs.
+//
+// expectedStartTime, when non-zero, re-validates the PID's identity the same
+// way doSignalPID does (field 22 of /proc/<pid>/stat) — a defense against a
+// stale caller re-checking a PID that has since been reused by an unrelated
+// process. expectedStartTime==0 skips the guard (used for the FIRST read,
+// when the caller has no prior starttime to compare against) and the read
+// starttime is always returned in Response.StartTime so the caller can latch
+// it for a subsequent guarded re-check.
+func doProcAlive(pid int, expectedStartTime uint64) Response {
+	if pid <= 0 {
+		return Response{Error: fmt.Sprintf("proc_alive: pid %d must be positive", pid)}
+	}
+	liveStart, err := procStartTime(pid)
+	if err != nil {
+		// The process is gone (or /proc/<pid>/stat is otherwise unreadable for a
+		// reason that is NOT AppArmor mediation, since this call runs unconfined) —
+		// a genuine "not alive", not a permission artifact.
+		return Response{Alive: false}
+	}
+	if expectedStartTime != 0 && liveStart != expectedStartTime {
+		// PID reused since the caller's earlier read — the ORIGINAL process it was
+		// tracking is gone, even though some (different) process now occupies pid.
+		return Response{Alive: false, StartTime: liveStart}
+	}
+	return Response{Alive: !processZombieOrDead(pid), StartTime: liveStart}
 }
 
 // processAlive reports whether /proc/<pid> still exists (the process has not been

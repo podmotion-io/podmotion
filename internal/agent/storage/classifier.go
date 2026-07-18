@@ -58,6 +58,22 @@ type StorageClassifier struct {
 	client client.Client
 }
 
+// podmotionHolderVolumeName is the emptyDir PodMotion's own mutating webhook
+// injects into every replacement pod to stage the holder binary (see
+// holderVolumeName in internal/controller/podmigration_controller.go — kept
+// as a separate literal here rather than a shared import to avoid a
+// storage->controller package dependency; the two names must stay in sync).
+// It is disk-backed, so without this exclusion it was indistinguishable from
+// real user pod-local state and got classified TierBlocked — meaning ANY
+// pod that had already been migrated once could never be migrated again, on
+// any storage tier or CNI, since the webhook re-injects this same volume
+// into every replacement pod. Confirmed live 2026-07-18: a bare nginx pod's
+// second migration (after a first, successful one) permanently stalled at
+// PreCopyMemory with StorageReadyForFreeze=False/BlockedVolume. This volume
+// holds no pod data — it's recreated fresh by the webhook on every
+// migration — so it is always transparent to migration, never blocked.
+const podmotionHolderVolumeName = "podmotion-holder-bin"
+
 // NewStorageClassifier returns a classifier backed by the given k8s client.
 func NewStorageClassifier(c client.Client) *StorageClassifier {
 	return &StorageClassifier{client: c}
@@ -85,6 +101,12 @@ func (sc *StorageClassifier) ClassifyPod(ctx context.Context, pod *corev1.Pod) (
 				Reason:  "memory-backed emptyDir cannot be migrated",
 				PVCName: vol.Name,
 			})
+			continue
+		}
+		// PodMotion's own injected holder-binary volume: never real pod data,
+		// always recreated fresh by the mutating webhook on every migration —
+		// transparent to migration, same as configMap/secret/projected below.
+		if vol.EmptyDir != nil && vol.Name == podmotionHolderVolumeName {
 			continue
 		}
 		// Disk-backed emptyDir holds real pod-local writable state on the source
@@ -250,6 +272,14 @@ func classifyByStorageClass(sc *storagev1.StorageClass) StorageTier {
 // Provisioner/Annotations fields rather than any hardcoded class name — a
 // class named e.g. "longhorn-migratable" is this repo's own naming choice,
 // not a universal identifier.
+// IsLonghornStorageClass is the exported form of isLonghornStorageClass, for callers outside this
+// package (e.g. internal/agent/server's re-attach mount tier classification) that need the same
+// Longhorn-detection rule this classifier uses — so a Longhorn-backed PVC is never independently
+// re-derived (and potentially drifted) by a second, narrower check elsewhere in the codebase.
+func IsLonghornStorageClass(sc *storagev1.StorageClass) bool {
+	return isLonghornStorageClass(sc)
+}
+
 func isLonghornStorageClass(sc *storagev1.StorageClass) bool {
 	if strings.Contains(sc.Provisioner, "longhorn.io") {
 		return true
