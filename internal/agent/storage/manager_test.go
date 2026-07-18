@@ -270,6 +270,10 @@ func (f *fakeCountingMigrator) Cutover(_ context.Context, _ storage.MigrationOpt
 	return nil
 }
 
+func (f *fakeCountingMigrator) AwaitSingleOwner(_ context.Context, _ storage.MigrationOptions) error {
+	return nil
+}
+
 // TestRunPreStage_TransientError_RetriesThenSucceeds is the regression test
 // for the no-retry-on-transient-failure bug: a PreStage call that fails
 // twice with a network/timeout-class error (the DNS/routing race right

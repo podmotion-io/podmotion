@@ -28,6 +28,15 @@ const (
 
 	// longhornPollInterval is the delay between replica health polls.
 	longhornPollInterval = 3 * time.Second
+
+	// longhornSingleOwnerTimeout bounds how long AwaitSingleOwner polls for
+	// Longhorn to collapse a volume's dual-engine live-migration state back
+	// down to a single RW replica on the destination node. Longhorn's own
+	// migration-confirm/handoff step normally completes within a few polling
+	// intervals of Cutover's attach call returning; a long stall here means
+	// something is genuinely stuck (e.g. the source engine failed to detach),
+	// so this must fail closed rather than poll forever.
+	longhornSingleOwnerTimeout = 2 * time.Minute
 )
 
 // LonghornMigrator implements Tier1 dual-engine live migration via the
@@ -178,6 +187,74 @@ func (m *LonghornMigrator) Cutover(ctx context.Context, opts MigrationOptions) e
 	}
 
 	return nil
+}
+
+// AwaitSingleOwner polls the Longhorn Manager API until each Tier1 volume's
+// replica list has collapsed to exactly one RW/running replica, and that
+// replica sits on opts.DestinationNode — i.e. the dual-engine live-migration
+// pair Cutover's attach left in place has been torn down on the source side
+// by Longhorn's own migration-confirm/handoff step, and the CSI driver will
+// therefore see a single controller when the destination pod's NodeStageVolume
+// call lands (this is the general fix for the "invalid controller count 2"
+// class of error, expressed via Longhorn's real replica-state signal — never
+// a string match on the CSI error itself).
+func (m *LonghornMigrator) AwaitSingleOwner(ctx context.Context, opts MigrationOptions) error {
+	log := logf.FromContext(ctx).WithValues("migration", opts.MigrationName, "tier", "Longhorn")
+
+	deadlineCtx, cancel := context.WithTimeout(ctx, longhornSingleOwnerTimeout)
+	defer cancel()
+
+	for _, clsf := range opts.Classifications {
+		if clsf.Tier != TierLonghorn {
+			continue
+		}
+
+		volumeName, err := m.resolveVolumeName(ctx, opts.PodNamespace, clsf.PVCName)
+		if err != nil {
+			return fmt.Errorf("tier1: resolve volume name for pvc %s: %w", clsf.PVCName, err)
+		}
+
+		log.Info("awaiting single-owner (collapsed dual-engine) state", "volume", volumeName, "destNode", opts.DestinationNode)
+		if err := m.pollUntilSingleOwner(deadlineCtx, volumeName, opts.DestinationNode); err != nil {
+			return fmt.Errorf("tier1: await single owner %s: %w", volumeName, err)
+		}
+		log.Info("volume collapsed to single owner", "volume", volumeName, "destNode", opts.DestinationNode)
+	}
+
+	return nil
+}
+
+// pollUntilSingleOwner polls fetchVolume until exactly one non-failed
+// RW/running replica exists and it is on destNode, or ctx is done (a timeout
+// or cancellation is returned as an error — fail closed, never requeue
+// forever).
+func (m *LonghornMigrator) pollUntilSingleOwner(ctx context.Context, volumeName, destNode string) error {
+	for {
+		vol, err := m.fetchVolume(ctx, volumeName)
+		if err == nil {
+			owners := 0
+			destIsSingleOwner := false
+			for _, r := range vol.Replicas {
+				if r.FailedAt != "" || r.Mode != "RW" || !r.Running {
+					continue
+				}
+				owners++
+				if r.NodeID == destNode {
+					destIsSingleOwner = true
+				}
+			}
+			if owners == 1 && destIsSingleOwner {
+				return nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timed out waiting for volume %s to collapse to a single RW replica on %s: %w",
+				volumeName, destNode, ctx.Err())
+		case <-time.After(longhornPollInterval):
+		}
+	}
 }
 
 // ── Longhorn HTTP helpers ───────────────────────────────────────────────────
@@ -414,6 +491,10 @@ type LonghornStubMigrator struct {
 	PreStageCalled int
 	// CutoverCalled records whether Cutover was called.
 	CutoverCalled bool
+	// AwaitSingleOwnerCalled records whether AwaitSingleOwner was called.
+	AwaitSingleOwnerCalled bool
+	// InjectAwaitSingleOwnerError causes AwaitSingleOwner to return this error.
+	InjectAwaitSingleOwnerError error
 }
 
 // Tier returns TierLonghorn.
@@ -434,4 +515,10 @@ func (s *LonghornStubMigrator) SyncPercent(_ context.Context, _ MigrationOptions
 func (s *LonghornStubMigrator) Cutover(_ context.Context, _ MigrationOptions) error {
 	s.CutoverCalled = true
 	return nil
+}
+
+// AwaitSingleOwner records the call and returns the injected error (nil by default).
+func (s *LonghornStubMigrator) AwaitSingleOwner(_ context.Context, _ MigrationOptions) error {
+	s.AwaitSingleOwnerCalled = true
+	return s.InjectAwaitSingleOwnerError
 }

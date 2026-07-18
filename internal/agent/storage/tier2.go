@@ -27,6 +27,18 @@ const (
 	// cephPollInterval is the delay between rbd migration status polls.
 	cephPollInterval = 2 * time.Second
 
+	// cephSingleOwnerTimeout bounds how long AwaitSingleOwner polls for
+	// `rbd migration status` to report state=="committed" after Cutover's
+	// "rbd migration commit" call. This is mostly a verification poll — commit
+	// is synchronous in practice — but bounding it means a stuck/partial
+	// commit fails closed instead of letting the destination pod mount race
+	// an image that is still mid-migration.
+	cephSingleOwnerTimeout = 1 * time.Minute
+
+	// cephMigrationCommittedState is the rbd migration status "state" value
+	// once the migration has fully committed and the image has a single owner.
+	cephMigrationCommittedState = "committed"
+
 	// cephSquidMinMajor is the minimum Ceph major version that supports live RBD migration
 	// without the "preview" caveat. Reef (18.x) exists but is unsupported for production use
 	// (ADR-0026).
@@ -156,6 +168,69 @@ func (m *CephRBDMigrator) Cutover(ctx context.Context, opts MigrationOptions) er
 	return nil
 }
 
+// AwaitSingleOwner polls `rbd migration status` until state=="committed" for
+// each Tier2 image — the point at which Ceph has fully handed the image over
+// to the destination pool/image and the source-side migration source image
+// no longer exists as a live owner. Cutover's "rbd migration commit" call is
+// synchronous in the common case, so this is mostly a verification poll of
+// the same status call PreStage already uses via migrationProgress — but it
+// is bounded and fails closed rather than assuming commit always finishes
+// before it returns.
+func (m *CephRBDMigrator) AwaitSingleOwner(ctx context.Context, opts MigrationOptions) error {
+	log := logf.FromContext(ctx).WithValues("migration", opts.MigrationName, "tier", "CephRBD")
+
+	deadlineCtx, cancel := context.WithTimeout(ctx, cephSingleOwnerTimeout)
+	defer cancel()
+
+	for _, clsf := range opts.Classifications {
+		if clsf.Tier != TierCephRBD {
+			continue
+		}
+
+		srcImage, _, err := m.imageNames(clsf, opts)
+		if err != nil {
+			return fmt.Errorf("tier2: parse image name for pvc %s: %w", clsf.PVCName, err)
+		}
+
+		log.Info("awaiting single-owner (committed) migration state", "src", srcImage)
+		if err := m.pollUntilCommitted(deadlineCtx, srcImage); err != nil {
+			return fmt.Errorf("tier2: await single owner %s: %w", srcImage, err)
+		}
+		log.Info("RBD migration committed — single owner", "src", srcImage)
+	}
+
+	return nil
+}
+
+func (m *CephRBDMigrator) migrationState(ctx context.Context, srcImage string) (string, error) {
+	cmd := m.ExecCommand("rbd", "migration", "status", srcImage, "--format", "json")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("rbd migration status %s: %w", srcImage, err)
+	}
+	var status rbdMigrationStatus
+	if err := json.Unmarshal(out, &status); err != nil {
+		return "", fmt.Errorf("parse rbd migration status: %w", err)
+	}
+	return status.State, nil
+}
+
+func (m *CephRBDMigrator) pollUntilCommitted(ctx context.Context, srcImage string) error {
+	for {
+		state, err := m.migrationState(ctx, srcImage)
+		if err == nil && state == cephMigrationCommittedState {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timed out waiting for rbd migration of %s to reach state=%s: %w",
+				srcImage, cephMigrationCommittedState, ctx.Err())
+		case <-time.After(cephPollInterval):
+		}
+	}
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 // imageNames derives rbd image addresses from the TierClassification.
@@ -245,10 +320,13 @@ func (m *CephRBDMigrator) warnIfReefCluster(ctx context.Context) {
 // CephRBDStubMigrator is used in unit tests and environments without Ceph.
 // It emits simulated progress 0 → 50 → 95 → 100 with 100ms delays.
 type CephRBDStubMigrator struct {
-	PreStageCalled bool
-	CutoverCalled  bool
+	PreStageCalled         bool
+	CutoverCalled          bool
+	AwaitSingleOwnerCalled bool
 	// InjectPreStageError causes PreStage to return an error.
 	InjectPreStageError error
+	// InjectAwaitSingleOwnerError causes AwaitSingleOwner to return this error.
+	InjectAwaitSingleOwnerError error
 	// progressSteps tracks which step the stub is on for SyncPercent calls.
 	progressStep int
 }
@@ -279,4 +357,10 @@ func (s *CephRBDStubMigrator) SyncPercent(_ context.Context, _ MigrationOptions)
 func (s *CephRBDStubMigrator) Cutover(_ context.Context, _ MigrationOptions) error {
 	s.CutoverCalled = true
 	return nil
+}
+
+// AwaitSingleOwner records the call and returns the injected error (nil by default).
+func (s *CephRBDStubMigrator) AwaitSingleOwner(_ context.Context, _ MigrationOptions) error {
+	s.AwaitSingleOwnerCalled = true
+	return s.InjectAwaitSingleOwnerError
 }
