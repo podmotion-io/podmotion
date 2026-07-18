@@ -29,6 +29,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -100,6 +101,13 @@ func main() {
 	flag.StringVar(&featureGates, "feature-gates", "",
 		"Comma-separated list of <Gate>=true|false pairs enabling experimental features "+
 			"(e.g. TCPPreservation=true,GPUMigration=false). No gate is enabled by default.")
+	var longhornManagerURL string
+	flag.StringVar(&longhornManagerURL, "longhorn-manager-url", "http://longhorn-backend.longhorn-system.svc.cluster.local:9500",
+		"Base URL of the Longhorn Manager HTTP API, used by the Tier1 (Longhorn) storage "+
+			"migrator for dual-engine replica add/poll/detach/attach during live migration. "+
+			"Defaults to the standard in-cluster Longhorn service address; override for "+
+			"non-standard Longhorn installs (different namespace/service name) or out-of-cluster "+
+			"testing.")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -261,6 +269,13 @@ func main() {
 	// StorageMigrationManager drives storage pre-stage (sets StorageReadyForFreeze=True).
 	replicationMgr := &replication.ReplicationManager{Client: mgr.GetClient(), AgentPool: agentPool}
 	storageMgr := storage.NewStorageMigrationManager(mgr.GetClient())
+	// Wire the real Longhorn Tier1 migrator (dual-engine replica add/poll/detach/attach via
+	// the Longhorn Manager HTTP API) in place of the LonghornStubMigrator default. Without
+	// this, TierLonghorn always reports 100% sync on the first poll and the freeze proceeds
+	// before a destination replica has actually been created — silent data loss on any
+	// Longhorn-backed volume. Ceph RBD and SnapshotRsync stay on their stub defaults here;
+	// this sprint's live testing only exercised and confirmed the Longhorn path.
+	storageMgr.RegisterMigrator(storage.TierLonghorn, storage.NewLonghornMigrator(longhornManagerURL, mgr.GetClient()))
 
 	// ADR-0322: dynamic client for the Cilium CiliumEndpoint readiness poll
 	// (cilium.io/v2 is a CRD, not compiled into the typed clientset).
@@ -270,10 +285,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Typed clientset threaded into CNIMobilitySelector for handoff strategies that need it —
+	// currently CalicoHandoff.WaitForWorkloadEndpointReady polls the destination pod via the
+	// typed Pods().Get API (calico.go).
+	kubeClient, err := kubernetes.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to create typed kubernetes client for CNIMobilitySelector")
+		os.Exit(1)
+	}
+
 	if err := (&controller.PodMigrationReconciler{
 		Client:        mgr.GetClient(),
 		Scheme:        mgr.GetScheme(),
 		DynamicClient: dynamicClient,
+		KubeClient:    kubeClient,
 		Estimator: &estimation.DefaultEstimator{
 			Prober: &estimation.StubProber{},
 		},

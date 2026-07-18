@@ -290,6 +290,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Fail-closed CNI runtime-dependency preflight (matches the netnsbroker ADR-0347 A1
+	// startup-pin pattern for nsenter/ip): if this node's detected CNI is Calico, calicoctl
+	// must be present and reachable on PATH before the agent serves anything — otherwise
+	// CalicoHandoff.WaitForWorkloadEndpointReady would fail mid-migration on the controller's
+	// reconcile hot path with a confusing exec error instead of a clear startup failure.
+	if err := nmcregistrar.PreflightRequiredCNIBinaries(); err != nil {
+		log.Error(err, "CNI runtime-dependency preflight failed")
+		os.Exit(1)
+	}
+
 	mustEnsureCheckpointTmpfs(log, "/run/podmotion/checkpoints")
 
 	// Try in-cluster config first (DaemonSet pod), fall back to kubeconfig file

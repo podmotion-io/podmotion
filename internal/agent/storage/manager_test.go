@@ -9,6 +9,7 @@ package storage_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -229,5 +230,193 @@ func TestProductionConstructor_RegistersRealLonghorn(t *testing.T) {
 	mgr2 := storage.NewStorageMigrationManagerWithProduction(c, "rbd-pool", "")
 	if _, ok := mgr2.Migrators[storage.TierLonghorn]; !ok {
 		t.Fatalf("production constructor with empty Longhorn URL must retain the explicit stub")
+	}
+}
+
+// fakeTransientNetError implements net.Error to simulate a DNS/routing-race
+// style transient failure (e.g. right after a fresh agent pod restart)
+// without depending on an actual network call.
+type fakeTransientNetError struct{}
+
+func (fakeTransientNetError) Error() string   { return "fake transient network error" }
+func (fakeTransientNetError) Timeout() bool   { return true }
+func (fakeTransientNetError) Temporary() bool { return true }
+
+// fakeCountingMigrator returns the queued error for each successive PreStage
+// call (nil once the queue is exhausted) and records the number of calls, so
+// tests can assert exactly how many attempts RunPreStage made.
+type fakeCountingMigrator struct {
+	tier      storage.StorageTier
+	errsQueue []error
+	calls     int
+}
+
+func (f *fakeCountingMigrator) Tier() storage.StorageTier { return f.tier }
+
+func (f *fakeCountingMigrator) PreStage(_ context.Context, _ storage.MigrationOptions) error {
+	idx := f.calls
+	f.calls++
+	if idx < len(f.errsQueue) {
+		return f.errsQueue[idx]
+	}
+	return nil
+}
+
+func (f *fakeCountingMigrator) SyncPercent(_ context.Context, _ storage.MigrationOptions) (int, error) {
+	return 100, nil
+}
+
+func (f *fakeCountingMigrator) Cutover(_ context.Context, _ storage.MigrationOptions) error {
+	return nil
+}
+
+// TestRunPreStage_TransientError_RetriesThenSucceeds is the regression test
+// for the no-retry-on-transient-failure bug: a PreStage call that fails
+// twice with a network/timeout-class error (the DNS/routing race right
+// after a fresh pod restart) and then succeeds on the third attempt must
+// still result in StorageReadyForFreeze=True — not a permanent False from
+// the first failure.
+func TestRunPreStage_TransientError_RetriesThenSucceeds(t *testing.T) {
+	scheme := newManagerScheme(t)
+	pm := makeMigration("mig-retry-ok", "default", "lh-pod")
+
+	pvc := makePVC("lh-pvc", "default", "longhorn",
+		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce})
+	sc := makeSC("longhorn", "driver.longhorn.io", nil)
+	pod := makePodWithPVC("default", "lh-pvc")
+	pod.Name = "lh-pod"
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pm, pvc, sc, pod).
+		WithStatusSubresource(pm).
+		Build()
+
+	fake := &fakeCountingMigrator{
+		tier: storage.TierLonghorn,
+		errsQueue: []error{
+			fakeTransientNetError{},
+			fakeTransientNetError{},
+		},
+	}
+
+	mgr := storage.NewStorageMigrationManager(c)
+	mgr.RegisterMigrator(storage.TierLonghorn, fake)
+
+	if err := mgr.RunPreStage(context.Background(), pm); err != nil {
+		t.Fatalf("RunPreStage returned error: %v", err)
+	}
+
+	if fake.calls != 3 {
+		t.Errorf("expected 3 PreStage attempts (2 transient failures + 1 success), got %d", fake.calls)
+	}
+
+	cond := readStorageReady(t, c, pm)
+	if cond == nil {
+		t.Fatalf("StorageReadyForFreeze condition not set")
+	}
+	if cond.Status != metav1.ConditionTrue {
+		t.Errorf("expected StorageReadyForFreeze=True after the transient failures cleared, got %s (reason=%s)",
+			cond.Status, cond.Reason)
+	}
+}
+
+// TestRunPreStage_TransientError_BoundedRetry_FailsClosedAfterMaxAttempts
+// proves the retry is bounded: if every attempt fails transiently, the
+// manager gives up after a fixed small number of attempts (not an infinite
+// or unbounded-exponential retry) and fails closed (ConditionFalse).
+func TestRunPreStage_TransientError_BoundedRetry_FailsClosedAfterMaxAttempts(t *testing.T) {
+	scheme := newManagerScheme(t)
+	pm := makeMigration("mig-retry-exhausted", "default", "lh-pod")
+
+	pvc := makePVC("lh-pvc", "default", "longhorn",
+		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce})
+	sc := makeSC("longhorn", "driver.longhorn.io", nil)
+	pod := makePodWithPVC("default", "lh-pvc")
+	pod.Name = "lh-pod"
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pm, pvc, sc, pod).
+		WithStatusSubresource(pm).
+		Build()
+
+	fake := &fakeCountingMigrator{
+		tier: storage.TierLonghorn,
+		errsQueue: []error{
+			fakeTransientNetError{},
+			fakeTransientNetError{},
+			fakeTransientNetError{},
+			fakeTransientNetError{}, // never reached if the bound holds
+		},
+	}
+
+	mgr := storage.NewStorageMigrationManager(c)
+	mgr.RegisterMigrator(storage.TierLonghorn, fake)
+
+	if err := mgr.RunPreStage(context.Background(), pm); err != nil {
+		t.Fatalf("RunPreStage returned error: %v", err)
+	}
+
+	if fake.calls != 3 {
+		t.Errorf("expected the retry to be bounded at 3 attempts, got %d calls", fake.calls)
+	}
+
+	cond := readStorageReady(t, c, pm)
+	if cond == nil {
+		t.Fatalf("StorageReadyForFreeze condition not set")
+	}
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("expected StorageReadyForFreeze=False once all bounded retries are exhausted, got %s (reason=%s)",
+			cond.Status, cond.Reason)
+	}
+}
+
+// TestRunPreStage_PermanentError_FailsFastWithoutRetry proves a genuinely
+// permanent error (e.g. the "volume doesn't exist" 404-style error from a
+// real Longhorn lookup) is NOT retried — retrying it would only waste the
+// migration's bounded completion budget on an error that can never resolve
+// itself.
+func TestRunPreStage_PermanentError_FailsFastWithoutRetry(t *testing.T) {
+	scheme := newManagerScheme(t)
+	pm := makeMigration("mig-permanent", "default", "lh-pod")
+
+	pvc := makePVC("lh-pvc", "default", "longhorn",
+		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce})
+	sc := makeSC("longhorn", "driver.longhorn.io", nil)
+	pod := makePodWithPVC("default", "lh-pvc")
+	pod.Name = "lh-pod"
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pm, pvc, sc, pod).
+		WithStatusSubresource(pm).
+		Build()
+
+	fake := &fakeCountingMigrator{
+		tier: storage.TierLonghorn,
+		errsQueue: []error{
+			fmt.Errorf("longhorn volume %q not found", "lh-pvc"),
+		},
+	}
+
+	mgr := storage.NewStorageMigrationManager(c)
+	mgr.RegisterMigrator(storage.TierLonghorn, fake)
+
+	if err := mgr.RunPreStage(context.Background(), pm); err != nil {
+		t.Fatalf("RunPreStage returned error: %v", err)
+	}
+
+	if fake.calls != 1 {
+		t.Errorf("expected a permanent (non-network) error to fail fast with exactly 1 attempt, got %d", fake.calls)
+	}
+
+	cond := readStorageReady(t, c, pm)
+	if cond == nil {
+		t.Fatalf("StorageReadyForFreeze condition not set")
+	}
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("expected StorageReadyForFreeze=False for a permanent error, got %s (reason=%s)",
+			cond.Status, cond.Reason)
 	}
 }

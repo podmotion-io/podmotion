@@ -1,0 +1,16 @@
+---
+# PodMotion EKS node-image playbook — entrypoint invoked by Packer's ansible
+# provisioner (see images/capi/packer/eks-node.pkr.hcl).
+#
+# Applies the podmotion-node role on top of the AWS EKS-optimized base AMI
+# (see images/capi/packer/al2023.pkrvars.hcl for the base-AMI filter and the
+# full variable set). The role itself is multi-distro (Ubuntu / AL2023 / RHEL9
+# / AL2) so this same playbook also serves any future non-EKS base image.
+
+- name: Bake PodMotion onto the EKS node base image
+  hosts: all
+  become: true
+  gather_facts: true
+
+  roles:
+    - podmotion-node

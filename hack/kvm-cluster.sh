@@ -92,6 +92,43 @@ CILIUM_OPERATOR_IMG="${CILIUM_OPERATOR_IMG:-quay.io/cilium/operator-generic:v${C
 CILIUM_APISERVER_HOST="${CILIUM_APISERVER_HOST:-}"   # resolved to CP1_IP at run time
 CILIUM_APISERVER_PORT="${CILIUM_APISERVER_PORT:-6443}"
 
+
+# ── Calico CNI (Tigera Operator, standard iptables/ipvs dataplane) ───────────
+# Calico via the Tigera Operator, installed as an ALTERNATIVE CNI candidate
+# alongside the existing Cilium path above (this block is purely additive —
+# it does not touch any Cilium variable or function). Single non-strict-
+# affinity IPPool covering the EXISTING pod CIDR (byte-identical, same
+# reasoning as the Cilium block above — no kubeadm re-init, no renumbering),
+# VXLAN encapsulation (not IPIP, not pure-BGP) to keep the existing
+# VXLAN-FDB link-type-discovery mechanism's assumptions intact
+# (internal/agent/network/fdb.go discovers the FDB interface by link type,
+# not by a Cilium-specific name, so it does not care which CNI programs the
+# VXLAN device). bpfEnabled is explicitly and permanently false: Calico's
+# own eBPF dataplane attaches to the same TC clsact hooks PodMotion's
+# TC-BPF/XDP bridge needs, with no supported coexistence mechanism — DO NOT
+# set this to true, ever, for any performance reason.
+CALICO_VERSION="${CALICO_VERSION:-3.28.0}"
+CALICO_CHART_VERSION="${CALICO_CHART_VERSION:-$CALICO_VERSION}"
+CALICO_OPERATOR_NAMESPACE="${CALICO_OPERATOR_NAMESPACE:-tigera-operator}"
+CALICO_NAMESPACE="${CALICO_NAMESPACE:-calico-system}"
+# The Tigera Operator versions ITSELF independently of the Calico release it
+# ships (confirmed against charts/tigera-operator/values.yaml pinned to the
+# projectcalico/calico v3.28.0 tag: tigeraOperator.version there is v1.34.0,
+# not v3.28.0). Using CALICO_VERSION for the operator tag produces a
+# reference that has never existed on quay.io ("failed to resolve reference
+# ...: not found") — this is the actual root cause of the operator
+# pre-import failure, not a missing docker-pull step. Keep this pinned
+# independently and bump it only alongside CALICO_VERSION, cross-checked
+# against that same upstream values.yaml file.
+CALICO_OPERATOR_VERSION="${CALICO_OPERATOR_VERSION:-1.34.0}"
+CALICO_OPERATOR_IMG="${CALICO_OPERATOR_IMG:-quay.io/tigera/operator:v${CALICO_OPERATOR_VERSION}}"
+CALICO_NODE_IMG="${CALICO_NODE_IMG:-docker.io/calico/node:v${CALICO_VERSION}}"
+CALICO_KUBE_CONTROLLERS_IMG="${CALICO_KUBE_CONTROLLERS_IMG:-docker.io/calico/kube-controllers:v${CALICO_VERSION}}"
+CALICO_CNI_IMG="${CALICO_CNI_IMG:-docker.io/calico/cni:v${CALICO_VERSION}}"
+CALICO_CSI_IMG="${CALICO_CSI_IMG:-docker.io/calico/csi:v${CALICO_VERSION}}"
+CALICO_CSI_REGISTRAR_IMG="${CALICO_CSI_REGISTRAR_IMG:-docker.io/calico/node-driver-registrar:v${CALICO_VERSION}}"
+CALICO_IPPOOL_NAME="${CALICO_IPPOOL_NAME:-default-ipv4-ippool}"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
@@ -597,6 +634,259 @@ EOF
   echo "==> Re-run TestCrossNodeReachability (PODMOTION_CILIUM_LIVE_TEST=1) to confirm the ipam.cilium.io/ip pin now honors cross-node placement."
 }
 
+# ── provision-calico: pre-import Tigera Operator/Calico images → helm install
+#    operator → apply Installation CR → wait for rollout ────────────────────
+# Idempotent. Installs Calico (via the Tigera Operator Helm chart) as an
+# ALTERNATIVE CNI candidate on this cluster. Mirrors cmd_provision_cilium's
+# 3-step shape (pre-import → install → wait) but the install phase is itself
+# two-phase: helm install the operator, then apply the Installation CR the
+# operator reconciles into the actual calico-node/kube-controllers workloads.
+# Preserves the existing pod CIDR (10.244.0.0/16) byte-identically via a
+# SINGLE non-strict-affinity IPPool (no per-node nodeSelector — default IPAM,
+# not the per-node-pool escalation cmd_provision_cilium_multipool exists to
+# work around; only build that variant later if cross-node IP pinning proves
+# unreliable under Calico's default IPAM). Encapsulation is VXLAN (matches
+# the existing VXLAN-FDB link-type-discovery mechanism's assumptions — see
+# internal/agent/network/fdb.go, which discovers the FDB interface by link
+# type and does not care which CNI programs it). Images are pre-imported
+# into each node's k8s.io containerd namespace (no-registry idiom, same as
+# cmd_provision_cilium) so a stalled pull cannot leave the cluster CNI-less.
+# This does NOT remove Flannel/Cilium/kube-proxy — cmd_cutover_calico
+# performs the ordered, recoverable cutover afterward. Does NOT modify
+# cmd_provision_cilium, cmd_provision_cilium_multipool, or cmd_reset_cluster
+# in any way — purely additive. VMs never touched.
+cmd_provision_calico() {
+  assert_no_vm_destruction
+  load_ips
+
+  echo "==> [1/3] Pre-importing Tigera Operator + Calico images into each node's k8s.io containerd namespace (no registry)..."
+  # Pre-import is MANDATORY, same reasoning as cmd_provision_cilium: removing
+  # the currently-active CNI before every Calico image is resident on every
+  # node would leave the cluster with no CNI while pods pull.
+  local ip
+  for img in "$CALICO_OPERATOR_IMG" "$CALICO_NODE_IMG" "$CALICO_KUBE_CONTROLLERS_IMG" \
+             "$CALICO_CNI_IMG" "$CALICO_CSI_IMG" "$CALICO_CSI_REGISTRAR_IMG"; do
+    echo "  -- ensure $img present on host"
+    docker image inspect "$img" >/dev/null 2>&1 || docker pull "$img"
+  done
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    echo "  -- import into $ip"
+    for img in "$CALICO_OPERATOR_IMG" "$CALICO_NODE_IMG" "$CALICO_KUBE_CONTROLLERS_IMG" \
+               "$CALICO_CNI_IMG" "$CALICO_CSI_IMG" "$CALICO_CSI_REGISTRAR_IMG"; do
+      docker save "$img" | nsh "$ip" "sudo ctr -n k8s.io images import -"
+    done
+    for tag in "operator:v${CALICO_OPERATOR_VERSION}" "node:v${CALICO_VERSION}" \
+               "kube-controllers:v${CALICO_VERSION}" "cni:v${CALICO_VERSION}" \
+               "csi:v${CALICO_VERSION}" "node-driver-registrar:v${CALICO_VERSION}"; do
+      if ! nsh "$ip" "sudo ctr -n k8s.io images ls -q | grep -q '${tag}'"; then
+        echo "ERROR: ${tag} not present in k8s.io containerd namespace on node $ip after import." >&2
+        exit 1
+      fi
+    done
+  done
+
+  echo "==> [2/3] helm install the Tigera Operator, then apply the Installation CR (single non-strict-affinity IPPool, VXLAN, bpfEnabled=false)..."
+  helm repo add projectcalico https://docs.tigera.io/calico/charts >/dev/null 2>&1 || true
+  helm repo update projectcalico >/dev/null 2>&1 || true
+  KUBECONFIG="$KUBECONFIG_OUT" helm upgrade --install calico projectcalico/tigera-operator \
+    --version "$CALICO_CHART_VERSION" \
+    --namespace "$CALICO_OPERATOR_NAMESPACE" --create-namespace \
+    --set installation.enabled=false \
+    --set tigeraOperator.image=tigera/operator \
+    --set tigeraOperator.version="v${CALICO_OPERATOR_VERSION}" \
+    --set tigeraOperator.imagePullPolicy=IfNotPresent
+
+  # Installation CR: single pool, non-strict-affinity (no nodeSelector), VXLAN
+  # encapsulation, EXISTING pod CIDR preserved byte-identically. bpfEnabled is
+  # explicitly false — SAFETY-CRITICAL, see the header comment on the Calico
+  # variable block above. Do not "helpfully" flip this to true for
+  # kube-proxy-replacement performance: it puts Calico's own TC-BPF programs
+  # in direct, unresolved conflict with PodMotion's zero-window hold and XDP
+  # bridge (internal/agent/network/bridge.go CheckXDPHookConflict, bpf/xdp_bridge.c,
+  # bpf/zero_window.c).
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl apply -f - <<YAML
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  cni:
+    type: Calico
+  calicoNetwork:
+    bgp: Disabled
+    ipPools:
+      - name: $CALICO_IPPOOL_NAME
+        cidr: $POD_CIDR
+        encapsulation: VXLAN
+        natOutgoing: Enabled
+        nodeSelector: all()
+    # bpfEnabled deliberately OMITTED/false — Calico stays on the standard
+    # iptables/ipvs dataplane. NEVER set this to true (see header comment).
+YAML
+
+  echo "==> [3/3] Waiting for the Tigera Operator to reconcile the Installation CR (namespace $CALICO_NAMESPACE)..."
+  # The Installation CR apply above only asks the Tigera Operator to act; the
+  # operator creates the $CALICO_NAMESPACE namespace (and everything in it)
+  # asynchronously as it reconciles. Running rollout-status before that
+  # namespace exists fails with a hard NotFound instead of waiting, so poll
+  # for the namespace first. Bounded wait, not a fixed sleep and not an
+  # infinite wait.
+  local waited=0
+  local calico_ns_timeout=120
+  until KUBECONFIG="$KUBECONFIG_OUT" kubectl get namespace "$CALICO_NAMESPACE" >/dev/null 2>&1; do
+    if (( waited >= calico_ns_timeout )); then
+      echo "ERROR: namespace $CALICO_NAMESPACE did not appear within ${calico_ns_timeout}s — Tigera Operator has not reconciled the Installation CR. Check 'kubectl -n $CALICO_OPERATOR_NAMESPACE logs deploy/tigera-operator'." >&2
+      exit 1
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  echo "  -- namespace $CALICO_NAMESPACE present after ${waited}s"
+
+  echo "==> Waiting for Calico to come up (rollout status on calico-node / calico-kube-controllers)..."
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CALICO_NAMESPACE" rollout status ds/calico-node --timeout=300s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CALICO_NAMESPACE" rollout status deploy/calico-kube-controllers --timeout=300s
+  echo "==> Calico ready. CNI swap done at the install layer; run cutover-calico to remove the previously-active CNI."
+}
+
+# ── cutover-calico: remove the previously-active CNI after Calico is confirmed
+#    live, never leaving a window with no active CNI ─────────────────────────
+# Mirrors cmd_cutover's discipline exactly, generalized to whichever CNI was
+# active before Calico: verifies calico-node is Ready on all nodes FIRST
+# (refuses to remove anything if Calico is not confirmed live — that would
+# leave the cluster with no CNI), then removes Flannel remnants (if present),
+# Cilium remnants (if present — DaemonSet/namespace, NOT the Cilium code
+# paths in this script, which are left untouched), and kube-proxy (Calico's
+# standard dataplane needs kube-proxy, so kube-proxy is NOT removed here —
+# unlike the Cilium cutover, which supersedes it).
+#
+# Removing the Cilium/Flannel Kubernetes API objects does NOT remove the
+# files Cilium's/Flannel's own install-cni init containers already wrote to
+# each host's /etc/cni/net.d/ — those persist on disk independently, so a
+# per-node SSH cleanup step is required (step [3/4] below). Two host-level
+# conditions have been observed on this standing cluster and both are
+# handled: (a) a leftover ACTIVE (non-.cilium_bak) cilium/flannel conflist
+# left behind after the k8s objects are gone, which must be removed so it
+# stops shadowing Calico's, and (b) Cilium's install-cni logic renames
+# *any* pre-existing conflist it finds to a *.cilium_bak suffix before
+# writing its own active file — including, if Calico was provisioned
+# before Cilium's objects were deleted, Calico's OWN conflist. That leaves
+# Calico's real conflist sitting inactive as e.g.
+# "10-calico.conflist.cilium_bak", so simply deleting the stale Cilium file
+# would leave the node with NO active CNI conflist at all. Step [3/4]
+# restores it (strips the .cilium_bak suffix) only when no active Calico
+# conflist is already present, and never touches genuine Flannel/Cilium
+# backups. Finally step [4/4] confirms each node's /etc/cni/net.d contains
+# exactly the Calico conflist as the active config. Idempotent and safe to
+# re-run. Does NOT modify cmd_cutover, cmd_provision_cilium,
+# cmd_provision_cilium_multipool, or cmd_reset_cluster. VMs never touched
+# (no virsh destroy/undefine — only files under /etc/cni/net.d/ on each
+# node are touched, via SSH).
+cmd_cutover_calico() {
+  assert_no_vm_destruction
+  load_ips
+
+  echo "==> [1/4] Confirming Calico is Ready on all nodes before removing the previously-active CNI..."
+  local ready desired
+  ready=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CALICO_NAMESPACE" get ds calico-node -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+  desired=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CALICO_NAMESPACE" get ds calico-node -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo -1)
+  if [[ "$ready" -lt 1 || "$ready" != "$desired" ]]; then
+    echo "ERROR: calico-node DaemonSet not fully Ready ($ready/$desired) — refusing to remove the previously-active CNI (cluster would be left with no CNI)." >&2
+    exit 1
+  fi
+  echo "  -- calico-node DaemonSet Ready: $ready/$desired"
+
+  echo "==> [2/4] Removing the previously-active CNI's remnants (Flannel and/or Cilium, whichever is present)..."
+  if KUBECONFIG="$KUBECONFIG_OUT" kubectl get ns kube-flannel >/dev/null 2>&1; then
+    echo "  -- removing Flannel remnants"
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-flannel delete daemonset kube-flannel-ds --ignore-not-found
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl delete ns kube-flannel --ignore-not-found
+  else
+    echo "  -- no kube-flannel namespace present"
+  fi
+  if KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" get ds cilium >/dev/null 2>&1; then
+    echo "  -- removing Cilium remnants (DaemonSet/Deployment only — Cilium script functions in this file are untouched)"
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" delete daemonset cilium --ignore-not-found
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" delete deployment cilium-operator --ignore-not-found
+  else
+    echo "  -- no active Cilium DaemonSet present"
+  fi
+
+  echo "==> [3/4] Cleaning up stale previously-active-CNI conflist files left on-disk on each node (K8s object deletion above does not remove these)..."
+  # Deliberately narrow: only ever removes a file matching *cilium*.conflist or
+  # *flannel*.conflist that is NOT already a .cilium_bak/.bak backup (i.e. would
+  # still be read by the CNI plugin manager), and only ever restores Calico's own
+  # conflist from a *calico*.conflist.cilium_bak backup when no active Calico
+  # conflist is already present. Never touches any other file in the directory
+  # (genuine Flannel .cilium_bak backups, calico-kubeconfig, etc. are preserved).
+  local cni_cleanup_script
+  cni_cleanup_script='
+set -e
+cd /etc/cni/net.d
+shopt -s nullglob
+echo "     -- before cleanup:"; sudo ls -la | sed "s/^/     /"
+for f in *cilium*.conflist *flannel*.conflist; do
+  case "$f" in
+    *.cilium_bak|*.bak) continue ;;
+  esac
+  echo "     -- removing stale active conflist: $f"
+  sudo rm -f -- "$f"
+done
+active_calico=0
+for f in *calico*.conflist; do
+  case "$f" in
+    *.cilium_bak|*.bak) continue ;;
+  esac
+  active_calico=1
+done
+if [[ "$active_calico" -eq 0 ]]; then
+  for f in *calico*.conflist.cilium_bak; do
+    newname="${f%.cilium_bak}"
+    echo "     -- restoring Calico conflist from backup: $f -> $newname"
+    sudo mv -f -- "$f" "$newname"
+  done
+fi
+# Remove stray calico-kubeconfig duplicates (e.g. calico-kubeconfig.bak/.orig)
+# left behind by a previous run. Never matches the canonical "calico-kubeconfig"
+# file itself (glob requires a further suffix), so the file the Calico
+# conflist references is never touched.
+for f in calico-kubeconfig.*; do
+  echo "     -- removing stray calico-kubeconfig duplicate: $f"
+  sudo rm -f -- "$f"
+done
+echo "     -- after cleanup:"; sudo ls -la | sed "s/^/     /"
+'
+  local ip
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    echo "  -- $ip: cleaning /etc/cni/net.d/"
+    # /etc/cni/net.d is root-owned (chad cannot even 'cd' into it), so the whole
+    # compound script must run as root in one go. sudo does not carry across
+    # shell operators like && or across a persistent 'cd' in a later command, so
+    # individual 'sudo rm'/'sudo mv' calls after an unprivileged 'cd' still fail —
+    # the entire script body is wrapped in a single 'sudo bash -c' invocation.
+    nsh "$ip" "sudo bash -c '$cni_cleanup_script'"
+  done
+
+  echo "==> [4/4] Verifying each node's CNI conf dir contains only the Calico conflist..."
+  local confs
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    confs=$(nsh "$ip" "sudo ls /etc/cni/net.d/" 2>/dev/null || echo "UNKNOWN")
+    echo "  -- $ip: $confs"
+    # Only files with a kubelet-recognized CNI extension are ever read by the
+    # CNI plugin manager — same discipline as cmd_cutover's flannel check,
+    # generalized to also reject a leftover active flannel or cilium conflist.
+    if echo "$confs" | grep -Ei '\.(conf|conflist|json)$' | grep -qiE 'flannel|cilium'; then
+      echo "ERROR: node $ip still has an ACTIVE non-Calico CNI conflist present after cutover." >&2
+      exit 1
+    fi
+    if ! echo "$confs" | grep -Ei '\.(conf|conflist|json)$' | grep -qi calico; then
+      echo "ERROR: node $ip has no active Calico conflist present after cutover." >&2
+      exit 1
+    fi
+  done
+  echo "==> Cutover complete: previously-active CNI removed (or already absent), Calico sole CNI-of-record on all nodes."
+}
+
 # ── cutover: remove Flannel/kube-proxy remnants after Cilium is confirmed live ──
 # Authored artifact for the Flannel→Cilium CNI cutover step (ADR-0322/ADR-0318
 # P-VERIFY-B / P-VERIFY-0 precondition). Idempotent and order-safe: verifies Cilium
@@ -662,7 +952,7 @@ cmd_cutover() {
 
 usage() {
   cat >&2 <<EOF
-Usage: hack/kvm-cluster.sh <verify|reset-cluster|deploy-podmotion|provision-shared-storage|provision-longhorn|provision-cilium|cutover|wipe|ssh <node-ip> [cmd]>
+Usage: hack/kvm-cluster.sh <verify|reset-cluster|deploy-podmotion|provision-shared-storage|provision-longhorn|provision-cilium|cutover|provision-calico|cutover-calico|wipe|ssh <node-ip> [cmd]>
 
   verify            assert 3 nodes Ready via $KUBECONFIG_OUT
   reset-cluster     kubeadm reset+reinit+flannel+join ON the standing VMs (NEVER destroys VMs)
@@ -671,6 +961,8 @@ Usage: hack/kvm-cluster.sh <verify|reset-cluster|deploy-podmotion|provision-shar
   provision-longhorn  attach $LH_DISK_SIZE $LH_DISK_TARGET per node + Longhorn + SCs ($LH_STORAGE_CLASS, $LH_MIGRATABLE_SC)
   provision-cilium  pre-import Cilium images + helm install cilium/cilium $CILIUM_CHART_VERSION (cluster-pool/geneve/kube-proxy-replacement)
   cutover           Flannel→Cilium CNI cutover: verify Cilium Ready, remove Flannel/kube-proxy remnants
+  provision-calico  pre-import Tigera Operator/Calico images + helm install operator + apply Installation CR (single non-strict-affinity IPPool, VXLAN, bpfEnabled=false)
+  cutover-calico    previously-active-CNI→Calico cutover: verify Calico Ready, remove Flannel/Cilium remnants
   wipe              clean k8s + PodMotion state on the VMs WITHOUT destroying the VMs
 
 This script REFUSES to 'virsh destroy'/'virsh undefine' any of: ${PM_VMS[*]}.
@@ -689,6 +981,8 @@ main() {
     provision-cilium) cmd_provision_cilium ;;
     provision-cilium-multipool) cmd_provision_cilium_multipool ;;
     cutover)          cmd_cutover ;;
+    provision-calico) cmd_provision_calico ;;
+    cutover-calico)   cmd_cutover_calico ;;
     wipe)             cmd_wipe ;;
     ssh)              load_ips; nsh "$@" ;;
     *)                usage ;;

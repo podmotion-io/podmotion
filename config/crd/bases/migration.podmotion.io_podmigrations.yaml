@@ -346,8 +346,10 @@ spec:
                 x-kubernetes-list-type: map
               criuRestoreConfirmed:
                 description: |-
-                  CRIURestoreConfirmed is set to true by the NRI plugin after JoinNsRestore
-                  completes successfully, confirming memory images were replayed.
+                  CRIURestoreConfirmed is set to true by the destination agent's
+                  AgentServer.ReportRestoreConfirmed (internal/agent/server/server.go), which persists it
+                  via a Status().Patch after a successful CRIU restore, confirming memory images were
+                  replayed. NOT set directly by the NRI plugin (ADR-0352 DR-13-class correction).
                 type: boolean
               dataIntact:
                 description: |-
