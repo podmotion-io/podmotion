@@ -398,6 +398,19 @@ cmd_reset_cluster_k3s() {
         sudo kubeadm reset -f 2>/dev/null || true
       fi
       sudo rm -rf /etc/cni/net.d "$HOME/.kube" /etc/kubernetes/manifests/* 2>/dev/null || true
+      # CNI IPAM lease state (host-local/bridge plugin leases, e.g.
+      # /var/lib/cni/networks/cbr0/ from a prior kubeadm+Flannel install)
+      # survives both the kubeadm reset above and the k3s uninstall below —
+      # neither one clears it. If left behind, the CNI plugin on the incoming
+      # k3s install consults these stale lease files for the first pods
+      # scheduled after boot and hands them IPs from the OLD pod CIDR
+      # (10.244.0.0/16) instead of k3s'"'"'s real one (10.42.0.0/16 by
+      # default), breaking their networking (verified live 2026-07-17:
+      # coredns/local-path-provisioner/metrics-server all got 10.244.0.x
+      # addresses and could not reach the 10.43.0.0/16 service CIDR).
+      # Purging it here guarantees every pod gets an IP from the CNI that is
+      # actually about to be installed.
+      sudo rm -rf /var/lib/cni/networks 2>/dev/null || true
       # k3s installer drops its own uninstall scripts — server and agent variants
       # are named differently and only one is present per node role.
       if [ -x /usr/local/bin/k3s-uninstall.sh ]; then
