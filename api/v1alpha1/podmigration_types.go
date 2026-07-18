@@ -505,6 +505,17 @@ const (
 	// not actually move to the destination, so the cross-node dataplane gate must NOT be
 	// credited. Surfaced as a specific, actionable condition instead of a silent wedge.
 	ReasonPreservedIPNotOnEndpoint = "PreservedIPNotOnCiliumEndpoint"
+	// ReasonCalicoWorkloadEndpointNotReady: the destination pod's Calico WorkloadEndpoint did
+	// not reach the ready predicate (CalicoHandoff.WaitForWorkloadEndpointReady timed out) —
+	// Felix has not confirmed the dataplane has been programmed for the preserved IP within
+	// the poll deadline. Fail-closed: block/requeue rather than crediting an unconfirmed
+	// endpoint. See tryEstablishDataplaneReachability.
+	ReasonCalicoWorkloadEndpointNotReady = "CalicoWorkloadEndpointNotReady"
+	// ReasonCalicoDataplaneProgrammed: POSITIVE reason. CalicoHandoff.WaitForWorkloadEndpointReady
+	// confirmed the replacement pod's Calico WorkloadEndpoint is active, the analogous
+	// authoritative signal to ReasonCiliumDataplaneProgrammed for a Calico cross-node
+	// destination. See tryEstablishDataplaneReachability.
+	ReasonCalicoDataplaneProgrammed = "CalicoDataplaneProgrammed"
 )
 
 // PreCopyStats records metrics from the iterative pre-copy phase.

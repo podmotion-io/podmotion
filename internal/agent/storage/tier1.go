@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -44,14 +46,41 @@ type LonghornMigrator struct {
 	// ManagerURL is the base URL of the Longhorn Manager, e.g. http://longhorn-frontend.longhorn-system:80
 	ManagerURL string
 	HTTPClient *http.Client
+	// client is used to resolve each PVC's bound PersistentVolume name — the
+	// actual Longhorn volume name — rather than assuming it equals the PVC's
+	// own name (only true for statically-provisioned volumes; dynamically
+	// provisioned PVCs are bound to a PV named e.g. "pvc-d39ce436-...", which
+	// is what the Longhorn Manager API actually keys volumes by).
+	client client.Client
 }
 
-// NewLonghornMigrator returns a production Longhorn migrator.
-func NewLonghornMigrator(managerURL string) *LonghornMigrator {
+// NewLonghornMigrator returns a production Longhorn migrator. c is used to
+// resolve each PVC's bound PersistentVolume name (see resolveVolumeName).
+func NewLonghornMigrator(managerURL string, c client.Client) *LonghornMigrator {
 	return &LonghornMigrator{
 		ManagerURL: strings.TrimRight(managerURL, "/"),
 		HTTPClient: &http.Client{Timeout: 30 * time.Second},
+		client:     c,
 	}
+}
+
+// resolveVolumeName returns the Longhorn volume name for a PVC — the name of
+// the PersistentVolume it is bound to (spec.volumeName), NOT the PVC's own
+// name. Longhorn volumes are keyed by PV name; for dynamically-provisioned
+// PVCs (the common case) the PV name is generated (e.g.
+// "pvc-d39ce436-...") and differs from the PVC name, so using the PVC name
+// directly causes the Longhorn Manager API to 404 on an otherwise-healthy
+// volume.
+func (m *LonghornMigrator) resolveVolumeName(ctx context.Context, namespace, pvcName string) (string, error) {
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := m.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: pvcName}, pvc); err != nil {
+		return "", fmt.Errorf("get pvc %s: %w", pvcName, err)
+	}
+	if pvc.Spec.VolumeName == "" {
+		return "", fmt.Errorf("pvc %s has no bound PersistentVolume (spec.volumeName empty, phase=%s)",
+			pvcName, pvc.Status.Phase)
+	}
+	return pvc.Spec.VolumeName, nil
 }
 
 // Tier returns TierLonghorn.
@@ -67,7 +96,10 @@ func (m *LonghornMigrator) PreStage(ctx context.Context, opts MigrationOptions) 
 			continue
 		}
 
-		volumeName := clsf.PVCName // Longhorn volume name == PVC name by convention
+		volumeName, err := m.resolveVolumeName(ctx, opts.PodNamespace, clsf.PVCName)
+		if err != nil {
+			return fmt.Errorf("tier1: resolve volume name for pvc %s: %w", clsf.PVCName, err)
+		}
 
 		if err := m.verifyVolume(ctx, volumeName); err != nil {
 			return fmt.Errorf("tier1: volume verify %s: %w", volumeName, err)
@@ -100,7 +132,11 @@ func (m *LonghornMigrator) SyncPercent(ctx context.Context, opts MigrationOption
 			continue
 		}
 		found = true
-		pct, err := m.replicaSyncPercent(ctx, clsf.PVCName, opts.DestinationNode)
+		volumeName, err := m.resolveVolumeName(ctx, opts.PodNamespace, clsf.PVCName)
+		if err != nil {
+			return 0, fmt.Errorf("tier1: resolve volume name for pvc %s: %w", clsf.PVCName, err)
+		}
+		pct, err := m.replicaSyncPercent(ctx, volumeName, opts.DestinationNode)
 		if err != nil {
 			return 0, err
 		}
@@ -125,7 +161,10 @@ func (m *LonghornMigrator) Cutover(ctx context.Context, opts MigrationOptions) e
 			continue
 		}
 
-		volumeName := clsf.PVCName
+		volumeName, err := m.resolveVolumeName(ctx, opts.PodNamespace, clsf.PVCName)
+		if err != nil {
+			return fmt.Errorf("tier1: resolve volume name for pvc %s: %w", clsf.PVCName, err)
+		}
 
 		log.Info("detaching volume from source node", "volume", volumeName, "src", opts.SourceNode)
 		if err := m.detachFromNode(ctx, volumeName, opts.SourceNode); err != nil {
@@ -182,15 +221,71 @@ func (m *LonghornMigrator) verifyVolume(ctx context.Context, volumeName string) 
 	return nil
 }
 
+// fetchVolume GETs and decodes the current state of a Longhorn volume,
+// including its replica list.
+func (m *LonghornMigrator) fetchVolume(ctx context.Context, volumeName string) (*longhornVolume, error) {
+	url := fmt.Sprintf("%s/v1/volumes/%s", m.ManagerURL, volumeName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := m.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("longhorn GET volume %q: HTTP %d", volumeName, resp.StatusCode)
+	}
+
+	var vol longhornVolume
+	if err := json.NewDecoder(resp.Body).Decode(&vol); err != nil {
+		return nil, err
+	}
+	return &vol, nil
+}
+
 // addDestReplica calls the Longhorn updateReplicaCount action to add one
 // replica on the destination node. Longhorn's scheduler will place the new
 // replica on the specified node if a node selector is set via the request body.
+//
+// Before calling, it fetches the volume's current replica set and skips the
+// call entirely if the destination node already has a non-failed replica.
+// Sprint48 bug: this used to call updateReplicaCount unconditionally with a
+// hardcoded replicaCount:2 on every PreStage, regardless of the volume's
+// actual current replica count or placement. For a volume that already had
+// 3 replicas (one already on the destination node), this silently told
+// Longhorn to SHRINK the replica set from 3 to 2 — the opposite of what
+// PreStage needs — right as the migration needed the replica set stable.
 func (m *LonghornMigrator) addDestReplica(ctx context.Context, volumeName, destNode string) error {
+	log := logf.FromContext(ctx).WithValues("volume", volumeName, "destNode", destNode)
+
+	vol, err := m.fetchVolume(ctx, volumeName)
+	if err != nil {
+		return fmt.Errorf("fetch volume before replica-count check: %w", err)
+	}
+
+	for _, r := range vol.Replicas {
+		if r.NodeID != destNode {
+			continue
+		}
+		if r.FailedAt != "" {
+			// Replica exists on the destination but is failed — fall through
+			// and let the updateReplicaCount call below trigger rescheduling.
+			break
+		}
+		log.Info("skipping addDestReplica: destination node already has a replica",
+			"replica", r.Name, "mode", r.Mode)
+		return nil
+	}
+
+	// No healthy/syncing replica on the destination yet — grow the replica
+	// set by one, preserving whatever count the volume already has instead
+	// of hardcoding it.
+	desiredCount := len(vol.Replicas) + 1
+
 	url := fmt.Sprintf("%s/v1/volumes/%s?action=updateReplicaCount", m.ManagerURL, volumeName)
-	// Longhorn expects a JSON body; replicaCount is current+1.
-	// In the full implementation we'd fetch current count and add 1.
-	// For the stub-safe path we use a minimal body that Longhorn accepts.
-	body := fmt.Sprintf(`{"replicaCount":2,"nodeSelector":[%q]}`, destNode)
+	body := fmt.Sprintf(`{"replicaCount":%d,"nodeSelector":[%q]}`, desiredCount, destNode)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url,
 		strings.NewReader(body))
 	if err != nil {
@@ -236,22 +331,8 @@ func (m *LonghornMigrator) pollUntilReady(ctx context.Context, volumeName, destN
 //	mode=ERR → 0%
 //	absent   → 0% (replica not yet scheduled)
 func (m *LonghornMigrator) replicaSyncPercent(ctx context.Context, volumeName, destNode string) (int, error) {
-	url := fmt.Sprintf("%s/v1/volumes/%s", m.ManagerURL, volumeName)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	vol, err := m.fetchVolume(ctx, volumeName)
 	if err != nil {
-		return 0, err
-	}
-	resp, err := m.HTTPClient.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-
-	var vol longhornVolume
-	if err := json.NewDecoder(resp.Body).Decode(&vol); err != nil {
 		return 0, err
 	}
 

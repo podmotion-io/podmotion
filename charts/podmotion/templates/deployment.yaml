@@ -56,6 +56,9 @@ spec:
             {{- if .Values.operator.featureGates }}
             - --feature-gates={{ .Values.operator.featureGates }}
             {{- end }}
+            {{- if .Values.operator.longhornManagerURL }}
+            - --longhorn-manager-url={{ .Values.operator.longhornManagerURL }}
+            {{- end }}
             {{- /* HOLD-B (ADR-0039 SD-6): the operator only builds its webhook server and
                    registers the exec-block handler when --webhook-cert-path is set (cmd/main.go
                    webhooksEnabled gate). Pass it on EITHER cert path so the SD-6 VWC has a live,
