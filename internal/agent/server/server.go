@@ -35,6 +35,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -51,6 +52,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/network"
 	"github.com/podmotion-io/podmotion/internal/agent/provenance"
 	"github.com/podmotion-io/podmotion/internal/agent/seccomp"
+	pmstorage "github.com/podmotion-io/podmotion/internal/agent/storage"
 	"github.com/podmotion-io/podmotion/internal/metrics"
 	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 )
@@ -1132,9 +1134,79 @@ func (s *AgentServer) resolveImageFromReplacementPod(migrationName string) strin
 // on restore (the kubelet-mounted volume dir of the replacement pod). ContainerPath alone drives
 // the patch's KEEP decision; the (ContainerPath, HostTarget) pair drives the restore-side
 // --ext-mount-map so CRIU re-attaches the SAME live data the destination pod already mounted.
+// reattachTierKind identifies WHICH reattach-eligible storage tier produced a reattachMount.
+// Tier0RWX and Tier1Longhorn are patched through the SAME checkpoint-image mechanism
+// (patch_checkpoint_script.go preserves the external mount entry and rewrites its recorded
+// root/source to the destination kubelet-staged volume dir — CRIU restores an autodetected
+// external by binding from mi->source directly, regardless of which storage tier produced the
+// entry). The kind is threaded through purely so the patch script's diagnostics/logging name the
+// tier that actually applies, instead of every re-attach mount being reported as "Tier0 RWX".
+type reattachTierKind int
+
+const (
+	reattachTierNone reattachTierKind = iota
+	reattachTierTier0RWX
+	reattachTierTier1Longhorn
+)
+
 type reattachMount struct {
 	ContainerPath string
 	HostTarget    string
+	// Tier records which reattach-eligible storage tier classified this mount (see
+	// classifyReattachTier). Zero value (reattachTierNone) never appears in a resolved mount —
+	// resolveReattachMountsImpl only appends a mount once its tier is non-none.
+	Tier reattachTierKind
+}
+
+// classifyReattachTier determines which reattach-eligible tier (if any) a PVC belongs to, mirroring
+// internal/agent/storage.StorageClassifier's OWN precedence exactly: a Longhorn-backed StorageClass
+// wins over the generic ReadWriteMany check REGARDLESS of access mode (storage/classifier.go
+// classifyPVC — "a Longhorn-backed StorageClass must be checked FIRST... Longhorn's own dual-engine
+// live migration is required even for an RWX Longhorn volume"). Only once Longhorn is ruled out does
+// a ReadWriteMany access mode map to the generic Tier0 RWX re-attach.
+//
+// This replaces the PRIOR pvcIsTier0RWX helper, which checked ONLY pvc.Spec.AccessModes and never
+// consulted the StorageClass at all. PodMotion's own `longhorn-migratable` StorageClass IS
+// ReadWriteMany (RWX is required so Longhorn can hold the volume dual-attached during its dual-engine
+// live migration — see docs/sprints/sprint46*/state.yaml and storage/tier1.go), so that narrower
+// check silently misclassified a Tier1-Longhorn PVC as Tier0 and threaded it through
+// patch_checkpoint_script.go's generic "Tier0 RWX cross-node" path — the exact mislabeling this fixes.
+// Conversely, had a deployment used a non-RWX Longhorn StorageClass, the old AccessModes-only check
+// would have EXCLUDED it from re-attach entirely, silently orphaning its open file handles into the
+// external-mount B-2 drop path. Both directions are fixed by consulting the StorageClass, the single
+// real source of truth, instead of re-deriving a narrower rule locally (the classification exists in
+// exactly one place: internal/agent/storage.IsLonghornStorageClass).
+func classifyReattachTier(ctx context.Context, k8sClient client.Client, pvc *corev1.PersistentVolumeClaim) reattachTierKind {
+	if pvc == nil {
+		return reattachTierNone
+	}
+	isRWX := false
+	for _, am := range pvc.Spec.AccessModes {
+		if am == corev1.ReadWriteMany {
+			isRWX = true
+			break
+		}
+	}
+
+	scName := ""
+	if pvc.Spec.StorageClassName != nil {
+		scName = *pvc.Spec.StorageClassName
+	}
+	if scName != "" && k8sClient != nil {
+		sc := &storagev1.StorageClass{}
+		if err := k8sClient.Get(ctx, client.ObjectKey{Name: scName}, sc); err == nil {
+			if pmstorage.IsLonghornStorageClass(sc) {
+				return reattachTierTier1Longhorn
+			}
+		}
+		// StorageClass lookup failed (not found / transient) — fall through to the RWX check,
+		// same fallback classifier.go itself uses.
+	}
+
+	if isRWX {
+		return reattachTierTier0RWX
+	}
+	return reattachTierNone
 }
 
 // reattachContainerPaths projects the in-container paths from a []reattachMount (the set the patch
@@ -1146,6 +1218,22 @@ func reattachContainerPaths(ms []reattachMount) []string {
 	paths := make([]string, 0, len(ms))
 	for _, m := range ms {
 		paths = append(paths, m.ContainerPath)
+	}
+	return paths
+}
+
+// reattachTier1ContainerPaths projects the in-container paths of ONLY the Tier1-Longhorn re-attach
+// mounts. Threaded through to patch_checkpoint_script.go as its own argv set so the patch script can
+// log/label a Tier1-Longhorn re-attach distinctly from the generic Tier0 RWX case (see
+// reattachTierKind) instead of collapsing every re-attach mount into one undifferentiated
+// "Tier0 RWX cross-node" message. The underlying rewrite mechanism is identical for both tiers; this
+// set is diagnostic/labeling input only, not a second mechanism.
+func reattachTier1ContainerPaths(ms []reattachMount) []string {
+	var paths []string
+	for _, m := range ms {
+		if m.Tier == reattachTierTier1Longhorn {
+			paths = append(paths, m.ContainerPath)
+		}
 	}
 	return paths
 }
@@ -1268,25 +1356,6 @@ func (s *AgentServer) resolveReattachMounts(ctx context.Context, migrationName s
 	return s.resolveReattachMountsImpl(ctx, migrationName, false)
 }
 
-// pvcIsTier0RWX reports whether a PVC classifies as Tier0 (ReadWriteMany re-attach) storage — the
-// ONLY tier eligible for the checkpoint-image re-attach mount-path rewrite. It mirrors the Tier0
-// determination in internal/agent/storage.classifier: a ReadWriteMany access mode maps to Tier0
-// regardless of provisioner. Every other access mode (ReadWriteOnce / ReadOnlyMany /
-// ReadWriteOncePod) resolves to a higher tier — Longhorn dual-engine, Ceph RBD live, or
-// snapshot+rsync — each of which owns its replication/consistency handoff and must NOT be re-attached
-// by rewriting the recorded mount source to the destination kubelet volume dir.
-func pvcIsTier0RWX(pvc *corev1.PersistentVolumeClaim) bool {
-	if pvc == nil {
-		return false
-	}
-	for _, am := range pvc.Spec.AccessModes {
-		if am == corev1.ReadWriteMany {
-			return true
-		}
-	}
-	return false
-}
-
 // resolveReattachMountsImpl is the shared body behind resolveReattachMounts (terminalOnBudget=false,
 // returns the retryable sentinel for a not-yet-published volume) and reattachMountsUnresolvedForTerminal
 // (terminalOnBudget=true, promotes the not-yet mount to a HostTarget=="" entry so the terminal
@@ -1356,14 +1425,18 @@ func (s *AgentServer) resolveReattachMountsImpl(callerCtx context.Context, migra
 	// whether the claim classifies as Tier0 (ReadWriteMany re-attach) storage. Only Tier0 PVCs are
 	// re-attach-eligible: the checkpoint-image mount-path rewrite (patchCheckpointImages) points a
 	// preserved external mount at the destination kubelet volume dir, which is correct ONLY when the
-	// same volume is concurrently visible on both nodes (RWX, zero data movement). A non-RWX PVC
-	// (Longhorn dual-engine, Ceph RBD live, snapshot-rsync — typically ReadWriteOnce) has its own
-	// replication/consistency handoff; treating it as a re-attach mount would silently bind the
-	// destination volume dir over CRIU's recorded source and bypass that handoff entirely. The Tier0
-	// test mirrors internal/agent/storage.classifier (a ReadWriteMany access mode maps to Tier0
-	// regardless of provisioner).
+	// same volume is concurrently visible on both nodes (RWX, zero data movement). Longhorn dual-engine
+	// (Tier1) also re-attaches through this same mechanism once its own cutover has collapsed the
+	// volume to a single owner on the destination (ADR-0356) — the destination kubelet-staged CSI
+	// mount is, at that point, an ordinary volume mount indistinguishable in kind from the Tier0 case.
+	// Ceph RBD live and snapshot-rsync (typically ReadWriteOnce, non-Longhorn) have their own
+	// replication/consistency handoff and are NOT reattach-eligible; treating one as a re-attach mount
+	// would silently bind the destination volume dir over CRIU's recorded source and bypass that
+	// handoff entirely. classifyReattachTier mirrors internal/agent/storage.classifier's real
+	// precedence (Longhorn-backed StorageClass wins over the generic RWX check regardless of access
+	// mode) rather than re-deriving a narrower, divergent rule locally.
 	claimToPV := make(map[string]string)
-	claimIsTier0 := make(map[string]bool)
+	claimReattachTier := make(map[string]reattachTierKind)
 	for _, claim := range pvcVolToClaim {
 		if _, done := claimToPV[claim]; done {
 			continue
@@ -1371,7 +1444,7 @@ func (s *AgentServer) resolveReattachMountsImpl(callerCtx context.Context, migra
 		pvc := &corev1.PersistentVolumeClaim{}
 		if err := s.k8sClient.Get(ctx, types.NamespacedName{Name: claim, Namespace: podNs}, pvc); err == nil {
 			claimToPV[claim] = pvc.Spec.VolumeName
-			claimIsTier0[claim] = pvcIsTier0RWX(pvc)
+			claimReattachTier[claim] = classifyReattachTier(ctx, s.k8sClient, pvc)
 		}
 	}
 
@@ -1393,11 +1466,12 @@ func (s *AgentServer) resolveReattachMountsImpl(callerCtx context.Context, migra
 				continue
 			}
 			// Tier gate (fail-closed against mis-classification): a PVC-backed mount is re-attach
-			// eligible ONLY if it classifies as Tier0 (ReadWriteMany re-attach). Excluding a non-Tier0
-			// PVC here keeps it out of reattach_mount_paths, so patch_checkpoint_script leaves its
-			// recorded mount source alone (the pre-existing non-Tier0 handling) rather than rewriting
-			// it as a cross-node re-attach mount.
-			if !claimIsTier0[claim] {
+			// eligible ONLY if it classifies as Tier0 RWX or Tier1-Longhorn. Excluding a non-reattach-
+			// eligible PVC here keeps it out of reattach_mount_paths, so patch_checkpoint_script leaves
+			// its recorded mount source alone (the pre-existing non-reattach handling) rather than
+			// rewriting it as a cross-node re-attach mount.
+			tier := claimReattachTier[claim]
+			if tier == reattachTierNone {
 				continue
 			}
 			cp := filepath.Clean(m.MountPath)
@@ -1416,7 +1490,7 @@ func (s *AgentServer) resolveReattachMountsImpl(callerCtx context.Context, migra
 				}
 				continue
 			}
-			mounts = append(mounts, reattachMount{ContainerPath: cp, HostTarget: host})
+			mounts = append(mounts, reattachMount{ContainerPath: cp, HostTarget: host, Tier: tier})
 		}
 	}
 	for i := range specPod.Spec.InitContainers {
@@ -4573,7 +4647,7 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	// the files.img↔mountpoints consistency invariant (ADR-0193 P-0193-1).
 	// inheritFdNamesForPatch is the same set that buildCRIURestoreArgs will pass via --inherit-fd
 	// (C-R3-1 single source of truth — no independent recomputation).
-	droppedMounts, patchErr := patchCheckpointImages(checkpointDir, inheritFdNamesForPatch, reattachContainerPaths(reattachMountPaths), reattachHostTargets(reattachMountPaths))
+	droppedMounts, patchErr := patchCheckpointImages(checkpointDir, inheritFdNamesForPatch, reattachContainerPaths(reattachMountPaths), reattachHostTargets(reattachMountPaths), reattachTier1ContainerPaths(reattachMountPaths))
 	if patchErr != nil {
 		return 0, nil, fmt.Errorf("patch checkpoint images: %w", patchErr)
 	}
@@ -6199,8 +6273,8 @@ func sandboxIDForPodUID(ctx context.Context, podUID string) (string, error) {
 // Tests can replace this variable to inject failures without requiring real CRIU images.
 // The function variable wraps patchCheckpointImages; it discards the dropped-mounts info
 // (callers that need events use patchCheckpointImages directly).
-var patchCheckpointImagesFn = func(checkpointDir string, inheritFdNames []string, reattachMountPaths []string, reattachHostTargets map[string]string) error {
-	_, err := patchCheckpointImages(checkpointDir, inheritFdNames, reattachMountPaths, reattachHostTargets)
+var patchCheckpointImagesFn = func(checkpointDir string, inheritFdNames []string, reattachMountPaths []string, reattachHostTargets map[string]string, reattachTier1MountPaths []string) error {
+	_, err := patchCheckpointImages(checkpointDir, inheritFdNames, reattachMountPaths, reattachHostTargets, reattachTier1MountPaths)
 	return err
 }
 
@@ -6375,16 +6449,22 @@ if len(sys.argv) >= 2 and sys.argv[1] == '--classify-selftest':
 // line-2200 decision. Pass nil/empty when no cgroup fds are inherited (degrade-and-continue).
 //
 // reattachMountPaths is the set of in-container mount paths backed by a shared/re-attach PVC
-// (Tier0 RWX). Such an external mountpoints entry is PRESERVED (not B-2 dropped) so its files.img
-// REG fds classify consistent instead of orphaning into the P-0193-1 hard-stop; on restore CRIU
-// re-attaches it via --ext-mount-map <path>:<path> to the identically-mounted destination volume.
+// (Tier0 RWX, or Tier1-Longhorn once its own cutover has collapsed to a single owner — see
+// reattachTier1MountPaths). Such an external mountpoints entry is PRESERVED (not B-2 dropped) so its
+// files.img REG fds classify consistent instead of orphaning into the P-0193-1 hard-stop; on restore
+// CRIU re-attaches it via the recorded-source rewrite (see reattachHostTargets doc below).
 // Sourced from the pod spec (resolveReattachMounts primitive), NOT a hardcoded workload
 // path. Pass nil/empty for stateless workloads (prior behavior — every external entry is dropped).
+//
+// reattachTier1MountPaths is the SUBSET of reattachMountPaths that classified as Tier1-Longhorn
+// (classifyReattachTier) rather than Tier0 RWX. It does not change which mounts are preserved or how
+// their source is rewritten (same mechanism for both tiers); it exists purely so the patch script logs
+// the correct tier name instead of always reporting "Tier0 RWX cross-node" for a Longhorn re-attach.
 //
 // Idempotent: backs up originals as *.orig on first call; subsequent calls are no-ops.
 // Returns (droppedMounts, error). droppedMounts is non-nil when B-2 external drops fired
 // successfully; callers should emit CRIUExternalMountDropped Normal events for each entry.
-func patchCheckpointImages(checkpointDir string, inheritFdNames []string, reattachMountPaths []string, reattachHostTargets map[string]string) ([]ExternalMountDroppedInfo, error) {
+func patchCheckpointImages(checkpointDir string, inheritFdNames []string, reattachMountPaths []string, reattachHostTargets map[string]string, reattachTier1MountPaths []string) ([]ExternalMountDroppedInfo, error) {
 	// Write the patch script to a temp file and run it with the system python3 + pycriu.
 	// containerdMaskedPaths is injected as a JSON argv so the patch step consumes the same
 	// single source of truth as buildMaskedPathExtMountArgs (ADR-0124 R2 / AC6) — no divergent
@@ -6424,6 +6504,15 @@ func patchCheckpointImages(checkpointDir string, inheritFdNames []string, reatta
 	if err != nil {
 		return nil, fmt.Errorf("marshal reattach host targets: %w", err)
 	}
+	// argv[6]: the SUBSET of reattachMountPaths that are Tier1-Longhorn (see reattachTier1MountPaths
+	// doc above). Diagnostic/labeling input only — normalize nil→[] like the other path sets.
+	if reattachTier1MountPaths == nil {
+		reattachTier1MountPaths = []string{}
+	}
+	reattachTier1JSON, err := json.Marshal(reattachTier1MountPaths)
+	if err != nil {
+		return nil, fmt.Errorf("marshal reattach tier1-longhorn mount paths: %w", err)
+	}
 	// The single REG-fd classifier (classifyRegFdPy) is prepended verbatim so the main pass and
 	// the consistency re-check below both call the one classify_reg_fd() abstraction.
 	// assemblePatchScript() is the SINGLE SOURCE OF TRUTH for the assembled patch script (H-19):
@@ -6440,8 +6529,9 @@ func patchCheckpointImages(checkpointDir string, inheritFdNames []string, reatta
 	}
 	defer os.Remove(scriptPath)
 	// argv[1]=checkpointDir argv[2]=maskedJSON argv[3]=inheritJSON (C-R3-1) argv[4]=reattachJSON
-	// argv[5]=reattachHostTargetsJSON (destination kubelet dirs for the cross-node source rewrite).
-	cmd := exec.Command("python3", scriptPath, checkpointDir, string(maskedJSON), string(inheritJSON), string(reattachJSON), string(reattachHostTargetsJSON))
+	// argv[5]=reattachHostTargetsJSON (destination kubelet dirs for the cross-node source rewrite)
+	// argv[6]=reattachTier1JSON (subset of argv[4] that is Tier1-Longhorn, for correct tier labeling).
+	cmd := exec.Command("python3", scriptPath, checkpointDir, string(maskedJSON), string(inheritJSON), string(reattachJSON), string(reattachHostTargetsJSON), string(reattachTier1JSON))
 	cmd.Env = append(os.Environ(), "PYTHONPATH=/usr/lib/python3/dist-packages")
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
@@ -8083,7 +8173,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	if rawReErr != nil {
 		return nil, fmt.Errorf("resolve re-attach mounts: %w", rawReErr)
 	}
-	if patchErr := patchCheckpointImagesFn(imagesDir, nil, reattachContainerPaths(rawReattachMounts), reattachHostTargets(rawReattachMounts)); patchErr != nil {
+	if patchErr := patchCheckpointImagesFn(imagesDir, nil, reattachContainerPaths(rawReattachMounts), reattachHostTargets(rawReattachMounts), reattachTier1ContainerPaths(rawReattachMounts)); patchErr != nil {
 		if req.TcpPreservationMode == "Strict" {
 			// Strict: fail closed. The controller will initiate rollback.
 			log.Error(patchErr, "Restore: patchCheckpointImages failed under Strict — aborting restore (ADR-0049 Amendment D A1)", "migration", req.MigrationName)
