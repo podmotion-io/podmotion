@@ -137,6 +137,24 @@ CALICO_CSI_IMG="${CALICO_CSI_IMG:-docker.io/calico/csi:v${CALICO_VERSION}}"
 CALICO_CSI_REGISTRAR_IMG="${CALICO_CSI_REGISTRAR_IMG:-docker.io/calico/node-driver-registrar:v${CALICO_VERSION}}"
 CALICO_IPPOOL_NAME="${CALICO_IPPOOL_NAME:-default-ipv4-ippool}"
 
+# ── CNI leftover-residue registry ────────────────────────────────────────────
+# One row per CNI this project's matrix actually supports (Flannel/Cilium/Calico
+# per CLAUDE.md), used by cmd_reset_cluster's post-reset purge below. Each row is
+# "name|iface_prefixes(space-sep, glob-safe)|iptables_jump_or_chain_regex". A
+# future 4th CNI (or a Calico/Cilium version that adds a new interface/chain
+# prefix) is a one-line addition here, not a hand-edit of two separate embedded
+# shell blocks (confirmed live 2026-07-17: a hardcoded two-CNI list is exactly
+# the class of bug that silently repeats when a 3rd/4th CNI is added).
+#
+# Flannel is intentionally NOT a row: cni0/flannel.1 are the CURRENT/target
+# CNI's own interfaces in the reset-TO-Flannel path, not residue from a prior
+# CNI — adding it here would delete the interface the cluster is being reset
+# INTO. Flannel also installs no custom iptables chains (kube-proxy owns NAT).
+CNI_LEFTOVER_REGISTRY=(
+  "cilium|cilium_host cilium_net cilium_geneve|CILIUM"
+  "calico|vxlan.calico|cali-"
+)
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
@@ -221,9 +239,28 @@ cmd_reset_cluster() {
   # on the node unreachable — even from the node itself — with no error surfaced
   # anywhere except a generic probe timeout). Sweep every prior-CNI leftover
   # unconditionally, on every reset, regardless of which CNI is being reset FROM.
-  echo "==> Purging leftover network interfaces from any prior CNI (Cilium/Calico residue)..."
+  #
+  # Interface names and iptables jump/chain prefixes are pulled from
+  # CNI_LEFTOVER_REGISTRY (declared near the top of this script) instead of being
+  # hardcoded here, so a future 4th CNI (or a Calico/Cilium version bump that adds
+  # a new interface/chain prefix) is a one-line registry addition, not a hand-edit
+  # of this block.
+  local cni_ifaces="" cni_iptables_regex=""
+  local reg_row reg_name reg_ifaces reg_regex
+  for reg_row in "${CNI_LEFTOVER_REGISTRY[@]}"; do
+    IFS='|' read -r reg_name reg_ifaces reg_regex <<< "$reg_row"
+    cni_ifaces="$cni_ifaces $reg_ifaces"
+    if [[ -z "$cni_iptables_regex" ]]; then
+      cni_iptables_regex="$reg_regex"
+    else
+      cni_iptables_regex="$cni_iptables_regex|$reg_regex"
+    fi
+  done
+  cni_ifaces="${cni_ifaces# }"
+
+  echo "==> Purging leftover network interfaces from any prior CNI (${CNI_LEFTOVER_REGISTRY[*]%%|*}, from CNI_LEFTOVER_REGISTRY)..."
   for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
-    nsh "$ip" "for l in cilium_host cilium_geneve vxlan.calico; do sudo ip link del \"\$l\" 2>/dev/null || true; done; sudo ip route flush proto 80 2>/dev/null || true"
+    nsh "$ip" "for l in $cni_ifaces; do sudo ip link del \"\$l\" 2>/dev/null || true; done; sudo ip route flush proto 80 2>/dev/null || true"
   done
 
   # Same leftover-CNI-residue problem as above, but in iptables rather than
@@ -235,23 +272,23 @@ cmd_reset_cluster() {
   # ClusterIP routing failures hours into a Flannel-only cluster's life —
   # exactly the class of "sometimes works" bug that's expensive to diagnose
   # blind. Purge unconditionally on every reset, same as the interface sweep.
-  echo "==> Purging leftover iptables chains from any prior CNI (Cilium/Calico residue)..."
+  echo "==> Purging leftover iptables chains from any prior CNI (${CNI_LEFTOVER_REGISTRY[*]%%|*}, from CNI_LEFTOVER_REGISTRY)..."
   local cni_iptables_purge
   cni_iptables_purge='
 for table in raw mangle filter nat; do
-  iptables-legacy -t "$table" -S 2>/dev/null | grep -E "^-A" | grep -E -- "-j (cali-|CILIUM)" | sed "s/^-A/-D/" | while read -r cmd; do
+  iptables-legacy -t "$table" -S 2>/dev/null | grep -E "^-A" | grep -E -- "-j ('"$cni_iptables_regex"')" | sed "s/^-A/-D/" | while read -r cmd; do
     iptables-legacy -t "$table" $cmd 2>/dev/null || true
   done
 done
 for pass in 1 2 3; do
   for table in raw mangle filter nat; do
-    for chain in $(iptables-legacy -t "$table" -S 2>/dev/null | grep -oE -- "-N (cali-|CILIUM_)[^ ]+" | awk "{print \$2}"); do
+    for chain in $(iptables-legacy -t "$table" -S 2>/dev/null | grep -oE -- "-N ('"$cni_iptables_regex"')[^ ]+" | awk "{print \$2}"); do
       iptables-legacy -t "$table" -F "$chain" 2>/dev/null || true
     done
   done
 done
 for table in raw mangle filter nat; do
-  for chain in $(iptables-legacy -t "$table" -S 2>/dev/null | grep -oE -- "-N (cali-|CILIUM_)[^ ]+" | awk "{print \$2}"); do
+  for chain in $(iptables-legacy -t "$table" -S 2>/dev/null | grep -oE -- "-N ('"$cni_iptables_regex"')[^ ]+" | awk "{print \$2}"); do
     iptables-legacy -t "$table" -X "$chain" 2>/dev/null || true
   done
 done
