@@ -242,6 +242,43 @@ func TestStorageClassifier_DiskEmptyDir_IsBlocked(t *testing.T) {
 	}
 }
 
+// TestStorageClassifier_PodmotionHolderVolume_NotBlocked is the regression guard
+// for a real bug confirmed live 2026-07-18: a bare nginx pod's SECOND migration
+// (after a first, successful one) permanently stalled at PreCopyMemory with
+// StorageReadyForFreeze=False/BlockedVolume. Root cause: PodMotion's own
+// mutating webhook injects a disk-backed emptyDir ("podmotion-holder-bin") into
+// every replacement pod to stage the holder binary, and the classifier's
+// disk-emptyDir-must-block rule couldn't distinguish that from real user data —
+// meaning ANY pod that had already been migrated once could never migrate
+// again, on any tier or CNI, since the webhook re-injects this same volume
+// every time. This volume holds no pod data (recreated fresh on every
+// migration), so it must always be transparent, unlike a genuine user emptyDir.
+func TestStorageClassifier_PodmotionHolderVolume_NotBlocked(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "twice-migrated-pod", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{
+				{
+					Name: "podmotion-holder-bin",
+					VolumeSource: corev1.VolumeSource{
+						EmptyDir: &corev1.EmptyDirVolumeSource{},
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(newScheme()).Build()
+	classifier := storage.NewStorageClassifier(fakeClient)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(clsfs) != 0 {
+		t.Fatalf("expected 0 classifications for PodMotion's own injected holder volume (must be transparent), got %d: %+v", len(clsfs), clsfs)
+	}
+}
+
 // TestStorageClassifier_TransparentVolumes_NotClassified confirms that genuinely
 // transparent non-PVC volumes (configMap/secret) are still skipped — the emptyDir
 // fix must not over-block volumes that carry no writable pod-local state.
