@@ -3857,7 +3857,7 @@ func ResolveNetnsFromSandbox(ctx context.Context, containerdClient interface{}, 
 // sandbox shares the host network namespace (no path).
 func sandboxNetnsPath(ctx context.Context, sandboxID string) (string, error) {
 	// `ctr containers info` prints the container record including the OCI runtime Spec.
-	out, err := nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "containers", "info", sandboxID).Output()
+	out, err := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "containers", "info", sandboxID)...).Output()
 	if err != nil {
 		return "", fmt.Errorf("ctr containers info %s: %w", sandboxID, err)
 	}
@@ -3951,7 +3951,7 @@ func resolveNetnsBindByProcPath(ctx context.Context, procPath string) string {
 // error is swallowed, and the established-TCP-socket classifier goes silent. Every consumer of
 // the host bundle path MUST go through this helper.
 func hostBundleDir(taskID string) string {
-	return fmt.Sprintf("/host-run/containerd/io.containerd.runtime.v2.task/k8s.io/%s", taskID)
+	return hostRunMountPath("io.containerd.runtime.v2.task/k8s.io/" + taskID)
 }
 
 // resolveCtrDumpLogPath returns the agent-visible path to runc's criu-dump.log for a task,
@@ -4004,12 +4004,11 @@ func resolveCtrDumpLogPath(taskID, ctrOutput string) string {
 // the containerd state prefix (nothing to remap). Pure string transform, split out so the
 // re-rooting is unit-testable without a real /host-run mount.
 func remapWorkTargetToDumpLog(workTarget string) string {
-	const hostStatePrefix = "/var/lib/containerd"
 	const agentStatePrefix = "/host-var-lib-containerd"
-	if !strings.HasPrefix(workTarget, hostStatePrefix) {
+	if !strings.HasPrefix(workTarget, containerdStateRoot) {
 		return ""
 	}
-	agentWork := agentStatePrefix + strings.TrimPrefix(workTarget, hostStatePrefix)
+	agentWork := agentStatePrefix + strings.TrimPrefix(workTarget, containerdStateRoot)
 	return filepath.Join(agentWork, "criu-dump.log")
 }
 
@@ -4022,7 +4021,7 @@ func remapWorkTargetToDumpLog(workTarget string) string {
 // task ID alone can point at the wrong directory. ctr's own error names the exact file — prefer
 // it. Returns "" if no host bundle path is present in the output.
 func ctrReportedDumpLogPath(out string) string {
-	const marker = "/run/containerd/io.containerd.runtime.v2.task/"
+	marker := containerdRunRoot + "/io.containerd.runtime.v2.task/"
 	idx := strings.Index(out, marker)
 	if idx < 0 {
 		return ""
@@ -4044,7 +4043,7 @@ func ctrReportedDumpLogPath(out string) string {
 }
 
 func FindContainerTaskID(ctx context.Context, podUID string) (string, error) {
-	out, err := nsenterCmd(ctx, "/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "list").Output()
+	out, err := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "list")...).Output()
 	if err == nil {
 		lines := strings.Split(string(out), "\n")
 		for _, line := range lines[1:] { // skip header
@@ -4078,7 +4077,7 @@ func FindContainerTaskID(ctx context.Context, podUID string) (string, error) {
 	// task path does not exist in the agent ns). Each bundle is at
 	// /host-run/containerd/io.containerd.runtime.v2.task/k8s.io/<taskID>/config.json.
 	// The pod UID appears in the cgroup path encoded in config.json's linux.cgroupsPath field.
-	const bundleBase = "/host-run/containerd/io.containerd.runtime.v2.task/k8s.io"
+	bundleBase := hostRunMountPath("io.containerd.runtime.v2.task/k8s.io")
 	entries, dirErr := os.ReadDir(bundleBase)
 	if dirErr == nil {
 		// Normalize pod UID for cgroup path matching (hyphens → underscores).
@@ -4116,8 +4115,8 @@ func ctrCheckpoint(ctx context.Context, taskID, imagesDir string, tcpEstablished
 	if err := os.MkdirAll(imagesDir, 0o700); err != nil {
 		return 0, fmt.Errorf("mkdir %s: %w", imagesDir, err)
 	}
-	cmd := nsenterCmd(ctx, "/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "checkpoint",
-		"--image-path", imagesDir, taskID)
+	cmd := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "checkpoint",
+		"--image-path", imagesDir, taskID)...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		// Detect in-flight / established TCP socket failure so the caller can fall back to
@@ -4909,9 +4908,9 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 
 	// Pull the image if not already present. Use nsenterCmd to run ctr in the host mount namespace
 	// (ctr is on the node, not in the agent container).
-	pullOut, _ := nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "images", "ls", "-q").Output()
+	pullOut, _ := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "images", "ls", "-q")...).Output()
 	if !strings.Contains(string(pullOut), imageName) {
-		if out, err := nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "images", "pull", imageName).CombinedOutput(); err != nil {
+		if out, err := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "images", "pull", imageName)...).CombinedOutput(); err != nil {
 			return 0, nil, fmt.Errorf("pull %s: %w\n%s", imageName, err, out)
 		}
 	}
@@ -4992,8 +4991,8 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 		}
 		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackExecBudget)
 		defer cancel()
-		_ = nsenterCmd(rollbackCtx, "ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
-		_ = nsenterCmd(rollbackCtx, "ctr", "--namespace", "k8s.io", "container", "rm", placeholderID).Run()
+		_ = nsenterCmd(rollbackCtx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID)...).Run()
+		_ = nsenterCmd(rollbackCtx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "container", "rm", placeholderID)...).Run()
 	}()
 
 	// Step 3: Create ext-mount-map target paths in the agent container's filesystem.
@@ -5188,10 +5187,10 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	// fd at /proc/<pid>/ns/mnt (accessible from host mount namespace via nsenter), then
 	// use nsenter --mount=<ns> to run umount -l /sys inside it.
 	placeholderIDForUmount := "pm-placeholder-" + migrationName
-	if placeholderPIDOut, pidErr := nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "tasks", "ls", "--quiet").Output(); pidErr == nil {
+	if placeholderPIDOut, pidErr := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "ls", "--quiet")...).Output(); pidErr == nil {
 		// `ctr task ls --quiet` lists running task IDs (not PIDs). Get the PID from `ctr task info`.
 		if strings.Contains(string(placeholderPIDOut), placeholderIDForUmount) {
-			if pidInfo, piErr := nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "task", "ls").Output(); piErr == nil {
+			if pidInfo, piErr := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "task", "ls")...).Output(); piErr == nil {
 				for _, line := range strings.Split(string(pidInfo), "\n") {
 					if strings.Contains(line, placeholderIDForUmount) {
 						fields := strings.Fields(line)
@@ -6593,8 +6592,8 @@ var sandboxIDForPodUIDFn = sandboxIDForPodUID
 // new external binary dependency. Returns errNoSandboxForPodUID (wrapped) when the query succeeds
 // but no sandbox exists yet, so callers can distinguish that retryable race from a hard ctr error.
 func sandboxIDForPodUID(ctx context.Context, podUID string) (string, error) {
-	out, err := nsenterCmd(ctx, "/usr/local/bin/ctr", "--namespace", "k8s.io", "containers", "list",
-		"-q", "labels.\"io.kubernetes.pod.uid\"=="+podUID).Output()
+	out, err := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "containers", "list",
+		"-q", "labels.\"io.kubernetes.pod.uid\"=="+podUID)...).Output()
 	if err != nil {
 		return "", fmt.Errorf("ctr containers list for pod uid %s: %w", podUID, err)
 	}
@@ -7271,7 +7270,7 @@ func setupRestoreOverlayfs(ctx context.Context, migrationName, checkpointDir, im
 	// missing on retry. The replacement container's overlay is stable for the duration of the
 	// NRI hook.
 	if containerID != "" {
-		containerRootfs := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s/rootfs", containerID)
+		containerRootfs := fmt.Sprintf(ctrTaskBundleRoot()+"/%s/rootfs", containerID)
 		// Verify the overlay is mounted in the host namespace (/proc/1/mounts is readable from
 		// agent container). The agent container cannot access /run/containerd/... directly
 		// (its /run is a private tmpfs), so content checks use nsenterCmd.
@@ -7304,8 +7303,8 @@ func setupRestoreOverlayfs(ctx context.Context, migrationName, checkpointDir, im
 	// The agent container cannot access /run/containerd/... directly (its /run is a private tmpfs).
 	// All existence/readiness checks use either /proc/1/mounts (host mount table, readable from
 	// agent) or nsenterCmd (runs commands in host mount namespace).
-	rootfsDir := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s/rootfs", placeholderID)
-	bundleDir := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s", placeholderID)
+	rootfsDir := fmt.Sprintf(ctrTaskBundleRoot()+"/%s/rootfs", placeholderID)
+	bundleDir := fmt.Sprintf(ctrTaskBundleRoot()+"/%s", placeholderID)
 
 	// hostOverlayMounted reports whether the overlay for rootfsDir is mounted in the host namespace.
 	// Uses /proc/1/mounts which is readable from the agent container because the agent has hostPID=true.
@@ -7327,7 +7326,7 @@ func setupRestoreOverlayfs(ctx context.Context, migrationName, checkpointDir, im
 	// Use `ctr task ls --quiet` to check for a running task with the placeholder ID.
 	// A stale bundle dir (from a previous failed attempt) would have dirs but no running task
 	// and no overlay mount — do NOT accept it.
-	taskOut, _ := nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "tasks", "ls", "--quiet").Output()
+	taskOut, _ := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "ls", "--quiet")...).Output()
 	placeholderRunning := strings.Contains(string(taskOut), placeholderID)
 	if placeholderRunning && hostOverlayMounted() {
 		log.Info("setupRestoreOverlayfs: placeholder rootfs already present (overlay confirmed)", "rootfs", rootfsDir)
@@ -7342,8 +7341,8 @@ func setupRestoreOverlayfs(ctx context.Context, migrationName, checkpointDir, im
 	// as brokerCriuCmd.Signal() and the joinNsRestore placeholder-teardown defer.
 	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackExecBudget)
 	defer rollbackCancel()
-	_ = nsenterCmd(rollbackCtx, "ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID).Run()
-	_ = nsenterCmd(rollbackCtx, "ctr", "--namespace", "k8s.io", "container", "rm", placeholderID).Run()
+	_ = nsenterCmd(rollbackCtx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "task", "kill", "--signal", "KILL", placeholderID)...).Run()
+	_ = nsenterCmd(rollbackCtx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "container", "rm", placeholderID)...).Run()
 	// Remove stale bundle dir left by containerd (containerd does not auto-clean on kill).
 	// This is necessary so containerd can create a fresh bundle with a properly mounted overlay.
 	// Use nsenterCmd since the agent container cannot access /run/containerd/... directly.
@@ -7355,10 +7354,10 @@ func setupRestoreOverlayfs(ctx context.Context, migrationName, checkpointDir, im
 	// Launch a placeholder container inside the host mount namespace so containerd prepares
 	// the overlayfs snapshot layers. nsenterCmd ensures ctr runs in the host mount namespace
 	// (necessary because containerd resolves temp paths like /tmp in the host namespace).
-	runOut, err := nsenterCmd(ctx, "ctr", "--namespace", "k8s.io", "run",
+	runOut, err := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "run",
 		"--detach", "--snapshotter", "overlayfs",
 		imageName, placeholderID, "sleep", "600",
-	).CombinedOutput()
+	)...).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("ctr run placeholder: %w\n%s", err, runOut)
 	}
@@ -7936,7 +7935,7 @@ func (s *AgentServer) Checkpoint(ctx context.Context, req *agentpb.CheckpointReq
 				stageTaskID, taskErr = FindContainerTaskID(ctx, podUID)
 			}
 			if taskErr == nil && stageTaskID != "" {
-				srcCfg := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s/config.json", stageTaskID)
+				srcCfg := fmt.Sprintf(ctrTaskBundleRoot()+"/%s/config.json", stageTaskID)
 				dstCfg := filepath.Join(checkpointPath, "config.json")
 				if data, readErr := os.ReadFile(srcCfg); readErr == nil {
 					if wErr := os.WriteFile(dstCfg, data, 0o600); wErr != nil { // ADR-SEC-B N-342: 0600 (invariant 7)
