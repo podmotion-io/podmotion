@@ -514,6 +514,14 @@ cmd_deploy_podmotion() {
   # sprint; a k3s deploy sets both (reset-cluster-k3s prints the exact values).
   local AGENT_CONTAINERD_SOCKET_PATH="${AGENT_CONTAINERD_SOCKET_PATH:-/run/containerd/containerd.sock}"
   local AGENT_CONTAINERD_STATE_DIR="${AGENT_CONTAINERD_STATE_DIR:-/var/lib/containerd}"
+  # AGENT_CNI_EXTRA_CONF_DIR: passed through to agent.cni.extraConfDir (Helm chart
+  # values.yaml / daemonset.yaml host-cni-conf-extra mount). Some distros do not
+  # populate the canonical /etc/cni/net.d that nmcregistrar.detectCNI() scans by
+  # default — k3s writes its embedded-Flannel conflist to
+  # /var/lib/rancher/k3s/agent/etc/cni/net.d instead, leaving /etc/cni/net.d empty and
+  # NMC's spec.networkCapability.cniPlugin stuck at "unknown". Empty (default) leaves
+  # a plain kubeadm deploy byte-identical to before this sprint; a k3s deploy sets this.
+  local AGENT_CNI_EXTRA_CONF_DIR="${AGENT_CNI_EXTRA_CONF_DIR:-}"
 
   echo "==> Building binaries (make build-linux)..."
   make build-linux   # emits bin/{manager,agent,criu-wrapper}-linux-amd64 (auto-renamed)
@@ -588,7 +596,8 @@ cmd_deploy_podmotion() {
     --set installCRDs=false \
     --set operator.featureGates="TCPPreservation=true" \
     --set agent.containerd.socketPath="$AGENT_CONTAINERD_SOCKET_PATH" \
-    --set agent.containerd.stateDir="$AGENT_CONTAINERD_STATE_DIR"
+    --set agent.containerd.stateDir="$AGENT_CONTAINERD_STATE_DIR" \
+    ${AGENT_CNI_EXTRA_CONF_DIR:+--set agent.cni.extraConfDir="$AGENT_CNI_EXTRA_CONF_DIR"}
 
   # A re-deploy within the same sprint reuses the same $TAG (see the image
   # import step above), so the rendered Deployment/DaemonSet spec is often

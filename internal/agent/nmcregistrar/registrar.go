@@ -72,14 +72,26 @@ func (r *Registrar) resolveNodeInternalIP(ctx context.Context) (string, error) {
 // criuBinaryPath is the path to the CRIU binary, mounted from the host node via hostPath volume.
 const criuBinaryPath = "/usr/sbin/criu"
 
-// detectCRIU runs "/usr/sbin/criu --version" and returns the version string (e.g. "3.17.1").
-// Falls back to searching PATH if the explicit path is not present.
+// criuBinaryPathFallback is a second candidate, mounted from the host-usr-local-sbin hostPath
+// volume (daemonset.yaml). On some hosts (observed on k3s-provisioned nodes) /usr/sbin/criu is
+// a symlink to /usr/local/sbin/criu rather than a real binary; the agent only ever mounted
+// /usr/sbin, so the symlink target was missing inside the container and os.Stat on the symlink
+// itself (which does not follow it to check the target) silently failed, leaving
+// spec.criuVersion empty even though CRIU was genuinely installed on the host.
+const criuBinaryPathFallback = "/usr/local/sbin/criu"
+
+// detectCRIU runs criu --version and returns the version string (e.g. "3.17.1").
+// Tries the canonical path, then the /usr/local/sbin fallback, then finally searches PATH.
 // Returns an empty string on any error.
 func detectCRIU() string {
 	bin := criuBinaryPath
 	if _, err := os.Stat(bin); err != nil {
-		// Fallback: search PATH (useful in dev/test environments)
-		bin = "criu"
+		if _, err2 := os.Stat(criuBinaryPathFallback); err2 == nil {
+			bin = criuBinaryPathFallback
+		} else {
+			// Fallback: search PATH (useful in dev/test environments)
+			bin = "criu"
+		}
 	}
 	out, err := exec.Command(bin, "--version").Output()
 	if err != nil {
@@ -461,6 +473,14 @@ func detectCNI() string {
 	}
 
 	cniConfDirs := []string{"/etc/cni/net.d"}
+	// Some distros do not populate the canonical /etc/cni/net.d: k3s writes its embedded-
+	// Flannel conflist to /var/lib/rancher/k3s/agent/etc/cni/net.d instead. The chart mounts
+	// that host path (or any other distro-specific path) into the container and tells us
+	// where via PODMOTION_CNI_EXTRA_CONF_DIR when agent.cni.extraConfDir is set (see
+	// values.yaml / daemonset.yaml host-cni-conf-extra).
+	if extra, ok := os.LookupEnv("PODMOTION_CNI_EXTRA_CONF_DIR"); ok && extra != "" {
+		cniConfDirs = append(cniConfDirs, extra)
+	}
 	for _, dir := range cniConfDirs {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
