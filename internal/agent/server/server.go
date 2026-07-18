@@ -5945,46 +5945,101 @@ func parsePidfileContent(data []byte) (pid int, ok bool) {
 // not present, is a zombie/dead, or exits during the settle window (ADR-0228 Invariant 1).
 var ErrRestoredPIDDead = errors.New("restored PID failed liveness verification")
 
-// verifyRestoredPIDAlive implements ADR-0228 Invariant 1's liveness gate: /proc/<pid> exists
-// and the task is not a zombie, re-confirmed after a short settle window to reject a PID that
-// exits between resolution and use. Identity ("not the holder stub") is guaranteed upstream by
-// the --pidfile source-of-truth, so this gate is liveness-only and never consults comm. A
-// settle of 0 skips the re-read (single-shot liveness).
+// procAliveCheck reports whether pid is alive, optionally guarding PID-reuse via
+// expectedStartTime (0 skips the guard). See procAliveFn's doc comment.
+type procAliveCheck func(pid int, expectedStartTime uint64) (alive bool, startTime uint64, err error)
+
+// procAliveFn is verifyRestoredPIDAlive's liveness-check seam. Production (the
+// zero-value default) routes through the unconfined netns-broker's proc_alive op
+// (brokerProcAlive) rather than reading /proc/<pid>/stat in this (confined) agent
+// process directly.
+//
+// WHY: the CRIU-restored workload root runs under the container runtime's default
+// AppArmor profile (e.g. cri-containerd.apparmor.d), never under podmotion-agent or
+// unconfined — the only two peers this agent's own narrow `ptrace (read)` profile
+// grants (see /etc/apparmor.d/podmotion-agent). Reading ANOTHER process's
+// /proc/<pid>/stat crosses a ptrace_may_access kernel gate that AppArmor mediates
+// against the TARGET's peer profile, so a plain os.ReadFile here was silently
+// DENIED for the restored workload — live on the sprint49 Longhorn cutover-gate
+// proof (dmesg: `apparmor="DENIED" operation="ptrace" class="ptrace"
+// profile="podmotion-agent" ... peer="cri-containerd.apparmor.d"`, firing on every
+// single restore at exactly this liveness-check instant). The prior code treated
+// ANY read error identically to "the process exited" (the same conflation
+// ResolveVeth/holder_sentinel/signal_pid were already fixed for — see their doc
+// comments), so a permission-denied read on a perfectly healthy, just-restored
+// Postgres process was misread as "dead," and the ADR-0351 G5 fail-closed reap
+// then SIGKILLed it — the actual root cause of the "Postgres dies shortly after a
+// successful CRIU restore" defect: the restore always looked to CRIU as if it
+// truly succeeded, because it did; the agent's OWN liveness re-check killed the
+// process afterward. The unconfined broker's read (doProcAlive) is not subject to
+// this mediation, so its answer is never a permission artifact.
+//
+// Tests override this to a same-process check (localProcAlive) — test PIDs are
+// the test binary's own process tree (self, or a forked-and-reaped child), where
+// no cross-profile mediation is in play and no broker socket is running.
+var procAliveFn procAliveCheck = brokerProcAlive
+
+// brokerProcAlive is procAliveFn's production implementation (ADR-0228 fix).
+func brokerProcAlive(pid int, expectedStartTime uint64) (bool, uint64, error) {
+	return netnsBrokerClientFn().ProcAlive(context.Background(), pid, expectedStartTime)
+}
+
+// localProcAlive reads /proc/<pid>/stat directly in THIS process — the ORIGINAL
+// verifyRestoredPIDAlive check logic, retained as the test-only seam target (safe
+// only when pid shares this process's own AppArmor confinement; never use this for
+// a CRIU-restored workload root in production — see procAliveFn).
+func localProcAlive(pid int, expectedStartTime uint64) (alive bool, startTime uint64, err error) {
+	data, rerr := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if rerr != nil {
+		return false, 0, nil // /proc/<pid> gone → reaped
+	}
+	// state is the field immediately after "(comm)"; comm may contain spaces and ')',
+	// so anchor on the LAST ')'.
+	s := string(data)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 || i+2 >= len(s) {
+		return false, 0, fmt.Errorf("unparseable /proc/%d/stat", pid)
+	}
+	if fields := strings.Fields(s[i+2:]); len(fields) > 19 {
+		startTime, _ = strconv.ParseUint(fields[19], 10, 64)
+	}
+	if expectedStartTime != 0 && startTime != expectedStartTime {
+		return false, startTime, nil // PID reused since the caller's earlier read
+	}
+	switch s[i+2] {
+	case 'Z', 'X', 'x':
+		return false, startTime, nil
+	default:
+		return true, startTime, nil
+	}
+}
+
+// verifyRestoredPIDAlive implements ADR-0228 Invariant 1's liveness gate: the
+// restored PID exists and is not a zombie, re-confirmed after a short settle
+// window to reject a PID that exits between resolution and use. Identity ("not
+// the holder stub") is guaranteed upstream by the --pidfile source-of-truth, so
+// this gate is liveness-only and never consults comm. A settle of 0 skips the
+// re-read (single-shot liveness). The actual liveness read is delegated to
+// procAliveFn — see its doc comment for why this can no longer be a direct
+// os.ReadFile in this process.
 func verifyRestoredPIDAlive(pid int, settle time.Duration) error {
 	if pid <= 0 {
 		return fmt.Errorf("%w: non-positive pid %d", ErrRestoredPIDDead, pid)
 	}
-	check := func() (alive bool, fatal error) {
-		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-		if err != nil {
-			return false, nil // /proc/<pid> gone → reaped
-		}
-		// state is the field immediately after "(comm)"; comm may contain spaces and ')',
-		// so anchor on the LAST ')'.
-		s := string(data)
-		i := strings.LastIndexByte(s, ')')
-		if i < 0 || i+2 >= len(s) {
-			return false, fmt.Errorf("%w: unparseable /proc/%d/stat", ErrRestoredPIDDead, pid)
-		}
-		switch s[i+2] {
-		case 'Z', 'X', 'x':
-			return false, nil
-		default:
-			return true, nil
-		}
-	}
-	alive, fatal := check()
-	if fatal != nil {
-		return fatal
+	alive, startTime, err := procAliveFn(pid, 0)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrRestoredPIDDead, err)
 	}
 	if !alive {
 		return fmt.Errorf("%w: pid %d not alive at first check", ErrRestoredPIDDead, pid)
 	}
 	if settle > 0 {
 		time.Sleep(settle)
-		alive, fatal = check()
-		if fatal != nil {
-			return fatal
+		// Re-check WITH the identity guard: a settle-window PID reuse must not be
+		// misread as "the original restored process is still alive".
+		alive, _, err = procAliveFn(pid, startTime)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrRestoredPIDDead, err)
 		}
 		if !alive {
 			return fmt.Errorf("%w: pid %d exited or became a zombie during the settle window", ErrRestoredPIDDead, pid)
@@ -9428,6 +9483,33 @@ func (s *AgentServer) ReleaseCheckpoint(_ context.Context, req *agentpb.ReleaseC
 	return &agentpb.ReleaseCheckpointResponse{Success: true}, nil
 }
 
+// KillFrozenSource delivers SIGKILL to the recorded frozen (SIGSTOPped) source PID for
+// req.MigrationName, if any, via the unconfined netns-broker — see killFrozenSource and
+// brokerKillSourcePID's doc comments for why this must be a direct kernel-level kill of
+// the STILL-STOPPED process rather than a Kubernetes pod delete (ADR-0356). Idempotent:
+// returns success with Killed=false if no frozen-source record exists (already
+// thawed/killed/never frozen for this migration).
+func (s *AgentServer) KillFrozenSource(ctx context.Context, req *agentpb.KillFrozenSourceRequest) (*agentpb.KillFrozenSourceResponse, error) {
+	if req.MigrationName == "" {
+		return &agentpb.KillFrozenSourceResponse{Success: false, Error: "migration_name required"}, nil
+	}
+	// Fallback pod UID for the "no frozen-source record" (ctr-native checkpoint) case:
+	// prefer the caller-supplied req.PodUid; else use this agent's own migrationPodUID
+	// cache, populated by Checkpoint() for this exact migration (see killFrozenSource's
+	// doc comment for why a fallback is needed at all).
+	fallbackPodUID := req.PodUid
+	if fallbackPodUID == "" {
+		s.migrationPodUIDMu.RLock()
+		fallbackPodUID = s.migrationPodUID[req.MigrationName]
+		s.migrationPodUIDMu.RUnlock()
+	}
+	killed, err := s.killFrozenSource(ctx, req.MigrationName, fallbackPodUID)
+	if err != nil {
+		return &agentpb.KillFrozenSourceResponse{Success: false, Error: err.Error()}, nil
+	}
+	return &agentpb.KillFrozenSourceResponse{Success: true, Killed: killed}, nil
+}
+
 // tarGzServerDir creates a gzip-compressed tar of all regular files in dir.
 // Mirrors tarGzDir in the controller package; duplicated here to avoid cross-package deps.
 func tarGzServerDir(dir string) ([]byte, error) {
@@ -9918,6 +10000,23 @@ func brokerSignalSourcePID(ctx context.Context, pid int32, startTime uint64) err
 	return netnsBrokerClientFn().SignalPID(sigCtx, int(pid), int(syscall.SIGCONT), startTime)
 }
 
+// brokerKillSourcePID delivers SIGKILL to a source-tree PID via the unconfined
+// netns-broker's dedicated kill_source_pid op (same C-06 MUST_ROUTE_BROKER reasoning as
+// brokerSignalSourcePID's SIGCONT — the confined agent's own syscall.Kill is
+// AppArmor-DENIED against a containerd-default-profile source workload). This is a
+// SEPARATE broker op from signal_pid (which enforces an SC-1 allowlist restricted to
+// SIGCONT/SIGSTOP only — see doSignalPID's doc comment) rather than SignalPID called with
+// syscall.SIGKILL, which the broker rejects outright. SIGKILL is fatal to a task even
+// while it is SIGSTOPped, without ever resuming it to userspace, so a source frozen by
+// LeaveStopped=true dies here without running any of its own signal handlers or
+// shutdown/cleanup code; it is equally fatal to a still-normally-running source (the
+// containerd-native ctr-checkpoint fast path never freezes it at all).
+func brokerKillSourcePID(ctx context.Context, pid int32, startTime uint64) error {
+	sigCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackExecBudget)
+	defer cancel()
+	return netnsBrokerClientFn().KillSourcePID(sigCtx, int(pid), startTime)
+}
+
 // thawSourcePID resumes a source process that was left in SIGSTOP by LeaveStopped=true
 // after a CRIU dump. Called on every error/rollback path that follows a successful dump
 // so the source workload is never permanently frozen. Idempotent: if the process is
@@ -9989,6 +10088,82 @@ func (s *AgentServer) thawFrozenSource(ctx context.Context, migrationName string
 	if ok {
 		thawSourcePID(ctx, pid, migrationName)
 	}
+}
+
+// killFrozenSource delivers SIGKILL to the recorded frozen source PID for migrationName
+// (if any), via the broker, and clears the frozen-source record (mirrors
+// thawFrozenSource, but kills instead of resuming). Returns killed=true only when a
+// record was found and the kill was actually attempted; killed=false is a legitimate
+// idempotent no-op (already thawed/killed/never frozen). Called by the ADR-0356 Tier1-
+// Longhorn early source release BEFORE the source pod is deleted, so the process is
+// terminated at the kernel level while still SIGSTOPped — never resumed to run its own
+// shutdown/cleanup code against the volume the destination has already restored onto.
+// findContainerPIDFn is killFrozenSource's fallback-PID-resolution seam, production
+// implementation FindContainerPID. Overridden in tests to avoid depending on a real
+// /proc/<pid>/cgroup entry containing a matching pod UID.
+var findContainerPIDFn = FindContainerPID
+
+func (s *AgentServer) killFrozenSource(ctx context.Context, migrationName string, fallbackPodUID string) (killed bool, err error) {
+	s.frozenSourcePIDsMu.Lock()
+	pid, ok := s.frozenSourcePIDs[migrationName]
+	if ok {
+		delete(s.frozenSourcePIDs, migrationName)
+	}
+	s.frozenSourcePIDsMu.Unlock()
+	// Mirror thawFrozenSource: drop the durable ADR-0216 record unconditionally so a
+	// startup reconcile after an agent restart does not later try to thaw (SIGCONT) a
+	// source this call already killed, or a since-deleted one.
+	removeFrozenSourceRecord(migrationName)
+
+	if !ok || pid <= 0 {
+		// No LeaveStopped=true frozen-source record — either already thawed/killed, OR
+		// (the common case in practice) this migration's Checkpoint used the
+		// containerd-native "ctr tasks checkpoint" fast path (Checkpoint's default
+		// branch), which does NOT stop the container: the source keeps running
+		// normally afterward, exactly as if LeaveStopped=false. That live process is
+		// exactly as dangerous to release via a plain pod delete as a frozen one — its
+		// own graceful-shutdown code still runs and can corrupt the shared volume
+		// (ADR-0356) — so resolve and kill it directly too, via the CURRENT container
+		// root PID, rather than silently no-op'ing and letting the unsafe pod-delete
+		// path run (sprint49: this fallback is what closes the observed live failure
+		// mode, where killed=false left the ctr-native-checkpoint source to be torn
+		// down the old, racy way).
+		if fallbackPodUID == "" {
+			return false, nil
+		}
+		fallbackPID, findErr := findContainerPIDFn(fallbackPodUID)
+		if findErr != nil {
+			// Container already gone (or genuinely never existed under this UID) —
+			// nothing left to kill. Not an error: expected shape of "already torn down."
+			log.Info("killFrozenSource: no frozen-source record and no live container PID for pod UID — treating as already gone",
+				"migration", migrationName, "podUID", fallbackPodUID, "err", findErr)
+			return false, nil
+		}
+		pid = fallbackPID
+	}
+
+	// Resolve the target's starttime via the broker's proc_alive op rather than a direct
+	// os.ReadFile(/proc/<pid>/stat) in this confined agent process: the source workload
+	// runs under the container runtime's default AppArmor profile (e.g.
+	// cri-containerd.apparmor.d), which this agent's own narrow podmotion-agent profile
+	// does NOT grant ptrace-read against — the exact ADR-0228/doProcAlive class of bug
+	// (see netnsbroker/broker.go's doProcAlive doc comment). The broker is unconfined,
+	// so its read is never subject to that mediation.
+	alive, startTime, paErr := netnsBrokerClientFn().ProcAlive(ctx, int(pid), 0)
+	if paErr != nil {
+		return false, fmt.Errorf("proc_alive check on source PID %d before kill: %w", pid, paErr)
+	}
+	if !alive {
+		log.Info("killFrozenSource: source PID already not alive — nothing to kill",
+			"migration", migrationName, "sourcePID", pid)
+		return false, nil
+	}
+	if killErr := brokerKillSourcePID(ctx, pid, startTime); killErr != nil {
+		return false, fmt.Errorf("broker SIGKILL to source PID %d failed: %w", pid, killErr)
+	}
+	log.Info("killFrozenSource: SIGKILL delivered to source process via netns-broker (ADR-0356)",
+		"migration", migrationName, "sourcePID", pid)
+	return true, nil
 }
 
 // emitCRIUImageInconsistencyEvent emits a Warning CRIUImageInconsistency Kubernetes Event on
