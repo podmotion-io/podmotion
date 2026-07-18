@@ -407,6 +407,21 @@ const (
 	// False/{ExplicitProbeFailed, DefaultedProbeFailed, AmbiguousProbeDefault}.
 	// Consumed additively by sourcePodDeletionBlockReason for ALL TCPPreservationMode values.
 	ConditionWorkloadLivenessVerified = "WorkloadLivenessVerified"
+	// ConditionWorkloadLivenessFirstPass is a staging condition set True the instant the FIRST
+	// real application probe (the same VerifyTCP(AppProbeOnly=true) call that produces
+	// ConditionWorkloadLivenessVerified) passes. ConditionWorkloadLivenessVerified is deliberately
+	// NOT set True on this first pass alone: a workload that dies shortly after CRIU restore (the
+	// documented gap — the restore process can crash 40-60s after an apparently-successful
+	// restore, e.g. Postgres killed by a subsequent internal fault) can still be alive during this
+	// narrow first-probe window, producing a false-positive liveness pass. reconcileServiceVerifying
+	// requires a SECOND real probe, issued no sooner than workloadLivenessStabilizationWindow after
+	// this condition's LastTransitionTime, to actually pass before ConditionWorkloadLivenessVerified
+	// is set True — a genuine second point-in-time health confirmation against the live workload,
+	// not a longer single wait. A failure on the second pass resets this condition to False so a
+	// later recovery must re-earn both passes. Reason vocabulary mirrors
+	// ConditionWorkloadLivenessVerified's {ExplicitProbePassed, DefaultedProbePassed} on True and
+	// {ReconfirmationFailed} on False.
+	ConditionWorkloadLivenessFirstPass = "WorkloadLivenessFirstPass"
 	// ConditionCni0CleanupVerified is set by reconcileVerifying after CleanupSourceIPHandoff
 	// (ADR-0241 item 1 / NR-BLOCK-1 CUTOVER_COMPLETE scope). True once VerifyCleanup confirms
 	// the cni0 neigh and cni0 host route for the OLD pod IP are both absent, within the
