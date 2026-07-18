@@ -183,6 +183,20 @@ cmd_reset_cluster() {
     nsh "$ip" "sudo kubeadm reset -f && sudo rm -rf /etc/cni/net.d \$HOME/.kube && sudo rm -rf /etc/kubernetes/manifests/*"
   done
 
+  # kubeadm reset only clears /etc/cni/net.d — it does NOT remove the kernel-level
+  # network interfaces that Cilium/Calico's own daemonsets create directly via
+  # netlink (cilium_host/cilium_net/cilium_geneve, vxlan.calico). Those survive
+  # every reset and their routes collide with the next CNI's routes for the same
+  # pod CIDR (confirmed live 2026-07-18: a stale cilium_host route for 10.244.1.0/24
+  # silently shadowed cni0's real Flannel route on that same node, making every pod
+  # on the node unreachable — even from the node itself — with no error surfaced
+  # anywhere except a generic probe timeout). Sweep every prior-CNI leftover
+  # unconditionally, on every reset, regardless of which CNI is being reset FROM.
+  echo "==> Purging leftover network interfaces from any prior CNI (Cilium/Calico residue)..."
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    nsh "$ip" "for l in cilium_host cilium_geneve vxlan.calico; do sudo ip link del \"\$l\" 2>/dev/null || true; done; sudo ip route flush proto 80 2>/dev/null || true"
+  done
+
   # Post-reset race guard: kubeadm reset disrupts containerd; restart it and wait for the
   # CRI socket to actually serve before init/join, else 'kubeadm init' fails preflight with
   # "containerd.sock: connection refused" (transient, intermittent).
