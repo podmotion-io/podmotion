@@ -161,6 +161,27 @@ assert_no_vm_destruction() {
   echo "SAFETY: this script never runs 'virsh destroy' or 'virsh undefine' on the standing VMs (${PM_VMS[*]}). The VMs are permanent infrastructure." >&2
 }
 
+# ── Precondition guard: local sudo must be non-interactively usable ──────────
+# Every remote (nsh) sudo call runs on the VMs, where passwordless sudo is
+# already provisioned for $SSH_USER — those are safe. cmd_provision_longhorn is
+# the one command that also shells out to LOCAL sudo (virsh attach-disk,
+# qemu-img create) on the host running this script, to manage libvirt disks.
+# A bare `sudo` with no cached credentials and no TTY (e.g. invoked from an
+# agent/non-interactive session) does not fail — it BLOCKS indefinitely waiting
+# on a password prompt nothing will ever answer (confirmed live 2026-07-18: a
+# provisioning run hung with no error output until killed). Fail fast instead,
+# with a clear, actionable message, before any local sudo call is attempted.
+require_local_sudo() {
+  if ! sudo -n true 2>/dev/null; then
+    echo "ERROR: this command needs local sudo (for virsh/qemu-img disk management)," >&2
+    echo "       but passwordless sudo is not available for this session (no TTY/cached" >&2
+    echo "       credentials). Run this command yourself in an interactive terminal where" >&2
+    echo "       you can enter your sudo password, e.g.:" >&2
+    echo "         $0 ${1:-<subcommand>}" >&2
+    exit 1
+  fi
+}
+
 cmd_verify() {
   load_ips
   echo "==> Verifying KVM kubeadm cluster (control-plane $CP1_IP)..."
@@ -410,6 +431,7 @@ cmd_provision_shared_storage() {
 # installs Longhorn and both StorageClasses. Safe to re-run; never destroys a VM.
 cmd_provision_longhorn() {
   assert_no_vm_destruction
+  require_local_sudo "provision-longhorn"
   load_ips
 
   echo "==> [1/5] Ensure a $LH_DISK_SIZE $LH_DISK_TARGET disk on each VM (attach only — never destroy)..."
