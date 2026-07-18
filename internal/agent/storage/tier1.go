@@ -191,8 +191,17 @@ type longhornVolume struct {
 }
 
 type longhornReplica struct {
-	Name    string `json:"name"`
-	NodeID  string `json:"nodeID"`
+	Name string `json:"name"`
+	// Longhorn's actual /v1/volumes/{name} response field is "hostId", not
+	// "nodeID" — confirmed live 2026-07-17 against a running v1.9.1 manager.
+	// The mismatched tag silently zero-valued NodeID on every decode, so
+	// every "does the destination already have a replica" check here and in
+	// replicaSyncPercent below always fell through (empty string never equals
+	// a real node name), causing addDestReplica to unconditionally grow the
+	// replica set by 1 on every reconcile forever — impossible to satisfy
+	// once replica count already equals node count — and pollUntilReady to
+	// never see a synced replica, since it uses the same broken match.
+	NodeID  string `json:"hostId"`
 	Mode    string `json:"mode"` // "RW", "WO", "ERR"
 	Running bool   `json:"running"`
 	// SnapshotSizeUsage is used to estimate sync progress.
