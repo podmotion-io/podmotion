@@ -134,17 +134,17 @@ const (
 	// These replace the 8-phase pipeline for TCPPreservationMode=Strict/BestEffort.
 	// TCPPreservationMode=None degenerates through the subset of phases that apply
 	// to stateless workloads (SocketInventory and TCPVerifying are skipped).
-	MigrationPhaseSocketInventory        MigrationPhase = "SocketInventory"
-	MigrationPhaseDestinationPrewarm     MigrationPhase = "DestinationPrewarm"
-	MigrationPhasePreCopyMemory          MigrationPhase = "PreCopyMemory"
-	MigrationPhaseZeroWindowArm          MigrationPhase = "ZeroWindowArm"
+	MigrationPhaseSocketInventory         MigrationPhase = "SocketInventory"
+	MigrationPhaseDestinationPrewarm      MigrationPhase = "DestinationPrewarm"
+	MigrationPhasePreCopyMemory           MigrationPhase = "PreCopyMemory"
+	MigrationPhaseZeroWindowArm           MigrationPhase = "ZeroWindowArm"
 	MigrationPhaseFinalFreezeStateCapture MigrationPhase = "FinalFreezeStateCapture"
-	MigrationPhaseOverlayHandoff         MigrationPhase = "OverlayHandoff"
-	MigrationPhaseRestoreSocketReattach  MigrationPhase = "RestoreSocketReattach"
-	MigrationPhaseDisengageHold          MigrationPhase = "DisengageHold"
-	MigrationPhaseTCPVerifying           MigrationPhase = "TCPVerifying"
-	MigrationPhaseServiceVerifying       MigrationPhase = "ServiceVerifying"
-	MigrationPhaseCutoverComplete        MigrationPhase = "CutoverComplete"
+	MigrationPhaseOverlayHandoff          MigrationPhase = "OverlayHandoff"
+	MigrationPhaseRestoreSocketReattach   MigrationPhase = "RestoreSocketReattach"
+	MigrationPhaseDisengageHold           MigrationPhase = "DisengageHold"
+	MigrationPhaseTCPVerifying            MigrationPhase = "TCPVerifying"
+	MigrationPhaseServiceVerifying        MigrationPhase = "ServiceVerifying"
+	MigrationPhaseCutoverComplete         MigrationPhase = "CutoverComplete"
 )
 
 // AffinityMode controls how PodMotion handles hard nodeAffinity and nodeSelector rules
@@ -306,6 +306,21 @@ const (
 	// driver before the migration backend has collapsed it to a single owner.
 	// Reason=CutoverFailed or AwaitSingleOwnerTimeout on False.
 	ConditionStorageCutoverComplete = "StorageCutoverComplete"
+	// ConditionTier1EarlySourceRelease is True when the source pod was deleted BEFORE
+	// TrafficVerified as the narrow, Tier1-Longhorn-only exception to ADR-0012 documented in
+	// ADR-0356. Longhorn's real single-owner collapse is driven by the Kubernetes CSI
+	// attacher, which only releases the source node's VolumeAttachment once no pod on that
+	// node references the PVC — for a Longhorn-classified (TierLonghorn) volume this
+	// functionally requires the source pod to be gone before the destination pod's own
+	// volume mount can ever succeed, which in turn gates restore and therefore
+	// TrafficVerified itself (ADR-0012's normal gate). ADR-0356 breaks that cycle for this
+	// tier ONLY by releasing the source pod immediately after CheckpointTransferred=True
+	// (a cryptographically-verified, durable checkpoint on the destination node — ADR-SEC-B)
+	// and a fresh destination-NMC-Ready check, in exchange for narrowing this tier's
+	// rollback guarantee from zero-downtime live-resume to checkpoint-guaranteed
+	// bounded-downtime recovery. Every other storage tier is untouched and keeps ADR-0012's
+	// full guarantee. Reason=Tier1LonghornEarlyRelease when True.
+	ConditionTier1EarlySourceRelease = "Tier1EarlySourceRelease"
 	// ConditionTCPSequenceContinuityVerified is True when all migrated connections
 	// have been confirmed to have seq_delta=0 post-restore (ADR-0049).
 	ConditionTCPSequenceContinuityVerified = "TCPSequenceContinuityVerified"
