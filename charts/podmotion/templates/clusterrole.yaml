@@ -88,6 +88,14 @@ rules:
   - apiGroups: [""]
     resources: [nodes]
     verbs: [get, list, watch]
+  # Restore-time re-attach tier classification (classifyReattachTier, server.go) resolves each
+  # PVC's StorageClass to distinguish a Longhorn-backed re-attach (Tier1-Longhorn) from the
+  # generic ReadWriteMany re-attach (Tier0 RWX) — StorageClass is a cluster-scoped resource.
+  # Without this the lookup is Forbidden and classifyReattachTier silently falls through to the
+  # narrower access-mode-only check, mislabeling a Longhorn-backed RWX PVC as Tier0 RWX.
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses]
+    verbs: [get, list, watch]
   # SSRF pod-CIDR allowlist (nodePodCIDRAllowlist, server.go — ADR-0325) keys on the AUTHORITATIVE
   # Cilium cluster-pool IPAM per-node block (CiliumNode.spec.ipam.podCIDRs), NOT Node.Spec.PodCIDRs
   # (proven to diverge from Cilium's real allocation on this substrate). Without get on ciliumnodes
