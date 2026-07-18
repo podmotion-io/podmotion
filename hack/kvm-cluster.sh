@@ -168,7 +168,7 @@ assert_no_vm_destruction() {
 # qemu-img create) on the host running this script, to manage libvirt disks.
 # A bare `sudo` with no cached credentials and no TTY (e.g. invoked from an
 # agent/non-interactive session) does not fail — it BLOCKS indefinitely waiting
-# on a password prompt nothing will ever answer (confirmed live 2026-07-18: a
+# on a password prompt nothing will ever answer (confirmed live 2026-07-17: a
 # provisioning run hung with no error output until killed). Fail fast instead,
 # with a clear, actionable message, before any local sudo call is attempted.
 require_local_sudo() {
@@ -208,7 +208,7 @@ cmd_reset_cluster() {
   # network interfaces that Cilium/Calico's own daemonsets create directly via
   # netlink (cilium_host/cilium_net/cilium_geneve, vxlan.calico). Those survive
   # every reset and their routes collide with the next CNI's routes for the same
-  # pod CIDR (confirmed live 2026-07-18: a stale cilium_host route for 10.244.1.0/24
+  # pod CIDR (confirmed live 2026-07-17: a stale cilium_host route for 10.244.1.0/24
   # silently shadowed cni0's real Flannel route on that same node, making every pod
   # on the node unreachable — even from the node itself — with no error surfaced
   # anywhere except a generic probe timeout). Sweep every prior-CNI leftover
