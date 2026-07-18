@@ -81,21 +81,8 @@ var _ = Describe("Cold Migration [cold-migration-amd64]", Ordered, Label("cold-m
 		sourcePodName = sprint31PodName
 
 		By("waiting for Redis pod to be Ready")
-		Eventually(func() bool {
-			p := &corev1.Pod{}
-			if err := k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: sprint31Namespace,
-				Name:      sprint31PodName,
-			}, p); err != nil {
-				return false
-			}
-			for _, c := range p.Status.Conditions {
-				if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-					return true
-				}
-			}
-			return false
-		}, 2*time.Minute, 3*time.Second).Should(BeTrue(), "Redis pod should become Ready")
+		Expect(utils.WaitForPodReady(ctx, k8sClient, sprint31PodName, sprint31Namespace,
+			2*time.Minute, 3*time.Second)).To(Succeed())
 
 		By("seeding " + sprint31RedisKey + "=" + sprint31RedisVal)
 		Eventually(func() error {
