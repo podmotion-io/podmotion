@@ -28,6 +28,15 @@ const (
 
 	// longhornPollInterval is the delay between replica health polls.
 	longhornPollInterval = 3 * time.Second
+
+	// longhornSingleOwnerTimeout bounds how long AwaitSingleOwner polls for
+	// Longhorn to collapse a volume's dual-engine live-migration state back
+	// down to a single RW replica on the destination node. Longhorn's own
+	// migration-confirm/handoff step normally completes within a few polling
+	// intervals of Cutover's attach call returning; a long stall here means
+	// something is genuinely stuck (e.g. the source engine failed to detach),
+	// so this must fail closed rather than poll forever.
+	longhornSingleOwnerTimeout = 2 * time.Minute
 )
 
 // LonghornMigrator implements Tier1 dual-engine live migration via the
@@ -152,7 +161,28 @@ func (m *LonghornMigrator) SyncPercent(ctx context.Context, opts MigrationOption
 }
 
 // Cutover detaches the volume from the source node and attaches it to the
-// destination. Called after the CRIU restore completes on the destination.
+// destination. Called by the controller from reconcileOverlayHandoff, after
+// the scheduling gate has already been removed (so the destination pod has
+// had a chance to schedule and kubelet has had a chance to mount the
+// volume — the real trigger for Longhorn's dual-engine collapse below) but
+// strictly before CRIU restore is permitted to run on the destination.
+//
+// NOTE (sprint49 root-cause finding): Longhorn's real dual-engine live
+// migration is driven entirely by the CSI attachment tickets on
+// volumeattachments.longhorn.io (spec.attachmentTickets, keyed by the
+// csi-attacher ticket type) — a second pod referencing the PVC on a
+// different node is what makes longhorn-manager populate
+// spec.migrationNodeID and start the second engine; that is a GET-only,
+// observable signal with no REST POST involved. The detachFromNode/
+// attachToNode calls below issue the legacy `?action=detach`/`?action=attach`
+// REST calls, which operate on a DIFFERENT ticket type and have been
+// confirmed (live cluster testing) to have no observed effect on that real
+// csi-attacher-driven attachment state for a migratable:true RWX Longhorn
+// volume. They are left in place rather than removed: they are harmless
+// (dead weight, not wrong), Tier2/Ceph-RBD and Tier3/snapshot-rsync still
+// need their own real Cutover actions through this same tier-agnostic
+// interface, and the actual gate that matters is AwaitSingleOwner below,
+// which polls the real GET-only replica-collapse signal.
 func (m *LonghornMigrator) Cutover(ctx context.Context, opts MigrationOptions) error {
 	log := logf.FromContext(ctx).WithValues("migration", opts.MigrationName, "tier", "Longhorn")
 
@@ -180,19 +210,129 @@ func (m *LonghornMigrator) Cutover(ctx context.Context, opts MigrationOptions) e
 	return nil
 }
 
+// AwaitSingleOwner polls the Longhorn Manager API until each Tier1 volume's
+// controller (engine) list has collapsed to exactly one running controller,
+// and that controller sits on opts.DestinationNode — i.e. the dual-engine
+// live-migration pair Cutover's attach left in place has been torn down on
+// the source side by Longhorn's own migration-confirm/handoff step, so the
+// CSI driver will see a single controller when the destination pod's
+// NodeStageVolume call lands (this is the general fix for the "invalid
+// controller count 2" class of error, expressed via Longhorn's real
+// controller-collapse signal — never a string match on the CSI error itself).
+//
+// sprint49 root-cause finding (live cluster verification, 2026-07-18):
+// this MUST poll the volume's "controllers" (engine) list, NOT its
+// "replicas" list. Longhorn's dual-engine live migration adds a SECOND
+// ENGINE on the destination node and later tears down the source engine —
+// it does not, and for an HA volume (numberOfReplicas>1, the normal case:
+// confirmed live against the longhorn-migratable StorageClass, which sets
+// numberOfReplicas=3) never does, change the underlying REPLICA count.
+// A healthy 3-replica volume keeps all 3 replicas RW/running on their 3
+// nodes for the volume's entire lifetime, migration included (confirmed
+// live: replicas on pm-cp1/pm-w1/pm-w2 all mode=RW running=true both before
+// and after a completed cutover) — polling for "replica count == 1" can
+// never be satisfied and times out every longhornSingleOwnerTimeout forever.
+// The real GET-only signal for "has the dual-engine pair collapsed back to
+// one" is the volume's controllers array (JSON field the live Longhorn
+// v1.9.1 Manager API actually returns, confirmed via GET
+// /v1/volumes/{name}): exactly one entry, running=true, hostId==destNode.
+func (m *LonghornMigrator) AwaitSingleOwner(ctx context.Context, opts MigrationOptions) error {
+	log := logf.FromContext(ctx).WithValues("migration", opts.MigrationName, "tier", "Longhorn")
+
+	deadlineCtx, cancel := context.WithTimeout(ctx, longhornSingleOwnerTimeout)
+	defer cancel()
+
+	for _, clsf := range opts.Classifications {
+		if clsf.Tier != TierLonghorn {
+			continue
+		}
+
+		volumeName, err := m.resolveVolumeName(ctx, opts.PodNamespace, clsf.PVCName)
+		if err != nil {
+			return fmt.Errorf("tier1: resolve volume name for pvc %s: %w", clsf.PVCName, err)
+		}
+
+		log.Info("awaiting single-owner (collapsed dual-engine) state", "volume", volumeName, "destNode", opts.DestinationNode)
+		if err := m.pollUntilSingleOwner(deadlineCtx, volumeName, opts.DestinationNode); err != nil {
+			return fmt.Errorf("tier1: await single owner %s: %w", volumeName, err)
+		}
+		log.Info("volume collapsed to single owner", "volume", volumeName, "destNode", opts.DestinationNode)
+	}
+
+	return nil
+}
+
+// pollUntilSingleOwner polls fetchVolume until exactly one running
+// controller (engine) exists and it is on destNode, or ctx is done (a
+// timeout or cancellation is returned as an error — fail closed, never
+// requeue forever). See the AwaitSingleOwner doc comment above for why this
+// checks the controller list rather than the replica list.
+func (m *LonghornMigrator) pollUntilSingleOwner(ctx context.Context, volumeName, destNode string) error {
+	for {
+		vol, err := m.fetchVolume(ctx, volumeName)
+		if err == nil {
+			owners := 0
+			destIsSingleOwner := false
+			for _, c := range vol.Controllers {
+				if !c.Running {
+					continue
+				}
+				owners++
+				if c.NodeID == destNode {
+					destIsSingleOwner = true
+				}
+			}
+			if owners == 1 && destIsSingleOwner {
+				return nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timed out waiting for volume %s to collapse to a single RW replica on %s: %w",
+				volumeName, destNode, ctx.Err())
+		case <-time.After(longhornPollInterval):
+		}
+	}
+}
+
 // ── Longhorn HTTP helpers ───────────────────────────────────────────────────
 
 // longhornVolume is the subset of the Longhorn volume API response we care about.
 type longhornVolume struct {
-	Name       string            `json:"name"`
-	State      string            `json:"state"`
-	Robustness string            `json:"robustness"`
-	Replicas   []longhornReplica `json:"replicas"`
+	Name       string             `json:"name"`
+	State      string             `json:"state"`
+	Robustness string             `json:"robustness"`
+	Replicas   []longhornReplica  `json:"replicas"`
+	// Controllers is Longhorn's engine list — during dual-engine live
+	// migration this holds one entry per active engine (source + dest);
+	// once the source engine is torn down (migration confirmed) it
+	// collapses to exactly one entry. This is the real single-owner
+	// signal AwaitSingleOwner polls for — see pollUntilSingleOwner.
+	Controllers []longhornController `json:"controllers"`
+}
+
+type longhornController struct {
+	Name string `json:"name"`
+	// NodeID: Longhorn's real /v1/volumes/{name} response field for a
+	// controller's node is "hostId" (same field name as on replicas —
+	// see longhornReplica.NodeID for why the tag matters).
+	NodeID  string `json:"hostId"`
+	Running bool   `json:"running"`
 }
 
 type longhornReplica struct {
-	Name    string `json:"name"`
-	NodeID  string `json:"nodeID"`
+	Name string `json:"name"`
+	// Longhorn's actual /v1/volumes/{name} response field is "hostId", not
+	// "nodeID" — confirmed live 2026-07-17 against a running v1.9.1 manager.
+	// The mismatched tag silently zero-valued NodeID on every decode, so
+	// every "does the destination already have a replica" check here and in
+	// replicaSyncPercent below always fell through (empty string never equals
+	// a real node name), causing addDestReplica to unconditionally grow the
+	// replica set by 1 on every reconcile forever — impossible to satisfy
+	// once replica count already equals node count — and pollUntilReady to
+	// never see a synced replica, since it uses the same broken match.
+	NodeID  string `json:"hostId"`
 	Mode    string `json:"mode"` // "RW", "WO", "ERR"
 	Running bool   `json:"running"`
 	// SnapshotSizeUsage is used to estimate sync progress.
@@ -405,6 +545,10 @@ type LonghornStubMigrator struct {
 	PreStageCalled int
 	// CutoverCalled records whether Cutover was called.
 	CutoverCalled bool
+	// AwaitSingleOwnerCalled records whether AwaitSingleOwner was called.
+	AwaitSingleOwnerCalled bool
+	// InjectAwaitSingleOwnerError causes AwaitSingleOwner to return this error.
+	InjectAwaitSingleOwnerError error
 }
 
 // Tier returns TierLonghorn.
@@ -425,4 +569,10 @@ func (s *LonghornStubMigrator) SyncPercent(_ context.Context, _ MigrationOptions
 func (s *LonghornStubMigrator) Cutover(_ context.Context, _ MigrationOptions) error {
 	s.CutoverCalled = true
 	return nil
+}
+
+// AwaitSingleOwner records the call and returns the injected error (nil by default).
+func (s *LonghornStubMigrator) AwaitSingleOwner(_ context.Context, _ MigrationOptions) error {
+	s.AwaitSingleOwnerCalled = true
+	return s.InjectAwaitSingleOwnerError
 }

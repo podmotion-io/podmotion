@@ -184,3 +184,12 @@ func (m *RWXReattachMigrator) Cutover(ctx context.Context, opts MigrationOptions
 
 	return nil
 }
+
+// AwaitSingleOwner is a no-op for Tier0: RWX volumes (NFS, CephFS, etc.) have
+// no dual-owner/dual-attachment concept — the same PV is simply mounted from
+// both nodes concurrently, and Cutover's StorageHandoffReady already gates
+// the source down to read-only before the destination mount proceeds. There
+// is no further "collapse to single owner" step to wait for.
+func (m *RWXReattachMigrator) AwaitSingleOwner(_ context.Context, _ MigrationOptions) error {
+	return nil
+}

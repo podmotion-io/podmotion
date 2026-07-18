@@ -19,7 +19,23 @@ import (
 	"time"
 )
 
+// withLocalProcAlive points verifyRestoredPIDAlive's procAliveFn seam at a direct
+// same-process /proc read (localProcAlive) for the duration of the test, restoring
+// the production default (brokerProcAlive) on cleanup. Unit tests exercise PIDs in
+// the TEST BINARY's own process tree (self, or a forked-and-reaped child) — no
+// broker socket is running here, and no cross-AppArmor-profile mediation applies,
+// so the direct read is both sufficient and correct for these cases (see
+// procAliveFn's doc comment in server.go for why production must NOT do this for a
+// real CRIU-restored workload root).
+func withLocalProcAlive(t *testing.T) {
+	t.Helper()
+	orig := procAliveFn
+	procAliveFn = localProcAlive
+	t.Cleanup(func() { procAliveFn = orig })
+}
+
 func TestVerifyRestoredPIDAlive_SelfIsAlive(t *testing.T) {
+	withLocalProcAlive(t)
 	// The test process itself is unambiguously alive across the settle window.
 	if err := verifyRestoredPIDAlive(os.Getpid(), 20*time.Millisecond); err != nil {
 		t.Fatalf("expected own PID to pass liveness, got: %v", err)
@@ -27,6 +43,7 @@ func TestVerifyRestoredPIDAlive_SelfIsAlive(t *testing.T) {
 }
 
 func TestVerifyRestoredPIDAlive_NonPositiveRejected(t *testing.T) {
+	withLocalProcAlive(t)
 	for _, pid := range []int{0, -1} {
 		if err := verifyRestoredPIDAlive(pid, 0); !errors.Is(err, ErrRestoredPIDDead) {
 			t.Errorf("pid %d: expected ErrRestoredPIDDead, got: %v", pid, err)
@@ -35,6 +52,7 @@ func TestVerifyRestoredPIDAlive_NonPositiveRejected(t *testing.T) {
 }
 
 func TestVerifyRestoredPIDAlive_DeadPIDRejected(t *testing.T) {
+	withLocalProcAlive(t)
 	// PID 2^30 is effectively guaranteed not to exist (well above /proc/sys/kernel/pid_max).
 	deadPID := 1 << 30
 	if err := verifyRestoredPIDAlive(deadPID, 0); !errors.Is(err, ErrRestoredPIDDead) {

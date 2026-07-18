@@ -33,6 +33,7 @@ func TestBuildCRIURestoreArgs_JoinNs(t *testing.T) {
 		"",
 		false,
 		nil,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("buildCRIURestoreArgs returned error: %v", err)
@@ -76,6 +77,7 @@ func TestBuildCRIURestoreArgs_ColdJoinNsPath(t *testing.T) {
 		"",
 		false,
 		nil,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("buildCRIURestoreArgs returned error: %v", err)
@@ -117,6 +119,7 @@ func TestBuildCRIURestoreArgs_StrictModeNRIPath(t *testing.T) {
 		"/var/run/netns/cni-abc123",
 		"",
 		true, // strictMode=true → must emit --leave-stopped (ADR-0144 D1)
+		nil,
 		nil,
 	)
 	if err != nil {
@@ -165,6 +168,7 @@ func TestBuildCRIURestoreArgs_NoDevShmExtMountMap(t *testing.T) {
 		"/var/run/netns/cni-abc123",
 		"",
 		false,
+		nil,
 		nil,
 	)
 	if err != nil {

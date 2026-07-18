@@ -202,7 +202,7 @@ func TestLonghornMigrator_PreStage_FullResolutionAndSync(t *testing.T) {
 		switch r.Method {
 		case http.MethodGet:
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"name":%q,"state":"attached","robustness":"healthy","replicas":[{"name":"r1","nodeID":%q,"mode":"RW","running":true}]}`, pvName, destNode)
+			fmt.Fprintf(w, `{"name":%q,"state":"attached","robustness":"healthy","replicas":[{"name":"r1","hostId":%q,"mode":"RW","running":true}]}`, pvName, destNode)
 		case http.MethodPost:
 			w.WriteHeader(http.StatusOK)
 		default:
@@ -274,9 +274,9 @@ func TestLonghornMigrator_PreStage_SkipsAddReplicaWhenDestAlreadyHealthy(t *test
 			// Volume already has 3 healthy replicas, one on each node,
 			// including the migration destination.
 			fmt.Fprintf(w, `{"name":%q,"state":"attached","robustness":"healthy","replicas":[`+
-				`{"name":"r1","nodeID":"pm-cp1","mode":"RW","running":true},`+
-				`{"name":"r2","nodeID":"pm-w1","mode":"RW","running":true},`+
-				`{"name":"r3","nodeID":%q,"mode":"RW","running":true}`+
+				`{"name":"r1","hostId":"pm-cp1","mode":"RW","running":true},`+
+				`{"name":"r2","hostId":"pm-w1","mode":"RW","running":true},`+
+				`{"name":"r3","hostId":%q,"mode":"RW","running":true}`+
 				`]}`, pvName, destNode)
 		case http.MethodPost:
 			b, _ := io.ReadAll(r.Body)
@@ -320,5 +320,120 @@ func TestLonghornMigrator_PreStage_SkipsAddReplicaWhenDestAlreadyHealthy(t *test
 	defer mu.Unlock()
 	if postCalls != 0 {
 		t.Errorf("expected PreStage to skip updateReplicaCount when destination already has a healthy replica, got %d POST call(s) with bodies %v", postCalls, postBodies)
+	}
+}
+
+// TestLonghornMigrator_AwaitSingleOwner_HAVolumeWithCollapsedController is the
+// sprint49 regression test for the root cause found in live-cluster testing:
+// AwaitSingleOwner used to poll the volume's REPLICA list for a collapse to
+// exactly one, which can never happen on a standard HA volume
+// (numberOfReplicas=3, the longhorn-migratable StorageClass's real setting —
+// confirmed live) because Longhorn keeps all 3 replicas RW/running for the
+// volume's entire lifetime, migration included. The real single-owner signal
+// is the volume's CONTROLLER (engine) list collapsing to one entry on the
+// destination node. This volume has 3 replicas (never collapsing) but only
+// one controller already on destNode — AwaitSingleOwner must succeed.
+func TestLonghornMigrator_AwaitSingleOwner_HAVolumeWithCollapsedController(t *testing.T) {
+	const (
+		namespace = "default"
+		pvcName   = "postgres-pgdata"
+		pvName    = "pvc-fc436e39-ha"
+		destNode  = "pm-w2"
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/volumes/"+pvName || r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"name":%q,"state":"attached","robustness":"healthy",`+
+			`"replicas":[`+
+			`{"name":"r1","hostId":"pm-cp1","mode":"RW","running":true},`+
+			`{"name":"r2","hostId":"pm-w1","mode":"RW","running":true},`+
+			`{"name":"r3","hostId":%q,"mode":"RW","running":true}`+
+			`],`+
+			`"controllers":[{"name":"e1","hostId":%q,"running":true}]}`,
+			pvName, destNode, destNode)
+	}))
+	defer srv.Close()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1: %v", err)
+	}
+	pvc := makeBoundPVC(namespace, pvcName, pvName)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pvc).Build()
+
+	mig := storage.NewLonghornMigrator(srv.URL, c)
+
+	opts := storage.MigrationOptions{
+		MigrationName:   "mig-5",
+		PodNamespace:    namespace,
+		DestinationNode: destNode,
+		Classifications: []storage.TierClassification{
+			{Tier: storage.TierLonghorn, PVCName: pvcName},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := mig.AwaitSingleOwner(ctx, opts); err != nil {
+		t.Fatalf("AwaitSingleOwner should succeed once controllers has collapsed to one entry on destNode, even with 3 replicas standing: %v", err)
+	}
+}
+
+// TestLonghornMigrator_AwaitSingleOwner_StillDualEngine_TimesOut proves
+// AwaitSingleOwner still fails closed (never succeeds) while the volume
+// genuinely has two active controllers (source + destination engine),
+// i.e. the migration has not yet been confirmed/collapsed.
+func TestLonghornMigrator_AwaitSingleOwner_StillDualEngine_TimesOut(t *testing.T) {
+	const (
+		namespace = "default"
+		pvcName   = "postgres-pgdata"
+		pvName    = "pvc-fc436e39-dual"
+		destNode  = "pm-w2"
+		srcNode   = "pm-w1"
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/volumes/"+pvName || r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"name":%q,"state":"attached","robustness":"healthy",`+
+			`"replicas":[{"name":"r1","hostId":%q,"mode":"RW","running":true}],`+
+			`"controllers":[{"name":"e1","hostId":%q,"running":true},{"name":"e2","hostId":%q,"running":true}]}`,
+			pvName, destNode, srcNode, destNode)
+	}))
+	defer srv.Close()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1: %v", err)
+	}
+	pvc := makeBoundPVC(namespace, pvcName, pvName)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pvc).Build()
+
+	mig := storage.NewLonghornMigrator(srv.URL, c)
+
+	opts := storage.MigrationOptions{
+		MigrationName:   "mig-6",
+		PodNamespace:    namespace,
+		DestinationNode: destNode,
+		Classifications: []storage.TierClassification{
+			{Tier: storage.TierLonghorn, PVCName: pvcName},
+		},
+	}
+
+	// Bound well under longhornSingleOwnerTimeout so the test itself stays fast;
+	// AwaitSingleOwner must return an error once ctx is done, never succeed.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	if err := mig.AwaitSingleOwner(ctx, opts); err == nil {
+		t.Fatalf("expected AwaitSingleOwner to time out while two controllers are still running, got nil error")
 	}
 }
