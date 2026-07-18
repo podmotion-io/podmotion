@@ -202,7 +202,7 @@ func TestLonghornMigrator_PreStage_FullResolutionAndSync(t *testing.T) {
 		switch r.Method {
 		case http.MethodGet:
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"name":%q,"state":"attached","robustness":"healthy","replicas":[{"name":"r1","nodeID":%q,"mode":"RW","running":true}]}`, pvName, destNode)
+			fmt.Fprintf(w, `{"name":%q,"state":"attached","robustness":"healthy","replicas":[{"name":"r1","hostId":%q,"mode":"RW","running":true}]}`, pvName, destNode)
 		case http.MethodPost:
 			w.WriteHeader(http.StatusOK)
 		default:
@@ -274,9 +274,9 @@ func TestLonghornMigrator_PreStage_SkipsAddReplicaWhenDestAlreadyHealthy(t *test
 			// Volume already has 3 healthy replicas, one on each node,
 			// including the migration destination.
 			fmt.Fprintf(w, `{"name":%q,"state":"attached","robustness":"healthy","replicas":[`+
-				`{"name":"r1","nodeID":"pm-cp1","mode":"RW","running":true},`+
-				`{"name":"r2","nodeID":"pm-w1","mode":"RW","running":true},`+
-				`{"name":"r3","nodeID":%q,"mode":"RW","running":true}`+
+				`{"name":"r1","hostId":"pm-cp1","mode":"RW","running":true},`+
+				`{"name":"r2","hostId":"pm-w1","mode":"RW","running":true},`+
+				`{"name":"r3","hostId":%q,"mode":"RW","running":true}`+
 				`]}`, pvName, destNode)
 		case http.MethodPost:
 			b, _ := io.ReadAll(r.Body)
