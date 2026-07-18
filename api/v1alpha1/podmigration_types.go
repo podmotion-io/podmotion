@@ -296,6 +296,16 @@ const (
 	// ConditionVXLANFDBUpdated is True when the two-sided AF_BRIDGE FDB and AF_INET
 	// neighbor entries have been injected on both nodes (ADR-0048).
 	ConditionVXLANFDBUpdated = "VXLANFDBUpdated"
+	// ConditionStorageCutoverComplete is True when the StorageMigrationManager's
+	// Cutover (detach source / attach destination) and AwaitSingleOwner (block
+	// until the migrated volume is in a single-owner, mountable state) have both
+	// completed successfully after CRIU restore. This gates the DisengageHold
+	// phase — and therefore the destination pod's volume mounts — so a
+	// dual-attached/dual-owner volume (e.g. Longhorn's live-migration dual
+	// engine, Ceph RBD's prepare/execute pair) is never mounted by the CSI
+	// driver before the migration backend has collapsed it to a single owner.
+	// Reason=CutoverFailed or AwaitSingleOwnerTimeout on False.
+	ConditionStorageCutoverComplete = "StorageCutoverComplete"
 	// ConditionTCPSequenceContinuityVerified is True when all migrated connections
 	// have been confirmed to have seq_delta=0 post-restore (ADR-0049).
 	ConditionTCPSequenceContinuityVerified = "TCPSequenceContinuityVerified"

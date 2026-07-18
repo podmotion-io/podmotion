@@ -86,6 +86,19 @@ type Migrator interface {
 	// Cutover detaches from the source and attaches to the destination.
 	// Called after CRIU restore completes on the destination node.
 	Cutover(ctx context.Context, opts MigrationOptions) error
+	// AwaitSingleOwner blocks until every classified volume for this tier is
+	// in a single-owner, mountable state on the destination node. Called by
+	// the controller after Cutover succeeds and before the destination pod's
+	// volume mounts are allowed to proceed.
+	//
+	// Must return promptly (bounded internal poll) rather than blocking
+	// forever; a timeout is a real error, not a wait condition. Each tier
+	// implements this using its own backend-specific readiness signal (e.g.
+	// Longhorn's replica list collapsing to a single RW replica on the
+	// destination node) — never a generic string match on a driver error.
+	// Tiers with no shared-attachment/dual-owner concept (RWX, snapshot-rsync)
+	// return nil immediately.
+	AwaitSingleOwner(ctx context.Context, opts MigrationOptions) error
 }
 
 // StorageMigrationManager selects the appropriate Migrator based on the tier
@@ -155,21 +168,12 @@ func (m *StorageMigrationManager) RegisterMigrator(tier StorageTier, mg Migrator
 func (m *StorageMigrationManager) RunPreStage(ctx context.Context, pm *pmv1.PodMigration) error {
 	log := logf.FromContext(ctx).WithValues("migration", pm.Name)
 
-	// Use the classifier to enumerate PVC tiers.
-	sourcePod, err := m.getSourcePod(ctx, pm)
+	highest, migrator, opts, err := m.buildMigrationOptions(ctx, pm)
 	if err != nil {
-		return m.patchStorageReady(ctx, pm, metav1.ConditionFalse, "ClassifyFailed",
-			fmt.Sprintf("get source pod: %v", err))
-	}
-
-	classifications, err := m.Classifier.ClassifyPod(ctx, sourcePod)
-	if err != nil {
-		return m.patchStorageReady(ctx, pm, metav1.ConditionFalse, "ClassifyFailed",
-			fmt.Sprintf("classify pod pvcs: %v", err))
+		return m.patchStorageReady(ctx, pm, metav1.ConditionFalse, "ClassifyFailed", err.Error())
 	}
 
 	// Persist the highest tier to status.storageTier.
-	highest := HighestTier(classifications)
 	tier := int32(highest.Tier)
 	if err := m.patchStorageTier(ctx, pm, tier); err != nil {
 		log.Error(err, "failed to patch storageTier — continuing")
@@ -180,8 +184,7 @@ func (m *StorageMigrationManager) RunPreStage(ctx context.Context, pm *pmv1.PodM
 			fmt.Sprintf("pod has un-migratable volume: %s", highest.Reason))
 	}
 
-	migrator, ok := m.Migrators[highest.Tier]
-	if !ok {
+	if migrator == nil {
 		// No migrator registered for the selected tier.
 		//
 		// The immediate-ready path is valid ONLY for TierRWX, where no data
@@ -204,14 +207,6 @@ func (m *StorageMigrationManager) RunPreStage(ctx context.Context, pm *pmv1.PodM
 			"tier", highest.Tier)
 		return m.patchStorageReady(ctx, pm, metav1.ConditionTrue, "NoOpTier",
 			fmt.Sprintf("tier%d: re-attach only — no data movement required", highest.Tier))
-	}
-
-	opts := MigrationOptions{
-		MigrationName:   pm.Name,
-		PodNamespace:    pm.Spec.PodNamespace,
-		SourceNode:      pm.Status.SourceNodeName,
-		DestinationNode: pm.Status.DestinationNodeName,
-		Classifications: classifications,
 	}
 
 	log.Info("starting storage pre-stage", "tier", highest.Tier, "reason", highest.Reason)
@@ -243,6 +238,127 @@ retryLoop:
 	// For tiers with a sync phase, PreStage blocks until ≥95% is reached internally.
 	return m.patchStorageReady(ctx, pm, metav1.ConditionTrue, "StorageReady",
 		fmt.Sprintf("tier%d pre-stage complete: %s", highest.Tier, highest.Reason))
+}
+
+// buildMigrationOptions classifies the source pod's PVCs, selects the
+// highest-tier classification, resolves the Migrator registered for it, and
+// assembles the MigrationOptions the migrator's methods need. This is the
+// shared classify-and-select boilerplate used by RunPreStage, Cutover, and
+// AwaitSingleOwner so it is written once instead of triplicated.
+//
+// migrator is nil when no Migrator is registered for the selected tier —
+// callers decide how to handle that (RunPreStage has a TierRWX-only no-op
+// fallback; Cutover/AwaitSingleOwner treat it as an error since a missing
+// migrator at that point means the cutover cannot be verified).
+func (m *StorageMigrationManager) buildMigrationOptions(ctx context.Context, pm *pmv1.PodMigration) (TierClassification, Migrator, MigrationOptions, error) {
+	sourcePod, err := m.getSourcePod(ctx, pm)
+	if err != nil {
+		return TierClassification{}, nil, MigrationOptions{}, fmt.Errorf("get source pod: %w", err)
+	}
+
+	classifications, err := m.Classifier.ClassifyPod(ctx, sourcePod)
+	if err != nil {
+		return TierClassification{}, nil, MigrationOptions{}, fmt.Errorf("classify pod pvcs: %w", err)
+	}
+
+	highest := HighestTier(classifications)
+	opts := MigrationOptions{
+		MigrationName:   pm.Name,
+		PodNamespace:    pm.Spec.PodNamespace,
+		SourceNode:      pm.Status.SourceNodeName,
+		DestinationNode: pm.Status.DestinationNodeName,
+		Classifications: classifications,
+	}
+
+	return highest, m.Migrators[highest.Tier], opts, nil
+}
+
+// Cutover looks up the classified tier's migrator and delegates to its
+// Cutover method (detach from source, attach to destination), patching
+// ConditionStorageCutoverComplete=False with a recoverable reason on
+// failure. Called by the controller after CRIU restore completes, before
+// AwaitSingleOwner and before the DisengageHold phase is allowed to proceed.
+func (m *StorageMigrationManager) Cutover(ctx context.Context, pm *pmv1.PodMigration) error {
+	highest, migrator, opts, err := m.buildMigrationOptions(ctx, pm)
+	if err != nil {
+		return m.patchStorageCutover(ctx, pm, metav1.ConditionFalse, "CutoverFailed",
+			fmt.Sprintf("classify pod pvcs for cutover: %v", err))
+	}
+	if highest.Tier == TierBlocked {
+		return m.patchStorageCutover(ctx, pm, metav1.ConditionFalse, "CutoverFailed",
+			fmt.Sprintf("pod has un-migratable volume: %s", highest.Reason))
+	}
+	if migrator == nil {
+		return m.patchStorageCutover(ctx, pm, metav1.ConditionFalse, "CutoverFailed",
+			fmt.Sprintf("tier%d: no storage migrator registered for cutover", highest.Tier))
+	}
+	if err := migrator.Cutover(ctx, opts); err != nil {
+		return m.patchStorageCutover(ctx, pm, metav1.ConditionFalse, "CutoverFailed",
+			fmt.Sprintf("tier%d cutover: %v", highest.Tier, err))
+	}
+	return nil
+}
+
+// AwaitSingleOwner looks up the classified tier's migrator and delegates to
+// its AwaitSingleOwner method, blocking until the migrated volume(s) are in
+// a single-owner, mountable state on the destination node. Patches
+// ConditionStorageCutoverComplete=False with reason AwaitSingleOwnerTimeout
+// on failure (a timeout is a real, recoverable error — not silently retried
+// forever). The controller calls this after Cutover succeeds and before
+// permitting the destination pod's volume mounts to proceed.
+func (m *StorageMigrationManager) AwaitSingleOwner(ctx context.Context, pm *pmv1.PodMigration) error {
+	highest, migrator, opts, err := m.buildMigrationOptions(ctx, pm)
+	if err != nil {
+		return m.patchStorageCutover(ctx, pm, metav1.ConditionFalse, "AwaitSingleOwnerTimeout",
+			fmt.Sprintf("classify pod pvcs for await-single-owner: %v", err))
+	}
+	if highest.Tier == TierBlocked {
+		return m.patchStorageCutover(ctx, pm, metav1.ConditionFalse, "AwaitSingleOwnerTimeout",
+			fmt.Sprintf("pod has un-migratable volume: %s", highest.Reason))
+	}
+	if migrator == nil {
+		return m.patchStorageCutover(ctx, pm, metav1.ConditionFalse, "AwaitSingleOwnerTimeout",
+			fmt.Sprintf("tier%d: no storage migrator registered for await-single-owner", highest.Tier))
+	}
+	if err := migrator.AwaitSingleOwner(ctx, opts); err != nil {
+		return m.patchStorageCutover(ctx, pm, metav1.ConditionFalse, "AwaitSingleOwnerTimeout",
+			fmt.Sprintf("tier%d await-single-owner: %v", highest.Tier, err))
+	}
+	return m.patchStorageCutover(ctx, pm, metav1.ConditionTrue, "CutoverComplete",
+		fmt.Sprintf("tier%d: volume collapsed to single-owner mountable state", highest.Tier))
+}
+
+// patchStorageCutover updates the StorageCutoverComplete condition on the
+// PodMigration CR. Retries on optimistic-lock conflict, mirroring
+// patchStorageReady.
+func (m *StorageMigrationManager) patchStorageCutover(
+	ctx context.Context,
+	pm *pmv1.PodMigration,
+	status metav1.ConditionStatus,
+	reason, message string,
+) error {
+	key := client.ObjectKeyFromObject(pm)
+	patchErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &pmv1.PodMigration{}
+		if err := m.Client.Get(ctx, key, fresh); err != nil {
+			return fmt.Errorf("get PodMigration for storage cutover patch: %w", err)
+		}
+		meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:               pmv1.ConditionStorageCutoverComplete,
+			Status:             status,
+			Reason:             reason,
+			Message:            message,
+			LastTransitionTime: metav1.Now(),
+		})
+		return m.Client.Status().Update(ctx, fresh)
+	})
+	if patchErr != nil {
+		return patchErr
+	}
+	if status != metav1.ConditionTrue {
+		return fmt.Errorf("%s: %s", reason, message)
+	}
+	return nil
 }
 
 // patchStorageReady updates the StorageReadyForFreeze condition on the PodMigration CR.
