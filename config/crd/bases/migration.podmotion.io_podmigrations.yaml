@@ -274,6 +274,53 @@ spec:
                   marker: if the controller crashes after the Put but before transitioning to Restoring,
                   the next reconcile skips the Get/Put and proceeds directly to gate removal + Restoring.
                 type: boolean
+              classifiedVolumes:
+                description: |-
+                  ClassifiedVolumes caches the per-PVC storage tier classification computed by
+                  StorageMigrationManager.RunPreStage while the source pod is still guaranteed to
+                  exist (PreMigrating phase). StorageMigrationManager.Cutover and AwaitSingleOwner
+                  (called later, from reconcileOverlayHandoff's gateStorageCutoverBeforeRestore) MUST
+                  read this cache instead of re-fetching and re-classifying the live source pod: for
+                  Tier1-Longhorn, ADR-0356 deliberately deletes the source pod right after
+                  CheckpointTransferred=True — well before Cutover runs — so a live re-fetch at Cutover
+                  time 404s every time (sprint49 live-proof finding: migration permanently stuck in
+                  OverlayHandoff with reason CutoverFailed / "get source pod: ... not found"). The PVC
+                  objects themselves are not deleted by ADR-0356 (only the pod is), so classification
+                  computed once from the live pod's volume list remains valid for the rest of the
+                  migration.
+                items:
+                  description: |-
+                    PVCTierClassification is the CRD-status mirror of internal/agent/storage.TierClassification
+                    for a single PVC, persisted so later phases (Cutover/AwaitSingleOwner) can use a classification
+                    computed while the source pod still existed, instead of re-fetching a pod that ADR-0356's
+                    Tier1-Longhorn early release may have already deleted. Field values and meaning are identical
+                    to internal/agent/storage.TierClassification (Tier: 0=RWX, 1=Longhorn, 2=CephRBD,
+                    3=SnapshotRsync, 4=Blocked) — kept as a separate type here rather than importing the storage
+                    package to avoid an api/v1alpha1 -> internal/agent/storage dependency.
+                  properties:
+                    pvcName:
+                      description: |-
+                        PVCName is the volume name as it appears in the pod's Spec.Volumes list, or the PVC
+                        claim name for volumes backed by a PersistentVolumeClaim.
+                      type: string
+                    reason:
+                      description: Reason explains why this PVC was classified into
+                        Tier.
+                      type: string
+                    storageClass:
+                      description: StorageClass is the PVC's storage class name, if
+                        any.
+                      type: string
+                    tier:
+                      description: Tier is the storage migration tier for this PVC
+                        (0=RWX, 1=Longhorn, 2=CephRBD, 3=SnapshotRsync, 4=Blocked).
+                      format: int32
+                      type: integer
+                  required:
+                  - pvcName
+                  - tier
+                  type: object
+                type: array
               cniProvider:
                 description: |-
                   CNIProvider is the detected CNI plugin on the source node (e.g. "calico", "cilium",

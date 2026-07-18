@@ -424,3 +424,73 @@ func TestRunPreStage_PermanentError_FailsFastWithoutRetry(t *testing.T) {
 			cond.Status, cond.Reason)
 	}
 }
+
+// TestCutover_UsesCachedClassification_AfterSourcePodDeleted is the regression test for the
+// sprint49 live-proof finding: ADR-0356's Tier1-Longhorn early source-pod release deletes the
+// source pod right after CheckpointTransferred=True, well before Cutover/AwaitSingleOwner run
+// (reconcileOverlayHandoff, much later in the phase graph). Cutover and AwaitSingleOwner MUST
+// classify from the cache RunPreStage persisted to pm.Status.ClassifiedVolumes, not from a live
+// re-fetch of the source pod — a live re-fetch 404s once the pod is gone, permanently wedging
+// the migration in OverlayHandoff (reason CutoverFailed / "get source pod: ... not found").
+//
+// On the pre-fix logic (Cutover/AwaitSingleOwner calling the live-pod buildMigrationOptions) this
+// test would fail with ConditionStorageCutoverComplete=False/CutoverFailed even though the PVC
+// is still perfectly classifiable from status — it is the "test that would have caught the bug".
+func TestCutover_UsesCachedClassification_AfterSourcePodDeleted(t *testing.T) {
+	scheme := newManagerScheme(t)
+	pm := makeMigration("mig-rwx", "default", "rwx-pod")
+
+	pvc := makePVC("rwx-pvc", "default", "nfs",
+		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
+	pod := makePodWithPVC("default", "rwx-pvc")
+	pod.Name = "rwx-pod"
+	pod.Namespace = "default"
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pm, pvc, pod).
+		WithStatusSubresource(pm).
+		Build()
+
+	mgr := storage.NewStorageMigrationManager(c)
+
+	// RunPreStage runs while the source pod still exists (PreMigrating phase) and must cache
+	// the classification into pm.Status.ClassifiedVolumes.
+	if err := mgr.RunPreStage(context.Background(), pm); err != nil {
+		t.Fatalf("RunPreStage returned error: %v", err)
+	}
+
+	fresh := &pmv1.PodMigration{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pm), fresh); err != nil {
+		t.Fatalf("get PodMigration after RunPreStage: %v", err)
+	}
+	if len(fresh.Status.ClassifiedVolumes) == 0 {
+		t.Fatalf("expected RunPreStage to cache ClassifiedVolumes, got none")
+	}
+
+	// Simulate ADR-0356's Tier1-Longhorn early source-pod release: the source pod is deleted
+	// well before Cutover/AwaitSingleOwner run.
+	if err := c.Delete(context.Background(), pod); err != nil {
+		t.Fatalf("delete source pod: %v", err)
+	}
+
+	if err := mgr.Cutover(context.Background(), fresh); err != nil {
+		t.Fatalf("Cutover failed after source pod deletion (should use cached classification): %v", err)
+	}
+	if err := mgr.AwaitSingleOwner(context.Background(), fresh); err != nil {
+		t.Fatalf("AwaitSingleOwner failed after source pod deletion (should use cached classification): %v", err)
+	}
+
+	final := &pmv1.PodMigration{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pm), final); err != nil {
+		t.Fatalf("get PodMigration after Cutover/AwaitSingleOwner: %v", err)
+	}
+	cond := meta.FindStatusCondition(final.Status.Conditions, pmv1.ConditionStorageCutoverComplete)
+	if cond == nil {
+		t.Fatalf("StorageCutoverComplete condition not set")
+	}
+	if cond.Status != metav1.ConditionTrue {
+		t.Errorf("expected StorageCutoverComplete=True after cutover with the source pod already deleted, got %s (reason=%s, message=%s)",
+			cond.Status, cond.Reason, cond.Message)
+	}
+}

@@ -846,12 +846,93 @@ func (r *PodMigrationReconciler) reconcileFinalFreezeStateCapture(ctx context.Co
 		return r.reconcileCheckpointing(ctx, pm)
 	}
 
-	// Step 2: transfer. Advance once CheckpointTransferred=True.
-	if !pm.Status.CheckpointTransferred {
+	// Step 2: transfer + scheduling-gate removal. Advance once conditionSchedulingGateRemoved=True
+	// — the true terminal state of reconcileTransferring — not merely CheckpointTransferred.
+	//
+	// sprint49 finding: gating on CheckpointTransferred alone is a real durability bug.
+	// reconcileTransferring persists CheckpointTransferred=true partway through its own body
+	// (before earlyReleaseSourceForTier1Longhorn and scheduling-gate removal run), and can then
+	// return early (e.g. ADR-0356's early-release-not-yet-safe requeue) without ever reaching
+	// removeSchedulingGate on that same call. On the NEXT reconcile, checking only
+	// CheckpointTransferred here would see it already true and skip calling
+	// reconcileTransferring again entirely — silently abandoning the migration with the
+	// scheduling gate still in place and the destination pod stuck at PodSchedulingGated
+	// forever, while this function nonetheless advances the phase past it. Checking
+	// conditionSchedulingGateRemoved instead keeps re-entering reconcileTransferring (which is
+	// already idempotent — see its own CheckpointTransferred branch — so this costs nothing)
+	// until it has actually reached and completed gate removal.
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionSchedulingGateRemoved) {
 		return r.reconcileTransferring(ctx, pm)
 	}
 
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseOverlayHandoff)
+}
+
+// gateStorageCutoverBeforeRestore blocks the phase transition into RestoreSocketReattach —
+// the first phase in the NRI hook's restore accept-set (nri/plugin.go verifyPhaseInAcceptSet:
+// exactly {Restoring, RestoreSocketReattach, DisengageHold}) — until the destination storage
+// engine has actually collapsed to a single owner (StorageMgr.Cutover + AwaitSingleOwner).
+//
+// This must run and complete BEFORE transitionTo(RestoreSocketReattach) persists the new phase
+// to the API server, not merely before this function returns control to the controller-runtime
+// work queue: the NRI StartContainer hook is driven by an independent kubelet event and reads
+// pm.Status.Phase straight from the API server the instant the write lands — it does not wait
+// for, or care about, whether the controller's own next reconcile (reconcileRestoreSocketReattach
+// / reconcileRestoring) has even started running. A gate placed inside reconcileRestoring is
+// therefore too late (sprint49 live finding): phase is already RestoreSocketReattach by the time
+// that function runs, so the NRI hook's phase check already passes and restore may already be
+// racing ahead on a separate goroutine driven entirely by kubelet/containerd. This call site —
+// the last moment before that phase write — is the only place that actually gates the NRI path.
+//
+// Ordering: this MUST run after scheduling-gate removal (unconditional, end of
+// reconcileTransferring), never before. Longhorn's real dual-engine collapse
+// (tier1.go AwaitSingleOwner) only begins once the destination pod is actually SCHEDULED and
+// kubelet issues NodeStageVolume there — that is what makes longhorn-manager populate
+// spec.migrationNodeID and start the second engine. Gating AwaitSingleOwner before the
+// scheduling gate is removed is a permanent deadlock: it polls for a collapse that can never
+// start because the pod it needs mounted on the destination node was never allowed to schedule.
+// (This is exactly what the sprint49 live-proof run hit: a 2-minute AwaitSingleOwner timeout
+// with the destination Longhorn volume still "detached"/"unknown" — it never had a chance to
+// attach.) reconcileOverlayHandoff runs strictly after reconcileTransferring/scheduling-gate
+// removal in the phase graph, so by the time this gate runs the destination pod has had the
+// full OverlayHandoff phase's worth of time to schedule and mount.
+//
+// Returns ready=true once ConditionStorageCutoverComplete is True (including the case where
+// r.StorageMgr is nil — no storage manager wired, e.g. some unit tests — treated as a no-op
+// pass-through rather than a permanent block). ready=false means the caller must return the
+// given ctrl.Result (a bounded requeue) without transitioning the phase.
+func (r *PodMigrationReconciler) gateStorageCutoverBeforeRestore(ctx context.Context, pm *pmv1.PodMigration) (ctrl.Result, bool, error) {
+	log := logf.FromContext(ctx)
+
+	if r.StorageMgr == nil {
+		return ctrl.Result{}, true, nil
+	}
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionStorageCutoverComplete) {
+		return ctrl.Result{}, true, nil
+	}
+
+	if err := r.StorageMgr.Cutover(ctx, pm); err != nil {
+		log.Error(err, "OverlayHandoff: storage cutover failed — requeuing before allowing the restore-eligible phase",
+			"migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, false, nil
+	}
+	if err := r.StorageMgr.AwaitSingleOwner(ctx, pm); err != nil {
+		log.Error(err, "OverlayHandoff: await-single-owner failed — requeuing before allowing the restore-eligible phase",
+			"migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, false, nil
+	}
+
+	// Cutover/AwaitSingleOwner patch ConditionStorageCutoverComplete on their own
+	// freshly-fetched copy of the CR (StorageMigrationManager.patchStorageCutover), not on
+	// this reconcile's in-memory pm. Re-fetch conditions here so the caller's subsequent
+	// statusUpdate/transitionTo calls — full Status replaces, not merges — don't clobber that
+	// just-written condition with the stale in-memory copy.
+	fresh := &pmv1.PodMigration{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(pm), fresh); err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("re-fetch PodMigration after storage cutover: %w", err)
+	}
+	pm.Status.Conditions = fresh.Status.Conditions
+	return ctrl.Result{}, true, nil
 }
 
 // reconcileOverlayHandoff injects the two-sided AF_BRIDGE FDB and AF_INET neighbor entries
@@ -860,6 +941,9 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 	log := logf.FromContext(ctx)
 
 	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionVXLANFDBUpdated) {
+		if res, ready, err := r.gateStorageCutoverBeforeRestore(ctx, pm); err != nil || !ready {
+			return res, err
+		}
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoreSocketReattach)
 	}
 
@@ -869,6 +953,9 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 			"Skipped", "TCPPreservationMode=None: overlay FDB injection not required")
 		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, err
+		}
+		if res, ready, err := r.gateStorageCutoverBeforeRestore(ctx, pm); err != nil || !ready {
+			return res, err
 		}
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoreSocketReattach)
 	}
@@ -958,6 +1045,9 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 	setCondition(pm, pmv1.ConditionVXLANFDBUpdated, metav1.ConditionTrue, "FDBConfirmed", msg)
 	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
+	}
+	if res, ready, err := r.gateStorageCutoverBeforeRestore(ctx, pm); err != nil || !ready {
+		return res, err
 	}
 	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRestoreSocketReattach)
 }
@@ -3090,8 +3180,28 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Remove the scheduling gate NOW — images are on the destination node so the
-	// NRI StartContainer hook can find them at /run/podmotion/checkpoints/<ref>/final.
+	// sprint49 finding: the storage-cutover gate (StorageMgr.Cutover/AwaitSingleOwner) does
+	// NOT belong here, before scheduling-gate removal. Longhorn's real dual-engine collapse
+	// (tier1.go AwaitSingleOwner) can only begin once the destination pod is actually
+	// SCHEDULED and kubelet issues NodeStageVolume there — that is what makes
+	// longhorn-manager populate spec.migrationNodeID and start the second engine in the
+	// first place. Removing the scheduling gate is the ONLY thing that lets the scheduler
+	// bind the destination pod to its node. Gating AwaitSingleOwner before gate-removal is a
+	// permanent deadlock: it polls forever for a collapse that can never start, because the
+	// pod it needs mounted is still held at PodSchedulingGated. (Confirmed live: the gate
+	// timed out at 2 minutes with the destination Longhorn volume still "detached"/"unknown"
+	// — it never had a chance to attach.) The real gate now lives at the end of
+	// reconcileOverlayHandoff, immediately before the phase transition into
+	// RestoreSocketReattach — see gateStorageCutoverBeforeRestore's doc comment for why that
+	// is the correct (and only correct) place: it is the exact boundary the NRI
+	// StartContainer hook's own phase check (nri/plugin.go verifyPhaseInAcceptSet) enforces,
+	// so gating there blocks BOTH the NRI-triggered restore and the direct/legacy RPC path
+	// uniformly, without deadlocking the storage collapse this gate depends on.
+	//
+	// Remove the scheduling gate NOW — images are on the destination node, so the
+	// NRI StartContainer hook can find the checkpoint at
+	// /run/podmotion/checkpoints/<ref>/final once CRIU restore is actually permitted to run
+	// (gated separately, later, in reconcileOverlayHandoff).
 	// Removing earlier (post-Checkpoint, pre-Transfer) would race the NRI hook against
 	// the PutCheckpointTar delivery, causing a CRIU restore failure on a cold destination.
 	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionSchedulingGateRemoved) {
@@ -3309,6 +3419,18 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 	}
 	log.Info("PrepareDestination OK", "migration", pm.Name, "destNode", destNode,
 		"ipReserved", prepDestResp.IpReserved, "storageReady", prepDestResp.StorageReady)
+
+	// No storage-cutover gate here (sprint49): by the time reconcileRestoring runs, phase is
+	// already RestoreSocketReattach or later, which is EXACTLY the accept-set the NRI
+	// StartContainer hook's own phase check enforces (nri/plugin.go verifyPhaseInAcceptSet) —
+	// a gate placed here would be too late to block the NRI path (that hook fires from an
+	// independent kubelet event the instant the phase write lands in etcd, not when this Go
+	// function happens to run) and was in fact unreachable on the common NRI path anyway,
+	// since the NRI branch above (replForRestore != nil) returns before reaching this point.
+	// The real, single gate lives in reconcileOverlayHandoff — see
+	// gateStorageCutoverBeforeRestore — which runs strictly before the phase transition into
+	// RestoreSocketReattach, so ConditionStorageCutoverComplete is already True by the time
+	// either this function or the NRI hook can trigger restore.
 
 	// Restore: CRIU restores the process tree from the checkpoint images on the destination
 	// node. checkpoint_ref carries the full images-dir path so the agent uses it directly
@@ -5147,7 +5269,22 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 	setCondition(pm, pmv1.ConditionReplacementEndpointsRemoved, metav1.ConditionTrue, "ReplacementEndpointsAbsent", "")
 
 	pm.Status.Phase = pmv1.MigrationPhaseFailed
-	setCondition(pm, pmv1.ConditionRolledBack, metav1.ConditionTrue, "RollbackComplete", "Source pod restored to live state")
+	// Status-honesty fix (sprint49): "Source pod restored to live state" is only true when
+	// the source pod was still alive (frozen, never deleted — ADR-0012's normal guarantee) and
+	// Rollbacker.Rollback thawed it in place. ADR-0356's Tier1-Longhorn early source release
+	// deletes the source pod BEFORE this phase can ever be reached for that migration, so
+	// r.Rollbacker.Rollback's ComputeRollback thaw step has nothing to thaw — Rollback()
+	// returns success as a no-op, not because a live pod was resumed. Report that honestly:
+	// this is a real bounded-downtime outage recovered via the source pod's owning controller
+	// (e.g. a ReplicaSet) recreating a fresh replacement, not a live-resume.
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionTier1EarlySourceRelease) {
+		setCondition(pm, pmv1.ConditionRolledBack, metav1.ConditionTrue, "RollbackCompleteBoundedDowntime",
+			"ADR-0356 Tier1-Longhorn early source release had already deleted the source pod before rollback "+
+				"ran — no live pod existed to resume. Recovery is bounded-downtime (checkpoint-guaranteed via the "+
+				"source pod's owning controller recreating a fresh replacement), not a zero-downtime live-resume.")
+	} else {
+		setCondition(pm, pmv1.ConditionRolledBack, metav1.ConditionTrue, "RollbackComplete", "Source pod restored to live state")
+	}
 	// M26: emit flow_loss counter at Failed (all TCP connections inventoried are treated as lost).
 	pmmetrics.MigrationFlowLossTotal.WithLabelValues(pm.Name, pm.Namespace).Add(
 		float64(len(pm.Status.TCPSeqSnapshots)),
