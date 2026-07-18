@@ -142,7 +142,7 @@ func TestResolveReattachMounts_ResolvesHostTargetByLabelWhenStatusEmpty(t *testi
 	// the resolved host target must be projected into the patch's host-target map (its real consumer).
 	args, err := buildCRIURestoreArgs(
 		"/ckpt", "/rootfs", "/data", "/termlog", "/secrets", "/restore.log",
-		"", "/var/run/netns/cni-x", "", false, mounts)
+		"", "/var/run/netns/cni-x", "", false, mounts, nil)
 	if err != nil {
 		t.Fatalf("buildCRIURestoreArgs returned error with a resolved host target: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestResolveReattachMounts_WaitsThenResolvesWhenVolumeNotYetPublished(t *tes
 	// must NOT emit an inert path-form map; the leaf must land in the patch's host-target map.
 	args, err := buildCRIURestoreArgs(
 		"/ckpt", "/rootfs", "/data", "/termlog", "/secrets", "/restore.log",
-		"", "/var/run/netns/cni-x", "", false, mounts)
+		"", "/var/run/netns/cni-x", "", false, mounts, nil)
 	if err != nil {
 		t.Fatalf("buildCRIURestoreArgs errored on resolved mounts: %v", err)
 	}
@@ -325,7 +325,7 @@ func TestResolveReattachMountsWaiting_BudgetExhausted_FailsClosed(t *testing.T) 
 	// buildCRIURestoreArgs must fail closed on the unresolved host target, never the 1:1 map.
 	if _, err := buildCRIURestoreArgs(
 		"/ckpt", "/rootfs", "/data", "/termlog", "/secrets", "/restore.log",
-		"", "/var/run/netns/cni-x", "", false, mounts); err == nil {
+		"", "/var/run/netns/cni-x", "", false, mounts, nil); err == nil {
 		t.Fatalf("expected buildCRIURestoreArgs to fail closed on unresolved host target; got nil error")
 	}
 }
@@ -376,7 +376,7 @@ func TestResolveReattachMounts_InTreeNFSShapeResolvesEndToEnd(t *testing.T) {
 
 	args, err := buildCRIURestoreArgs(
 		"/ckpt", "/rootfs", "/data", "/termlog", "/secrets", "/restore.log",
-		"", "/var/run/netns/cni-x", "", false, mounts)
+		"", "/var/run/netns/cni-x", "", false, mounts, nil)
 	if err != nil {
 		t.Fatalf("buildCRIURestoreArgs errored on the resolved in-tree NFS mount: %v", err)
 	}
