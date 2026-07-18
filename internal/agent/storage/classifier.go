@@ -250,6 +250,14 @@ func classifyByStorageClass(sc *storagev1.StorageClass) StorageTier {
 // Provisioner/Annotations fields rather than any hardcoded class name — a
 // class named e.g. "longhorn-migratable" is this repo's own naming choice,
 // not a universal identifier.
+// IsLonghornStorageClass is the exported form of isLonghornStorageClass, for callers outside this
+// package (e.g. internal/agent/server's re-attach mount tier classification) that need the same
+// Longhorn-detection rule this classifier uses — so a Longhorn-backed PVC is never independently
+// re-derived (and potentially drifted) by a second, narrower check elsewhere in the codebase.
+func IsLonghornStorageClass(sc *storagev1.StorageClass) bool {
+	return isLonghornStorageClass(sc)
+}
+
 func isLonghornStorageClass(sc *storagev1.StorageClass) bool {
 	if strings.Contains(sc.Provisioner, "longhorn.io") {
 		return true

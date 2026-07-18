@@ -17,8 +17,13 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
+	"net"
+	"strconv"
 	"testing"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -28,8 +33,25 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	agentclient "github.com/podmotion-io/podmotion/internal/agent/client"
 	"github.com/podmotion-io/podmotion/internal/agent/storage"
+	agentpb "github.com/podmotion-io/podmotion/proto/gen"
 )
+
+// spyKillFrozenSourceAgentServer is a minimal MigrationAgentService stub used to prove
+// earlyReleaseSourceForTier1Longhorn routes source termination through KillFrozenSource
+// (ADR-0356 round 2 fix) before ever deleting the source pod. It records whether/how many
+// times it was called so the test can assert call ORDER (kill before delete) and count.
+type spyKillFrozenSourceAgentServer struct {
+	agentpb.UnimplementedMigrationAgentServiceServer
+	calls int
+	resp  *agentpb.KillFrozenSourceResponse
+}
+
+func (s *spyKillFrozenSourceAgentServer) KillFrozenSource(_ context.Context, _ *agentpb.KillFrozenSourceRequest) (*agentpb.KillFrozenSourceResponse, error) {
+	s.calls++
+	return s.resp, nil
+}
 
 func adr0356Scheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
@@ -175,17 +197,46 @@ func TestEarlyReleaseSourceForTier1Longhorn_DeletesWhenBothGuaranteesSatisfied(t
 	scheme := adr0356Scheme(t)
 	pod := srcPodOnNode("node-src")
 	pm := tier1PM("pm1", int32(storage.TierLonghorn), true)
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+	serverCert := adr0351SelfSignedServerCert(t)
+	spy := &spyKillFrozenSourceAgentServer{resp: &agentpb.KillFrozenSourceResponse{Success: true, Killed: true}}
+	grpcSrv := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{serverCert}})))
+	agentpb.RegisterMigrationAgentServiceServer(grpcSrv, spy)
+	go func() { _ = grpcSrv.Serve(lis) }()
+	defer grpcSrv.Stop()
+	port := lis.Addr().(*net.TCPAddr).Port
+
+	// Running agent pod on node-src (the SOURCE node) at 127.0.0.1 so AgentClientPool.ForNode
+	// resolves KillFrozenSource's target to the spy — this test proves the source-side kill
+	// happens, not the destination side.
+	srcAgentPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "podmotion-agent-src", Namespace: "podmotion-system", Labels: map[string]string{"app": "podmotion-agent"}},
+		Spec:       corev1.PodSpec{NodeName: "node-src"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"},
+	}
+
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&pmv1.PodMigration{}).
-		WithObjects(pod, pm, readyNMC("node-dst")).Build()
-	r := &PodMigrationReconciler{Client: fakeClient, Scheme: scheme}
+		WithIndex(&corev1.Pod{}, "spec.nodeName", adr0351PodNodeNameIndexer).
+		WithObjects(pod, srcAgentPod, pm, readyNMC("node-dst")).Build()
+	clientTLSCfg := &tls.Config{InsecureSkipVerify: true}
+	pool := agentclient.NewAgentClientPool(fakeClient, strconv.Itoa(port), clientTLSCfg)
+	r := &PodMigrationReconciler{Client: fakeClient, Scheme: scheme, AgentPool: pool}
 
 	if err := r.earlyReleaseSourceForTier1Longhorn(context.Background(), pm); err != nil {
 		t.Fatalf("expected success, got: %v", err)
 	}
-	err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "src-pod", Namespace: "default"}, &corev1.Pod{})
-	if !apierrors.IsNotFound(err) {
-		t.Fatalf("expected source pod to be deleted (NotFound), got err=%v", err)
+	if spy.calls != 1 {
+		t.Fatalf("expected KillFrozenSource to be called exactly once before pod deletion, got %d calls", spy.calls)
+	}
+	getErr := fakeClient.Get(context.Background(), types.NamespacedName{Name: "src-pod", Namespace: "default"}, &corev1.Pod{})
+	if !apierrors.IsNotFound(getErr) {
+		t.Fatalf("expected source pod to be deleted (NotFound), got err=%v", getErr)
 	}
 	if !meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionTier1EarlySourceRelease) {
 		t.Fatal("expected ConditionTier1EarlySourceRelease=True")
@@ -195,9 +246,66 @@ func TestEarlyReleaseSourceForTier1Longhorn_DeletesWhenBothGuaranteesSatisfied(t
 	}
 
 	// Idempotency: calling again must be a safe no-op (no error re-attempting a delete on
-	// an already-absent pod).
+	// an already-absent pod). ConditionTier1EarlySourceRelease is already True, so
+	// earlyReleaseSourceForTier1Longhorn returns before ever reaching KillFrozenSource again.
 	if err := r.earlyReleaseSourceForTier1Longhorn(context.Background(), pm); err != nil {
 		t.Fatalf("expected idempotent no-op on second call, got: %v", err)
+	}
+	if spy.calls != 1 {
+		t.Fatalf("expected KillFrozenSource still called exactly once after idempotent replay, got %d calls", spy.calls)
+	}
+}
+
+// TestEarlyReleaseSourceForTier1Longhorn_KillFrozenSourceFailureBlocksDelete is the
+// falsifiable regression proof for the actual bug found live in sprint49: a plain
+// Kubernetes pod delete resumes (SIGCONT) a SIGSTOPped source container before signalling
+// it, giving its application-level shutdown code a real window to mutate the SAME shared
+// Longhorn volume the CRIU-restored destination depends on (observed: PostgreSQL's own
+// postmaster.pid safety check then self-terminates the destination). The fix routes source
+// termination through KillFrozenSource (a direct SIGKILL to the still-stopped PID, which
+// never resumes it to userspace) BEFORE deleting the pod. This test proves the source pod
+// is NOT deleted, and the unsafe fallback path is never taken, if KillFrozenSource fails.
+func TestEarlyReleaseSourceForTier1Longhorn_KillFrozenSourceFailureBlocksDelete(t *testing.T) {
+	scheme := adr0356Scheme(t)
+	pod := srcPodOnNode("node-src")
+	pm := tier1PM("pm1", int32(storage.TierLonghorn), true)
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+	serverCert := adr0351SelfSignedServerCert(t)
+	spy := &spyKillFrozenSourceAgentServer{resp: &agentpb.KillFrozenSourceResponse{Success: false, Error: "broker SIGKILL failed"}}
+	grpcSrv := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{serverCert}})))
+	agentpb.RegisterMigrationAgentServiceServer(grpcSrv, spy)
+	go func() { _ = grpcSrv.Serve(lis) }()
+	defer grpcSrv.Stop()
+	port := lis.Addr().(*net.TCPAddr).Port
+
+	srcAgentPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "podmotion-agent-src", Namespace: "podmotion-system", Labels: map[string]string{"app": "podmotion-agent"}},
+		Spec:       corev1.PodSpec{NodeName: "node-src"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&pmv1.PodMigration{}).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", adr0351PodNodeNameIndexer).
+		WithObjects(pod, srcAgentPod, pm, readyNMC("node-dst")).Build()
+	clientTLSCfg := &tls.Config{InsecureSkipVerify: true}
+	pool := agentclient.NewAgentClientPool(fakeClient, strconv.Itoa(port), clientTLSCfg)
+	r := &PodMigrationReconciler{Client: fakeClient, Scheme: scheme, AgentPool: pool}
+
+	if err := r.earlyReleaseSourceForTier1Longhorn(context.Background(), pm); err == nil {
+		t.Fatal("expected an error when KillFrozenSource fails — must not fall through to an unsafe pod delete")
+	}
+	getErr := fakeClient.Get(context.Background(), types.NamespacedName{Name: "src-pod", Namespace: "default"}, &corev1.Pod{})
+	if getErr != nil {
+		t.Fatalf("source pod should NOT have been deleted when KillFrozenSource failed: %v", getErr)
+	}
+	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionTier1EarlySourceRelease) {
+		t.Fatal("ConditionTier1EarlySourceRelease must not be set when KillFrozenSource failed")
 	}
 }
 

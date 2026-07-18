@@ -255,6 +255,7 @@ func TestRemoveStalePidfile_FailOpenVsFailClosed(t *testing.T) {
 // TestPriorRestoredPIDIfAlive_LivePID: a pidfile holding a live PID (this test process)
 // returns (pid, true) — the confirm-and-advance path.
 func TestPriorRestoredPIDIfAlive_LivePID(t *testing.T) {
+	withLocalProcAlive(t)
 	dataDir := t.TempDir()
 	live := os.Getpid()
 	if err := os.WriteFile(dataDir+"/"+restoredPidfileName, []byte(strconv.Itoa(live)), 0o600); err != nil {
@@ -280,6 +281,7 @@ func TestPriorRestoredPIDIfAlive_AbsentFile(t *testing.T) {
 // TestPriorRestoredPIDIfAlive_DeadPID: a pidfile holding a PID that is not alive → (0,false),
 // caller proceeds to a real restore rather than falsely confirming.
 func TestPriorRestoredPIDIfAlive_DeadPID(t *testing.T) {
+	withLocalProcAlive(t)
 	dataDir := t.TempDir()
 	// PID 2^31-1 is effectively guaranteed not to exist on Linux (pid_max is far lower).
 	if err := os.WriteFile(dataDir+"/"+restoredPidfileName, []byte("2147483646"), 0o600); err != nil {

@@ -34,6 +34,7 @@ const (
 	MigrationAgentService_PutCheckpointTar_FullMethodName           = "/podmotion.agent.v1.MigrationAgentService/PutCheckpointTar"
 	MigrationAgentService_GetCheckpointTar_FullMethodName           = "/podmotion.agent.v1.MigrationAgentService/GetCheckpointTar"
 	MigrationAgentService_ReleaseCheckpoint_FullMethodName          = "/podmotion.agent.v1.MigrationAgentService/ReleaseCheckpoint"
+	MigrationAgentService_KillFrozenSource_FullMethodName           = "/podmotion.agent.v1.MigrationAgentService/KillFrozenSource"
 	MigrationAgentService_InjectIPHandoff_FullMethodName            = "/podmotion.agent.v1.MigrationAgentService/InjectIPHandoff"
 	MigrationAgentService_CleanupSourceIPHandoff_FullMethodName     = "/podmotion.agent.v1.MigrationAgentService/CleanupSourceIPHandoff"
 	MigrationAgentService_InjectSourceRedirect_FullMethodName       = "/podmotion.agent.v1.MigrationAgentService/InjectSourceRedirect"
@@ -101,6 +102,21 @@ type MigrationAgentServiceClient interface {
 	// pm.Status.CheckpointTransferred has been durably persisted. Idempotent: returns
 	// success if the directory is already absent (handles controller-restart replay).
 	ReleaseCheckpoint(ctx context.Context, in *ReleaseCheckpointRequest, opts ...grpc.CallOption) (*ReleaseCheckpointResponse, error)
+	// KillFrozenSource delivers SIGKILL directly to the source process left in SIGSTOP by
+	// a LeaveStopped=true CRIU dump (see registerFrozenSource), via the same unconfined
+	// netns-broker path thawFrozenSource uses for SIGCONT. Unlike a Kubernetes pod delete
+	// (which always resumes a stopped container's init process — SIGCONT-then-signal — to
+	// run its stop sequence, giving app-level shutdown code a window to run and mutate
+	// on-disk state before the final SIGKILL lands), this terminates the STILL-STOPPED
+	// process straight from the kernel: SIGKILL is fatal to a stopped task without ever
+	// resuming it to userspace, so no application shutdown/cleanup code ever executes.
+	// Used by the ADR-0356 Tier1-Longhorn early source release, where the source and
+	// destination share the same underlying volume and any app-level shutdown hook that
+	// touches shared on-disk state (e.g. a database unlinking its own lock file) would
+	// corrupt state out from under the already-restored destination process. Idempotent:
+	// returns success if no frozen-source record exists for migration_name (e.g. it was
+	// already thawed or killed).
+	KillFrozenSource(ctx context.Context, in *KillFrozenSourceRequest, opts ...grpc.CallOption) (*KillFrozenSourceResponse, error)
 	// InjectIPHandoff installs neighbor/FDB entries on the DESTINATION node so the OLD
 	// pod IP becomes reachable at the replacement pod's veth MAC (ADR-0133 Decision 2).
 	// Called by the controller in reconcileVerifying after criuRestoreConfirmed=true and
@@ -337,6 +353,16 @@ func (c *migrationAgentServiceClient) ReleaseCheckpoint(ctx context.Context, in 
 	return out, nil
 }
 
+func (c *migrationAgentServiceClient) KillFrozenSource(ctx context.Context, in *KillFrozenSourceRequest, opts ...grpc.CallOption) (*KillFrozenSourceResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(KillFrozenSourceResponse)
+	err := c.cc.Invoke(ctx, MigrationAgentService_KillFrozenSource_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *migrationAgentServiceClient) InjectIPHandoff(ctx context.Context, in *InjectIPHandoffRequest, opts ...grpc.CallOption) (*InjectIPHandoffResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(InjectIPHandoffResponse)
@@ -501,6 +527,21 @@ type MigrationAgentServiceServer interface {
 	// pm.Status.CheckpointTransferred has been durably persisted. Idempotent: returns
 	// success if the directory is already absent (handles controller-restart replay).
 	ReleaseCheckpoint(context.Context, *ReleaseCheckpointRequest) (*ReleaseCheckpointResponse, error)
+	// KillFrozenSource delivers SIGKILL directly to the source process left in SIGSTOP by
+	// a LeaveStopped=true CRIU dump (see registerFrozenSource), via the same unconfined
+	// netns-broker path thawFrozenSource uses for SIGCONT. Unlike a Kubernetes pod delete
+	// (which always resumes a stopped container's init process — SIGCONT-then-signal — to
+	// run its stop sequence, giving app-level shutdown code a window to run and mutate
+	// on-disk state before the final SIGKILL lands), this terminates the STILL-STOPPED
+	// process straight from the kernel: SIGKILL is fatal to a stopped task without ever
+	// resuming it to userspace, so no application shutdown/cleanup code ever executes.
+	// Used by the ADR-0356 Tier1-Longhorn early source release, where the source and
+	// destination share the same underlying volume and any app-level shutdown hook that
+	// touches shared on-disk state (e.g. a database unlinking its own lock file) would
+	// corrupt state out from under the already-restored destination process. Idempotent:
+	// returns success if no frozen-source record exists for migration_name (e.g. it was
+	// already thawed or killed).
+	KillFrozenSource(context.Context, *KillFrozenSourceRequest) (*KillFrozenSourceResponse, error)
 	// InjectIPHandoff installs neighbor/FDB entries on the DESTINATION node so the OLD
 	// pod IP becomes reachable at the replacement pod's veth MAC (ADR-0133 Decision 2).
 	// Called by the controller in reconcileVerifying after criuRestoreConfirmed=true and
@@ -631,6 +672,9 @@ func (UnimplementedMigrationAgentServiceServer) GetCheckpointTar(context.Context
 }
 func (UnimplementedMigrationAgentServiceServer) ReleaseCheckpoint(context.Context, *ReleaseCheckpointRequest) (*ReleaseCheckpointResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ReleaseCheckpoint not implemented")
+}
+func (UnimplementedMigrationAgentServiceServer) KillFrozenSource(context.Context, *KillFrozenSourceRequest) (*KillFrozenSourceResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method KillFrozenSource not implemented")
 }
 func (UnimplementedMigrationAgentServiceServer) InjectIPHandoff(context.Context, *InjectIPHandoffRequest) (*InjectIPHandoffResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method InjectIPHandoff not implemented")
@@ -956,6 +1000,24 @@ func _MigrationAgentService_ReleaseCheckpoint_Handler(srv interface{}, ctx conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MigrationAgentService_KillFrozenSource_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(KillFrozenSourceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MigrationAgentServiceServer).KillFrozenSource(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MigrationAgentService_KillFrozenSource_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MigrationAgentServiceServer).KillFrozenSource(ctx, req.(*KillFrozenSourceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MigrationAgentService_InjectIPHandoff_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(InjectIPHandoffRequest)
 	if err := dec(in); err != nil {
@@ -1220,6 +1282,10 @@ var MigrationAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReleaseCheckpoint",
 			Handler:    _MigrationAgentService_ReleaseCheckpoint_Handler,
+		},
+		{
+			MethodName: "KillFrozenSource",
+			Handler:    _MigrationAgentService_KillFrozenSource_Handler,
 		},
 		{
 			MethodName: "InjectIPHandoff",

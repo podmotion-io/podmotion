@@ -554,6 +554,7 @@ func TestBuildCRIURestoreArgs_ReattachDoesNotEmitInertExtMountMap(t *testing.T) 
 		"/ckpt", "/rootfs", "/data", "/termlog", "/secrets", "/restore.log",
 		"", "/var/run/netns/cni-x", "", false,
 		[]reattachMount{{ContainerPath: "/var/lib/postgresql/data", HostTarget: hostTarget}},
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("buildCRIURestoreArgs returned error with a resolved host target: %v", err)
@@ -572,6 +573,7 @@ func TestBuildCRIURestoreArgs_ReattachDoesNotEmitInertExtMountMap(t *testing.T) 
 		"/ckpt", "/rootfs", "/data", "/termlog", "/secrets", "/restore.log",
 		"", "/var/run/netns/cni-x", "", false,
 		[]reattachMount{{ContainerPath: "/mnt/data", HostTarget: ""}},
+		nil,
 	)
 	if errFB == nil {
 		t.Errorf("expected an error when re-attach host target is unresolved (fail closed); got args: %s", strings.Join(argsFB, " "))
