@@ -84,12 +84,29 @@ type Migrator interface {
 	// Returns 100 for tiers with no sync phase (Tier0).
 	SyncPercent(ctx context.Context, opts MigrationOptions) (int, error)
 	// Cutover detaches from the source and attaches to the destination.
-	// Called after CRIU restore completes on the destination node.
+	// Called by the controller from reconcileOverlayHandoff
+	// (gateStorageCutoverBeforeRestore), at the very end of that phase,
+	// immediately before the phase transition into RestoreSocketReattach —
+	// the first phase in the NRI StartContainer hook's restore accept-set
+	// (nri/plugin.go verifyPhaseInAcceptSet). That is deliberately AFTER the
+	// scheduling gate has already been removed (end of reconcileTransferring):
+	// for tiers like Longhorn whose dual-engine collapse only begins once the
+	// destination pod is actually scheduled and kubelet mounts the volume,
+	// gating any earlier would deadlock forever waiting for a collapse that
+	// can never start (sprint49 finding). Restore must never be allowed to
+	// race ahead of storage actually being attached/collapsing on the
+	// destination node — gating at the last moment before the phase write
+	// that unblocks restore is what actually prevents that race.
 	Cutover(ctx context.Context, opts MigrationOptions) error
 	// AwaitSingleOwner blocks until every classified volume for this tier is
 	// in a single-owner, mountable state on the destination node. Called by
-	// the controller after Cutover succeeds and before the destination pod's
-	// volume mounts are allowed to proceed.
+	// the controller immediately after Cutover succeeds, in the same
+	// gateStorageCutoverBeforeRestore call — still strictly BEFORE the phase
+	// transition into RestoreSocketReattach, so CRIU restore (NRI-triggered
+	// or the direct/legacy RPC path) cannot begin until this returns. This is
+	// the actual gate that prevents restore from racing ahead of the
+	// destination storage engine being present/ready (e.g. Longhorn's
+	// dual-engine collapsing to a single RW replica on the destination node).
 	//
 	// Must return promptly (bounded internal poll) rather than blocking
 	// forever; a timeout is a real error, not a wait condition. Each tier
@@ -168,15 +185,23 @@ func (m *StorageMigrationManager) RegisterMigrator(tier StorageTier, mg Migrator
 func (m *StorageMigrationManager) RunPreStage(ctx context.Context, pm *pmv1.PodMigration) error {
 	log := logf.FromContext(ctx).WithValues("migration", pm.Name)
 
-	highest, migrator, opts, err := m.buildMigrationOptions(ctx, pm)
+	highest, classifications, migrator, opts, err := m.classifyFromLiveSourcePod(ctx, pm)
 	if err != nil {
 		return m.patchStorageReady(ctx, pm, metav1.ConditionFalse, "ClassifyFailed", err.Error())
 	}
 
-	// Persist the highest tier to status.storageTier.
+	// Persist the highest tier and the full per-PVC classification to status.
+	// ClassifiedVolumes is what Cutover/AwaitSingleOwner read later — RunPreStage runs during
+	// PreMigrating, while the source pod is still guaranteed to exist, so this is the last
+	// point in the phase graph where a live re-classification is possible for every tier
+	// (Tier1-Longhorn's ADR-0356 early source-pod release means the pod may already be gone
+	// by the time Cutover runs — see ClassifiedVolumes' doc comment in podmigration_types.go).
 	tier := int32(highest.Tier)
 	if err := m.patchStorageTier(ctx, pm, tier); err != nil {
 		log.Error(err, "failed to patch storageTier — continuing")
+	}
+	if err := m.patchClassifiedVolumes(ctx, pm, classifications); err != nil {
+		log.Error(err, "failed to patch classifiedVolumes — continuing")
 	}
 
 	if highest.Tier == TierBlocked {
@@ -240,25 +265,74 @@ retryLoop:
 		fmt.Sprintf("tier%d pre-stage complete: %s", highest.Tier, highest.Reason))
 }
 
-// buildMigrationOptions classifies the source pod's PVCs, selects the
-// highest-tier classification, resolves the Migrator registered for it, and
-// assembles the MigrationOptions the migrator's methods need. This is the
-// shared classify-and-select boilerplate used by RunPreStage, Cutover, and
-// AwaitSingleOwner so it is written once instead of triplicated.
+// classifyFromLiveSourcePod fetches the live source pod, classifies its PVCs, selects the
+// highest-tier classification, resolves the Migrator registered for it, and assembles the
+// MigrationOptions the migrator's methods need.
 //
-// migrator is nil when no Migrator is registered for the selected tier —
-// callers decide how to handle that (RunPreStage has a TierRWX-only no-op
-// fallback; Cutover/AwaitSingleOwner treat it as an error since a missing
-// migrator at that point means the cutover cannot be verified).
-func (m *StorageMigrationManager) buildMigrationOptions(ctx context.Context, pm *pmv1.PodMigration) (TierClassification, Migrator, MigrationOptions, error) {
+// This performs a live GET of the source pod and MUST ONLY be called from RunPreStage, which
+// runs during PreMigrating — before ADR-0356's Tier1-Longhorn early source-pod release can
+// possibly have fired (that release requires CheckpointTransferred=True, several phases later).
+// Cutover and AwaitSingleOwner run much later (reconcileOverlayHandoff) and must NOT call this:
+// they use buildMigrationOptionsFromCache instead, which reads the classification RunPreStage
+// persisted to pm.Status.ClassifiedVolumes, since a live re-fetch of the source pod 404s once
+// ADR-0356 has released it (sprint49 live-proof finding).
+//
+// migrator is nil when no Migrator is registered for the selected tier — RunPreStage has a
+// TierRWX-only no-op fallback for that case.
+func (m *StorageMigrationManager) classifyFromLiveSourcePod(ctx context.Context, pm *pmv1.PodMigration) (TierClassification, []TierClassification, Migrator, MigrationOptions, error) {
 	sourcePod, err := m.getSourcePod(ctx, pm)
 	if err != nil {
-		return TierClassification{}, nil, MigrationOptions{}, fmt.Errorf("get source pod: %w", err)
+		return TierClassification{}, nil, nil, MigrationOptions{}, fmt.Errorf("get source pod: %w", err)
 	}
 
 	classifications, err := m.Classifier.ClassifyPod(ctx, sourcePod)
 	if err != nil {
-		return TierClassification{}, nil, MigrationOptions{}, fmt.Errorf("classify pod pvcs: %w", err)
+		return TierClassification{}, nil, nil, MigrationOptions{}, fmt.Errorf("classify pod pvcs: %w", err)
+	}
+
+	highest := HighestTier(classifications)
+	opts := MigrationOptions{
+		MigrationName:   pm.Name,
+		PodNamespace:    pm.Spec.PodNamespace,
+		SourceNode:      pm.Status.SourceNodeName,
+		DestinationNode: pm.Status.DestinationNodeName,
+		Classifications: classifications,
+	}
+
+	return highest, classifications, m.Migrators[highest.Tier], opts, nil
+}
+
+// buildMigrationOptionsFromCache assembles MigrationOptions from the per-PVC classification
+// RunPreStage persisted to pm.Status.ClassifiedVolumes, WITHOUT re-fetching the live source
+// pod. This is the classify path Cutover and AwaitSingleOwner must use: by the time they run
+// (reconcileOverlayHandoff, well after CheckpointTransferred=True), ADR-0356's Tier1-Longhorn
+// early source-pod release may have already deleted the source pod, so a live re-fetch/
+// re-classify 404s every time (sprint49 live-proof finding — migration permanently stuck in
+// OverlayHandoff, reason CutoverFailed / "get source pod: ... not found"). The PVC objects are
+// never deleted by ADR-0356 (only the pod is), so the classification computed once while the
+// pod still existed remains valid for the rest of the migration.
+//
+// Re-fetches pm fresh so it observes RunPreStage's patch even if the caller's in-memory copy
+// predates it. Returns an error if no classification has been cached yet (RunPreStage has not
+// completed) — this is a recoverable, retryable condition, not a permanent failure.
+func (m *StorageMigrationManager) buildMigrationOptionsFromCache(ctx context.Context, pm *pmv1.PodMigration) (TierClassification, Migrator, MigrationOptions, error) {
+	fresh := &pmv1.PodMigration{}
+	if err := m.Client.Get(ctx, client.ObjectKeyFromObject(pm), fresh); err != nil {
+		return TierClassification{}, nil, MigrationOptions{}, fmt.Errorf("re-fetch PodMigration for cached classification: %w", err)
+	}
+	if fresh.Status.StorageTier == nil {
+		return TierClassification{}, nil, MigrationOptions{}, errors.New(
+			"no cached PVC classification yet (RunPreStage has not completed) — cannot cutover before storage pre-stage classifies volumes")
+	}
+
+	classifications := make([]TierClassification, 0, len(fresh.Status.ClassifiedVolumes))
+	for _, c := range fresh.Status.ClassifiedVolumes {
+		classifications = append(classifications, TierClassification{
+			Tier:         StorageTier(c.Tier),
+			Reason:       c.Reason,
+			PVCName:      c.PVCName,
+			StorageClass: c.StorageClass,
+		})
 	}
 
 	highest := HighestTier(classifications)
@@ -276,10 +350,14 @@ func (m *StorageMigrationManager) buildMigrationOptions(ctx context.Context, pm 
 // Cutover looks up the classified tier's migrator and delegates to its
 // Cutover method (detach from source, attach to destination), patching
 // ConditionStorageCutoverComplete=False with a recoverable reason on
-// failure. Called by the controller after CRIU restore completes, before
-// AwaitSingleOwner and before the DisengageHold phase is allowed to proceed.
+// failure. Called by the controller from reconcileOverlayHandoff
+// (gateStorageCutoverBeforeRestore), after scheduling-gate removal but
+// strictly before the phase transition into RestoreSocketReattach —
+// immediately before AwaitSingleOwner, never after restore, since restore
+// racing ahead of a ready destination storage engine is the failure this
+// gate exists to prevent.
 func (m *StorageMigrationManager) Cutover(ctx context.Context, pm *pmv1.PodMigration) error {
-	highest, migrator, opts, err := m.buildMigrationOptions(ctx, pm)
+	highest, migrator, opts, err := m.buildMigrationOptionsFromCache(ctx, pm)
 	if err != nil {
 		return m.patchStorageCutover(ctx, pm, metav1.ConditionFalse, "CutoverFailed",
 			fmt.Sprintf("classify pod pvcs for cutover: %v", err))
@@ -304,10 +382,12 @@ func (m *StorageMigrationManager) Cutover(ctx context.Context, pm *pmv1.PodMigra
 // a single-owner, mountable state on the destination node. Patches
 // ConditionStorageCutoverComplete=False with reason AwaitSingleOwnerTimeout
 // on failure (a timeout is a real, recoverable error — not silently retried
-// forever). The controller calls this after Cutover succeeds and before
-// permitting the destination pod's volume mounts to proceed.
+// forever). The controller calls this after Cutover succeeds, from
+// reconcileOverlayHandoff's gateStorageCutoverBeforeRestore, and before
+// permitting the phase transition that makes CRIU restore eligible to run
+// (RestoreSocketReattach — see nri/plugin.go verifyPhaseInAcceptSet).
 func (m *StorageMigrationManager) AwaitSingleOwner(ctx context.Context, pm *pmv1.PodMigration) error {
-	highest, migrator, opts, err := m.buildMigrationOptions(ctx, pm)
+	highest, migrator, opts, err := m.buildMigrationOptionsFromCache(ctx, pm)
 	if err != nil {
 		return m.patchStorageCutover(ctx, pm, metav1.ConditionFalse, "AwaitSingleOwnerTimeout",
 			fmt.Sprintf("classify pod pvcs for await-single-owner: %v", err))
@@ -396,6 +476,33 @@ func (m *StorageMigrationManager) patchStorageTier(ctx context.Context, pm *pmv1
 			return err
 		}
 		fresh.Status.StorageTier = &tier
+		return m.Client.Status().Update(ctx, fresh)
+	})
+}
+
+// patchClassifiedVolumes writes pm.Status.ClassifiedVolumes via a fresh fetch, converting from
+// the internal TierClassification slice to the CRD-status PVCTierClassification mirror. This is
+// the cache Cutover/AwaitSingleOwner read from later (buildMigrationOptionsFromCache) instead of
+// re-fetching and re-classifying the live source pod, which may already be deleted by the time
+// they run (ADR-0356 Tier1-Longhorn early source-pod release). Retries on optimistic-lock
+// conflict, mirroring patchStorageTier.
+func (m *StorageMigrationManager) patchClassifiedVolumes(ctx context.Context, pm *pmv1.PodMigration, classifications []TierClassification) error {
+	cached := make([]pmv1.PVCTierClassification, 0, len(classifications))
+	for _, c := range classifications {
+		cached = append(cached, pmv1.PVCTierClassification{
+			Tier:         int32(c.Tier),
+			Reason:       c.Reason,
+			PVCName:      c.PVCName,
+			StorageClass: c.StorageClass,
+		})
+	}
+	key := client.ObjectKeyFromObject(pm)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &pmv1.PodMigration{}
+		if err := m.Client.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		fresh.Status.ClassifiedVolumes = cached
 		return m.Client.Status().Update(ctx, fresh)
 	})
 }

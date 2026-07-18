@@ -99,6 +99,13 @@ func TestTwelvePhaseTransitions(t *testing.T) {
 			// Pre-seed all agent-dependent conditions so phases advance without a live agent.
 			Conditions: []metav1.Condition{
 				trueCondition(conditionCheckpointed),
+				// sprint49: reconcileFinalFreezeStateCapture now advances past the
+				// transfer step on conditionSchedulingGateRemoved (the true terminal
+				// state of reconcileTransferring), not merely CheckpointTransferred —
+				// pre-seed it here too so this fast-path/no-AgentPool test still
+				// advances without blocking on reconcileTransferring's AgentPool-nil
+				// early-return.
+				trueCondition(conditionSchedulingGateRemoved),
 				trueCondition(conditionRestored),
 				trueCondition(conditionTrafficVerified),
 				trueCondition(conditionDestinationVolumeReady),
@@ -864,6 +871,10 @@ func TestStrictMigrationVisitsOverlayHandoffAndDisengageHold(t *testing.T) {
 			Phase: pmv1.MigrationPhaseFinalFreezeStateCapture,
 			Conditions: []metav1.Condition{
 				cond(conditionCheckpointed),
+				// sprint49: reconcileFinalFreezeStateCapture now advances past the transfer
+				// step on conditionSchedulingGateRemoved, not merely CheckpointTransferred —
+				// pre-seed it here too (see TestTwelvePhaseTransitions for the full rationale).
+				cond(conditionSchedulingGateRemoved),
 				// OverlayHandoff fast-path: VXLANFDBUpdated=True → RestoreSocketReattach.
 				cond(string(pmv1.ConditionVXLANFDBUpdated)),
 				// RestoreSocketReattach fast-path: Restored=True → DisengageHold.
