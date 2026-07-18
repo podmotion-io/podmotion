@@ -163,3 +163,17 @@ docs/security/PROVISIONAL-APPLICATION-BRIEF-2026-06-16.md
 docs/security/REASONABLE-MEASURES-DECLARATION-2026-06-16.md
 docs/security/SECURITY-DEBT-LEDGER.md
 docs/security/sprint44-integration-security-lens-validation.md
+
+# Terraform test infrastructure (terraform/) — local state, generated SSH keys,
+# and the provider binary cache never get tracked. The .tf configs themselves,
+# and .terraform.lock.hcl (pins provider versions — meant to be committed), ARE.
+terraform/**/.terraform/
+terraform/**/terraform.tfstate
+terraform/**/terraform.tfstate.backup
+terraform/**/*.tfvars
+terraform/**/crash.log
+terraform/**/override.tf
+terraform/**/override.tf.json
+terraform/**/*.pem
+terraform/**/*_rsa
+terraform/**/*_rsa.pub
