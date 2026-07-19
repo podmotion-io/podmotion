@@ -216,6 +216,31 @@ func (c *Client) KillSourcePID(ctx context.Context, pid int, expectedStarttime u
 	return nil
 }
 
+// MoveCgroup asks the privileged, UNCONFINED broker to write pid into the
+// cgroup.procs file of the container's own cgroup v2 scope (cgroupPath, relative
+// to /sys/fs/cgroup — the SAME confined leaf server.go's resolveCgroupAnchorTarget
+// already resolved). ADR-0351 D2 (sprint53-kind): the de-privileged main agent
+// cannot perform this write itself — a cgroup v2 cgroup.procs write is permitted
+// only when the target cgroup is a descendant of the WRITER's own cgroup
+// namespace root, and the SD-1 agent's privileged:false container gets a fresh
+// cgroup namespace rooted at its own container scope (a sibling, not an
+// ancestor, of the target pod's kubepods cgroup) — so the write ENOENTs there
+// regardless of mount-path visibility. The broker's cgroup namespace root is the
+// host root (same property its pre-existing "cat" exec-allowlist entry already
+// relies on to resolve host-absolute /proc/<pid>/cgroup paths), so the target is
+// always reachable there. Same PID-reuse (starttime) guard as SignalPID/
+// KillSourcePID: expectedStarttime==0 is rejected server-side.
+func (c *Client) MoveCgroup(ctx context.Context, pid int, cgroupPath string, expectedStarttime uint64) error {
+	resp, err := c.do(ctx, Request{Op: "move_cgroup", SignalPID: pid, CgroupPath: cgroupPath, ExpectedStartTime: expectedStarttime})
+	if err != nil {
+		return fmt.Errorf("netns-broker move_cgroup %d %s: %w", pid, cgroupPath, err)
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("netns-broker move_cgroup %d %s: %s", pid, cgroupPath, resp.Error)
+	}
+	return nil
+}
+
 // ProcAlive asks the privileged, UNCONFINED broker to report whether pid is
 // alive (present under /proc and not a zombie), reading /proc/<pid>/stat in
 // the broker's own process rather than the de-privileged agent's. The main

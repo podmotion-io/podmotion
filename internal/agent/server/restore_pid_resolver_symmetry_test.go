@@ -121,9 +121,12 @@ func TestSurvivingSandboxGateIsCgroupPlacementOnly(t *testing.T) {
 		t.Skip("no sandboxID gate present — cgroup placement may have been restructured")
 	}
 	// The block guarded by the surviving gate must be the cgroup move, not PID resolution.
+	// Sprint53-kind: the call site now goes through the moveProcessToPodCgroupFn seam (mirrors
+	// joinNsRestoreFn/reapRestoredProcessTreeFn) rather than calling moveProcessToPodCgroup
+	// directly, so match either name.
 	after := body[gateIdx:]
-	if !strings.Contains(after, "moveProcessToPodCgroup(") {
-		t.Fatal("surviving `if sandboxID != \"\"` block does not contain moveProcessToPodCgroup — " +
+	if !strings.Contains(after, "moveProcessToPodCgroup(") && !strings.Contains(after, "moveProcessToPodCgroupFn(") {
+		t.Fatal("surviving `if sandboxID != \"\"` block does not contain moveProcessToPodCgroup/moveProcessToPodCgroupFn — " +
 			"the only sandboxID-dependent step should be ADR-0128 cgroup placement")
 	}
 	if strings.Contains(after, "readRestoredPIDFromPidfile(") {
