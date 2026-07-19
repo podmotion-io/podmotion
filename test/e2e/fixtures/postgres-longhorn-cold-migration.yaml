@@ -1,0 +1,18 @@
+# postgres-longhorn-cold-migration.yaml — sprint50 Longhorn cold-migration proof on k3s.
+#
+# Apply AFTER test/e2e/fixtures/postgres-longhorn.yaml (postgres-src pinned to pm-w1,
+# Longhorn-migratable RWX PVC). Targets pm-w2 as the destination node. mode: Cold
+# because embedded Flannel on this k3s cluster is not live-migration-eligible
+# (FlannelHandoff.LiveMigrationEligible() unconditionally returns false — see
+# docs/sprints/sprint50-k3s/STATUS.md §3) — this is expected, not a bug.
+apiVersion: migration.podmotion.io/v1alpha1
+kind: PodMigration
+metadata:
+  name: postgres-longhorn-cold
+  namespace: pm-db-longhorn-test
+spec:
+  podName: postgres-src
+  podNamespace: pm-db-longhorn-test
+  targetNodeName: pm-w2
+  mode: Cold
+  affinityMode: ignore
