@@ -5948,16 +5948,41 @@ func resolveCgroupAnchorTarget(containerCgroupsPath, podCgroupParent string) (st
 
 	// ADR-0351 D2.4/BD-10: real path-confinement via EvalSymlinks + prefix check — NOT lexical
 	// filepath.Clean alone (which does not defeat ".." traversal composed with filepath.Join, and
-	// never resolves symlinks). Reject anything that does not canonicalize under
-	// cgroupFsRoot/kubepods.
+	// never resolves symlinks). Reject anything that does not canonicalize under one of the
+	// allowed pod-cgroup roots.
+	//
+	// Sprint53 (kind Cilium revival), verified live: kubelet's cgroupRoot is NOT always "/" (the
+	// vanilla kubeadm/KVM convention giving a flat cgroupFsRoot/kubepods.slice). kind's own
+	// kubelet config sets `cgroupRoot: /kubelet` (confirmed live: /var/lib/kubelet/config.yaml on
+	// every kind node) — a standard, distinct, equally-legitimate systemd cgroup-driver layout
+	// that nests pod cgroups at cgroupFsRoot/kubelet.slice/kubelet-kubepods.slice/... instead.
+	// expandSystemdSlice already expands this correctly (it's generic hyphen-nesting, not
+	// kubepods-specific); the old single-prefix allowlist just didn't recognize the result as
+	// pod-cgroup territory and fail-closed on a 100%-legitimate restore target, breaking every
+	// migration on kind. Both prefixes anchor at a real, well-known kubelet-owned pod-cgroup
+	// subtree — allowing both preserves BD-10's actual intent (never write into an
+	// attacker-influenced or non-pod cgroup) while tolerating kubelet's two standard cgroupRoot
+	// conventions. The EvalSymlinks call above still defeats symlink/".." traversal regardless of
+	// which prefix ultimately matches.
 	candidate := filepath.Join(cgroupFsRoot, leaf)
 	resolved, err := filepath.EvalSymlinks(candidate)
 	if err != nil {
 		return "", fmt.Errorf("ADR-0351: resolve cgroup leaf %q: %w", candidate, err)
 	}
-	if !strings.HasPrefix(resolved, filepath.Join(cgroupFsRoot, "kubepods")) {
-		return "", fmt.Errorf("ADR-0351: cgroup leaf %q resolves to %q, outside %s/kubepods* — refusing (path-confinement, BD-10)",
-			containerCgroupsPath, resolved, cgroupFsRoot)
+	allowedCgroupRoots := []string{
+		filepath.Join(cgroupFsRoot, "kubepods"),                          // vanilla kubeadm/KVM: cgroupRoot="/"
+		filepath.Join(cgroupFsRoot, "kubelet.slice", "kubelet-kubepods"), // kind: cgroupRoot=/kubelet
+	}
+	allowed := false
+	for _, root := range allowedCgroupRoots {
+		if strings.HasPrefix(resolved, root) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return "", fmt.Errorf("ADR-0351: cgroup leaf %q resolves to %q, outside %s — refusing (path-confinement, BD-10)",
+			containerCgroupsPath, resolved, strings.Join(allowedCgroupRoots, " or "))
 	}
 
 	// ADR-0351 D2.3: never anchor at the parent slice itself (cgroup v2 no-internal-process rule
