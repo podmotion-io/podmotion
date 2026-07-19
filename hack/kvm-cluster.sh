@@ -173,6 +173,47 @@ K3S_KUBECONFIG_PATH="${K3S_KUBECONFIG_PATH:-/etc/rancher/k3s/k3s.yaml}"
 K3S_CONTAINERD_SOCKET="${K3S_CONTAINERD_SOCKET:-/run/k3s/containerd/containerd.sock}"
 K3S_CONTAINERD_STATE_DIR="${K3S_CONTAINERD_STATE_DIR:-/var/lib/rancher/k3s/agent/containerd}"
 
+# ── RKE2 (sprint51, alternative reset-cluster mode, sibling of k3s above) ────
+# RKE2 ("Rancher Kubernetes Engine 2") is a DIFFERENT distribution from k3s, not
+# a variant of it: separate server/agent binaries (rke2), its own install
+# script (get.rke2.io, not get.k3s.io), separate systemd units
+# (rke2-server.service / rke2-agent.service, not k3s.service/k3s-agent.service),
+# its own config mechanism (/etc/rancher/rke2/config.yaml, read by the systemd
+# unit at start — RKE2 does NOT take an INSTALL_*_EXEC inline-flags idiom the
+# way k3s's installer does), its own embedded containerd under
+# /var/lib/rancher/rke2/, and — per docs.rke2.io/reference/server_config
+# (fetched live this round, not from training-data memory) — its own default
+# CNI: "canal" (a Flannel dataplane + Calico policy-only hybrid), not k3s's
+# embedded Flannel. RKE2_CONTAINERD_SOCKET/RKE2_CONTAINERD_STATE_DIR/RKE2_CNI_CONF_DIR below
+# were CONFIRMED LIVE against a real RKE2 v1.35.6+rke2r1 node this round (sprint51-rke2,
+# pm-cp1/pm-w1/pm-w2), superseding the earlier guessed values:
+#   - containerd socket + task-bundle "state" tree: RKE2's containerd config.toml sets
+#     state = "/run/k3s/containerd" — RKE2 reuses the EXACT SAME /run/k3s/containerd path
+#     k3s uses (both are Rancher's embedded-containerd packaging), confirmed by the running
+#     shim/runc processes' --address and --bundle paths. containerd's "root" (persistent
+#     image/snapshot store, NOT the runtime task-bundle dir the criu-dump.log fix cares
+#     about) is the RKE2-specific /var/lib/rancher/rke2/agent/containerd, but that is not
+#     what RKE2_CONTAINERD_STATE_DIR needs to be — the task-bundle/work dir (where runc
+#     writes criu-dump.log) lives directly under the run root, so STATE_DIR = same value
+#     as SOCKET's directory, matching k3s's already-shipped override exactly. No new Go
+#     code path or third distinct value was needed here.
+#   - CNI conf dir: RKE2 writes its canal conflist straight to the CANONICAL
+#     /etc/cni/net.d/10-canal.conflist — unlike k3s (which writes under
+#     /var/lib/rancher/k3s/agent/etc/cni/net.d and needs the extraConfDir override),
+#     RKE2 needs NO extraConfDir override at all; nmcregistrar's existing default scan of
+#     /etc/cni/net.d already finds it. RKE2_CNI_CONF_DIR is kept as an override knob for
+#     completeness but defaults to empty (no extra dir) to reflect this.
+RKE2_VERSION="${RKE2_VERSION:-}"                 # empty = get.rke2.io installs the current stable channel
+RKE2_CNI="${RKE2_CNI:-}"                          # empty = RKE2's own default (canal) — this sprint's scope is proving RKE2 on its OWN default CNI, not a CNI swap
+RKE2_INSTALL_EXTRA_ARGS="${RKE2_INSTALL_EXTRA_ARGS:-}"
+RKE2_SUPERVISOR_PORT="${RKE2_SUPERVISOR_PORT:-9345}"   # RKE2 agents join the supervisor API on 9345, NOT the k8s API's 6443
+RKE2_TOKEN_FILE="${RKE2_TOKEN_FILE:-/var/lib/rancher/rke2/server/node-token}"
+RKE2_KUBECONFIG_PATH="${RKE2_KUBECONFIG_PATH:-/etc/rancher/rke2/rke2.yaml}"
+RKE2_DATA_DIR="${RKE2_DATA_DIR:-/var/lib/rancher/rke2}"
+RKE2_CONTAINERD_SOCKET="${RKE2_CONTAINERD_SOCKET:-/run/k3s/containerd/containerd.sock}"       # CONFIRMED LIVE 2026-07 against RKE2 v1.35.6+rke2r1
+RKE2_CONTAINERD_STATE_DIR="${RKE2_CONTAINERD_STATE_DIR:-/run/k3s/containerd}"                 # CONFIRMED LIVE — same run root as the socket, NOT /var/lib/rancher/rke2/agent/containerd (that's containerd's image/snapshot "root", not the task-bundle/work dir)
+RKE2_CNI_CONF_DIR="${RKE2_CNI_CONF_DIR:-}"                                                     # CONFIRMED LIVE — RKE2 writes to canonical /etc/cni/net.d already; no extra scan dir needed
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
@@ -480,6 +521,158 @@ cmd_reset_cluster_k3s() {
   echo "      CONTAINERD_ADDRESS=$K3S_CONTAINERD_SOCKET \\"
   echo "      AGENT_CONTAINERD_SOCKET_PATH=$K3S_CONTAINERD_SOCKET \\"
   echo "      AGENT_CONTAINERD_STATE_DIR=$K3S_CONTAINERD_STATE_DIR \\"
+  echo "      TAG=<tag> bash hack/kvm-cluster.sh deploy-podmotion"
+}
+
+# ── reset-cluster-rke2: alternative reset-cluster mode, same 3 standing VMs ──
+# Sibling of cmd_reset_cluster / cmd_reset_cluster_k3s, not a mode flag inside
+# either — RKE2 diverges from BOTH kubeadm and k3s at almost every step: own
+# server/agent binaries, own installer (get.rke2.io), own systemd unit names
+# (rke2-server/rke2-agent), config driven by a file
+# (/etc/rancher/rke2/config.yaml) the systemd unit reads at start rather than
+# k3s's inline INSTALL_*_EXEC idiom, agents join the SUPERVISOR api on port
+# 9345 (not 6443), and — per docs.rke2.io (fetched live this round) — its own
+# default CNI is "canal" (Flannel dataplane + Calico policy-only), not k3s's
+# embedded Flannel. This function installs RKE2 on its OWN DEFAULT CNI
+# (canal) — sprint51's explicit scope is proving the distribution +
+# provisioning + a Cold-mode migration first; a Cilium-on-RKE2 CNI swap is a
+# separate, later round (see RKE2_CNI above, left empty by default).
+cmd_reset_cluster_rke2() {
+  assert_no_vm_destruction
+  load_ips
+  echo "==> RESET (rke2): removing any existing kubeadm/k3s/RKE2 state on all nodes (VMs are NOT destroyed)..."
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    echo "  -- clean $ip"
+    # Symmetric N-way swap, same reasoning as the k3s reset: whichever distro
+    # was previously installed, run ITS OWN uninstaller before the incoming
+    # RKE2 install — a stale kubeadm cert/manifest tree, a stale k3s data dir,
+    # or a stale RKE2 data dir can each collide with the other distros' fresh
+    # init if left behind.
+    nsh "$ip" '
+      set -e
+      if command -v kubeadm >/dev/null 2>&1; then
+        sudo kubeadm reset -f 2>/dev/null || true
+      fi
+      sudo rm -rf /etc/cni/net.d "$HOME/.kube" /etc/kubernetes/manifests/* 2>/dev/null || true
+      if [ -x /usr/local/bin/k3s-uninstall.sh ]; then
+        sudo /usr/local/bin/k3s-uninstall.sh || true
+      fi
+      if [ -x /usr/local/bin/k3s-agent-uninstall.sh ]; then
+        sudo /usr/local/bin/k3s-agent-uninstall.sh || true
+      fi
+      sudo rm -rf /etc/rancher/k3s /var/lib/rancher/k3s 2>/dev/null || true
+      # RKE2'"'"'s own uninstallers — separate scripts from k3s'"'"'s, dropped by the
+      # RKE2 installer at a fixed path regardless of server/agent role.
+      if [ -x /usr/local/bin/rke2-uninstall.sh ]; then
+        sudo /usr/local/bin/rke2-uninstall.sh || true
+      fi
+      if [ -x /usr/local/bin/rke2-killall.sh ]; then
+        sudo /usr/local/bin/rke2-killall.sh || true
+      fi
+      sudo rm -rf /etc/rancher/rke2 /var/lib/rancher/rke2 2>/dev/null || true
+      # Same stale CNI IPAM lease problem the k3s reset guards against
+      # (cd304e9) — host-local/bridge plugin leases from ANY prior CNI
+      # (kubeadm+Flannel, k3s+Flannel, or a prior RKE2+canal run) survive
+      # every distro'"'"'s own reset/uninstall and hand the wrong pod-CIDR IPs to
+      # the first pods scheduled after the incoming CNI comes up.
+      sudo rm -rf /var/lib/cni/networks 2>/dev/null || true
+    '
+  done
+
+  # Same leftover-interface/iptables-chain problem cmd_reset_cluster and
+  # cmd_reset_cluster_k3s guard against. Canal'"'"'s policy component ships the
+  # same Calico node/felix binaries as standalone Calico, installing the same
+  # cali-* iptables chains — already covered by the existing "calico" row in
+  # CNI_LEFTOVER_REGISTRY, no new row needed for that half. Canal'"'"'s dataplane
+  # is a Flannel VXLAN device (flannel.1/cni0), which — like the kubeadm/k3s
+  # Flannel paths — is the RESET-TARGET's own interface when resetting INTO
+  # canal, not prior-CNI residue, so it stays excluded from the registry for
+  # the same reason Flannel is excluded there already.
+  sweep_cni_leftovers
+
+  echo "==> Restarting containerd + waiting for CRI readiness on all nodes (post-reset race guard)..."
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    nsh "$ip" "sudo systemctl restart containerd 2>/dev/null || true; for i in \$(seq 1 30); do sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock info >/dev/null 2>&1 && { echo '  CRI ready on '\$(hostname); break; }; sleep 2; done"
+  done
+
+  echo "==> Installing RKE2 server on $CP_VM ($CP1_IP)..."
+  # RKE2 does not take k3s'"'"'s inline INSTALL_*_EXEC idiom — its systemd unit
+  # reads /etc/rancher/rke2/config.yaml at start, so the config must exist
+  # BEFORE `systemctl start rke2-server`, not passed as an install-time env var.
+  nsh "$CP1_IP" "sudo mkdir -p /etc/rancher/rke2"
+  local cp_config="node-ip: $CP1_IP
+advertise-address: $CP1_IP
+tls-san:
+  - $CP1_IP
+write-kubeconfig-mode: \"0644\""
+  if [[ -n "$RKE2_CNI" ]]; then
+    cp_config="$cp_config
+cni: $RKE2_CNI"
+  fi
+  if [[ -n "$RKE2_INSTALL_EXTRA_ARGS" ]]; then
+    cp_config="$cp_config
+$RKE2_INSTALL_EXTRA_ARGS"
+  fi
+  printf '%s\n' "$cp_config" | nsh "$CP1_IP" "sudo tee /etc/rancher/rke2/config.yaml >/dev/null"
+  nsh "$CP1_IP" "curl -sfL https://get.rke2.io | ${RKE2_VERSION:+INSTALL_RKE2_VERSION=$RKE2_VERSION }sudo sh -"
+  nsh "$CP1_IP" "sudo systemctl enable --now rke2-server.service"
+
+  echo "==> Waiting for RKE2 node-token on $CP_VM..."
+  local i
+  for i in $(seq 1 60); do
+    if nsh "$CP1_IP" "sudo test -f $RKE2_TOKEN_FILE"; then break; fi
+    sleep 2
+  done
+  local rke2_token
+  rke2_token="$(nsh "$CP1_IP" "sudo cat $RKE2_TOKEN_FILE")"
+  if [[ -z "$rke2_token" ]]; then
+    echo "ERROR: could not read RKE2 node-token from $CP1_IP:$RKE2_TOKEN_FILE." >&2
+    exit 1
+  fi
+
+  # RKE2's own kubectl/crictl/ctr live under $RKE2_DATA_DIR/bin, not on the
+  # default PATH — wait for the API server to actually answer before joining
+  # workers, using RKE2's own bundled kubectl against its own kubeconfig.
+  echo "==> Waiting for RKE2 API server to become reachable on $CP_VM..."
+  for i in $(seq 1 60); do
+    if nsh "$CP1_IP" "sudo $RKE2_DATA_DIR/bin/kubectl --kubeconfig $RKE2_KUBECONFIG_PATH get --raw=/readyz" >/dev/null 2>&1; then
+      echo "  API server ready."
+      break
+    fi
+    sleep 2
+  done
+
+  echo "==> Installing RKE2 agent on workers, joining $CP1_IP:$RKE2_SUPERVISOR_PORT..."
+  for ip in "${WORKER_IPS[@]}"; do
+    echo "  -- join worker $ip"
+    nsh "$ip" "sudo mkdir -p /etc/rancher/rke2"
+    local worker_config="node-ip: $ip
+server: https://$CP1_IP:$RKE2_SUPERVISOR_PORT
+token: $rke2_token"
+    printf '%s\n' "$worker_config" | nsh "$ip" "sudo tee /etc/rancher/rke2/config.yaml >/dev/null"
+    nsh "$ip" "curl -sfL https://get.rke2.io | ${RKE2_VERSION:+INSTALL_RKE2_VERSION=$RKE2_VERSION }INSTALL_RKE2_TYPE=agent sudo sh -"
+    nsh "$ip" "sudo systemctl enable --now rke2-agent.service"
+  done
+
+  echo "==> Exporting RKE2 kubeconfig to $KUBECONFIG_OUT..."
+  # RKE2's generated kubeconfig also embeds a loopback server address
+  # (https://127.0.0.1:6443), same as k3s — rewrite it to the real CP1 IP so
+  # KUBECONFIG_OUT is usable off-node, matching this script's assumption.
+  nsh "$CP1_IP" "sudo cat $RKE2_KUBECONFIG_PATH" | sed "s#https://127.0.0.1:6443#https://$CP1_IP:6443#" > "$KUBECONFIG_OUT"
+  chmod 600 "$KUBECONFIG_OUT"
+
+  echo "==> Waiting for 3 nodes Ready..."
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl wait --for=condition=Ready nodes --all --timeout=300s
+  cmd_verify
+
+  echo "==> reset-cluster-rke2 complete."
+  echo "    RKE2 containerd socket:  $RKE2_CONTAINERD_SOCKET (confirmed live against pm-cp1/pm-w1/pm-w2)"
+  echo "    RKE2 containerd state:   $RKE2_CONTAINERD_STATE_DIR (confirmed live — same run root as socket)"
+  echo "    RKE2 CNI conf dir:       canonical /etc/cni/net.d — no extraConfDir override needed (confirmed live)"
+  echo "    Deploy PodMotion against this cluster with:"
+  echo "      CONTAINERD_ADDRESS=$RKE2_CONTAINERD_SOCKET \\"
+  echo "      AGENT_CONTAINERD_SOCKET_PATH=$RKE2_CONTAINERD_SOCKET \\"
+  echo "      AGENT_CONTAINERD_STATE_DIR=$RKE2_CONTAINERD_STATE_DIR \\"
   echo "      TAG=<tag> bash hack/kvm-cluster.sh deploy-podmotion"
 }
 
@@ -1281,12 +1474,13 @@ cmd_cutover() {
 
 usage() {
   cat >&2 <<EOF
-Usage: hack/kvm-cluster.sh <verify|reset-cluster|reset-cluster-k3s|deploy-podmotion|provision-shared-storage|provision-longhorn|provision-cilium|cutover|provision-calico|cutover-calico|wipe|ssh <node-ip> [cmd]>
+Usage: hack/kvm-cluster.sh <verify|reset-cluster|reset-cluster-k3s|reset-cluster-rke2|deploy-podmotion|provision-shared-storage|provision-longhorn|provision-cilium|cutover|provision-calico|cutover-calico|wipe|ssh <node-ip> [cmd]>
 
   verify            assert 3 nodes Ready via $KUBECONFIG_OUT
   reset-cluster     kubeadm reset+reinit+flannel+join ON the standing VMs (NEVER destroys VMs)
   reset-cluster-k3s k3s install (stock, embedded Flannel) ON the standing VMs (NEVER destroys VMs) — sprint50
-  deploy-podmotion  build+import images, mint mTLS, apply CRDs, helm install (TAG=<tag>; CONTAINERD_ADDRESS/AGENT_CONTAINERD_SOCKET_PATH/AGENT_CONTAINERD_STATE_DIR for k3s)
+  reset-cluster-rke2 RKE2 install (stock, default canal CNI) ON the standing VMs (NEVER destroys VMs) — sprint51
+  deploy-podmotion  build+import images, mint mTLS, apply CRDs, helm install (TAG=<tag>; CONTAINERD_ADDRESS/AGENT_CONTAINERD_SOCKET_PATH/AGENT_CONTAINERD_STATE_DIR for k3s/RKE2)
   provision-shared-storage  NFS server on cp + nfs-common on all + RWX StorageClass $NFS_STORAGE_CLASS
   provision-longhorn  attach $LH_DISK_SIZE $LH_DISK_TARGET per node + Longhorn + SCs ($LH_STORAGE_CLASS, $LH_MIGRATABLE_SC)
   provision-cilium  pre-import Cilium images + helm install cilium/cilium $CILIUM_CHART_VERSION (cluster-pool/geneve/kube-proxy-replacement)
@@ -1306,6 +1500,7 @@ main() {
     verify)           cmd_verify ;;
     reset-cluster)    cmd_reset_cluster ;;
     reset-cluster-k3s) cmd_reset_cluster_k3s ;;
+    reset-cluster-rke2) cmd_reset_cluster_rke2 ;;
     deploy-podmotion) cmd_deploy_podmotion ;;
     provision-shared-storage) cmd_provision_shared_storage ;;
     provision-longhorn) cmd_provision_longhorn ;;
