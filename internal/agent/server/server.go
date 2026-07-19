@@ -3656,6 +3656,52 @@ func cgroupContainsPodUID(data, podUID string) bool {
 	return false
 }
 
+// podUIDFromCgroupsPath extracts the destination pod UID from containerCgroupsPath — the SAME
+// trusted NRI-carried input that produces CgroupPath/resolveCgroupAnchorTarget's leaf — BEFORE
+// any symlink resolution (ADR-0351 D2.5). This is the caller-side half of the move_cgroup
+// ExpectedPodUID cross-check (see netnsbroker.Request.ExpectedPodUID's doc comment).
+//
+// systemd cgroup slice names always encode the pod UID with '_' in place of '-' (e.g.
+// "kubepods-besteffort-pod34b0b99f_b322_4cd8_b4e2_6b3003963468.slice") — the exact same
+// substitution cgroupUIDVariants above generates when matching in the other direction. This
+// scans for a "pod"-prefixed 36-character UUID token in EITHER encoding — the systemd
+// underscore form (4 '_' in place of the UUID's 4 '-' separators, same substitution
+// cgroupUIDVariants performs) and the standard hyphenated form (the UUID's own 4 '-'
+// separators, unmodified) — which is what resolveCgroupAnchorTarget's sibling
+// isSliceToken/expandSliceToken path deliberately keeps a raw-path passthrough for (a future
+// cgroupfs-driver substrate that delivers an already-hyphenated path). Reuses the same
+// length+separator-count structural check both branches already use, rather than inventing new
+// UUID-validation logic, and normalizes the underscore form to the canonical hyphenated form
+// this function always returns.
+func podUIDFromCgroupsPath(containerCgroupsPath string) (string, error) {
+	const marker = "pod"
+	searchEnd := len(containerCgroupsPath)
+	for searchEnd > 0 {
+		idx := strings.LastIndex(containerCgroupsPath[:searchEnd], marker)
+		if idx == -1 {
+			break
+		}
+		rest := containerCgroupsPath[idx+len(marker):]
+		token := rest
+		if end := strings.IndexAny(rest, "./:"); end != -1 {
+			token = rest[:end]
+		}
+		// A pod UID is a 36-character UUID (32 hex + 4 separators); systemd encodes it with
+		// '_' in place of '-' (same substitution cgroupUIDVariants performs).
+		if len(token) == 36 && strings.Count(token, "_") == 4 {
+			return strings.ReplaceAll(token, "_", "-"), nil
+		}
+		// Standard hyphenated UUID shape (8-4-4-4-12 hex groups joined by exactly 4 '-'
+		// separators, no '_') — already the canonical form this function returns, so no
+		// substitution needed.
+		if len(token) == 36 && strings.Count(token, "-") == 4 && strings.Count(token, "_") == 0 {
+			return token, nil
+		}
+		searchEnd = idx
+	}
+	return "", fmt.Errorf("ADR-0351 D2.5: could not extract pod UID from cgroup path %q", containerCgroupsPath)
+}
+
 // scanProcForPodUID looks through /proc/*/cgroup for any entry containing podUID.
 // Returns true if found. Ignores errors (best-effort).
 func scanProcForPodUID(podUID string) bool {
@@ -5547,7 +5593,16 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 			logCgroupAnchorOutcome(migrationName, "failed-closed-resolve", aerr)
 			return 0, nil, fmt.Errorf("ADR-0351: resolve cgroup anchor for sandbox %s: %w", sandboxID, aerr)
 		}
-		if merr := moveProcessToPodCgroupFn(pid, anchorTarget); merr != nil {
+		// ADR-0351 D2.5: the destination pod UID cross-check the broker's move_cgroup op
+		// requires, extracted from the SAME trusted NRI-carried containerCgroupsPath that
+		// produced anchorTarget above, before any symlink resolution.
+		expectedPodUID, uerr := podUIDFromCgroupsPath(containerCgroupsPath)
+		if uerr != nil {
+			reapRestoredProcessTreeFn(pid, criuWrapperPID) // ADR-0351 G5
+			logCgroupAnchorOutcome(migrationName, "failed-closed-poduid", uerr)
+			return 0, nil, fmt.Errorf("ADR-0351 D2.5: resolve expected pod UID for sandbox %s: %w", sandboxID, uerr)
+		}
+		if merr := moveProcessToPodCgroupFn(pid, anchorTarget, expectedPodUID); merr != nil {
 			reapRestoredProcessTreeFn(pid, criuWrapperPID) // ADR-0351 G5
 			logCgroupAnchorOutcome(migrationName, "failed-closed-write", merr)
 			return 0, nil, fmt.Errorf("ADR-0351: move restored PID %d into cgroup %s: %w", pid, anchorTarget, merr)
@@ -6027,14 +6082,19 @@ var moveProcessToPodCgroupFn = moveProcessToPodCgroup
 // host-rooted-cgroup-namespace property — see netnsbroker execAllowlist's doc comment), so its
 // write reaches the target. A PID-reuse (starttime) guard, same as every other broker op that
 // targets a PID the broker never spawned (SignalPID/KillSourcePID/ProcAlive), protects the move.
-func moveProcessToPodCgroup(pid int, podCgroupPath string) error {
+// expectedPodUID (ADR-0351 D2.5) is the destination pod UID extracted from the same trusted
+// NRI-carried containerCgroupsPath that produced podCgroupPath (see podUIDFromCgroupsPath) —
+// threaded through to the broker so it can independently re-check the resolved cgroup path
+// still belongs to this migration's destination pod (see netnsbroker.Request.ExpectedPodUID's
+// doc comment for why kind's host-cgroup-namespace-rooted broker needs this backstop).
+func moveProcessToPodCgroup(pid int, podCgroupPath string, expectedPodUID string) error {
 	startTime, stErr := readProcStartTime(int32(pid))
 	if stErr != nil {
 		return fmt.Errorf("read starttime for restored PID %d before cgroup move: %w", pid, stErr)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := netnsBrokerClientFn().MoveCgroup(ctx, pid, podCgroupPath, startTime); err != nil {
+	if err := netnsBrokerClientFn().MoveCgroup(ctx, pid, podCgroupPath, startTime, expectedPodUID); err != nil {
 		return fmt.Errorf("move PID %d into cgroup %s via broker: %w", pid, podCgroupPath, err)
 	}
 	return nil

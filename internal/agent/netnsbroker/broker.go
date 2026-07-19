@@ -272,6 +272,21 @@ type Request struct {
 	// mount namespace, is what gates this operation, and the broker's own process
 	// already sits in the host cgroup namespace.
 	CgroupPath string `json:"cgroupPath,omitempty"`
+
+	// ExpectedPodUID is the destination pod UID the caller (server.go) extracted
+	// from the SAME trusted NRI-carried input (containerCgroupsPath) that produced
+	// CgroupPath, BEFORE any symlink resolution. Required on move_cgroup. The
+	// broker independently re-checks that the resolved CgroupPath still contains
+	// this UID (see cgroupPathContainsPodUID) — on every other platform, a
+	// de-privileged agent's own private cgroup namespace makes it kernel-
+	// impossible to reach a DIFFERENT pod's cgroup even given a wrong/attacker-
+	// influenced path; the broker has no such backstop (it is deliberately
+	// host-cgroup-namespace-rooted — see CgroupPath's doc comment above), so this
+	// check is what keeps move_cgroup's blast radius equivalent to "this one
+	// migration's own destination pod" rather than "any pod under the shared
+	// kubepods root" (Chad, 2026-07-19: kind's posture must stay uniform with the
+	// other platforms', not merely code-identical to them).
+	ExpectedPodUID string `json:"expectedPodUID,omitempty"`
 }
 
 // Response is the JSON wire response. Error is "" on success.
@@ -540,7 +555,7 @@ func Handle(req Request) Response {
 		// ADR-0351 D2 (sprint53-kind): move an already-restored PID's whole thread
 		// group into its container's own cgroup v2 scope. See CgroupPath's doc
 		// comment on Request for why this must be a broker op.
-		return doMoveCgroup(req.SignalPID, req.CgroupPath, req.ExpectedStartTime)
+		return doMoveCgroup(req.SignalPID, req.CgroupPath, req.ExpectedStartTime, req.ExpectedPodUID)
 	case "netns_exec_start":
 		// ADR-0326: spawn an allowlisted command inside the target pod's NET
 		// namespace DETACHED (the __inetns_echo listener, which must outlive the
@@ -1277,8 +1292,11 @@ func doKillSourcePID(pid int, expectedStartTime uint64) Response {
 
 // cgroupFsRoot is the broker's own view of the cgroup v2 mount point. The broker
 // is privileged:true and unconfined, so this is the real host cgroupfs root
-// (never a namespaced/masked view) — see CgroupPath's doc comment on Request.
-const cgroupFsRoot = "/sys/fs/cgroup"
+// (never a namespaced/masked view) — see CgroupPath's doc comment on Request. A
+// package var (not a bare constant), mirroring server.go's identically-named
+// cgroupFsRoot, so tests can point it at a fixture tree instead of a real host
+// /sys/fs/cgroup.
+var cgroupFsRoot = "/sys/fs/cgroup"
 
 // moveCgroupAllowedRoots mirrors the allowlist server.go's resolveCgroupAnchorTarget
 // (ADR-0351 D2.4/BD-10) enforces agent-side. The broker is the actual privileged
@@ -1294,6 +1312,18 @@ func moveCgroupAllowedRoots() []string {
 	}
 }
 
+// cgroupPathContainsPodUID mirrors server.go's cgroupUIDVariants/cgroupContainsPodUID
+// (can't import them directly — server.go imports this package, not the reverse).
+// cgroup v2 on systemd encodes pod UIDs with underscores
+// (kubepods-besteffort-pod<uid_with_underscores>.slice), so both forms are checked.
+func cgroupPathContainsPodUID(path, podUID string) bool {
+	underscored := strings.ReplaceAll(podUID, "-", "_")
+	if strings.Contains(path, podUID) {
+		return true
+	}
+	return underscored != podUID && strings.Contains(path, underscored)
+}
+
 // doMoveCgroup implements the move_cgroup op (ADR-0351 D2, sprint53-kind): writes
 // pid into the cgroup.procs file of the container's own cgroup v2 scope, run from
 // the broker's own (host-rooted) cgroup namespace — see CgroupPath's doc comment
@@ -1306,12 +1336,21 @@ func moveCgroupAllowedRoots() []string {
 // cgroupPath is independently re-confined here (EvalSymlinks + prefix check against
 // moveCgroupAllowedRoots) rather than trusted from the client — see
 // moveCgroupAllowedRoots' doc comment.
-func doMoveCgroup(pid int, cgroupPath string, expectedStartTime uint64) Response {
+//
+// expectedPodUID is re-derived and re-checked here too, not just trusted as a
+// caller-computed boolean: on kind the broker shares the host cgroup namespace
+// (no kernel-level per-pod isolation backstop), so the allowlist-root check alone
+// only proves "somewhere under kubepods," not "this migration's destination pod."
+// Requiring the resolved path to actually contain expectedPodUID closes that gap.
+func doMoveCgroup(pid int, cgroupPath string, expectedStartTime uint64, expectedPodUID string) Response {
 	if pid <= 0 {
 		return Response{Error: fmt.Sprintf("move_cgroup: pid %d must be positive", pid)}
 	}
 	if cgroupPath == "" {
 		return Response{Error: "move_cgroup: empty cgroupPath"}
+	}
+	if expectedPodUID == "" {
+		return Response{Error: fmt.Sprintf("move_cgroup: no expected pod UID supplied for pid %d — refusing to move without a destination-pod identity", pid)}
 	}
 	if expectedStartTime == 0 {
 		return Response{Error: fmt.Sprintf("move_cgroup: no expected starttime supplied for pid %d — refusing to move without a PID-reuse identity", pid)}
@@ -1339,6 +1378,10 @@ func doMoveCgroup(pid int, cgroupPath string, expectedStartTime uint64) Response
 	if !allowed {
 		return Response{Error: fmt.Sprintf("move_cgroup: cgroup path %q resolves to %q, outside %s — refusing (path-confinement)",
 			cgroupPath, resolved, strings.Join(moveCgroupAllowedRoots(), " or "))}
+	}
+	if !cgroupPathContainsPodUID(resolved, expectedPodUID) {
+		return Response{Error: fmt.Sprintf("move_cgroup: cgroup path %q does not contain expected pod UID %q — refusing (pod-confinement)",
+			resolved, expectedPodUID)}
 	}
 
 	procsPath := filepath.Join(resolved, "cgroup.procs")

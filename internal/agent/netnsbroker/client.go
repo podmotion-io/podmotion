@@ -230,8 +230,14 @@ func (c *Client) KillSourcePID(ctx context.Context, pid int, expectedStarttime u
 // relies on to resolve host-absolute /proc/<pid>/cgroup paths), so the target is
 // always reachable there. Same PID-reuse (starttime) guard as SignalPID/
 // KillSourcePID: expectedStarttime==0 is rejected server-side.
-func (c *Client) MoveCgroup(ctx context.Context, pid int, cgroupPath string, expectedStarttime uint64) error {
-	resp, err := c.do(ctx, Request{Op: "move_cgroup", SignalPID: pid, CgroupPath: cgroupPath, ExpectedStartTime: expectedStarttime})
+//
+// expectedPodUID (ADR-0351 D2.5, sprint53-kind hardening) is the destination pod
+// UID, re-checked broker-side against the resolved cgroup path — required because
+// on kind the broker shares the host cgroup namespace, so the allowlist-root check
+// alone can't distinguish this migration's destination pod from any other pod's
+// cgroup under the same root. See doMoveCgroup's doc comment (broker.go).
+func (c *Client) MoveCgroup(ctx context.Context, pid int, cgroupPath string, expectedStarttime uint64, expectedPodUID string) error {
+	resp, err := c.do(ctx, Request{Op: "move_cgroup", SignalPID: pid, CgroupPath: cgroupPath, ExpectedStartTime: expectedStarttime, ExpectedPodUID: expectedPodUID})
 	if err != nil {
 		return fmt.Errorf("netns-broker move_cgroup %d %s: %w", pid, cgroupPath, err)
 	}
