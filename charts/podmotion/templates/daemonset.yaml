@@ -361,6 +361,23 @@ spec:
               mountPath: /var/run/nri
             - name: sys
               mountPath: /sys
+            # Sprint53 (kind Cilium revival), verified live: containerd's CRI mount-merge only
+            # skips its own default /sys/fs/cgroup entry when that EXACT destination is already
+            # present in the container's requested mounts. The /sys rbind above recursively
+            # covers /sys/fs/cgroup content-wise, but its destination is "/sys", not
+            # "/sys/fs/cgroup" — so CRI's merge does not recognize it as already-requested and
+            # layers its own default cgroup-type mount (source=cgroup, ro, container's own
+            # cgroup-namespace-relative view) on top, AFTER the /sys rbind in the OCI mounts
+            # list. That default mount silently shadows the live host cgroupfs the agent needs
+            # for ADR-0351's cgroup-anchor write: every restore on kind failed closed with
+            # "write PID ... to .../cgroup.procs: no such file or directory" even though the
+            # exact same path, confirmed live via `docker exec <node> find ...`, existed on the
+            # host the whole time — the agent process just could not see it through the
+            # shadowing default mount. An explicit /sys/fs/cgroup destination here makes CRI
+            # recognize the mount as already-requested and skip adding its own, restoring the
+            # live, read-write, unnamespaced host cgroupfs view the anchor write depends on.
+            - name: sys-fs-cgroup
+              mountPath: /sys/fs/cgroup
             - name: host-usr-sbin
               mountPath: /usr/sbin
               readOnly: true
@@ -419,6 +436,9 @@ spec:
         - name: sys
           hostPath:
             path: /sys
+        - name: sys-fs-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
         - name: nri-socket
           hostPath:
             path: /var/run/nri
