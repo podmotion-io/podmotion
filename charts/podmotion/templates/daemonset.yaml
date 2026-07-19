@@ -66,6 +66,7 @@ spec:
           volumeMounts:
             - name: run-podmotion
               mountPath: /run/podmotion
+        {{- if ne .Values.agent.apparmorProfile "unconfined" }}
         - name: install-apparmor-profile
           image: busybox:1.36
           # ADR-0300: loads the narrow podmotion-agent AppArmor profile onto
@@ -81,6 +82,17 @@ spec:
           # Idempotent (apparmor_parser -r replaces/reloads) and re-runs on
           # every rollout, so profile drift between the ConfigMap and the host
           # file cannot occur.
+          # Sprint53 (kind Cilium revival), verified live: this init container is
+          # SKIPPED when agent.apparmorProfile=unconfined. It used to run
+          # unconditionally regardless of the value.yaml setting, unconditionally
+          # hostPath-mounting /etc/apparmor.d — on kind's node image (a bare
+          # container, no AppArmor userspace/LSM surface at all) that path doesn't
+          # exist as a directory, so the mount fails outright
+          # ("hostPath type check failed: /etc/apparmor.d is not a directory") and
+          # every agent pod hangs forever at Init:0/4. The values.yaml comment
+          # already documents apparmorProfile=unconfined as the intended
+          # "explicit degraded-but-working" fallback for exactly this substrate —
+          # this guard is what actually makes that fallback usable.
           securityContext:
             privileged: true
           command:
@@ -97,6 +109,7 @@ spec:
               readOnly: true
             - name: host-etc-apparmor-d
               mountPath: /host-etc-apparmor-d
+        {{- end }}
         - name: init-checkpoint-tmpfs
           image: busybox:1.36
           # ADR-0148 SD-1 (Amendment SD-1-INIT-B): init-ONLY privilege for host
@@ -372,6 +385,7 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
+        {{- if ne .Values.agent.apparmorProfile "unconfined" }}
         # ADR-0300: source of the podmotion-agent AppArmor profile, populated
         # from charts/podmotion/files/apparmor/podmotion-agent.profile via a
         # ConfigMap (see configmap-apparmor.yaml). Mounted read-only into the
@@ -381,10 +395,13 @@ spec:
             name: podmotion-agent-apparmor-profile
         # ADR-0300: host /etc/apparmor.d — the init container copies the profile
         # here and apparmor_parser -r reads it from the host mount namespace.
+        # Sprint53: guarded off (with the init container above) when
+        # agent.apparmorProfile=unconfined — see install-apparmor-profile comment.
         - name: host-etc-apparmor-d
           hostPath:
             path: /etc/apparmor.d
             type: Directory
+        {{- end }}
         {{- if .Values.agent.tls.enabled }}
         - name: agent-tls
           secret:
