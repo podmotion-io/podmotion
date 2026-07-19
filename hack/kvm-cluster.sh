@@ -1472,9 +1472,167 @@ cmd_cutover() {
   echo "==> Cutover complete: Flannel/kube-proxy removed (or already absent), Cilium sole CNI-of-record on all nodes."
 }
 
+# ── provision-cilium-rke2 / cutover-canal-rke2 (sprint52, RKE2-specific) ────
+# RKE2 ships its own default CNI (canal) via a server-side --cni flag and its
+# addon-manager (HelmChart CRs reconciled from /var/lib/rancher/rke2/server/
+# manifests/, NOT the same install path cmd_provision_cilium/cmd_cutover use
+# on the kubeadm substrate). Confirmed LIVE this round against a real RKE2
+# v1.35.6+rke2r1 cluster (sprint52-rke2-cilium), not assumed from k3s's
+# --flannel-backend=none idiom (a DIFFERENT distribution, per the RKE2 header
+# comment above RKE2_VERSION):
+#   - RKE2's own mechanism to disable the built-in CNI is `cni: none` in
+#     /etc/rancher/rke2/config.yaml on the SERVER node, followed by a
+#     `systemctl restart rke2-server`. On restart, RKE2's addon-manager
+#     regenerates the desired manifest set, drops rke2-canal.yaml (since
+#     canal is no longer selected), deletes the owned HelmChart CR, and the
+#     helm-controller runs a real `helm uninstall` — this is the clean,
+#     RKE2-native equivalent of cmd_cutover_calico's k8s-object-removal step,
+#     not a manual `kubectl delete ds`.
+#   - kube-proxy on RKE2 is a PER-NODE static pod (not a DaemonSet — unlike
+#     kubeadm), controlled independently by each node's OWN config.yaml via
+#     `disable-kube-proxy: true` + a restart of that node's own rke2-server
+#     (control-plane) or rke2-agent (workers) service. Must be set on ALL
+#     THREE nodes, not just the server.
+#   - RKE2's own pod CIDR default is 10.42.0.0/16 (/24 per node) — DIFFERENT
+#     from the kubeadm substrate's hardcoded $POD_CIDR (10.244.0.0/16).
+#     RKE2_CILIUM_POD_CIDR below is intentionally a SEPARATE variable, not a
+#     rebind of the kubeadm-only $POD_CIDR global, to avoid silently breaking
+#     the kubeadm path.
+# Same install-then-verify-then-cutover discipline as cmd_provision_cilium/
+# cmd_cutover_calico: Cilium is installed and confirmed Ready BEFORE canal is
+# touched, so a stalled Cilium rollout never leaves the cluster CNI-less.
+# Does NOT modify cmd_provision_cilium, cmd_cutover, cmd_provision_calico,
+# cmd_cutover_calico, or cmd_reset_cluster_rke2. VMs never touched.
+RKE2_CILIUM_POD_CIDR="${RKE2_CILIUM_POD_CIDR:-10.42.0.0/16}"
+
+cmd_provision_cilium_rke2() {
+  assert_no_vm_destruction
+  load_ips
+  CILIUM_APISERVER_HOST="${CILIUM_APISERVER_HOST:-$CP1_IP}"
+
+  echo "==> [1/2] helm install cilium/cilium $CILIUM_CHART_VERSION on RKE2 (cluster-pool over RKE2's OWN pod CIDR $RKE2_CILIUM_POD_CIDR, geneve, kube-proxy-replacement)..."
+  # Images are expected to already be resident (imported by an earlier
+  # provision-cilium run on this same standing cluster, or pre-import them
+  # the same way cmd_provision_cilium does before running this). This
+  # function does not repeat the pre-import loop to avoid a second silent
+  # image-provenance path; run provision-cilium's [1/3] step manually first
+  # if starting from a node that has never pulled Cilium images.
+  helm repo add cilium https://helm.cilium.io >/dev/null 2>&1 || true
+  helm repo update cilium >/dev/null 2>&1 || true
+  KUBECONFIG="$KUBECONFIG_OUT" helm upgrade --install cilium cilium/cilium \
+    --version "$CILIUM_CHART_VERSION" --namespace "$CILIUM_NAMESPACE" \
+    --set ipam.mode=cluster-pool \
+    --set ipam.operator.clusterPoolIPv4PodCIDRList="{$RKE2_CILIUM_POD_CIDR}" \
+    --set ipam.operator.clusterPoolIPv4MaskSize=24 \
+    --set routingMode=tunnel \
+    --set tunnelProtocol=geneve \
+    --set endpointRoutes.enabled=true \
+    --set kubeProxyReplacement=true \
+    --set k8sServiceHost="$CILIUM_APISERVER_HOST" \
+    --set k8sServicePort="$CILIUM_APISERVER_PORT" \
+    --set bpf.masquerade=true \
+    --set enableIPv4Masquerade=true \
+    --set ipv4NativeRoutingCIDR="$RKE2_CILIUM_POD_CIDR" \
+    --set image.pullPolicy=IfNotPresent \
+    --set operator.image.pullPolicy=IfNotPresent \
+    --set operator.replicas=1
+
+  echo "==> [2/2] Waiting for Cilium to come up (cilium status --wait)..."
+  if command -v cilium >/dev/null 2>&1; then
+    KUBECONFIG="$KUBECONFIG_OUT" cilium status --wait
+  else
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" rollout status ds/cilium --timeout=300s
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" rollout status deploy/cilium-operator --timeout=300s
+  fi
+  echo "==> Cilium ready alongside canal (both active — canal's install-cni already renamed its own conflist to *.cilium_bak on each node). Run cutover-canal-rke2 to disable canal via RKE2's own mechanism."
+}
+
+cmd_cutover_canal_rke2() {
+  assert_no_vm_destruction
+  load_ips
+
+  echo "==> [1/4] Confirming Cilium is Ready on all nodes before disabling canal..."
+  local ready desired
+  ready=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" get ds cilium -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+  desired=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" get ds cilium -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo -1)
+  if [[ "$ready" -lt 1 || "$ready" != "$desired" ]]; then
+    echo "ERROR: cilium DaemonSet not fully Ready ($ready/$desired) — refusing to disable canal (cluster would be left with no CNI)." >&2
+    exit 1
+  fi
+  echo "  -- cilium DaemonSet Ready: $ready/$desired"
+
+  echo "==> [2/4] Disabling canal via RKE2's own mechanism (cni: none in server config.yaml, restart rke2-server)..."
+  nsh "$CP1_IP" "sudo cp /etc/rancher/rke2/config.yaml /etc/rancher/rke2/config.yaml.bak-canal-\$(date +%s) 2>/dev/null || true; grep -q '^cni: none' /etc/rancher/rke2/config.yaml || sudo bash -c 'echo \"cni: none\" >> /etc/rancher/rke2/config.yaml'"
+  nsh "$CP1_IP" "sudo systemctl restart rke2-server.service"
+  echo "  -- waiting for apiserver to come back..."
+  local waited=0
+  until KUBECONFIG="$KUBECONFIG_OUT" kubectl get nodes >/dev/null 2>&1; do
+    if (( waited >= 150 )); then
+      echo "ERROR: apiserver did not come back within 150s of rke2-server restart." >&2
+      exit 1
+    fi
+    sleep 5; waited=$((waited + 5))
+  done
+
+  echo "==> [3/4] Disabling kube-proxy static pods on all nodes (disable-kube-proxy: true, per-node — RKE2 kube-proxy is NOT a DaemonSet)..."
+  nsh "$CP1_IP" "grep -q '^disable-kube-proxy: true' /etc/rancher/rke2/config.yaml || sudo bash -c 'echo \"disable-kube-proxy: true\" >> /etc/rancher/rke2/config.yaml'"
+  nsh "$CP1_IP" "sudo systemctl restart rke2-server.service"
+  local ip
+  for ip in "${WORKER_IPS[@]}"; do
+    nsh "$ip" "grep -q '^disable-kube-proxy: true' /etc/rancher/rke2/config.yaml || sudo bash -c 'echo \"disable-kube-proxy: true\" >> /etc/rancher/rke2/config.yaml'"
+    nsh "$ip" "sudo systemctl restart rke2-agent.service"
+  done
+  waited=0
+  until KUBECONFIG="$KUBECONFIG_OUT" kubectl get nodes >/dev/null 2>&1; do
+    if (( waited >= 150 )); then
+      echo "ERROR: apiserver did not come back within 150s of rke2-server restart (kube-proxy disable step)." >&2
+      exit 1
+    fi
+    sleep 5; waited=$((waited + 5))
+  done
+  local kp
+  kp=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-system get pods -o name 2>/dev/null | grep -c '^pod/kube-proxy-' || true)
+  if [[ "$kp" -ne 0 ]]; then
+    echo "ERROR: $kp kube-proxy static pod(s) still present after disable-kube-proxy on all nodes." >&2
+    exit 1
+  fi
+  echo "  -- kube-proxy fully removed on all nodes"
+
+  echo "==> [4/4] Recreating pods still wired to canal's now-dead dataplane, then sweeping leftover canal/calico interfaces + iptables (CNI_LEFTOVER_REGISTRY 'calico' row — canal's policy component is Calico's felix/node binaries) and calico-kubeconfig..."
+  # Pods created before the cutover keep their existing (canal) netns/veth
+  # wiring undisturbed — same no-forced-restart discipline as cmd_cutover —
+  # so any Deployment/DaemonSet-managed workload that must move onto Cilium's
+  # CNI needs an explicit rollout restart. This step handles the RKE2-bundled
+  # in-cluster components only; caller is responsible for restarting their
+  # own workloads the same way if IP-mobility/Cilium-only invariants matter.
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-system rollout restart deploy/rke2-coredns-rke2-coredns deploy/rke2-coredns-rke2-coredns-autoscaler deploy/rke2-metrics-server deploy/rke2-snapshot-controller 2>/dev/null || true
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-system rollout restart daemonset/rke2-ingress-nginx-controller 2>/dev/null || true
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-system rollout status deploy/rke2-coredns-rke2-coredns --timeout=120s 2>/dev/null || true
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    nsh "$ip" "sudo ip link del flannel.1 2>/dev/null || true; sudo rm -f /etc/cni/net.d/calico-kubeconfig"
+  done
+  sweep_cni_leftovers
+
+  echo "==> [verify] each node's CNI conf dir contains only the active Cilium conflist (canal's is the inactive *.cilium_bak)..."
+  local confs
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    confs=$(nsh "$ip" "sudo ls /etc/cni/net.d/" 2>/dev/null || echo "UNKNOWN")
+    echo "  -- $ip: $confs"
+    if echo "$confs" | grep -Ei '\.(conf|conflist|json)$' | grep -qiE 'canal|calico|flannel'; then
+      echo "ERROR: node $ip still has an ACTIVE non-Cilium CNI conflist present after cutover." >&2
+      exit 1
+    fi
+    if ! echo "$confs" | grep -Ei '\.(conf|conflist|json)$' | grep -qi cilium; then
+      echo "ERROR: node $ip has no active Cilium conflist present after cutover." >&2
+      exit 1
+    fi
+  done
+  echo "==> Cutover complete: canal + kube-proxy disabled via RKE2's own mechanism, Cilium sole CNI-of-record on all nodes. Restart the podmotion-agent DaemonSet (rollout restart) to re-run nmcregistrar detection against the new CNI."
+}
+
 usage() {
   cat >&2 <<EOF
-Usage: hack/kvm-cluster.sh <verify|reset-cluster|reset-cluster-k3s|reset-cluster-rke2|deploy-podmotion|provision-shared-storage|provision-longhorn|provision-cilium|cutover|provision-calico|cutover-calico|wipe|ssh <node-ip> [cmd]>
+Usage: hack/kvm-cluster.sh <verify|reset-cluster|reset-cluster-k3s|reset-cluster-rke2|deploy-podmotion|provision-shared-storage|provision-longhorn|provision-cilium|cutover|provision-calico|cutover-calico|provision-cilium-rke2|cutover-canal-rke2|wipe|ssh <node-ip> [cmd]>
 
   verify            assert 3 nodes Ready via $KUBECONFIG_OUT
   reset-cluster     kubeadm reset+reinit+flannel+join ON the standing VMs (NEVER destroys VMs)
@@ -1487,6 +1645,8 @@ Usage: hack/kvm-cluster.sh <verify|reset-cluster|reset-cluster-k3s|reset-cluster
   cutover           Flannel→Cilium CNI cutover: verify Cilium Ready, remove Flannel/kube-proxy remnants
   provision-calico  pre-import Tigera Operator/Calico images + helm install operator + apply Installation CR (single non-strict-affinity IPPool, VXLAN, bpfEnabled=false)
   cutover-calico    previously-active-CNI→Calico cutover: verify Calico Ready, remove Flannel/Cilium remnants
+  provision-cilium-rke2  helm install cilium/cilium on RKE2 (cluster-pool over RKE2's own pod CIDR $RKE2_CILIUM_POD_CIDR) alongside canal — sprint52
+  cutover-canal-rke2     RKE2-native canal→Cilium cutover: verify Cilium Ready, disable canal via cni:none + restart rke2-server, disable kube-proxy per-node, sweep leftovers — sprint52
   wipe              clean k8s + PodMotion state on the VMs WITHOUT destroying the VMs
 
 This script REFUSES to 'virsh destroy'/'virsh undefine' any of: ${PM_VMS[*]}.
@@ -1509,6 +1669,8 @@ main() {
     cutover)          cmd_cutover ;;
     provision-calico) cmd_provision_calico ;;
     cutover-calico)   cmd_cutover_calico ;;
+    provision-cilium-rke2) cmd_provision_cilium_rke2 ;;
+    cutover-canal-rke2)    cmd_cutover_canal_rke2 ;;
     wipe)             cmd_wipe ;;
     ssh)              load_ips; nsh "$@" ;;
     *)                usage ;;
