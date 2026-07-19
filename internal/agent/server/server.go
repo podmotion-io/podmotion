@@ -5547,7 +5547,7 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 			logCgroupAnchorOutcome(migrationName, "failed-closed-resolve", aerr)
 			return 0, nil, fmt.Errorf("ADR-0351: resolve cgroup anchor for sandbox %s: %w", sandboxID, aerr)
 		}
-		if merr := moveProcessToPodCgroup(pid, anchorTarget); merr != nil {
+		if merr := moveProcessToPodCgroupFn(pid, anchorTarget); merr != nil {
 			reapRestoredProcessTreeFn(pid, criuWrapperPID) // ADR-0351 G5
 			logCgroupAnchorOutcome(migrationName, "failed-closed-write", merr)
 			return 0, nil, fmt.Errorf("ADR-0351: move restored PID %d into cgroup %s: %w", pid, anchorTarget, merr)
@@ -6002,16 +6002,40 @@ func resolveCgroupAnchorTarget(containerCgroupsPath, podCgroupParent string) (st
 	return rel, nil
 }
 
+// moveProcessToPodCgroupFn is the seam over moveProcessToPodCgroup used by joinNsRestore
+// (mirrors reapRestoredProcessTreeFn/joinNsRestoreFn — same overridable-var idiom) so tests can
+// spy on the cgroup move without a real host cgroupfs/broker socket.
+var moveProcessToPodCgroupFn = moveProcessToPodCgroup
+
 // moveProcessToPodCgroup implements ADR-0128/ADR-0351 D2: moves pid into the container's own
 // cgroup by writing it to <podCgroupPath>/cgroup.procs under /sys/fs/cgroup. A single
 // cgroup.procs write moves the whole thread group of the leader; the CRIU-restored tree shares
 // one cgroup, so moving the root migrates the group (whole-tree containment is scoped to that
 // property — see ADR-0351 D2.6/BD-8 for the multi-process/descendant-TGID gap, not changed by
 // this ADR). podCgroupPath is the cgroup v2 path (e.g. "/kubepods.slice/.../...scope").
+//
+// Sprint53-kind: the write is delegated to the privileged, UNCONFINED netns-broker
+// (netnsBrokerClientFn().MoveCgroup) rather than performed in-process (os.WriteFile) as before.
+// Diagnosed live on kind: a cgroup v2 cgroup.procs write is permitted only when the target
+// cgroup is a descendant of the WRITER's own cgroup namespace root (kernel-enforced,
+// independent of mount-path visibility). The SD-1 main agent runs privileged:false and gets a
+// fresh cgroup namespace from containerd's default CRI behavior, rooted at the agent's OWN
+// container scope — a sibling, not an ancestor, of the target pod's kubepods cgroup — so the
+// in-process write ENOENTs regardless of the /sys/fs/cgroup mount-visibility fix (commit
+// c425b7e). The broker (the SOLE privileged:true container in the pod) is not cgroup-namespace-
+// isolated the same way (its pre-existing "cat" exec-allowlist entry already depends on the same
+// host-rooted-cgroup-namespace property — see netnsbroker execAllowlist's doc comment), so its
+// write reaches the target. A PID-reuse (starttime) guard, same as every other broker op that
+// targets a PID the broker never spawned (SignalPID/KillSourcePID/ProcAlive), protects the move.
 func moveProcessToPodCgroup(pid int, podCgroupPath string) error {
-	procsPath := filepath.Join("/sys/fs/cgroup", podCgroupPath, "cgroup.procs")
-	if err := os.WriteFile(procsPath, []byte(strconv.Itoa(pid)), 0o644); err != nil {
-		return fmt.Errorf("write PID %d to %s: %w", pid, procsPath, err)
+	startTime, stErr := readProcStartTime(int32(pid))
+	if stErr != nil {
+		return fmt.Errorf("read starttime for restored PID %d before cgroup move: %w", pid, stErr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := netnsBrokerClientFn().MoveCgroup(ctx, pid, podCgroupPath, startTime); err != nil {
+		return fmt.Errorf("move PID %d into cgroup %s via broker: %w", pid, podCgroupPath, err)
 	}
 	return nil
 }

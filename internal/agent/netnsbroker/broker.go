@@ -151,7 +151,7 @@ func validateNetnsPath(netnsPath string) error {
 
 // Request is the JSON wire request accepted on the broker socket.
 type Request struct {
-	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal" | "signal_pid" | "kill_source_pid" | "proc_alive" | "resolve_veth" | "holder_sentinel" | "netns_exec" | "netns_exec_start"
+	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal" | "signal_pid" | "kill_source_pid" | "proc_alive" | "resolve_veth" | "holder_sentinel" | "netns_exec" | "netns_exec_start" | "move_cgroup"
 	// MigrationUID names the per-migration netns dir. Validated by migrationUIDRe.
 	// Required on create/teardown; ignored on exec*.
 	MigrationUID string `json:"migrationUID"`
@@ -242,6 +242,36 @@ type Request struct {
 	// at a FIXED server-side relative path, so a client never supplies a filesystem
 	// path (no traversal surface). Validated by containerIDRe.
 	ContainerID string `json:"containerID,omitempty"`
+
+	// ADR-0351 D2 (move_cgroup op, sprint53-kind): CgroupPath is a cgroupFsRoot
+	// ("/sys/fs/cgroup")-RELATIVE leaf path (already resolved + path-confined by the
+	// agent's resolveCgroupAnchorTarget — the broker re-validates independently below,
+	// never trusts the client's confinement alone) that SignalPID's whole thread
+	// group should be moved into via a cgroup.procs write. Reuses SignalPID +
+	// ExpectedStartTime for the target PID / PID-reuse guard, exactly like
+	// signal_pid/kill_source_pid/proc_alive above — this is a fourth op on that same
+	// "arbitrary host PID the broker never spawned" surface, not a new PID field.
+	//
+	// Why this must run in the broker and not the de-privileged main agent: a
+	// cgroup v2 cgroup.procs write is permitted only when the target cgroup is a
+	// descendant of the WRITER's own cgroup namespace root (kernel-enforced,
+	// independent of DAC/mount visibility). The SD-1 main agent (privileged:false)
+	// gets a fresh, path-less cgroup namespace from containerd's default CRI mount-
+	// merge/namespace behavior, rooted at the agent's OWN container scope — a
+	// sibling of, not an ancestor of, the target pod's kubepods cgroup, so the
+	// kernel refuses the write with ENOENT regardless of the mount-visibility fix
+	// (charts/podmotion/templates/daemonset.yaml, commit c425b7e) that made the
+	// PATH readable. The unconfined netns-broker (privileged:true, the SOLE
+	// privileged:true container in the pod) is not cgroup-namespace-isolated from
+	// the host by containerd's same default behavior (verified live, sprint53-kind:
+	// its pre-existing "cat" exec-allowlist entry already depends on this same
+	// property to resolve host-absolute /proc/<pid>/cgroup paths — see execAllowlist
+	// doc comment above), so its cgroup namespace root is the host root and the
+	// target pod cgroup is always a descendant. No nsenter is needed for the write
+	// itself (unlike the host-MOUNT-namespace "exec" op) — cgroup namespace, not
+	// mount namespace, is what gates this operation, and the broker's own process
+	// already sits in the host cgroup namespace.
+	CgroupPath string `json:"cgroupPath,omitempty"`
 }
 
 // Response is the JSON wire response. Error is "" on success.
@@ -506,6 +536,11 @@ func Handle(req Request) Response {
 		// ADR-0326: run an allowlisted ("ip" or the broker's own pinned self path)
 		// command inside the target pod's NET namespace, run-to-completion.
 		return doNetnsExec(req.SrcPID, req.NetnsPath, req.Argv)
+	case "move_cgroup":
+		// ADR-0351 D2 (sprint53-kind): move an already-restored PID's whole thread
+		// group into its container's own cgroup v2 scope. See CgroupPath's doc
+		// comment on Request for why this must be a broker op.
+		return doMoveCgroup(req.SignalPID, req.CgroupPath, req.ExpectedStartTime)
 	case "netns_exec_start":
 		// ADR-0326: spawn an allowlisted command inside the target pod's NET
 		// namespace DETACHED (the __inetns_echo listener, which must outlive the
@@ -516,7 +551,7 @@ func Handle(req Request) Response {
 		// exactly as they do exec_start children (ADR-0326 Decision item 4).
 		return doNetnsExecStart(req.SrcPID, req.NetnsPath, req.Argv)
 	default:
-		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal|signal_pid|kill_source_pid|proc_alive|resolve_veth|holder_sentinel|netns_exec|netns_exec_start)", req.Op))
+		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal|signal_pid|kill_source_pid|proc_alive|resolve_veth|holder_sentinel|netns_exec|netns_exec_start|move_cgroup)", req.Op))
 	}
 }
 
@@ -1236,6 +1271,79 @@ func doKillSourcePID(pid int, expectedStartTime uint64) Response {
 	}
 	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
 		return Response{Error: fmt.Sprintf("kill_source_pid: kill(%d, SIGKILL): %v", pid, err)}
+	}
+	return Response{}
+}
+
+// cgroupFsRoot is the broker's own view of the cgroup v2 mount point. The broker
+// is privileged:true and unconfined, so this is the real host cgroupfs root
+// (never a namespaced/masked view) — see CgroupPath's doc comment on Request.
+const cgroupFsRoot = "/sys/fs/cgroup"
+
+// moveCgroupAllowedRoots mirrors the allowlist server.go's resolveCgroupAnchorTarget
+// (ADR-0351 D2.4/BD-10) enforces agent-side. The broker is the actual privileged
+// write surface, so it re-derives and re-checks confinement independently here
+// rather than trusting the agent's prior resolution — a compromised or buggy
+// de-privileged agent must not be able to direct the broker to write an arbitrary
+// PID into an arbitrary cgroup. Kept in exact sync with server.go's allowedCgroupRoots
+// (vanilla kubeadm/KVM cgroupRoot="/" and kind's cgroupRoot=/kubelet layout).
+func moveCgroupAllowedRoots() []string {
+	return []string{
+		filepath.Join(cgroupFsRoot, "kubepods"),
+		filepath.Join(cgroupFsRoot, "kubelet.slice", "kubelet-kubepods"),
+	}
+}
+
+// doMoveCgroup implements the move_cgroup op (ADR-0351 D2, sprint53-kind): writes
+// pid into the cgroup.procs file of the container's own cgroup v2 scope, run from
+// the broker's own (host-rooted) cgroup namespace — see CgroupPath's doc comment
+// on Request for why the de-privileged main agent cannot do this write itself.
+//
+// Same PID-reuse (starttime) guard as doSignalPID/doKillSourcePID: expectedStartTime
+// ==0 is rejected, and a live/expected mismatch means the PID has been reused —
+// refuse rather than move the wrong process's tree into a container's cgroup.
+//
+// cgroupPath is independently re-confined here (EvalSymlinks + prefix check against
+// moveCgroupAllowedRoots) rather than trusted from the client — see
+// moveCgroupAllowedRoots' doc comment.
+func doMoveCgroup(pid int, cgroupPath string, expectedStartTime uint64) Response {
+	if pid <= 0 {
+		return Response{Error: fmt.Sprintf("move_cgroup: pid %d must be positive", pid)}
+	}
+	if cgroupPath == "" {
+		return Response{Error: "move_cgroup: empty cgroupPath"}
+	}
+	if expectedStartTime == 0 {
+		return Response{Error: fmt.Sprintf("move_cgroup: no expected starttime supplied for pid %d — refusing to move without a PID-reuse identity", pid)}
+	}
+	liveStart, err := procStartTime(pid)
+	if err != nil {
+		return Response{Error: fmt.Sprintf("move_cgroup: read starttime for pid %d (process gone?): %v", pid, err)}
+	}
+	if liveStart != expectedStartTime {
+		return Response{Error: fmt.Sprintf("move_cgroup: pid %d starttime mismatch (expected %d, live %d) — PID reused, refusing to move", pid, expectedStartTime, liveStart)}
+	}
+
+	candidate := filepath.Join(cgroupFsRoot, cgroupPath)
+	resolved, rerr := filepath.EvalSymlinks(candidate)
+	if rerr != nil {
+		return Response{Error: fmt.Sprintf("move_cgroup: resolve cgroup path %q: %v", candidate, rerr)}
+	}
+	allowed := false
+	for _, root := range moveCgroupAllowedRoots() {
+		if strings.HasPrefix(resolved, root) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return Response{Error: fmt.Sprintf("move_cgroup: cgroup path %q resolves to %q, outside %s — refusing (path-confinement)",
+			cgroupPath, resolved, strings.Join(moveCgroupAllowedRoots(), " or "))}
+	}
+
+	procsPath := filepath.Join(resolved, "cgroup.procs")
+	if werr := os.WriteFile(procsPath, []byte(strconv.Itoa(pid)), 0o644); werr != nil {
+		return Response{Error: fmt.Sprintf("move_cgroup: write pid %d to %s: %v", pid, procsPath, werr)}
 	}
 	return Response{}
 }
