@@ -144,6 +144,25 @@ webhook:
   # Set false ONLY to deliberately disable the SD-6 exec-block control.
   agentExecBlock:
     enabled: true
+  # Sprint52 diagnosis fix: the pod-mutating webhook (mpod.podmotion.io, /mutate-core-v1-pod)
+  # that injects schedulerName, the scheduling gate, and the CNI IPAM pin annotation onto
+  # migration replacement pods. Previously there was NO MutatingWebhookConfiguration rule
+  # routing pods to this handler at all, in any chart history, and the one rule that did
+  # exist (mpodmigration.kb.io, for the PodMigration CR) was gated solely behind
+  # certManager.enabled — so on the standing KVM dev cluster (certManager.enabled=false) zero
+  # MutatingWebhookConfiguration objects were installed and injectIPAMAnnotation never ran.
+  # Default true and INDEPENDENT of cert-manager, mirroring agentExecBlock above: on
+  # substrates without cert-manager the chart mints a self-signed serving cert (shared with
+  # the exec-block secret, podmotion-webhook-tls) and inlines the matching caBundle.
+  # Set false ONLY to deliberately disable replacement-pod mutation (migrations will then
+  # run without scheduler pinning, the checkpoint scheduling gate, or IP-preservation pins).
+  # ADR-0359: as of this ADR the controller no longer pins spec.NodeName directly either
+  # (that pin raced the scheduling gate above and defeated it), so disabling podMutation
+  # now ALSO forfeits node binding entirely — the replacement pod falls through to the
+  # default Kubernetes scheduler with whatever constraints the source pod happened to carry,
+  # which may not be the node the checkpoint image was staged on.
+  podMutation:
+    enabled: true
 
 networkPolicy:
   enabled: false

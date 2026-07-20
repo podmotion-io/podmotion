@@ -26,6 +26,22 @@ true
 {{- end -}}
 {{- end -}}
 
+{{/*
+podmotion.podMutationEnabled — nil-safe accessor for webhook.podMutation.enabled.
+Defaults to true when the key is absent (e.g. helm upgrade --reuse-values from a release
+installed before this value existed), so the pod-mutation webhook is on by default and an
+old reuse-values upgrade does NOT silently disable it. Returns "true" or "" (falsey).
+*/}}
+{{- define "podmotion.podMutationEnabled" -}}
+{{- $w := .Values.webhook | default dict -}}
+{{- $pm := $w.podMutation | default dict -}}
+{{- if hasKey $pm "enabled" -}}
+{{- if $pm.enabled }}true{{ end -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
 {{- define "podmotion.webhookSelfSignedCert" -}}
 {{- if not (index $ "podmotionWebhookCert") -}}
   {{- $altNames := list (printf "podmotion-webhook-service.%s.svc" .Release.Namespace) (printf "podmotion-webhook-service.%s.svc.cluster.local" .Release.Namespace) -}}

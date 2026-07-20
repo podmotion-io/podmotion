@@ -786,6 +786,7 @@ cmd_deploy_podmotion() {
     --set operator.replicas=1 \
     --set webhook.certManager.enabled=false \
     --set scheduler.enabled=false \
+    --set webhook.podMutation.enabled=false \
     --set installCRDs=false \
     --set operator.featureGates="TCPPreservation=true" \
     --set agent.containerd.socketPath="$AGENT_CONTAINERD_SOCKET_PATH" \
