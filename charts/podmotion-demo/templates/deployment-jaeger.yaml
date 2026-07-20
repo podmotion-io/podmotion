@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podmotion-demo-jaeger
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion-demo
+    app.kubernetes.io/component: jaeger
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  # Single-pod all-in-one, matching backend/README.md's component table
+  # ("jaeger | Jaeger all-in-one ... | 1 (demo)") and backend/internal/otel/otel.go's
+  # doc comment, which already names this exact file.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: podmotion-demo-jaeger
+  template:
+    metadata:
+      labels:
+        app: podmotion-demo-jaeger
+        app.kubernetes.io/name: podmotion-demo
+        app.kubernetes.io/component: jaeger
+    spec:
+      containers:
+        - name: jaeger
+          image: "{{ .Values.jaeger.image.repository }}:{{ .Values.jaeger.image.tag }}"
+          imagePullPolicy: {{ .Values.jaeger.image.pullPolicy }}
+          env:
+            # Explicit rather than relying on the image's own default — recent
+            # jaegertracing/all-in-one versions enable the OTLP receiver by
+            # default, but this pins the behavior this chart depends on
+            # (backend/internal/otel/otel.go exports via OTLP/HTTP) regardless of
+            # which tag values.yaml is later bumped to.
+            - name: COLLECTOR_OTLP_ENABLED
+              value: "true"
+          ports:
+            # Query UI — see service-jaeger.yaml (NodePort, values.yaml jaeger.uiNodePort).
+            - name: ui
+              containerPort: 16686
+              protocol: TCP
+            # OTLP/gRPC receiver (not currently used by the api backend, which
+            # talks OTLP/HTTP — exposed anyway since it's part of the standard
+            # all-in-one image surface and costs nothing to publish on the Service).
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            # OTLP/HTTP receiver — internal/otel/otel.go's otlptracehttp exporter
+            # target (see OTEL_EXPORTER_OTLP_ENDPOINT in deployment-api.yaml).
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 16686
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 16686
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.jaeger.resources | nindent 12 }}

@@ -173,6 +173,23 @@ var (
 		},
 		[]string{"leg"},
 	)
+
+	// DisarmRelayFailedTotal counts non-fatal DisarmRelay failures inside DisarmTCRedirect's
+	// ADR-0357 D5 removal-symmetry step — a PM_SEQ_XLAT entry that could not be cleanly removed
+	// during the destination-side IP-reclaim teardown. Warn-only by design (matches D3's
+	// ADR-0224 3h-SYM posture: a PM_SEQ_XLAT entry that fails to disarm is a strictly better
+	// state than blocking IP reclaim on it), but every occurrence increments this counter and
+	// emits a DisarmRelayFailed Warning Event so an orphaned entry is operator-visible rather
+	// than silently unbounded (Security Reviewer round-2 CONDITION, ADR-0357).
+	// Labels: migration_name, namespace
+	DisarmRelayFailedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "podmotion",
+			Name:      "disarm_relay_failed_total",
+			Help:      "Count of non-fatal DisarmRelay failures during DisarmTCRedirect's PM_SEQ_XLAT removal-symmetry step (ADR-0357 D5).",
+		},
+		[]string{"migration_name", "namespace"},
+	)
 )
 
 func init() {
@@ -188,5 +205,6 @@ func init() {
 		ReplacementEndpointRemovalExhaustedTotal,
 		CgroupAnchorOutcomeTotal,
 		BrokerExecDeadlineAbortsTotal,
+		DisarmRelayFailedTotal,
 	)
 }

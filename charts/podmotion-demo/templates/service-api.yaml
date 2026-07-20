@@ -1,0 +1,33 @@
+# Named literally "podmotion-demo-api" — like every resource name in this chart,
+# NOT prefixed with .Release.Name (matching ../podmotion/charts/podmotion's own
+# convention of fixed literal names, e.g. "podmotion-operator", rather than
+# release-templated ones — see e.g. templates/deployment.yaml in that chart).
+# That convention matters MORE here than anywhere else in this chart:
+# deploy/nginx.conf hardcodes
+#   proxy_pass http://podmotion-demo-api:8080/api/;
+# as a bare, unqualified hostname with no build-time or deploy-time substitution
+# mechanism. Kubernetes resolves a bare Service name via the pod's own namespace
+# search domain, so keeping this Service's name a fixed literal — identical to
+# what nginx.conf already expects — means nginx.conf needs ZERO changes (no
+# ConfigMap+envsubst init step, no ConfigMap-mounted nginx.conf at all) regardless
+# of what release name this chart is installed under, standalone or as the
+# podmotion chart's dependency. This was judged the least invasive of the two
+# options in the task brief.
+apiVersion: v1
+kind: Service
+metadata:
+  name: podmotion-demo-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion-demo
+    app.kubernetes.io/component: api
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  type: ClusterIP
+  selector:
+    app: podmotion-demo-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

@@ -126,6 +126,28 @@ func (sc *StorageClassifier) ClassifyPod(ctx context.Context, pod *corev1.Pod) (
 			continue
 		}
 
+		// Bare in-tree NFS volume (no PVC wrapper): per ADR-0007, NFS is Tier0
+		// ReadWriteMany re-attach storage regardless of whether it arrives via a
+		// PVC/PV or a raw pod-spec volume. Classify it explicitly here rather than
+		// letting it fall through the no-PVC branch below — falling through means
+		// ClassifyPod returns zero entries for this volume and the ONLY reason it
+		// ever reads as Tier0 is HighestTier's empty-list default ("no PVCs — treat
+		// as RWX re-attach"), which is a coincidence, not a real classification: a
+		// pod with a genuinely unmigratable non-PVC volume type would hit that same
+		// vacuous default and be silently waved through. Earning the label here
+		// also makes it reachable by resolveReattachMountsImpl's mirrored tier
+		// logic in internal/agent/server (classifyReattachTier's NFS counterpart),
+		// which needs a real Tier0 signal to admit the volume into the re-attach
+		// set instead of PVC-only gating it out.
+		if vol.NFS != nil {
+			results = append(results, TierClassification{
+				Tier:    TierRWX,
+				Reason:  "ReadWriteMany NFS volume (no PVC) — re-attach only",
+				PVCName: vol.Name,
+			})
+			continue
+		}
+
 		if vol.PersistentVolumeClaim == nil {
 			// Remaining non-PVC volumes (configMap, secret, downwardAPI, projected)
 			// are reconstructed on the destination from the pod spec — no data

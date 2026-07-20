@@ -47,6 +47,17 @@ RUN criu --version && criu --version | grep -qE "^Version: [4-9]\." || \
 # The flannel DaemonSet installs only the `flannel` meta-plugin, not its delegated plugins.
 # Make the node image self-contained: install + checksum-verify the standard plugin set,
 # then assert bridge/host-local are present (fail the build loudly if they regress).
+# --no-same-owner + explicit chown (sprint53, verified live on kind): the upstream
+# cni-plugins tarball's top-level `./` directory entry is owned by the release CI
+# runner's uid:gid (1001:127), not root. A plain `tar -x` run as root RESTORES that
+# original ownership onto the extraction target (/opt/cni/bin already exists from
+# mkdir as root:root, but tar's `./` entry clobbers it back to 1001:127). Cilium's
+# mount-cgroup init container deliberately drops ALL capabilities except
+# SYS_ADMIN/SYS_CHROOT/SYS_PTRACE (no CAP_DAC_OVERRIDE), so root-in-container can no
+# longer write into a non-root-owned /opt/cni/bin — it CrashLoopBackOffs with
+# "cp: cannot create regular file '/hostbin/cilium-mount': Permission denied". Force
+# root:root ownership explicitly so any CNI plugin (Cilium, Flannel, etc.) that needs
+# to drop-in a binary here can.
 ARG CNI_PLUGINS_VERSION=v1.5.1
 ARG TARGETARCH=amd64
 RUN set -eux; \
@@ -59,7 +70,8 @@ RUN set -eux; \
     curl -fsSL -o /tmp/cni-plugins.tgz \
       "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-${TARGETARCH}-${CNI_PLUGINS_VERSION}.tgz"; \
     echo "${CNI_SHA}  /tmp/cni-plugins.tgz" | sha256sum -c -; \
-    tar -C /opt/cni/bin -xzf /tmp/cni-plugins.tgz; \
+    tar --no-same-owner -C /opt/cni/bin -xzf /tmp/cni-plugins.tgz; \
+    chown root:root /opt/cni/bin; \
     rm -f /tmp/cni-plugins.tgz; \
     test -x /opt/cni/bin/bridge || { echo "ERROR: /opt/cni/bin/bridge missing after CNI install (ADR-0221)" >&2; exit 1; }; \
     test -x /opt/cni/bin/host-local || { echo "ERROR: /opt/cni/bin/host-local missing after CNI install (ADR-0221)" >&2; exit 1; }

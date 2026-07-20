@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: podmotion-demo-postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion-demo
+    app.kubernetes.io/component: postgres
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  type: ClusterIP
+  selector:
+    app: podmotion-demo-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+      protocol: TCP

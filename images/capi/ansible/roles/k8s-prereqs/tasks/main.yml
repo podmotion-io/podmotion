@@ -1,0 +1,188 @@
+---
+# k8s-prereqs Ansible role — Ubuntu 24.04 ONLY.
+#
+# Installs the layer the podmotion-node role assumes is already present
+# (it checks `containerd --version` to decide whether to write its NRI
+# conf.d snippet, but does not install containerd/kubeadm/kubelet itself).
+# The EKS-optimized AL2023 base AMI gets this layer for free from AWS;
+# the plain Ubuntu 24.04 base AMI used by terraform/kubeadm-ec2 does not,
+# so this role bakes it in for the kubeadm-ubuntu Packer build
+# (see ../../packer/kubeadm-ubuntu.pkr.hcl).
+#
+# Installs, in order: swap disabled -> kernel modules + sysctls kubeadm
+# requires -> containerd (SystemdCgroup=true) -> kubeadm/kubelet/kubectl
+# from the pkgs.k8s.io apt repo, held at the installed version.
+#
+# This role must run BEFORE podmotion-node in the playbook — podmotion-node's
+# containerd-version check needs containerd already installed to correctly
+# detect whether to enable NRI.
+
+- name: Fail fast if this host is not Ubuntu
+  fail:
+    msg: "k8s-prereqs is Ubuntu-24.04-only; got {{ ansible_distribution }} {{ ansible_distribution_version }}"
+  when: >
+    ansible_distribution != "Ubuntu" or
+    ansible_distribution_major_version | int < 24
+
+# ---- swap --------------------------------------------------------------------
+- name: Disable swap now
+  command: swapoff -a
+  changed_when: true
+
+- name: Remove swap entries from /etc/fstab (kubelet refuses to start with swap on)
+  replace:
+    path: /etc/fstab
+    regexp: '^([^#\n]+\sswap\s+.*)$'
+    replace: '# \1'
+
+# ---- kernel modules kubeadm/containerd require --------------------------------
+- name: Load kernel modules at boot
+  copy:
+    content: |
+      overlay
+      br_netfilter
+    dest: /etc/modules-load.d/k8s-prereqs.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Load kernel modules now
+  modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - overlay
+    - br_netfilter
+
+# ---- sysctl kubeadm requires ---------------------------------------------------
+- name: Install kubeadm-required sysctl config
+  copy:
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+    dest: /etc/sysctl.d/90-k8s-prereqs.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Apply sysctl settings
+  command: sysctl --system
+  changed_when: true
+
+# ---- containerd ----------------------------------------------------------------
+- name: Install containerd (Ubuntu universe package)
+  apt:
+    name: containerd
+    state: present
+    update_cache: true
+
+- name: Create /etc/containerd directory
+  file:
+    path: /etc/containerd
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Generate default containerd config
+  command: containerd config default
+  register: containerd_default_config
+  changed_when: false
+
+- name: Write containerd config with SystemdCgroup enabled
+  copy:
+    content: "{{ containerd_default_config.stdout | regex_replace('SystemdCgroup = false', 'SystemdCgroup = true') }}"
+    dest: /etc/containerd/config.toml
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart containerd
+
+- name: Enable and start containerd
+  systemd:
+    name: containerd
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Flush handlers so containerd is running with its final config before the version check below
+  meta: flush_handlers
+
+# ---- kubeadm / kubelet / kubectl (pkgs.k8s.io apt repo) -------------------------
+- name: Ensure apt prerequisites for the pkgs.k8s.io repo are present
+  apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gpg
+    state: present
+    update_cache: true
+
+- name: Create apt keyrings directory
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Fetch the pkgs.k8s.io release signing key
+  get_url:
+    url: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_minor_version }}/deb/Release.key"
+    dest: /tmp/k8s-release.key
+    mode: "0644"
+
+- name: De-armor and install the pkgs.k8s.io signing key
+  shell: |
+    set -euo pipefail
+    gpg --dearmor < /tmp/k8s-release.key > /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  args:
+    executable: /bin/bash # ansible's shell module defaults to /bin/sh (dash on
+    # Ubuntu), which has no `set -o pipefail` builtin and fails with "Illegal
+    # option -o pipefail" — same pitfall the packer template's own shell-local
+    # provisioner already documents and works around for the same reason.
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+- name: Add the pkgs.k8s.io apt repo for the target Kubernetes minor version
+  apt_repository:
+    repo: >-
+      deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg]
+      https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_minor_version }}/deb/ /
+    filename: kubernetes
+    state: present
+    update_cache: true
+
+- name: Install kubelet, kubeadm, kubectl
+  apt:
+    name:
+      - "kubelet{{ '=' + kubernetes_package_version if kubernetes_package_version | length > 0 else '' }}"
+      - "kubeadm{{ '=' + kubernetes_package_version if kubernetes_package_version | length > 0 else '' }}"
+      - "kubectl{{ '=' + kubernetes_package_version if kubernetes_package_version | length > 0 else '' }}"
+    state: present
+    update_cache: true
+
+- name: Hold kubelet, kubeadm, kubectl at their installed version
+  dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+
+- name: Enable kubelet (kubeadm starts it once the node joins/inits a cluster)
+  systemd:
+    name: kubelet
+    enabled: true
+    daemon_reload: true
+
+- name: Record installed Kubernetes package versions
+  command: dpkg-query -W -f='${Version}' kubeadm
+  register: kubeadm_installed_version
+  changed_when: false
+
+- name: Show installed Kubernetes version
+  debug:
+    msg: "kubeadm/kubelet/kubectl installed and held at: {{ kubeadm_installed_version.stdout }}"

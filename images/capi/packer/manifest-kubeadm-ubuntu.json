@@ -1,0 +1,31 @@
+{
+  "builds": [
+    {
+      "name": "podmotion_io_kubeadm_ubuntu",
+      "builder_type": "amazon-ebs",
+      "build_time": 1784510285,
+      "files": null,
+      "artifact_id": "us-east-2:ami-0e69d6e71f58070f9",
+      "packer_run_uuid": "e7441398-6c8a-5475-b425-4aef64ea357b",
+      "custom_data": {
+        "base_ami": "ami-0dc6aa44dbcdd872e",
+        "kubernetes_version": "1.32",
+        "podmotion_version": "v0.1.0"
+      }
+    },
+    {
+      "name": "podmotion_io_kubeadm_ubuntu",
+      "builder_type": "amazon-ebs",
+      "build_time": 1784512228,
+      "files": null,
+      "artifact_id": "us-east-2:ami-02022fc46f87a5924",
+      "packer_run_uuid": "3d0946f2-dfb8-37de-ee72-4847be17aeaa",
+      "custom_data": {
+        "base_ami": "ami-0dc6aa44dbcdd872e",
+        "kubernetes_version": "1.32",
+        "podmotion_version": "v0.1.0"
+      }
+    }
+  ],
+  "last_run_uuid": "3d0946f2-dfb8-37de-ee72-4847be17aeaa"
+}

@@ -9,10 +9,12 @@ package network
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"time"
 
+	"github.com/cilium/ebpf"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -177,6 +179,25 @@ func SeedRelayFromSnapshots(
 		}
 		results = append(results, r)
 
+		// ADR-0357 D1.2: verify the entry SeedRelayFromFreshSocket just wrote via ArmRelay is
+		// actually resident in the kernel PM_SEQ_XLAT map, via a real bpf_map_lookup — the
+		// literal implementation of the overlay.go:22 doc comment's promise. ArmRelay's Update()
+		// call returning without error is not sufficient evidence: this is exactly the gap that
+		// let SeqXlatSeeded=true be asserted while PM_SEQ_XLAT was categorically absent from the
+		// kernel on both nodes (ADR-0357 Context, Probe 2). Only report success if every entry
+		// round-trips.
+		key := ipPortToSeqXlatKey(localIP.To4(), uint16(snap.SrcPort), peerIP.To4(), uint16(snap.DstPort))
+		if _, found, lookupErr := ebpfMgr.LookupSeqXlat(ctx, key); lookupErr != nil {
+			return nil, fmt.Errorf("reattach: LookupSeqXlat verification failed for %s:%d→%s:%d: %w",
+				snap.SrcIP, snap.SrcPort, snap.DstIP, snap.DstPort, lookupErr)
+		} else if !found {
+			return nil, fmt.Errorf("reattach: LookupSeqXlat verification: PM_SEQ_XLAT entry not resident in kernel map after ArmRelay for %s:%d→%s:%d (ADR-0357 D1.2)",
+				snap.SrcIP, snap.SrcPort, snap.DstIP, snap.DstPort)
+		} else {
+			log.Info("reattach: PM_SEQ_XLAT entry verified resident via LookupSeqXlat (ADR-0357 D1.2)",
+				"srcPort", snap.SrcPort, "dstPort", snap.DstPort)
+		}
+
 		// Load relay on the migration veth in addition to flannel.1 so that traffic
 		// entering the destination via the host-side veth (pmdst0 peer) also undergoes
 		// seq/ack translation before reaching the restored container (M24 requirement).
@@ -202,6 +223,45 @@ func SeedRelayFromSnapshots(
 	return results, nil
 }
 
+// DisarmRelayForSnapshots removes the PM_SEQ_XLAT entries SeedRelayFromSnapshots seeded for
+// each of the given snapshots (ADR-0357 D5 — DisarmRelay removal-symmetry). Called from the
+// destination agent's DisarmTCRedirect handler once the controller's ipReclaimEligible gate
+// confirms the OLD IP has no live conntrack entry or ESTABLISHED socket on either node.
+//
+// Warn-only by design, matching D3's ADR-0224 3h-SYM posture (server.go DisarmZeroWindow): a
+// PM_SEQ_XLAT entry that fails to disarm cleanly is a strictly better state than blocking IP
+// reclaim on it — a lingering entry is bounded (the caller's ipReclaimEligible sweep already
+// proved no live traffic can reach the OLD 4-tuple) and cleanup can simply retry on the next
+// sweep pass. Every non-nil, non-ErrKeyNotExist failure is returned in the aggregate slice
+// (never swallowed) so the caller can surface it as a distinct, alertable signal — the Security
+// Reviewer's round-2 CONDITION on this ADR — instead of discarding it.
+func DisarmRelayForSnapshots(ctx context.Context, snapshots []SeqSnapshot, ebpfMgr EBPFManager) []error {
+	log := logf.FromContext(ctx)
+	var errs []error
+	for _, snap := range snapshots {
+		localIP := net.ParseIP(snap.SrcIP)
+		peerIP := net.ParseIP(snap.DstIP)
+		if localIP == nil || peerIP == nil {
+			errs = append(errs, fmt.Errorf("reattach: DisarmRelayForSnapshots: invalid snapshot IPs src=%q dst=%q", snap.SrcIP, snap.DstIP))
+			continue
+		}
+		key := IPPortToSeqXlatKey(localIP.To4(), uint16(snap.SrcPort), peerIP.To4(), uint16(snap.DstPort))
+		if err := ebpfMgr.DisarmRelay(ctx, key); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				// Already gone — not a failure (idempotent, matches DisarmXDPBridge/DisarmVTEP).
+				continue
+			}
+			log.Error(err, "reattach: DisarmRelayForSnapshots: DisarmRelay failed for a PM_SEQ_XLAT entry (ADR-0357 D5, non-fatal)",
+				"srcPort", snap.SrcPort, "dstPort", snap.DstPort)
+			errs = append(errs, fmt.Errorf("DisarmRelay %s:%d→%s:%d: %w", snap.SrcIP, snap.SrcPort, snap.DstIP, snap.DstPort, err))
+			continue
+		}
+		log.Info("reattach: DisarmRelayForSnapshots: PM_SEQ_XLAT entry disarmed (ADR-0357 D5)",
+			"srcPort", snap.SrcPort, "dstPort", snap.DstPort)
+	}
+	return errs
+}
+
 // SeqSnapshot is a local copy of the proto SeqSnapshot fields used to avoid
 // importing the proto package from the network package. Callers in server.go
 // convert proto SeqSnapshot to this type.
@@ -212,6 +272,15 @@ type SeqSnapshot struct {
 	DstPort uint32
 	SndNxt  uint32
 	RcvNxt  uint32
+}
+
+// IPPortToSeqXlatKey is the exported form of ipPortToSeqXlatKey, for callers outside this
+// package that need to reconstruct a PM_SEQ_XLAT key in the disarm direction (ADR-0357 D5 —
+// DisarmTCRedirect reconstructing keys from pm.Status.TCPSeqSnapshots). Mirrors the exact same
+// 4-tuple construction SeedRelayFromSnapshots uses in the seed direction, so a disarm key is
+// always byte-identical to the key it was seeded under.
+func IPPortToSeqXlatKey(srcIP net.IP, srcPort uint16, dstIP net.IP, dstPort uint16) SeqXlatKey {
+	return ipPortToSeqXlatKey(srcIP, srcPort, dstIP, dstPort)
 }
 
 // ipPortToSeqXlatKey builds a SeqXlatKey from net.IP and port values.
