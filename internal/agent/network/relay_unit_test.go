@@ -13,21 +13,37 @@ import (
 	"testing"
 )
 
-// recordingEBPFStub captures ArmRelay and DisarmRelay calls for assertion.
+// recordingEBPFStub captures ArmRelay and DisarmRelay calls for assertion. It also backs
+// LookupSeqXlat with the same in-memory map ArmRelay/DisarmRelay maintain, so it behaves like a
+// real kernel map for ADR-0357 D1.2's post-arm verification (SeedRelayFromSnapshots calls
+// LookupSeqXlat after every ArmRelay to confirm the entry round-tripped) — the plain
+// eBPFManagerStub embedded here always reports found=false by design (no real map behind it),
+// which is correct for the stub itself but wrong for a fixture standing in for a working relay.
 type recordingEBPFStub struct {
 	eBPFManagerStub
 	armed    []SeqXlatEntry
 	disarmed []SeqXlatKey
+	seqXlat  map[SeqXlatKey]SeqXlatEntry
 }
 
-func (r *recordingEBPFStub) ArmRelay(_ context.Context, _ string, _ SeqXlatKey, entry SeqXlatEntry) error {
+func (r *recordingEBPFStub) ArmRelay(_ context.Context, _ string, key SeqXlatKey, entry SeqXlatEntry) error {
 	r.armed = append(r.armed, entry)
+	if r.seqXlat == nil {
+		r.seqXlat = make(map[SeqXlatKey]SeqXlatEntry)
+	}
+	r.seqXlat[key] = entry
 	return nil
 }
 
 func (r *recordingEBPFStub) DisarmRelay(_ context.Context, key SeqXlatKey) error {
 	r.disarmed = append(r.disarmed, key)
+	delete(r.seqXlat, key)
 	return nil
+}
+
+func (r *recordingEBPFStub) LookupSeqXlat(_ context.Context, key SeqXlatKey) (SeqXlatEntry, bool, error) {
+	entry, found := r.seqXlat[key]
+	return entry, found, nil
 }
 
 // TestRelaySeqDeltaBothDirections verifies that SeedRelayFromFreshSocket populates
@@ -265,6 +281,61 @@ func TestRelayTsDeltaPopulated(t *testing.T) {
 	// Verify the field exists and is int32 (compilation coverage for TSval path).
 	entry := mgr.armed[0]
 	_ = entry.TsDelta // int32 — TSval/TSecr delta slot (PAWS ADR-0049)
+}
+
+// notFoundEBPFStub is a recordingEBPFStub whose LookupSeqXlat always reports found=false
+// regardless of what ArmRelay wrote — simulating the exact ADR-0357 Context defect (ArmRelay's
+// Update() call returns nil, but the entry is not actually resident in the kernel map: this is
+// the "categorically absent from the kernel on both nodes" state Probe 2 found).
+type notFoundEBPFStub struct {
+	recordingEBPFStub
+}
+
+func (n *notFoundEBPFStub) LookupSeqXlat(_ context.Context, _ SeqXlatKey) (SeqXlatEntry, bool, error) {
+	return SeqXlatEntry{}, false, nil
+}
+
+// TestSeedRelayFromSnapshots_LookupVerificationFailure is the ADR-0357 D1.2 / §P-VERIFY
+// assertion 1 fault-injection regression: when ArmRelay succeeds (returns nil) but the
+// follow-up LookupSeqXlat reports the entry is not resident, SeedRelayFromSnapshots MUST fail
+// closed — an ArmRelay Update() call returning without error is not sufficient evidence the
+// entry is actually in the kernel map. This is the literal fix for the Context defect ("PM_SEQ_
+// XLAT categorically does not exist in the kernel" while seqXlatSeeded=true was asserted).
+func TestSeedRelayFromSnapshots_LookupVerificationFailure(t *testing.T) {
+	ctx := context.Background()
+	mgr := &notFoundEBPFStub{}
+
+	snaps := []SeqSnapshot{
+		{SrcIP: "10.244.1.60", SrcPort: 11001, DstIP: "10.244.0.60", DstPort: 5432, SndNxt: 100, RcvNxt: 200},
+	}
+
+	_, err := SeedRelayFromSnapshots(ctx, 0, snaps, "ens5", mgr)
+	if err == nil {
+		t.Fatal("expected SeedRelayFromSnapshots to fail closed when LookupSeqXlat reports found=false, got nil error")
+	}
+	if len(mgr.armed) != 1 {
+		t.Fatalf("expected ArmRelay to have been called once (it must succeed before the verification failure is observed), got %d calls", len(mgr.armed))
+	}
+}
+
+// TestSeedRelayFromSnapshots_VerifiedSeedSucceeds is the happy-path companion: when ArmRelay
+// succeeds AND LookupSeqXlat confirms the entry round-trips, SeedRelayFromSnapshots must
+// succeed and return one result per snapshot.
+func TestSeedRelayFromSnapshots_VerifiedSeedSucceeds(t *testing.T) {
+	ctx := context.Background()
+	mgr := &recordingEBPFStub{}
+
+	snaps := []SeqSnapshot{
+		{SrcIP: "10.244.1.61", SrcPort: 11002, DstIP: "10.244.0.61", DstPort: 5432, SndNxt: 100, RcvNxt: 200},
+	}
+
+	results, err := SeedRelayFromSnapshots(ctx, 0, snaps, "ens5", mgr)
+	if err != nil {
+		t.Fatalf("expected verified seed to succeed, got: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
 }
 
 // TestRelayKeyNormalizationIPv4Mapped verifies that IPv4-mapped IPv6 addresses

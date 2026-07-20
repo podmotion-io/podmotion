@@ -410,6 +410,39 @@ func (m *ciliumEBPFManager) DisarmRelay(ctx context.Context, key SeqXlatKey) err
 	return nil
 }
 
+// LookupSeqXlat performs a real bpf_map_lookup against PM_SEQ_XLAT for key (ADR-0357 D1.2) —
+// the literal implementation of the overlay.go:22 doc comment's promise that predicate B is
+// "verified via bpf_map_lookup", not merely inferred from ArmRelay's Update() call returning
+// without error. Uses the same *ebpf.Map (m.relayObjs.PmSeqXlat) ArmRelay/DisarmRelay already
+// hold. found=false (nil error) when the relay collection is not loaded at all (nothing has
+// ever been armed) or the specific key is genuinely absent from the map.
+func (m *ciliumEBPFManager) LookupSeqXlat(ctx context.Context, key SeqXlatKey) (SeqXlatEntry, bool, error) {
+	log := logf.FromContext(ctx)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.relayObjs == nil {
+		log.Info("ebpf cilium: LookupSeqXlat — relay collection not loaded (nothing armed yet)",
+			"srcPort", key.SrcPort, "dstPort", key.DstPort)
+		return SeqXlatEntry{}, false, nil
+	}
+
+	bpfKey := pmRelayBpfKey(key)
+	var bpfVal [16]byte
+	if err := m.relayObjs.PmSeqXlat.Lookup(bpfKey, &bpfVal); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			log.Info("ebpf cilium: LookupSeqXlat — entry not resident in PM_SEQ_XLAT",
+				"srcPort", key.SrcPort, "dstPort", key.DstPort)
+			return SeqXlatEntry{}, false, nil
+		}
+		return SeqXlatEntry{}, false, fmt.Errorf("PM_SEQ_XLAT lookup: %w", err)
+	}
+
+	entry := pmRelayBpfValToEntry(bpfVal[:])
+	log.Info("ebpf cilium: LookupSeqXlat — entry confirmed resident", "srcPort", key.SrcPort, "dstPort", key.DstPort)
+	return entry, true, nil
+}
+
 // ArmVTEP populates PM_VTEP_MAP and attaches PM_XDP_VTEP to dstIfname and
 // PM_XDP_SRC_GUARD to srcIfname.
 func (m *ciliumEBPFManager) ArmVTEP(ctx context.Context, podIP net.IP, ve VtepEntry, dstIfname, srcIfname string) error {
@@ -958,7 +991,7 @@ func attachTCIngress(ifindex int, prog *ebpf.Program) (uint32, error) {
 		Info    uint32
 	}
 	const prioDefault = 1
-	const ethPAll = 0x0300 // ADR-0209: htons(ETH_P_ALL); tcm_info protocol is network byte order
+	const ethPAll = 0x0300             // ADR-0209: htons(ETH_P_ALL); tcm_info protocol is network byte order
 	const tcParentIngress = 0xFFFFFFF2 // TC_H_MIN_INGRESS
 	filterHandle := uint32(0xFFFF0002)
 	tc := tcmsg{
@@ -1232,6 +1265,19 @@ func pmRelayBpfVal(e SeqXlatEntry) []byte {
 	b[14] = e.State
 	b[15] = 0
 	return b
+}
+
+// pmRelayBpfValToEntry is the inverse of pmRelayBpfVal — decodes the packed PM_SEQ_XLAT value
+// bytes read back by LookupSeqXlat into a SeqXlatEntry (ADR-0357 D1.2).
+func pmRelayBpfValToEntry(b []byte) SeqXlatEntry {
+	return SeqXlatEntry{
+		SeqDelta:    int32(binary.LittleEndian.Uint32(b[0:4])),
+		AckDelta:    int32(binary.LittleEndian.Uint32(b[4:8])),
+		TsDelta:     int32(binary.LittleEndian.Uint32(b[8:12])),
+		Wscale:      b[12],
+		SackPresent: b[13],
+		State:       b[14],
+	}
 }
 
 // pmVtepBpfVal converts a VtepEntry to the packed struct for PM_VTEP_MAP.

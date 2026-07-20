@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podmotion-demo-postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion-demo
+    app.kubernetes.io/component: postgres
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  # Single replica, no PVC — backend/README.md: "postgres ... Test/migration
+  # history store, ephemeral (no PVC)" and docs/NORTH-STAR.md: "data loss on
+  # restart is acceptable for this tier." Deliberately no volumeClaimTemplates /
+  # PersistentVolumeClaim anywhere in this file.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: podmotion-demo-postgres
+  template:
+    metadata:
+      labels:
+        app: podmotion-demo-postgres
+        app.kubernetes.io/name: podmotion-demo
+        app.kubernetes.io/component: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
+          imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.auth.user | quote }}
+            - name: POSTGRES_PASSWORD
+              value: {{ .Values.postgres.auth.password | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.auth.database | quote }}
+            # Official postgres image default PGDATA is a subdirectory of the
+            # mount, not the mount root itself — required when the mount is a
+            # fresh emptyDir (postgres refuses to initdb into a non-empty mount
+            # that already has lost+found-style reserved dirs on some CSI drivers;
+            # harmless here too, and keeps behavior identical if this is ever
+            # pointed at a real volume later).
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.postgres.auth.user | quote }}]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.postgres.auth.user | quote }}]
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        # emptyDir, not a PVC — see the ephemeral-by-design note above.
+        - name: data
+          emptyDir: {}

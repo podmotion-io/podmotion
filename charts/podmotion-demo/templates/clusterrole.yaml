@@ -1,0 +1,55 @@
+# Exactly the permission set backend/internal/k8s/{client.go,watch.go} actually
+# calls — verified by reading both files line by line (see the podmotion-demo repo,
+# Sprint work "merge as optional add-on"). No get/watch/update/delete beyond what
+# is cited next to each rule. This mirrors the least-privilege-with-a-comment style
+# already used in ../podmotion/charts/podmotion/templates/clusterrole.yaml.
+#
+# The package doc-comment in client.go itself already says this out loud: "the
+# ServiceAccount backing this client is granted broad RBAC ... which is only safe
+# on an isolated demo cluster" — full command-and-control (any pod, any namespace)
+# is the deliberate design, not an accident. See docs/NORTH-STAR.md "Architecture
+# decisions made so far."
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: podmotion-demo-api-role
+  labels:
+    app.kubernetes.io/name: podmotion-demo
+    app.kubernetes.io/component: api
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+rules:
+  # internal/k8s/client.go ListNodes(): c.Clientset.CoreV1().Nodes().List(...).
+  # A one-shot List call, never Get on an individual node — "list" only.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [list]
+  # internal/k8s/client.go ListPods(): c.Clientset.CoreV1().Pods("").List(...)
+  # (all namespaces, topology view) AND TailLogs(): c.Clientset.CoreV1().Pods(ns).
+  # List(...) (namespace-scoped, selecting operator/agent pods by label). Both are
+  # List calls, never Get on an individual pod — "list" only, cluster-wide so the
+  # namespace-scoped TailLogs call is also covered.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+  # internal/k8s/client.go podLogLines(): c.Clientset.CoreV1().Pods(ns).
+  # GetLogs(podName, &corev1.PodLogOptions{...}) — the pods/log subresource GET.
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  # internal/k8s/client.go ListMigrations(): c.Dynamic.Resource(podMigrationGVR).
+  # Namespace("").List(...) — "list".
+  # internal/k8s/client.go TriggerMigration(): c.Dynamic.Resource(podMigrationGVR).
+  # Namespace(podNamespace).Create(...) — "create".
+  # internal/k8s/watch.go WatchMigrations(): a dynamicinformer.NewDynamicShared-
+  # InformerFactory(c.Dynamic, 0).ForResource(podMigrationGVR).Informer() watching
+  # EVERY PodMigration CR cluster-wide (no namespace scope passed to the factory)
+  # — its ListWatch does an initial List (already covered above) plus an ongoing
+  # Watch, so "watch" is required too. This informer is easy to miss reading only
+  # client.go; it lives in the separate watch.go file in the same package — it is
+  # what makes the History leaderboard capture migrations this portal did not
+  # itself trigger (MigrationPolicy, descheduler, kubectl apply).
+  # No single-object Get is ever called on podmigrations, so "get" is deliberately
+  # NOT granted here.
+  - apiGroups: [migration.podmotion.io]
+    resources: [podmigrations]
+    verbs: [list, watch, create]

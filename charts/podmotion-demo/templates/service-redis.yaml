@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: podmotion-demo-redis
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion-demo
+    app.kubernetes.io/component: redis
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  type: ClusterIP
+  selector:
+    app: podmotion-demo-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      protocol: TCP

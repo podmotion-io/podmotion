@@ -154,6 +154,85 @@ func TestResolveReattachMounts_ResolvesHostTargetByLabelWhenStatusEmpty(t *testi
 	}
 }
 
+// TestResolveReattachMounts_BareNFSVolumeNoPVC is the sprint53-kind EC2/ADR-0193-P-0193-1 regression:
+// a pod spec whose volume is a BARE pod-spec `nfs:` source with NO PersistentVolumeClaim wrapper —
+// the exact shape used on a cluster with no StorageClass/CSI (see
+// docs/sprints/sprint53-kind/STATUS-EC2-KUBEADM.md), where the postgres PGDATA mount was pointed at
+// a raw NFS export instead of a PVC. Before the fix, resolveReattachMountsImpl was keyed exclusively
+// on v.PersistentVolumeClaim, so this pod's PGDATA volume never entered pvcVolToClaim, the function
+// returned an EMPTY reattach set, and patch_checkpoint_script.go's ADR-0194 B-2 drop pass discarded
+// the mount as an unresolved external — orphaning its open REG fds (the live postgres WAL segment)
+// into the ADR-0193 P-0193-1 DECLINE hard-stop at restore time, even though
+// internal/agent/storage.classifier's StorageReadyForFreeze precondition had already reported the
+// same volume as Tier0/RWX-ready. This test fails before the fix (empty mounts) and passes after
+// (the NFS mount resolves with Tier0RWX and its real kubelet host target).
+func TestResolveReattachMounts_BareNFSVolumeNoPVC(t *testing.T) {
+	const migName = "postgres-live-migration"
+	const replUID = "c2a1d9e0-1111-4a8a-ad72-f6d5d5436abc"
+	const volName = "pgdata"
+	const containerPath = "/var/lib/postgresql/data"
+	wantHost := "/var/lib/kubelet/pods/" + replUID + "/volumes/kubernetes.io~nfs/" + volName
+
+	orig := kubeletVolumeGlobFn
+	t.Cleanup(func() { kubeletVolumeGlobFn = orig })
+	kubeletVolumeGlobFn = func(_ context.Context, uid, pv string) string {
+		if uid == replUID && pv == volName {
+			return wantHost
+		}
+		return ""
+	}
+
+	pm := &pmv1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{Name: migName, Namespace: "default"},
+		Spec:       pmv1.PodMigrationSpec{PodName: "postgres-src", PodNamespace: "default"},
+	}
+	// No PVC object at all — the pod spec's volume is a bare `nfs:` source.
+	replPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "postgres-src-m-bare-nfs",
+			Namespace: "default",
+			UID:       types.UID(replUID),
+			Labels:    map[string]string{replacementPodLabelKey: migName},
+		},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name: volName,
+				VolumeSource: corev1.VolumeSource{
+					NFS: &corev1.NFSVolumeSource{Server: "10.60.1.225", Path: "/export/pgdata"},
+				},
+			}},
+			Containers: []corev1.Container{{
+				Name:         "postgres",
+				VolumeMounts: []corev1.VolumeMount{{Name: volName, MountPath: containerPath}},
+			}},
+		},
+	}
+	s := newFakeAgentServerWithCoreObjects(t, pm, replPod)
+
+	mounts, err := s.resolveReattachMounts(context.Background(), migName)
+	if err != nil {
+		t.Fatalf("resolveReattachMounts returned error for a bare NFS volume with a resolved host target: %v", err)
+	}
+	if len(mounts) != 1 {
+		t.Fatalf("expected exactly 1 re-attach mount for the bare NFS volume, got %d: %+v", len(mounts), mounts)
+	}
+	if mounts[0].ContainerPath != containerPath {
+		t.Errorf("container path: got %q, want %q", mounts[0].ContainerPath, containerPath)
+	}
+	if mounts[0].HostTarget != wantHost {
+		t.Fatalf("bare-NFS host target NOT resolved: got %q, want %q (P-0193-1 regression: an empty reattach set here means the mount gets B-2 dropped and its fds DECLINE at restore)", mounts[0].HostTarget, wantHost)
+	}
+	if mounts[0].Tier != reattachTierTier0RWX {
+		t.Errorf("bare NFS volume must classify as Tier0 RWX re-attach: got tier %d", mounts[0].Tier)
+	}
+
+	// End-to-end: the resolved host target must reach the patch-script host-target map, the actual
+	// consumer that keeps patch_checkpoint_script.go from B-2-dropping this mount.
+	if ht := reattachHostTargets(mounts); ht[containerPath] != wantHost {
+		t.Errorf("resolved bare-NFS host target must be projected into the patch host-target map: got %q, want %q", ht[containerPath], wantHost)
+	}
+}
+
 // reattachTestFixture builds a (pm, pvc, replPod) triad wired for the re-attach resolver: an empty
 // Status.ReplacementPodName, a labelled replacement pod, and a single PVC-backed volume mount.
 func reattachTestFixture(migName, replUID, pvName, containerPath string) (*pmv1.PodMigration, *corev1.PersistentVolumeClaim, *corev1.Pod) {

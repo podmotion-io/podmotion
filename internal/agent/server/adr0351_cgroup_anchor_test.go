@@ -253,12 +253,21 @@ func TestCgroupAnchor_NoSecondOwnershipLock(t *testing.T) {
 // run-adr0351-cgroup-anchor-live-proof.sh) is what actually MEASURES whole-tree containment
 // against a real multi-process workload; this unit test asserts the documented single-write
 // property structurally so a future silent change to move multiple PIDs is visible here too.
+//
+// Sprint53-kind UPDATE: the write itself moved from an in-process os.WriteFile to exactly one
+// netnsBrokerClientFn().MoveCgroup call (see moveProcessToPodCgroup's doc comment — a cgroup v2
+// cgroup.procs write requires the writer's own cgroup namespace to be an ancestor of the target,
+// which the de-privileged agent's namespace is not on kind). The single-write/no-tree-walk
+// property this test polices is unchanged; only the mechanism performing that one write moved.
 func TestCgroupAnchor_WholeTreeContainment(t *testing.T) {
 	src := readAnchorFuncSource(t, "func moveProcessToPodCgroup(")
-	if strings.Count(src, "WriteFile") != 1 {
-		t.Fatalf("moveProcessToPodCgroup's cgroup.procs write count changed (found %d os.WriteFile calls) — if this now writes multiple PIDs/walks descendants, update the D2.6/BD-8 Consequences containment claim scope and this test together; do not let scope silently change unnoticed", strings.Count(src, "WriteFile"))
+	if strings.Count(src, "MoveCgroup(") != 1 {
+		t.Fatalf("moveProcessToPodCgroup's cgroup-move call count changed (found %d MoveCgroup calls) — if this now writes multiple PIDs/walks descendants, update the D2.6/BD-8 Consequences containment claim scope and this test together; do not let scope silently change unnoticed", strings.Count(src, "MoveCgroup("))
 	}
-	t.Log("BD-8: whole-tree (multi-process descendant TGID) containment is NOT unit-testable without a real process tree + real cgroupfs — MEASURED by the live D2.6 proof script, not this test. This test only pins the pre-existing single-root-PID-write property so a change to that property is visible.")
+	if strings.Contains(src, "os.WriteFile") {
+		t.Fatalf("moveProcessToPodCgroup contains a direct os.WriteFile — the cgroup.procs write must go through the privileged broker (netnsBrokerClientFn().MoveCgroup), not an in-process write (sprint53-kind, ENOENT under the SD-1 agent's own cgroup namespace)")
+	}
+	t.Log("BD-8: whole-tree (multi-process descendant TGID) containment is NOT unit-testable without a real process tree + real cgroupfs — MEASURED by the live D2.6 proof script, not this test. This test only pins the pre-existing single-root-PID-move property so a change to that property is visible.")
 }
 
 // TestCgroupAnchor_G5ReapOnTerminalLeg mirrors the retained TestReapRestoredProcessTreeFn_Injectable

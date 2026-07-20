@@ -1,0 +1,6 @@
+dependencies:
+- name: podmotion-demo
+  repository: file://../podmotion-demo
+  version: 0.1.0
+digest: sha256:6e6ae9aaf168e5ab84679d5b37dc3646f6f8c42c5db61c056426b2da4c81f4af
+generated: "2026-07-19T10:10:08.199496011-06:00"

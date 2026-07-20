@@ -10,6 +10,7 @@ you may not use this file except in compliance with the License.
 package network
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"syscall"
@@ -18,6 +19,77 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ADR-0357 D1.2 — LookupSeqXlat real bpf_map_lookup round-trip (§P-VERIFY assertion 1).
+//
+// Loading a real BPF collection requires CAP_BPF/CAP_SYS_ADMIN (BPF_PROG_LOAD). This test is
+// skipped, not failed, when that privilege is unavailable — matching the established pattern in
+// this package (adr0355_pmdst0_idempotency_test.go, tcprepair_export_test.go) for tests that
+// need real kernel privilege the sandboxed CI/dev environment does not grant.
+// ──────────────────────────────────────────────────────────────────────────────
+
+// TestCiliumEBPFManager_LookupSeqXlat_RoundTrip seeds an entry via ArmRelay then confirms
+// LookupSeqXlat returns found=true with the exact key/value round-tripped — the literal
+// §P-VERIFY assertion 1 requirement for the new EBPFManager method.
+func TestCiliumEBPFManager_LookupSeqXlat_RoundTrip(t *testing.T) {
+	ctx := context.Background()
+	m := newCiliumEBPFManager()
+
+	key := SeqXlatKey{
+		SrcIP:   [4]byte{10, 244, 1, 70},
+		DstIP:   [4]byte{10, 244, 0, 70},
+		SrcPort: 12345,
+		DstPort: 5432,
+	}
+	entry := SeqXlatEntry{
+		SeqDelta:    1234,
+		AckDelta:    5678,
+		TsDelta:     42,
+		Wscale:      7,
+		SackPresent: 1,
+		State:       1,
+	}
+
+	if err := m.ArmRelay(ctx, "lo", key, entry); err != nil {
+		t.Skipf("ArmRelay failed (likely no CAP_BPF/CAP_SYS_ADMIN in this environment): %v", err)
+	}
+	defer func() { _ = m.DisarmRelay(ctx, key) }()
+
+	got, found, err := m.LookupSeqXlat(ctx, key)
+	if err != nil {
+		t.Fatalf("LookupSeqXlat: unexpected error: %v", err)
+	}
+	if !found {
+		t.Fatal("LookupSeqXlat: expected found=true immediately after ArmRelay, got false")
+	}
+	if got != entry {
+		t.Errorf("LookupSeqXlat: round-tripped entry mismatch: got %+v, want %+v", got, entry)
+	}
+}
+
+// TestCiliumEBPFManager_LookupSeqXlat_NotFound confirms LookupSeqXlat reports found=false
+// (nil error) for a key that was never armed — the entry-genuinely-absent case, distinct from
+// an actual lookup error.
+func TestCiliumEBPFManager_LookupSeqXlat_NotFound(t *testing.T) {
+	ctx := context.Background()
+	m := newCiliumEBPFManager()
+
+	armedKey := SeqXlatKey{SrcIP: [4]byte{10, 244, 1, 71}, DstIP: [4]byte{10, 244, 0, 71}, SrcPort: 1, DstPort: 2}
+	if err := m.ArmRelay(ctx, "lo", armedKey, SeqXlatEntry{State: 1}); err != nil {
+		t.Skipf("ArmRelay failed (likely no CAP_BPF/CAP_SYS_ADMIN in this environment): %v", err)
+	}
+	defer func() { _ = m.DisarmRelay(ctx, armedKey) }()
+
+	neverArmedKey := SeqXlatKey{SrcIP: [4]byte{10, 244, 1, 72}, DstIP: [4]byte{10, 244, 0, 72}, SrcPort: 3, DstPort: 4}
+	_, found, err := m.LookupSeqXlat(ctx, neverArmedKey)
+	if err != nil {
+		t.Fatalf("LookupSeqXlat: unexpected error for absent key: %v", err)
+	}
+	if found {
+		t.Error("LookupSeqXlat: expected found=false for a key that was never armed, got true")
+	}
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // ADR-0204 — readNetlinkAck correlated-read regression tests.

@@ -190,6 +190,45 @@ func TestCheckAtomicityBarrier_NonEmptySnapshot_RelaySeedConfirmed(t *testing.T)
 	})
 }
 
+// TestCheckAtomicityBarrier_PreRestore_PredicateBDeferred is the ADR-0357 D1.1 regression: in
+// PreRestore mode (reconcileOverlayHandoff's call, before CRIU restore has run on either path)
+// predicate B must be deferred (vacuous pass) regardless of the SeqXlatSeeded value supplied —
+// seeding is fundamentally a post-restore event, so no client-supplied bool sent pre-restore can
+// make it real. This closes the exact defect the ADR's Context describes: a hardcoded
+// seqXlatSeeded=true sent before restore has run.
+func TestCheckAtomicityBarrier_PreRestore_PredicateBDeferred(t *testing.T) {
+	p := network.BarrierPredicates{
+		SeqXlatSeeded:      false, // deliberately false — must not matter in PreRestore mode
+		DestConntrackArmed: true,
+		PreRestore:         true,
+		FDBManager:         nil,
+	}
+	result, err := network.CheckAtomicityBarrier(context.Background(), p)
+	if err != nil {
+		t.Fatalf("PreRestore mode: expected predicate B deferred (no error), got: %v", err)
+	}
+	if !result.BPredicate {
+		t.Error("PreRestore mode: expected predicate B to be vacuously satisfied (deferred), got false")
+	}
+}
+
+// TestCheckAtomicityBarrier_PostRestore_PredicateBStillEnforced confirms D1.1's deferral is
+// scoped to PreRestore mode only — once PreRestore is false (DisengageHold, post-restore) a
+// false SeqXlatSeeded must still fail the barrier, exactly like before this ADR.
+func TestCheckAtomicityBarrier_PostRestore_PredicateBStillEnforced(t *testing.T) {
+	p := network.BarrierPredicates{
+		SeqXlatSeeded:        false,
+		SourceConntrackArmed: true,
+		DestConntrackArmed:   true,
+		RestoreComplete:      true,
+		PreRestore:           false,
+	}
+	_, err := network.CheckAtomicityBarrier(context.Background(), p)
+	if err == nil {
+		t.Fatal("PostRestore mode: expected error for unsatisfied predicate B, got nil")
+	}
+}
+
 func TestComputePAWSTsDelta(t *testing.T) {
 	cases := []struct {
 		name   string

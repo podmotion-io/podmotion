@@ -1000,13 +1000,20 @@ func (r *PodMigrationReconciler) reconcileOverlayHandoff(ctx context.Context, pm
 	// fdbIfname may be "" — that is intentional; the agent discovers the VXLAN device at runtime.
 
 	// seq_xlat_seeded: predicate B of the atomicity barrier.
-	// When TCPSeqSnapshots is non-empty, SeedSeqXlat ran during Restore to populate
-	// PM_SEQ_XLAT — seeded=true.
-	// When TCPSeqSnapshots is empty there are no active TCP connections to translate:
-	// PM_SEQ_XLAT needs no entries, so predicate B is vacuously satisfied — seeded=true.
-	// Sending seeded=false when snapshots are absent causes an infinite OverlayHandoff
-	// retry loop because CheckAtomicityBarrier always appends "B: PM_SEQ_XLAT not seeded"
-	// regardless of whether seeding was necessary (Sprint 32 gate blocker B5).
+	//
+	// ADR-0357 D1/D1.1 CORRECTION: this value is now VACUOUS/IGNORED on the agent side. This
+	// call is PreRestore:true — CRIU restore has not run yet on either path, so seeding
+	// categorically cannot have happened, and no client-supplied bool sent here can make
+	// predicate B real. The stale comment this replaces described a *conditional* rule
+	// ("non-empty TCPSeqSnapshots means SeedSeqXlat ran during Restore") that the code never
+	// actually implemented — it sent `true` unconditionally in both branches, which is exactly
+	// the "trust a client-supplied bool pre-restore" defect ADR-0357 exists to close (Context
+	// item 2). The real fix lives in network.CheckAtomicityBarrier: when BarrierPredicates.
+	// PreRestore is true, predicate B is explicitly DEFERRED (vacuous pass, same idiom as
+	// predicates E-source/F below it) rather than evaluated against whatever bool arrives here.
+	// Predicate B becomes real post-restore, gated on pm.Status.SeqXlatSeeded — see
+	// reconcileDisengageHold (D1.3). The field is still sent (proto requires a value; the agent
+	// ignores it in PreRestore mode) so as not to change the wire shape.
 	seqXlatSeeded := true
 
 	log.Info("OverlayHandoff: calling ConfirmOverlayReady on destination agent (pre-restore, predicates B-E)",
@@ -1222,12 +1229,34 @@ func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm 
 		}
 	}
 
-	// PM_SEQ_XLAT relay wiring is M22. For M20 we set RelayProgramsLoaded=True as a placeholder
-	// once the zero-window hold is confirmed disarmed. This unblocks TCPVerifying.
-	log.Info("DisengageHold: ZW hold disarmed; marking RelayProgramsLoaded (PM_SEQ_XLAT relay wired in M22)",
-		"migration", pm.Name)
-	setCondition(pm, pmv1.ConditionRelayProgramsLoaded, metav1.ConditionTrue,
-		"ZWHoldDisarmed", "Zero-window hold disarmed; PM_SEQ_XLAT relay programs wired in M22 (ADR-0049)")
+	// ADR-0357 D1.3: PM_SEQ_XLAT relay wiring is real (D1/D2), not an M20 placeholder. Read the
+	// destination agent's write-back (pm.Status.SeqXlatSeeded, a plain bool set only after
+	// EBPFManager.LookupSeqXlat confirms the PM_SEQ_XLAT entry is actually resident in the
+	// kernel map — D1.2) as a bare bool, the same read style as the pm.Status.SourceConntrackArmed
+	// check above (predicate E-source), never meta.IsStatusConditionTrue. When TCPSeqSnapshots is
+	// empty there is nothing to seed — predicate B is vacuously satisfied (D1.4). When
+	// TCPSeqSnapshots is non-empty but SeqXlatSeeded was never confirmed, fail closed to
+	// rollback rather than silently reporting RelayProgramsLoaded=True — the exact defect this
+	// ADR closes (a live Strict migration reporting success while PM_SEQ_XLAT was categorically
+	// absent from the kernel).
+	if len(pm.Status.TCPSeqSnapshots) > 0 && !pm.Status.SeqXlatSeeded {
+		msg := fmt.Sprintf("PM_SEQ_XLAT seeding required (%d TCP sequence snapshot(s)) but "+
+			"Status.SeqXlatSeeded is not set — the destination agent never confirmed a verified "+
+			"bpf_map_lookup write-back (ADR-0357 D1/D2); failing closed rather than reporting "+
+			"relay-programs-loaded on an unverified/absent seq translation", len(pm.Status.TCPSeqSnapshots))
+		log.Error(nil, "DisengageHold: "+msg, "migration", pm.Name)
+		setCondition(pm, pmv1.ConditionRelayProgramsLoaded, metav1.ConditionFalse, "SeqXlatNotSeeded", msg)
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr
+		}
+		return r.initiateRollback(ctx, pm, msg)
+	}
+	relayMsg := fmt.Sprintf("Zero-window hold disarmed; PM_SEQ_XLAT relay verified via destination "+
+		"bpf_map_lookup write-back (seqXlatSeeded=%v, tcpSeqSnapshotCount=%d) (ADR-0357 D1/D2)",
+		pm.Status.SeqXlatSeeded, len(pm.Status.TCPSeqSnapshots))
+	log.Info("DisengageHold: ZW hold disarmed; PM_SEQ_XLAT relay verified (ADR-0357 D1/D2)",
+		"migration", pm.Name, "seqXlatSeeded", pm.Status.SeqXlatSeeded, "tcpSeqSnapshotCount", len(pm.Status.TCPSeqSnapshots))
+	setCondition(pm, pmv1.ConditionRelayProgramsLoaded, metav1.ConditionTrue, "SeqXlatVerified", relayMsg)
 	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}

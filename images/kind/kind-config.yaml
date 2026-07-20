@@ -1,33 +1,38 @@
-# PodMotion Sprint 42 cluster — 1 control-plane + 2 worker (amd64/kind)
-# Usage: kind create cluster --name podmotion-sprint42 --config images/kind/kind-config.yaml
+# PodMotion Sprint 53 cluster — 1 control-plane + 2 worker (amd64/kind)
+# Usage: kind create cluster --name podmotion-sprint53 --config images/kind/kind-config.yaml
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
-name: podmotion-sprint42
+name: podmotion-sprint53
+# ADR-MAP: sprint53 (kind Cilium revival), verified live. The extraMounts: hostPath:
+# /sys/fs/bpf that used to be here on EVERY node bind-mounted the SAME physical host
+# directory (Bidirectional) into all 3 node containers. bpffs is a shared-inode
+# filesystem, not a namespace-scoped one purely by mount location — bind-mounting one
+# host path into multiple containers means all 3 "nodes" pin/read/write the exact same
+# backing bpffs, so Cilium's per-node global BPF maps and endpoint links collided
+# across nodes (confirmed live: `ls /sys/fs/bpf/tc/globals` was byte-identical between
+# control-plane and worker). This surfaced as "-> endpoint <bogus-id>" phantom local
+# delivery in `cilium-dbg monitor` for genuinely cross-node pod-to-pod traffic — packets
+# silently vanish (no drop counter, nothing egresses eth0) because Cilium's datapath
+# thinks a remote pod IP maps to a local (non-existent) endpoint slot on the wrong node.
+# This was latent and harmless under the original Flannel/PodMotion-agent kind path
+# (Flannel doesn't pin much under /sys/fs/bpf/tc/globals) but breaks any CNI that
+# manages its own datapath state there, e.g. Cilium. images/kind/Dockerfile already
+# installs its own sys-fs-bpf.mount systemd unit giving each node container a private,
+# per-netns bpffs — that alone is correct and sufficient; do NOT re-add a shared
+# hostPath mount for /sys/fs/bpf here.
 nodes:
   - role: control-plane
-    image: podmotion-node:sprint42-amd64
+    image: podmotion-node:sprint53-amd64
     kubeadmConfigPatches:
       - |
         kind: InitConfiguration
         nodeRegistration:
           kubeletExtraArgs:
             feature-gates: "ContainerCheckpoint=true"
-    extraMounts:
-      - hostPath: /sys/fs/bpf
-        containerPath: /sys/fs/bpf
-        propagation: Bidirectional
   - role: worker
-    image: podmotion-node:sprint42-amd64
-    extraMounts:
-      - hostPath: /sys/fs/bpf
-        containerPath: /sys/fs/bpf
-        propagation: Bidirectional
+    image: podmotion-node:sprint53-amd64
   - role: worker
-    image: podmotion-node:sprint42-amd64
-    extraMounts:
-      - hostPath: /sys/fs/bpf
-        containerPath: /sys/fs/bpf
-        propagation: Bidirectional
+    image: podmotion-node:sprint53-amd64
 networking:
   # disableDefaultCNI: kind's default CNI is kindnet. `make kind-create` separately
   # applies flannel (kube-flannel v0.25.4). Without this flag BOTH kindnet and flannel

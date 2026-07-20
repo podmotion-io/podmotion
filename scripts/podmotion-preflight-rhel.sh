@@ -185,6 +185,24 @@ else
   info "WARN  sysctl net.core.bpf_jit_enable=${BPF_JIT_VAL} (expected 1 or 2)"
   ((WARN++)); RESULTS["sysctl_bpf_jit"]="warn"
 fi
+# fs.inotify ceilings: CRIU's kerndat probe and inotify-watch restore path need
+# headroom above the stock Linux defaults (max_user_instances=128, max_user_watches=8192)
+INOTIFY_INSTANCES_VAL=$(sysctl -n fs.inotify.max_user_instances 2>/dev/null || echo "0")
+if [[ "$INOTIFY_INSTANCES_VAL" -ge 8192 ]]; then
+  info "PASS  sysctl fs.inotify.max_user_instances=${INOTIFY_INSTANCES_VAL}"
+  ((PASS++)); RESULTS["sysctl_inotify_instances"]="pass"
+else
+  info "WARN  sysctl fs.inotify.max_user_instances=${INOTIFY_INSTANCES_VAL} (expected >= 8192)"
+  ((WARN++)); RESULTS["sysctl_inotify_instances"]="warn"
+fi
+INOTIFY_WATCHES_VAL=$(sysctl -n fs.inotify.max_user_watches 2>/dev/null || echo "0")
+if [[ "$INOTIFY_WATCHES_VAL" -ge 1048576 ]]; then
+  info "PASS  sysctl fs.inotify.max_user_watches=${INOTIFY_WATCHES_VAL}"
+  ((PASS++)); RESULTS["sysctl_inotify_watches"]="pass"
+else
+  info "WARN  sysctl fs.inotify.max_user_watches=${INOTIFY_WATCHES_VAL} (expected >= 1048576)"
+  ((WARN++)); RESULTS["sysctl_inotify_watches"]="warn"
+fi
 log ""
 
 # ---------------------------------------------------------------------------

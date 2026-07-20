@@ -763,6 +763,20 @@ type PodMigrationStatus struct {
 	// +optional
 	SourceConntrackArmed bool `json:"sourceConntrackArmed,omitempty"`
 
+	// SeqXlatSeeded indicates that PM_SEQ_XLAT has been seeded on the destination node AND
+	// verified resident via a real bpf_map_lookup (ADR-0357 D1/D2) — predicate B of the
+	// ADR-0049 atomicity barrier. Written by the destination agent's restore path (both the
+	// gRPC Restore handler and the NRI JoinNsRestore path converge on this write) only after
+	// EBPFManager.LookupSeqXlat confirms the entry round-trips, never merely after ArmRelay's
+	// map Update() call returns without error. A plain status bool, parallel to
+	// SourceConntrackArmed above — deliberately not a metav1.Condition (ADR-0357 Amendment F4):
+	// every other layer this value touches (ConfirmOverlayReadyRequest.SeqXlatSeeded,
+	// network.BarrierPredicates.SeqXlatSeeded) is already bool-typed. reconcileDisengageHold
+	// reads this as a bare bool (never meta.IsStatusConditionTrue) and fails closed to rollback
+	// when TCPSeqSnapshots is non-empty but this remains false.
+	// +optional
+	SeqXlatSeeded bool `json:"seqXlatSeeded,omitempty"`
+
 	// SourceClockNs is CLOCK_MONOTONIC nanoseconds captured on the source node at freeze
 	// time, returned in CheckpointResponse. Passed to ConfirmOverlayReady so the destination
 	// can compute the PAWS ts_delta for PM_SEQ_XLAT (ADR-0049).
