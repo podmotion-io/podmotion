@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podmotion-demo-redis
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion-demo
+    app.kubernetes.io/component: redis
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  # Single replica, no PVC — see deployment-postgres.yaml for the same ephemeral-
+  # by-design rationale (backend/README.md: "redis ... Cache/pubsub for live
+  # status, ephemeral (no PVC)").
+  replicas: 1
+  selector:
+    matchLabels:
+      app: podmotion-demo-redis
+  template:
+    metadata:
+      labels:
+        app: podmotion-demo-redis
+        app.kubernetes.io/name: podmotion-demo
+        app.kubernetes.io/component: redis
+    spec:
+      containers:
+        - name: redis
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        # emptyDir, not a PVC — ephemeral by design (see above).
+        - name: data
+          emptyDir: {}

@@ -1,0 +1,97 @@
+# podmotion-demo Helm chart values
+#
+# This chart is normally consumed as an optional, disabled-by-default dependency
+# of ../podmotion (see that chart's Chart.yaml `dependencies:` entry and the
+# `podmotion-demo.enabled` condition in its values.yaml). It can also be installed
+# standalone (`helm install podmotion-demo charts/podmotion-demo/`) for iterating
+# on the demo portal by itself.
+#
+# Everything here is sized for a single conference-booth cluster, not production
+# load: single replica per component, small resource requests/limits, no PVCs on
+# postgres/redis (data loss on pod restart is intentional — see backend/README.md).
+
+# enabled is only meaningful when this chart is installed AS A DEPENDENCY of the
+# parent podmotion chart (the parent's values.yaml sets podmotion-demo.enabled).
+# It has no effect on a standalone `helm install podmotion-demo`.
+enabled: false
+
+web:
+  image:
+    repository: ghcr.io/podmotion/podmotion-demo-web
+    tag: latest
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+
+api:
+  image:
+    repository: ghcr.io/podmotion/podmotion-demo-api
+    tag: latest
+    pullPolicy: IfNotPresent
+  # podmotionNamespace is the namespace the PodMotion operator + agent are
+  # installed in (passed through as PODMOTION_NAMESPACE, read by cmd/server/main.go)
+  # — internal/k8s/client.go TailLogs uses it to select operator/agent pods to tail.
+  # It is a DIFFERENT namespace than this portal's own when the parent podmotion
+  # chart installs both under one release, since the operator's own templates
+  # hardcode their namespace to .Release.Namespace of the podmotion release.
+  podmotionNamespace: podmotion-system
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+postgres:
+  image:
+    repository: postgres
+    tag: "16-alpine"
+    pullPolicy: IfNotPresent
+  auth:
+    user: podmotion
+    password: podmotion-demo
+    database: podmotion_demo
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+redis:
+  image:
+    repository: redis
+    tag: "7-alpine"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+jaeger:
+  image:
+    repository: jaegertracing/all-in-one
+    tag: "1.60"
+    pullPolicy: IfNotPresent
+  # uiNodePort exposes the Jaeger Query UI (port 16686) on every node at this
+  # port. 30686 is what backend/docs/NORTH-STAR.md already documents as the
+  # intended default. Nothing in ../podmotion/charts/podmotion currently opens
+  # any NodePort, so this doesn't collide with the main chart.
+  uiNodePort: 30686
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi

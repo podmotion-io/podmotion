@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podmotion-demo-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion-demo
+    app.kubernetes.io/component: api
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: podmotion-demo-api
+  template:
+    metadata:
+      labels:
+        app: podmotion-demo-api
+        app.kubernetes.io/name: podmotion-demo
+        app.kubernetes.io/component: api
+    spec:
+      # No KUBECONFIG is set anywhere here. backend/internal/k8s/client.go
+      # NewClient() calls rest.InClusterConfig() FIRST and only falls back to
+      # ~/.kube/config on error — running this ServiceAccount in-cluster is all
+      # that's needed for client-go to pick up the in-cluster config automatically.
+      # Do not add a KUBECONFIG env var; it would defeat that fallback order.
+      serviceAccountName: podmotion-demo-api
+      containers:
+        - name: api
+          image: "{{ .Values.api.image.repository }}:{{ .Values.api.image.tag }}"
+          imagePullPolicy: {{ .Values.api.image.pullPolicy }}
+          # deploy/Dockerfile.backend: ENTRYPOINT ["/server"], EXPOSE 8080.
+          # cmd/server/main.go: LISTEN_ADDR defaults to ":8080" when unset, so it's
+          # left unset here deliberately rather than duplicated.
+          env:
+            # cmd/server/main.go: store.NewPostgres(envOr("DATABASE_URL", "")) —
+            # points at the postgres Service this chart creates (service-postgres.yaml).
+            - name: DATABASE_URL
+              value: "postgres://{{ .Values.postgres.auth.user }}:{{ .Values.postgres.auth.password }}@podmotion-demo-postgres:5432/{{ .Values.postgres.auth.database }}?sslmode=disable"
+            # cmd/server/main.go: cache.NewRedis(envOr("REDIS_ADDR", "localhost:6379"))
+            # — points at the redis Service this chart creates (service-redis.yaml).
+            - name: REDIS_ADDR
+              value: "podmotion-demo-redis:6379"
+            # cmd/server/main.go: otel.Init(...) only runs when this is non-empty.
+            # internal/otel/otel.go: "endpoint is a host:port (no scheme) — otlptracehttp
+            # talks plain HTTP" — 4318 is Jaeger's OTLP/HTTP receiver port, matching the
+            # jaeger Service this chart creates (service-jaeger.yaml).
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "podmotion-demo-jaeger:4318"
+            # cmd/server/main.go: envOr("PODMOTION_NAMESPACE", "podmotion-system") —
+            # passed to api.NewRouter, consumed by internal/k8s/client.go TailLogs to
+            # select the operator/agent pods to tail (a different namespace than this
+            # portal's own when installed as a podmotion-chart dependency).
+            - name: PODMOTION_NAMESPACE
+              value: {{ .Values.api.podmotionNamespace | quote }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /api/topology
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/topology
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          securityContext:
+            # deploy/Dockerfile.backend's final stage is
+            # `gcr.io/distroless/static-debian12` with no USER directive, so the
+            # image's own default is root. Every distroless image still ships the
+            # standard nonroot UID/GID 65532 (same convention the operator's own
+            # deployment.yaml relies on) — pin it explicitly rather than setting
+            # runAsNonRoot without a runAsUser, which would fail closed against
+            # this particular base image's root default.
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]

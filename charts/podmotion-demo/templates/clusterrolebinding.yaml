@@ -1,0 +1,16 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: podmotion-demo-api-rolebinding
+  labels:
+    app.kubernetes.io/name: podmotion-demo
+    app.kubernetes.io/component: api
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: podmotion-demo-api-role
+subjects:
+  - kind: ServiceAccount
+    name: podmotion-demo-api
+    namespace: {{ .Release.Namespace }}

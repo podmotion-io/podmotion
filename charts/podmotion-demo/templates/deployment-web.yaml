@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podmotion-demo-web
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion-demo
+    app.kubernetes.io/component: web
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  # Single replica by design (backend/README.md "Everything is single-replica and
+  # ephemeral on purpose... single instances are themselves migration targets for
+  # the demo").
+  replicas: 1
+  selector:
+    matchLabels:
+      app: podmotion-demo-web
+  template:
+    metadata:
+      labels:
+        app: podmotion-demo-web
+        app.kubernetes.io/name: podmotion-demo
+        app.kubernetes.io/component: web
+    spec:
+      securityContext:
+        # nginx:alpine's built-in "nginx" user/group (uid/gid 101) already owns
+        # /var/cache/nginx/* in the base image. Starting the container directly
+        # as that uid avoids nginx's own startup chown of those cache dirs —
+        # which fails ("Operation not permitted") once capabilities.drop:[ALL]
+        # below strips CAP_CHOWN, since the container would otherwise start as
+        # root (deploy/Dockerfile.frontend sets no USER) and never get a chance
+        # to drop to nginx before that chown runs.
+        runAsUser: 101
+        runAsGroup: 101
+        runAsNonRoot: true
+      containers:
+        - name: web
+          image: "{{ .Values.web.image.repository }}:{{ .Values.web.image.tag }}"
+          imagePullPolicy: {{ .Values.web.image.pullPolicy }}
+          # deploy/Dockerfile.frontend: nginx EXPOSEs 8080 (deploy/nginx.conf
+          # "listen 8080"). deploy/nginx.conf also hardcodes
+          # "proxy_pass http://podmotion-demo-api:8080/api/" as a literal, unqualified
+          # hostname — see service-api.yaml in this chart for why that Service is
+          # named literally "podmotion-demo-api" (not release-name-prefixed) so this
+          # resolves via in-cluster DNS with zero changes to nginx.conf.
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.web.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
