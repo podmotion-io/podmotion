@@ -310,6 +310,48 @@ func TestStorageClassifier_TransparentVolumes_NotClassified(t *testing.T) {
 	}
 }
 
+// TestStorageClassifier_BareNFSVolume_EarnsTier0 is the sprint53-kind EC2 regression: a pod-spec
+// volume that is a BARE `nfs:` source with no PersistentVolumeClaim wrapper — the shape used on a
+// cluster with no StorageClass/CSI (docs/sprints/sprint53-kind/STATUS-EC2-KUBEADM.md) — must be
+// classified TierRWX by real inspection of vol.NFS, not merely read as Tier0 by accident through
+// HighestTier's empty-classification-list default. Before this fix, ClassifyPod fell through the
+// "remaining non-PVC volumes are transparent" branch for an NFS volume exactly like it does for a
+// configMap, returning ZERO classifications; HighestTier then defaulted the empty list to TierRWX,
+// which coincidentally matched but did not derive from actually inspecting the volume — the same
+// vacuous default a genuinely unmigratable non-PVC volume type would also hit. This test asserts
+// ClassifyPod itself returns a real, non-empty TierRWX entry for the NFS volume.
+func TestStorageClassifier_BareNFSVolume_EarnsTier0(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "postgres-src", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{
+				{
+					Name: "pgdata",
+					VolumeSource: corev1.VolumeSource{
+						NFS: &corev1.NFSVolumeSource{Server: "10.60.1.225", Path: "/export/pgdata"},
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(newScheme()).Build()
+	classifier := storage.NewStorageClassifier(fakeClient)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(clsfs) != 1 {
+		t.Fatalf("expected 1 real classification for the bare NFS volume, got %d: %+v", len(clsfs), clsfs)
+	}
+	if clsfs[0].Tier != storage.TierRWX {
+		t.Errorf("expected TierRWX (0) for a bare NFS volume, got %d", clsfs[0].Tier)
+	}
+	if got := storage.HighestTier(clsfs); got.Tier != storage.TierRWX {
+		t.Errorf("HighestTier: expected TierRWX (0), got %d (reason: %s)", got.Tier, got.Reason)
+	}
+}
+
 // TestStorageClassifier_PostgresPGDataOnRWX_ReachesTier0 is the PINNED regression
 // guard for the postgres checkpoint-stage failure (2026-07-10 live gate).
 //
