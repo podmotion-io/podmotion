@@ -1,0 +1,35 @@
+# type: NodePort per backend/README.md ("jaeger ... UI exposed via NodePort") and
+# docs/NORTH-STAR.md ("UI on NodePort 30686"). Only the UI port gets an explicit
+# nodePort (values.yaml jaeger.uiNodePort); the OTLP ports are consumed
+# in-cluster only (see deployment-api.yaml OTEL_EXPORTER_OTLP_ENDPOINT), reached
+# via this Service's ClusterIP regardless of the Service's overall type — a
+# NodePort Service still gets a ClusterIP. Kubernetes will auto-assign node ports
+# for otlp-grpc/otlp-http too since the Service type is NodePort, but nothing in
+# this chart relies on reaching them that way.
+apiVersion: v1
+kind: Service
+metadata:
+  name: podmotion-demo-jaeger
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion-demo
+    app.kubernetes.io/component: jaeger
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  type: NodePort
+  selector:
+    app: podmotion-demo-jaeger
+  ports:
+    - name: ui
+      port: 16686
+      targetPort: 16686
+      nodePort: {{ .Values.jaeger.uiNodePort }}
+      protocol: TCP
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+      protocol: TCP

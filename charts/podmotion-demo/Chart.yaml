@@ -1,0 +1,16 @@
+apiVersion: v2
+name: podmotion-demo
+description: Conference-booth command-and-control and observability portal for PodMotion — optional add-on, disabled by default
+type: application
+version: 0.1.0
+appVersion: 0.1.0
+keywords:
+  - kubernetes
+  - migration
+  - demo
+  - observability
+home: https://podmotion.io
+sources:
+  - https://github.com/podmotion-io/podmotion-demo
+maintainers:
+  - name: PodMotion Authors
