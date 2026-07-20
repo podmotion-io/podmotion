@@ -87,6 +87,14 @@ type EBPFManager interface {
 	// If the entry does not exist it is a no-op (returns nil).
 	// This must be called INSTEAD of ArmRelay when only ts_delta needs to be updated.
 	PatchRelayTsDelta(ctx context.Context, key SeqXlatKey, tsDelta int32) error
+	// LookupSeqXlat performs a real bpf_map_lookup against PM_SEQ_XLAT for key, grounding
+	// predicate B of the ADR-0049 atomicity barrier (ADR-0357 D1.2). Returns the resident
+	// entry and found=true when the key round-trips out of the kernel map; found=false (with
+	// a nil error) when the key is genuinely absent. Callers — specifically
+	// network.SeedRelayFromSnapshots — must treat found=false as a seeding failure: an
+	// ArmRelay Update() call returning without error is NOT sufficient evidence the entry is
+	// actually resident.
+	LookupSeqXlat(ctx context.Context, key SeqXlatKey) (SeqXlatEntry, bool, error)
 }
 
 // eBPFManager is the interface consumed by NetworkBridgeAgent.
@@ -134,6 +142,9 @@ type eBPFManager interface {
 	// PatchRelayTsDelta performs a read-modify-write on PM_SEQ_XLAT for the given key,
 	// updating only the ts_delta field while preserving the existing seq_delta/ack_delta.
 	PatchRelayTsDelta(ctx context.Context, key SeqXlatKey, tsDelta int32) error
+
+	// LookupSeqXlat performs a real bpf_map_lookup against PM_SEQ_XLAT for key (ADR-0357 D1.2).
+	LookupSeqXlat(ctx context.Context, key SeqXlatKey) (SeqXlatEntry, bool, error)
 }
 
 // NewEBPFManager is the exported constructor for callers outside the network
@@ -230,6 +241,17 @@ func (s *eBPFManagerStub) DisarmVTEP(ctx context.Context, podIP net.IP) error {
 func (s *eBPFManagerStub) PatchRelayTsDelta(ctx context.Context, key SeqXlatKey, tsDelta int32) error {
 	logf.FromContext(ctx).Info("ebpf stub: PatchRelayTsDelta", "srcPort", key.SrcPort, "dstPort", key.DstPort, "tsDelta", tsDelta)
 	return nil
+}
+
+// LookupSeqXlat on the stub always reports found=false: there is no real kernel map behind a
+// stub manager (non-Linux, kernel <5.9, or an explicit test opt-out), so a stub-backed migration
+// can never truthfully claim PM_SEQ_XLAT is seeded (ADR-0357 D1.2/§P-VERIFY assertion 1). This
+// is intentional fail-closed behavior, not an oversight: callers depending on a verified seed
+// (network.SeedRelayFromSnapshots) must fail rather than silently pass on a stub.
+func (s *eBPFManagerStub) LookupSeqXlat(ctx context.Context, key SeqXlatKey) (SeqXlatEntry, bool, error) {
+	logf.FromContext(ctx).Info("ebpf stub: LookupSeqXlat (always not-found — no real kernel map behind the stub)",
+		"srcPort", key.SrcPort, "dstPort", key.DstPort)
+	return SeqXlatEntry{}, false, nil
 }
 
 // resolveIfindex converts an interface name (e.g. "veth1a2b3c") to its kernel ifindex.

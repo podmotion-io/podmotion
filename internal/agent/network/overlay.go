@@ -73,12 +73,23 @@ func CheckAtomicityBarrier(ctx context.Context, p BarrierPredicates) (BarrierRes
 	var result BarrierResult
 	var errs []string
 
-	// Predicate B: PM_SEQ_XLAT entries seeded.
-	result.BPredicate = p.SeqXlatSeeded
-	if !p.SeqXlatSeeded {
-		errs = append(errs, "B: PM_SEQ_XLAT not seeded")
+	// Predicate B: PM_SEQ_XLAT entries seeded — deferred in PreRestore mode (ADR-0357 D1.1),
+	// exactly like predicate E-source and predicate F below (ADR-0049 §gate20). Seeding is
+	// fundamentally a post-restore event (SeedRelayFromSnapshots takes the restored PID as an
+	// argument) — at the PreRestore call site (reconcileOverlayHandoff, before CRIU restore has
+	// run on either path) the fact predicate B checks categorically cannot have happened yet, so
+	// no amount of "verify harder" there can make it real. Vacuous pass, matching the existing
+	// deferral idiom for E/F.
+	if p.PreRestore {
+		result.BPredicate = true
+		log.Info("barrier: predicate B deferred (pre-restore mode) — PM_SEQ_XLAT seeding is a post-restore event (ADR-0357 D1.1)")
 	} else {
-		log.Info("barrier: predicate B satisfied — PM_SEQ_XLAT seeded")
+		result.BPredicate = p.SeqXlatSeeded
+		if !p.SeqXlatSeeded {
+			errs = append(errs, "B: PM_SEQ_XLAT not seeded")
+		} else {
+			log.Info("barrier: predicate B satisfied — PM_SEQ_XLAT seeded")
+		}
 	}
 
 	// Predicates C+D: FDB entries confirmed via RTM_GETNEIGH on both nodes.

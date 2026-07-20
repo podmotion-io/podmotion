@@ -1,3 +1,5 @@
+//go:build linux
+
 /*
 Copyright 2026 PodMotion Authors.
 
@@ -13,8 +15,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-//go:build linux
 
 package server
 
@@ -69,6 +69,9 @@ func (m *mockEBPFManager) ArmVTEP(_ context.Context, _ net.IP, _ network.VtepEnt
 func (m *mockEBPFManager) DisarmVTEP(_ context.Context, _ net.IP) error { return nil }
 func (m *mockEBPFManager) PatchRelayTsDelta(_ context.Context, _ network.SeqXlatKey, _ int32) error {
 	return nil
+}
+func (m *mockEBPFManager) LookupSeqXlat(_ context.Context, _ network.SeqXlatKey) (network.SeqXlatEntry, bool, error) {
+	return network.SeqXlatEntry{}, false, nil
 }
 
 // Ensure mockEBPFManager satisfies the interface at compile time.
