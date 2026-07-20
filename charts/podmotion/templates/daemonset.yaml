@@ -241,6 +241,28 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # sprint50 (k3s compat): standard kubeadm/containerd installs use
+            # /run/containerd/{containerd.sock,io.containerd.runtime.v2.task/k8s.io/...} and
+            # /var/lib/containerd/io.containerd.runtime.v2.task/k8s.io/... . k3s's embedded
+            # containerd uses different roots (UNVERIFIED-EXTERNAL — see
+            # docs/sprints/sprint50-k3s/K3S-COMPATIBILITY-PLAN.md §0 items 1-4; confirm against
+            # a live k3s node before relying on a non-default override). These three values
+            # drive every containerd socket/bundle-path construction in the agent
+            # (internal/agent/server/containerd_paths.go, internal/agent/seccomp/manager.go) —
+            # override via agent.containerd.* on a k3s deploy instead of patching Go code.
+            - name: PODMOTION_CONTAINERD_RUN_ROOT
+              value: {{ dir .Values.agent.containerd.socketPath | quote }}
+            - name: PODMOTION_CONTAINERD_SOCKET
+              value: {{ .Values.agent.containerd.socketPath | quote }}
+            - name: PODMOTION_CONTAINERD_STATE_ROOT
+              value: {{ .Values.agent.containerd.stateDir | quote }}
+            {{- if .Values.agent.cni.extraConfDir }}
+            # detectCNI() (internal/agent/nmcregistrar/registrar.go) also scans this
+            # container-local path (mounted from host-cni-conf-extra above) in addition to
+            # the canonical /etc/cni/net.d — see agent.cni.extraConfDir in values.yaml.
+            - name: PODMOTION_CNI_EXTRA_CONF_DIR
+              value: "/host-cni-conf-extra"
+            {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.agent.grpcPort }}
@@ -328,7 +350,7 @@ spec:
             - name: criu-socket
               mountPath: /var/run/criu
             - name: containerd-socket
-              mountPath: /run/containerd/containerd.sock
+              mountPath: {{ .Values.agent.containerd.socketPath }}
             # host /run, read-only: the checkpoint classifier reads runc's task run bundle
             # (/host-run/containerd/.../<taskID>/, incl. the `work` symlink and config.json) to
             # resolve and read criu-dump.log. Without this mount hostBundleDir()/resolveCtrDumpLogPath()
@@ -351,11 +373,25 @@ spec:
             - name: host-usr-sbin
               mountPath: /usr/sbin
               readOnly: true
+            # Some hosts' /usr/sbin/criu is a symlink to a target outside /usr/sbin (e.g.
+            # /usr/local/sbin/criu on some k3s-provisioned hosts) — mounting only
+            # host-usr-sbin leaves that symlink dangling inside the container, so
+            # detectCRIU() (internal/agent/nmcregistrar/registrar.go) silently fails and
+            # NMC's spec.criuVersion is empty even though CRIU is genuinely installed.
+            # Mounting /usr/local/sbin alongside /usr/sbin lets the symlink resolve.
+            - name: host-usr-local-sbin
+              mountPath: /usr/local/sbin
+              readOnly: true
             - name: host-var-lib-podmotion
               mountPath: /var/lib/podmotion
             - name: host-cni-conf
               mountPath: /etc/cni/net.d
               readOnly: true
+            {{- if .Values.agent.cni.extraConfDir }}
+            - name: host-cni-conf-extra
+              mountPath: /host-cni-conf-extra
+              readOnly: true
+            {{- end }}
             - name: run-podmotion
               mountPath: /run/podmotion
               mountPropagation: HostToContainer
@@ -397,7 +433,7 @@ spec:
             type: DirectoryOrCreate
         - name: containerd-socket
           hostPath:
-            path: /run/containerd/containerd.sock
+            path: {{ .Values.agent.containerd.socketPath }}
             type: Socket
         - name: sys
           hostPath:
@@ -410,6 +446,10 @@ spec:
           hostPath:
             path: /usr/sbin
             type: Directory
+        - name: host-usr-local-sbin
+          hostPath:
+            path: /usr/local/sbin
+            type: DirectoryOrCreate
         - name: host-var-lib-podmotion
           hostPath:
             path: /var/lib/podmotion
@@ -421,12 +461,18 @@ spec:
         # host containerd state dir — holds the task `work` dirs where runc writes criu-dump.log.
         - name: host-var-lib-containerd
           hostPath:
-            path: /var/lib/containerd
+            path: {{ .Values.agent.containerd.stateDir }}
             type: Directory
         - name: host-cni-conf
           hostPath:
             path: /etc/cni/net.d
             type: DirectoryOrCreate
+        {{- if .Values.agent.cni.extraConfDir }}
+        - name: host-cni-conf-extra
+          hostPath:
+            path: {{ .Values.agent.cni.extraConfDir }}
+            type: DirectoryOrCreate
+        {{- end }}
         - name: run-podmotion
           hostPath:
             path: /run/podmotion

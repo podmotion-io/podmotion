@@ -148,8 +148,8 @@ docs/personas/k8s-oss-developer.md
 
 # Purpose-built sprint-engine scripts — local tooling only, same handling as docs/corveth.js
 # (carry internal process vocabulary at a path not covered by the codename exemption list)
-docs/corveth2.js
-docs/sprint46-finish.js
+docs/sprint*
+docs/SPRINT*
 
 # Legal/IP-protection drafts and internal design-decision records — never tracked, need
 # deliberate human review before ever entering the repo (same handling as AGENTIC_STRATEGY.md)
