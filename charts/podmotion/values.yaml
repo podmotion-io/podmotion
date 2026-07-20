@@ -161,3 +161,10 @@ aws:
   # spotReclaimTimeoutSeconds is the CompletionTimeoutSeconds set on PodMigration CRs
   # created by the spot reclaim controller. Should be < 120 (AWS notice window).
   spotReclaimTimeoutSeconds: 90
+
+# podmotion-demo is an OPTIONAL add-on (charts/podmotion-demo/) — disabled by
+# default. Enable explicitly per-cluster with --set podmotion-demo.enabled=true;
+# it must never come up as a side effect of a plain helm install/upgrade of the
+# core operator chart.
+podmotion-demo:
+  enabled: false

@@ -152,6 +152,8 @@ CGROUPV=$(cgroup_version)
 FREEZER_OK=$(cgroup_freezer_ok)
 BPF_JIT_RUNTIME=$(sysctl_val net.core.bpf_jit_enable)
 UFD_UNPRIV=$(sysctl_val vm.unprivileged_userfaultfd)
+INOTIFY_INSTANCES=$(sysctl_val fs.inotify.max_user_instances)
+INOTIFY_WATCHES=$(sysctl_val fs.inotify.max_user_watches)
 
 CRIU_VER=$(criu_version)
 CONTAINERD_VER=$(containerd_version)
@@ -235,7 +237,10 @@ cat <<EOF
     "unixDiag": ${UNIX_DIAG},
     "inetDiag": ${INET_DIAG},
     "cgroupFreezer": ${FREEZER_OK},
-    "userfaultfdUnprivileged": $([ "$UFD_UNPRIV" = "1" ] && echo true || echo false)
+    "userfaultfdUnprivileged": $([ "$UFD_UNPRIV" = "1" ] && echo true || echo false),
+    "inotifyMaxUserInstances": ${INOTIFY_INSTANCES},
+    "inotifyMaxUserWatches": ${INOTIFY_WATCHES},
+    "inotifyLimitsOk": $([ "$INOTIFY_INSTANCES" -ge 8192 ] && [ "$INOTIFY_WATCHES" -ge 1048576 ] && echo true || echo false)
   },
   "migrationCapabilities": {
     "coldMigration": ${COLD_MIGRATION},

@@ -4,10 +4,10 @@
   disable = false
   disable_connections = false
   plugin_registration_timeout = "5s"
-  # ADR-0185 C1: the NRI HandleStartContainer hook runs a 45s bounded verify retry to tolerate
+  # The NRI HandleStartContainer hook runs a 45s bounded verify retry to tolerate
   # operator phase advance (OverlayHandoff -> Restoring). plugin_request_timeout MUST be >= 60s on
-  # all nodes or containerd cancels the hook context before the retry can succeed. SS-P-VERIFY asserts
-  # this at gate time (the project conventions doc section 3d). Default/legacy 2s-30s is a HARD STOP.
+  # all nodes or containerd cancels the hook context before the retry can succeed.
+  # Default/legacy values in the 2s-30s range are too short and will break migration.
   plugin_request_timeout = "60s"
   socket_path = "/var/run/nri/nri.sock"
   state_dir = "/var/lib/nri"

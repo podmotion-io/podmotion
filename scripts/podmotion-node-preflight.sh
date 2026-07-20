@@ -323,7 +323,8 @@ check_sysctl "kernel.perf_event_paranoid"    "<="  "2"         "false"
 check_sysctl "kernel.unprivileged_bpf_disabled" "=" "1"        "false"
 check_sysctl "net.core.bpf_jit_enable"       ">="  "1"         "false"
 check_sysctl "vm.unprivileged_userfaultfd"    ">="  "1"         "false"
-check_sysctl "fs.inotify.max_user_watches"    ">="  "524288"    "false"
+check_sysctl "fs.inotify.max_user_watches"    ">="  "1048576"   "false"
+check_sysctl "fs.inotify.max_user_instances"  ">="  "8192"      "false"
 check_sysctl "kernel.pid_max"                 ">="  "4194304"   "false"
 
 # ----------------------------------------------------------------------------
