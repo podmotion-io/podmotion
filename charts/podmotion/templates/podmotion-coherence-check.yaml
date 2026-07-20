@@ -1,0 +1,9 @@
+{{/*
+ADR-0360 Decision §4: render-time trigger for the webhook.podMutation.enabled / scheduler.enabled
+coherence guard defined in _coherence-checks.tpl. Underscore-prefixed partials are never executed
+directly by Helm — only their `define` blocks, invoked via `include` from a template that IS part
+of the render tree. This file's only job is to be that trigger. It produces no manifest content;
+the include either renders to an empty string (values coherent) or calls `fail` and aborts the
+render (values incoherent).
+*/}}
+{{- include "podmotion.coherenceChecks" . -}}

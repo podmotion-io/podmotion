@@ -65,24 +65,41 @@ const (
 	maxRestoreAttempts = 3
 
 	// Event reasons (ADR-0009 §3 / §4).
-	eventReasonSeccompWeakened          = "SeccompWeakened"          // Warning, on swap to Unconfined
-	eventReasonSeccompRestored          = "SeccompRestored"          // Normal, on successful restore
+	eventReasonSeccompWeakened            = "SeccompWeakened"            // Warning, on swap to Unconfined
+	eventReasonSeccompRestored            = "SeccompRestored"            // Normal, on successful restore
 	eventReasonSeccompRestoreAfterRestart = "SeccompRestoreAfterRestart" // Normal, crash-recovery restore
-	eventReasonSeccompRestorationFailed = "SeccompRestorationFailed" // Warning (Critical), after maxRestoreAttempts
+	eventReasonSeccompRestorationFailed   = "SeccompRestorationFailed"   // Warning (Critical), after maxRestoreAttempts
 
 	// seccompRestoreFailedAnnotation blocks new PodMigrations for a pod whose seccomp
 	// profile could not be restored (ADR-0009 §4.3). Cleared only by a cluster operator.
 	seccompRestoreFailedAnnotation = "podmotion.io/seccomp-restore-failed"
 
-	// hostBundleBase is the containerd v2 task bundle root as visible to the agent. The
-	// agent mounts the host /run at /host-run (server.go hostBundleDir), so the live OCI
-	// spec (config.json) for a container lives under this tree, NOT bare /run.
-	hostBundleBase = "/host-run/containerd/io.containerd.runtime.v2.task/k8s.io"
-
 	// profileUnconfined is the sentinel persisted when the container ran with no seccomp
 	// profile (already unconfined). Restoring it is a no-op spec-wise but we still record it.
 	profileUnconfined = "unconfined"
+
+	// defaultContainerdRunRoot is the standard kubeadm/containerd host socket/bundle root.
+	// Kept identical to internal/agent/server's default (sprint50 k3s compat plan §0 item 4 —
+	// this is a second, independent hardcode of the same path, not a shared constant).
+	defaultContainerdRunRoot = "/run/containerd"
 )
+
+// hostBundleBase is the containerd v2 task bundle root as visible to the agent. The agent
+// mounts the host /run at /host-run (server.go hostBundleDir), so the live OCI spec
+// (config.json) for a container lives under this tree, NOT bare /run. Standard
+// kubeadm/containerd installs use /run/containerd; k3s's embedded containerd uses a different
+// root (UNVERIFIED-EXTERNAL — see docs/sprints/sprint50-k3s/K3S-COMPATIBILITY-PLAN.md §0 item
+// 4). Override via PODMOTION_CONTAINERD_RUN_ROOT (same env var server.go reads — set from
+// Helm value agent.containerd.socketPath's directory), so a k3s deploy needs a values
+// override, not a code change.
+var hostBundleBase = "/host-run" + strings.TrimPrefix(containerdRunRootEnv(), "/run") + "/io.containerd.runtime.v2.task/k8s.io"
+
+func containerdRunRootEnv() string {
+	if v := os.Getenv("PODMOTION_CONTAINERD_RUN_ROOT"); v != "" {
+		return v
+	}
+	return defaultContainerdRunRoot
+}
 
 var log = logf.Log.WithName("seccomp-manager")
 

@@ -3335,15 +3335,33 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 	// (gated separately, later, in reconcileOverlayHandoff).
 	// Removing earlier (post-Checkpoint, pre-Transfer) would race the NRI hook against
 	// the PutCheckpointTar delivery, causing a CRIU restore failure on a cold destination.
+	//
+	// ADR-0360: no outer one-shot latch here. ensureReplacementPodBound is called
+	// unconditionally every reconcile of Transferring and derives `bound` solely from a
+	// fresh post-patch Get of the live pod object — never from removeSchedulingGate's old
+	// nil return, which was compatible with "we never looked at the real pod at all." A
+	// false-positive on any one call self-heals on the next reconcile instead of
+	// permanently stranding the pod behind a latched condition.
+	replPod, bound, err := r.ensureReplacementPodBound(ctx, pm)
+	if err != nil {
+		log.Error(err, "ensureReplacementPodBound: gate-removal/verification failed — requeuing",
+			"migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+	if !bound {
+		podName := ""
+		if replPod != nil {
+			podName = replPod.Name
+		}
+		log.Info("ensureReplacementPodBound: replacement pod not yet bound (gate not verified absent) — requeuing",
+			"migration", pm.Name, "pod", podName)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
 	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionSchedulingGateRemoved) {
-		if err := r.removeSchedulingGate(ctx, pm); err != nil {
-			log.Error(err, "scheduling gate removal failed — continuing", "migration", pm.Name)
-		} else {
-			setCondition(pm, conditionSchedulingGateRemoved, metav1.ConditionTrue,
-				"GateRemoved", "podmotion.io/awaiting-checkpoint gate removed post-transfer")
-			if err := r.statusUpdate(ctx, pm); err != nil {
-				return ctrl.Result{}, err
-			}
+		setCondition(pm, conditionSchedulingGateRemoved, metav1.ConditionTrue,
+			"GateRemoved", "podmotion.io/awaiting-checkpoint gate removed and verified via fresh read")
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 
@@ -6169,6 +6187,16 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	spec := *sourcePod.Spec.DeepCopy()
 	spec.SchedulerName = ""    // webhook injects podmotion-scheduler
 	spec.SchedulingGates = nil // webhook injects the gate
+	// ADR-0359: sourcePod is not always pristine — for a live pod, sourcePod.Spec.NodeName
+	// is populated to the SOURCE node. Explicitly zero it here rather than letting it fall
+	// out of the (now-removed) destination-NodeName pin below: with the pin gone, a blind
+	// deep copy would otherwise leave the replacement pod's spec.NodeName bound to the
+	// source node — a NodeName-bound pod bypasses the scheduler entirely (kubelet on that
+	// node picks it up via pod-watch regardless of SchedulingGates), which would strand the
+	// replacement pod scheduling-gate-inert against the node the SOURCE workload is still
+	// live on (ADR-0012: source is not deleted until TrafficVerified=True). This must be an
+	// explicit, verified statement — not an implicit side effect of what got deleted.
+	spec.NodeName = ""
 
 	// ADR-0195 Rule A (universal injected holder — replaces ADR-0176 --podmotion-holder append).
 	//
@@ -6337,9 +6365,16 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 		spec.Containers[i].Lifecycle = nil
 	}
 
-	// Pin NodeName directly to the destination node if known.
-	// When the MutatingAdmissionWebhook is deployed it would enforce this via spec.destinationNode;
-	// setting NodeName here ensures correctness when the webhook is not running (dev/PoC clusters).
+	// ADR-0359: the controller no longer pins spec.NodeName to the destination node.
+	// A NodeName-bound pod bypasses the scheduler and is picked up by kubelet directly via
+	// its pod-watch, regardless of spec.SchedulingGates — so a direct NodeName assignment
+	// here defeated the podmotion.io/awaiting-checkpoint gate (ADR-0046) the mutating webhook
+	// injects, letting kubelet/CRIU-restore start before the checkpoint was staged. The
+	// webhook's scheduling-gate injection plus the podmotion-scheduler custom scheduler
+	// (MigrationAwareFilter/Score, ADR-0025) are now the sole, exclusive mechanism binding
+	// the replacement pod to pm.Status.DestinationNodeName. destNodeName is still resolved
+	// here (from status, falling back to spec) because it remains needed below for the
+	// taint-toleration logic and is read by other reconcile call sites.
 	destNodeName := pm.Status.DestinationNodeName
 	if destNodeName == "" {
 		destNodeName = pm.Spec.TargetNodeName
@@ -6348,24 +6383,24 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 		destNodeName = pm.Spec.DestinationNode
 	}
 	log := logf.FromContext(ctx)
-	log.Info("createReplacementPod: pinning node",
+	log.Info("createReplacementPod: resolved destination node (scheduling-gate + custom scheduler bind, no direct NodeName pin per ADR-0359)",
 		"migration", pm.Name,
 		"statusDestinationNodeName", pm.Status.DestinationNodeName,
 		"specTargetNodeName", pm.Spec.TargetNodeName,
 		"resolved", destNodeName,
 		"sourcePodNode", sourcePod.Spec.NodeName)
-	if destNodeName != "" {
-		spec.NodeName = destNodeName
-		// Clear nodeSelector and hard nodeAffinity: the source pod may be pinned to the
-		// source node (e.g. nodeSelector: kubernetes.io/hostname=worker). These constraints
-		// would reject the replacement pod on the destination node. NodeName already provides
-		// an authoritative node pin, so node selection constraints are not needed.
-		spec.NodeSelector = nil
-		if spec.Affinity != nil && spec.Affinity.NodeAffinity != nil {
-			spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = nil
-		}
-	} else {
-		spec.NodeName = "" // let scheduler decide if destination unknown
+
+	// ADR-0359 removal-symmetry: the NodeSelector/NodeAffinity clearing is
+	// retained UNCONDITIONALLY, decoupled from the removed destNodeName-gated NodeName
+	// assignment it was originally bundled with. This has independent justification: the
+	// source pod may carry a nodeSelector/nodeAffinity pinning it to the source node (e.g.
+	// nodeSelector: kubernetes.io/hostname=<source-node>), which would otherwise survive
+	// into the replacement pod and make it Unschedulable at the destination — trading the
+	// gate-bypass race this ADR fixes for a stuck-Pending regression instead. spec.NodeName
+	// is no longer set here at all (zeroed explicitly above, right after the deep copy).
+	spec.NodeSelector = nil
+	if spec.Affinity != nil && spec.Affinity.NodeAffinity != nil {
+		spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = nil
 	}
 
 	// Add tolerations for any taints on the destination node so the kubelet
@@ -6549,7 +6584,115 @@ func (r *PodMigrationReconciler) removeSchedulingGate(ctx context.Context, pm *p
 	}
 	patch := client.MergeFrom(pod.DeepCopy())
 	pod.Spec.SchedulingGates = filtered
-	return r.Patch(ctx, pod, patch)
+	if err := r.Patch(ctx, pod, patch); err != nil {
+		// ADR-0359 (Observability Architect condition): this gate removal is now the SOLE
+		// load-bearing transition from "held out of the scheduling queue" to "schedulable"
+		// for every migration — distinguish a failed patch from a routine reconcile error.
+		logf.FromContext(ctx).Error(err, "removeSchedulingGate: failed to patch away scheduling gate",
+			"migration", pm.Name, "pod", pod.Name, "gate", gate)
+		return err
+	}
+	logf.FromContext(ctx).Info("removeSchedulingGate: scheduling gate removed, replacement pod now schedulable",
+		"migration", pm.Name, "pod", pod.Name, "gate", gate)
+	return nil
+}
+
+// schedulingGateAwaitingCheckpoint is the podmotion.io/awaiting-checkpoint PodSchedulingGate
+// name injected by the mutating admission webhook (ADR-0046) and removed here once the
+// checkpoint has been transferred to the destination node.
+const schedulingGateAwaitingCheckpoint = "podmotion.io/awaiting-checkpoint"
+
+// ensureReplacementPodBound (ADR-0360) is the single idempotent, re-entrant primitive that owns
+// gate-removal AND its verification as one operation. It replaces the old pairing of
+// removeSchedulingGate (whose nil return was, for three of its four paths, compatible with
+// "we never looked at the real pod at all") plus a one-shot latch at the call site that treated
+// that nil as proof.
+//
+// Behavior (ADR-0360 Decision §1):
+//  1. Resolve the replacement pod via resolveReplacementPodByLabel — never pm.Status.ReplacementPodName
+//     directly. Heal the status mirror inline if the label resolves a pod the mirror missed, the
+//     same pattern already proven at reconcileTCPVerifying/reconcileRestoring.
+//  2. If no pod resolves, return (nil, false, nil) — a legitimate not-yet-created state, distinct
+//     from every other case below. Not an error.
+//  3. If the live pod's Spec.SchedulingGates still contains the awaiting-checkpoint gate, patch it
+//     off (same client.MergeFrom mechanics as the old removeSchedulingGate).
+//  4. Regardless of whether step 3 patched anything THIS call, re-Get the pod fresh (not the
+//     in-memory patched copy) and derive `bound` ONLY from that freshly observed object's
+//     SchedulingGates. Never from "the patch call returned no error."
+//  5. No internal one-shot latch — safe, and intended, to be called every reconcile of
+//     reconcileTransferring; the caller no longer guards the call behind
+//     conditionSchedulingGateRemoved.
+func (r *PodMigrationReconciler) ensureReplacementPodBound(
+	ctx context.Context, pm *pmv1.PodMigration,
+) (pod *corev1.Pod, bound bool, err error) {
+	log := logf.FromContext(ctx)
+
+	resolved, resolveErr := r.resolveReplacementPodByLabel(ctx, pm)
+	if resolveErr != nil {
+		return nil, false, resolveErr
+	}
+	if resolved == nil {
+		// Legitimate not-yet-created state — never treated as gate-removal success.
+		return nil, false, nil
+	}
+
+	// Heal the status mirror so later phases that still read pm.Status.ReplacementPodName
+	// resolve, mirroring reconcileTCPVerifying/reconcileRestoring's existing healing logic.
+	if pm.Status.ReplacementPodName == "" {
+		pm.Status.ReplacementPodName = resolved.Name
+		if err := r.statusUpdate(ctx, pm); err != nil {
+			log.Error(err, "ensureReplacementPodBound: failed to heal Status.ReplacementPodName — continuing",
+				"migration", pm.Name, "replacementPod", resolved.Name)
+		}
+	}
+
+	hasGate := false
+	for _, g := range resolved.Spec.SchedulingGates {
+		if g.Name == schedulingGateAwaitingCheckpoint {
+			hasGate = true
+			break
+		}
+	}
+	if hasGate {
+		patch := client.MergeFrom(resolved.DeepCopy())
+		filtered := resolved.Spec.SchedulingGates[:0]
+		for _, g := range resolved.Spec.SchedulingGates {
+			if g.Name != schedulingGateAwaitingCheckpoint {
+				filtered = append(filtered, g)
+			}
+		}
+		resolved.Spec.SchedulingGates = filtered
+		if err := r.Patch(ctx, resolved, patch); err != nil {
+			log.Error(err, "ensureReplacementPodBound: failed to patch away scheduling gate",
+				"migration", pm.Name, "pod", resolved.Name, "gate", schedulingGateAwaitingCheckpoint)
+			return resolved, false, err
+		}
+		log.Info("ensureReplacementPodBound: patch-removed scheduling gate; verifying via fresh re-read",
+			"migration", pm.Name, "pod", resolved.Name, "gate", schedulingGateAwaitingCheckpoint)
+	}
+
+	// The core fix: proof of "gate gone" is a fresh read of the real object, never the patch
+	// call's return value (which today, and for three of its four early-return paths, means
+	// nothing was ever verified against the live pod).
+	fresh := &corev1.Pod{}
+	getErr := r.Get(ctx, types.NamespacedName{Namespace: resolved.Namespace, Name: resolved.Name}, fresh)
+	if getErr != nil {
+		if apierrors.IsNotFound(getErr) {
+			// The pod vanished between resolve and re-Get. Not proof of success — the caller
+			// requeues and resolveReplacementPodByLabel is tried again next reconcile.
+			return nil, false, nil
+		}
+		return resolved, false, getErr
+	}
+
+	for _, g := range fresh.Spec.SchedulingGates {
+		if g.Name == schedulingGateAwaitingCheckpoint {
+			// Gate still present on the freshly re-read object — not bound, whether or not a
+			// patch was attempted this call.
+			return fresh, false, nil
+		}
+	}
+	return fresh, true, nil
 }
 
 // checkDestinationVolumeReady returns true when all RWO PVCs used by the source pod
