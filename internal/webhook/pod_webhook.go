@@ -170,7 +170,12 @@ func (w *PodMutatingWebhook) Handle(ctx context.Context, req admission.Request) 
 	}
 	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
 		pod.Annotations[AnnotationCheckpointRef] = pm.Status.CheckpointRef.Name
-		pod.Labels[AnnotationCheckpointRef] = pm.Status.CheckpointRef.Name
+		// Label values must be valid Kubernetes label values (alphanumeric, '-', '_',
+		// '.') — CheckpointRef.Name is a filesystem path (e.g.
+		// /run/podmotion/checkpoints/<migration>/final) and is NOT legal there, so the
+		// label must use pm.Name instead (short, DNS-label-safe, matches the
+		// controller's own convention in createReplacementPod).
+		pod.Labels[AnnotationCheckpointRef] = pm.Name
 	}
 
 	// 4. Inject CNI-specific IPAM annotation so the destination pod receives the
@@ -183,10 +188,27 @@ func (w *PodMutatingWebhook) Handle(ctx context.Context, req admission.Request) 
 		// (mirroring the controller's fetch pattern) — but on fetch error, fall
 		// THROUGH to no-annotation (a mutating admission request cannot requeue);
 		// the unpinned case is caught downstream by P-VERIFY-C, not blocked here.
+		//
+		// sprint52 diagnosis follow-up: gating the destNMC lookup on pm.Spec.TargetNodeName
+		// alone reproduces the ADR-0322 bug for every scheduler-selected (unpinned)
+		// migration — TargetNodeName's own doc comment says "If empty, the scheduler
+		// plugin selects," and for that (normal) case the controller populates
+		// pm.Status.DestinationNodeName instead, never Spec.TargetNodeName. Every other
+		// call site (e.g. createReplacementPod) resolves the destination node via the
+		// fallback chain Status.DestinationNodeName -> Spec.TargetNodeName ->
+		// Spec.DestinationNode; the webhook must use the same chain so its CNI-plugin
+		// resolution agrees with the node the pod is actually being placed on.
+		destNode := pm.Status.DestinationNodeName
+		if destNode == "" {
+			destNode = pm.Spec.TargetNodeName
+		}
+		if destNode == "" {
+			destNode = pm.Spec.DestinationNode
+		}
 		cniPlugin := pm.Status.CNIProvider
-		if pm.Spec.TargetNodeName != "" {
+		if destNode != "" {
 			destNMC := &pmv1.NodeMigrationCapacity{}
-			if nmcErr := w.Client.Get(ctx, types.NamespacedName{Name: pm.Spec.TargetNodeName}, destNMC); nmcErr == nil {
+			if nmcErr := w.Client.Get(ctx, types.NamespacedName{Name: destNode}, destNMC); nmcErr == nil {
 				cniPlugin = destNMC.Spec.NetworkCapability.CNIPlugin
 			} else {
 				log.Error(nmcErr, "ADR-0322: destNMC fetch failed — falling through to no-annotation (P-VERIFY-C catches unpinned case)")

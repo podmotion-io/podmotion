@@ -1,0 +1,67 @@
+{{- if include "podmotion.podMutationEnabled" . }}
+# Sprint52 diagnosis fix: routes pod CREATE admission to the pod-mutating webhook
+# (internal/webhook/pod_webhook.go, /mutate-core-v1-pod, kubebuilder marker
+# resources=pods,verbs=create,name=mpod.podmotion.io). That handler has existed in the Go
+# source since sprint31-era work and is correctly registered on the manager's webhook server
+# (cmd/main.go), but NO MutatingWebhookConfiguration rule ever routed real pod CREATE
+# admission requests to it, in any chart history — so injectIPAMAnnotation (the CNI IPAM pin
+# that preserves the source pod's IP across migration) never ran on any real cluster.
+#
+# Gated on webhook.podMutation.enabled (default true), NOT on cert-manager (mirrors the
+# webhook-agent-exec-block.yaml pattern) — on the cert-manager path the caBundle is injected
+# by the cert-manager CA injector annotation; on the non-cert-manager path (kind/KVM dev) the
+# chart mints a self-signed serving cert (_webhook-certs.tpl + webhook-selfsigned-secret.yaml,
+# shared with the exec-block secret) and the matching CA is inlined into
+# clientConfig.caBundle below. Either way the operator is wired with --webhook-cert-path so
+# its webhook server is actually serving.
+#
+# objectSelector scopes this rule to only the replacement pods the operator creates (they
+# already carry the podmotion.io/migration-name label in the object submitted for admission,
+# per pod_webhook.go's own Handle() check) — so failurePolicy: Fail only ever blocks creation
+# of a migration replacement pod when the webhook is unreachable, never ordinary cluster pod
+# creation.
+{{- $selfSigned := and (include "podmotion.podMutationEnabled" .) (not .Values.webhook.certManager.enabled) }}
+{{- if $selfSigned }}
+{{- include "podmotion.webhookSelfSignedCert" . -}}
+{{- end }}
+{{- $caBundle := "" }}
+{{- if $selfSigned }}
+{{- $caBundle = ((index . "podmotionWebhookCert").CA | b64enc) }}
+{{- end }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: podmotion-pod-mutation
+  {{- if .Values.webhook.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/podmotion-serving-cert
+  {{- end }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: operator
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+webhooks:
+  - name: mpod.podmotion.io
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      {{- if $caBundle }}
+      caBundle: {{ $caBundle }}
+      {{- end }}
+      service:
+        name: podmotion-webhook-service
+        namespace: {{ .Release.Namespace }}
+        path: /mutate-core-v1-pod
+    failurePolicy: Fail
+    matchPolicy: Equivalent
+    objectSelector:
+      matchExpressions:
+        - key: podmotion.io/migration-name
+          operator: Exists
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+        scope: Namespaced
+    sideEffects: None
+{{- end }}
