@@ -10,60 +10,50 @@ Dockerfile.cross
 # Test binary, built with `go test -c`
 *.test
 
-# Output of the go coverage tool, specifically when used with LiteIDE
+# Go coverage tool output
 *.out
 
 # Go workspace file
 go.work
 
-# Kubernetes Generated files - skip generated files, except for vendored files
+# Keep vendored generated files
 !vendor/**/zz_generated.*
 
-# editor and IDE paraphernalia
+# Editor / IDE
 .idea
 .vscode
 *.swp
 *.swo
 *~
 
-# Kubeconfig might contain secrets
+# May contain secrets
 *.kubeconfig
+.kube/
 
-# AI agent session memory — contains PII and cross-project data, never publish
 docs/session-memory/
-
-# Session handoff notes — contain private IPs, hostnames, multi-project context
-docs/HANDOFF-*.md
-
-# Sprint VM provisioning docs — contain internal IPs, kubeadm tokens, lab topology
+docs/*HANDOFF*.md
 docs/sprints/SPRINT*-VM-*.md
 
-# Compiled binaries at repo root
-# NOTE: these MUST be anchored with a leading '/'. A bare name like `agent` (unanchored)
-# matches every path component of that name anywhere in the tree — the bare `agent` pattern
-# was silently gitignoring the entire internal/agent/ package, which is why prior unit-test
-# files under internal/agent/server were "gitignored, never committed" (Workstream-40C).
+# Compiled binaries at repo root — keep these anchored with a leading '/'.
+# An unanchored bare name matches every path component of that name anywhere
+# in the tree (e.g. a bare `agent` pattern would swallow all of internal/agent/).
 /local_gate
 /pm-cni
 /fleetctl
 /agent
 /hack/gate-workload/gate-server
 
-# macOS artifacts
+# macOS
 .DS_Store
 **/.DS_Store
 
-# Claude Code project files
 .claude/settings.local.json
 CLAUDE.md
 AGENTS.md
+docs/AGENTIC_STRATEGY*.md
 
-# Internal strategy docs — live locally only, never committed or pushed
-docs/AGENTIC_STRATEGY.md
-docs/AGENTIC_STRATEGY_*.md
-
-# Internal delivery-process corpus — sprint plans, review logs, personas, process docs
-# These document the internal delivery process and must never be published
+/HANDOFF-LOG.md
+docs/sprint46-finish.js
 docs/sprints/
 docs/personas/
 docs/audit/
@@ -75,28 +65,21 @@ docs/cncf/
 docs/compliance/
 docs/memory/
 
-# Internal sprint handoff/evidence charters — carry internal delivery-process matter
-# (planning-role rosters, process-section citations); live locally only, never committed.
-docs/SPRINT-43-HANDOFF.md
-docs/LIVE-E2E-EVIDENCE-2026-07-10.md
+docs/LIVE-E2E-EVIDENCE-*.md
 
-# Internal resumption state file (process engine, never public)
 docs/proof/*-STATE.yaml
 
-# All internal process records (relocated out of the public tree — local only)
 .internal/
 
-# Stray sprint-gate / checkpoint / proposal scratch artifacts (never publish)
 SPRINT*-PHASE-*-GATE-*.md
 docs/adr/PROOF_NS5_BETA_SPRINT_GATE.md
 
-# Internal process/governance ADRs — local only, never public
-docs/adr/0205-principal-architect-agent.md
-docs/adr/0206-*.md
-docs/adr/0207-grounding-obligation-constitutional.md
+# 0205/0206/0207 are the only ADRs at these numbers (verified) — safe as a range.
+# ADR-0226 uses the OTHER "ADR-"-prefixed naming convention this repo also uses
+# for ~9 legitimate public ADRs, so it stays a specific exclusion, not a wildcard.
+docs/adr/020[5-7]-*.md
 docs/adr/ADR-0226-*.md
 
-# Top-level methodology and strategy docs
 docs/sprint-workflow-skeleton.js
 docs/self-heal-workflow-skeleton.js
 docs/design/SELF-HEAL-WORKFLOW-MONITORING.md
@@ -109,64 +92,51 @@ docs/ns4-revolutionary-plan.md
 docs/AWS_COST_PLAN.md
 docs/VALIDATION_AND_CERTIFICATION_PLAN.md
 
-# Compiled binaries directory
 bin/
 
 # eBPF compiled objects
 *.o
 
-# Python artifacts
+# Python
 __pycache__/
 *.pyc
 
-# Kubernetes config directory (may contain secrets)
-.kube/
-
-# Line-ending marker file (Windows artifact)
+# Windows line-ending artifact
 LF
 
-# Internal gate-run / phase-review logs (process records, not publication proofs — never publish)
-docs/proof/*-GATE-CLOSURE-ATTEMPT-*.md
-docs/proof/*-GATE-ATTEMPT-*.md
+# `**` so this also reaches nested dirs (e.g. docs/proof/archive/.../*.md) —
+# a single `*` stops at a path segment and previously missed those.
+docs/proof/**/*-GATE-*ATTEMPT-*.md
 docs/proof/SPRINT40-S1-PROOF.md
 
-# Internal sprint/workstream planning + certification docs at docs/ top level (delivery process — never publish)
 docs/SPRINT*-PLAN.md
 docs/WORKSTREAM-*.md
 
-# Public-CI methodology-lexicon scanner — enumerates the internal codename lexicon in cleartext.
-# Republishing it announces the vocabulary it exists to hide; the local pre-commit hook enforces instead.
 .github/workflows/disclose-check.yaml
 docs/design/PREAUTHOR-GATE-DEADEND-ANALYSIS.md
 docs/design/DEV-PHASE-INTERDEP-HARDENING.md
 docs/design/SPRINT-CONVERGENCE-POSTMORTEM.md
-docs/corveth.js
 docs/personas/k8s-oss-developer.md
 
-# Root-level session handoff log (may contain live host/IP details — same handling as docs/HANDOFF-*.md)
-/HANDOFF-LOG.md
-
-# Purpose-built sprint-engine scripts — local tooling only, same handling as docs/corveth.js
-# (carry internal process vocabulary at a path not covered by the codename exemption list)
-docs/corveth2.js
-docs/sprint46-finish.js
-
-# Legal/IP-protection drafts and internal design-decision records — never tracked, need
-# deliberate human review before ever entering the repo (same handling as AGENTIC_STRATEGY.md)
 docs/converged/
 docs/design/HUMAN-CHECKPOINT-MINIMIZATION-OPTIONS.md
 docs/design/quorum-transcripts/
-docs/security/EXPOSURE-FACTUAL-RECORD-2026-06-16.md
-docs/security/NO-ENABLING-DISCLOSURE-MEMO-2026-06-16.md
-docs/security/PRE-PUBLICATION-HISTORY-SCRUB-PLAN.md
-docs/security/PROVISIONAL-APPLICATION-BRIEF-2026-06-16.md
-docs/security/REASONABLE-MEASURES-DECLARATION-2026-06-16.md
-docs/security/SECURITY-DEBT-LEDGER.md
-docs/security/sprint44-integration-security-lens-validation.md
 
-# Terraform test infrastructure (terraform/) — local state, generated SSH keys,
-# and the provider binary cache never get tracked. The .tf configs themselves,
-# and .terraform.lock.hcl (pins provider versions — meant to be committed), ARE.
+# docs/design/ and docs/security/ mix a handful of legitimately public files in
+# with internal-only ones. Default-deny + allowlist the known-public files is both
+# shorter than listing every internal filename AND safer going forward — a new
+# internal file dropped into either directory is private by default.
+docs/design/
+!docs/design/headless-service-migration-matrix.md
+
+docs/security/
+!docs/security/SECURITY-ARCHITECTURE.md
+!docs/security/podmotion-usb-backup.service
+!docs/security/podmotion-usb-backup.timer
+!docs/security/usb-backup.sh
+
+# Terraform local state, generated keys, provider cache.
+# Configs (.tf) and .terraform.lock.hcl are meant to be tracked.
 terraform/**/.terraform/
 terraform/**/terraform.tfstate
 terraform/**/terraform.tfstate.backup
@@ -177,3 +147,9 @@ terraform/**/override.tf.json
 terraform/**/*.pem
 terraform/**/*_rsa
 terraform/**/*_rsa.pub
+terraform/**/tfplan
+terraform/**/hosts.env
+terraform/**/kubeconfig
+
+# Packer build output — churns every build, not meant to be tracked
+images/capi/packer/manifest.json
