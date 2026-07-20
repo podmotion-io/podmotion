@@ -1040,6 +1040,78 @@ func (s *AgentServer) JoinNsRestore(ctx context.Context, migrationName, namespac
 		return 0, "", frErr
 	}
 
+	// ADR-0357 D2: seed PM_SEQ_XLAT from the source freeze SeqSnapshots on the NRI restore
+	// path, the same way the gRPC Restore handler already does (server.go ~8598). This is a
+	// plain in-process Go function call into the network package — it does NOT call the Restore
+	// RPC and does NOT trigger a second CRIU restore; the documented constraint at
+	// reconcileRestoringNRI (podmigration_controller.go) is specifically about not re-invoking
+	// CRIU restore via the Restore RPC handler's restore step, not about seeding being
+	// unreachable from the NRI path.
+	//
+	// D2.1: unlike the gRPC handler, JoinNsRestore has no incoming RestoreRequest — "on the NRI
+	// path req.SeqSnapshots is always 0" (see the strictMode block above). Snapshots are sourced
+	// by reading pm.Status.TCPSeqSnapshots from the PodMigration CR via s.lookupPodMigration,
+	// the real s.k8sClient read primitive this file already relies on (resolveImageFromMCP,
+	// resolveImageFromReplacementPod). If the CR cannot be resolved (no k8sClient, or the CR is
+	// genuinely absent) we cannot prove there is anything to seed, so we log and skip rather than
+	// fail the whole restore on an unrelated read failure — reconcileDisengageHold (ADR-0357
+	// D1.3) is the authoritative fail-closed backstop: it reads the CONTROLLER's own copy of
+	// TCPSeqSnapshots (no RPC needed there) against Status.SeqXlatSeeded and rolls back if a
+	// non-empty snapshot set was never confirmed seeded.
+	if pm, ok := s.lookupPodMigration(joinNsRestoreCtx, migrationName); ok && len(pm.Status.TCPSeqSnapshots) > 0 {
+		snaps := make([]network.SeqSnapshot, 0, len(pm.Status.TCPSeqSnapshots))
+		for _, ss := range pm.Status.TCPSeqSnapshots {
+			snaps = append(snaps, network.SeqSnapshot{
+				SrcIP:   ss.SrcIP,
+				SrcPort: ss.SrcPort,
+				DstIP:   ss.DstIP,
+				DstPort: ss.DstPort,
+				SndNxt:  ss.SndNxt,
+				RcvNxt:  ss.RcvNxt,
+			})
+		}
+
+		// D2.4: resolve relayIfname via discoverHostInterface — the ONLY resolution mechanism
+		// on this call site (there is no incoming RestoreRequest, so no RelayIfname override is
+		// possible). Any hardcoded "flannel.1" fallback here — even as a "just for NRI"
+		// special case — would reproduce the exact defect this ADR closes, on the one path this
+		// migration actually takes. Fail closed: a real snapshot set with no resolvable
+		// interface must not silently proceed.
+		relayIfname, discErr := discoverHostInterface(joinNsRestoreCtx)
+		if discErr != nil || relayIfname == "" {
+			log.Error(discErr, "JoinNsRestore: ADR-0357 D2.4 relayIfname resolution failed — failing closed (no flannel.1 fallback)",
+				"migration", migrationName)
+			return 0, "", fmt.Errorf("JoinNsRestore: relayIfname resolution failed: discoverHostInterface: %w", discErr)
+		}
+		log.Info("JoinNsRestore: relayIfname resolved via discoverHostInterface (ADR-0357 D2.4)",
+			"migration", migrationName, "relayIfname", relayIfname)
+
+		// D2.2: fail closed identically to the gRPC path — a seeding failure here (including the
+		// D1.2 LookupSeqXlat verification failing) returns an error, which per the existing
+		// documented behavior causes the NRI callback to return an error, containerd marks the
+		// replacement container failed, and the operator requeues/rolls back (ADR-0144 NB-2).
+		seedCtx, seedCancel := context.WithTimeout(joinNsRestoreCtx, 2*time.Second)
+		_, seedErr := network.SeedRelayFromSnapshots(seedCtx, int32(pid), snaps, relayIfname, s.ebpfMgr)
+		seedCancel()
+		if seedErr != nil {
+			log.Error(seedErr, "JoinNsRestore: SeedRelayFromSnapshots FAILED (NRI path) — failing closed to prevent premature source deletion (ADR-0357 D2.2)",
+				"migration", migrationName)
+			return 0, "", fmt.Errorf("JoinNsRestore: SeedRelayFromSnapshots: %w — relay seq translation not seeded; migration cannot safely proceed", seedErr)
+		}
+
+		// D2.3: write the verified write-back only after LookupSeqXlat has confirmed every
+		// entry is resident. Non-fatal on failure here — same posture as
+		// ReportRestoreConfirmed below on this exact path: a missed write does not silently
+		// report success, because reconcileDisengageHold (D1.3) fails closed to rollback when
+		// TCPSeqSnapshots is non-empty but Status.SeqXlatSeeded remains absent.
+		if markErr := s.markSeqXlatSeeded(joinNsRestoreCtx, migrationName, namespace); markErr != nil {
+			log.Error(markErr, "JoinNsRestore: markSeqXlatSeeded failed (non-fatal — reconcileDisengageHold fails closed if this is truly missing)",
+				"migration", migrationName)
+		}
+		log.Info("JoinNsRestore: PM_SEQ_XLAT seeded and verified on the NRI restore path (ADR-0357 D2)",
+			"migration", migrationName, "snapshotCount", len(snaps), "relayIfname", relayIfname)
+	}
+
 	// ADR-0353 R4/D6: ReportRestoreConfirmed is consolidated here (moved from
 	// cmd/agent/main.go, outside the server package) so the deferred releaseRestore above fires
 	// AFTER the terminal confirm, not before — the release must never straddle the server<->main
@@ -1943,6 +2015,39 @@ func (s *AgentServer) ReportRestoreConfirmed(ctx context.Context, migrationName,
 	}
 	log.Info("ReportRestoreConfirmed: criuRestoreConfirmed set true",
 		"migration", migrationName, "namespace", namespace, "restoredPID", pid, "replVethMAC", replVethMAC)
+	return nil
+}
+
+// markSeqXlatSeeded writes Status.SeqXlatSeeded=true on the PodMigration CR after
+// network.SeedRelayFromSnapshots has verified (via EBPFManager.LookupSeqXlat) that every
+// PM_SEQ_XLAT entry it wrote is actually resident in the kernel map (ADR-0357 D1.2/D2.3). Both
+// the gRPC Restore handler and the NRI JoinNsRestore path converge on this single write site.
+// namespace may be empty; it is resolved via resolveNamespaceForMigration in that case (the
+// gRPC Restore handler has no namespace parameter of its own).
+func (s *AgentServer) markSeqXlatSeeded(ctx context.Context, migrationName, namespace string) error {
+	if s.k8sClient == nil {
+		return fmt.Errorf("markSeqXlatSeeded: no k8s client available on agent server")
+	}
+	if namespace == "" {
+		namespace = s.resolveNamespaceForMigration(ctx, migrationName)
+	}
+	if migrationName == "" || namespace == "" {
+		return fmt.Errorf("markSeqXlatSeeded: migrationName and namespace are required (got %q/%q)", namespace, migrationName)
+	}
+
+	pm := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: migrationName}, pm); err != nil {
+		return fmt.Errorf("markSeqXlatSeeded: get PodMigration %s/%s: %w", namespace, migrationName, err)
+	}
+
+	base := pm.DeepCopy()
+	pm.Status.SeqXlatSeeded = true
+
+	if err := s.k8sClient.Status().Patch(ctx, pm, client.MergeFrom(base)); err != nil {
+		return fmt.Errorf("markSeqXlatSeeded: patch status %s/%s: %w", namespace, migrationName, err)
+	}
+	log.Info("markSeqXlatSeeded: Status.SeqXlatSeeded=true written (ADR-0357 D1.2)",
+		"migration", migrationName, "namespace", namespace)
 	return nil
 }
 
@@ -3314,6 +3419,55 @@ func (s *AgentServer) DisarmTCRedirect(ctx context.Context, req *agentpb.DisarmT
 			log.Info("DisarmTCRedirect: removed ADR-0140 FORWARD ACCEPT + ADR-0141 NOTRACK", "migration", req.MigrationName, "oldPodIP", req.OldPodIp)
 		}
 	}
+
+	// ADR-0357 D5: close the DisarmRelay removal-symmetry gap at the correct, destination-side
+	// location. D1/D2 make ArmRelay fire for the first time in production; from that point
+	// forward every migration seeds a bare-4-tuple, no-TTL PM_SEQ_XLAT entry that nothing else
+	// ever removes. This is deliberately NOT wired into DisarmZeroWindow/D3 — that path runs
+	// exclusively against the SOURCE node's agent, while PM_SEQ_XLAT/ArmRelay's EBPFManager
+	// instance lives on the DESTINATION agent (Restore/JoinNsRestore are always called against
+	// destNode); calling DisarmRelay from the source-side handler would silently no-op against
+	// the wrong node's map. DisarmTCRedirect is itself always a destination-agent RPC
+	// (controller-side caller resolves ForNode(ctx, destNode)) invoked from
+	// reconcileIPReclaimSweep only after ipReclaimEligible's R6/R7 checks confirm no live
+	// conntrack/socket for the OLD IP remains — a strictly safer disarm gate than D3's timing,
+	// since PM_SEQ_XLAT must stay populated through TCPVerifying/ServiceVerifying.
+	if pm, ok := s.lookupPodMigration(ctx, req.MigrationName); ok && len(pm.Status.TCPSeqSnapshots) > 0 {
+		snaps := make([]network.SeqSnapshot, 0, len(pm.Status.TCPSeqSnapshots))
+		for _, ss := range pm.Status.TCPSeqSnapshots {
+			snaps = append(snaps, network.SeqSnapshot{
+				SrcIP:   ss.SrcIP,
+				SrcPort: ss.SrcPort,
+				DstIP:   ss.DstIP,
+				DstPort: ss.DstPort,
+				SndNxt:  ss.SndNxt,
+				RcvNxt:  ss.RcvNxt,
+			})
+		}
+		if disarmErrs := network.DisarmRelayForSnapshots(ctx, snaps, s.ebpfMgr); len(disarmErrs) > 0 {
+			// Security Reviewer round-2 CONDITION (carried forward, mandatory): a non-nil,
+			// non-ErrKeyNotExist DisarmRelay error must never be silently swallowed. D5's own
+			// disposition is explicitly warn-only here — matching D3's ADR-0224 3h-SYM posture,
+			// the same non-fatal pattern this handler's tc/qdisc/FORWARD-ACCEPT teardown steps
+			// above already use — so this does NOT fail the RPC (that would block IP reclaim on
+			// a PM_SEQ_XLAT entry the controller's own ipReclaimEligible gate already proved is
+			// unreachable). Instead every failure is made operator-visible via a Warning Event
+			// (mirroring this file's existing emitCRIUImageInconsistencyEvent /
+			// emitExternalMountUnresolvedEvent pattern for other non-fatal restore-path partial
+			// failures) and a counter metric, so an orphaned PM_SEQ_XLAT entry is bounded and
+			// alertable rather than silently unbounded.
+			for _, derr := range disarmErrs {
+				log.Error(derr, "DisarmTCRedirect: DisarmRelay failed for a PM_SEQ_XLAT entry (ADR-0357 D5) — non-fatal, but now operator-visible",
+					"migration", req.MigrationName)
+			}
+			metrics.DisarmRelayFailedTotal.WithLabelValues(req.MigrationName, pm.Namespace).Add(float64(len(disarmErrs)))
+			s.emitDisarmRelayFailedEvent(ctx, pm, disarmErrs)
+		} else {
+			log.Info("DisarmTCRedirect: DisarmRelay removal-symmetry complete for all PM_SEQ_XLAT entries (ADR-0357 D5)",
+				"migration", req.MigrationName, "entryCount", len(snaps))
+		}
+	}
+
 	log.Info("DisarmTCRedirect: tc-ingress redirect disarmed (ADR-0139 D3)", "migration", req.MigrationName, "fdbIf", fdbIf)
 	return &agentpb.DisarmTCRedirectResponse{Disarmed: true}, nil
 }
@@ -8600,7 +8754,27 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		if len(req.SeqSnapshots) > 0 {
 			relayIfname := req.RelayIfname
 			if relayIfname == "" {
-				relayIfname = "flannel.1"
+				// ADR-0357 D1.5: no "flannel.1" literal fallback. req.RelayIfname has no
+				// non-test caller anywhere in the codebase, so this branch always fired in
+				// production — and resolveIfindex("flannel.1") errors deterministically on the
+				// standing Cilium/geneve substrate (no flannel.1 device exists), making ArmRelay
+				// fail on every attempt regardless of D1/D2's other fixes. discoverHostInterface
+				// is the project's existing, substrate-validated runtime-discovery primitive for
+				// exactly this class of problem (InjectIPHandoff, DisarmTCRedirect,
+				// verify_cleanup.go already use it the same way). Fail closed — do not
+				// reintroduce the flannel.1 literal as a last-resort fallback.
+				discovered, discErr := discoverHostInterface(ctx)
+				if discErr != nil || discovered == "" {
+					log.Error(discErr, "Restore: relayIfname resolution failed — no RelayIfname override and discoverHostInterface could not resolve a live interface; failing closed (ADR-0357 D1.5, no flannel.1 fallback)",
+						"migration", req.MigrationName)
+					return &agentpb.RestoreResponse{
+						Success:      false,
+						ErrorMessage: fmt.Sprintf("relayIfname resolution failed: no RelayIfname override supplied and discoverHostInterface: %v", discErr),
+					}, nil
+				}
+				relayIfname = discovered
+				log.Info("Restore: relayIfname resolved via discoverHostInterface (ADR-0357 D1.5)",
+					"migration", req.MigrationName, "relayIfname", relayIfname)
 			}
 			snaps := make([]network.SeqSnapshot, 0, len(req.SeqSnapshots))
 			for _, ss := range req.SeqSnapshots {
@@ -8627,6 +8801,16 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 					Success:      false,
 					ErrorMessage: fmt.Sprintf("SeedRelayFromSnapshots: %v — relay seq translation not seeded; migration cannot safely proceed", seedErr),
 				}, nil
+			}
+			// ADR-0357 D1.2/D2.3: write the verified write-back only after LookupSeqXlat has
+			// confirmed every entry is resident (SeedRelayFromSnapshots above already failed
+			// closed if not). Non-fatal on failure here — same posture as ReportRestoreConfirmed
+			// on this path: a missed write does not silently report success, because
+			// reconcileDisengageHold (ADR-0357 D1.3) fails closed to rollback when
+			// TCPSeqSnapshots is non-empty but Status.SeqXlatSeeded remains absent.
+			if markErr := s.markSeqXlatSeeded(context.Background(), req.MigrationName, ""); markErr != nil {
+				log.Error(markErr, "Restore: markSeqXlatSeeded failed (non-fatal — reconcileDisengageHold fails closed if this is truly missing)",
+					"migration", req.MigrationName)
 			}
 		}
 
@@ -10053,6 +10237,36 @@ func checksumDir(dir string) (string, int64) {
 // DisarmZeroWindow before the watchdog fires an emergency disarm.
 const zwWatchdogMargin = 500 * time.Millisecond
 
+// disarmConntrackNotrackForHold removes the ADR-0224 conntrack NOTRACK rule installed at
+// ArmZeroWindow time. Extracted (ADR-0357 D3) so BOTH the normal DisarmZeroWindow path and the
+// watchdog-fired emergency-disarm path call the exact same cleanup — before this fix, the
+// watchdog goroutine called disarmZeroWindowBPF only, never network.DisarmConntrackNotrack,
+// leaking one NOTRACK rule per watchdog-fired disarm (deterministic on a 75s reconcile loop vs.
+// a 500ms zwWatchdogMargin; live-probe evidence: three stacked, uncleaned rules, one per
+// migration attempt, zero cleaned up). Warn-only, matching the pre-existing ADR-0224 3h-SYM
+// posture: a partial disarm (BPF down, NOTRACK rule lingering) is a better state than a
+// stuck-disarmed response that blocks migration completion. Idempotent on delete (ENOENT-safe).
+func disarmConntrackNotrackForHold(ctx context.Context, migrationName, sourcePodIP string) {
+	if sourcePodIP == "" {
+		return
+	}
+	log.Info("disarmConntrackNotrackForHold: disarming source conntrack NOTRACK (ADR-0224 3h-SYM / ADR-0357 D3)",
+		"migration", migrationName, "sourcePodIP", sourcePodIP)
+	if err := disarmConntrackNotrackFn(ctx, network.ConntrackNotrackRule{
+		PodIP:   sourcePodIP,
+		Comment: "pm-notrack-" + migrationName,
+	}); err != nil {
+		log.Info("disarmConntrackNotrackForHold: conntrack NOTRACK disarm failed (warn-only, ADR-0224 3h-SYM)",
+			"migration", migrationName, "sourcePodIP", sourcePodIP, "err", err)
+	}
+}
+
+// disarmConntrackNotrackFn is a seam over network.DisarmConntrackNotrack (test-only override
+// point, matching the established joinNsRestoreFn/readReplVethMACFn pattern in this file) so
+// tests can observe disarmConntrackNotrackForHold's call sites — specifically the ADR-0357 D3
+// watchdog-fired path — without shelling out to real iptables.
+var disarmConntrackNotrackFn = network.DisarmConntrackNotrack
+
 // authoritativePodUID resolves the pod UID for a per-migration RPC, given the agent's
 // migrationPodUID cache and a freshly-resolved value from the caller (the controller's live pod
 // read on ArmZeroWindow/DisarmZeroWindow, or the freshly-fetched CR's spec.SourcePodUID on
@@ -10200,6 +10414,10 @@ func (s *AgentServer) ArmZeroWindow(ctx context.Context, req *agentpb.ArmZeroWin
 			if dErr := disarmZeroWindowBPF(disarmCtx, ifindex); dErr != nil {
 				log.Info("ArmZeroWindow: watchdog disarm BPF error", "migration", req.MigrationName, "err", dErr)
 			}
+			// ADR-0357 D3: close the NOTRACK removal-symmetry gap on the watchdog-fired path —
+			// previously only DisarmZeroWindow's normal path called this, leaking one NOTRACK
+			// rule per watchdog-fired disarm (Probe 3: three stacked, uncleaned rules).
+			disarmConntrackNotrackForHold(disarmCtx, req.MigrationName, req.SourcePodIp)
 			s.zwHoldMu.Lock()
 			if st, exists := s.zwHolds[req.MigrationName]; exists {
 				st.watchdogFired = true
@@ -10278,21 +10496,9 @@ func (s *AgentServer) DisarmZeroWindow(_ context.Context, req *agentpb.DisarmZer
 		log.Info("DisarmZeroWindow: BPF disarm error", "migration", req.MigrationName, "err", err)
 	}
 
-	// ADR-0224 3h-SYM: remove the conntrack NOTRACK rule installed at arm time so it does
-	// not leak. Warn-only — a partial disarm (BPF down, NOTRACK rule lingering) is a better
-	// state than a stuck-disarmed response that blocks migration completion. The rule is
-	// idempotent on delete (ENOENT treated as success).
-	if req.SourcePodIp != "" {
-		log.Info("DisarmZeroWindow: disarming source conntrack NOTRACK (ADR-0224 3h-SYM)",
-			"migration", req.MigrationName, "sourcePodIP", req.SourcePodIp)
-		if err := network.DisarmConntrackNotrack(disarmCtx, network.ConntrackNotrackRule{
-			PodIP:   req.SourcePodIp,
-			Comment: "pm-notrack-" + req.MigrationName,
-		}); err != nil {
-			log.Info("DisarmZeroWindow: conntrack NOTRACK disarm failed (warn-only, ADR-0224 3h-SYM)",
-				"migration", req.MigrationName, "sourcePodIP", req.SourcePodIp, "err", err)
-		}
-	}
+	// ADR-0224 3h-SYM / ADR-0357 D3: remove the conntrack NOTRACK rule installed at arm time
+	// so it does not leak, via the shared helper also called from the watchdog-fired path.
+	disarmConntrackNotrackForHold(disarmCtx, req.MigrationName, req.SourcePodIp)
 
 	disarmedAtNs := time.Now().UnixNano()
 	holdMs := int64(0)
@@ -10767,6 +10973,52 @@ func (s *AgentServer) emitExternalMountDroppedEvent(ctx context.Context, migrati
 	} else {
 		log.Info("emitExternalMountDroppedEvent: Normal CRIUExternalMountDropped Event emitted (ADR-0194 B-2)",
 			"migration", migrationName, "mnt_id", d.MntID, "ext_key", d.ExtKey)
+	}
+}
+
+// emitDisarmRelayFailedEvent emits a Warning DisarmRelayFailed Kubernetes Event on the
+// PodMigration CR when DisarmTCRedirect's DisarmRelay removal-symmetry step (ADR-0357 D5) fails
+// for one or more PM_SEQ_XLAT entries. Non-fatal — DisarmTCRedirect's own RPC contract stays
+// warn-only, matching D3's ADR-0224 3h-SYM posture — but the Security Reviewer's round-2
+// CONDITION requires the orphaned entry to be operator-visible rather than silently unbounded,
+// so every failure is surfaced here (alongside the log line above and the
+// metrics.DisarmRelayFailedTotal counter) exactly like emitCRIUImageInconsistencyEvent /
+// emitExternalMountUnresolvedEvent already do for other non-fatal restore-path partial failures
+// in this file. pm is already in hand from the DisarmTCRedirect call site (via
+// s.lookupPodMigration), so this does not re-fetch it.
+func (s *AgentServer) emitDisarmRelayFailedEvent(ctx context.Context, pm *pmv1.PodMigration, disarmErrs []error) {
+	if s.k8sClient == nil {
+		log.Info("emitDisarmRelayFailedEvent: k8sClient nil — event not emitted", "migration", pm.Name)
+		return
+	}
+	msg := fmt.Sprintf("DisarmRelay failed for %d PM_SEQ_XLAT entry(ies) during DisarmTCRedirect (ADR-0357 D5); entry remains resident until the next ipReclaimEligible sweep pass retries teardown: %v",
+		len(disarmErrs), disarmErrs[0])
+	now := metav1.Now()
+	event := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s.disarm-relay-failed.%d", pm.Name, now.UnixNano()),
+			Namespace: pm.Namespace,
+		},
+		InvolvedObject: corev1.ObjectReference{
+			APIVersion: "podmotion.io/v1alpha1",
+			Kind:       "PodMigration",
+			Name:       pm.Name,
+			Namespace:  pm.Namespace,
+			UID:        pm.UID,
+		},
+		Reason:         "DisarmRelayFailed",
+		Message:        msg,
+		Type:           corev1.EventTypeWarning,
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+		Count:          1,
+		Source:         corev1.EventSource{Component: "podmotion-agent"},
+	}
+	if createErr := s.k8sClient.Create(ctx, event); createErr != nil {
+		log.Error(createErr, "emitDisarmRelayFailedEvent: failed to create Event", "migration", pm.Name)
+	} else {
+		log.Info("emitDisarmRelayFailedEvent: Warning DisarmRelayFailed Event emitted (ADR-0357 D5 / Security Reviewer round-2 CONDITION)",
+			"migration", pm.Name, "failureCount", len(disarmErrs))
 	}
 }
 

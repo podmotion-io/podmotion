@@ -196,3 +196,23 @@ func TestStubEBPFManagerPatchRelayTsDelta(t *testing.T) {
 		t.Errorf("stub PatchRelayTsDelta: %v", err)
 	}
 }
+
+// TestStubEBPFManagerLookupSeqXlat is ADR-0357 §P-VERIFY assertion 1: the stub implementation
+// (non-Linux/test) must return (_, false, nil) — never panic, never report found=true — because
+// there is no real kernel map behind a stub manager. A stub-backed migration can never
+// truthfully claim PM_SEQ_XLAT is seeded.
+func TestStubEBPFManagerLookupSeqXlat(t *testing.T) {
+	ctx := context.Background()
+	mgr := NewStubEBPFManager()
+	key := SeqXlatKey{SrcPort: 1, DstPort: 2}
+	entry, found, err := mgr.LookupSeqXlat(ctx, key)
+	if err != nil {
+		t.Errorf("stub LookupSeqXlat: unexpected error: %v", err)
+	}
+	if found {
+		t.Error("stub LookupSeqXlat: expected found=false (no real kernel map behind the stub), got true")
+	}
+	if entry != (SeqXlatEntry{}) {
+		t.Errorf("stub LookupSeqXlat: expected zero-value entry when not found, got %+v", entry)
+	}
+}
