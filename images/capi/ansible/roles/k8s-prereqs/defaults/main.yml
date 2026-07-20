@@ -1,0 +1,12 @@
+---
+# kubernetes_minor_version selects the pkgs.k8s.io apt repo track
+# (https://pkgs.k8s.io/core:/stable:/v<minor>/deb/) — this project standardizes
+# on v1.32.x (see CLAUDE.md).
+kubernetes_minor_version: "1.32"
+
+# kubernetes_package_version, if set, pins the exact apt package version
+# (e.g. "1.32.3-1.1") for kubelet/kubeadm/kubectl. Leave empty to install the
+# newest package available in the kubernetes_minor_version track — either way
+# the installed version is apt-marked held afterward so it never silently
+# drifts within the image.
+kubernetes_package_version: ""

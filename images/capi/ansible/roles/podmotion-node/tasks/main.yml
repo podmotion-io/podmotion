@@ -12,11 +12,42 @@
       - min
 
 # ---- package installation (apt — Ubuntu) ------------------------------------
-- name: Install CRIU and tools (Debian/Ubuntu)
+# NOTE: "criu" is NOT an installable apt package on Ubuntu 24.04 (noble) — it is
+# a virtual package with no provider (verified live: `apt-cache policy criu` /
+# `apt show criu` report "not a real package (virtual)", and `apt-get install
+# criu` fails with "has no installation candidate"). It was dropped from the
+# Debian/Ubuntu archive upstream. CRIU must be built from source on this distro.
+#
+# Building from source is also required to get nftables support at all: even on
+# older distros where a "criu" apt package exists, Debian/Ubuntu's prebuilt criu
+# binaries are commonly built WITHOUT libnftables linked in, which produces the
+# runtime failure this task exists to fix:
+#   "Error (criu/net.c:2653): net: Unable to restore nftables. CRIU was built
+#   without libnftables support"
+# CRIU's build silently omits nftables support unless libnftables-dev (pkg-config
+# name libnftables) is present on the PATH at build time — there is no explicit
+# --enable/--disable flag, it's autodetected. So the fix is: install
+# libnftables-dev (plus the rest of CRIU's build deps) BEFORE compiling, then
+# build CRIU itself from source.
+- name: Install CRIU build dependencies + other node tools (Debian/Ubuntu)
   apt:
     name:
-      - criu
-      - bpftool
+      - build-essential
+      - pkg-config
+      - git
+      - libprotobuf-dev
+      - libprotobuf-c-dev
+      - protobuf-c-compiler
+      - protobuf-compiler
+      - python3-protobuf
+      - libbsd-dev
+      - libnl-3-dev
+      - libnl-genl-3-dev
+      - libnet1-dev
+      - libcap-dev
+      - uuid-dev
+      - libnftables-dev
+      - libgnutls28-dev
       - iproute2
       - libnetfilter-queue-dev
       - buildah
@@ -24,6 +55,81 @@
       - jq
     state: present
     update_cache: true
+  when: ansible_os_family == "Debian"
+
+# "bpftool" is a virtual package on Debian/Ubuntu (pre-existing bug, not
+# related to the CRIU/nftables fix above — surfaced live during this build):
+# `apt install bpftool` fails with "has no installation candidate" because the
+# real binary ships in the kernel-version-matched linux-tools package via
+# update-alternatives, not a package literally named "bpftool".
+- name: Install bpftool (Debian/Ubuntu) — kernel-version-matched linux-tools package
+  apt:
+    name:
+      - linux-tools-common
+      - "linux-tools-{{ ansible_kernel }}"
+    state: present
+  when: ansible_os_family == "Debian"
+
+# CRIU has no GPG-signed release tarballs, so the trust anchor here is an exact,
+# non-mutable commit SHA on the official upstream repo (not a branch, and not
+# just the "v4.2" tag name, which — unlike the commit it currently points at —
+# is technically re-writable by anyone with push access). Bump this SHA
+# deliberately when upgrading CRIU; don't track a moving tag/branch.
+# SHA below verified to be what the "v4.2" tag pointed at on the upstream repo
+# at the time this task was written (github.com/checkpoint-restore/criu).
+- name: Set pinned CRIU source commit
+  set_fact:
+    criu_src_commit: "3c7d4fa013297b431da48eff821db7f2e8b90c27" # v4.2
+  when: ansible_os_family == "Debian"
+
+- name: Clone CRIU source at pinned commit (Debian/Ubuntu)
+  git:
+    repo: https://github.com/checkpoint-restore/criu.git
+    dest: /usr/local/src/criu
+    version: "{{ criu_src_commit }}"
+  when: ansible_os_family == "Debian"
+
+- name: Verify checked-out CRIU source matches the pinned commit exactly
+  command: git -C /usr/local/src/criu rev-parse HEAD
+  register: criu_src_head
+  changed_when: false
+  when: ansible_os_family == "Debian"
+
+- name: Fail if CRIU source commit does not match the pin (supply-chain guard)
+  fail:
+    msg: >-
+      CRIU source at /usr/local/src/criu is at commit {{ criu_src_head.stdout }},
+      expected the pinned commit {{ criu_src_commit }}. Refusing to build —
+      this would ship an unverified/unpinned CRIU binary.
+  when:
+    - ansible_os_family == "Debian"
+    - criu_src_head.stdout != criu_src_commit
+
+- name: Build CRIU from source (Debian/Ubuntu)
+  command: make -j{{ ansible_processor_vcpus | default(2) }}
+  args:
+    chdir: /usr/local/src/criu
+  when: ansible_os_family == "Debian"
+
+- name: Confirm the freshly-built criu binary links libnftables
+  shell: ldd /usr/local/src/criu/criu/criu | grep -q libnftables
+  changed_when: false
+  when: ansible_os_family == "Debian"
+
+- name: Install CRIU to /usr/sbin (Debian/Ubuntu)
+  # PREFIX=/usr puts the binary at /usr/sbin/criu — the runtime path hardcoded
+  # in cmd/agent/main.go, internal/agent/nmcregistrar/registrar.go, and the
+  # criu-wrapper invocation in internal/agent/server/server.go. Installing to
+  # the default /usr/local/sbin would leave the agent unable to find it.
+  command: make PREFIX=/usr install-criu
+  args:
+    chdir: /usr/local/src/criu
+  when: ansible_os_family == "Debian"
+
+- name: Remove CRIU build tree (image hygiene — do not ship build artifacts)
+  file:
+    path: /usr/local/src/criu
+    state: absent
   when: ansible_os_family == "Debian"
 
 # ---- package installation (dnf — AL2023 / RHEL 9) ---------------------------
@@ -177,20 +283,51 @@
     containerd_ver_out.stdout is not defined or
     not (containerd_ver_out.stdout | regex_search('\d+\.(\d+)', '\\1') | first | int >= 7)
 
-# ---- bpffs systemd mount unit ------------------------------------------------
-- name: Install bpffs systemd mount unit
-  copy:
-    src: sys-fs-bpf.mount
-    dest: /etc/systemd/system/sys-fs-bpf.mount
-    owner: root
-    group: root
-    mode: "0644"
+# ---- /usr/local/bin/ctr symlink ----------------------------------------------
+# podmotion-agent's exec allowlist (internal/agent/netnsbroker/broker.go) hard-
+# codes "/usr/local/bin/ctr". The apt containerd package on Ubuntu 24.04 only
+# installs the binary at /usr/bin/ctr, so without this symlink the agent's
+# allowlisted exec fails outright. Same "provision host deps on deploy"
+# discipline hack/kvm-cluster.sh already applies for the KVM substrate
+# (`sudo ln -sfn "$REAL_CTR" /usr/local/bin/ctr`, idempotent, resolves ctr
+# wherever it actually lives) — replicated here so the golden AMI ships with
+# the symlink baked in rather than relying on a post-boot fixup.
+- name: Find real ctr binary path
+  command: which ctr
+  register: real_ctr_path
+  changed_when: false
+  failed_when: real_ctr_path.rc != 0 or real_ctr_path.stdout == ""
 
-- name: Enable bpffs mount at boot
-  systemd:
-    name: sys-fs-bpf.mount
-    enabled: true
-    daemon_reload: true
+- name: Symlink /usr/local/bin/ctr to the real ctr binary
+  file:
+    src: "{{ real_ctr_path.stdout }}"
+    dest: /usr/local/bin/ctr
+    state: link
+    force: true
+  when: real_ctr_path.stdout != "/usr/local/bin/ctr"
+
+- name: Verify /usr/local/bin/ctr is executable
+  command: test -x /usr/local/bin/ctr
+  changed_when: false
+
+# ---- bpffs mount ---------------------------------------------------------
+# NOTE: /sys/fs/bpf is on systemd's hard-coded list of reserved "API virtual
+# filesystems" (same list as /proc, /sys, /sys/fs/cgroup) that systemd mounts
+# internally itself during early boot (mount-setup.c) — verified live via
+# `systemd-analyze verify` against a copy of this role's own unit file on
+# systemd 255 (matches Ubuntu 24.04's shipped version): systemd refuses to
+# even LOAD a user-defined .mount unit for these paths, failing closed with
+# "Cannot create mount unit for API file system /sys/fs/bpf. Refusing." /
+# "Unit sys-fs-bpf.mount has a bad unit file setting." This is not something
+# to retry or narrow — bpffs is already mounted automatically by systemd on
+# every systemd >=237 host, so no custom unit is needed or possible. The
+# previous custom sys-fs-bpf.mount unit + enable task were removed; this task
+# only verifies systemd already provides the mount as expected.
+- name: Verify bpffs is mounted at /sys/fs/bpf (provided natively by systemd)
+  command: findmnt -n -t bpf /sys/fs/bpf
+  register: bpffs_mount_check
+  changed_when: false
+  failed_when: bpffs_mount_check.rc != 0
 
 # ---- SELinux module (AL2023 / RHEL 9 only) -----------------------------------
 - name: Copy PodMotion SELinux type enforcement file
