@@ -1,0 +1,27 @@
+---
+# PodMotion.io kubeadm-ubuntu node-image playbook — entrypoint invoked by
+# Packer's ansible provisioner (see
+# images/capi/packer/kubeadm-ubuntu.pkr.hcl).
+#
+# Builds a golden Ubuntu 24.04 AMI for the EC2 kubeadm proving ground
+# (terraform/kubeadm-ec2/) with containerd/kubeadm/kubelet/kubectl AND
+# PodMotion's node-agent, NRI plugin, and kernel/CRIU prerequisites all
+# pre-baked in — so future cluster launches skip the from-scratch
+# bootstrap-over-SSH path.
+#
+# Runs k8s-prereqs FIRST (installs containerd/kubeadm/kubelet/kubectl —
+# the layer the EKS-optimized base AMI already provides, which plain
+# Ubuntu 24.04 does not), then podmotion-node (existing, multi-distro role
+# — see images/capi/ansible/playbook.yml for its EKS/AL2023 use). Order
+# matters: podmotion-node's `containerd --version` check needs containerd
+# already installed to correctly decide whether to write its NRI conf.d
+# snippet.
+
+- name: Bake PodMotion onto a plain Ubuntu 24.04 base image for EC2 kubeadm
+  hosts: all
+  become: true
+  gather_facts: true
+
+  roles:
+    - k8s-prereqs
+    - podmotion-node
