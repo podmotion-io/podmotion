@@ -239,6 +239,8 @@
       net.core.bpf_jit_enable = 1
       net.ipv4.conf.all.rp_filter = 0
       net.ipv4.conf.default.rp_filter = 0
+      fs.inotify.max_user_instances = 8192
+      fs.inotify.max_user_watches = 1048576
     dest: /etc/sysctl.d/90-podmotion.conf
     owner: root
     group: root

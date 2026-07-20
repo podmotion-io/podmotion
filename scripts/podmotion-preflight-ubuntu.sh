@@ -309,6 +309,22 @@ else
   record "sysctl/net.core.bpf_jit_harden" 1 "bpf_jit_harden=0 (JIT hardening off)"
 fi
 
+# fs.inotify ceilings — CRIU's kerndat probe and inotify-watch restore path need
+# headroom above the stock Linux defaults (max_user_instances=128, max_user_watches=8192)
+INOTIFY_INSTANCES=$(sysctl -n fs.inotify.max_user_instances 2>/dev/null || echo "0")
+if [[ "$INOTIFY_INSTANCES" -ge 8192 ]]; then
+  record "sysctl/fs.inotify.max_user_instances" 1 "fs.inotify.max_user_instances=${INOTIFY_INSTANCES} >= 8192"
+else
+  warn_record "sysctl/fs.inotify.max_user_instances" "fs.inotify.max_user_instances=${INOTIFY_INSTANCES} (expected >= 8192); fix: sysctl -w fs.inotify.max_user_instances=8192"
+fi
+
+INOTIFY_WATCHES=$(sysctl -n fs.inotify.max_user_watches 2>/dev/null || echo "0")
+if [[ "$INOTIFY_WATCHES" -ge 1048576 ]]; then
+  record "sysctl/fs.inotify.max_user_watches" 1 "fs.inotify.max_user_watches=${INOTIFY_WATCHES} >= 1048576"
+else
+  warn_record "sysctl/fs.inotify.max_user_watches" "fs.inotify.max_user_watches=${INOTIFY_WATCHES} (expected >= 1048576); fix: sysctl -w fs.inotify.max_user_watches=1048576"
+fi
+
 # ===========================================================================
 # SECTION 5: cgroup v2
 # ===========================================================================
