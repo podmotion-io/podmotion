@@ -1620,12 +1620,29 @@ func (s *AgentServer) resolveReattachMountsImpl(callerCtx context.Context, migra
 
 	// Map each PVC-backed volume name → its in-container mountPath(s).
 	pvcVolToClaim := make(map[string]string)
+	// Bare in-tree NFS volumes (no PVC/PV wrapper) are re-attach-eligible in exactly the same way
+	// PVC-backed Tier0 RWX volumes are: per ADR-0007, NFS is Tier0 (ReadWriteMany, re-attach only,
+	// zero data movement) regardless of whether it arrives through a PersistentVolumeClaim or a raw
+	// pod-spec `nfs:` volume source. Prior to this, this function was keyed exclusively on
+	// v.PersistentVolumeClaim, so a bare-NFS pod (the shape used on clusters with no StorageClass/CSI —
+	// see docs/sprints/sprint53-kind/STATUS-EC2-KUBEADM.md) always produced an EMPTY reattach set here,
+	// even though internal/agent/storage.classifier's StorageReadyForFreeze precondition gate reported
+	// it as Tier0/RWX-ready. That divergence let a genuinely re-attachable NFS mount reach
+	// patchCheckpointImages with no reattachMountPaths entry, so it was ADR-0194 B-2 dropped as an
+	// unresolved external and its open REG fds (e.g. an in-use postgres WAL segment) orphaned into the
+	// ADR-0193 P-0193-1 DECLINE hard-stop at restore time — not because the guard was wrong (an
+	// unpreserved mount's fds SHOULD decline), but because the mount was never given a chance to be
+	// preserved in the first place. Track bare NFS volumes the same way pvcVolToClaim tracks PVCs so
+	// the collect loop below can admit them.
+	nfsVolNames := make(map[string]bool)
 	for _, v := range specPod.Spec.Volumes {
 		if v.PersistentVolumeClaim != nil {
 			pvcVolToClaim[v.Name] = v.PersistentVolumeClaim.ClaimName
+		} else if v.NFS != nil {
+			nfsVolNames[v.Name] = true
 		}
 	}
-	if len(pvcVolToClaim) == 0 {
+	if len(pvcVolToClaim) == 0 && len(nfsVolNames) == 0 {
 		return nil, nil
 	}
 
@@ -1669,16 +1686,29 @@ func (s *AgentServer) resolveReattachMountsImpl(callerCtx context.Context, migra
 	var notYetCP, notYetPV string
 	collect := func(mnts []corev1.VolumeMount) {
 		for _, m := range mnts {
-			claim, isPVC := pvcVolToClaim[m.Name]
-			if !isPVC {
+			// pvName is the kubelet-volume-dir leaf resolveKubeletVolumeHostPath matches against
+			// (/var/lib/kubelet/pods/<replUID>/volumes/kubernetes.io~<provisioner>/<pvName>). For a
+			// PVC it's the bound PV name; for a bare in-tree NFS volume (no PV object exists) the
+			// kubelet publishes the mount under the volume's own pod-spec name instead — the same
+			// kubernetes.io~nfs/<leaf> shape parseKubeletMountFromMountinfo already matches generically.
+			var pvName string
+			var tier reattachTierKind
+			if claim, isPVC := pvcVolToClaim[m.Name]; isPVC {
+				// Tier gate (fail-closed against mis-classification): a PVC-backed mount is re-attach
+				// eligible ONLY if it classifies as Tier0 RWX or Tier1-Longhorn. Excluding a non-reattach-
+				// eligible PVC here keeps it out of reattach_mount_paths, so patch_checkpoint_script leaves
+				// its recorded mount source alone (the pre-existing non-reattach handling) rather than
+				// rewriting it as a cross-node re-attach mount.
+				tier = claimReattachTier[claim]
+				pvName = claimToPV[claim]
+			} else if nfsVolNames[m.Name] {
+				// Bare in-tree NFS: always Tier0 RWX (ADR-0007) — there is no PVC/StorageClass to
+				// consult, and NFS re-attach eligibility does not depend on one.
+				tier = reattachTierTier0RWX
+				pvName = m.Name
+			} else {
 				continue
 			}
-			// Tier gate (fail-closed against mis-classification): a PVC-backed mount is re-attach
-			// eligible ONLY if it classifies as Tier0 RWX or Tier1-Longhorn. Excluding a non-reattach-
-			// eligible PVC here keeps it out of reattach_mount_paths, so patch_checkpoint_script leaves
-			// its recorded mount source alone (the pre-existing non-reattach handling) rather than
-			// rewriting it as a cross-node re-attach mount.
-			tier := claimReattachTier[claim]
 			if tier == reattachTierNone {
 				continue
 			}
@@ -1687,14 +1717,14 @@ func (s *AgentServer) resolveReattachMountsImpl(callerCtx context.Context, migra
 				continue
 			}
 			seen[cp] = true
-			host := resolveKubeletVolumeHostPath(ctx, replUID, claimToPV[claim])
+			host := resolveKubeletVolumeHostPath(ctx, replUID, pvName)
 			if host == "" && replUID != "" && !terminalOnBudget {
 				// Replacement pod resolved but its kubelet volume is not yet published in the host
 				// mount table: capture it as the retryable "not yet" case rather than appending a
 				// HostTarget=="" mount (which would fail closed immediately).
 				if notYetCP == "" {
 					notYetCP = cp
-					notYetPV = claimToPV[claim]
+					notYetPV = pvName
 				}
 				continue
 			}
