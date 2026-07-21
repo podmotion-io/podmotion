@@ -89,10 +89,21 @@ const (
 	conditionDataplaneReconciled        = "DataplaneReconciled"
 	conditionGitOpsSuspended            = "GitOpsSuspended"
 	conditionEndpointSliceCleanVerified = "EndpointSliceCleanupVerified"
+	// conditionDestinationPlacementValid is set False with reason "SameNodePlacement" when the
+	// destination node backfilled from the already-bound replacement pod (degraded no-scheduler
+	// substrate, see reconcileTransferring) resolves to the SAME node as the source pod. A
+	// same-node placement is a degenerate, non-migration and must not be silently advanced as if
+	// it were a valid cross-node transfer; the reconcile requeues instead of proceeding.
+	conditionDestinationPlacementValid = "DestinationPlacementValid"
 	// cni0CleanupVerifyAttemptsAnnotation stamps the current VerifyCleanup(CUTOVER_COMPLETE)
 	// retry attempt count on the PodMigration so the bounded 3-attempt/2s-4s-8s backoff
 	// (ADR-0241 item 1) survives across reconcile requeues without a blocking sleep.
 	cni0CleanupVerifyAttemptsAnnotation = "podmotion.io/cni0-cleanup-verify-attempts"
+	// sameNodeRecoveryAttemptsAnnotation stamps the current same-node placement recovery
+	// (delete-and-reschedule) attempt count on the PodMigration so the bounded
+	// maxSameNodeRecoveryDeletes budget in resolveAndValidateReplacementPlacement survives across
+	// reconcile requeues, mirroring cni0CleanupVerifyAttemptsAnnotation / ipReclaimVerifyAttemptsAnnotation.
+	sameNodeRecoveryAttemptsAnnotation = "podmotion.io/samenode-recovery-attempts"
 	// conditionIPHandoffInjected records that the ADR-0133 destination-side neighbor/FDB
 	// handoff for the OLD pod IP has been installed and the reachability probe passed.
 	conditionIPHandoffInjected = "IPHandoffInjected"
@@ -235,7 +246,19 @@ func (r *PodMigrationReconciler) recordPhaseDecision(from, decided pmv1.Migratio
 // +kubebuilder:rbac:groups=migration.podmotion.io,resources=podmigrations/finalizers,verbs=update
 // +kubebuilder:rbac:groups=migration.podmotion.io,resources=nodemigrationcapacities,verbs=get;list;watch
 // +kubebuilder:rbac:groups=migration.podmotion.io,resources=migrationcheckpoints,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
+// ADR-0361 sprint56B finding: getRSSelector (below) reads appsv1.ReplicaSet to resolve and strip
+// the owning ReplicaSet's selector labels off a replacement pod, but no RBAC marker for it existed
+// anywhere in this codebase — a pre-existing, cross-substrate bug (not kind-specific) that silently
+// stalls FinalFreezeStateCapture forever for every ReplicaSet-owned (Deployment-backed) source pod,
+// confirmed live: "replicasets.apps is forbidden ... at the cluster scope" from the controller-runtime
+// cache reflector, checkpoint captured but no replacement pod ever created.
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
+// ADR-0361 sprint56B finding: ensureReplacementPodBound (ADR-0360) removes the
+// podmotion.io/awaiting-checkpoint scheduling gate via a direct `patch` on the replacement pod —
+// `patch` was missing from this marker (and from the chart's hand-maintained ClusterRole), so the
+// gate could never be lifted and every gated migration replacement pod stalled forever. Confirmed
+// live: "pods ... is forbidden ... cannot patch resource \"pods\"" from ensureReplacementPodBound.
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete;create;update;patch
 // +kubebuilder:rbac:groups="",resources=pods/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
@@ -265,21 +288,21 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	deadline, cancel := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
 	defer cancel()
 
-	// Normalize destination node: spec.destinationNode (webhook-populated) and
-	// spec.targetNodeName (user-set) are two synonymous fields. Populate
-	// status.destinationNodeName early from whichever is set so downstream
-	// reconcilers can use status.destinationNodeName unconditionally.
-	if pm.Status.DestinationNodeName == "" {
-		if pm.Spec.TargetNodeName != "" {
-			pm.Status.DestinationNodeName = pm.Spec.TargetNodeName
-		} else if pm.Spec.DestinationNode != "" {
-			pm.Status.DestinationNodeName = pm.Spec.DestinationNode
-		}
-		if pm.Status.DestinationNodeName != "" {
-			if err := r.statusUpdate(deadline, pm); err != nil {
-				log.Error(err, "failed to persist DestinationNodeName from spec", "migration", pm.Name)
-				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-			}
+	// Normalize destination node (SINGLE SOURCE OF TRUTH): spec.destinationNode (webhook-populated)
+	// and spec.targetNodeName (user-set) are two synonymous fields that seed the
+	// status.destinationNodeName observability cache so downstream reconcilers can read it. This
+	// seed-from-spec and the live-pod binding read in reconcileTransferring are the ONLY two producers
+	// of Status.DestinationNodeName, and BOTH route through resolveAndValidateReplacementPlacement so
+	// no producer can latch a same-node destination that would wedge the migration (round-3 finding
+	// #2 — an operator targeting a pod's own current node). Seed mode (correctInvalid=false) caches
+	// the declared target only when it is distinct from the source and NEVER deletes a pod or fails
+	// the migration; the authoritative valid-vs-needs-correcting decision (and real recovery) is made
+	// once, in reconcileTransferring's correct-mode call. Skipped while the CR is being deleted (the
+	// finalizer path below owns that).
+	if pm.DeletionTimestamp.IsZero() {
+		if _, err := r.resolveAndValidateReplacementPlacement(deadline, pm, pm.Status.SourceNodeName, false); err != nil {
+			log.Error(err, "normalize: replacement-placement resolve failed — requeuing", "migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 	}
 
@@ -592,9 +615,9 @@ func (r *PodMigrationReconciler) reconcileDestinationPrewarm(ctx context.Context
 	// and ConfirmOverlayReady (ADR-0048).
 	pm.Status.DestNetnsPath = prepResp.DestNetnsFd
 	pm.Status.DestVtepMac = prepResp.DestVtepMac
-	if pm.Status.DestinationNodeName == "" {
-		pm.Status.DestinationNodeName = destNode
-	}
+	// Cache via the shared validated seed so a same-node destination can never be latched here
+	// (round-3 finding #2); the authoritative placement decision remains reconcileTransferring's.
+	cacheDestinationNodeFromSpec(pm, destNode, pm.Status.SourceNodeName)
 
 	msg := fmt.Sprintf("Destination netns pre-staged on node %s; dest_netns_fd=%s dest_vtep_mac=%s (ADR-0048)",
 		destNode, prepResp.DestNetnsFd, prepResp.DestVtepMac)
@@ -667,9 +690,7 @@ func (r *PodMigrationReconciler) reconcilePreCopyMemory(ctx context.Context, pm 
 	}
 
 	if memorySynced && storageReady && networkBridgeArmed {
-		if pm.Status.DestinationNodeName == "" && pm.Spec.TargetNodeName != "" {
-			pm.Status.DestinationNodeName = pm.Spec.TargetNodeName
-		}
+		cacheDestinationNodeFromSpec(pm, pm.Spec.TargetNodeName, pm.Status.SourceNodeName)
 		// Pre-copy TCP freeze-go gate (M24): for TCP-stateful migrations the controller
 		// must confirm three convergence predicates before arming the zero-window hold.
 		// This avoids freezing during a high-retransmit or fast-growing seq window where
@@ -2750,11 +2771,10 @@ func (r *PodMigrationReconciler) reconcilePreMigrating(ctx context.Context, pm *
 	}
 
 	if memorySynced && storageReady && networkBridgeArmed {
-		// Set DestinationNodeName from spec.targetNodeName if not already set.
-		// This is required by reconcileRestoring to connect to the destination agent.
-		if pm.Status.DestinationNodeName == "" && pm.Spec.TargetNodeName != "" {
-			pm.Status.DestinationNodeName = pm.Spec.TargetNodeName
-		}
+		// Cache DestinationNodeName from spec.targetNodeName if not already set (required by
+		// reconcileRestoring to connect to the destination agent), via the shared validated seed so a
+		// same-node destination can never be latched here (round-3 finding #2).
+		cacheDestinationNodeFromSpec(pm, pm.Spec.TargetNodeName, pm.Status.SourceNodeName)
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseCheckpointing)
 	}
 
@@ -3146,15 +3166,16 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		}
 	}
 
-	// Ensure DestinationNodeName is set before creating the replacement pod.
+	// Ensure DestinationNodeName is cached before creating the replacement pod.
 	// It is normally set in reconcilePreMigrating and persisted via transitionTo, but
 	// can be empty if this reconcile was fetched from cache before the status write landed.
-	if pm.Status.DestinationNodeName == "" && pm.Spec.TargetNodeName != "" {
-		pm.Status.DestinationNodeName = pm.Spec.TargetNodeName
+	// Routed through the shared validated seed so a same-node destination can never be latched
+	// here (round-3 finding #2).
+	if cacheDestinationNodeFromSpec(pm, pm.Spec.TargetNodeName, pm.Status.SourceNodeName) {
 		if err := r.statusUpdate(ctx, pm); err != nil {
-			return ctrl.Result{}, fmt.Errorf("setting DestinationNodeName in Checkpointing phase: %w", err)
+			return ctrl.Result{}, fmt.Errorf("caching DestinationNodeName in Checkpointing phase: %w", err)
 		}
-		log.Info("set DestinationNodeName from spec.targetNodeName in Checkpointing phase",
+		log.Info("cached DestinationNodeName from spec.targetNodeName in Checkpointing phase (validated distinct from source)",
 			"migration", pm.Name, "destNode", pm.Status.DestinationNodeName)
 	}
 
@@ -3216,13 +3237,35 @@ func (r *PodMigrationReconciler) reconcileTransferring(ctx context.Context, pm *
 		log.Info("reconcileTransferring: sourceNodeName not set, requeuing", "migration", pm.Name)
 		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 	}
-	destNode := pm.Status.DestinationNodeName
-	if destNode == "" && pm.Spec.TargetNodeName != "" {
-		destNode = pm.Spec.TargetNodeName
+	// Placement authority (SINGLE SOURCE OF TRUTH). resolveAndValidateReplacementPlacement re-reads
+	// the LIVE replacement pod every call, validates its ACTUAL binding (present, Ready, != source),
+	// and — in correct mode — performs bounded, apiserver-legal REAL recovery: when the
+	// migration-unaware default scheduler bound the replacement pod onto the source node it DELETES
+	// that pod so the scheduler reschedules a fresh one (a bound pod's spec.nodeName is immutable — a
+	// delete is the only legal correction), up to maxSameNodeRecoveryDeletes times before failing
+	// closed. It, not a latched Status.DestinationNodeName, decides whether this migration may
+	// proceed, so an operator/automation pin at the pod's own node (round-3 finding #2) can no longer
+	// wedge the migration through any producer path. On success Status.DestinationNodeName is
+	// refreshed to the validated destination.
+	decision, err := r.resolveAndValidateReplacementPlacement(ctx, pm, sourceNode, true)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
-	if destNode == "" {
-		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	switch decision.Action {
+	case replacementPlacementTerminal:
+		// Same-node placement could not be corrected within the bound — fail closed to rollback
+		// (source pod never deleted — ADR-0012; the replacement pod is torn down by the rollback
+		// path). This is the honest terminal outcome, not an infinite silent retry.
+		return r.initiateRollback(ctx, pm, decision.TerminalReason)
+	case replacementPlacementRequeue:
+		ra := decision.RequeueAfter
+		if ra == 0 {
+			ra = 3 * time.Second
+		}
+		return ctrl.Result{RequeueAfter: ra}, nil
 	}
+	// Proceed: placement is valid and distinct from the source; use it as the transfer destination.
+	destNode := decision.DestNode
 
 	// Idempotency guard: if the controller crashed after Put but before transitioning to
 	// Restoring, CheckpointTransferred is already true — skip straight to gate removal.
@@ -3545,13 +3588,14 @@ func (r *PodMigrationReconciler) reconcileRestoring(ctx context.Context, pm *pmv
 
 	destNode := pm.Status.DestinationNodeName
 	if destNode == "" {
-		// Fallback: populate from spec.targetNodeName if status was not set during pre-migration.
-		if pm.Spec.TargetNodeName != "" {
-			pm.Status.DestinationNodeName = pm.Spec.TargetNodeName
+		// Fallback: populate from spec.targetNodeName if status was not set during pre-migration,
+		// via the shared validated seed so a same-node destination can never be latched here
+		// (round-3 finding #2). A same-node or empty target yields no seed and requeues.
+		if cacheDestinationNodeFromSpec(pm, pm.Spec.TargetNodeName, pm.Status.SourceNodeName) {
 			if err := r.statusUpdate(ctx, pm); err != nil {
 				return ctrl.Result{}, err
 			}
-			destNode = pm.Spec.TargetNodeName
+			destNode = pm.Status.DestinationNodeName
 		} else {
 			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 		}
@@ -6722,6 +6766,409 @@ func (r *PodMigrationReconciler) ensureReplacementPodBound(
 		}
 	}
 	return fresh, true, nil
+}
+
+// maxSameNodeRecoveryDeletes bounds the real, apiserver-legal recovery loop for a replacement pod
+// the (migration-unaware) default scheduler bound onto the SOURCE node on the degraded
+// scheduler.enabled=false substrate. A bound pod's spec.nodeName is IMMUTABLE — the apiserver
+// rejects any in-place rebind — so the ONLY corrective action that actually reschedules is to
+// DELETE the replacement pod and let the scheduler place a fresh one. Each attempt is one such
+// delete+recreate. After this many deletes have all still landed the pod on the source node, the
+// migration fails closed to RollingBack (source pod never deleted — ADR-0012; the replacement pod
+// is torn down by the rollback path) rather than looping forever. 3 mirrors this file's other
+// bounded retry budgets (cni0/IP-reclaim cleanup) and gives the default scheduler's
+// BalancedAllocation/topology-spread scoring several independent chances — with the source pod still
+// consuming the source node's resources each time — without unbounded pod churn.
+const maxSameNodeRecoveryDeletes = 3
+
+// replacementPlacementAction is what a caller of resolveAndValidateReplacementPlacement must do with
+// the freshly-computed decision.
+type replacementPlacementAction int
+
+const (
+	// replacementPlacementProceed: placement is valid (a present, Ready node distinct from the
+	// source). The caller continues its phase; decision.DestNode is the validated destination and
+	// Status.DestinationNodeName has been refreshed to it as an observability cache.
+	replacementPlacementProceed replacementPlacementAction = iota
+	// replacementPlacementRequeue: nothing is wrong that time won't fix (pod not yet bound), OR a
+	// corrective delete/recreate was just issued. The caller requeues after decision.RequeueAfter.
+	replacementPlacementRequeue
+	// replacementPlacementTerminal: the replacement pod could not be placed off the source node
+	// within the bound (or a still-gated pod is pinned to the source node with no legal reschedule).
+	// The caller must fail the migration closed (rollback); decision.TerminalReason explains why.
+	replacementPlacementTerminal
+)
+
+// replacementPlacementDecision is the single authoritative answer resolveAndValidateReplacementPlacement
+// returns.
+type replacementPlacementDecision struct {
+	// Pod is the live replacement pod, or nil if none resolves yet.
+	Pod *corev1.Pod
+	// PodBound reports whether DestNode was taken from the live pod's own spec.nodeName (true) or
+	// fell back to the declared destination for a still-gated/unbound pod (false).
+	PodBound bool
+	// DestNode is the validated destination node the caller should proceed with — the replacement
+	// pod's ACTUAL binding when it is bound, else the declared destination (Status/spec) for a pod
+	// still held by its scheduling gate. "" == not determinable yet.
+	DestNode string
+	// Valid is true only when Action == replacementPlacementProceed.
+	Valid          bool
+	Action         replacementPlacementAction
+	RequeueAfter   time.Duration
+	TerminalReason string
+}
+
+// destinationDistinctFromSource is the SINGLE definition of the load-bearing half of placement
+// validity: a candidate destination node must be non-empty and different from the source node. A
+// same-node destination is a degenerate non-migration (source and destination agents are the same
+// process; the checkpoint would be "transferred" to the node it already lives on and nothing would
+// move) and must never be persisted into Status.DestinationNodeName by ANY producer. sourceNode==""
+// means the source node is not yet known — we cannot prove sameness, so we allow the candidate; the
+// authoritative live-pod gate (resolveAndValidateReplacementPlacement in correct mode) re-checks
+// against the real source before any transfer proceeds.
+func destinationDistinctFromSource(candidate, sourceNode string) bool {
+	return candidate != "" && candidate != sourceNode
+}
+
+// cacheDestinationNodeFromSpec seeds Status.DestinationNodeName — an observability CACHE, never the
+// authority for placement validity — from a declared candidate node, but ONLY when the cache is
+// still empty and the candidate is distinct from the source node. It mutates pm in memory and
+// returns whether it assigned; the caller persists as part of its existing status write. Every
+// pre-pod spec→status producer funnels through this one choke point so none can latch a same-node
+// destination (round-3 finding #2: a second/third producer bypassing the same-node guard). The
+// authoritative decision for an already-bound pod is resolveAndValidateReplacementPlacement, which
+// re-reads the live pod and never trusts this cache.
+func cacheDestinationNodeFromSpec(pm *pmv1.PodMigration, candidate, sourceNode string) bool {
+	if pm.Status.DestinationNodeName != "" {
+		return false
+	}
+	if !destinationDistinctFromSource(candidate, sourceNode) {
+		return false
+	}
+	pm.Status.DestinationNodeName = candidate
+	return true
+}
+
+// readSameNodeRecoveryAttempts returns the current same-node recovery (delete-and-reschedule)
+// attempt count stamped on pm by sameNodeRecoveryAttemptsAnnotation, or 0 if absent/unparseable,
+// mirroring readCni0CleanupVerifyAttempts / readIPReclaimVerifyAttempts.
+func readSameNodeRecoveryAttempts(pm *pmv1.PodMigration) int {
+	if pm.Annotations == nil {
+		return 0
+	}
+	v, ok := pm.Annotations[sameNodeRecoveryAttemptsAnnotation]
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// nodeIsPresentAndReady reports whether the named Node exists and has NodeReady=True. When the Node
+// object cannot be read (transient get error / RBAC), it returns present=false so the caller does
+// NOT treat an unreadable Node as a hard placement failure — the load-bearing safety property is
+// "distinct from source" (established separately), and blocking on a transient Node-get blip would
+// trade a corrected placement for a needless hold.
+func (r *PodMigrationReconciler) nodeIsPresentAndReady(ctx context.Context, nodeName string) (present bool, ready bool) {
+	if nodeName == "" {
+		return false, false
+	}
+	node := &corev1.Node{}
+	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+		return false, false
+	}
+	for _, c := range node.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return true, c.Status == corev1.ConditionTrue
+		}
+	}
+	// Node exists but reports no Ready condition yet (just registered) — present, not-yet-ready.
+	return true, false
+}
+
+// replacementPodGated reports whether the replacement pod still carries the awaiting-checkpoint
+// scheduling gate. A gated pod is held OUT of the scheduling queue entirely (real substrate: the
+// webhook injects the gate and the podmotion-scheduler binds it only after the gate is lifted at the
+// end of reconcileTransferring), so it will NOT self-bind to a distinct node on its own. That
+// distinguishes "a source-pinned destination that a reschedule can never fix" (gated → terminal)
+// from "an ungated pod that has simply not been bound yet" (wait).
+func replacementPodGated(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for _, g := range pod.Spec.SchedulingGates {
+		if g.Name == schedulingGateAwaitingCheckpoint {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveAndValidateReplacementPlacement is THE single source of truth for the question
+// "is the current replacement-pod placement valid, and if not, what corrective action fires?"
+// Both historical producers of Status.DestinationNodeName — the top-level Reconcile normalize block
+// and the reconcileTransferring backfill branch — now route through it, so exactly one place in the
+// codebase decides valid-vs-needs-correcting, and a future producer cannot reintroduce the same-node
+// latch bug class.
+//
+// On EVERY call it re-reads the LIVE replacement pod via resolveReplacementPodByLabel and, when that
+// pod is actually bound, computes validity FRESHLY from its spec.nodeName — it NEVER trusts a
+// persisted/latched Status.DestinationNodeName as the source of truth for placement (that field is
+// only an observability cache of the last known-good node). A bound pod's real node is authoritative;
+// only when the pod is still held by its scheduling gate (real substrate, unbound during the
+// transfer) does it fall back to the declared destination (Status → spec) so that flow is preserved.
+// Validity == bound to a node that is present, Ready, and != sourceNode.
+//
+// correctInvalid selects the two call modes:
+//   - false (normalize/seed path, top of every reconcile, all phases): validate/cache only. With no
+//     live pod it seeds Status.DestinationNodeName from the declared spec target via
+//     cacheDestinationNodeFromSpec (refusing a same-node target). It NEVER deletes a pod and never
+//     returns a terminal action.
+//   - true (reconcileTransferring): additionally performs REAL, bounded recovery. A pod bound to the
+//     source node is DELETED (grace 0 — replacement pods carry no finalizer, so the apiserver removes
+//     it promptly; a delete is always legal, unlike an apiserver-rejected spec.nodeName mutation) so
+//     the scheduler gets a fresh placement attempt, and a fresh pod is recreated on the following
+//     pass once the old one is gone. This is BOUNDED by maxSameNodeRecoveryDeletes, after which the
+//     migration is failed closed to rollback rather than looping forever.
+//
+// ADR-0012: the pod deleted here is ALWAYS the REPLACEMENT pod (label
+// replacementPodMigrationNameLabel == pm.Name, ownerRef == the PodMigration CR). The SOURCE pod is
+// never touched by this primitive and is never deleted before TrafficVerified=True — deleting the
+// replacement pod for reschedule is unrelated to source-pod teardown.
+func (r *PodMigrationReconciler) resolveAndValidateReplacementPlacement(
+	ctx context.Context, pm *pmv1.PodMigration, sourceNode string, correctInvalid bool,
+) (replacementPlacementDecision, error) {
+	log := logf.FromContext(ctx)
+
+	replPod, err := r.resolveReplacementPodByLabel(ctx, pm)
+	if err != nil {
+		return replacementPlacementDecision{Action: replacementPlacementRequeue, RequeueAfter: 3 * time.Second}, err
+	}
+
+	// Recovery recreate: we DELETED a same-node replacement pod on an earlier pass and it is now
+	// gone. Recreate a fresh one (deterministic name, idempotent) so the scheduler makes its next
+	// placement attempt. The source pod still exists (ADR-0012), so we can clone from it. Only in
+	// correct mode; the seed path never recreates.
+	if replPod == nil && correctInvalid && readSameNodeRecoveryAttempts(pm) > 0 {
+		sourcePod, getErr := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+		if getErr != nil {
+			log.Error(getErr, "resolveAndValidateReplacementPlacement: source pod unreadable during same-node recovery recreate — requeuing",
+				"migration", pm.Name)
+			return replacementPlacementDecision{Action: replacementPlacementRequeue, RequeueAfter: 3 * time.Second}, nil
+		}
+		if createErr := r.createReplacementPod(ctx, pm, sourcePod); createErr != nil {
+			log.Error(createErr, "resolveAndValidateReplacementPlacement: recreate after same-node delete failed — requeuing",
+				"migration", pm.Name)
+			return replacementPlacementDecision{Action: replacementPlacementRequeue, RequeueAfter: 3 * time.Second}, nil
+		}
+		log.Info("resolveAndValidateReplacementPlacement: recreated replacement pod after same-node delete; awaiting fresh scheduler placement",
+			"migration", pm.Name, "recoveryAttempt", readSameNodeRecoveryAttempts(pm))
+		return replacementPlacementDecision{Action: replacementPlacementRequeue, RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Our prior corrective delete is not yet reaped. Wait; do NOT re-evaluate placement against a
+	// terminating pod, and do not burn the recovery budget on it.
+	if replPod != nil && !replPod.DeletionTimestamp.IsZero() {
+		return replacementPlacementDecision{Pod: replPod, Action: replacementPlacementRequeue, RequeueAfter: 3 * time.Second}, nil
+	}
+
+	// Determine the effective destination and whether it came from the pod's ACTUAL binding.
+	podBound := replPod != nil && replPod.Spec.NodeName != ""
+	var effectiveNode string
+	if podBound {
+		// Authority: the pod's real binding (degraded substrate — pod is ungated and bound early).
+		effectiveNode = replPod.Spec.NodeName
+	} else {
+		// Pod still gated (real substrate) or not yet created: the declared destination is the only
+		// signal for where it is headed. Never trusted for VALIDITY of a bound pod — only used here
+		// because there is no binding to read yet.
+		effectiveNode = pm.Status.DestinationNodeName
+		if effectiveNode == "" {
+			effectiveNode = pm.Spec.TargetNodeName
+		}
+		if effectiveNode == "" {
+			effectiveNode = pm.Spec.DestinationNode
+		}
+	}
+
+	// SEED MODE (top-of-reconcile, all phases): behave like the historical normalize producer — cache
+	// the declared spec target into the Status.DestinationNodeName observability cache ONLY when it is
+	// still empty AND the target is valid (distinct from source). It writes at most once (only when it
+	// actually seeds a new value), sets NO validity condition, deletes nothing, and never fails the
+	// migration — so it does not perturb the finalizer-add / phase-handler writes that follow in the
+	// same reconcile. Refusing to seed a same-node target is the finding-#2 fix: an empty cache cannot
+	// latch the wedge. The authoritative valid-vs-needs-correcting decision (and all recovery) is the
+	// correct-mode call in reconcileTransferring.
+	if !correctInvalid {
+		if !podBound {
+			candidate := pm.Spec.TargetNodeName
+			if candidate == "" {
+				candidate = pm.Spec.DestinationNode
+			}
+			if cacheDestinationNodeFromSpec(pm, candidate, sourceNode) {
+				if serr := r.statusUpdate(ctx, pm); serr != nil {
+					return replacementPlacementDecision{Action: replacementPlacementRequeue, RequeueAfter: 2 * time.Second}, serr
+				}
+				effectiveNode = pm.Status.DestinationNodeName
+			}
+		}
+		return replacementPlacementDecision{Pod: replPod, PodBound: podBound, DestNode: effectiveNode, Action: replacementPlacementProceed}, nil
+	}
+
+	// ---- Correct mode below (reconcileTransferring): validate the live placement and, if it is the
+	// degenerate same-node case, perform bounded real recovery. ----
+	if effectiveNode == "" {
+		// Nothing known yet — wait for the scheduler to bind the pod (degraded) or a producer to set
+		// the destination (real). Not an error.
+		return replacementPlacementDecision{Pod: replPod, DestNode: "", Action: replacementPlacementRequeue, RequeueAfter: 3 * time.Second}, nil
+	}
+
+	if effectiveNode == sourceNode {
+		return r.correctSameNodePlacement(ctx, pm, replPod, sourceNode, correctInvalid, podBound)
+	}
+
+	// ---- effectiveNode is distinct from the source node. ----
+	// For a bound pod, additionally confirm the node is present + Ready (a NotReady destination is a
+	// transient hold, not a same-node corrective case — a delete would not help). Fail-open when the
+	// Node object is unreadable: != source is the load-bearing invariant, already satisfied here.
+	if podBound {
+		if present, ready := r.nodeIsPresentAndReady(ctx, effectiveNode); present && !ready {
+			setCondition(pm, conditionDestinationPlacementValid, metav1.ConditionFalse, "DestinationNodeNotReady",
+				fmt.Sprintf("replacement pod bound to node %q which is present but not Ready — holding until it recovers", effectiveNode))
+			if serr := r.statusUpdate(ctx, pm); serr != nil {
+				return replacementPlacementDecision{Pod: replPod, PodBound: podBound, DestNode: effectiveNode}, serr
+			}
+			return replacementPlacementDecision{Pod: replPod, PodBound: podBound, DestNode: effectiveNode, Action: replacementPlacementRequeue, RequeueAfter: 5 * time.Second}, nil
+		}
+	}
+
+	// ---- Valid placement. Refresh the Status.DestinationNodeName cache, clear any veto, and clear
+	// the recovery attempt counter. ----
+	if attempts := readSameNodeRecoveryAttempts(pm); attempts != 0 {
+		delete(pm.Annotations, sameNodeRecoveryAttemptsAnnotation)
+		if uerr := r.Update(ctx, pm); uerr != nil {
+			return replacementPlacementDecision{Pod: replPod, PodBound: podBound, DestNode: effectiveNode, Valid: true}, uerr
+		}
+	}
+	statusDirty := false
+	if pm.Status.DestinationNodeName != effectiveNode {
+		pm.Status.DestinationNodeName = effectiveNode
+		statusDirty = true
+	}
+	if !meta.IsStatusConditionTrue(pm.Status.Conditions, conditionDestinationPlacementValid) {
+		setCondition(pm, conditionDestinationPlacementValid, metav1.ConditionTrue, "DistinctNodePlacement",
+			fmt.Sprintf("destination node %q is distinct from source node %q", effectiveNode, sourceNode))
+		statusDirty = true
+	}
+	if statusDirty {
+		if serr := r.statusUpdate(ctx, pm); serr != nil {
+			return replacementPlacementDecision{Pod: replPod, PodBound: podBound, DestNode: effectiveNode, Valid: true}, serr
+		}
+	}
+	return replacementPlacementDecision{Pod: replPod, PodBound: podBound, DestNode: effectiveNode, Valid: true, Action: replacementPlacementProceed}, nil
+}
+
+// correctSameNodePlacement is the corrective half of resolveAndValidateReplacementPlacement, reached
+// only when the effective destination equals the source node. It is the ONLY place that DELETES a
+// replacement pod for placement recovery.
+//
+//   - Detect-only (correctInvalid=false, the seed caller): record the veto and ask the caller to
+//     requeue. Never deletes; the authoritative gate in reconcileTransferring performs recovery.
+//   - Correct + pod bound to the source node (correctInvalid=true, podBound=true): perform the
+//     bounded, apiserver-legal recovery — DELETE the replacement pod so a fresh one can be scheduled
+//     elsewhere, bumping the attempt counter; once maxSameNodeRecoveryDeletes deletes have all still
+//     landed on the source node, return terminal so the caller fails closed to rollback.
+//   - Correct + pod NOT bound but still gated to a source-pinned destination (podBound=false, gated):
+//     no reschedule can fix a statically source-pinned destination on a gated pod — return terminal.
+//   - Correct + pod not bound and ungated: the ungated pod may still bind to a distinct node — wait.
+func (r *PodMigrationReconciler) correctSameNodePlacement(
+	ctx context.Context, pm *pmv1.PodMigration, replPod *corev1.Pod, sourceNode string, correctInvalid, podBound bool,
+) (replacementPlacementDecision, error) {
+	log := logf.FromContext(ctx)
+
+	podName := ""
+	if replPod != nil {
+		podName = replPod.Name
+	}
+	// The SameNodePlacement veto is set per-branch, always AFTER any metadata r.Update below: on the
+	// status-subresource client an Update rewrites the in-memory status from the store, so setting the
+	// condition before it would silently discard the veto.
+	sameNodeMsg := fmt.Sprintf("replacement pod %q would be placed on the source node %q (no migration-aware scheduler on this substrate) — a same-node transfer moves nothing", podName, sourceNode)
+
+	if !correctInvalid {
+		// Detect-only: never delete; the top-level seed caller only records the veto.
+		setCondition(pm, conditionDestinationPlacementValid, metav1.ConditionFalse, "SameNodePlacement", sameNodeMsg)
+		if serr := r.statusUpdate(ctx, pm); serr != nil {
+			return replacementPlacementDecision{Pod: replPod, DestNode: sourceNode}, serr
+		}
+		return replacementPlacementDecision{Pod: replPod, PodBound: podBound, DestNode: sourceNode, Valid: false, Action: replacementPlacementRequeue, RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// ---- Correct mode. ----
+	if !podBound {
+		if replacementPodGated(replPod) {
+			// A gated pod is held out of the scheduling queue and will not self-bind to a distinct
+			// node; a source-pinned destination it cannot escape is unrecoverable by rescheduling.
+			reason := fmt.Sprintf("declared destination equals the source node %q for a scheduling-gated replacement pod — no apiserver-legal reschedule can correct a statically source-pinned destination; failing closed to rollback (source never deleted — ADR-0012)", sourceNode)
+			setCondition(pm, conditionDestinationPlacementValid, metav1.ConditionFalse, "SameNodePlacementUnrecoverable", reason)
+			if serr := r.statusUpdate(ctx, pm); serr != nil {
+				return replacementPlacementDecision{Pod: replPod, DestNode: sourceNode}, serr
+			}
+			log.Error(nil, "resolveAndValidateReplacementPlacement: gated replacement pod pinned to the source node — rolling back",
+				"migration", pm.Name, "sourceNode", sourceNode)
+			return replacementPlacementDecision{Pod: replPod, DestNode: sourceNode, Valid: false, Action: replacementPlacementTerminal, TerminalReason: reason}, nil
+		}
+		// Ungated and not yet bound — the default scheduler may still place it on a distinct node.
+		// Wait for the binding to be revealed rather than acting on a declared value.
+		setCondition(pm, conditionDestinationPlacementValid, metav1.ConditionFalse, "SameNodePlacement", sameNodeMsg)
+		if serr := r.statusUpdate(ctx, pm); serr != nil {
+			return replacementPlacementDecision{Pod: replPod, DestNode: sourceNode}, serr
+		}
+		return replacementPlacementDecision{Pod: replPod, DestNode: sourceNode, Valid: false, Action: replacementPlacementRequeue, RequeueAfter: 3 * time.Second}, nil
+	}
+
+	// Pod is actually bound to the source node: real, bounded delete-and-reschedule recovery.
+	attempts := readSameNodeRecoveryAttempts(pm)
+	if attempts >= maxSameNodeRecoveryDeletes {
+		reason := fmt.Sprintf("replacement pod could not be scheduled off the source node %q after %d delete-and-reschedule attempts — failing closed to rollback rather than performing a degenerate same-node migration (source pod never deleted — ADR-0012)",
+			sourceNode, maxSameNodeRecoveryDeletes)
+		setCondition(pm, conditionDestinationPlacementValid, metav1.ConditionFalse, "SameNodePlacementUnrecoverable", reason)
+		if serr := r.statusUpdate(ctx, pm); serr != nil {
+			return replacementPlacementDecision{Pod: replPod, DestNode: sourceNode}, serr
+		}
+		log.Error(nil, "resolveAndValidateReplacementPlacement: same-node placement unrecoverable after bounded retries — rolling back",
+			"migration", pm.Name, "sourceNode", sourceNode, "attempts", attempts, "maxAttempts", maxSameNodeRecoveryDeletes)
+		return replacementPlacementDecision{Pod: replPod, PodBound: true, DestNode: sourceNode, Valid: false, Action: replacementPlacementTerminal, TerminalReason: reason}, nil
+	}
+
+	// Under budget: bump the attempt counter (metadata, r.Update) FIRST so the delete is always
+	// accounted for; the veto condition is then set and persisted (status) AFTER it, because an
+	// r.Update on the status-subresource client rewrites the in-memory status from the store and would
+	// otherwise discard a veto set before it.
+	if pm.Annotations == nil {
+		pm.Annotations = make(map[string]string)
+	}
+	pm.Annotations[sameNodeRecoveryAttemptsAnnotation] = strconv.Itoa(attempts + 1)
+	if uerr := r.Update(ctx, pm); uerr != nil {
+		return replacementPlacementDecision{Pod: replPod, DestNode: sourceNode}, uerr
+	}
+	setCondition(pm, conditionDestinationPlacementValid, metav1.ConditionFalse, "SameNodePlacement", sameNodeMsg)
+	if serr := r.statusUpdate(ctx, pm); serr != nil {
+		return replacementPlacementDecision{Pod: replPod, DestNode: sourceNode}, serr
+	}
+	// Delete the REPLACEMENT pod (never the source — ADR-0012). Grace 0: replacement pods carry no
+	// finalizer, so the apiserver removes it promptly and the next pass recreates a fresh one.
+	if derr := r.Delete(ctx, replPod, client.GracePeriodSeconds(0)); derr != nil && !apierrors.IsNotFound(derr) {
+		log.Error(derr, "resolveAndValidateReplacementPlacement: failed to delete same-node replacement pod — will retry",
+			"migration", pm.Name, "pod", replPod.Name)
+		return replacementPlacementDecision{Pod: replPod, DestNode: sourceNode, Action: replacementPlacementRequeue, RequeueAfter: 3 * time.Second}, nil
+	}
+	log.Info("resolveAndValidateReplacementPlacement: deleted same-node replacement pod for reschedule (real recovery, apiserver-legal delete)",
+		"migration", pm.Name, "pod", replPod.Name, "sourceNode", sourceNode, "attempt", attempts+1, "maxAttempts", maxSameNodeRecoveryDeletes)
+	return replacementPlacementDecision{Pod: replPod, PodBound: true, DestNode: sourceNode, Valid: false, Action: replacementPlacementRequeue, RequeueAfter: 5 * time.Second}, nil
 }
 
 // checkDestinationVolumeReady returns true when all RWO PVCs used by the source pod
