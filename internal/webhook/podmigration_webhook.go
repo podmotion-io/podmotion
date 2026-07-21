@@ -95,7 +95,7 @@ func (v *PodMigrationValidator) Handle(ctx context.Context, req admission.Reques
 		return admission.Allowed("lifecycle/finalizer UPDATE on deleting or terminal-phase PodMigration — spec admission rules skipped (ADR-0212)")
 	}
 
-	if errs := v.validate(ctx, pm); len(errs) > 0 {
+	if errs := v.validate(ctx, pm, req.Operation == admissionv1.Create); len(errs) > 0 {
 		return admission.Denied(errs.ToAggregate().Error())
 	}
 	return admission.Allowed("")
@@ -132,8 +132,28 @@ func isLifecycleOnlyRequest(req admission.Request, pm *pmv1.PodMigration) bool {
 	return false
 }
 
+// isTerminalPodMigrationPhase reports whether a PodMigration phase is a terminal outcome —
+// i.e. it is no longer "in flight" and must not block a new migration from being admitted
+// against the same pod. Mirrors the terminal-phase set the controller itself treats as done
+// (podmigration_controller.go's isTerminalOrRollingBackPhase), minus RollingBack: a migration
+// that is actively rolling back still holds the source pod (or its replacement) in a
+// transitional state, so it still counts as "in flight" for the concurrent-migration guard.
+func isTerminalPodMigrationPhase(p pmv1.MigrationPhase) bool {
+	switch p {
+	case pmv1.MigrationPhaseComplete, pmv1.MigrationPhaseFailed, pmv1.MigrationPhaseDryRunComplete:
+		return true
+	default:
+		return false
+	}
+}
+
 // validate runs all admission rules and returns any field errors.
-func (v *PodMigrationValidator) validate(ctx context.Context, pm *pmv1.PodMigration) field.ErrorList {
+//
+// isCreate is true only for CREATE operations. Rule 1b (concurrent-migration guard) is
+// CREATE-only by design: it exists to stop a second PodMigration from ever being admitted
+// against a pod that already has one in flight, not to re-litigate an already-admitted CR
+// on a later spec-preserving status/finalizer UPDATE.
+func (v *PodMigrationValidator) validate(ctx context.Context, pm *pmv1.PodMigration, isCreate bool) field.ErrorList {
 	var allErrs field.ErrorList
 	spec := field.NewPath("spec")
 
@@ -148,6 +168,43 @@ func (v *PodMigrationValidator) validate(ctx context.Context, pm *pmv1.PodMigrat
 		}
 		// Can't proceed without the pod — remaining rules need it.
 		return allErrs
+	}
+
+	// Rule 1b: concurrent-migration guard (CREATE only).
+	//
+	// Root cause found live on the AWS kubeadm cluster (2026-07-21): two PodMigration CRs
+	// were created ~3s apart against the same source pod (pm-test-postgres-...-b4bds). Both
+	// were admitted — nothing here ever checked for an existing in-flight migration on the
+	// same pod. The first reached ADR-0356's Tier1-Longhorn early source release and deleted
+	// the source pod ahead of TrafficVerified; the second then failed its own Checkpoint step
+	// with "source pod not found" because the first had already removed it out from under it.
+	// That is not a checkpoint/controller bug — it is a missing admission invariant: at most
+	// one non-terminal PodMigration may target a given pod at a time. Enforce it here so the
+	// race can never be admitted in the first place, rather than trying to detect/recover from
+	// it after the fact in the controller.
+	if isCreate {
+		var pmList pmv1.PodMigrationList
+		if listErr := v.client.List(ctx, &pmList, client.InNamespace(pm.Spec.PodNamespace)); listErr != nil {
+			allErrs = append(allErrs, field.InternalError(spec.Child("podName"), fmt.Errorf("checking for concurrent migrations: %w", listErr)))
+		} else {
+			for i := range pmList.Items {
+				other := &pmList.Items[i]
+				if other.Name == pm.Name {
+					continue
+				}
+				if other.Spec.PodName != pm.Spec.PodName {
+					continue
+				}
+				if isTerminalPodMigrationPhase(other.Status.Phase) {
+					continue
+				}
+				allErrs = append(allErrs, field.Forbidden(spec.Child("podName"),
+					fmt.Sprintf("pod %s/%s already has an in-flight PodMigration %q (phase=%s); "+
+						"only one non-terminal migration may target a pod at a time",
+						pm.Spec.PodNamespace, pm.Spec.PodName, other.Name, other.Status.Phase)))
+				break
+			}
+		}
 	}
 
 	// Rule 2: UID match if specified
