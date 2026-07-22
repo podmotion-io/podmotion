@@ -15,12 +15,19 @@ rules:
     verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [pods]
-    verbs: [create, delete, get, list, update, watch]
+    verbs: [create, delete, get, list, patch, update, watch]
   - apiGroups: [""]
     resources: [pods/status]
     verbs: [get]
   - apiGroups: [apps]
     resources: [statefulsets]
+    verbs: [get, list, watch]
+  # ADR-0361 sprint56B finding: getRSSelector (podmigration_controller.go) reads appsv1.ReplicaSet
+  # to resolve and strip the owning ReplicaSet's selector labels off a replacement pod. Without
+  # this rule the ReplicaSet informer fails ("replicasets.apps is forbidden ... at the cluster
+  # scope"), which blocks WaitForCacheSync and wedges the entire controller.
+  - apiGroups: [apps]
+    resources: [replicasets]
     verbs: [get, list, watch]
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
