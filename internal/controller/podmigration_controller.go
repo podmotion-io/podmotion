@@ -2823,8 +2823,29 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 		"checkpointed", meta.IsStatusConditionTrue(pm.Status.Conditions, conditionCheckpointed))
 
 	// Fast-path: if the Checkpointed condition was already set True (e.g. agent called back
-	// directly or we are re-entering after a controller restart), advance immediately.
+	// directly or we are re-entering after a controller restart), do NOT advance on that fact
+	// alone (brittle-chain fix): Checkpointed=True says nothing about whether the
+	// replacement pod was ever actually created — that is a separate, non-atomically-written
+	// fact. ensureReplacementPodCreated performs a live, label-based lookup (the same
+	// authoritative primitive resolveAndValidateReplacementPlacement already trusts) and creates
+	// the pod if it is genuinely missing, so a prior partial failure between the Checkpointed
+	// persist and createReplacementPod (status-write contention, transient error, controller
+	// restart) is detected and retried here instead of being silently and permanently skipped.
 	if meta.IsStatusConditionTrue(pm.Status.Conditions, conditionCheckpointed) {
+		sourcePod, spErr := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+		if spErr != nil {
+			log.Error(spErr, "checkpoint fast-path: source pod unreadable — cannot verify/create replacement pod; requeuing",
+				"migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
+		if _, err := r.ensureReplacementPodCreated(ctx, pm, sourcePod); err != nil {
+			log.Error(err, "checkpoint fast-path: replacement pod not yet created — requeuing",
+				"migration", pm.Name)
+			// RequeueAfter (not Requeue:true / a bare error) so this transient condition is
+			// Forget()'d by the workqueue rate limiter rather than compounding AddRateLimited
+			// backoff from an unrelated prior error on this item toward the 1000s cap.
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
 		return r.advanceAfterCheckpoint(ctx, pm)
 	}
 
@@ -3135,19 +3156,18 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 
 	setCondition(pm, conditionCheckpointed, metav1.ConditionTrue, "Checkpointed", checkpointMsg)
 
-	// Persist Checkpointed=True BEFORE creating the replacement pod so that if
-	// createReplacementPod fails and we requeue, the next reconcile sees True and skips
-	// the Checkpoint RPC. Without this write the in-memory condition is lost on requeue
-	// and the controller issues repeated CRIU dumps until the frozen pod's PID disappears.
-	if err := r.statusUpdate(ctx, pm); err != nil {
-		return ctrl.Result{}, fmt.Errorf("persisting Checkpointed=True: %w", err)
-	}
-
 	// ADR-0168 B2 / ADR-0217 D1: write the workload image to the MigrationCheckpoint CR so the
 	// destination agent can use the correct image for the restore placeholder container.
 	// As of ADR-0217 the AUTHORITATIVE producer is reconcileValidating (runs BEFORE the
 	// DestinationPrewarm consumer); this Checkpointing write is now an IDEMPOTENT RE-ASSERT
 	// retained for defense-in-depth and the legacy 8-phase pipeline. Warn-only (ADR-0012).
+	//
+	// Deliberately run BEFORE the Checkpointed=True persist below (moved here from after it):
+	// this block's own comment already establishes it is a non-authoritative, idempotent
+	// re-assert, so if it were to ever need to fail closed there is nothing lost by re-running
+	// it on a fresh reconcile — whereas persisting Checkpointed=True first (the old order) would
+	// let a failure downstream of that persist strand the migration past the point where the
+	// normal (non-fast-path) body re-runs.
 	if len(sourcePod.Spec.Containers) > 0 {
 		workloadImage := sourcePod.Spec.Containers[0].Image
 		mcpRef := &pmv1.MigrationCheckpoint{}
@@ -3171,6 +3191,10 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 	// can be empty if this reconcile was fetched from cache before the status write landed.
 	// Routed through the shared validated seed so a same-node destination can never be latched
 	// here (round-3 finding #2).
+	//
+	// Also moved ahead of the Checkpointed=True persist: if this statusUpdate fails, the function
+	// returns here with Checkpointed still False in etcd (only set in-memory above), so the next
+	// reconcile re-runs the full body from scratch instead of landing past the point of no return.
 	if cacheDestinationNodeFromSpec(pm, pm.Spec.TargetNodeName, pm.Status.SourceNodeName) {
 		if err := r.statusUpdate(ctx, pm); err != nil {
 			return ctrl.Result{}, fmt.Errorf("caching DestinationNodeName in Checkpointing phase: %w", err)
@@ -3179,16 +3203,30 @@ func (r *PodMigrationReconciler) reconcileCheckpointing(ctx context.Context, pm 
 			"migration", pm.Name, "destNode", pm.Status.DestinationNodeName)
 	}
 
+	// Persist Checkpointed=True BEFORE creating the replacement pod so that if
+	// ensureReplacementPodCreated fails and we requeue, the next reconcile sees True and skips
+	// the Checkpoint RPC. Without this write the in-memory condition is lost on requeue
+	// and the controller issues repeated CRIU dumps until the frozen pod's PID disappears.
+	// This is safe against the historical bug (checkpoint persisted, replacement pod silently
+	// never created) because every path that re-enters with Checkpointed=True already read —
+	// the fast-path above and the call immediately below — funnels through
+	// ensureReplacementPodCreated, which always re-verifies with a live lookup rather than
+	// assuming completion from this condition alone.
+	if err := r.statusUpdate(ctx, pm); err != nil {
+		return ctrl.Result{}, fmt.Errorf("persisting Checkpointed=True: %w", err)
+	}
+
 	// Create the replacement pod that will receive the restored process.
 	// The admission webhook injects the scheduling gate + checkpoint-ref annotation.
 	// The pod is held at PodSchedulingGated until removeSchedulingGate fires at the
 	// END of reconcileTransferring — only after images land on the destination node.
-	if pm.Status.ReplacementPodName == "" {
-		if err := r.createReplacementPod(ctx, pm, sourcePod); err != nil {
-			log.Error(err, "failed to create replacement pod", "migration", pm.Name)
-			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
-		}
-		log.Info("created replacement pod", "migration", pm.Name, "replacementPod", pm.Status.ReplacementPodName)
+	//
+	// Brittle-chain fix: this no longer gates on pm.Status.ReplacementPodName == "" (a cached
+	// flag that can be wrong). ensureReplacementPodCreated performs its own live check and is
+	// idempotent, so it is always safe to call here.
+	if _, err := r.ensureReplacementPodCreated(ctx, pm, sourcePod); err != nil {
+		log.Error(err, "failed to create replacement pod", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 	}
 
 	// Gate removal is intentionally deferred to end of reconcileTransferring.
@@ -6551,6 +6589,63 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 		fresh.Status.ReplacementPodName = replacementName
 		return r.Status().Update(ctx, fresh)
 	})
+}
+
+// ensureReplacementPodCreated is the single source-of-truth gate for "has the replacement pod been
+// durably created for this migration." Brittle-chain fix: prior to this helper, the only
+// callers of createReplacementPod gated on either the whole-function Checkpointing fast-path
+// (which infers "replacement pod exists" from the unrelated fact "Checkpointed=True") or the
+// cached pm.Status.ReplacementPodName == "" flag (which can silently desync from the cluster on a
+// status-write race, transient error mid-createReplacementPod, or a controller restart between
+// the Checkpointed persist and the createReplacementPod call). Both call sites now funnel through
+// this one function so there is exactly one implementation of the question, and it is always
+// re-answered from a live read rather than assumed from a sibling condition or a stale cache.
+//
+// It performs a live resolveReplacementPodByLabel lookup (a real List call against the API
+// server) — the same authoritative primitive resolveAndValidateReplacementPlacement already
+// treats as its own source of truth for this exact question — rather than trusting
+// pm.Status.ReplacementPodName alone.
+//
+//   - If the live lookup finds the pod: self-heal pm.Status.ReplacementPodName if it drifted, and
+//     report created=true. No pod is created.
+//   - If the live lookup finds nothing: call the existing createReplacementPod (unchanged
+//     internals; already idempotent via its deterministic name + IsAlreadyExists handling).
+//
+// Fail-closed guarantee: if the live lookup itself errors (e.g. a transient API-server hiccup), this fails
+// closed — it returns an error and creates nothing, so the caller requeues and retries rather than
+// advancing the phase on an unverified guess.
+func (r *PodMigrationReconciler) ensureReplacementPodCreated(ctx context.Context, pm *pmv1.PodMigration, sourcePod *corev1.Pod) (bool, error) {
+	log := logf.FromContext(ctx)
+
+	replPod, err := r.resolveReplacementPodByLabel(ctx, pm)
+	if err != nil {
+		return false, fmt.Errorf("ensureReplacementPodCreated: live replacement-pod lookup failed: %w", err)
+	}
+	if replPod != nil {
+		// Self-heal the cached name if it drifted (e.g. lost on a status-write race) so the rest
+		// of the reconciler's other pm.Status.ReplacementPodName readers stay consistent with the
+		// live cluster state this function just observed.
+		if pm.Status.ReplacementPodName != replPod.Name {
+			pm.Status.ReplacementPodName = replPod.Name
+			if serr := r.statusUpdate(ctx, pm); serr != nil {
+				return false, fmt.Errorf("ensureReplacementPodCreated: self-healing ReplacementPodName cache: %w", serr)
+			}
+			log.Info("ensureReplacementPodCreated: self-healed ReplacementPodName cache from live label lookup",
+				"migration", pm.Name, "replacementPod", replPod.Name)
+		}
+		return true, nil
+	}
+
+	// No replacement pod exists yet by the live check — create it. createReplacementPod is
+	// idempotent (deterministic name + IsAlreadyExists handling), so calling it again after a
+	// prior partial failure (this migration's first attempt errored before or during creation) is
+	// safe and is exactly the retry this fix exists to enable.
+	if err := r.createReplacementPod(ctx, pm, sourcePod); err != nil {
+		return false, fmt.Errorf("ensureReplacementPodCreated: createReplacementPod failed: %w", err)
+	}
+	log.Info("ensureReplacementPodCreated: created replacement pod",
+		"migration", pm.Name, "replacementPod", pm.Status.ReplacementPodName)
+	return true, nil
 }
 
 // replacementPodMigrationNameLabel is the label the controller stamps on every replacement pod
