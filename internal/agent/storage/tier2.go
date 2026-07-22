@@ -84,7 +84,9 @@ func (m *CephRBDMigrator) Tier() StorageTier { return TierCephRBD }
 func (m *CephRBDMigrator) PreStage(ctx context.Context, opts MigrationOptions) error {
 	log := logf.FromContext(ctx).WithValues("migration", opts.MigrationName, "tier", "CephRBD")
 
-	m.warnIfReefCluster(ctx)
+	if err := m.checkCephVersionGate(ctx); err != nil {
+		return fmt.Errorf("tier2: %w", err)
+	}
 
 	for _, clsf := range opts.Classifications {
 		if clsf.Tier != TierCephRBD {
@@ -293,26 +295,52 @@ func (m *CephRBDMigrator) pollUntilReady(ctx context.Context, srcImage string) e
 	}
 }
 
-// warnIfReefCluster logs a warning if the ceph version is Reef (18.x).
-// Reef has only "preview" support for live RBD migration (ADR-0026).
-func (m *CephRBDMigrator) warnIfReefCluster(ctx context.Context) {
+// errCephVersionCheckFailed is returned by checkCephVersionGate when the `ceph version`
+// exec/parse itself fails — a version-detection failure, distinct from a confirmed Reef
+// result. ADR-0026 §3 mandates failing closed on detection failure, not assuming OK.
+var errCephVersionCheckFailed = fmt.Errorf("ceph version check failed")
+
+// errCephReefUnsupported is returned by checkCephVersionGate when a Reef 18.x cluster is
+// confirmed. ADR-0026 §1 mandates a hard block for Tier2 (RBD live migration) on Reef;
+// Tier3 (SnapshotRsync) remains available as the supported fallback.
+var errCephReefUnsupported = fmt.Errorf("Ceph Reef 18.x detected — Tier2 RBD live migration requires Squid 19.x+ (ADR-0026); Tier3 snapshot-rsync remains available")
+
+// checkCephVersionGate implements the agent-side (PreStage call-path) half of ADR-0026's
+// version gate.
+//
+// fail-closed phase-gate (item 6): the prior warnIfReefCluster silently discarded BOTH the failure case
+// (exec/parse error → "assume OK and let the migration fail naturally") and the confirmed-Reef
+// case (logged a warning only, never blocked) — a Reef cluster or an undetectable Ceph version
+// let Tier2 proceed exactly as if Squid had been confirmed. ADR-0026 mandates the opposite in
+// both cases: fail-closed on detection failure, and a hard block on confirmed Reef.
+//
+// This closes the finding as scoped to this call path (agent-side PreStage gate) — it does
+// NOT implement ADR-0026's actual mandated control point, a ValidatingAdmissionWebhook check at
+// CR admission (that control point does not exist at all; internal/webhook/podmigration_webhook.go
+// has zero Reef/Ceph/version logic). Making PreStage fail closed here fires later (mid-PreStage,
+// after scheduling/checkpointing has already begun) than the ADR intends. See the remediation
+// design's item 6 note — flagged for a separate follow-up ADR, not implemented here to avoid
+// overreaching a "small, independent fix" scope.
+func (m *CephRBDMigrator) checkCephVersionGate(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	cmd := m.ExecCommand("ceph", "version", "--format", "json")
 	out, err := cmd.Output()
 	if err != nil {
-		// Unable to check version — assume OK and let the migration fail naturally.
-		return
+		// ADR-0026 §3: MUST reject on version-detection failure — fail-closed, not fail-open.
+		return fmt.Errorf("%w: exec ceph version: %v", errCephVersionCheckFailed, err)
 	}
 	var v struct {
 		Version string `json:"version"`
 	}
-	if err := json.Unmarshal(out, &v); err != nil {
-		return
+	if jsonErr := json.Unmarshal(out, &v); jsonErr != nil {
+		return fmt.Errorf("%w: parse ceph version output: %v", errCephVersionCheckFailed, jsonErr)
 	}
 	// version string looks like: "ceph version 18.2.1 (hash) reef (stable)"
 	if strings.Contains(v.Version, " 18.") {
-		log.Info("WARNING: Ceph Reef 18.x detected — live RBD migration is preview-only; upgrade to Squid 19.x for production use (ADR-0026)")
+		return fmt.Errorf("%w (reported version: %q)", errCephReefUnsupported, v.Version)
 	}
+	log.Info("Ceph version gate passed (Squid 19.x+ or newer)", "version", v.Version)
+	return nil
 }
 
 // ── Stub ───────────────────────────────────────────────────────────────────
