@@ -265,6 +265,8 @@ func (c *CRIUCheckpointer) PreDump(ctx context.Context, opts PreDumpOptions) (Ch
 	}
 
 	// CRIU uses -t for pid (short form) — --pid is not recognized for pre-dump.
+	// --stats (-S) makes CRIU write a stats-dump image into ImagesDir carrying the real
+	// dirty-page accounting (decoded below by decodeCRIUStats) — see criu_stats.go.
 	args := []string{
 		"pre-dump",
 		"-t", strconv.Itoa(int(opts.Pid)),
@@ -272,6 +274,7 @@ func (c *CRIUCheckpointer) PreDump(ctx context.Context, opts PreDumpOptions) (Ch
 		"--log-file", "predump.log",
 		"-v4",
 		"--pre-dump-mode", "read",
+		"--stats",
 	}
 
 	if opts.PrevImagesDir != "" {
@@ -305,9 +308,18 @@ func (c *CRIUCheckpointer) PreDump(ctx context.Context, opts PreDumpOptions) (Ch
 			runErr, string(stderrBytes), string(predumpLog))
 	}
 
+	// fail-closed phase-gate (item 1a/1b): read CRIU's own --stats output for the real dirty-page count.
+	// PreDump must NEVER report DirtyPagesMB: 0 as a stand-in for "couldn't measure" — a
+	// decode failure here fails the whole call closed, because 0 is indistinguishable from
+	// "genuinely no dirty pages" to every caller (EstimateCheckpoint chief among them).
+	dirtyMB, statsErr := decodeCRIUStats(opts.ImagesDir)
+	if statsErr != nil {
+		return CheckpointResult{}, fmt.Errorf("PreDump: stats image parse failed: %w", statsErr)
+	}
+
 	return CheckpointResult{
 		ImagesDir:        opts.ImagesDir,
-		DirtyPagesMB:     0, // stats file parsing not yet implemented
+		DirtyPagesMB:     dirtyMB,
 		FreezeDurationMs: 0, // pre-dump does not freeze
 		RoundNumber:      0,
 		CheckpointedAt:   time.Now(),

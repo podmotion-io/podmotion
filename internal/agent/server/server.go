@@ -3793,25 +3793,58 @@ func (s *AgentServer) PrepareSource(_ context.Context, req *agentpb.PrepareSourc
 		s.migrationPodUID[req.MigrationName] = req.PodUid
 		s.migrationPodUIDMu.Unlock()
 
-		found := scanProcForPodUID(req.PodUid)
+		found, scanErr := scanProcForPodUID(req.PodUid)
+		if scanErr != nil {
+			// fail-closed phase-gate (item 4): a /proc read failure is an infra problem, not a confident
+			// negative — the agent could not determine compatibility at all. Fail closed with
+			// a gRPC error rather than defaulting Compatible either way.
+			log.Error(scanErr, "PrepareSource: /proc cgroup scan failed", "uid", req.PodUid)
+			return nil, status.Errorf(codes.Unavailable, "PrepareSource: /proc cgroup scan failed: %v", scanErr)
+		}
+		// fail-closed phase-gate (item 4): Compatible now reflects the real scan result. A UID WAS supplied,
+		// so a negative scan is a genuine, confirmed "pod not found" — no silent kind/dev
+		// fallback here (that bypass is reserved for the "no UID supplied" branch below, a
+		// distinct, explicit "caller didn't ask for verification" case).
+		compatible = found
 		if found {
 			note = fmt.Sprintf("pod %s/%s confirmed running via /proc cgroup scan", req.PodNamespace, req.PodName)
 			log.Info("PrepareSource: pod found via /proc cgroup scan", "uid", req.PodUid)
 		} else {
-			// Not found in /proc — could be that cgroup paths differ or we lack permission.
-			// Return compatible=true with a note; the operator decides whether to proceed.
-			note = fmt.Sprintf("pod %s/%s not confirmed via /proc (may still be running — kind/dev fallback)", req.PodNamespace, req.PodName)
-			log.Info("PrepareSource: pod not found via /proc, using kind/dev fallback", "uid", req.PodUid)
+			note = fmt.Sprintf("pod %s/%s not found via /proc cgroup scan — incompatible", req.PodNamespace, req.PodName)
+			log.Info("PrepareSource: pod not found via /proc cgroup scan — reporting incompatible", "uid", req.PodUid)
 		}
 	} else {
-		note = "no pod UID provided; skipping /proc scan — compatible=true (dev mode)"
+		note = "no pod UID provided; skipping /proc scan — compatible=true (dev mode, explicit opt-out)"
 	}
 
-	log.Info("PrepareSource result", "compatible", compatible, "note", note)
+	// fail-closed phase-gate (item 3): populate the real TCP socket-inventory count so
+	// reconcileSocketInventory (controller) has an actual, freshly-observed fact to gate on
+	// instead of a no-op condition flip. Only attempted when the pod was actually resolved
+	// (found via cgroup scan, or the caller explicitly skipped verification with an empty
+	// UID and we can still try FindContainerPID as a best-effort dev-mode path). A socket
+	// inventory failure here is non-fatal to PrepareSource itself (TCP preservation is an
+	// independent, later phase gated by reconcileSocketInventory's own RPC round trip) — it
+	// is logged and the count is simply left at zero, which reconcileSocketInventory's own
+	// real call will re-attempt and correctly fail closed on if it also fails.
+	var tcpConnectionCount int32
+	if compatible && req.PodUid != "" {
+		if pid, pidErr := FindContainerPID(req.PodUid); pidErr == nil && pid != 0 {
+			if entries, invErr := network.SocketInventory(pid); invErr == nil {
+				tcpConnectionCount = int32(len(entries))
+			} else {
+				log.Info("PrepareSource: socket inventory scan failed (non-fatal)", "uid", req.PodUid, "error", invErr)
+			}
+		} else if pidErr != nil {
+			log.Info("PrepareSource: could not resolve container PID for socket inventory (non-fatal)", "uid", req.PodUid, "error", pidErr)
+		}
+	}
+
+	log.Info("PrepareSource result", "compatible", compatible, "note", note, "tcpConnectionCount", tcpConnectionCount)
 	return &agentpb.PrepareSourceResponse{
-		Compatible:     compatible,
-		BlockingReason: note,
-		StorageTier:    1,
+		Compatible:         compatible,
+		BlockingReason:     note,
+		StorageTier:        1,
+		TcpConnectionCount: tcpConnectionCount,
 	}, nil
 }
 
@@ -3887,26 +3920,32 @@ func podUIDFromCgroupsPath(containerCgroupsPath string) (string, error) {
 }
 
 // scanProcForPodUID looks through /proc/*/cgroup for any entry containing podUID.
-// Returns true if found. Ignores errors (best-effort).
-func scanProcForPodUID(podUID string) bool {
+//
+// fail-closed phase-gate (item 4): returns (found, err) rather than collapsing two distinct real facts into
+// one bool. An os.ReadDir("/proc") failure is an infra/permission problem — the scan could not
+// run at all, so the caller cannot conclude anything about the pod — and must be surfaced as an
+// error, not silently reported as "not found" (which PrepareSource used to treat as compatible
+// anyway, but a future caller that gates on this return must be able to tell the two apart). A
+// clean scan that simply never matches a cgroup entry is a genuine, confirmed negative.
+func scanProcForPodUID(podUID string) (found bool, err error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return false
+		return false, fmt.Errorf("scanProcForPodUID: reading /proc: %w", err)
 	}
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 		cgroupPath := filepath.Join("/proc", entry.Name(), "cgroup")
-		data, err := os.ReadFile(cgroupPath)
-		if err != nil {
+		data, readErr := os.ReadFile(cgroupPath)
+		if readErr != nil {
 			continue
 		}
 		if cgroupContainsPodUID(string(data), podUID) {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // isPauseContainer returns true if the given PID is a pause/infra container.
@@ -9735,14 +9774,13 @@ func (s *AgentServer) EstimateCheckpoint(ctx context.Context, req *agentpb.Estim
 		PrevImagesDir: "",
 	})
 	if err != nil {
-		log.Error(err, "EstimateCheckpoint pre-dump failed — falling back to stub values")
-		return &agentpb.EstimateCheckpointResponse{
-			DirtyPageRateMbPerSec:     32.0,
-			EstimatedFreezeDurationMs: 150,
-			EstimatedCheckpointSizeMb: 512,
-			StorageTier:               1,
-			Migratable:                true,
-		}, nil
+		// fail-closed phase-gate (item 1a): a PreDump failure means there is no real measurement — return
+		// a typed gRPC error rather than a (fabricatedResponse, nil) pair. A (nil, err) return
+		// cannot be mistaken by a caller for a genuine estimate; the former stub numbers
+		// (32.0 MB/s, 150ms, 512MB, Migratable:true) were indistinguishable from real ones at
+		// the type level and let the estimate condition go "True" on nothing at all.
+		log.Error(err, "EstimateCheckpoint pre-dump failed — no real measurement available")
+		return nil, status.Errorf(codes.Unavailable, "EstimateCheckpoint: pre-dump failed, no measurement available: %v", err)
 	}
 
 	elapsedMs := time.Since(start).Milliseconds()
