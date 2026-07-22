@@ -62,7 +62,7 @@ func TestTwelvePhaseTransitions(t *testing.T) {
 			Namespace: "default",
 			UID:       "test-uid-1",
 		},
-		Spec: corev1.PodSpec{NodeName: "src-node"},
+		Spec:   corev1.PodSpec{NodeName: "src-node"},
 		Status: corev1.PodStatus{PodIP: "10.0.0.1"},
 	}
 
@@ -200,11 +200,11 @@ func TestTwelvePhaseTransitions(t *testing.T) {
 
 // TestTCPPreservationModeGating verifies the safety invariants for Strict and BestEffort modes:
 //
-//   (a) In Strict mode: a TCP verification failure triggers rollback and does NOT delete the
-//       source pod (i.e. the migration must not reach Complete with source deleted).
-//   (b) In BestEffort mode: a TCP verification failure emits a warning but proceeds; the source
-//       pod is NOT deleted before TrafficVerified=True.
-//   (c) Source pod deletion in CutoverComplete is gated by TrafficVerified=True re-check.
+//	(a) In Strict mode: a TCP verification failure triggers rollback and does NOT delete the
+//	    source pod (i.e. the migration must not reach Complete with source deleted).
+//	(b) In BestEffort mode: a TCP verification failure emits a warning but proceeds; the source
+//	    pod is NOT deleted before TrafficVerified=True.
+//	(c) Source pod deletion in CutoverComplete is gated by TrafficVerified=True re-check.
 //
 // These tests satisfy the M19 gate requirement: "Strict/BestEffort code path has non-zero coverage
 // and the rollback branch must be reachable".  Real probes are not implemented (M20); the tests
@@ -216,9 +216,9 @@ func TestTCPPreservationModeGating(t *testing.T) {
 	tests := []struct {
 		name             string
 		mode             pmv1.TCPPreservationMode
-		wantPhase        pmv1.MigrationPhase  // expected terminal phase
-		wantRolledBack   bool                  // migration should reach RollingBack/Failed
-		sourcePodDeleted bool                  // source pod must NOT be deleted
+		wantPhase        pmv1.MigrationPhase // expected terminal phase
+		wantRolledBack   bool                // migration should reach RollingBack/Failed
+		sourcePodDeleted bool                // source pod must NOT be deleted
 	}{
 		{
 			name:             "Strict_TCPVerifyFails_Rollback_SourcePodSurvives",
@@ -228,8 +228,8 @@ func TestTCPPreservationModeGating(t *testing.T) {
 			sourcePodDeleted: false,
 		},
 		{
-			name:             "BestEffort_TCPVerifyFails_ProceedsWarn_SourcePodNotDeletedWithoutTrafficVerified",
-			mode:             pmv1.TCPPreservationModeBestEffort,
+			name: "BestEffort_TCPVerifyFails_ProceedsWarn_SourcePodNotDeletedWithoutTrafficVerified",
+			mode: pmv1.TCPPreservationModeBestEffort,
 			// BestEffort proceeds past TCPVerifying but CutoverComplete blocks on TrafficVerified=True.
 			// With no TrafficVerifier wired and Strict=false, it sets TrafficVerified=True and
 			// tries CutoverComplete, but the defensive re-check blocks deletion because
@@ -679,9 +679,26 @@ func TestFinalFreezeStateCaptureDoesNotHijackPipeline(t *testing.T) {
 		if mutate != nil {
 			mutate(pm)
 		}
+		// Seed the source pod (reconcileCheckpointing's Checkpointed=True fast-path now fetches it
+		// via getPod before calling ensureReplacementPodCreated — brittle-chain fix, replacement-pod-creation
+		// stall remediation) and a pre-existing replacement pod carrying the migration-name label so
+		// the live resolveReplacementPodByLabel lookup inside ensureReplacementPodCreated finds it
+		// immediately. This keeps these fixtures exercising ONLY the legacy-hijack ledger assertion
+		// they were written for, without also needing AGENT_IMAGE / createReplacementPod plumbing.
+		srcPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: pm.Spec.PodName, Namespace: pm.Spec.PodNamespace},
+			Spec:       corev1.PodSpec{NodeName: pm.Status.SourceNodeName},
+		}
+		replPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      pm.Spec.PodName + "-m-repl",
+				Namespace: pm.Spec.PodNamespace,
+				Labels:    map[string]string{replacementPodMigrationNameLabel: pm.Name},
+			},
+		}
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
-			WithObjects(pm).
+			WithObjects(pm, srcPod, replPod).
 			WithStatusSubresource(pm).
 			Build()
 		ledger := &[]transition{}
@@ -980,10 +997,10 @@ func TestDisengageHoldReadsOverlayReadyFromConditions(t *testing.T) {
 				TargetNodeName:      "pm-w2",
 			},
 			Status: pmv1.PodMigrationStatus{
-				Phase:               pmv1.MigrationPhaseDisengageHold,
-				Conditions:          conds,
-				SourceNodeName:      "pm-w1",
-				DestinationNodeName: "pm-w2",
+				Phase:                pmv1.MigrationPhaseDisengageHold,
+				Conditions:           conds,
+				SourceNodeName:       "pm-w1",
+				DestinationNodeName:  "pm-w2",
 				SourceConntrackArmed: srcConntrack,
 			},
 		}
