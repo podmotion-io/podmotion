@@ -678,6 +678,20 @@ token: $rke2_token"
 
 # ── deploy-podmotion: build → import images → certs → CRDs → helm ────────────
 cmd_deploy_podmotion() {
+  # ADR-0325-remediation Fix 1 (Deploy Provenance Gate, §2.1): --allow-dirty is the ONLY
+  # accepted flag. Root cause of the round5-vs-main incident this gate exists to prevent:
+  # nothing in this pipeline previously verified that "deployed" meant "matches the git ref
+  # you intend to test" — a stale/wrong-branch image tag can silently keep serving traffic
+  # indefinitely. This is now a structural build/deploy identity contract, not a one-off check.
+  local allow_dirty=0
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --allow-dirty) allow_dirty=1 ;;
+      *) echo "ERROR: deploy-podmotion: unrecognized argument '$arg' (only --allow-dirty is accepted)" >&2; exit 2 ;;
+    esac
+  done
+
   load_ips
   # TAG carries sprint provenance so consecutive sprints don't collide on one
   # static tag (keeps verifyArtifacts' build-stamp check meaningful). Passed in
@@ -685,6 +699,45 @@ cmd_deploy_podmotion() {
   local TAG="${TAG:-kvm-dev}"
   local OP_IMG="podmotion-operator:$TAG"
   local AGENT_IMG="podmotion-agent:$TAG"
+
+  # ── §2.1 build-time provenance ───────────────────────────────────────────────
+  # Compute the revision from the WORKTREE ACTUALLY BEING BUILT (this script's own repo
+  # root, not some other checkout), refuse a dirty tree unless --allow-dirty was passed
+  # explicitly, and if it was, stamp "<sha>-dirty" rather than a clean sha — a dirty stamp
+  # can never be mistaken for a verified, reproducible commit.
+  local GIT_SHA GIT_BRANCH GIT_DIRTY=0
+  GIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+  GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  if [[ "$GIT_SHA" == "unknown" ]]; then
+    echo "ERROR: deploy-podmotion: could not resolve 'git rev-parse HEAD' for this worktree — refusing to build with unknown provenance." >&2
+    exit 1
+  fi
+  if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+    if [[ "$allow_dirty" -ne 1 ]]; then
+      echo "ERROR: deploy-podmotion: worktree is dirty (uncommitted changes). Refusing to build — a dirty deploy cannot be matched back to a git ref later, which is exactly the failure mode this gate exists to prevent." >&2
+      echo "       Commit or stash your changes, or re-run with 'deploy-podmotion --allow-dirty' to build anyway (the image will be stamped '<sha>-dirty', never a clean sha)." >&2
+      exit 1
+    fi
+    GIT_DIRTY=1
+    GIT_SHA="${GIT_SHA}-dirty"
+    echo "WARNING: deploy-podmotion --allow-dirty: building from a dirty worktree; images/annotations will be stamped '$GIT_SHA', not a clean, reproducible commit." >&2
+  fi
+
+  # TAG-collision guard: if this TAG already resolves to a locally-built image whose baked-in
+  # org.opencontainers.image.revision differs from the revision we are about to build, refuse —
+  # this is the most likely mechanism by which a tag silently keeps pointing at stale content
+  # across branches (a same-tag re-deploy from a different branch/checkout than intended).
+  local existing_rev img
+  for img in "$OP_IMG" "$AGENT_IMG"; do
+    if docker image inspect "$img" >/dev/null 2>&1; then
+      existing_rev="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$img" 2>/dev/null || echo "")"
+      if [[ -n "$existing_rev" && "$existing_rev" != "$GIT_SHA" ]]; then
+        echo "ERROR: deploy-podmotion: image tag '$img' already exists locally, built from revision '$existing_rev', which does not match the revision about to be built ('$GIT_SHA')." >&2
+        echo "       Reusing TAG='$TAG' across differing revisions is exactly how a stale image ends up silently serving a different branch than the one under test. Choose a distinct TAG (e.g. TAG=\$(git rev-parse --short HEAD)-amd64), or remove the stale local image first (docker rmi $img)." >&2
+        exit 1
+      fi
+    fi
+  done
   # sprint50 (k3s compat, plan §1 Q2 item 1): this script's own `ctr` calls below
   # (image rm/import/ls, distinct from the agent's own ctr invocations — see
   # internal/agent/server/containerd_paths.go) fall back to ctr's compiled-in
@@ -720,9 +773,9 @@ cmd_deploy_podmotion() {
   make build-linux   # emits bin/{manager,agent,criu-wrapper}-linux-amd64 (auto-renamed)
 
   echo "==> Building operator + agent images..."
-  # Stamp images with the git commit they were built from so deployed images can be
-  # verified against source provenance. Falls back to "unknown" if git is unavailable.
-  local GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  # Stamp images with the git commit they were built from (computed once, above, as the
+  # §2.1 provenance gate's GIT_SHA — includes the "-dirty" suffix under --allow-dirty) so
+  # deployed images can be verified against source provenance.
   docker build --build-arg GIT_SHA="$GIT_SHA" -f images/operator/Dockerfile -t "$OP_IMG" .
   docker build --build-arg GIT_SHA="$GIT_SHA" -f images/agent/Dockerfile   -t "$AGENT_IMG" .
 
@@ -807,7 +860,85 @@ cmd_deploy_podmotion() {
   echo "==> Waiting for rollout (failure/timeout is a real error, not swallowed)..."
   KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system rollout status deploy/podmotion-operator --timeout=180s
   KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system rollout status ds/podmotion-agent --timeout=180s
+
+  # ── §2.2 deploy-time provenance ──────────────────────────────────────────────
+  # Make provenance queryable from the cluster itself, not just from whoever ran the deploy:
+  # stamp the resolved {revision, dirty, branch, tag} tuple as annotations on BOTH workloads,
+  # and write the same tuple (plus each image's local digest) to deploy-manifest.json
+  # alongside the kubeconfig, so a fresh session/orchestrator can read it without re-deploying.
+  echo "==> Stamping deploy provenance (podmotion.io/deployed-revision, podmotion.io/deployed-branch)..."
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system annotate deploy/podmotion-operator \
+    "podmotion.io/deployed-revision=$GIT_SHA" "podmotion.io/deployed-branch=$GIT_BRANCH" --overwrite
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system annotate ds/podmotion-agent \
+    "podmotion.io/deployed-revision=$GIT_SHA" "podmotion.io/deployed-branch=$GIT_BRANCH" --overwrite
+
+  local op_digest agent_digest
+  op_digest="$(docker image inspect --format '{{.Id}}' "$OP_IMG" 2>/dev/null || echo unknown)"
+  agent_digest="$(docker image inspect --format '{{.Id}}' "$AGENT_IMG" 2>/dev/null || echo unknown)"
+  local manifest_out="$KVM_DIR/deploy-manifest.json"
+  cat > "$manifest_out" <<EOF
+{
+  "revision": "$GIT_SHA",
+  "dirty": $([[ "$GIT_DIRTY" -eq 1 ]] && echo true || echo false),
+  "branch": "$GIT_BRANCH",
+  "tag": "$TAG",
+  "operator_image": "$OP_IMG",
+  "operator_image_digest": "$op_digest",
+  "agent_image": "$AGENT_IMG",
+  "agent_image_digest": "$agent_digest",
+  "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+  echo "==> Wrote deploy provenance manifest: $manifest_out"
+
   echo "==> deploy-podmotion complete."
+}
+
+# ── verify-deployed-revision: ADR-0325-remediation Fix 1 §2.3 test-orchestration-time gate ────
+# The mechanical fix for "every reproduction this session ran against the wrong code without
+# anyone noticing": read podmotion.io/deployed-revision off the LIVE operator Deployment and
+# compare it against 'git rev-parse HEAD' of the branch under test (this worktree). A mismatch
+# is a hard precondition failure — report it the same way a dirty tree or a not-Ready node
+# would be, BEFORE any migration is attempted through the podmotion-demo API. Intended to be
+# run by the orchestrator as the third precondition clause (alongside "main clean" and
+# "3/3 Ready"), and callable standalone for manual verification.
+cmd_verify_deployed_revision() {
+  load_ips
+  local expect_dirty_ok=0
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --allow-dirty) expect_dirty_ok=1 ;;
+      *) echo "ERROR: verify-deployed-revision: unrecognized argument '$arg' (only --allow-dirty is accepted)" >&2; exit 2 ;;
+    esac
+  done
+
+  local want_sha
+  want_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+  if [[ "$want_sha" == "unknown" ]]; then
+    echo "ERROR: verify-deployed-revision: could not resolve 'git rev-parse HEAD' for this worktree." >&2
+    exit 1
+  fi
+  if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+    if [[ "$expect_dirty_ok" -ne 1 ]]; then
+      echo "ERROR: verify-deployed-revision: worktree under test is dirty — the deployed image (if any) cannot be honestly matched to uncommitted source. Commit/stash, or pass --allow-dirty to compare against '<sha>-dirty' semantics." >&2
+      exit 1
+    fi
+    want_sha="${want_sha}-dirty"
+  fi
+
+  local got_sha
+  got_sha="$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system get deploy/podmotion-operator \
+    -o jsonpath='{.metadata.annotations.podmotion\.io/deployed-revision}' 2>/dev/null || echo "")"
+  if [[ -z "$got_sha" ]]; then
+    echo "ERROR: verify-deployed-revision: live operator Deployment has no podmotion.io/deployed-revision annotation — it was deployed by a version of this script predating the provenance gate, or deploy-podmotion has never run against this cluster. Re-run 'deploy-podmotion'." >&2
+    exit 1
+  fi
+  if [[ "$got_sha" != "$want_sha" ]]; then
+    echo "ERROR: verify-deployed-revision: MISMATCH — cluster is serving revision '$got_sha' but the worktree under test is '$want_sha'. This is precisely the failure mode that produced false migration-failure reproductions before (a stale/wrong-branch image on the cluster). Re-run 'deploy-podmotion' against this worktree before testing." >&2
+    exit 1
+  fi
+  echo "==> OK: cluster-deployed revision '$got_sha' matches worktree HEAD."
 }
 
 # ── wipe: clean k8s + PodMotion STATE on the VMs, WITHOUT destroying VMs ──────
@@ -1649,6 +1780,11 @@ Usage: hack/kvm-cluster.sh <verify|reset-cluster|reset-cluster-k3s|reset-cluster
   provision-cilium-rke2  helm install cilium/cilium on RKE2 (cluster-pool over RKE2's own pod CIDR $RKE2_CILIUM_POD_CIDR) alongside canal — sprint52
   cutover-canal-rke2     RKE2-native canal→Cilium cutover: verify Cilium Ready, disable canal via cni:none + restart rke2-server, disable kube-proxy per-node, sweep leftovers — sprint52
   wipe              clean k8s + PodMotion state on the VMs WITHOUT destroying the VMs
+  verify-deployed-revision  ADR-0325-remediation deploy-provenance gate: compare the
+                    live operator Deployment's podmotion.io/deployed-revision annotation
+                    against 'git rev-parse HEAD' of the current worktree; exits non-zero
+                    on any mismatch (or on a dirty deployed revision) so a stale/wrong-branch
+                    image can never silently be mistaken for the code under test
 
 This script REFUSES to 'virsh destroy'/'virsh undefine' any of: ${PM_VMS[*]}.
 EOF
@@ -1662,7 +1798,8 @@ main() {
     reset-cluster)    cmd_reset_cluster ;;
     reset-cluster-k3s) cmd_reset_cluster_k3s ;;
     reset-cluster-rke2) cmd_reset_cluster_rke2 ;;
-    deploy-podmotion) cmd_deploy_podmotion ;;
+    deploy-podmotion) cmd_deploy_podmotion "$@" ;;
+    verify-deployed-revision) cmd_verify_deployed_revision "$@" ;;
     provision-shared-storage) cmd_provision_shared_storage ;;
     provision-longhorn) cmd_provision_longhorn ;;
     provision-cilium) cmd_provision_cilium ;;
