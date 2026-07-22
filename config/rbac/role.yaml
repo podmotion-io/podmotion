@@ -28,9 +28,12 @@ rules:
   resources:
   - pods
   verbs:
+  - create
   - delete
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - ""
@@ -41,6 +44,7 @@ rules:
 - apiGroups:
   - apps
   resources:
+  - replicasets
   - statefulsets
   verbs:
   - get
@@ -123,15 +127,6 @@ rules:
   resources:
   - storageclasses
   - volumeattachments
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - cilium.io
-  resources:
-  - ciliumendpoints
-  - ciliumnodes
   verbs:
   - get
   - list
