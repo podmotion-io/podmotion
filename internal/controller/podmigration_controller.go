@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -113,6 +114,10 @@ const (
 	// ipReclaimVerifyAttemptsAnnotation stamps the current VerifyCleanup(IP_RECLAIM) retry
 	// attempt count (ADR-0244 / NR-BLOCK-2), mirroring cni0CleanupVerifyAttemptsAnnotation.
 	ipReclaimVerifyAttemptsAnnotation = "podmotion.io/ip-reclaim-verify-attempts"
+	// disarmZeroWindowRetryAttemptsAnnotation stamps the current DisarmZeroWindow RPC-error
+	// retry attempt count (fail-closed phase-gate item 5). Mirrors ipReclaimVerifyAttemptsAnnotation /
+	// cni0CleanupVerifyAttemptsAnnotation.
+	disarmZeroWindowRetryAttemptsAnnotation = "podmotion.io/disarm-zero-window-retry-attempts"
 )
 
 // reclaimSweepInterval is the ADR-0244 (NR-BLOCK-2) periodic pod-IP GC sweep requeue
@@ -142,6 +147,15 @@ const reclaimDeletionForceTimeout = reclaimQuarantineSeconds + 5*time.Minute
 // 2s/4s/8s, converging to a fail-open (ConditionIPReclaimVerified=False +
 // DatapathCleanupLeakTotal + a DatapathCleanupLeak Event) on exhaustion.
 var ipReclaimVerifyBackoff = []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+// disarmZeroWindowRetryBackoff (fail-closed phase-gate item 5) bounds how many times reconcileDisengageHold
+// retries the DisarmZeroWindow RPC after a transport/connect error before giving up and
+// surfacing a real, visible error condition. ADR-0157's watchdog auto-disarms the BPF hold
+// independently after FreezeWindowBudgetMs + margin regardless of RPC reachability — so the
+// real risk being guarded against here is only "the controller declares success before it has
+// ANY evidence," not the hold itself running open-ended. Same 3-attempt/2s-4s-8s shape as the
+// other bounded-retry schedules in this file (ipReclaimVerifyBackoff, cni0CleanupVerifyBackoff).
+var disarmZeroWindowRetryBackoff = []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
 
 // cni0CleanupVerifyBackoff is the ADR-0241 item 1 bounded retry schedule for
 // VerifyCleanup(CUTOVER_COMPLETE): up to 3 attempts, 2s/4s/8s backoff, converging to a
@@ -456,12 +470,62 @@ func (r *PodMigrationReconciler) reconcileSocketInventory(ctx context.Context, p
 		return r.transitionTo(ctx, pm, pmv1.MigrationPhaseValidating)
 	}
 
-	// Agent-driven: the source node agent enumerates /proc/net/tcp[6] per container netns
-	// and reports the inventory via the PrepareSource RPC. For now we set the condition so
-	// the controller can advance; full implementation in M20 (TCP agent discipline).
+	// fail-closed phase-gate (item 3): the source node agent enumerates /proc/net/tcp[6] per container
+	// netns and reports the inventory via a REAL PrepareSource RPC round trip — the
+	// condition may only go True after that RPC actually succeeds, carrying the real
+	// observed count. This used to set the condition unconditionally with no RPC call at
+	// all ("full implementation in M20"); the RPC, the agent-side socket scan, and the
+	// PrepareSourceResponse.TcpConnectionCount field all already existed end-to-end but were
+	// dead on both ends until now.
 	log.Info("SocketInventory: recording TCP 4-tuples from source pod", "migration", pm.Name)
+
+	if r.AgentPool == nil {
+		log.Error(nil, "SocketInventory: AgentPool not wired — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	sourcePod, err := r.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+	if err != nil {
+		log.Error(err, "SocketInventory: source pod not found — requeuing", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	sourceNode := pm.Status.SourceNodeName
+	if sourceNode == "" {
+		sourceNode = sourcePod.Spec.NodeName
+		pm.Status.SourceNodeName = sourceNode
+	}
+
+	agentClient, err := r.AgentPool.ForNode(ctx, sourceNode)
+	if err != nil {
+		log.Error(err, "SocketInventory: cannot connect to source agent — requeuing", "migration", pm.Name, "node", sourceNode)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	prepResp, err := agentClient.PrepareSource(ctx, &agentpb.PrepareSourceRequest{
+		PodName:       pm.Spec.PodName,
+		PodNamespace:  pm.Spec.PodNamespace,
+		PodUid:        string(sourcePod.UID),
+		MigrationName: pm.Name,
+	})
+	if err != nil {
+		log.Error(err, "SocketInventory: PrepareSource RPC failed — requeuing (fail-closed phase-gate, no fabricated pass)", "migration", pm.Name)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	if !prepResp.Compatible {
+		reason := prepResp.BlockingReason
+		if reason == "" {
+			reason = "agent reported source pod incompatible"
+		}
+		setCondition(pm, pmv1.ConditionSocketInventoryComplete, metav1.ConditionFalse, "PrepareSourceIncompatible", reason)
+		if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+			return ctrl.Result{}, sErr
+		}
+		return r.initiateRollback(ctx, pm, reason)
+	}
+
 	setCondition(pm, pmv1.ConditionSocketInventoryComplete, metav1.ConditionTrue,
-		"InventoryRecorded", "TCP socket inventory recorded from source pod netns")
+		"InventoryRecorded", fmt.Sprintf("recorded %d TCP socket(s) from source pod %s/%s netns via PrepareSource",
+			prepResp.TcpConnectionCount, pm.Spec.PodNamespace, pm.Spec.PodName))
 	if err := r.statusUpdate(ctx, pm); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1201,17 +1265,49 @@ func (r *PodMigrationReconciler) reconcileDisengageHold(ctx context.Context, pm 
 			SourcePodIp:   pm.Spec.SourcePodIP, // ADR-0224 3h-SYM: remove NOTRACK rule
 		})
 		if err != nil {
-			// RPC error on the happy path: the watchdog backstop will auto-disarm.
-			// ADR-0157 D3: surface as WatchdogFired (not WatchdogDisarm) and emit event.
-			log.Error(err, "DisengageHold: DisarmZeroWindow RPC error — watchdog backstop will disarm (ADR-0157 D3)",
-				"migration", pm.Name)
-			setCondition(pm, pmv1.ConditionZeroWindowDisarmed, metav1.ConditionTrue,
-				"WatchdogFired", fmt.Sprintf("DisarmZeroWindow RPC failed (%v); watchdog auto-disarm assumed (ADR-0157 D3)", err))
-			if r.Recorder != nil {
-				r.Recorder.Eventf(pm, corev1.EventTypeWarning, "ZeroWindowWatchdogFired",
-					"zero-window hold watchdog fired for migration %s (RPC error); FreezeWindowBudgetMs=%d",
-					pm.Name, pm.Spec.FreezeWindowBudgetMs)
+			// fail-closed phase-gate (item 5): an RPC error means the controller has NO signal at all about
+			// the actual hold state — it is not evidence the watchdog fired, and the
+			// ConditionZeroWindowDisarmed=True this branch used to set on error was a
+			// fabricated pass. Retry (bounded) so the next reconcile gets a real
+			// DisarmZeroWindowResponse once the agent is reachable again — matching the
+			// established local idiom for "can't reach the agent right now" (AgentPool==nil /
+			// connect-failure branches above). ADR-0157's watchdog auto-disarms the BPF hold
+			// independently on its own timer regardless of RPC reachability, so bounding the
+			// retry here only bounds "how long before the controller gives up waiting for
+			// real evidence" — it does not affect hold safety.
+			attempts := readDisarmZeroWindowRetryAttempts(pm)
+			if attempts < len(disarmZeroWindowRetryBackoff) {
+				backoff := disarmZeroWindowRetryBackoff[attempts]
+				if pm.Annotations == nil {
+					pm.Annotations = make(map[string]string)
+				}
+				pm.Annotations[disarmZeroWindowRetryAttemptsAnnotation] = strconv.Itoa(attempts + 1)
+				if updErr := r.Update(ctx, pm); updErr != nil {
+					return ctrl.Result{}, updErr
+				}
+				log.Error(err, "DisengageHold: DisarmZeroWindow RPC error — retrying for a real answer (fail-closed phase-gate)",
+					"migration", pm.Name, "attempt", attempts+1, "backoff", backoff)
+				return ctrl.Result{RequeueAfter: backoff}, nil
 			}
+			// Retry budget exhausted: surface a real, visible failure — never a fabricated
+			// True. The migration cannot safely be declared to have a disarmed hold when the
+			// controller has never once observed a real DisarmZeroWindowResponse.
+			msg := fmt.Sprintf("DisarmZeroWindow RPC failed after %d retries (last error: %v); "+
+				"no verified hold-disarm signal obtained (fail-closed phase-gate)", len(disarmZeroWindowRetryBackoff), err)
+			log.Error(err, "DisengageHold: "+msg, "migration", pm.Name)
+			setCondition(pm, pmv1.ConditionZeroWindowDisarmed, metav1.ConditionFalse,
+				"DisarmVerificationExhausted", msg)
+			if r.Recorder != nil {
+				r.Recorder.Eventf(pm, corev1.EventTypeWarning, "ZeroWindowDisarmVerificationFailed",
+					"DisarmZeroWindow RPC retry budget exhausted for migration %s: %v", pm.Name, err)
+			}
+			if pm.Annotations != nil {
+				delete(pm.Annotations, disarmZeroWindowRetryAttemptsAnnotation)
+			}
+			if sErr := r.statusUpdate(ctx, pm); sErr != nil {
+				return ctrl.Result{}, sErr
+			}
+			return r.initiateRollback(ctx, pm, msg)
 		} else if !disarmResp.Disarmed {
 			// disarmed=false means the watchdog already fired (ADR-0157 D3).
 			log.Info("DisengageHold: DisarmZeroWindow returned disarmed=false — watchdog fired (ADR-0157 D3)",
@@ -4540,6 +4636,23 @@ func readIPReclaimVerifyAttempts(pm *pmv1.PodMigration) int {
 	return n
 }
 
+// readDisarmZeroWindowRetryAttempts reads the current DisarmZeroWindow RPC-error retry attempt
+// count (fail-closed phase-gate item 5), mirroring readIPReclaimVerifyAttempts.
+func readDisarmZeroWindowRetryAttempts(pm *pmv1.PodMigration) int {
+	if pm.Annotations == nil {
+		return 0
+	}
+	v, ok := pm.Annotations[disarmZeroWindowRetryAttemptsAnnotation]
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 // resolveDestCNIPlugin (ADR-0322) fetches the destination NodeMigrationCapacity and
 // returns the write-verified CNI signal (destNMC.Spec.NetworkCapability.CNIPlugin).
 // This is the single source both the controller (injectIPHandoff, fail-closed) and the
@@ -7321,14 +7434,41 @@ func (r *PodMigrationReconciler) checkDestinationVolumeReady(ctx context.Context
 	return true, nil
 }
 
-// verifyRestoredSecurityContext is a stub that will assert the restored process's
-// capabilities and seccomp profile match what was captured at checkpoint.
-// Full implementation in M15 (security hardening) — returns nil (pass) for now.
+// verifyRestoredSecurityContext is intended to assert the restored process's capabilities
+// (CapEff/CapPrm/CapInh/CapBnd), seccomp mode, and AppArmor label match what was captured on
+// the source at checkpoint time.
+//
+// fail-closed phase-gate (item 2): the prior stub was `return nil` unconditionally — a hard no-op that let
+// conditionSecurityContextVerified go True on NOTHING, not even a degraded check. No code
+// anywhere in this codebase captures the source process's Cap*/seccomp/AppArmor state at
+// checkpoint time, and no RPC surface exists to read the restored process's real /proc state on
+// the destination — the two capture points a real comparison needs (a source-side CRIU
+// creds-<pid>.img decode + a destination-side /proc/<pid>/status + /proc/<pid>/attr/current
+// read, both immediately available via primitives already proven elsewhere in this codebase —
+// see docs/adr remediation design, item 2) do not exist yet. Wiring those is a materially larger
+// change (new fields on the Checkpoint/Restore RPC surface and PodMigration.Status, touching
+// both agents) than the other six items in this remediation and is intentionally NOT bundled
+// into this fix, per the explicit scope note in the accompanying design doc.
+//
+// Per that design's own interim-compliant fallback: until the two capture RPCs are wired, this
+// function returns a visible, typed "cannot verify" error — blocking the phase (the caller
+// already fails the migration on any non-nil error, ADR-0012-safe: the source pod is never
+// deleted before this phase, so failing closed here cannot orphan the source) — rather than the
+// previous silent `nil` that fabricated a pass on nothing at all. Flagged for a dedicated
+// follow-up ADR to land the real capture RPCs; do not silently re-introduce `return nil` as a
+// substitute for actually implementing them.
 func (r *PodMigrationReconciler) verifyRestoredSecurityContext(_ context.Context, _ *pmv1.PodMigration) error {
-	// TODO(M15): capture CapEff/CapPrm/CapInh/CapBnd + seccomp mode + AppArmor label
-	// at checkpoint time; assert they match post-restore; kill process on mismatch.
-	return nil
+	return errSecurityContextVerificationNotImplemented
 }
+
+// errSecurityContextVerificationNotImplemented is the sentinel verifyRestoredSecurityContext
+// returns until the source-side creds capture and destination-side /proc read (fail-closed phase-gate item 2)
+// are wired. errors.Is-able so tests and any future caller can distinguish "not yet implemented"
+// from a genuine attestation mismatch.
+var errSecurityContextVerificationNotImplemented = errors.New(
+	"verifyRestoredSecurityContext: not yet implemented — no source-side capability/seccomp/AppArmor " +
+		"capture and no destination-side /proc read exist yet, so a real comparison cannot be made " +
+		"(fail-closed phase-gate: failing closed rather than fabricating a pass; see remediation design item 2)")
 
 // checkPDBAllowsDeletion blocks source pod deletion when a matching PodDisruptionBudget
 // has DisruptionsAllowed==0.  Fail-open: if PDBs cannot be listed, migration continues.
