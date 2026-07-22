@@ -147,6 +147,8 @@ type Checkpointer interface {
 // StubCheckpointer is used in M3 and tests. It records calls without invoking CRIU.
 // Replace with CRIUCheckpointer once the kind node image is running.
 type StubCheckpointer struct {
+	// InjectPreDumpError makes PreDump return this error (for failure path testing).
+	InjectPreDumpError error
 	// InjectDumpError makes Dump return this error (for failure path testing).
 	InjectDumpError error
 	// InjectRestoreError makes Restore return this error.
@@ -165,6 +167,9 @@ type StubCheckpointer struct {
 
 func (s *StubCheckpointer) PreDump(_ context.Context, opts PreDumpOptions) (CheckpointResult, error) {
 	s.PreDumpCalls = append(s.PreDumpCalls, opts)
+	if s.InjectPreDumpError != nil {
+		return CheckpointResult{}, s.InjectPreDumpError
+	}
 	dirtyMB := s.SimulatedDirtyMB
 	if dirtyMB == 0 {
 		dirtyMB = 128
