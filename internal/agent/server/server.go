@@ -6886,10 +6886,23 @@ func (s *AgentServer) resolvePodNetnsSandboxOnce(ctx context.Context, migrationN
 func (s *AgentServer) resolvePodNetnsSandboxWaiting(ctx context.Context, migrationName string) (sandboxID string, attempted bool) {
 	waitCtx, cancel := context.WithTimeout(ctx, replacementSandboxWaitBudget)
 	defer cancel()
+	// ADR-0325-remediation design §3.2 instrumentation: track attempt count + elapsed wait time
+	// so that if this gate ever fires again on a verified-main deployment, the transcript shows
+	// whether it was "genuinely never appeared within the budget" (a real problem) versus
+	// "appeared on attempt N at t=Xms but we only tried once" (the one-shot-race bug this bounded
+	// wait exists to close). Recorded on BOTH the success and fail-closed legs below.
+	start := time.Now()
+	attempts := 0
 	for {
+		attempts++
 		id, att, err := s.resolvePodNetnsSandboxOnce(waitCtx, migrationName)
 		var notYet *ReplacementSandboxNotYetCreatedError
 		if !errors.As(err, &notYet) {
+			elapsed := time.Since(start)
+			resolved := id != ""
+			log.Info("resolvePodNetnsSandboxWaiting: resolution loop finished (resolved, no-k8sClient, or terminal error)",
+				"migration", migrationName, "attempts", attempts, "elapsedMs", elapsed.Milliseconds(), "resolved", resolved)
+			sandboxWaitObserveFn(migrationName, attempts, elapsed, resolved)
 			return id, att // resolved, no-client, or a terminal error → caller's existing gate logic
 		}
 		select {
@@ -6897,13 +6910,23 @@ func (s *AgentServer) resolvePodNetnsSandboxWaiting(ctx context.Context, migrati
 			// Budget spent: the replacement pod's sandbox never materialized within the bound. Fail
 			// closed exactly as the one-shot gate did (attempted=true, empty id) — a sandbox that
 			// never appears IS the detached/non-pod-namespace condition the ADR-0325 gate guards.
+			elapsed := time.Since(start)
 			log.Info("resolvePodNetnsSandboxWaiting: replacement pod sandbox did not appear within wait budget (ADR-0325) — failing closed",
-				"migration", migrationName, "budget", replacementSandboxWaitBudget.String())
+				"migration", migrationName, "budget", replacementSandboxWaitBudget.String(),
+				"attempts", attempts, "elapsedMs", elapsed.Milliseconds())
+			sandboxWaitObserveFn(migrationName, attempts, elapsed, false)
 			return "", true
 		case <-time.After(replacementSandboxPollInterval):
 		}
 	}
 }
+
+// sandboxWaitObserveFn is a test seam (mirrors sandboxIDForPodUIDFn/joinNsRestoreFn) invoked once
+// per resolvePodNetnsSandboxWaiting call, on both the success and fail-closed legs, with the same
+// attempt-count/elapsed-time/resolved facts the paired log line above records — the ADR-0325-
+// remediation design §3.2 hardening instrumentation, made assertable from tests without parsing
+// log output. No-op by default.
+var sandboxWaitObserveFn = func(migrationName string, attempts int, elapsed time.Duration, resolved bool) {}
 
 // errNoSandboxForPodUID is returned by sandboxIDForPodUID when the ctr query SUCCEEDS but no
 // containerd sandbox exists for the pod UID yet — the destination kubelet has not created the
