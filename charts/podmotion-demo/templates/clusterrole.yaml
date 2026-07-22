@@ -48,8 +48,22 @@ rules:
   # client.go; it lives in the separate watch.go file in the same package — it is
   # what makes the History leaderboard capture migrations this portal did not
   # itself trigger (MigrationPolicy, descheduler, kubectl apply).
-  # No single-object Get is ever called on podmigrations, so "get" is deliberately
-  # NOT granted here.
+  # internal/k8s/client.go CancelMigration(): c.Dynamic.Resource(podMigrationGVR).
+  # Namespace(namespace).Get(...) — "get" — to read the current phase before
+  # deciding whether cancellation is safe.
   - apiGroups: [migration.podmotion.io]
     resources: [podmigrations]
-    verbs: [list, watch, create]
+    verbs: [list, watch, create, get]
+  # internal/k8s/client.go CancelMigration(): c.Dynamic.Resource(podMigrationGVR).
+  # Namespace(namespace).UpdateStatus(...) — transitions status.phase to
+  # RollingBack, the same real abort entry point the operator's own controller
+  # uses internally (initiateRollback/transitionTo in podmigration_controller.go).
+  # Status is a separate subresource for RBAC purposes.
+  - apiGroups: [migration.podmotion.io]
+    resources: [podmigrations/status]
+    verbs: [update]
+  # internal/k8s/client.go ListNodeCapacities(): c.Dynamic.Resource(
+  # nodeMigrationCapacityGVR).List(...) — cluster-scoped, "list" only.
+  - apiGroups: [migration.podmotion.io]
+    resources: [nodemigrationcapacities]
+    verbs: [list]
