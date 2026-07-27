@@ -58,9 +58,8 @@ For the full narrative, start with
 | Document | Purpose |
 |----------|---------|
 | [`docs/why-podmotion.md`](docs/why-podmotion.md) | The case for live pod migration |
-| [`docs/architecture-overview.md`](docs/architecture-overview.md) | Narrative entry point to the ADR corpus and roadmap |
+| [`docs/architecture-overview.md`](docs/architecture-overview.md) | Narrative entry point to the architecture and roadmap |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Milestone roadmap |
-| [`docs/adr/`](docs/adr/) | Architecture Decision Records |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to contribute |
 | [`GOVERNANCE.md`](GOVERNANCE.md) | Project governance |
 | [`SECURITY.md`](SECURITY.md) | Security policy and threat model |
