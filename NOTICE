@@ -22,6 +22,28 @@ Note: CRIU itself (criu/criu) is GPLv2 and is invoked exclusively as an external
   PodMotion binary. This subprocess firewall preserves PodMotion's Apache 2.0 licensing.
 
 --------------------------------------------------------------------------------
+pycriu (Python bindings for CRIU)
+Version: 4.2 (vendored from CRIU release v4.2, lib/pycriu)
+License: LGPL-2.1-only
+Source: https://github.com/checkpoint-restore/criu/tree/v4.2/lib/pycriu
+Attribution: Copyright the CRIU team (criu@lists.linux.dev) and contributors. Per the
+  CRIU top-level COPYING, all software under lib/ is licensed under LGPL v2.1, and
+  CRIU's lib/pyproject.toml declares the pycriu package license as LGPLv2.1. This is
+  distinct from the CRIU tool (GPLv2) and from the go-criu Go binding above.
+  The pycriu package is vendored, UNMODIFIED, in the pycriu/ directory of this repo
+  and is COPIED INTO the shipped node-agent container image
+  (images/agent/Dockerfile: COPY pycriu/ -> /usr/lib/python3/dist-packages/pycriu/).
+  It is NOT linked into any PodMotion binary: the Go agent invokes it only as an
+  out-of-process python3 subprocess (PYTHONPATH-imported) to decode/patch CRIU
+  checkpoint images on the checkpoint/restore path (internal/agent/server/). The full
+  LGPL-2.1 text and a detailed attribution notice ship alongside the code at
+  pycriu/LICENSE.LGPL-2.1 and pycriu/README.attribution.md, so the license and
+  attribution accompany the library wherever the agent image is distributed.
+  Downstream redistributors must preserve those files and may obtain corresponding
+  source from the upstream location above; modifications to the vendored copy must be
+  released under LGPL-2.1.
+
+--------------------------------------------------------------------------------
 sigs.k8s.io/controller-runtime
 Version: see go.mod
 License: Apache-2.0
