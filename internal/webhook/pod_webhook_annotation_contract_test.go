@@ -20,7 +20,7 @@ import (
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 )
 
-// TestPodMutatingWebhookAnnotationSatisfiesNRIContract is the §P-VERIFY integration
+// TestPodMutatingWebhookAnnotationSatisfiesNRIContract is the verification integration
 // test required by ADR-0369. It closes the six-week detection gap the ADR documents:
 // the webhook side and the NRI plugin side were each covered only by isolated unit
 // tests that independently assumed different, disagreeing shapes for the same

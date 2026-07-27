@@ -657,7 +657,7 @@ const (
 	// ReasonPreservedIPNotOnEndpoint: the replacement pod's CiliumEndpoint reached ready with
 	// an identity, but cilium-agent's status.networking.addressing does NOT advertise the
 	// preserved SourcePodIP — the ipam.cilium.io/ip pin was not honored (e.g. cluster-pool
-	// per-node /24 blocks reject a foreign IP; ADR-0324 P-VERIFY-C). Fail-closed: the IP did
+	// per-node /24 blocks reject a foreign IP; ADR-0324 verification check C). Fail-closed: the IP did
 	// not actually move to the destination, so the cross-node dataplane gate must NOT be
 	// credited. Surfaced as a specific, actionable condition instead of a silent wedge.
 	ReasonPreservedIPNotOnEndpoint = "PreservedIPNotOnCiliumEndpoint"

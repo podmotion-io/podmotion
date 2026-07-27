@@ -14,8 +14,7 @@ import (
 // sprint50 (k3s compat): every containerd host-path/socket construction in this package used
 // to hardcode kubeadm/standard-containerd's default locations (/run/containerd/...,
 // /var/lib/containerd/...). k3s ships its own embedded containerd at different locations
-// (UNVERIFIED-EXTERNAL — not confirmed against a live k3s node this round, see
-// docs/sprints/sprint50-k3s/K3S-COMPATIBILITY-PLAN.md §0 items 1-4 and §2 Round 2). Rather than
+// (UNVERIFIED-EXTERNAL — not confirmed against a live k3s node this round). Rather than
 // hardcode a second guessed path, these roots are read once from the environment (set via Helm
 // values on the k3s deploy path — see charts/podmotion/values.yaml agent.containerd.*) and
 // default to exactly the previous hardcoded values, so behavior on the standing kubeadm/

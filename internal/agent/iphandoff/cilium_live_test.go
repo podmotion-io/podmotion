@@ -6,7 +6,7 @@ you may not use this file except in compliance with the License.
 */
 
 // TestCrossNodeReachability is the empirical check named by ADR-0324's
-// P-VERIFY-C (inherited unchanged from ADR-0322): it confirms whether the
+// verification check C (inherited unchanged from ADR-0322): it confirms whether the
 // ipam.cilium.io/ip pinning annotation actually forces Cilium CNI ADD to
 // assign a caller-specified pod IP under the standing cluster's real
 // ipam.mode=cluster-pool configuration, and specifically whether that
@@ -16,7 +16,7 @@ you may not use this file except in compliance with the License.
 //
 // Gated behind PODMOTION_CILIUM_LIVE_TEST=1 because it requires a live
 // cluster reachable via KUBECONFIG (or the standing KVM kubeconfig at
-// /home/chad/podmotion-kvm/kubeconfig by default) and creates/deletes real
+// $HOME/podmotion-kvm/kubeconfig by default) and creates/deletes real
 // pods on it. It is intentionally NOT part of the default `go test ./...`
 // run.
 package iphandoff
@@ -25,6 +25,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -43,7 +44,11 @@ func TestCrossNodeReachability(t *testing.T) {
 
 	kubeconfig := os.Getenv("KUBECONFIG")
 	if kubeconfig == "" {
-		kubeconfig = "/home/chad/podmotion-kvm/kubeconfig"
+		home, herr := os.UserHomeDir()
+		if herr != nil {
+			t.Fatalf("resolving home directory for default kubeconfig: %v", herr)
+		}
+		kubeconfig = filepath.Join(home, "podmotion-kvm", "kubeconfig")
 	}
 	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
@@ -123,14 +128,14 @@ func TestCrossNodeReachability(t *testing.T) {
 	// 3. Observe the outcome. Under cluster-pool IPAM, /24 blocks are
 	// allocated per-node, so pinning an IP owned by pm-w1's block onto a pod
 	// scheduled on pm-w2 is expected to be REJECTED or to silently receive a
-	// different IP — this is exactly the open empirical question P-VERIFY-C
+	// different IP — this is exactly the open empirical question verification check C
 	// asks to be resolved rather than assumed. We assert on the actual
 	// outcome and report it either way; we do not pre-suppose success.
 	gotIP, podErr := waitForPodIPOrError(ctx, client, dstName)
 	if podErr != nil {
 		t.Logf("RESULT: destination pod on pm-w2 failed to start with pinned IP %s under cluster-pool IPAM: %v", srcIP, podErr)
 		t.Logf("CONCLUSION: ipam.cilium.io/ip pinning is NOT honored across cluster-pool per-node blocks; " +
-			"per ADR-0324 P-VERIFY-C escalation path, the substrate IPAM mode must move to multi-pool/crd " +
+			"per ADR-0324 verification check C escalation path, the substrate IPAM mode must move to multi-pool/crd " +
 			"before the live Cilium IP-handoff proof can be credited on IP-preservation grounds.")
 		t.Fatalf("cross-node IP pinning under cluster-pool IPAM did not succeed (see log): %v", podErr)
 	}

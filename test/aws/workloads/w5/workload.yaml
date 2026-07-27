@@ -33,7 +33,7 @@ spec:
       containers:
         - name: grpc-server
           # image: <registry>/grpc-streaming-server:latest  # human-readable tag
-          image: FILL_IN_DIGEST  # pin to sha256 digest before gate run; see docs/sprints/m27-image-pins.md
+          image: FILL_IN_DIGEST  # pin to sha256 digest before gate run
           ports:
             - name: grpc
               containerPort: 50051

@@ -7,8 +7,7 @@ package nri
 
 // adr0351_antispoof_test.go pins ADR-0351 D4: the synchronous PodMigration-CR anti-spoof verify
 // loop in HandleStartContainer MUST return well before containerd's real, GROUNDED
-// nriPluginRequestTimeout (G0.3 — 2s on this substrate, docs/sprints/sprint46B7/
-// g0-probe-adr0351-transcript.md) or containerd drops the plugin connection entirely, forcing
+// nriPluginRequestTimeout (G0.3 — 2s on this substrate) or containerd drops the plugin connection entirely, forcing
 // every migration onto the raw-CRIU fallback where the D1 cgroup-anchor primitive never runs.
 
 import (

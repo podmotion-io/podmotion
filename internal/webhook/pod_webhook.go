@@ -188,7 +188,7 @@ func (w *PodMutatingWebhook) Handle(ctx context.Context, req admission.Request) 
 		// written. Resolve the real, write-verified signal from the destination NMC
 		// (mirroring the controller's fetch pattern) — but on fetch error, fall
 		// THROUGH to no-annotation (a mutating admission request cannot requeue);
-		// the unpinned case is caught downstream by P-VERIFY-C, not blocked here.
+		// the unpinned case is caught downstream by verification check C, not blocked here.
 		//
 		// sprint52 diagnosis follow-up: gating the destNMC lookup on pm.Spec.TargetNodeName
 		// alone reproduces the ADR-0322 bug for every scheduler-selected (unpinned)
@@ -212,7 +212,7 @@ func (w *PodMutatingWebhook) Handle(ctx context.Context, req admission.Request) 
 			if nmcErr := w.Client.Get(ctx, types.NamespacedName{Name: destNode}, destNMC); nmcErr == nil {
 				cniPlugin = destNMC.Spec.NetworkCapability.CNIPlugin
 			} else {
-				log.Error(nmcErr, "ADR-0322: destNMC fetch failed — falling through to no-annotation (P-VERIFY-C catches unpinned case)")
+				log.Error(nmcErr, "ADR-0322: destNMC fetch failed — falling through to no-annotation (verification check C catches unpinned case)")
 			}
 		}
 		injectIPAMAnnotation(pod, pm.Spec.SourcePodIP, cniPlugin)

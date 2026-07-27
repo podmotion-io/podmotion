@@ -7,15 +7,14 @@ package server
 
 // shmem_pagemap_guard.go — ADR-0246 D1/D3: post-checkpoint, pre-transfer completeness guard.
 //
-// CRIU 4.2 has a confirmed (§P-PREMISE-decoded, docs/sprints/SPRINT40C-SHMEM-PREMISE-EVIDENCE.md)
+// CRIU 4.2 has a confirmed (empirically decoded)
 // dump-time defect where a genuine anon-shmem vma (VMA_ANON_SHARED) is recorded in mm-<pid>.img
 // but the corresponding pagemap-shmem-<shmid>.img is never written. Restoring such a checkpoint
 // dies partway through with "criu/shmem.c:534: Can't restore shmem content". This guard detects
 // that reference-without-data pattern BEFORE transfer so a non-restorable checkpoint never ships
 // (ADR-0246 D1) — a pure detector, no retry, no repair.
 //
-// SPRINT41 NR-BLOCK-2 bugfix (docs/sprints/SPRINT41-NR-BLOCK-2-MECHANISM-INVESTIGATION.md,
-// panel-verified by two independent architect reviews): the original scan logic treated ANY
+// SPRINT41 NR-BLOCK-2 bugfix (panel-verified by two independent architect reviews): the original scan logic treated ANY
 // non-zero vma_entry.shmid field as an anon-shmem pagemap obligation. CRIU's mm-*.img overloads
 // that field as a generic per-checkpoint object index for multiple unrelated vma classes, which
 // produced a false positive on every checkpoint (the exact fixed small-integer signature
@@ -113,8 +112,7 @@ const ShmemPagemapMissingReasonDomain = "podmotion.io"
 // pagemap-shmem keys that must have a matching pagemap-shmem-<key>.img.
 //
 // CRIU's mm-*.img vma_entry.shmid field is a generic, overloaded per-checkpoint object index —
-// NOT always a real anon-shmem/pagemap key (see docs/sprints/SPRINT41-NR-BLOCK-2-MECHANISM-
-// INVESTIGATION.md and ADR-0246's follow-up bugfix note). The vma_entry.status bitmask
+// NOT always a real anon-shmem/pagemap key (see ADR-0246's follow-up bugfix note). The vma_entry.status bitmask
 // (CRIU's mmap.status flags, pycriu/images/pb2dict.py mmap_status_map) distinguishes three
 // cases this scan must treat differently:
 //
@@ -128,7 +126,7 @@ const ShmemPagemapMissingReasonDomain = "podmotion.io"
 //     CRIUMFD parasite-injection regions). This DOES have a real on-disk pagemap — but keyed by
 //     the memfd's real kernel inode/shmid recorded in memfd.img, not by the vma's own (small,
 //     sequential, overloaded) shmid field. On a REAL CRIU 4.2 dump (verified live against the
-//     go-tcp-echo workload, docs/sprints/SPRINT41-NR-BLOCK-2-MECHANISM-INVESTIGATION.md), the
+//     go-tcp-echo workload), the
 //     vma's shmid field is actually a files.img file-object id, NOT memfd.img's inode_id
 //     directly — the correct resolution is a two-hop join: vma.shmid -> files.img entry (type
 //     MEMFD) with matching id -> that entry's memfd.inode_id -> memfd.img's
@@ -248,7 +246,7 @@ func verifyShmemPagemapCompleteness(imagesDir string) error {
 		return fmt.Errorf("verifyShmemPagemapCompleteness: write scan script: %w", err)
 	}
 	defer func() {
-		// §P-VERIFY: zeroize the transient script before removal, identically to how
+		// Verification: zeroize the transient script before removal, identically to how
 		// checkpoint images themselves are zeroized on exit paths (zeroizeDir), even though
 		// the script itself carries no tenant memory content — treat every artifact this
 		// guard places on tmpfs imagesDir the same way, no exceptions.

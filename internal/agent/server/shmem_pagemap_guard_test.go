@@ -5,17 +5,17 @@ Licensed under the Apache License, Version 2.0.
 
 package server
 
-// shmem_pagemap_guard_test.go — ADR-0246 §P-VERIFY test coverage.
+// shmem_pagemap_guard_test.go — ADR-0246 verification test coverage.
 //
 // Before this ADR, the string "shmem" appeared in zero Go files in this repo — this failure
 // class had no test coverage anywhere. These tests cover:
 //   1. Smoke test: the pycriu.images generic reader actually decodes a real mm-<pid>.img
-//      produced with pycriu itself and extracts the expected shmid (§P-VERIFY: this decode
+//      produced with pycriu itself and extracts the expected shmid (Verification: this decode
 //      path must be proven working, not assumed, per Security Review round-1 Finding 1).
 //   2. Negative: a referenced-but-missing pagemap-shmem-<shmid>.img fails the guard closed
 //      with ErrIncompleteShmemPagemap.
 //   3. Positive: a referenced shmid WITH a present, non-empty pagemap-shmem-<shmid>.img passes.
-//   4. §P-VERIFY artifact-hygiene: no stray decode artifact (the scan script) survives on a
+//   4. verification artifact-hygiene: no stray decode artifact (the scan script) survives on a
 //      non-tmpfs filesystem after the guard runs, on both the pass and fail paths.
 //
 // Uses the same synthetic-fixture-built-with-pycriu approach as pycriu_corpus_test.go, and
@@ -84,7 +84,7 @@ with open(%q, 'wb') as f:
 // writeMemfdImage builds a real CRIU memfd.img (via the vendored pycriu writer) containing one
 // memfd_inode_entry mapping the given local inodeID to the given realShmid (the actual
 // kernel-assigned identifier that pagemap-shmem-<realShmid>.img is keyed by) — mirroring the
-// memfd.img structure decoded in docs/sprints/SPRINT41-NR-BLOCK-2-MECHANISM-INVESTIGATION.md
+// memfd.img structure decoded
 // (e.g. inode_id=1 -> shmid=13353). Pair with writeFilesImageMemfd to complete the two-hop join
 // a VMA_AREA_MEMFD vma's shmid field requires on a real CRIU dump (vma.shmid -> files.img id ->
 // this inodeID -> this realShmid).
@@ -146,7 +146,7 @@ func withRepoPycriuPath(t *testing.T) {
 	t.Cleanup(func() { pycriuPythonPath = orig })
 }
 
-// TestVerifyShmemPagemapCompleteness_Smoke is the §P-VERIFY-required smoke test: proves the
+// TestVerifyShmemPagemapCompleteness_Smoke is the verification-required smoke test: proves the
 // pycriu.images generic reader actually decodes a real mm-<pid>.img and the guard extracts the
 // expected shmid — this exact call path had never been exercised end-to-end before this ADR.
 //
@@ -155,11 +155,10 @@ func withRepoPycriuPath(t *testing.T) {
 // pycriu.images.load() — the SAME library on both ends. That proves internal round-trip
 // self-consistency, but it is NOT proof that pycriu correctly parses a real mm-*.img produced
 // by an actual CRIU 4.2 dump (CRIU's own image writer, not pycriu's). A real captured fixture
-// from the original gate failure (shmid 22685 on gate3 or shmid 11423 on gate2, per
-// docs/sprints/SPRINT40C-SHMEM-PREMISE-EVIDENCE.md) is NOT currently available in-repo, and one
+// from the original gate failure (shmid 22685 on gate3 or shmid 11423 on gate2) is NOT currently available in-repo, and one
 // was deliberately NOT fabricated here rather than falsely claiming this gap closed. This is
 // flagged as a residual gap to close with a real fixture at live-gate time — see ADR-0246
-// §P-VERIFY for the corresponding disclosure.
+// verification for the corresponding disclosure.
 func TestVerifyShmemPagemapCompleteness_Smoke(t *testing.T) {
 	withRepoPycriuPath(t)
 	dir := t.TempDir()
@@ -270,8 +269,7 @@ func TestVerifyShmemPagemapCompleteness_AnonSharedMissing_StillCaught(t *testing
 func TestVerifyShmemPagemapCompleteness_FilePrivate_NotFlagged(t *testing.T) {
 	withRepoPycriuPath(t)
 	dir := t.TempDir()
-	// shmid=1 mirrors the real false-positive signature from
-	// docs/sprints/SPRINT41-NR-BLOCK-2-MECHANISM-INVESTIGATION.md (the /tcpecho binary's own
+	// shmid=1 mirrors the real false-positive signature (the /tcpecho binary's own
 	// text segment decoded as {"shmid": 1, "status": "VMA_AREA_REGULAR | VMA_FILE_PRIVATE"}).
 	writeMMImageWithShmidStatus(t, pycriuPythonPath, append(os.Environ(), "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python"), filepath.Join(dir, "mm-1.img"), 1, vmaFilePrivate)
 	// No pagemap-shmem-1.img written — and none should ever be required for VMA_FILE_PRIVATE.
@@ -332,7 +330,7 @@ func TestVerifyShmemPagemapCompleteness_MemfdRealKeyMissing_StillCaught(t *testi
 	}
 }
 
-// TestVerifyShmemPagemapCompleteness_NoStrayArtifact is the required §P-VERIFY artifact-hygiene
+// TestVerifyShmemPagemapCompleteness_NoStrayArtifact is the required verification artifact-hygiene
 // test: the guard's own transient decode artifact (the scan script it writes into imagesDir)
 // must not survive after the guard returns, on either the pass or fail path, and — the ADR's
 // explicit requirement — must never be written anywhere outside the already-governed tmpfs
@@ -385,7 +383,7 @@ func TestVerifyShmemPagemapCompleteness_NoStrayArtifact(t *testing.T) {
 		assertNoStrayFiles(t, dir, before)
 	})
 
-	// D3/§P-VERIFY: the guard must never place any artifact outside the imagesDir it was given
+	// D3/Verification: the guard must never place any artifact outside the imagesDir it was given
 	// — confirm a sibling, unrelated non-tmpfs-style scratch directory is untouched by a guard
 	// call against a different dir entirely.
 	t.Run("no_artifact_outside_imagesDir", func(t *testing.T) {

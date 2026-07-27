@@ -21,7 +21,7 @@ import (
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
-// ADR-0357 D1.2 — LookupSeqXlat real bpf_map_lookup round-trip (§P-VERIFY assertion 1).
+// ADR-0357 D1.2 — LookupSeqXlat real bpf_map_lookup round-trip (verification assertion 1).
 //
 // Loading a real BPF collection requires CAP_BPF/CAP_SYS_ADMIN (BPF_PROG_LOAD). This test is
 // skipped, not failed, when that privilege is unavailable — matching the established pattern in
@@ -31,7 +31,7 @@ import (
 
 // TestCiliumEBPFManager_LookupSeqXlat_RoundTrip seeds an entry via ArmRelay then confirms
 // LookupSeqXlat returns found=true with the exact key/value round-tripped — the literal
-// §P-VERIFY assertion 1 requirement for the new EBPFManager method.
+// verification assertion 1 requirement for the new EBPFManager method.
 func TestCiliumEBPFManager_LookupSeqXlat_RoundTrip(t *testing.T) {
 	ctx := context.Background()
 	m := newCiliumEBPFManager()

@@ -19,7 +19,7 @@ spec:
   containers:
     - name: grpc-client
       # image: <registry>/grpc-streaming-client:latest  # human-readable tag
-      image: FILL_IN_DIGEST  # pin to sha256 digest before gate run; see docs/sprints/m27-image-pins.md
+      image: FILL_IN_DIGEST  # pin to sha256 digest before gate run
       env:
         - name: TARGET_SVC
           value: w5-svc.podmotion-gate.svc.cluster.local:8080

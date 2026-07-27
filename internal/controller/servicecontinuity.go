@@ -31,7 +31,7 @@ import (
 // errNoEndpointSliceServiceLabelYet is returned by resolveTargetService when no
 // EndpointSlice carrying destPodIP has a discoveryv1.LabelServiceName label. This is the
 // ONE resolveTargetService failure mode establishServiceContinuity treats specially
-// (§P-MECHANISM, ADR-0390): every other resolveTargetService error (API list error,
+// (ADR-0390): every other resolveTargetService error (API list error,
 // Service fetch error, ClusterIP not yet assigned) stays a plain transient requeue, but
 // this specific one is ambiguous on its own — it is produced identically whether (a) a
 // Service selects this pod and its EndpointSlice controller simply hasn't converged yet

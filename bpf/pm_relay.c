@@ -152,8 +152,7 @@ static __always_inline __sum16 csum_diff32(__sum16 old_csum, __be32 old_val, __b
  *     > data_end bounds check after a constant offset clamp (see PM_MAX_*_OFF).
  * The epilogue outer-UDP re-derivation (below) uses out_outer_udp_off and no
  * longer re-reads outer_ip->ihl — removing the duplicate read that fed the CSE
- * merge. Both TC programs load-proven on kernel 6.8.0-136-generic; see
- * docs/proof/PM-RELAY-CODEGEN-INVESTIGATION.md and ADR-0403 §P-VERIFY RESULTS.
+ * merge. Both TC programs load-proven on kernel 6.8.0-136-generic (ADR-0403).
  */
 static __noinline int parse_vxlan_inner_tcp(
     struct __sk_buff *skb,
@@ -313,8 +312,7 @@ static __always_inline __u32 rewrite_tcp_options(
      * index scalar widened to [33..286]. Advancing a pointer keeps the accessible-
      * range fact attached to the register that is read. All rewrite arithmetic
      * below (ts_delta, sack_edge_delta, opt_csum_add32) is byte-for-byte identical
-     * to the index form; only the addressing changes. See
-     * docs/proof/PM-RELAY-CODEGEN-INVESTIGATION.md.
+     * to the index form; only the addressing changes.
      */
     __u8 *cur      = opts;
     __u8 *opts_end = opts + opts_len; /* logical end of options region */

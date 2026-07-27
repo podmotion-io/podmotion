@@ -13,7 +13,7 @@ you may not use this file except in compliance with the License.
 // holds the source pod alive with the preserved IP — see tryEstablishCiliumDataplaneReachability),
 // the authoritative CiliumEndpoint read genuinely CONVERGES to a confirmation on a correctly
 // migrated IP, and FAILS CLOSED (never false-credits) when the ipam.cilium.io/ip pin was not
-// honored (ADR-0324 P-VERIFY-C) or the endpoint is not ready.
+// honored (ADR-0324 verification check C) or the endpoint is not ready.
 package iphandoff
 
 import (
@@ -78,7 +78,7 @@ func TestConfirmEndpointOwnsPreservedIP_Converges(t *testing.T) {
 		ns     = "pm-live-proof-c2"
 		pod    = "redis-src-m-5604a0fb"
 		wantIP = "10.244.1.178"
-		node   = "192.168.122.243"
+		node   = "203.0.113.243"
 	)
 	ch := fakeCiliumHandoff(ciliumEndpoint(ns, pod, "ready", 12345, node, wantIP))
 
@@ -92,7 +92,7 @@ func TestConfirmEndpointOwnsPreservedIP_Converges(t *testing.T) {
 }
 
 // TestConfirmEndpointOwnsPreservedIP_FailClosed_WrongIP is the load-bearing negative control for
-// ADR-0324 P-VERIFY-C: the endpoint is ready with an identity, but cilium-agent assigned a
+// ADR-0324 verification check C: the endpoint is ready with an identity, but cilium-agent assigned a
 // DIFFERENT IP (the ipam.cilium.io/ip pin was not honored under cluster-pool per-node blocks). The
 // read MUST fail closed — never credit a dataplane that did not actually move the preserved IP —
 // with a specific, classifiable reason token.
@@ -102,7 +102,7 @@ func TestConfirmEndpointOwnsPreservedIP_FailClosed_WrongIP(t *testing.T) {
 		pod    = "redis-src-m-5604a0fb"
 		wantIP = "10.244.1.178"
 		gotIP  = "10.244.2.99" // pm-w2's own /24 — pin rejected, endpoint got a native IP
-		node   = "192.168.122.243"
+		node   = "203.0.113.243"
 	)
 	ch := fakeCiliumHandoff(ciliumEndpoint(ns, pod, "ready", 12345, node, gotIP))
 
@@ -120,7 +120,7 @@ func TestConfirmEndpointOwnsPreservedIP_FailClosed_NotReady(t *testing.T) {
 		ns     = "pm-live-proof-c2"
 		pod    = "redis-src-m-5604a0fb"
 		wantIP = "10.244.1.178"
-		node   = "192.168.122.243"
+		node   = "203.0.113.243"
 	)
 	// state=regenerating with the preserved IP already present: readiness alone must gate.
 	ch := fakeCiliumHandoff(ciliumEndpoint(ns, pod, "regenerating", 12345, node, wantIP))
@@ -139,7 +139,7 @@ func TestConfirmEndpointOwnsPreservedIP_FailClosed_ZeroIdentity(t *testing.T) {
 		ns     = "pm-live-proof-c2"
 		pod    = "redis-src-m-5604a0fb"
 		wantIP = "10.244.1.178"
-		node   = "192.168.122.243"
+		node   = "203.0.113.243"
 	)
 	ch := fakeCiliumHandoff(ciliumEndpoint(ns, pod, "ready", 0, node, wantIP))
 

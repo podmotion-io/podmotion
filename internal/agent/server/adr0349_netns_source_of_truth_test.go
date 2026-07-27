@@ -135,7 +135,7 @@ func TestCaptureRestoredVethMAC_ReadsProcessOwnNetns_NotRecordedBindPath(t *test
 }
 
 // TestCaptureRestoredVethMAC_SucceedsWhereBindPathReadFails_LiveProofCycle1Regression is the RED
-// TEST for the exact live cycle-1 failure (docs/sprints/sprint46B2/live-proof-cycle1.md): the redis
+// TEST for the exact live cycle-1 failure: the redis
 // Strict pm-w1→pm-w2 restore reached RestoreSocketReattach, the restored pod was reachable at its
 // pod IP (so eth0 IS present in the process's netns), yet finalizeRestore fail-closed with
 // "replVethMAC empty after restore" because the recorded /var/run/netns/cni-<id> BIND PATH read
@@ -434,7 +434,7 @@ func TestRestore_StrictUnresolvableSandbox_FailsClosedBeforeJoinNsRestore(t *tes
 	}
 	// ADR-0370 citation fix: this exact error string (server.go, one of the two Restore() call
 	// sites named in scope) now cites ADR-0125/ADR-0177/ADR-0349 instead of the mislabeled
-	// "ADR-0325" — see ADR-0370 First Finding / §P-VERIFY assertion 5.
+	// "ADR-0325" — see ADR-0370 First Finding / verification assertion 5.
 	if !strings.Contains(resp.ErrorMessage, "could not resolve replacement pod sandbox netns (ADR-0125/ADR-0177/ADR-0349)") {
 		t.Errorf("ErrorMessage = %q, want the ADR-0125/ADR-0177/ADR-0349 fail-closed message", resp.ErrorMessage)
 	}

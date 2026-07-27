@@ -152,7 +152,7 @@ func TestFinalizeRestore_PassesIfnameToMACRead(t *testing.T) {
 
 // TestFinalizeRestore_WriteBack_CaptureLatchesValue_NoReReadOnReinvocation is the falsifiable
 // proof of the ADR-0349 security write-back (Security Reviewer, sprint46B2 validation cycle 1).
-// The live-proof (docs/sprints/sprint46B2/live-proof-cycle1.md) showed the controller re-invoked
+// The live-proof showed the controller re-invoked
 // Restore ~25 times over ~75s, each RE-READING eth0 against the recorded /var/run/netns/cni-<id>
 // bind handle via the broker's path-mode nsenter and getting empty — the invariant-#10 poll-and-hope
 // brittle chain the Security Reviewer rejected on. This test pins the fix: the AT-RESTORE capture

@@ -974,7 +974,7 @@ func TestStrictMigrationVisitsOverlayHandoffAndDisengageHold(t *testing.T) {
 // VXLANFDBUpdated=True, Restored=True and Status.SourceConntrackArmed=true — every input the
 // ADR-0049 post-restore barrier needs — yet hung for the full 120s cap because reconcileDisengageHold
 // re-derived the barrier by re-issuing a live ConfirmOverlayReady RPC that requeued every 5s and
-// never set OverlayReady (docs/sprints/sprint46B4/live-proof-c2-transcript.txt).
+// never set OverlayReady.
 //
 // This test drives reconcileDisengageHold with that EXACT condition set and a nil AgentPool (the
 // live re-probe is unreachable). Under the old brittle-chain code the barrier block returned a

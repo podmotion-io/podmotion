@@ -10,7 +10,7 @@ package controller
 // completion_deadline_test.go — regression for the sprint46B3 surgical fix: the top-level
 // AUTHORITATIVE completion-deadline primitive in Reconcile (invariant #8 / ADR-0012).
 //
-// Live evidence (docs/sprints/sprint46B3/live-proof-c2-transcript.txt): a redis Strict pm-w1→pm-w2
+// Live evidence: a redis Strict pm-w1→pm-w2
 // migration ran …→RestoreSocketReattach→DisengageHold→Verifying and WEDGED in phase=Verifying for
 // the whole watch window — the outer watch bound fired rc=124 at 125s, MIG1_FINAL_PHASE=Verifying,
 // finalizer intact, namespace stuck Terminating. Root cause: no phase on the DisengageHold→Verifying

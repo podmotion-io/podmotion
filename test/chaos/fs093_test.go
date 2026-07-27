@@ -86,7 +86,7 @@ func TestRunFS093Variants(t *testing.T) {
 			// is wired end-to-end (WaitForSyncPoint -> fault injection ->
 			// waitForTerminalFailure -> HasEndpointForIP ->
 			// AssertNoDestinationMountCreated/AssertSourceStorageWriteRestored)
-			// rather than being an undefined symbol (ADR-0344 P-VERIFY gap).
+			// rather than being an undefined symbol (ADR-0344 verification gap).
 			err := RunFS093(ctx, f, pmNN, "default", "10.0.0.5", variant)
 			if err == nil {
 				t.Fatalf("RunFS093(variant=%d): expected bounded error against an unsignalled sync point, got nil", variant)

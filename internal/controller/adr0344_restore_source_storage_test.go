@@ -21,7 +21,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/storage"
 )
 
-// TestRestoreSourceStorageIfNeeded is the ADR-0344 Decision A.2 / §P-VERIFY
+// TestRestoreSourceStorageIfNeeded is the ADR-0344 Decision A.2 / verification
 // table-driven unit test over (tier, priorHandoffState): Tier0 requires the
 // source-agent-reachability precondition (fails closed, condition set False)
 // before ConditionSourceStorageWriteRestored can be set True; all other

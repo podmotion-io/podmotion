@@ -30,7 +30,7 @@
 set -euo pipefail
 
 # ── Standing infra constants ─────────────────────────────────────────────────
-KVM_DIR="${KVM_DIR:-/home/chad/podmotion-kvm}"
+KVM_DIR="${KVM_DIR:-$HOME/podmotion-kvm}"
 SSH_KEY="${SSH_KEY:-$KVM_DIR/id_pmkvm}"
 HOSTS_ENV="${HOSTS_ENV:-$KVM_DIR/hosts.env}"
 KUBECONFIG_OUT="${KUBECONFIG_OUT:-$KVM_DIR/kubeconfig}"
@@ -158,8 +158,7 @@ CNI_LEFTOVER_REGISTRY=(
 # ── k3s (alternative reset-cluster mode, sprint50 k3s compat plan §1) ────────
 # k3s ships its own embedded containerd at different host paths than
 # kubeadm/standard-containerd (UNVERIFIED-EXTERNAL — not confirmed against a
-# live k3s node this round; see docs/sprints/sprint50-k3s/K3S-COMPATIBILITY-PLAN.md
-# §0 items 1-4 and §2 Round 2). K3S_CONTAINERD_SOCKET/K3S_CONTAINERD_STATE_DIR
+# live k3s node this round). K3S_CONTAINERD_SOCKET/K3S_CONTAINERD_STATE_DIR
 # below are the values a k3s deploy passes to the Helm chart
 # (agent.containerd.socketPath / agent.containerd.stateDir — see
 # charts/podmotion/values.yaml) and to CONTAINERD_ADDRESS for
@@ -1110,8 +1109,7 @@ cmd_deploy_podmotion_demo() {
 
   # ── Local access: always via the idempotent helper, never a hand-typed
   # `kubectl port-forward` ────────────────────────────────────────────────
-  # Recurring bug (podmotion/docs/proof/SESSION-HANDOFF-2026-07-24.md §5, hit
-  # at least 3 times in one session): a manually-typed port-forward after this
+  # Recurring bug (hit at least 3 times in one session): a manually-typed port-forward after this
   # function returns has repeatedly ended up pointed at svc/podmotion-demo-api
   # (backend only, 404s on "/") instead of svc/podmotion-demo-web (the
   # frontend, which also reverse-proxies /api/* — the only correct target for
@@ -1568,7 +1566,7 @@ cmd_provision_cilium() {
   echo "==> Cilium ready. CNI swap done at the install layer; run the cutover to remove Flannel/kube-proxy."
 }
 
-# ── multi-pool IPAM re-provision (ADR-0324 P-VERIFY-C escalation) ──
+# ── multi-pool IPAM re-provision (ADR-0324 verification check C escalation) ──
 # cluster-pool IPAM binds each node's pod CIDR to that node only, so the
 # ipam.cilium.io/ip pinning annotation used by CiliumHandoff.AnnotateDestPodIPAM
 # to preserve a source pod's IP on a DIFFERENT destination node can never be
@@ -1905,7 +1903,7 @@ echo "     -- after cleanup:"; sudo ls -la | sed "s/^/     /"
 
 # ── cutover: remove Flannel/kube-proxy remnants after Cilium is confirmed live ──
 # Authored artifact for the Flannel→Cilium CNI cutover step (ADR-0322/ADR-0318
-# P-VERIFY-B / P-VERIFY-0 precondition). Idempotent and order-safe: verifies Cilium
+# verification check B / verification check 0 precondition). Idempotent and order-safe: verifies Cilium
 # is Ready on all 3 nodes FIRST (refuses to remove Flannel/kube-proxy if Cilium is not
 # confirmed live — that would leave the cluster with no CNI), then removes the
 # kube-flannel DaemonSet/namespace and kube-proxy DaemonSet/configmap if present, and

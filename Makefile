@@ -92,26 +92,26 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # E2E tests target the STANDING KVM/libvirt kubeadm cluster (VMs pm-cp1/pm-w1/pm-w2 on
 # the libvirt `default` NAT network, 192.168.122.0/24). Node IPs are DHCP — do NOT
 # hardcode them; discover via `sudo virsh net-dhcp-leases default` or the CP1/W1/W2
-# vars in /home/chad/podmotion-kvm/hosts.env. Kind cluster creation is intentionally
+# vars in $(HOME)/podmotion-kvm/hosts.env. Kind cluster creation is intentionally
 # skipped. The cluster must be reachable via KUBECONFIG (default below points at the
 # standing cluster's admin kubeconfig). See CLAUDE.md "KVM kubeadm cluster — deploy
 # sequence" and hack/kvm-cluster.sh (verify | reset-cluster | deploy-podmotion | wipe).
 #
 # Optional env vars:
 #   CERT_MANAGER_INSTALL_SKIP=true  — skip cert-manager installation (default: skip on kubeadm)
-#   KUBECONFIG                      — path to kubeconfig (default: /home/chad/podmotion-kvm/kubeconfig)
+#   KUBECONFIG                      — path to kubeconfig (default: $(HOME)/podmotion-kvm/kubeconfig)
 #   E2E_LABEL_FILTER                — Ginkgo label filter (e.g. "proof" for the proof milestone only)
 
 E2E_TIMEOUT ?= 30m
 E2E_LABEL_FILTER ?=
-export KUBECONFIG ?= /home/chad/podmotion-kvm/kubeconfig
+export KUBECONFIG ?= $(HOME)/podmotion-kvm/kubeconfig
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Verify kubeadm cluster is reachable before running e2e tests
 	@echo "==> Verifying kubeadm cluster connectivity (KUBECONFIG=$(KUBECONFIG))..."
 	@kubectl cluster-info 2>/dev/null || { \
 		echo "ERROR: kubectl cannot reach the standing KVM kubeadm cluster."; \
-		echo "       Ensure KUBECONFIG points at the standing cluster (default /home/chad/podmotion-kvm/kubeconfig)"; \
+		echo "       Ensure KUBECONFIG points at the standing cluster (default $(HOME)/podmotion-kvm/kubeconfig)"; \
 		echo "       and that it is healthy: bash hack/kvm-cluster.sh verify"; \
 		exit 1; \
 	}

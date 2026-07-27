@@ -335,7 +335,7 @@ func TestStorageClassifier_TransparentVolumes_NotClassified(t *testing.T) {
 
 // TestStorageClassifier_BareNFSVolume_EarnsTier0 is the sprint53-kind EC2 regression: a pod-spec
 // volume that is a BARE `nfs:` source with no PersistentVolumeClaim wrapper — the shape used on a
-// cluster with no StorageClass/CSI (docs/sprints/sprint53-kind/STATUS-EC2-KUBEADM.md) — must be
+// cluster with no StorageClass/CSI — must be
 // classified TierRWX by real inspection of vol.NFS, not merely read as Tier0 by accident through
 // HighestTier's empty-classification-list default. Before this fix, ClassifyPod fell through the
 // "remaining non-PVC volumes are transparent" branch for an NFS volume exactly like it does for a

@@ -9,7 +9,7 @@ you may not use this file except in compliance with the License.
 
 package main
 
-// ADR-0363 §P-VERIFY assertion 2 ("Registration assertion") — closes a verification gap.
+// ADR-0363 verification assertion 2 ("Registration assertion") — closes a verification gap.
 //
 // The compile-time block in adapter.go (var _ fwk.FilterPlugin = (*Adapter)(nil), etc.) only
 // proves the Adapter TYPE satisfies the framework interfaces. It proves nothing about whether
@@ -66,7 +66,7 @@ users:
     token: fake-token
 `
 
-// TestMigrationAwarePluginRegistration proves ADR-0363 §P-VERIFY assertion 2: the constructed
+// TestMigrationAwarePluginRegistration proves ADR-0363 verification assertion 2: the constructed
 // scheduler command's plugin registry contains an entry for podmigration.PluginName
 // ("MigrationAware") whose factory produces a plugin satisfying both fwk.FilterPlugin and
 // fwk.ScorePlugin — built via the real main.go wiring, not a restatement of adapter.go's

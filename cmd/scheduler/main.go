@@ -49,7 +49,7 @@ import (
 // under podmigration.PluginName. Kubeconfig/client construction happens lazily, INSIDE the
 // closure, not at package/command-construction time: the factory only runs when the scheduler
 // command actually starts serving (Setup/Run), never during cobra flag parsing or --help — so
-// `podmotion-scheduler --help` exits 0 with no kubeconfig/cluster present (§P-VERIFY assertion
+// `podmotion-scheduler --help` exits 0 with no kubeconfig/cluster present (verification assertion
 // 4), and a missing/invalid kubeconfig fails the running binary loudly at startup rather than
 // producing a plugin that silently never gates anything.
 func newMigrationAwarePluginFactory() func(ctx context.Context, obj apimachineryruntime.Object, h fwk.Handle) (fwk.Plugin, error) {

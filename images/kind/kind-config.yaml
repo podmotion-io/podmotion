@@ -41,7 +41,7 @@ networking:
   # the forwarding plane and device plane contradict, cross-node pod packets are dropped,
   # and the agent's substrate detection (internal/agent/nmcregistrar/registrar.go) is
   # ambiguous. Disabling the default CNI makes flannel the single coherent plane.
-  # ADR-MAP: ADR-0202 (Sprint 35 Phase C §P-SUBSTRATE dual-CNI fix).
+  # ADR-MAP: ADR-0202 (Sprint 35 Phase C substrate dual-CNI fix).
   disableDefaultCNI: true
   podSubnet: "10.244.0.0/16"
   serviceSubnet: "10.96.0.0/12"
