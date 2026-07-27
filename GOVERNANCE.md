@@ -2,9 +2,7 @@
 
 PodMotion is an open-source project on a CNCF-track trajectory. This document
 describes how decisions are made and how the project is run. It is the
-authoritative operational document for governance; the originating decision
-record is **ADR-0091** (Vendor Neutrality, Maintainer Diversity, and
-Single-Company Committer Risk).
+authoritative operational document for PodMotion governance.
 
 ---
 
@@ -113,8 +111,8 @@ the nominee's organization's share of the maintainer team will remain below
 the next maintainer admitted **must come from a different organization** before
 the over-represented organization's nominee is admitted.
 
-This rule is encoded here as the authoritative operational constraint and
-recorded in **ADR-0091 §2** as the originating decision.
+This rule is the authoritative operational constraint on maintainer-team
+composition.
 
 ---
 
@@ -133,10 +131,10 @@ approvals arrive.
   maintainers decides.
 
 Significant technical decisions (architecture, security model, API compatibility
-breaks, new subsystem adoption) are recorded as **Architectural Decision Records
-(ADRs)** in `docs/adr/`. ADRs go through the standard lazy-consensus window;
-acceptance requires no veto and ≥ 1 explicit maintainer approval beyond the
-author.
+breaks, new subsystem adoption) are documented in the pull request that
+introduces them, together with its design notes, and go through the standard
+lazy-consensus window; acceptance requires no veto and ≥ 1 explicit maintainer
+approval beyond the author.
 
 ---
 
@@ -148,8 +146,8 @@ author.
   member of `@podmotion-io/security-reviewers`.
 - Authors may not approve their own PRs.
 - All required status checks must be green before merge.
-- Each commit must carry a **Signed-off-by** trailer (`git commit -s`) per
-  ADR-0090 (DCO enforcement).
+- Each commit must carry a **Signed-off-by** trailer (`git commit -s`) per the
+  project's Developer Certificate of Origin (DCO) policy.
 
 ---
 
@@ -193,8 +191,6 @@ Changes to this governance document require:
 2. A **7-day** comment window (extended from the standard 3 days given the
    significance of governance changes).
 3. Approval by **simple majority** of current maintainers with no veto.
-4. If the change alters a policy decision recorded in **ADR-0091**, a new ADR
-   or an amendment to ADR-0091 must be filed simultaneously.
 
 ---
 
@@ -205,6 +201,6 @@ and emeritus members.
 
 As of 2026-06-12, the project has **one maintainer** (single-organization,
 single-committer status). A concrete diversity plan with named milestones and
-outreach targets is documented in **ADR-0091 §3**. No CNCF sandbox application
+outreach targets is maintained by the project. No CNCF sandbox application
 will be filed until `MAINTAINERS.md` lists ≥ 2 maintainers from ≥ 2 distinct
 organizations (M-GOV-3, target 2026-09-30).

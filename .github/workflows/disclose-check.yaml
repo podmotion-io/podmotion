@@ -4,6 +4,11 @@ name: Disclosure Check
 # git-tracked file. Scans the tracked tree (git ls-files), so it covers source,
 # manifests, and docs — not just Markdown. Locally-ignored internal records
 # (.internal/, gitignored process dirs) are never tracked and so never scanned.
+#
+# The term list itself is NOT stored in this (tracked) file — that would be the
+# very leak this check exists to prevent. It lives in .internal/disclose-lexicon.txt,
+# which is gitignored and local-only, and is read at runtime below. On a checkout
+# where that file is absent (e.g. a clean public clone) the check no-ops.
 
 on: [push, pull_request]
 
@@ -15,13 +20,22 @@ jobs:
       - name: Check for internal-process vocabulary leakage
         run: |
           set -euo pipefail
-          # Word-boundary lexicon. Keep in sync with the disclosure policy.
-          LEXICON='thrix|frixel|murven|nultrix|ospen|brivex|belmid|feln|torge|drex|vorn|volm|14-reviewer|ADR-Firewall|scrum-master|Nav-Point|tessera|spetha|spethb'
-          # Exclude this workflow itself — it is the one file that must name the
-          # lexicon in order to enforce it.
+          LEXICON_FILE=".internal/disclose-lexicon.txt"
+          if [ ! -f "$LEXICON_FILE" ]; then
+            echo "SKIP: no local lexicon at $LEXICON_FILE — nothing to enforce."
+            echo "This check only runs where the internal lexicon is present"
+            echo "(local/internal working copies), never in a clean public checkout."
+            exit 0
+          fi
+          # Build a word-boundary alternation from the term list: drop blank lines
+          # and comments, then join the remaining terms with '|'.
+          LEXICON="$(grep -vE '^[[:space:]]*(#|$)' "$LEXICON_FILE" | paste -sd'|' -)"
+          if [ -z "$LEXICON" ]; then
+            echo "SKIP: lexicon file present but empty — nothing to enforce."
+            exit 0
+          fi
           hits="$(git ls-files \
             | grep -v '^\.internal/' \
-            | grep -v '^\.github/workflows/disclose-check.yaml$' \
             | tr '\n' '\0' \
             | xargs -0 grep -IilwE "$LEXICON" 2>/dev/null || true)"
           if [ -n "$hits" ]; then

@@ -74,9 +74,16 @@ docs/proof/*-STATE.yaml
 SPRINT*-PHASE-*-GATE-*.md
 docs/adr/PROOF_NS5_BETA_SPRINT_GATE.md
 
-# 0205/0206/0207 are the only ADRs at these numbers (verified) — safe as a range.
-# ADR-0226 uses the OTHER "ADR-"-prefixed naming convention this repo also uses
-# for ~9 legitimate public ADRs, so it stays a specific exclusion, not a wildcard.
+# Pre-publication remediation (2026-07-27): the entire ADR corpus, the proof
+# corpus, and the sprint records are internal-only and must never ship publicly.
+# They live durably under ip-vault/podmotion/ and remain in the working tree,
+# but are untracked. 0238 and 0239 are the sole intentional exceptions — they
+# stay tracked and are handled separately in a dedicated patent-sensitivity pass.
+# (Tracked files ignore .gitignore, so those two are unaffected by the line below.)
+docs/adr/
+docs/proof/
+
+# (superseded by the blanket docs/adr/ ignore above; kept for clarity of intent)
 docs/adr/020[5-7]-*.md
 docs/adr/ADR-0226-*.md
 
