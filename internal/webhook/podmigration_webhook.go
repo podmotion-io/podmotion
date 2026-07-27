@@ -76,60 +76,20 @@ func (v *PodMigrationValidator) Handle(ctx context.Context, req admission.Reques
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
-	// ADR-0212: lifecycle-UPDATE bypass — the spec-admission rules below (Rule 1 pod
-	// existence in particular) are CREATE-time premigration gates. They must NOT run on a
-	// deletion-path or terminal-phase UPDATE.
-	//
-	// Mechanism (§P-MECHANISM map, Sprint 35 gate-8): a Complete PodMigration has, by
-	// ADR-0012, already had its source pod deleted (source pod is removed only after
-	// TrafficVerified=True). When the CR is then deleted, the controller issues an UPDATE
-	// to RemoveFinalizer (podmigration_controller.go:3586). That UPDATE is intercepted by
-	// vpodmigration.kb.io [CREATE,UPDATE], Rule 1 calls getPod, gets IsNotFound, and DENIES
-	// the UPDATE ("pod <ns>/<name> not found"). The finalizer can never be removed → the CR
-	// wedges with a deletionTimestamp forever (§P-SUBSTRATE probe-2 stuck-finalizer HARD STOP).
-	//
-	// Fix: short-circuit ALLOW for any request where the object is being deleted
-	// (DeletionTimestamp set) or is already in a terminal phase. Spec is immutable in those
-	// states; there is nothing to re-validate, and the source pod is legitimately absent.
-	if isLifecycleOnlyRequest(req, pm) {
-		return admission.Allowed("lifecycle/finalizer UPDATE on deleting or terminal-phase PodMigration — spec admission rules skipped (ADR-0212)")
-	}
-
+	// ADR-0212 / round-2 revision (Finding 1, brittle-chain BLOCKING): the spec-admission
+	// rules below — Rule 1 pod existence in particular — are CREATE-time premigration gates.
+	// They must NOT run on a deletion-path, terminal-phase, or any other post-admission
+	// UPDATE. Rather than special-casing individual UPDATE shapes here (the round-1 approach,
+	// isLifecycleOnlyRequest, rejected: see docs/adr/0362), every CREATE-time premigration
+	// gate inside validate() is now scoped behind isCreate, which is derived directly from
+	// req.Operation — an apiserver-authenticated, immutable admission-request property, never
+	// a field in the object body (Finding 2 trust-boundary). No UPDATE can trip Rule 1 (or any
+	// other live-data premigration gate) any more, structurally, so no per-shape bypass
+	// function is needed at all.
 	if errs := v.validate(ctx, pm, req.Operation == admissionv1.Create); len(errs) > 0 {
 		return admission.Denied(errs.ToAggregate().Error())
 	}
 	return admission.Allowed("")
-}
-
-// isLifecycleOnlyRequest reports whether req is a delete-path or terminal-phase mutation
-// that carries no new migration intent and therefore must bypass CREATE-time spec admission
-// rules (notably Rule 1 source-pod existence). See ADR-0212.
-//
-// A request qualifies when EITHER:
-//   - the object is being deleted (metadata.deletionTimestamp != nil) — this is the
-//     finalizer-removal UPDATE the controller issues; OR
-//   - the operation is UPDATE and the object is already in a terminal phase
-//     (Complete / Failed / RollingBack / DryRunComplete), for which the source pod may
-//     legitimately no longer exist and the spec is no longer actionable.
-//
-// CREATE is never treated as lifecycle-only: a fresh migration must always be fully validated.
-func isLifecycleOnlyRequest(req admission.Request, pm *pmv1.PodMigration) bool {
-	if req.Operation == admissionv1.Create {
-		return false
-	}
-	if pm.DeletionTimestamp != nil {
-		return true
-	}
-	if req.Operation == admissionv1.Update {
-		switch pm.Status.Phase {
-		case pmv1.MigrationPhaseComplete,
-			pmv1.MigrationPhaseFailed,
-			pmv1.MigrationPhaseRollingBack,
-			pmv1.MigrationPhaseDryRunComplete:
-			return true
-		}
-	}
-	return false
 }
 
 // isTerminalPodMigrationPhase reports whether a PodMigration phase is a terminal outcome —
@@ -149,40 +109,59 @@ func isTerminalPodMigrationPhase(p pmv1.MigrationPhase) bool {
 
 // validate runs all admission rules and returns any field errors.
 //
-// isCreate is true only for CREATE operations. Rule 1b (concurrent-migration guard) is
-// CREATE-only by design: it exists to stop a second PodMigration from ever being admitted
-// against a pod that already has one in flight, not to re-litigate an already-admitted CR
-// on a later spec-preserving status/finalizer UPDATE.
+// isCreate is true only for CREATE operations (derived from req.Operation in Handle — an
+// apiserver-authenticated, immutable admission-request property, never read from the object
+// body). Round-2 revision of the Verifying-phase wedge fix (Finding 1, brittle-chain BLOCKING):
+// every CREATE-time premigration/environmental gate that depends on live cluster state (the
+// source pod, an NMC, or a remote federator) is scoped behind isCreate — Rule 1b already
+// demonstrated the correct pattern; this generalizes it to the whole class. Only Rule 3 (mode
+// enum) and Rule 10 (range validations) are pure pm.Spec self-checks with no live dependency,
+// so they alone remain unconditional: since spec is otherwise immutable post-admission, they
+// can never newly fail on UPDATE if they passed at CREATE.
+//
+// Net effect: no live pod fetch happens at all on UPDATE — the fetch itself lives inside the
+// isCreate block below — so there is no stale/zero-value pod result for a later rule to
+// (incorrectly) evaluate on an UPDATE, and no UPDATE can be denied by anything except Rule 3/10.
 func (v *PodMigrationValidator) validate(ctx context.Context, pm *pmv1.PodMigration, isCreate bool) field.ErrorList {
 	var allErrs field.ErrorList
 	spec := field.NewPath("spec")
 
-	// Rule 1: pod must exist
-	pod, err := v.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			allErrs = append(allErrs, field.Invalid(spec.Child("podName"), pm.Spec.PodName,
-				fmt.Sprintf("pod %s/%s not found", pm.Spec.PodNamespace, pm.Spec.PodName)))
-		} else {
-			allErrs = append(allErrs, field.InternalError(spec.Child("podName"), err))
-		}
-		// Can't proceed without the pod — remaining rules need it.
-		return allErrs
+	// Rule 3: mode enum (defence-in-depth — CRD enum already enforces this). Pure pm.Spec
+	// self-check, no live data — always safe to run on every operation.
+	switch pm.Spec.Mode {
+	case pmv1.MigrationModePreCopy, pmv1.MigrationModePostCopy, pmv1.MigrationModeCold, "":
+		// valid
+	default:
+		allErrs = append(allErrs, field.NotSupported(spec.Child("mode"), pm.Spec.Mode,
+			[]string{"PreCopy", "PostCopy", "Cold"}))
 	}
 
-	// Rule 1b: concurrent-migration guard (CREATE only).
-	//
-	// Root cause found live on the AWS kubeadm cluster (2026-07-21): two PodMigration CRs
-	// were created ~3s apart against the same source pod (pm-test-postgres-...-b4bds). Both
-	// were admitted — nothing here ever checked for an existing in-flight migration on the
-	// same pod. The first reached ADR-0356's Tier1-Longhorn early source release and deleted
-	// the source pod ahead of TrafficVerified; the second then failed its own Checkpoint step
-	// with "source pod not found" because the first had already removed it out from under it.
-	// That is not a checkpoint/controller bug — it is a missing admission invariant: at most
-	// one non-terminal PodMigration may target a given pod at a time. Enforce it here so the
-	// race can never be admitted in the first place, rather than trying to detect/recover from
-	// it after the fact in the controller.
 	if isCreate {
+		// Rule 1: pod must exist (CREATE-time premigration gate ONLY).
+		pod, err := v.getPod(ctx, pm.Spec.PodNamespace, pm.Spec.PodName)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				allErrs = append(allErrs, field.Invalid(spec.Child("podName"), pm.Spec.PodName,
+					fmt.Sprintf("pod %s/%s not found", pm.Spec.PodNamespace, pm.Spec.PodName)))
+			} else {
+				allErrs = append(allErrs, field.InternalError(spec.Child("podName"), err))
+			}
+			// Can't proceed without the pod — remaining CREATE-only rules need it.
+			return allErrs
+		}
+
+		// Rule 1b: concurrent-migration guard (CREATE only).
+		//
+		// Root cause found live on the AWS kubeadm cluster (2026-07-21): two PodMigration CRs
+		// were created ~3s apart against the same source pod (pm-test-postgres-...-b4bds). Both
+		// were admitted — nothing here ever checked for an existing in-flight migration on the
+		// same pod. The first reached ADR-0356's Tier1-Longhorn early source release and deleted
+		// the source pod ahead of TrafficVerified; the second then failed its own Checkpoint step
+		// with "source pod not found" because the first had already removed it out from under it.
+		// That is not a checkpoint/controller bug — it is a missing admission invariant: at most
+		// one non-terminal PodMigration may target a given pod at a time. Enforce it here so the
+		// race can never be admitted in the first place, rather than trying to detect/recover from
+		// it after the fact in the controller.
 		var pmList pmv1.PodMigrationList
 		if listErr := v.client.List(ctx, &pmList, client.InNamespace(pm.Spec.PodNamespace)); listErr != nil {
 			allErrs = append(allErrs, field.InternalError(spec.Child("podName"), fmt.Errorf("checking for concurrent migrations: %w", listErr)))
@@ -205,218 +184,210 @@ func (v *PodMigrationValidator) validate(ctx context.Context, pm *pmv1.PodMigrat
 				break
 			}
 		}
-	}
 
-	// Rule 2: UID match if specified
-	if pm.Spec.SourcePodUID != "" && string(pod.UID) != pm.Spec.SourcePodUID {
-		allErrs = append(allErrs, field.Invalid(spec.Child("sourcePodUID"), pm.Spec.SourcePodUID,
-			fmt.Sprintf("pod UID mismatch: live pod has UID %s", pod.UID)))
-	}
+		// Rule 2: UID match if specified
+		if pm.Spec.SourcePodUID != "" && string(pod.UID) != pm.Spec.SourcePodUID {
+			allErrs = append(allErrs, field.Invalid(spec.Child("sourcePodUID"), pm.Spec.SourcePodUID,
+				fmt.Sprintf("pod UID mismatch: live pod has UID %s", pod.UID)))
+		}
 
-	// Rule 3: mode enum (defence-in-depth — CRD enum already enforces this)
-	switch pm.Spec.Mode {
-	case pmv1.MigrationModePreCopy, pmv1.MigrationModePostCopy, pmv1.MigrationModeCold, "":
-		// valid
-	default:
-		allErrs = append(allErrs, field.NotSupported(spec.Child("mode"), pm.Spec.Mode,
-			[]string{"PreCopy", "PostCopy", "Cold"}))
-	}
-
-	// Rule 4: PostCopy requires userfaultfd on the source node
-	if pm.Spec.Mode == pmv1.MigrationModePostCopy {
-		sourceNode := pod.Spec.NodeName
-		if sourceNode != "" {
-			nmc, nmcErr := v.getNMC(ctx, sourceNode)
-			if nmcErr == nil && !nmc.Spec.KernelFeatures.Userfaultfd {
-				allErrs = append(allErrs, field.Forbidden(spec.Child("mode"),
-					fmt.Sprintf("PostCopy requires CONFIG_USERFAULTFD on source node %q; node reports userfaultfd=false", sourceNode)))
+		// Rule 4: PostCopy requires userfaultfd on the source node
+		if pm.Spec.Mode == pmv1.MigrationModePostCopy {
+			sourceNode := pod.Spec.NodeName
+			if sourceNode != "" {
+				nmc, nmcErr := v.getNMC(ctx, sourceNode)
+				if nmcErr == nil && !nmc.Spec.KernelFeatures.Userfaultfd {
+					allErrs = append(allErrs, field.Forbidden(spec.Child("mode"),
+						fmt.Sprintf("PostCopy requires CONFIG_USERFAULTFD on source node %q; node reports userfaultfd=false", sourceNode)))
+				}
 			}
 		}
-	}
 
-	// Rule M25-A: Reject IPv6-primary source pod addresses (ADR-0081).
-	// IPv6 and dual-stack pod migration is not supported in v0.1/v0.2.
-	if errs := validateIPv6PrimaryAddress(pod); len(errs) > 0 {
-		allErrs = append(allErrs, errs...)
-	}
+		// Rule M25-A: Reject IPv6-primary source pod addresses (ADR-0081).
+		// IPv6 and dual-stack pod migration is not supported in v0.1/v0.2.
+		if errs := validateIPv6PrimaryAddress(pod); len(errs) > 0 {
+			allErrs = append(allErrs, errs...)
+		}
 
-	// Rule M25-B: Reject IPSec-encrypted source nodes; enforce encryption-mode consistency (ADR-0102).
-	if pod.Spec.NodeName != "" {
-		srcNMC, nmcErr := v.getNMC(ctx, pod.Spec.NodeName)
-		if nmcErr == nil {
-			if srcNMC.Status.IPSecEncryption {
-				allErrs = append(allErrs, field.Forbidden(spec.Child("podName"),
-					fmt.Sprintf(
-						"source node %q uses CNI-managed IPSec encryption (XFRM pod-CIDR policies detected). "+
-							"IPSec migration is not supported in PodMotion v0.1/v0.2 (ADR-0102). "+
-							"WireGuard-encrypted overlays are supported. "+
-							"Track IPSec support at https://github.com/podmotion-io/podmotion/issues/IPSec",
-						pod.Spec.NodeName)))
-			}
-			// Cross-encryption-mode check (requires targetNodeName to be set).
-			if pm.Spec.TargetNodeName != "" {
-				dstNMC, dstErr := v.getNMC(ctx, pm.Spec.TargetNodeName)
-				if dstErr == nil {
-					srcHasWG := srcNMC.Spec.NetworkCapability.WireGuardInterface != ""
-					dstHasWG := dstNMC.Spec.NetworkCapability.WireGuardInterface != ""
-					if srcHasWG != dstHasWG {
-						allErrs = append(allErrs, field.Invalid(spec.Child("targetNodeName"), pm.Spec.TargetNodeName,
-							fmt.Sprintf(
-								"source node %q WireGuard=%v but destination node %q WireGuard=%v: "+
-									"cross-encryption-mode migration is not supported (ADR-0102). "+
-									"Ensure both nodes are part of the same encrypted overlay.",
-								pod.Spec.NodeName, srcHasWG, pm.Spec.TargetNodeName, dstHasWG)))
-					}
-					// Reject if destination node is IPv6-only (ADR-0081 §3).
-					if dstNMC.Status.ClusterIPFamily == pmv1.IPFamilySupportIPv6Only {
-						allErrs = append(allErrs, field.Invalid(spec.Child("targetNodeName"), pm.Spec.TargetNodeName,
-							fmt.Sprintf(
-								"destination node %q has IPv6-only primary interface (clusterIPFamily=IPv6Only). "+
-									"IPv6 migration is not supported in v0.1/v0.2 (ADR-0081). "+
-									"Track support at https://github.com/podmotion-io/podmotion/issues/IPv6",
-								pm.Spec.TargetNodeName)))
+		// Rule M25-B: Reject IPSec-encrypted source nodes; enforce encryption-mode consistency (ADR-0102).
+		if pod.Spec.NodeName != "" {
+			srcNMC, nmcErr := v.getNMC(ctx, pod.Spec.NodeName)
+			if nmcErr == nil {
+				if srcNMC.Status.IPSecEncryption {
+					allErrs = append(allErrs, field.Forbidden(spec.Child("podName"),
+						fmt.Sprintf(
+							"source node %q uses CNI-managed IPSec encryption (XFRM pod-CIDR policies detected). "+
+								"IPSec migration is not supported in PodMotion v0.1/v0.2 (ADR-0102). "+
+								"WireGuard-encrypted overlays are supported. "+
+								"Track IPSec support at https://github.com/podmotion-io/podmotion/issues/IPSec",
+							pod.Spec.NodeName)))
+				}
+				// Cross-encryption-mode check (requires targetNodeName to be set).
+				if pm.Spec.TargetNodeName != "" {
+					dstNMC, dstErr := v.getNMC(ctx, pm.Spec.TargetNodeName)
+					if dstErr == nil {
+						srcHasWG := srcNMC.Spec.NetworkCapability.WireGuardInterface != ""
+						dstHasWG := dstNMC.Spec.NetworkCapability.WireGuardInterface != ""
+						if srcHasWG != dstHasWG {
+							allErrs = append(allErrs, field.Invalid(spec.Child("targetNodeName"), pm.Spec.TargetNodeName,
+								fmt.Sprintf(
+									"source node %q WireGuard=%v but destination node %q WireGuard=%v: "+
+										"cross-encryption-mode migration is not supported (ADR-0102). "+
+										"Ensure both nodes are part of the same encrypted overlay.",
+									pod.Spec.NodeName, srcHasWG, pm.Spec.TargetNodeName, dstHasWG)))
+						}
+						// Reject if destination node is IPv6-only (ADR-0081 §3).
+						if dstNMC.Status.ClusterIPFamily == pmv1.IPFamilySupportIPv6Only {
+							allErrs = append(allErrs, field.Invalid(spec.Child("targetNodeName"), pm.Spec.TargetNodeName,
+								fmt.Sprintf(
+									"destination node %q has IPv6-only primary interface (clusterIPFamily=IPv6Only). "+
+										"IPv6 migration is not supported in v0.1/v0.2 (ADR-0081). "+
+										"Track support at https://github.com/podmotion-io/podmotion/issues/IPv6",
+									pm.Spec.TargetNodeName)))
+						}
 					}
 				}
 			}
 		}
-	}
 
-	// Rules 5-8: targetNodeName checks (only when explicitly set)
-	if pm.Spec.TargetNodeName != "" {
-		nmc, nmcErr := v.getNMC(ctx, pm.Spec.TargetNodeName)
-		if nmcErr != nil {
-			if apierrors.IsNotFound(nmcErr) {
-				allErrs = append(allErrs, field.Invalid(spec.Child("targetNodeName"), pm.Spec.TargetNodeName,
-					"no NodeMigrationCapacity found for this node; podmotion-agent may not be running there"))
-			} else {
-				allErrs = append(allErrs, field.InternalError(spec.Child("targetNodeName"), nmcErr))
-			}
-		} else {
-			// Rule 5: NMC readiness
-			if !nmc.Status.Ready {
-				allErrs = append(allErrs, field.Invalid(spec.Child("targetNodeName"), pm.Spec.TargetNodeName,
-					"NodeMigrationCapacity.status.ready=false; agent is not healthy on destination node"))
-			}
-
-			// Rule 6: CRIU present on destination
-			if nmc.Spec.CRIUVersion == "" {
-				allErrs = append(allErrs, field.Forbidden(spec.Child("targetNodeName"),
-					fmt.Sprintf("destination node %q has no CRIU version reported; CRIU must be installed", pm.Spec.TargetNodeName)))
-			}
-
-			// Rule 7: destination capacity
-			if nmc.Status.ActiveDestinationMigrations >= nmc.Spec.MaxConcurrentMigrationsDestination {
-				allErrs = append(allErrs, field.Forbidden(spec.Child("targetNodeName"),
-					fmt.Sprintf("destination node %q is at maximum concurrent migration capacity (%d/%d)",
-						pm.Spec.TargetNodeName,
-						nmc.Status.ActiveDestinationMigrations,
-						nmc.Spec.MaxConcurrentMigrationsDestination)))
-			}
-
-			// Rule 8: networkContinuity downgrade (warn via annotation, not reject)
-			// Handled in MutatingWebhook — see PodMigrationDefaulter.
-		}
-	}
-
-	// Rule 8b: hard nodeAffinity / nodeSelector pinning check
-	// If the source pod is pinned to its current node via hard constraints AND the caller
-	// has not opted out (affinityMode=patch|ignore), deny the migration.
-	if conflict, nodeName := detectHardNodeAffinity(pod); conflict {
-		switch pm.Spec.AffinityMode {
-		case pmv1.AffinityModePatch, pmv1.AffinityModeIgnore:
-			// Caller acknowledged the conflict — allow and let the controller handle it.
-		default: // AffinityModeStrict or unset → block
-			allErrs = append(allErrs, field.Forbidden(spec.Child("affinityMode"),
-				fmt.Sprintf("source pod has hard nodeAffinity pinning it to node %s; clear the affinity or set spec.affinityMode=patch|ignore before migrating", nodeName)))
-		}
-	}
-
-	// Rule 9: Tier 4 storage block
-	// Reject if any volume uses a hostPath, emptyDir with memory medium, or projected token volume
-	// when storageStrategy is not Skip (explicit user opt-out).
-	if pm.Spec.StorageStrategy != pmv1.StorageStrategySkip {
-		if tier4Reason := detectTier4Volume(pod); tier4Reason != "" {
-			allErrs = append(allErrs, field.Forbidden(spec.Child("storageStrategy"),
-				fmt.Sprintf("pod uses unsupported storage (%s); set storageStrategy=Skip to bypass at your own risk", tier4Reason)))
-		}
-	}
-
-	// Rule 10a: GPU migration gate — deny early if pod has GPU resources but gate is off.
-	// This prevents a migration from reaching the Checkpointing phase only to fail there.
-	// See ADR-0032: GPUMigration gate is never enabled by default.
-	if webhookPodHasGPU(pod) && !featuregate.IsEnabled(featuregate.GPUMigration) {
-		allErrs = append(allErrs, field.Forbidden(spec,
-			"GPU migration requires --feature-gates=GPUMigration=true"))
-	}
-
-	// Rule 10b: TCPPreservationMode=Strict/BestEffort admission gate (ADR-0047 critical safety).
-	// The full TCP preservation pipeline (eBPF zero-window hold, overlay FDB handoff via ADR-0048,
-	// PrepareDestinationNetns wiring, real TCP sequence verification) is NOT implemented until
-	// M20/M21. Admitting Strict/BestEffort today would guarantee TCP RST on every migrated
-	// connection while reporting success to the operator. Hard-block until the TCPPreservation
-	// feature gate is explicitly enabled by the operator.
-	if pm.Spec.TCPPreservationMode == "Strict" || pm.Spec.TCPPreservationMode == "BestEffort" {
-		if !featuregate.IsEnabled(featuregate.TCPPreservation) {
-			allErrs = append(allErrs, field.Forbidden(spec.Child("tcpPreservationMode"),
-				fmt.Sprintf("TCPPreservationMode=%s is not yet implemented: eBPF zero-window hold, overlay FDB handoff (ADR-0048), and TCP sequence verification are all stubs in this release. "+
-					"Enabling this mode would silently RST every preserved TCP connection while reporting success. "+
-					"Enable --feature-gates=TCPPreservation=true only after M21 lands the full implementation.",
-					pm.Spec.TCPPreservationMode)))
-		}
-	}
-
-	// Rule 10c: TCPPreservationMode=Strict requires TC clsact support on the destination node
-	// (ADR-0169). Enforced at admission — fail early before any dest netns is staged.
-	// No silent fallback: a substrate without clsact must use BestEffort.
-	if pm.Spec.TCPPreservationMode == "Strict" && featuregate.IsEnabled(featuregate.TCPPreservation) {
+		// Rules 5-8: targetNodeName checks (only when explicitly set)
 		if pm.Spec.TargetNodeName != "" {
-			// Direct case: named destination node — check its NMC.
-			destNMC, destNMCErr := v.getNMC(ctx, pm.Spec.TargetNodeName)
-			if destNMCErr != nil || !destNMC.Status.Ready || !destNMC.Spec.KernelFeatures.TCClsactSupported {
-				substrate := ""
-				if destNMCErr == nil {
-					substrate = fmt.Sprintf("%s/%s", destNMC.Spec.NetworkCapability.CNIPlugin, destNMC.Spec.KernelFeatures.KernelVersion)
+			nmc, nmcErr := v.getNMC(ctx, pm.Spec.TargetNodeName)
+			if nmcErr != nil {
+				if apierrors.IsNotFound(nmcErr) {
+					allErrs = append(allErrs, field.Invalid(spec.Child("targetNodeName"), pm.Spec.TargetNodeName,
+						"no NodeMigrationCapacity found for this node; podmotion-agent may not be running there"))
+				} else {
+					allErrs = append(allErrs, field.InternalError(spec.Child("targetNodeName"), nmcErr))
 				}
-				msg := fmt.Sprintf("tcpPreservationMode=Strict requires TC clsact support; node %q reports tcClsactSupported=false (substrate %s). Use tcpPreservationMode=BestEffort or target a clsact-capable node.", pm.Spec.TargetNodeName, substrate)
-				allErrs = append(allErrs, field.Forbidden(spec.Child("tcpPreservationMode"), msg))
+			} else {
+				// Rule 5: NMC readiness
+				if !nmc.Status.Ready {
+					allErrs = append(allErrs, field.Invalid(spec.Child("targetNodeName"), pm.Spec.TargetNodeName,
+						"NodeMigrationCapacity.status.ready=false; agent is not healthy on destination node"))
+				}
+
+				// Rule 6: CRIU present on destination
+				if nmc.Spec.CRIUVersion == "" {
+					allErrs = append(allErrs, field.Forbidden(spec.Child("targetNodeName"),
+						fmt.Sprintf("destination node %q has no CRIU version reported; CRIU must be installed", pm.Spec.TargetNodeName)))
+				}
+
+				// Rule 7: destination capacity
+				if nmc.Status.ActiveDestinationMigrations >= nmc.Spec.MaxConcurrentMigrationsDestination {
+					allErrs = append(allErrs, field.Forbidden(spec.Child("targetNodeName"),
+						fmt.Sprintf("destination node %q is at maximum concurrent migration capacity (%d/%d)",
+							pm.Spec.TargetNodeName,
+							nmc.Status.ActiveDestinationMigrations,
+							nmc.Spec.MaxConcurrentMigrationsDestination)))
+				}
+
+				// Rule 8: networkContinuity downgrade (warn via annotation, not reject)
+				// Handled in MutatingWebhook — see PodMigrationDefaulter.
 			}
-		} else {
-			// Scheduler-selected case: reject if NO ready NMC reports tcClsactSupported=true.
-			nmcList := &pmv1.NodeMigrationCapacityList{}
-			if listErr := v.client.List(ctx, nmcList); listErr == nil {
-				anyCapable := false
-				for i := range nmcList.Items {
-					n := &nmcList.Items[i]
-					if n.Status.Ready && n.Spec.KernelFeatures.TCClsactSupported {
-						anyCapable = true
-						break
+		}
+
+		// Rule 8b: hard nodeAffinity / nodeSelector pinning check
+		// If the source pod is pinned to its current node via hard constraints AND the caller
+		// has not opted out (affinityMode=patch|ignore), deny the migration.
+		if conflict, nodeName := detectHardNodeAffinity(pod); conflict {
+			switch pm.Spec.AffinityMode {
+			case pmv1.AffinityModePatch, pmv1.AffinityModeIgnore:
+				// Caller acknowledged the conflict — allow and let the controller handle it.
+			default: // AffinityModeStrict or unset → block
+				allErrs = append(allErrs, field.Forbidden(spec.Child("affinityMode"),
+					fmt.Sprintf("source pod has hard nodeAffinity pinning it to node %s; clear the affinity or set spec.affinityMode=patch|ignore before migrating", nodeName)))
+			}
+		}
+
+		// Rule 9: Tier 4 storage block
+		// Reject if any volume uses a hostPath, emptyDir with memory medium, or projected token volume
+		// when storageStrategy is not Skip (explicit user opt-out).
+		if pm.Spec.StorageStrategy != pmv1.StorageStrategySkip {
+			if tier4Reason := detectTier4Volume(pod); tier4Reason != "" {
+				allErrs = append(allErrs, field.Forbidden(spec.Child("storageStrategy"),
+					fmt.Sprintf("pod uses unsupported storage (%s); set storageStrategy=Skip to bypass at your own risk", tier4Reason)))
+			}
+		}
+
+		// Rule 10a: GPU migration gate — deny early if pod has GPU resources but gate is off.
+		// This prevents a migration from reaching the Checkpointing phase only to fail there.
+		// See ADR-0032: GPUMigration gate is never enabled by default.
+		if webhookPodHasGPU(pod) && !featuregate.IsEnabled(featuregate.GPUMigration) {
+			allErrs = append(allErrs, field.Forbidden(spec,
+				"GPU migration requires --feature-gates=GPUMigration=true"))
+		}
+
+		// Rule 10b: TCPPreservationMode=Strict/BestEffort admission gate (ADR-0047 critical safety).
+		// The full TCP preservation pipeline (eBPF zero-window hold, overlay FDB handoff via ADR-0048,
+		// PrepareDestinationNetns wiring, real TCP sequence verification) is NOT implemented until
+		// M20/M21. Admitting Strict/BestEffort today would guarantee TCP RST on every migrated
+		// connection while reporting success to the operator. Hard-block until the TCPPreservation
+		// feature gate is explicitly enabled by the operator.
+		if pm.Spec.TCPPreservationMode == "Strict" || pm.Spec.TCPPreservationMode == "BestEffort" {
+			if !featuregate.IsEnabled(featuregate.TCPPreservation) {
+				allErrs = append(allErrs, field.Forbidden(spec.Child("tcpPreservationMode"),
+					fmt.Sprintf("TCPPreservationMode=%s is not yet implemented: eBPF zero-window hold, overlay FDB handoff (ADR-0048), and TCP sequence verification are all stubs in this release. "+
+						"Enabling this mode would silently RST every preserved TCP connection while reporting success. "+
+						"Enable --feature-gates=TCPPreservation=true only after M21 lands the full implementation.",
+						pm.Spec.TCPPreservationMode)))
+			}
+		}
+
+		// Rule 10c: TCPPreservationMode=Strict requires TC clsact support on the destination node
+		// (ADR-0169). Enforced at admission — fail early before any dest netns is staged.
+		// No silent fallback: a substrate without clsact must use BestEffort.
+		if pm.Spec.TCPPreservationMode == "Strict" && featuregate.IsEnabled(featuregate.TCPPreservation) {
+			if pm.Spec.TargetNodeName != "" {
+				// Direct case: named destination node — check its NMC.
+				destNMC, destNMCErr := v.getNMC(ctx, pm.Spec.TargetNodeName)
+				if destNMCErr != nil || !destNMC.Status.Ready || !destNMC.Spec.KernelFeatures.TCClsactSupported {
+					substrate := ""
+					if destNMCErr == nil {
+						substrate = fmt.Sprintf("%s/%s", destNMC.Spec.NetworkCapability.CNIPlugin, destNMC.Spec.KernelFeatures.KernelVersion)
+					}
+					msg := fmt.Sprintf("tcpPreservationMode=Strict requires TC clsact support; node %q reports tcClsactSupported=false (substrate %s). Use tcpPreservationMode=BestEffort or target a clsact-capable node.", pm.Spec.TargetNodeName, substrate)
+					allErrs = append(allErrs, field.Forbidden(spec.Child("tcpPreservationMode"), msg))
+				}
+			} else {
+				// Scheduler-selected case: reject if NO ready NMC reports tcClsactSupported=true.
+				nmcList := &pmv1.NodeMigrationCapacityList{}
+				if listErr := v.client.List(ctx, nmcList); listErr == nil {
+					anyCapable := false
+					for i := range nmcList.Items {
+						n := &nmcList.Items[i]
+						if n.Status.Ready && n.Spec.KernelFeatures.TCClsactSupported {
+							anyCapable = true
+							break
+						}
+					}
+					if !anyCapable {
+						allErrs = append(allErrs, field.Forbidden(spec.Child("tcpPreservationMode"),
+							"tcpPreservationMode=Strict requires TC clsact support; no Ready node in the cluster reports tcClsactSupported=true. Use tcpPreservationMode=BestEffort or ensure at least one clsact-capable node is available."))
 					}
 				}
-				if !anyCapable {
-					allErrs = append(allErrs, field.Forbidden(spec.Child("tcpPreservationMode"),
-						"tcpPreservationMode=Strict requires TC clsact support; no Ready node in the cluster reports tcClsactSupported=true. Use tcpPreservationMode=BestEffort or ensure at least one clsact-capable node is available."))
-				}
+				// If list fails, allow admission (fail-open on webhook list failure; the pre-prewarm
+				// controller re-check is the binding gate on the scheduler-selected path).
 			}
-			// If list fails, allow admission (fail-open on webhook list failure; the pre-prewarm
-			// controller re-check is the binding gate on the scheduler-selected path).
+		}
+
+		// Rule 11: destinationCluster cross-cluster checks (ADR-0022, ADR-0034)
+		if pm.Spec.DestinationCluster != "" {
+			// Verify remote cluster connectivity.
+			if _, err := v.Federator.GetRemoteClient(pm.Spec.DestinationCluster); err != nil {
+				allErrs = append(allErrs, field.Invalid(spec.Child("destinationCluster"), pm.Spec.DestinationCluster,
+					fmt.Sprintf("cannot reach remote cluster: %v", err)))
+			}
+			// Warn via annotation: multi-cluster uses TIER_4 network (reconnect model).
+			// We surface this as an informational deny-override via an annotation rather
+			// than a rejection because the caller has explicitly opted in to cross-cluster.
+			webhookLog.Info("multi-cluster migration uses TIER_4 network reconnect model — IP preservation is not available",
+				"destinationCluster", pm.Spec.DestinationCluster, "migration", pm.Name)
 		}
 	}
 
-	// Rule 11: destinationCluster cross-cluster checks (ADR-0022, ADR-0034)
-	if pm.Spec.DestinationCluster != "" {
-		// Verify remote cluster connectivity.
-		if _, err := v.Federator.GetRemoteClient(pm.Spec.DestinationCluster); err != nil {
-			allErrs = append(allErrs, field.Invalid(spec.Child("destinationCluster"), pm.Spec.DestinationCluster,
-				fmt.Sprintf("cannot reach remote cluster: %v", err)))
-		}
-		// Warn via annotation: multi-cluster uses TIER_4 network (reconnect model).
-		// We surface this as an informational deny-override via an annotation rather
-		// than a rejection because the caller has explicitly opted in to cross-cluster.
-		webhookLog.Info("multi-cluster migration uses TIER_4 network reconnect model — IP preservation is not available",
-			"destinationCluster", pm.Spec.DestinationCluster, "migration", pm.Name)
-	}
-
-	// Rule 10: range validations
+	// Rule 10: range validations. Pure pm.Spec numeric bounds, no live dependency — always
+	// safe to re-run on every operation for the same reason as Rule 3.
 	if pm.Spec.PreCopyMaxRounds < 1 || pm.Spec.PreCopyMaxRounds > 20 {
 		allErrs = append(allErrs, field.Invalid(spec.Child("preCopyMaxRounds"), pm.Spec.PreCopyMaxRounds,
 			"must be between 1 and 20"))
@@ -466,20 +437,45 @@ func validateIPv6PrimaryAddress(pod *corev1.Pod) field.ErrorList {
 	return errs
 }
 
+// webhookHolderVolumeName is PodMotion's own injected holder-binary emptyDir
+// (see holderVolumeName in internal/controller/podmigration_controller.go and
+// podmotionHolderVolumeName in internal/agent/storage/classifier.go — kept as a
+// separate literal here, rather than a shared import, to avoid a webhook->controller
+// package dependency; all three names must stay in sync). It is disk-backed, so
+// without this exclusion a pod's SECOND migration (its pod spec already carries this
+// volume, injected by the mutating webhook during the first migration's replacement-pod
+// creation) would be admission-rejected as an unsupported disk-backed emptyDir, even
+// though the classifier itself always treats this exact volume as transparent
+// (classifier.go's podmotionHolderVolumeName exclusion). This volume holds no pod
+// data — it's recreated fresh on every migration — so it must never count as Tier4.
+const webhookHolderVolumeName = "podmotion-holder-bin"
+
 // detectTier4Volume returns a non-empty reason string if any pod volume is in the Tier 4 (blocked) category.
 //
 // Tier 4 volumes are those PodMotion cannot migrate because no standard copy path exists:
 //   - hostPath volumes (tied to a specific node's filesystem)
 //   - emptyDir with memory medium (ephemeral, can't be migrated meaningfully)
+//   - emptyDir with disk medium (default) holding pod-local state that no storage-tier
+//     migrator moves today — same terminal verdict internal/agent/storage/classifier.go's
+//     ClassifyPod independently reaches at PreCopyMemory time (ADR-0383). Catching it here
+//     rejects the PodMigration at admission instead of letting it run three phases before
+//     failing on the identical, already-knowable-at-admission-time reason.
 //   - projected ServiceAccountToken-only volumes are always re-created on restore — not blocked.
 func detectTier4Volume(pod *corev1.Pod) string {
 	for _, vol := range pod.Spec.Volumes {
 		if vol.HostPath != nil {
 			return fmt.Sprintf("hostPath volume %q (path: %s)", vol.Name, vol.HostPath.Path)
 		}
-		if vol.EmptyDir != nil && vol.EmptyDir.Medium == corev1.StorageMediumMemory {
+		if vol.EmptyDir == nil {
+			continue
+		}
+		if vol.EmptyDir.Medium == corev1.StorageMediumMemory {
 			return fmt.Sprintf("emptyDir volume %q with memory medium (tmpfs data is not migratable)", vol.Name)
 		}
+		if vol.Name == webhookHolderVolumeName {
+			continue // PodMotion's own injected holder volume — always transparent, never Tier4.
+		}
+		return fmt.Sprintf("disk-backed emptyDir volume %q (no storage-tier migrator moves this data today; remove the emptyDir or use a supported PVC-backed volume)", vol.Name)
 	}
 	return ""
 }

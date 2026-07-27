@@ -32,6 +32,7 @@ import (
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	"github.com/podmotion-io/podmotion/internal/agent/spotimds"
+	"github.com/podmotion-io/podmotion/internal/podlineage"
 )
 
 const (
@@ -212,7 +213,10 @@ func labelsOf(pod corev1.Pod) labels.Labels {
 func buildPodMigration(pod corev1.Pod, policy *pmv1.MigrationPolicy, timeoutSeconds int32) *pmv1.PodMigration {
 	return &pmv1.PodMigration{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "spot-reclaim-" + pod.Name + "-",
+			// Derive the CR name prefix from the STABLE ROOT workload name, not the
+			// (possibly already "-m-"/"-r-"-suffixed) current pod name, so reclaiming an
+			// already-migrated pod does not carry an accreted suffix into the CR name.
+			GenerateName: "spot-reclaim-" + podlineage.OriginalNameFromLabels(pod.Labels, pod.Name) + "-",
 			Namespace:    pod.Namespace,
 			Labels: map[string]string{
 				"migration.podmotion.io/trigger": "spot-reclaim",

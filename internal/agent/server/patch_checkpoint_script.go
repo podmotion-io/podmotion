@@ -143,11 +143,25 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
         # NOTE: procfs NOT here — policy keeps /proc root, drops only named submounts
     }
 
+    # ADR-0382: '/dev/shm' REMOVED from this set. It used to be dropped here
+    # unconditionally, symmetric with the (also since-corrected) dump-side --skip-mnt
+    # /dev/shm. Because dump no longer skips /dev/shm (criu_checkpointer.go), a real
+    # checkpoint now carries a genuine, content-populated /dev/shm tmpfs mountpoints
+    # entry — dropping it here would throw that captured content away right back to
+    # the pre-fix data-loss state, one step later in the pipeline. Leaving the entry
+    # in place lets it flow through to kept_mnt_ids, so any files.img REG fd under
+    # /dev/shm (e.g. a PostgreSQL POSIX-shmem segment) classifies KEEP instead of
+    # needing the ADR-0311 REBIND_TO_ROOT rescue — the rebind path remains in place
+    # below as defense-in-depth for any OTHER tmpfs mount that legitimately gets
+    # dropped, but /dev/shm itself no longer takes that path. See
+    # docs/adr/0382-devshm-content-capture.md.
+    # ADR-0415: DROP_PATHS carries the /proc and /sys STRUCTURAL carve-out ONLY (carve-out 1 —
+    # kernel-synthesized views that regenerate fresh on restore). The serviceaccount token tmpfs,
+    # /etc/{hosts,hostname,resolv.conf}, and /dev/termination-log are NO LONGER dropped here: they
+    # are pod-owned/runtime-provided mounts captured by default and internalized in the external
+    # loop below (owned => CRIU-owned + content). Dropping them was the ad hoc per-mount
+    # classification this ADR removes.
     DROP_PATHS = {
-        '/var/run/secrets/kubernetes.io/serviceaccount',
-        '/run/secrets/kubernetes.io/serviceaccount',  # canonical form (ADR-0190)
-        '/etc/hosts', '/etc/hostname', '/etc/resolv.conf',
-        '/dev/termination-log', '/dev/shm',
         '/proc/bus', '/proc/fs', '/proc/irq', '/proc/sys', '/proc/sysrq-trigger',
         '/proc/acpi', '/proc/scsi', '/proc/interrupts', '/proc/kcore', '/proc/keys',
         '/proc/latency_stats', '/proc/timer_list', '/proc/sched_debug',
@@ -306,55 +320,53 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
             root_mnt_id = e.get('mnt_id')
             break
 
-    # Identify and drop external entries. Collect the mnt_ids being dropped (ext_drop_mnt_ids)
-    # for the lockstep files.img rebind in the next section.
-    ext_drop_mnt_ids = {}  # mnt_id -> ext_key (for event emission)
-    reattach_kept_mnt_ids = set()  # mnt_ids preserved as shared/re-attach externals (Tier0 RWX)
+    # ADR-0415: capture everything the pod owns — no per-mount drop/preserve/internalize
+    # classification. Every kept mountpoints entry CRIU recorded EXTERNAL is exactly one of two
+    # things, and both carve-outs are STRUCTURAL (not judgment calls about whether content matters):
+    #
+    #   (a) an already-durable, storage-tier-managed PVC re-attach (carve-out 2) — matched by the
+    #       pod-spec-derived mountPath (or ext_key). PRESERVE its ext_key and rewrite its recorded
+    #       root/source to the destination kubelet volume dir so CRIU re-attaches the identically-
+    #       mounted DESTINATION volume (CRIU binds mi->source directly for an AUTODETECTED_MOUNT,
+    #       get_mp_root criu/mount.c 4.2; a Longhorn/literal-ext_key entry additionally needs the
+    #       emitted --ext-mount-map token). Multi-GB/TB volume content is re-attached, never tarred.
+    #
+    #   (b) an ORDINARY POD-OWNED mount — the /dev tmpfs, /dev/shm (a POSIX-shm tmpfs the ctr fast
+    #       path records as a sandbox bind, ext_key='/dev/shm'), the serviceaccount token tmpfs, any
+    #       pod-local tmpfs, or any OS construct a future runtime injects. INTERNALIZE it: clear
+    #       ext_key and set root='/' so CRIU OWNS it and lays its captured content back down (the
+    #       ADR-0413-proven CRIU-owned-mount -> CRIU-creates-and-fills primitive). No backing file
+    #       is pre-created (never zero-fill); the content comes from CRIU's own dump/restore engine
+    #       (its native tmpfs tar / shmem-pagemap re-lay), captured by default at dump.
+    #
+    # The /proc and /sys structural carve-out (carve-out 1) was already dropped above in Phase A/B.
+    # The pm-dev obscured-parent placeholder, the /dev/shm special-case, and the B-2 external-drop of
+    # pod-owned mounts (the four-site ad hoc classification) are ALL removed in favor of this single
+    # "owned => CRIU-owned + content" rule. See docs/adr/0415-*.md.
+    ext_drop_mnt_ids = {}  # retained for the files.img reconciliation ctx below; empty under ADR-0415
+                           # (no pod-owned external is dropped — owned mounts are internalized+kept)
+    reattach_kept_mnt_ids = set()  # mnt_ids preserved+rewritten as storage-tier PVC re-attaches (carve-out 2)
+    internalized_mnt_ids = set()   # mnt_ids re-owned to CRIU as internal tmpfs (owned-content capture)
     kept_after_ext_drop = []
     for e in kept:
         ext_key = e.get('ext_key')
         mnt_id = e.get('mnt_id')
         mp = e.get('mountpoint')
-        # Preserve shared/re-attach PVC externals: keep the entry so its files.img REG fds stay
-        # consistent (NOT dropped, NOT orphaned into the P-0193-1 hard-stop), and rewrite its recorded
-        # source so CRIU re-attaches the identically-mounted DESTINATION volume on restore.
-        #
-        # The match is on the MOUNTPOINT — the mount's real in-container identity, which equals the
-        # pod-spec PVC mountPath resolveReattachMounts derives (server.go) and threads in via argv[4].
-        # It is NOT the ext_key: CRIU 4.2's auto-external mode (--external mnt[]AUTO) records the
-        # ext_key of EVERY auto-detected external as the constant literal "CRIU:AUTOGENERATED", NOT the
-        # mountpoint (ground-truthed from a live postgres nfs4 PGDATA checkpoint: mnt_id=2263
-        # mountpoint=/var/lib/postgresql/data fstype=0 ext_key=CRIU:AUTOGENERATED). Keying preservation
-        # on the ext_key therefore NEVER matched a mountPath and silently B-2-dropped every RWX
-        # re-attach volume, orphaning its open data-file fds into the P-0193-1 hard-stop.
-        #
-        # CROSS-NODE SOURCE REWRITE (the postgres None/PreCopy restore wall): a preserved auto-detected
-        # external is restored by CRIU binding from mi->source DIRECTLY (get_mp_root in criu/mount.c
-        # 4.2 bypasses --ext-mount-map for AUTODETECTED_MOUNT). The recorded root/source is the SOURCE
-        # node's kubelet volume path (…/pods/<sourceUID>/volumes/kubernetes.io~*/<pv>), absent on the
-        # destination — CRIU open_tree()s it and ENOENTs at mount-v2.c:319. So when a destination host
-        # target is supplied for this mountpoint (argv[5]), rewrite the entry's root AND source to it
-        # (…/pods/<replUID>/…), preserving the leading-slash count CRIU uses to mark an external source
-        # ('//<abspath>'). No host target → source left intact; buildCRIURestoreArgs fail-closes
-        # upstream so CRIU is never invoked with a source-node-only path.
-        #
-        # Guard is unweakened: only a mount whose mountpoint (or ext_key) exactly matches a
-        # pod-spec-derived PVC mountPath is preserved; every other external (masked /proc bind, SA
-        # token, /dev/shm, /etc/* file binds — none of which mount at a PVC path) is still dropped.
-        if ext_key and mnt_id is not None and (mp in reattach_mount_paths or ext_key in reattach_mount_paths):
+        if not ext_key or mnt_id is None:
+            # Not external (or missing mnt_id) — an ordinary in-container mount; keep unchanged.
+            kept_after_ext_drop.append(e)
+            continue
+        # (a) storage-tier PVC re-attach (carve-out 2): preserve + rewrite recorded source to the
+        # destination kubelet volume dir. Matched on the pod-spec-derived mountPath (or ext_key).
+        if mp in reattach_mount_paths or ext_key in reattach_mount_paths:
             reattach_kept_mnt_ids.add(mnt_id)
-            # Tier label for diagnostics only (argv[6]) — does NOT change which entries are preserved
-            # or how the source is rewritten below; both tiers share the identical mechanism (see
-            # argv[6] doc comment above for why a Longhorn re-attach must not be reported as Tier0 RWX).
             _is_tier1 = mp in reattach_tier1_mount_paths
             _tier_label = 'Tier1-Longhorn' if _is_tier1 else 'Tier0 RWX'
             host_target = reattach_host_targets.get(mp) or reattach_host_targets.get(ext_key)
             if host_target:
-                # Whole-volume re-attach (the common case, incl. the postgres gate workload): the
-                # recorded source IS the kubelet volume dir, so it is replaced wholesale with the
-                # destination volume dir. (A k8s volumeMount subPath, which would bake a suffix beyond
-                # the volume dir into the recorded source, is a known unhandled edge — resolveReattachMounts
-                # resolves the volume dir, not the subPath; tracked as follow-up.)
+                # Whole-volume re-attach: the recorded source IS the kubelet volume dir, replaced
+                # wholesale with the destination volume dir (leading-slash count preserved — CRIU
+                # marks an external source as '//<abspath>').
                 for _f in ('root', 'source'):
                     _orig = e.get(_f)
                     if isinstance(_orig, str) and _orig:
@@ -362,27 +374,10 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
                         e[_f] = ('/' * _lead) + host_target.lstrip('/')
                 print('mountpoints: re-attach mnt_id=%d mountpoint=%s root/source rewritten to destination kubelet dir %s (%s cross-node; CRIU binds mi->source directly for AUTODETECTED_MOUNT)' % (
                     mnt_id, mp, host_target, _tier_label))
-                # mount.c:3141 fix (Tier1-Longhorn "No mapping for <id>:(null) mountpoint"):
-                # the root/source rewrite above is the correct — and ONLY — restore lever for a
-                # TRUE CRIU AUTODETECTED_MOUNT external, whose ext_key is the CRIU-internal
-                # constant literal 'CRIU:AUTOGENERATED': get_mp_root() (criu/mount.c 4.2) special-
-                # cases that exact ext_key and binds from the recorded mi->source directly,
-                # bypassing --ext-mount-map entirely. That bypass was ground-truthed only against
-                # a Tier0 NFS PGDATA checkpoint (ext_key literally 'CRIU:AUTOGENERATED' — see
-                # server.go's reattachHostTargets doc). A Longhorn-backed PVC is mounted from a
-                # real, locally-resolvable block device (an attached Longhorn/iSCSI device
-                # formatted ext4/xfs) — the SAME topological shape CRIU records for ADR-0194's
-                # /data case (mnt_id 2951, source=/dev/nvme0n1p2, ext_key='/data', a LITERAL key,
-                # NOT 'CRIU:AUTOGENERATED'). For a literal ext_key, get_mp_root takes the OTHER
-                # branch: ext = ext_mount_lookup(me->ext_key); if (!ext) "No mapping for
-                # <id>:(null) mountpoint" — the exact wall live-proven against Tier1-Longhorn
-                # restore. So: whenever the entry's REAL on-disk ext_key (read here, not assumed)
-                # is anything other than the CRIU auto-detect constant, also emit a structured
-                # token so buildCRIURestoreArgs can supply the required
-                # --ext-mount-map <ext_key>:<host_target> for THIS entry's actual key. This is a
-                # no-op for the proven AUTODETECTED_MOUNT/Tier0 case (CRIU bypasses the map lookup
-                # for that branch, so an unused extra map entry changes nothing) and is the actual
-                # fix for the literal-ext_key/Tier1-Longhorn case.
+                # For a literal (non-'CRIU:AUTOGENERATED') ext_key (the Longhorn/local-block-device
+                # shape), get_mp_root takes the ext_mount_lookup(ext_key) branch, so also emit a
+                # token so buildCRIURestoreArgs supplies --ext-mount-map <ext_key>:<host_target>. A
+                # no-op for the AUTODETECTED_MOUNT/Tier0 case (CRIU bypasses the map lookup there).
                 if ext_key != 'CRIU:AUTOGENERATED':
                     print('CRIU_REATTACH_EXT_MOUNT_MAP:{"mnt_id":%d,"mountpoint":"%s","ext_key":"%s","host_target":"%s"}' % (
                         mnt_id, mp.replace('"', '\\"'), ext_key.replace('"', '\\"'), host_target.replace('"', '\\"')))
@@ -390,33 +385,26 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
             print('mountpoints: preserving re-attach external mnt_id=%d mountpoint=%s ext_key=%s (%s)' % (
                 mnt_id, mp, ext_key, _tier_label))
             continue
-        if ext_key and mnt_id is not None:
-            # P-0194-1b re-entry guard (H2): before dropping, assert no kept entry references
-            # this mnt_id as parent_mnt_id (i.e. confirm it is a leaf — AC-1 re-assertion).
-            referencing_parents = [x for x in kept if x.get('parent_mnt_id') == mnt_id and x.get('mnt_id') != mnt_id]
-            if referencing_parents:
-                print('EXTERNAL_MOUNT_UNRESOLVED:{"mnt_id":%d,"ext_key":"%s","shared_id":0,"master_id":0,"reason":"non_leaf_external"}' % (
-                    mnt_id, ext_key.replace('"', '\\"')), file=sys.stderr)
-                sys.exit(1)
-            ext_drop_mnt_ids[mnt_id] = ext_key
-            # Emit CRIUExternalMountDropped event token (H4 / Platform PM C-2).
-            # ext_key is the path (e.g. "/data") — safe as a name, not a full volume path.
-            print('CRIU_EXTERNAL_MOUNT_DROPPED:{"mnt_id":%d,"ext_key":"%s","source":"%s"}' % (
-                mnt_id,
-                ext_key.replace('"', '\\"'),
-                (e.get('source') or '').replace('"', '\\"')))
-        else:
-            kept_after_ext_drop.append(e)
+        # (b) ordinary pod-owned mount: internalize so CRIU owns + fills it with captured content.
+        # P-0194-1b (SC-3): a mount with non-zero shared_id/master_id was already hard-stopped above
+        # (collapsing a propagation-peer group is forbidden), so internalizing here is safe.
+        e.pop('ext_key', None)
+        e['root'] = '/'
+        internalized_mnt_ids.add(mnt_id)
+        kept_after_ext_drop.append(e)
+        print('mountpoints: ADR-0415 internalizing owned mount mnt_id=%d mountpoint=%s (was ext_key=%s) -> CRIU-owned tmpfs so its captured content is recreated+filled' % (
+            mnt_id, mp, ext_key))
 
     img['entries'] = kept_after_ext_drop
     # Build the set of kept mountpoints mnt_ids AFTER external-drop (for P-0193-1 + P-0194-1c).
     kept_mnt_ids = {e['mnt_id'] for e in kept_after_ext_drop if 'mnt_id' in e}
 
-    # P-0194-1 (H2 re-entry guard / P-0194-1c pre-check): verify no external entry survives
-    # WITHOUT a mapping. Under B-2 all external entries were dropped above EXCEPT the deliberately
-    # preserved shared/re-attach PVC externals (reattach_kept_mnt_ids), whose recorded source was
-    # rewritten above to the destination kubelet volume dir so CRIU auto-binds them on restore. Any
-    # OTHER surviving external entry is unmapped — HARD-STOP before writing the image.
+    # ADR-0415 P-0194-1 (H2 re-entry guard): verify no external entry survives that we did not
+    # deliberately keep. The ONLY entries that legitimately retain an ext_key are the storage-tier
+    # PVC re-attaches (reattach_kept_mnt_ids), whose recorded source was rewritten above to the
+    # destination kubelet volume dir. Every pod-owned external was INTERNALIZED above (ext_key
+    # cleared), so it has no ext_key here. Any OTHER surviving external entry is an unmapped
+    # external — HARD-STOP before writing the image.
     for e in kept_after_ext_drop:
         if e.get('ext_key') and e.get('mnt_id') not in reattach_kept_mnt_ids:
             print('EXTERNAL_MOUNT_UNRESOLVED:{"mnt_id":%d,"ext_key":"%s","shared_id":0,"master_id":0,"reason":"survived_drop"}' % (
@@ -734,13 +722,12 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
     # from kept_mnt_ids), AND files.img must have no REG fd still referencing those dropped mnt_ids.
     # This is the both-or-neither enforcement at the assertion layer.
     #
-    # Shared/re-attach PVC externals (reattach_kept_mnt_ids) are DELIBERATELY preserved with their
-    # ext_key intact — CRIU re-attaches them on restore by binding from the (rewritten-to-destination)
-    # recorded source, not by dropping them. They are therefore EXEMPT from the "surviving external"
-    # mismatch: their presence in the
-    # mountpoints image is the intended state, and their files.img fds are kept-consistent (KEEP),
-    # not dangling references to a dropped mnt_id. Only a B-2-dropped external surviving unexpectedly
-    # (or a files.img fd still pointing at a dropped mnt_id) is a real dual-write mismatch.
+    # ADR-0415: Shared/re-attach PVC externals (reattach_kept_mnt_ids) are the ONLY entries
+    # DELIBERATELY preserved with their ext_key intact — CRIU re-attaches them on restore by binding
+    # from the (rewritten-to-destination) recorded source. They are therefore EXEMPT from the
+    # "surviving external" mismatch. Every pod-owned external was internalized (ext_key cleared), so
+    # it carries no ext_key here and cannot appear in this set. Any other surviving external (or a
+    # files.img fd still pointing at a dropped mnt_id) is a real dual-write mismatch.
     with open(mp_path, 'rb') as f:
         mp_img_final = pycriu.images.load(f)
     surviving_ext_in_mp = {e['mnt_id'] for e in mp_img_final.get('entries', [])

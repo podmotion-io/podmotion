@@ -82,6 +82,12 @@ rules:
   - apiGroups: [storage.k8s.io]
     resources: [storageclasses]
     verbs: [get, list, watch]
+  # ADR-0393 note: the operator's snapshot-HMAC Secret grant (create/get/update on the single
+  # podmotion-operator-snapshot-hmac Secret) is deliberately NOT on this cluster-wide ClusterRole.
+  # `create` cannot be resourceName-scoped, so a cluster-wide `secrets: [create]` would let the
+  # operator SA create a Secret in ANY namespace. The grant is instead a namespaced Role +
+  # RoleBinding confined to the operator's own namespace ({{ .Release.Namespace }}) — see
+  # templates/role.yaml (podmotion-operator-snapshot-hmac-role).
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

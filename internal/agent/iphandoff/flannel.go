@@ -19,9 +19,5 @@ package iphandoff
 // clusters — TCP connections are not preserved across the migration.
 type FlannelHandoff struct{}
 
-// LiveMigrationEligible always returns false for Flannel. Called by the compat
-// prober and the admission webhook to enforce the cold-migration-only policy.
-func (f *FlannelHandoff) LiveMigrationEligible() bool { return false }
-
 // Name returns the identifier used in logs and metrics.
 func (f *FlannelHandoff) Name() string { return "flannel-cold-only" }

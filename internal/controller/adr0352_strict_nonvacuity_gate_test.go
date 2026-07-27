@@ -8,21 +8,25 @@ you may not use this file except in compliance with the License.
 package controller
 
 // adr0352_strict_nonvacuity_gate_test.go is the falsifiable regression proof for the ADR-0352
-// B8-DR-2 / D6(i) / DR-23 Strict NON-VACUITY guard added to reconcileTCPVerifying.
+// B8-DR-2 / D6(i) / DR-23 Strict NON-VACUITY guard added to reconcileTCPVerifying, updated per
+// ADR-0388 (docs/adr/0388-strict-vacuous-pass-and-default.md), which corrects ADR-0352 B8-DR-2.
 //
-// The defect this closes (Validation cycle 1, live-migration-race lens): under Strict,
-// VerifyTCP's stateless fast path returns Verified=true with ConnectionsExpected=0 when there
-// were no source SeqSnapshots and no destination ESTABLISHED sockets. The controller gate
-// previously inferred TCP continuity from a trivially-true measuredSeqDelta==0 and never read
-// the authoritative connection count, so a Strict migration that preserved ZERO connections
-// reached Complete — a vacuous proof that authorises source-pod deletion without ever exercising
-// the preservation datapath (the exact "0/0 connections" completion the panel declared a FAIL).
+// Historical defect this originally closed (a live-migration connection-preservation race): under
+// Strict, VerifyTCP's stateless fast path returns Verified=true with ConnectionsExpected=0 when
+// there were no source SeqSnapshots and no destination ESTABLISHED sockets. The controller gate
+// previously inferred TCP continuity from a trivially-true measuredSeqDelta==0 and never read the
+// authoritative connection count, so a Strict migration that preserved ZERO connections reached
+// Complete — a vacuous proof that must be treated as a FAIL.
 //
-// The guard reads vtcpResp.ConnectionsExpected / ConnectionsVerified directly and fails closed.
-// This test drives reconcileTCPVerifying through a real AgentClientPool + gRPC spy so the fix is
-// falsifiable in BOTH directions: a 0/0 response must roll back; a real held-connection response
-// must pass. A future refactor that reintroduces the vacuity goes red here instead of shipping a
-// byte-identical green.
+// ADR-0388 correction: Chad's standing direction (2026-07-23) established that a GENUINE zero
+// (nothing held, nothing to preserve) is TRIVIALLY SATISFIED under Strict, not vacuous — the 0/0
+// completion above is now the INTENDED pass, not a defect. What remains a hard failure is a real
+// MISMATCH: ConnectionsExpected>0 but ConnectionsVerified!=ConnectionsExpected (a connection that
+// was expected to survive and did not). This test drives reconcileTCPVerifying through a real
+// AgentClientPool + gRPC spy so both directions stay falsifiable: a genuine 0/0 must pass; a real
+// held-connection response must pass; a mismatched response must still roll back. A future
+// refactor that reintroduces failure on an honest zero, or that stops failing on a genuine
+// mismatch, goes red here instead of shipping a byte-identical green.
 
 import (
 	"context"
@@ -67,13 +71,13 @@ func TestReconcileTCPVerifying_StrictNonVacuityGate(t *testing.T) {
 		wantReason    string
 	}{
 		{
-			// The stateless VerifyTCP fast path: Verified=true but ConnectionsExpected=0.
-			// Under Strict this is a vacuous proof and MUST fail closed to rollback.
-			name:          "vacuous_0_of_0_fails_closed_to_rollback",
+			// ADR-0388: the stateless VerifyTCP fast path (Verified=true, ConnectionsExpected=0)
+			// is now TRIVIALLY SATISFIED under Strict — nothing was held, nothing needed to be
+			// preserved — and MUST pass through to ServiceVerifying, not roll back.
+			name:          "trivially_satisfied_0_of_0_passes_to_serviceverifying",
 			resp:          &agentpb.VerifyTCPResponse{Verified: true, ConnectionsVerified: 0, ConnectionsExpected: 0},
-			wantPhase:     pmv1.MigrationPhaseRollingBack,
-			wantCondFalse: true,
-			wantReason:    "VacuousTCPProof",
+			wantPhase:     pmv1.MigrationPhaseServiceVerifying,
+			wantCondFalse: false,
 		},
 		{
 			// A genuine held connection: ConnectionsExpected>0, all verified, seq_delta==0.
@@ -82,6 +86,16 @@ func TestReconcileTCPVerifying_StrictNonVacuityGate(t *testing.T) {
 			resp:          &agentpb.VerifyTCPResponse{Verified: true, ConnectionsVerified: 2, ConnectionsExpected: 2, SndSeqDeltaMax: 0, RcvSeqDeltaMax: 0},
 			wantPhase:     pmv1.MigrationPhaseServiceVerifying,
 			wantCondFalse: false,
+		},
+		{
+			// ADR-0388 does NOT touch a genuine mismatch: ConnectionsExpected>0 but not all
+			// verified is a real connection that was expected to survive and did not — still
+			// MUST fail closed to rollback.
+			name:          "mismatch_partial_verification_fails_closed_to_rollback",
+			resp:          &agentpb.VerifyTCPResponse{Verified: true, ConnectionsVerified: 1, ConnectionsExpected: 2},
+			wantPhase:     pmv1.MigrationPhaseRollingBack,
+			wantCondFalse: true,
+			wantReason:    "VacuousTCPProof",
 		},
 	}
 

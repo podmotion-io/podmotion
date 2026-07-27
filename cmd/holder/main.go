@@ -21,6 +21,15 @@ Licensed under the Apache License, Version 2.0.
 // The resulting binary is statically linked (CGO_ENABLED=0) and resolves inside a
 // FROM-scratch rootfs via the emptyDir mount at /podmotion/holder — no base-image tool dependency.
 //
+// The holder performs no CPU-bound work and needs no cgroup-aware GOMAXPROCS. Go 1.25 made the
+// runtime open and HOLD an O_RDONLY fd to the host-cgroupns cpu.max file to watch the CPU limit;
+// CRIU cannot map that host-path fd to a restorable mount and fails the whole dump of a
+// holder-rooted source pod (ADR-0411, criu/files-reg.c:1790). Disabling containermaxprocs stops
+// the runtime opening that fd. This MUST be the build-baked godebug directive below — env
+// GOMAXPROCS does NOT stop it (proven a non-fix in the ADR-0411 mechanism map §4). The directive
+// is honored because go.mod pins go 1.25.7 (≥1.21) and this is package main.
+//
+//go:debug containermaxprocs=0
 package main
 
 import (

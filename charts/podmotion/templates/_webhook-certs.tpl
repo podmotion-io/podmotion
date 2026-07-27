@@ -42,6 +42,23 @@ true
 {{- end -}}
 {{- end -}}
 
+{{/*
+podmotion.evictionEnabled — nil-safe accessor for webhook.eviction.enabled (ADR-0401).
+Defaults to true when the key is absent (e.g. helm upgrade --reuse-values from a release
+installed before this value existed), so the fail-closed eviction guard is on by default and
+an old reuse-values upgrade does NOT silently disable source-pod protection. Returns "true"
+or "" (falsey).
+*/}}
+{{- define "podmotion.evictionEnabled" -}}
+{{- $w := .Values.webhook | default dict -}}
+{{- $ev := $w.eviction | default dict -}}
+{{- if hasKey $ev "enabled" -}}
+{{- if $ev.enabled }}true{{ end -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
 {{- define "podmotion.webhookSelfSignedCert" -}}
 {{- if not (index $ "podmotionWebhookCert") -}}
   {{- $altNames := list (printf "podmotion-webhook-service.%s.svc" .Release.Namespace) (printf "podmotion-webhook-service.%s.svc.cluster.local" .Release.Namespace) -}}

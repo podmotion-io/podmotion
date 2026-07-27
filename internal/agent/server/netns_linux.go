@@ -1,9 +1,9 @@
+//go:build linux
+
 /*
 Copyright 2026 PodMotion Authors.
 Licensed under the Apache License, Version 2.0.
 */
-
-//go:build linux
 
 package server
 
@@ -26,7 +26,9 @@ import (
 // (e.g. /run/podmotion/netns/pm-mig-<uid>) which CRIU receives via
 // --join-ns net:<dest_netns_fd> during restore.
 //
-// The returned dest_vtep_mac is the destination node's flannel.1 VTEP MAC address.
+// The returned dest_vtep_mac is the destination node's VTEP MAC address, for whatever
+// VXLAN-class overlay device this node actually has (ADR-0386 — discovered via
+// network.DiscoverFdbInterface's link-type discrimination, no "flannel.1" literal).
 // The controller injects this into the AF_BRIDGE FDB on the source node so that VXLAN
 // frames for the source pod IP are encapsulated toward the destination VTEP.
 func (s *AgentServer) PrepareDestinationNetns(ctx context.Context, req *agentpb.PrepareDestinationNetnsRequest) (*agentpb.PrepareDestinationNetnsResponse, error) {
@@ -78,17 +80,45 @@ func (s *AgentServer) PrepareDestinationNetns(ctx context.Context, req *agentpb.
 			"migration", req.MigrationName, "image", *req.WorkloadImage)
 	}
 
-	// Discover the local VTEP MAC from the flannel.1 interface.
-	// The flannel annotation JSON is not available here (the server does not have k8s API access
-	// at this call site), so we fall directly to the RTM_GETLINK path on flannel.1.
-	vtepMAC, err := network.DiscoverVTEPMAC(ctx, "", "flannel.1")
-	if err != nil {
-		// Non-fatal in environments where flannel.1 may not be present (e.g. Cilium, Calico).
-		// Return the netns path with an empty VTEP MAC and let the controller decide.
-		log.Info("PrepareDestinationNetns: VTEP MAC discovery failed — returning empty mac",
-			"migration", req.MigrationName, "err", err)
+	// ADR-0386: resolve the VTEP device by link-type discrimination (network.DiscoverFdbInterface,
+	// ADR-0192 Site B B4) instead of the "flannel.1" name literal this call site previously hardcoded.
+	// DiscoverFdbInterface enumerates host interfaces via RTM_GETLINK and returns the first
+	// IFLA_INFO_KIND=="vxlan" link it finds, whatever that device is actually named on this
+	// substrate — it returns "" (not an error) when no VXLAN overlay device exists at all (e.g.
+	// Cilium's geneve/native-routing datapath, kindnet). The flannel annotation JSON is not
+	// available here (the server does not have k8s API access at this call site), so once a
+	// device name is resolved we still fall through to DiscoverVTEPMAC's RTM_GETLINK path on it.
+	fdbIfName, fdbErr := network.DiscoverFdbInterface()
+	if fdbErr != nil {
+		log.Info("PrepareDestinationNetns: VXLAN overlay device discovery error — returning empty mac",
+			"migration", req.MigrationName, "err", fdbErr)
 		return &agentpb.PrepareDestinationNetnsResponse{
-			Ready:      true,
+			Ready:       true,
+			DestNetnsFd: ns.NetnsPath,
+			DestVtepMac: "",
+		}, nil
+	}
+	if fdbIfName == "" {
+		// No VXLAN-class device on this node at all — substrate has no FDB/VTEP overlay to
+		// discover a MAC for (Cilium geneve/native routing, kindnet host-routing, etc.). This is
+		// the expected, non-fatal steady state on those substrates, not a discovery failure.
+		log.Info("PrepareDestinationNetns: no VXLAN overlay device on this node — returning empty mac",
+			"migration", req.MigrationName)
+		return &agentpb.PrepareDestinationNetnsResponse{
+			Ready:       true,
+			DestNetnsFd: ns.NetnsPath,
+			DestVtepMac: "",
+		}, nil
+	}
+
+	vtepMAC, err := network.DiscoverVTEPMAC(ctx, "", fdbIfName)
+	if err != nil {
+		// Non-fatal: the discovered device disappeared or is unreadable between discovery and
+		// lookup. Return the netns path with an empty VTEP MAC and let the controller decide.
+		log.Info("PrepareDestinationNetns: VTEP MAC discovery failed — returning empty mac",
+			"migration", req.MigrationName, "fdbIfName", fdbIfName, "err", err)
+		return &agentpb.PrepareDestinationNetnsResponse{
+			Ready:       true,
 			DestNetnsFd: ns.NetnsPath,
 			DestVtepMac: "",
 		}, nil
@@ -101,7 +131,7 @@ func (s *AgentServer) PrepareDestinationNetns(ctx context.Context, req *agentpb.
 		"vtepMAC", vtepMACStr,
 	)
 	return &agentpb.PrepareDestinationNetnsResponse{
-		Ready:      true,
+		Ready:       true,
 		DestNetnsFd: ns.NetnsPath,
 		DestVtepMac: vtepMACStr,
 	}, nil

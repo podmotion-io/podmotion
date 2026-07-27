@@ -5,8 +5,9 @@
 #
 # failurePolicy: Fail — if this webhook is unreachable, interactive access to a
 # privileged agent pod is DENIED, never fail-open. A fail-open here would reopen
-# exactly the kubectl-exec privilege-escalation vector the control exists to close
-# (contrast the eviction webhook, which fails open to avoid blocking cluster ops).
+# exactly the kubectl-exec privilege-escalation vector the control exists to close.
+# (As of ADR-0401 the eviction webhook, webhook-eviction.yaml, also fails CLOSED —
+# both admission guards now default to deny-when-unverifiable.)
 #
 # HOLD-B (ADR-0039 SD-6 ungate): this VWC is gated on webhook.agentExecBlock.enabled
 # (default true), NOT on cert-manager. On the cert-manager path the caBundle is injected

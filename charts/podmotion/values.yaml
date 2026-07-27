@@ -6,6 +6,14 @@ operator:
     tag: latest
     pullPolicy: IfNotPresent
   replicas: 3
+  # ADR-0401 (review condition C3): PodDisruptionBudget for the operator. With the eviction webhook
+  # failurePolicy: Fail, cluster-wide user-namespace API-eviction availability depends on the
+  # webhook (operator) being reachable; all replicas serve the webhook. A minAvailable:1 PDB
+  # prevents a voluntary disruption (node drain / autoscaler consolidation) from taking every
+  # webhook backend down at once. Rendered only when replicas > 1 (a no-op at replicas:1 dev by
+  # design — see templates/operator-pdb.yaml). Default true.
+  podDisruptionBudget:
+    enabled: true
   # featureGates enables experimental feature gates in the operator.
   # Passed as --feature-gates=<value> to the manager binary.
   # Example: "TCPPreservation=true,GPUMigration=false"
@@ -40,14 +48,31 @@ agent:
   # capability names do not exist and the kubelet/runtime rejects them; set false on such
   # nodes and BPF/perf rights fall back to CAP_SYS_ADMIN (as they always did pre-5.8).
   kernelGE58: true
-  # sprint50 (k3s compat): standard kubeadm/containerd host paths. Override both on a k3s
-  # deploy (UNVERIFIED-EXTERNAL k3s defaults — confirm against a live k3s node before using
-  # non-default values): socketPath is typically /run/k3s/containerd/containerd.sock,
-  # stateDir is typically /var/lib/rancher/k3s/agent/containerd. See
-  # docs/sprints/sprint50-k3s/K3S-COMPATIBILITY-PLAN.md §0 items 1-4.
+  # sprint50 (k3s compat): standard kubeadm/containerd host paths. These drive ONLY the
+  # DaemonSet's static hostPath VOLUME MOUNTS (containerd-socket, host-var-lib-containerd —
+  # charts/podmotion/templates/daemonset.yaml) and must always be a concrete, non-empty path
+  # (a Helm-render-time value; Kubernetes rejects an empty hostPath). They are NOT the agent's
+  # own idea of which containerd is authoritative — see containerd.override below (ADR-0370).
   containerd:
     socketPath: /run/containerd/containerd.sock
     stateDir: /var/lib/containerd
+    # ADR-0370: explicit operator override for the agent's OWN self-discovery primitive
+    # (internal/agent/server/containerd_discovery.go). Deliberately a SEPARATE set of fields
+    # from socketPath/stateDir above — those always render a concrete value (required for the
+    # volume mounts), so tying the override signal to them would mean every deploy looks like
+    # an explicit override and self-discovery could never run. Leave all three empty (the
+    # default) to let the agent self-discover the authoritative containerd socket at startup
+    # (correct on both kubeadm/system-containerd and RKE2/k3s nodes, without operator action —
+    # this is what actually fixes the RKE2 dual-containerd failure). Set override.socket ONLY
+    # to force the agent to use exactly that socket; it fails loud at startup (refuses to
+    # start) rather than silently falling back to self-discovery if that socket does not
+    # actually own the agent's own pod sandbox. override.runRoot/override.stateRoot default to
+    # the directory of override.socket when left empty (see containerd_discovery.go
+    # buildContainerdCandidates); set them explicitly only for a layout where that's wrong.
+    override:
+      socket: ""
+      runRoot: ""
+      stateRoot: ""
   # cni.extraConfDir: an additional host CNI conf directory to mount and scan, alongside
   # the canonical /etc/cni/net.d that nmcregistrar.detectCNI() (internal/agent/nmcregistrar/
   # registrar.go) checks by default. Needed because some distros do not populate the
@@ -86,17 +111,25 @@ agent:
       cpu: 500m
       memory: 256Mi
   # SD-1-NETNS-BROKER (ADR-0148 Amendment): the privileged netns-broker sidecar.
-  # Same image as the agent, invoked via args: ["netns-broker"]. It serves only the
-  # netns-broker Unix socket and does per-migration netns bind/teardown — a tiny,
-  # mostly-idle workload, so its limits are deliberately small.
+  # Same image as the agent, invoked via args: ["netns-broker"]. It originally did only
+  # per-migration netns bind/teardown, but its responsibility has grown: exec_start now
+  # spawns the CRIU restore wrapper as the broker's own child, so the broker's cgroup
+  # transiently hosts the entire resident memory of EVERY CONCURRENT restore destined for
+  # this node (up to MaxConcurrentMigrationsDestination, default 2 — nmcregistrar/registrar.go)
+  # plus the broker daemon itself, until each restored tree is individually relocated by a
+  # separate move_cgroup op (ADR-0372). memory.limit is sized as
+  # broker-baseline(16Mi) + CRIU-overhead(64Mi x N) + per-workload-budget(512Mi x N), N=2 =
+  # 1168Mi, rounded to 1280Mi. The limits below are a stopgap ceiling raise, NOT a fix for
+  # that underlying unbounded-cgroup-charging defect — see ADR-0372 for the full mechanism
+  # and corrected math, and ADR-0373 for the tracked durable-fix follow-up.
   netnsBroker:
     resources:
       requests:
         cpu: 10m
-        memory: 16Mi
+        memory: 32Mi
       limits:
-        cpu: 100m
-        memory: 64Mi
+        cpu: 200m
+        memory: 1280Mi
   # ADR-SEC-A §2.1 (C-330): agent mTLS material. Default true — fail-closed. Mounted at
   # /etc/podmotion/tls/{tls.crt,tls.key,ca.crt}. Without it the agent refuses to start (default
   # build) rather than serving plaintext on the privileged host-network :9090.
@@ -127,8 +160,34 @@ checkpoint:
   retentionSeconds: 3600
 
 scheduler:
+  # ADR-0364 (Part B2 of Task #20): unchanged from the pre-existing chart default (true).
+  # Flipping this true (already the default) now renders a real podmotion-scheduler
+  # Deployment/ConfigMap/RBAC (scheduler-deployment.yaml, scheduler-configmap.yaml,
+  # scheduler-rbac.yaml) instead of nothing — but the image it runs is only real once
+  # ADR-0362 Part B1 lands. The live KVM deploy path (hack/kvm-cluster.sh) explicitly
+  # passes --set scheduler.enabled=false and is NOT changed by this ADR (that override
+  # flip is ADR-0362 Part C, dispatched separately) — so this chart-level default staying
+  # true does not put a broken pod on the standing cluster. Do not flip this to false: the
+  # _coherence-checks.tpl guard (ADR-0360) fails render on a bare `helm template` (no
+  # overrides) if scheduler.enabled=false while webhook.podMutation.enabled=true (also
+  # default true) — the two defaults are a matched pair.
   enabled: true
   profileName: podmotion-scheduler
+  image:
+    repository: ghcr.io/podmotion/podmotion-scheduler
+    tag: latest
+    pullPolicy: IfNotPresent
+  # A scheduler is naturally leader-elected and can run >1 replica, but default 1 keeps
+  # parity with operator.replicas default dev behavior and avoids exercising the
+  # multi-replica leader-election path by default (ADR-0364 Decision §1).
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
 
 descheduler:
   enabled: false
@@ -162,6 +221,18 @@ webhook:
   # default Kubernetes scheduler with whatever constraints the source pod happened to carry,
   # which may not be the node the checkpoint image was staged on.
   podMutation:
+    enabled: true
+  # ADR-0401: the eviction-interception MutatingWebhookConfiguration
+  # (meviction.podmotion.io, /mutate-core-v1-pod-eviction). Blocks eviction of a pod while a
+  # PodMigration is active for it, and FAILS CLOSED (failurePolicy: Fail + deny-on-unverifiable
+  # handler) so a stressed/partitioned control plane cannot evict an in-flight migration source.
+  # Default true and INDEPENDENT of cert-manager, mirroring agentExecBlock/podMutation: on
+  # substrates without cert-manager the chart mints a self-signed serving cert and inlines the
+  # matching caBundle. The Fail blast radius is bounded by a namespaceSelector excluding the
+  # operator/system namespaces, timeoutSeconds: 5, and a retriable 429 denial. Set false ONLY to
+  # deliberately disable source-pod eviction protection (migrating pods then become evictable
+  # mid-migration in the field — a constitutional source-pod-protection regression, rule 5).
+  eviction:
     enabled: true
 
 networkPolicy:

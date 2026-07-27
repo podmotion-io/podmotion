@@ -116,15 +116,14 @@ func TestRestoreBranch1_MACFlowsToReportRestoreConfirmed(t *testing.T) {
 // path of the gRPC Restore handler (no config.json). It stubs joinNsRestoreFn to return a
 // fake PID and stubs readReplVethMACFn to return a known MAC. The test asserts:
 //   - joinNsRestoreFn was called (the raw-CRIU fallback branch was taken).
-//   - patchCheckpointImagesFn succeeded (stubbed to nil).
 //   - Restore returns Success=true.
+//
+// ADR-0385: Branch 2 no longer runs its own standalone patch-images pre-call (that call was a
+// redundant duplicate of joinNsRestore's internal Step 1 patch — see the ADR). Stubbing
+// joinNsRestoreFn wholesale (below) already bypasses the real patch step entirely, so no
+// patch-related stub is needed here any more.
 func TestRestoreBranch2_MACFlowsToReportRestoreConfirmed(t *testing.T) {
 	imagesDir := makeBranch2Dir(t)
-
-	// Stub patchCheckpointImagesFn — Branch 2 calls this; without stub it would exec Python.
-	origPatch := patchCheckpointImagesFn
-	patchCheckpointImagesFn = func(_ string, _ []string, _ []string, _ map[string]string, _ []string) error { return nil }
-	defer func() { patchCheckpointImagesFn = origPatch }()
 
 	// Track that joinNsRestoreFn was called.
 	joinNsCalled := false

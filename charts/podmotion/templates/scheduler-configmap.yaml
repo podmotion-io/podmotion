@@ -1,0 +1,61 @@
+{{- /*
+ADR-0364 (Part B2 of Task #20): KubeSchedulerConfiguration for the podmotion-scheduler
+second-scheduler Deployment (scheduler-deployment.yaml), ported from
+config/scheduler/scheduler-config.yaml with two required adaptations (ADR-0364 Decision §2):
+
+  1. clientConnection.kubeconfig is DELIBERATELY OMITTED. The kustomize-tree value
+     (/etc/kubernetes/scheduler.conf) is a control-plane host file path that does not exist
+     inside a chart-deployed pod; omitting the field makes the scheduler binary's client-config
+     resolution fall through to in-cluster discovery via the mounted ServiceAccount token
+     (scheduler-rbac.yaml), the same mechanism the operator and agent already use. Carrying the
+     kustomize value forward unmodified would crash-loop every scheduler pod on
+     "no such file or directory" at startup.
+  2. leaderElection.resourceName/resourceNamespace are set EXPLICITLY, rather than left at the
+     v1 KubeSchedulerConfiguration upstream default (resourceName: kube-scheduler,
+     resourceNamespace: kube-system) — the same lease object the cluster's stock kube-scheduler
+     already holds. Left unset, this second scheduler would contend for that identical lease and
+     hang indefinitely in "waiting to become leader," never scheduling a single pod — a silent,
+     total functional failure that still renders clean and shows Running/Ready on the pod.
+
+Everything else (schedulerName, the MigrationAware filter/score plugin registration, the four
+pluginConfig weight args) carries forward unchanged from config/scheduler/scheduler-config.yaml —
+it is data the scheduler binary consumes, not a path/identity assumption specific to the
+kustomize substrate.
+*/ -}}
+{{- if .Values.scheduler.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: podmotion-scheduler-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: scheduler
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+data:
+  scheduler-config.yaml: |
+    apiVersion: kubescheduler.config.k8s.io/v1
+    kind: KubeSchedulerConfiguration
+    leaderElection:
+      resourceName: podmotion-scheduler-leader
+      resourceNamespace: {{ .Release.Namespace }}
+    profiles:
+      - schedulerName: podmotion-scheduler
+        plugins:
+          filter:
+            enabled:
+              - name: MigrationAware
+          score:
+            enabled:
+              - name: MigrationAware
+                weight: 10
+        pluginConfig:
+          - name: MigrationAware
+            args:
+              # Weights control the relative importance of each scoring dimension.
+              # See scheduler-plugins/pkg/podmigration/score.go ScoreWeights.
+              networkLocalityWeight: 40
+              thermalWeight: 20
+              migrationLoadWeight: 20
+              memoryHeadroomWeight: 20
+{{- end }}

@@ -1,0 +1,58 @@
+{{- /*
+ADR-0393: namespaced Role + RoleBinding for the operator's snapshot-HMAC signing key.
+
+The operator loads-or-creates a single Secret (podmotion-operator-snapshot-hmac) in its OWN
+namespace holding the operator-only HMAC key that signs SourcePodSpecSnapshots
+(internal/controller/snapshot_integrity.go: snapshotHMACKey resolves the namespace from
+POD_NAMESPACE, defaulting podmotion-system — which the chart sets to {{ .Release.Namespace }}).
+
+Because Kubernetes RBAC `create` cannot be resourceName-scoped, so
+granting `secrets: [create]` on the cluster-wide podmotion-manager-role ClusterRole would let the
+operator SA create a Secret in ANY namespace. This grant is therefore confined to a namespaced
+Role + RoleBinding in the operator's own namespace ({{ .Release.Namespace }}), bound ONLY to the
+podmotion-operator ServiceAccount — the operator can create/get/update the HMAC Secret in its own
+namespace and nowhere else. get/update are additionally resourceName-scoped to the single
+podmotion-operator-snapshot-hmac Secret.
+
+This grant is intentionally NOT given to podmotion-agent: the node agent is a co-writer of the
+podmigrations/status subresource that carries the snapshot, but it must be unable to READ the
+signing key, so a compromised agent cannot forge a valid snapshot (the keyed HMAC is meaningless
+if the adversary can read the key).
+*/ -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: podmotion-operator-snapshot-hmac-role
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: operator
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+rules:
+  # `create` cannot be resourceName-scoped; namespaced to {{ .Release.Namespace }} only.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+  # get/update scoped to the single snapshot-HMAC Secret.
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [podmotion-operator-snapshot-hmac]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: podmotion-operator-snapshot-hmac-rolebinding
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: operator
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: podmotion-operator-snapshot-hmac-role
+subjects:
+  - kind: ServiceAccount
+    name: podmotion-operator
+    namespace: {{ .Release.Namespace }}

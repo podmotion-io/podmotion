@@ -29,6 +29,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -69,10 +72,13 @@ func TestMarkDestinationReadyIfConverged_FiresWhenBothConvergenceSignalsTrue(t *
 	slice := destSliceReadyFalse(ns, "slice-dest", destIP)
 
 	confirmed := true
+	node, replPod := "pm-w2", "dest-repl"
 	pm := &pmv1.PodMigration{
 		ObjectMeta: metav1.ObjectMeta{Name: "pm-d01-pos", Namespace: ns},
 		Spec:       pmv1.PodMigrationSpec{PodName: "src", PodNamespace: ns},
 		Status: pmv1.PodMigrationStatus{
+			DestinationNodeName:  node,
+			ReplacementPodName:   replPod,
 			CRIURestoreConfirmed: &confirmed,
 			Conditions: []metav1.Condition{
 				{Type: pmv1.ConditionWorkloadLivenessVerified, Status: metav1.ConditionTrue, Reason: "ExplicitProbePassed"},
@@ -80,13 +86,23 @@ func TestMarkDestinationReadyIfConverged_FiresWhenBothConvergenceSignalsTrue(t *
 		},
 	}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(slice, pm).WithStatusSubresource(pm).Build()
-	r := &PodMigrationReconciler{Client: c, Scheme: scheme}
+	// ADR-0405: the write-back now also requires the destination CNI's own confirmation that the
+	// replacement endpoint is programmed and advertises destIP. Wire a ready CiliumEndpoint so the
+	// full three-signal gate is satisfied (the two-signal-only case is covered by the ADR-0405 held
+	// tests in adr0405_ready_gate_test.go). Helpers ciliumNMC/fakeCiliumEndpointObj/
+	// testCiliumEndpointGVR come from dataplane_cilium_authoritative_test.go.
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(slice, pm, ciliumNMC(node, "cilium")).WithStatusSubresource(pm).Build()
+	dc := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{testCiliumEndpointGVR: "CiliumEndpointList"},
+		fakeCiliumEndpointObj(ns, replPod, "ready", 4242, node, destIP),
+	)
+	r := &PodMigrationReconciler{Client: c, Scheme: scheme, DynamicClient: dc}
 
 	r.markDestinationReadyIfConverged(context.Background(), pm, destIP)
 
 	if !isReady(t, c, ns, "slice-dest", destIP) {
-		t.Fatalf("expected destination endpoint Ready=true: WorkloadLivenessVerified=True AND CRIURestoreConfirmed=true should fire the D0.1 write-back")
+		t.Fatalf("expected destination endpoint Ready=true: liveness + CRIURestoreConfirmed + CNI-programmed destIP should fire the write-back")
 	}
 }
 
@@ -221,6 +237,107 @@ func TestReconcileVerifying_Strict_NeverInvokesRetiredProducers(t *testing.T) {
 	// this hand-off.
 	if fresh.Status.Phase != pmv1.MigrationPhaseDisengageHold {
 		t.Fatalf("ADR-0352 B8-D3: Strict reconcileVerifying must hand off to DisengageHold, got phase=%q", fresh.Status.Phase)
+	}
+}
+
+// TestEstablishServiceContinuity_NoServiceSelectsPod_TriviallySatisfied is the ADR-0390
+// regression test for §P-MECHANISM's stuck-ServiceVerifying finding: a pod that no Service in
+// its namespace ever selects (e.g. a standalone pod with no owning Service — the live
+// podmotion-demo-6vf5f/default/nginx case) must NOT requeue establishServiceContinuity
+// indefinitely waiting for an EndpointSlice that will never exist. Because no EndpointSlice will
+// ever carry destPodIP with a Service label, resolveTargetService always returns
+// errNoEndpointSliceServiceLabelYet; anyServiceSelectsPod must recognize — from the real source
+// of truth (Service selectors vs. the pod's own labels), not from EndpointSlice population — that
+// this is permanent, not transient, and set ServiceContinuityVerified=True immediately (vacuous
+// pass: nothing routes to this pod via a Service, so Strict's Service-continuity guarantee is
+// trivially satisfied over an empty set — mirrors ADR-0388's zero-TCP-connection disposition).
+func TestEstablishServiceContinuity_NoServiceSelectsPod_TriviallySatisfied(t *testing.T) {
+	scheme := adr0210Scheme(t)
+	ns := "default"
+	destIP := "10.42.2.117"
+
+	destPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "nginx-m-117e6b9f", Namespace: ns,
+			Labels: map[string]string{"run": "nginx"}},
+		Status: corev1.PodStatus{PodIP: destIP},
+	}
+	// Deliberately NO EndpointSlice and NO Service selecting {"run": "nginx"} anywhere in the
+	// namespace — the exact live condition (verified via kubectl: no Service anywhere selects
+	// this pod's labels).
+	pm := &pmv1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{Name: "pm-no-service", Namespace: ns},
+		Spec: pmv1.PodMigrationSpec{
+			PodName:             "nginx",
+			PodNamespace:        ns,
+			TCPPreservationMode: pmv1.TCPPreservationModeStrict,
+		},
+		Status: pmv1.PodMigrationStatus{
+			ReplacementPodName: "nginx-m-117e6b9f",
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(destPod, pm).WithStatusSubresource(pm).Build()
+	r := &PodMigrationReconciler{Client: c, Scheme: scheme}
+
+	res, err, done := r.establishServiceContinuity(context.Background(), pm, destIP)
+	if err != nil {
+		t.Fatalf("establishServiceContinuity: %v", err)
+	}
+	if !done {
+		t.Fatalf("expected done=true (permanent disposition recognized immediately), got requeue %+v — this is the exact indefinite-requeue-until-deadline-backstop bug ADR-0390 fixes", res)
+	}
+	cond := findCondition(pm.Status.Conditions, pmv1.ConditionServiceContinuityVerified)
+	if cond == nil {
+		t.Fatalf("expected ConditionServiceContinuityVerified to be set")
+	}
+	if cond.Status != metav1.ConditionTrue || cond.Reason != "NoServiceSelectsPod" {
+		t.Fatalf("expected ServiceContinuityVerified=True/NoServiceSelectsPod, got status=%s reason=%s", cond.Status, cond.Reason)
+	}
+}
+
+// TestEstablishServiceContinuity_ServiceSelectsPodButSliceNotConverged_StillHolds is the negative
+// control for the ADR-0390 fix: when a real Service DOES select the pod's labels but its
+// EndpointSlice simply has not caught up yet, establishServiceContinuity must keep requeuing
+// (transient), never mistake this for the permanent no-Service case above.
+func TestEstablishServiceContinuity_ServiceSelectsPodButSliceNotConverged_StillHolds(t *testing.T) {
+	scheme := adr0210Scheme(t)
+	ns := "default"
+	destIP := "10.42.2.200"
+
+	destPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "nginx-m-2", Namespace: ns,
+			Labels: map[string]string{"run": "nginx"}},
+		Status: corev1.PodStatus{PodIP: destIP},
+	}
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "nginx-svc", Namespace: ns},
+		Spec:       corev1.ServiceSpec{Selector: map[string]string{"run": "nginx"}, ClusterIP: "10.96.5.5"},
+	}
+	// Deliberately no EndpointSlice at all yet — the EndpointSlice controller hasn't converged.
+	pm := &pmv1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{Name: "pm-service-pending", Namespace: ns},
+		Spec: pmv1.PodMigrationSpec{
+			PodName:             "nginx",
+			PodNamespace:        ns,
+			TCPPreservationMode: pmv1.TCPPreservationModeStrict,
+		},
+		Status: pmv1.PodMigrationStatus{
+			ReplacementPodName: "nginx-m-2",
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(destPod, svc, pm).WithStatusSubresource(pm).Build()
+	r := &PodMigrationReconciler{Client: c, Scheme: scheme}
+
+	_, err, done := r.establishServiceContinuity(context.Background(), pm, destIP)
+	if err != nil {
+		t.Fatalf("establishServiceContinuity: %v", err)
+	}
+	if done {
+		t.Fatalf("expected done=false (transient — a Service selects this pod, must keep waiting for its EndpointSlice), got done=true")
+	}
+	if cond := findCondition(pm.Status.Conditions, pmv1.ConditionServiceContinuityVerified); cond != nil {
+		t.Fatalf("ServiceContinuityVerified must remain unset while transient, got %+v", cond)
 	}
 }
 

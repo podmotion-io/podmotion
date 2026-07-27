@@ -20,6 +20,14 @@ import (
 // values on the k3s deploy path — see charts/podmotion/values.yaml agent.containerd.*) and
 // default to exactly the previous hardcoded values, so behavior on the standing kubeadm/
 // containerd cluster is unchanged.
+//
+// ADR-0370: the envOrDefault-only value below is no longer authoritative by itself. It is the
+// STARTUP-TIME PLACEHOLDER for these three vars; EnsureContainerdDiscovered
+// (containerd_discovery.go), called once from cmd/agent/main.go before the agent advertises
+// readiness, empirically confirms which containerd daemon actually owns this agent's own pod
+// sandbox and overwrites all three vars with the confirmed values (or exits the process loud on
+// failure — see containerd_discovery.go's doc comments). This closes the RKE2/k3s dual-
+// containerd failure mode where the blind default silently pointed at the wrong daemon.
 
 const (
 	defaultContainerdRunRoot   = "/run/containerd"

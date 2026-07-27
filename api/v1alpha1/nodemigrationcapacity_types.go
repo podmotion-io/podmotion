@@ -175,6 +175,34 @@ const (
 	ReasonCNISupported = "CNISupported"
 )
 
+// ADR-0366: CRIUDetected condition Type/Reason constants for NodeMigrationCapacity.
+// Written by the agent registrar via meta.SetStatusCondition (same freeform
+// status.conditions discipline as ConditionCNICompatible above) — the real,
+// genuinely-observable signal for a CRIU-detection failure, not just a log line: the
+// original bug (spec.criuVersion silently empty fleet-wide) went unnoticed for weeks
+// specifically because nothing surfaced it anywhere an operator or dashboard would see it.
+const (
+	// ConditionCRIUDetected is True when detectCRIU successfully resolved a CRIU version
+	// string (Spec.CRIUVersion populated); False when detection failed — either the
+	// netns-broker was unreachable after the bounded startup retry, or the host CRIU
+	// exec itself ran and failed/exited nonzero.
+	ConditionCRIUDetected = "CRIUDetected"
+
+	// ReasonCRIUVersionDetected is the Reason used when ConditionCRIUDetected is True.
+	ReasonCRIUVersionDetected = "CRIUVersionDetected"
+
+	// ReasonCRIUBrokerUnreachable is the Reason used when ConditionCRIUDetected is False
+	// because the netns-broker could not be reached after the bounded (3-attempt,
+	// 500ms-backoff) startup retry — a startup race, not a deterministic CRIU failure.
+	ReasonCRIUBrokerUnreachable = "CRIUBrokerUnreachable"
+
+	// ReasonCRIUExecFailed is the Reason used when ConditionCRIUDetected is False because
+	// the CRIU exec itself (direct in-container fallback, or via the broker) ran and
+	// failed or exited nonzero — a genuine, deterministic CRIU/host problem, not a
+	// startup race, and therefore not retried.
+	ReasonCRIUExecFailed = "CRIUExecFailed"
+)
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=nmc,categories=podmotion

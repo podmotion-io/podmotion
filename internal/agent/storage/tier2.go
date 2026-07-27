@@ -204,6 +204,39 @@ func (m *CephRBDMigrator) AwaitSingleOwner(ctx context.Context, opts MigrationOp
 	return nil
 }
 
+// ReleaseDestination returns a wrapped ErrRollbackPointOfNoReturn for every classified Tier2
+// volume when — and ONLY when — opts.CutoverComplete confirms Cutover's `rbd migration commit`
+// actually ran for this migration (ADR-0368 §5.2/CONDITION 2). `rbd migration commit` is Ceph's
+// own irrevocable operation — the source image is deleted the instant it runs — so once
+// confirmed, there is no Ceph-native undo, full stop; no `rbd` command is ever attempted here.
+//
+// If cutover never happened (the common case: a rollback triggered by a Checkpointing- or
+// Transferring-phase failure, well before the storage-cutover gate ever runs), returning the
+// sentinel anyway would incorrectly convert a perfectly recoverable failure into a fabricated
+// "cannot roll back" terminal outcome — exactly the failure mode
+// this gate exists to prevent. In that case ReleaseDestination returns nil: PreStage's
+// `rbd migration prepare`/`execute` calls are not commit — they leave the source image intact —
+// so there is genuinely nothing irrevocable to report here (a separate, narrower, disclosed gap:
+// an in-progress-but-never-committed rbd migration is not aborted by this method either, since
+// ADR-0368 does not add an `rbd migration abort` call — out of this ADR's scope).
+func (m *CephRBDMigrator) ReleaseDestination(_ context.Context, opts MigrationOptions) error {
+	if !opts.CutoverComplete {
+		return nil
+	}
+	for _, clsf := range opts.Classifications {
+		if clsf.Tier != TierCephRBD {
+			continue
+		}
+		srcImage, _, err := m.imageNames(clsf, opts)
+		if err != nil {
+			return fmt.Errorf("tier2: parse image name for pvc %s: %w", clsf.PVCName, err)
+		}
+		return fmt.Errorf("tier2: %w: rbd migration commit already completed for %s — source image deleted",
+			ErrRollbackPointOfNoReturn, srcImage)
+	}
+	return nil
+}
+
 func (m *CephRBDMigrator) migrationState(ctx context.Context, srcImage string) (string, error) {
 	cmd := m.ExecCommand("rbd", "migration", "status", srcImage, "--format", "json")
 	out, err := cmd.Output()
@@ -357,6 +390,8 @@ type CephRBDStubMigrator struct {
 	InjectAwaitSingleOwnerError error
 	// progressSteps tracks which step the stub is on for SyncPercent calls.
 	progressStep int
+	// ReleaseDestinationCalled records whether ReleaseDestination was called.
+	ReleaseDestinationCalled bool
 }
 
 // Tier returns TierCephRBD.
@@ -391,4 +426,21 @@ func (s *CephRBDStubMigrator) Cutover(_ context.Context, _ MigrationOptions) err
 func (s *CephRBDStubMigrator) AwaitSingleOwner(_ context.Context, _ MigrationOptions) error {
 	s.AwaitSingleOwnerCalled = true
 	return s.InjectAwaitSingleOwnerError
+}
+
+// ReleaseDestination matches CephRBDMigrator.ReleaseDestination's semantics exactly (ADR-0368
+// CONDITION 1): this stub is what is ACTUALLY deployed for TierCephRBD in the real operator
+// today (cmd/main.go only wires the real Longhorn migrator — see manager.go's
+// NewStorageMigrationManager doc comment), so a stub that silently returned nil regardless of
+// tier would reopen the exact "fabricated rollback success" bug this ADR exists to close.
+// Returns a wrapped ErrRollbackPointOfNoReturn only when opts.CutoverComplete confirms cutover
+// (the tier's irrevocable commit) actually ran; nil otherwise. Never invokes any command — there
+// is no backend to talk to.
+func (s *CephRBDStubMigrator) ReleaseDestination(_ context.Context, opts MigrationOptions) error {
+	s.ReleaseDestinationCalled = true
+	if !opts.CutoverComplete {
+		return nil
+	}
+	return fmt.Errorf("tier2 stub: %w: destination-side commit already ran for this migration — source image is gone",
+		ErrRollbackPointOfNoReturn)
 }

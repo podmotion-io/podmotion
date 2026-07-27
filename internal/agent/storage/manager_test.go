@@ -109,7 +109,7 @@ func TestRunPreStage_MissingMigratorAboveRWX_BlocksFreeze(t *testing.T) {
 		Build()
 
 	mgr := storage.NewStorageMigrationManager(c)
-	if err := mgr.RunPreStage(context.Background(), pm); err != nil {
+	if err := mgr.RunPreStage(context.Background(), pm, false, ""); err != nil {
 		t.Fatalf("RunPreStage returned error: %v", err)
 	}
 
@@ -149,7 +149,7 @@ func TestRunPreStage_UnregisteredDataTier_BlocksFreeze(t *testing.T) {
 		storage.TierRWX: storage.NewRWXReattachMigrator(c),
 	}
 
-	if err := mgr.RunPreStage(context.Background(), pm); err != nil {
+	if err := mgr.RunPreStage(context.Background(), pm, false, ""); err != nil {
 		t.Fatalf("RunPreStage returned error: %v", err)
 	}
 
@@ -174,10 +174,10 @@ func TestDefaultConstructor_RegistersLonghornMigrator(t *testing.T) {
 	scheme := newManagerScheme(t)
 	pm := makeMigration("mig-3", "default", "lh-pod")
 
-	pvc := makePVC("lh-pvc", "default", "longhorn",
-		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce})
-	sc := makeSC("longhorn", "driver.longhorn.io", nil)
-	pod := makePodWithPVC("default", "lh-pvc")
+	pvc := makePVC("lh-pvc", "default", "longhorn-migratable",
+		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
+	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+	pod := makeOwnedPodWithPVC("default", "lh-pvc")
 	pod.Name = "lh-pod"
 
 	c := fake.NewClientBuilder().
@@ -191,7 +191,7 @@ func TestDefaultConstructor_RegistersLonghornMigrator(t *testing.T) {
 		t.Fatalf("default constructor must register a TierLonghorn migrator")
 	}
 
-	if err := mgr.RunPreStage(context.Background(), pm); err != nil {
+	if err := mgr.RunPreStage(context.Background(), pm, false, ""); err != nil {
 		t.Fatalf("RunPreStage returned error: %v", err)
 	}
 
@@ -274,6 +274,10 @@ func (f *fakeCountingMigrator) AwaitSingleOwner(_ context.Context, _ storage.Mig
 	return nil
 }
 
+func (f *fakeCountingMigrator) ReleaseDestination(_ context.Context, _ storage.MigrationOptions) error {
+	return nil
+}
+
 // TestRunPreStage_TransientError_RetriesThenSucceeds is the regression test
 // for the no-retry-on-transient-failure bug: a PreStage call that fails
 // twice with a network/timeout-class error (the DNS/routing race right
@@ -284,10 +288,10 @@ func TestRunPreStage_TransientError_RetriesThenSucceeds(t *testing.T) {
 	scheme := newManagerScheme(t)
 	pm := makeMigration("mig-retry-ok", "default", "lh-pod")
 
-	pvc := makePVC("lh-pvc", "default", "longhorn",
-		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce})
-	sc := makeSC("longhorn", "driver.longhorn.io", nil)
-	pod := makePodWithPVC("default", "lh-pvc")
+	pvc := makePVC("lh-pvc", "default", "longhorn-migratable",
+		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
+	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+	pod := makeOwnedPodWithPVC("default", "lh-pvc")
 	pod.Name = "lh-pod"
 
 	c := fake.NewClientBuilder().
@@ -307,7 +311,7 @@ func TestRunPreStage_TransientError_RetriesThenSucceeds(t *testing.T) {
 	mgr := storage.NewStorageMigrationManager(c)
 	mgr.RegisterMigrator(storage.TierLonghorn, fake)
 
-	if err := mgr.RunPreStage(context.Background(), pm); err != nil {
+	if err := mgr.RunPreStage(context.Background(), pm, false, ""); err != nil {
 		t.Fatalf("RunPreStage returned error: %v", err)
 	}
 
@@ -333,10 +337,10 @@ func TestRunPreStage_TransientError_BoundedRetry_FailsClosedAfterMaxAttempts(t *
 	scheme := newManagerScheme(t)
 	pm := makeMigration("mig-retry-exhausted", "default", "lh-pod")
 
-	pvc := makePVC("lh-pvc", "default", "longhorn",
-		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce})
-	sc := makeSC("longhorn", "driver.longhorn.io", nil)
-	pod := makePodWithPVC("default", "lh-pvc")
+	pvc := makePVC("lh-pvc", "default", "longhorn-migratable",
+		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
+	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+	pod := makeOwnedPodWithPVC("default", "lh-pvc")
 	pod.Name = "lh-pod"
 
 	c := fake.NewClientBuilder().
@@ -358,7 +362,7 @@ func TestRunPreStage_TransientError_BoundedRetry_FailsClosedAfterMaxAttempts(t *
 	mgr := storage.NewStorageMigrationManager(c)
 	mgr.RegisterMigrator(storage.TierLonghorn, fake)
 
-	if err := mgr.RunPreStage(context.Background(), pm); err != nil {
+	if err := mgr.RunPreStage(context.Background(), pm, false, ""); err != nil {
 		t.Fatalf("RunPreStage returned error: %v", err)
 	}
 
@@ -385,10 +389,10 @@ func TestRunPreStage_PermanentError_FailsFastWithoutRetry(t *testing.T) {
 	scheme := newManagerScheme(t)
 	pm := makeMigration("mig-permanent", "default", "lh-pod")
 
-	pvc := makePVC("lh-pvc", "default", "longhorn",
-		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce})
-	sc := makeSC("longhorn", "driver.longhorn.io", nil)
-	pod := makePodWithPVC("default", "lh-pvc")
+	pvc := makePVC("lh-pvc", "default", "longhorn-migratable",
+		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
+	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+	pod := makeOwnedPodWithPVC("default", "lh-pvc")
 	pod.Name = "lh-pod"
 
 	c := fake.NewClientBuilder().
@@ -407,7 +411,7 @@ func TestRunPreStage_PermanentError_FailsFastWithoutRetry(t *testing.T) {
 	mgr := storage.NewStorageMigrationManager(c)
 	mgr.RegisterMigrator(storage.TierLonghorn, fake)
 
-	if err := mgr.RunPreStage(context.Background(), pm); err != nil {
+	if err := mgr.RunPreStage(context.Background(), pm, false, ""); err != nil {
 		t.Fatalf("RunPreStage returned error: %v", err)
 	}
 
@@ -456,7 +460,7 @@ func TestCutover_UsesCachedClassification_AfterSourcePodDeleted(t *testing.T) {
 
 	// RunPreStage runs while the source pod still exists (PreMigrating phase) and must cache
 	// the classification into pm.Status.ClassifiedVolumes.
-	if err := mgr.RunPreStage(context.Background(), pm); err != nil {
+	if err := mgr.RunPreStage(context.Background(), pm, false, ""); err != nil {
 		t.Fatalf("RunPreStage returned error: %v", err)
 	}
 

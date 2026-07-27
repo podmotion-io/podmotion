@@ -18,12 +18,14 @@ package nri
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	nriapi "github.com/containerd/nri/pkg/api"
@@ -33,13 +35,14 @@ import (
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	"github.com/podmotion-io/podmotion/internal/agent/netnsbroker"
+	"github.com/podmotion-io/podmotion/internal/metrics"
 )
 
-// validCheckpointRef rejects any ref that is not a plain DNS-label-safe identifier.
+// ValidCheckpointRef rejects any ref that is not a plain DNS-label-safe identifier.
 // A ref like "../../etc" will never match. This is defense-in-depth — the k8s API
 // server already constrains object names, but we validate here since the ref crosses
 // the annotation→filesystem boundary.
-var validCheckpointRef = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{0,61}[a-z0-9]$`)
+var ValidCheckpointRef = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{0,61}[a-z0-9]$`)
 
 var log = logf.Log.WithName("nri-plugin")
 
@@ -106,6 +109,62 @@ type ContainerEvent struct {
 	PodCgroupParent string `json:"podCgroupParent,omitempty"`
 }
 
+// ADR-0412 D2 — sentinel errors for the terminal-phase restore-gate classification. They are
+// package-level so both hooks and the unit tests can classify an outcome with errors.Is rather
+// than by string-matching a message. None of them contain the substring "phase is", so
+// isPhaseTransientErr treats them all as PERMANENT (non-transient): the inner retry loop breaks
+// immediately and the outcome is decided in one pass.
+var (
+	// errRestoreNotApplicableTerminalOwn signals that the pod's OWN migration already reached
+	// Complete: the restore already landed during the migration, so a post-completion kubelet
+	// restart must cold-start the container WITHOUT re-restoring stale checkpoint memory. This is
+	// NOT a rejection — the container starts normally; it only means "no restore here". Distinct
+	// from every fail-closed error below.
+	errRestoreNotApplicableTerminalOwn = errors.New(
+		"restore not applicable: pod's own migration already Complete — start normally")
+
+	// errTerminalNotOwn is a fail-closed rejection: the checkpoint-ref points at a terminal or
+	// aborting migration (Complete-but-not-own / Failed / RollingBack / DryRunComplete) that this
+	// pod cannot prove ownership of. Cold-starting it risks a second live instance alongside the
+	// ADR-0157-thawed source (split-brain), so it is permanently rejected. Wrapped for errors.Is.
+	errTerminalNotOwn = errors.New(
+		"PodMigration is in a terminal/aborting phase and is not restorable by this pod")
+
+	// errNodeMismatch is a fail-closed rejection: the ref's destination node is not this node.
+	// Checked before phase classification so a wrong-node ref fails fast rather than spinning as a
+	// transient "phase is ...". Wrapped for errors.Is.
+	errNodeMismatch = errors.New("PodMigration destination node is not this node")
+)
+
+// restoreDecision is the outcome HandleStartContainer computed for a restore-target container.
+// It is threaded to HandlePostStartContainer (ADR-0412 condition #1) so PostStartContainer acts
+// on the SAME decision instead of re-deriving it from a second, independent CR read — which a
+// phase transition occurring between the two synchronous hook calls could make disagree.
+type restoreDecision int
+
+const (
+	// restoreDecisionProceed: the anti-spoof + phase gate authorized restore (phase in the
+	// {Restoring, RestoreSocketReattach, DisengageHold} accept-set). HandlePostStartContainer runs
+	// the holder-quiescent barrier + CRIU restore.
+	restoreDecisionProceed restoreDecision = iota
+	// restoreDecisionTerminalOwnColdStart: the pod's OWN migration already reached Complete
+	// (ADR-0412 D2). HandlePostStartContainer must NOT run the barrier or CRIU restore — the
+	// container cold-starts normally.
+	restoreDecisionTerminalOwnColdStart
+)
+
+// startDecisionTTL bounds how long a recorded StartContainer decision is retained if its paired
+// PostStartContainer never fires (e.g. the container failed to start after StartContainer
+// returned nil). PostStartContainer normally fires within milliseconds-to-seconds of
+// StartContainer, so this is generous; expired entries are swept on the next record.
+const startDecisionTTL = 2 * time.Minute
+
+// startDecisionEntry is a recorded decision plus the time it was recorded (for TTL sweeping).
+type startDecisionEntry struct {
+	decision restoreDecision
+	at       time.Time
+}
+
 // Plugin is the NRI lifecycle hook handler.
 type Plugin struct {
 	// OnStopping is called for each Stopping event.
@@ -125,6 +184,49 @@ type Plugin struct {
 
 	// nodeName is the name of this node, used to validate the migration targets here.
 	nodeName string
+
+	// startDecisions threads the restore decision HandleStartContainer computed for a
+	// restore-target container to HandlePostStartContainer (ADR-0412 condition #1), keyed by
+	// container ID (event.ID). Only populated when k8sClient != nil (the verify path runs).
+	startDecisionsMu sync.Mutex
+	startDecisions   map[string]startDecisionEntry
+}
+
+// recordStartDecision stores the decision HandleStartContainer computed for container id, so the
+// paired HandlePostStartContainer consumes the SAME outcome (ADR-0412 condition #1). Expired
+// entries (see startDecisionTTL) are swept on each record so a container whose PostStart never
+// fires cannot leak the map unbounded.
+func (p *Plugin) recordStartDecision(id string, d restoreDecision) {
+	p.startDecisionsMu.Lock()
+	defer p.startDecisionsMu.Unlock()
+	if p.startDecisions == nil {
+		p.startDecisions = make(map[string]startDecisionEntry)
+	}
+	now := time.Now()
+	for k, e := range p.startDecisions {
+		if now.Sub(e.at) > startDecisionTTL {
+			delete(p.startDecisions, k)
+		}
+	}
+	p.startDecisions[id] = startDecisionEntry{decision: d, at: now}
+}
+
+// takeStartDecision returns and REMOVES the decision recorded for container id. found is false if
+// no (unexpired) decision was recorded — e.g. stub mode (k8sClient == nil, nothing recorded) or
+// the agent restarted between the two hooks. Callers must fail closed on a missing decision, not
+// assume proceed.
+func (p *Plugin) takeStartDecision(id string) (restoreDecision, bool) {
+	p.startDecisionsMu.Lock()
+	defer p.startDecisionsMu.Unlock()
+	e, ok := p.startDecisions[id]
+	if !ok {
+		return 0, false
+	}
+	delete(p.startDecisions, id)
+	if time.Since(e.at) > startDecisionTTL {
+		return 0, false
+	}
+	return e.decision, true
 }
 
 // New creates a Plugin. onStopping and onStartContainer may both be nil (stub mode). k8sClient
@@ -199,10 +301,36 @@ func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent)
 
 	// Validate before the ref touches the filesystem — reject anything that isn't a
 	// plain identifier (no slashes, dots, or path traversal sequences).
-	if !validCheckpointRef.MatchString(checkpointRef) {
+	if !ValidCheckpointRef.MatchString(checkpointRef) {
 		log.Error(nil, "NRI StartContainer: rejecting invalid checkpointRef — possible path traversal",
 			"checkpointRef", checkpointRef, "container", event.ID)
 		return fmt.Errorf("invalid checkpointRef %q: must match [a-z0-9][a-z0-9-]{0,61}[a-z0-9]", checkpointRef)
+	}
+
+	// ADR-0197 Rule D (agent side) — per-container restore-target gate.
+	// ADR-0412 D1: this exclusion runs BEFORE the verifyPodMigration anti-spoof/phase gate below
+	// (it previously ran AFTER it). The pod-scoped checkpoint-ref has no per-container
+	// discriminator, so this hook fires for EVERY container in the pod — including the cp-only
+	// podmotion-inject-holder init container, which is NOT a restore target (excluded from
+	// restore-target-containers by construction). Subjecting that init container to the
+	// restore-phase gate is what deadlocked it once the owning migration reached a terminal phase
+	// (Complete/Failed): the terminal phase was misclassified as a transient "phase is ..." error
+	// and retried forever (kubelet CrashLoopBackOff, the live 114-restart case).
+	//
+	// The anti-spoof gate exists SOLELY to guard the restore TRIGGER. A container excluded from
+	// restore-target-containers returns nil here without ever triggering restore, socket-reattach,
+	// or the barrier — the exact outcome it would get with no annotation at all — so there is
+	// nothing to spoof on this branch. Every container that IS a restore target still traverses
+	// the FULL, unchanged anti-spoof + phase gate below before reaching the trigger. (ADR-0412 D1:
+	// coverage over the protected action is byte-identical; only a false-positive deadlock on
+	// non-targets is removed.)
+	const restoreTargetsKey = "podmotion.io/restore-target-containers"
+	if targets := event.Annotations[restoreTargetsKey]; targets != "" {
+		if !containerInList(event.Name, targets) {
+			log.Info("ADR-0197 Rule D: container is not a restore target — clean pass-through (no restore, no barrier)",
+				"container", event.ID, "name", event.Name, "restoreTargets", targets)
+			return nil
+		}
 	}
 
 	// Verify that a PodMigration CR with this checkpointRef actually exists and
@@ -215,6 +343,12 @@ func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent)
 	// which point the ADR-0048/0049 FDB barrier is confirmed) into an accepted restore phase, or
 	// the deadline expires. A spoofed/absent CR never enters an accepted phase, so this still
 	// hard-blocks on timeout with the same blocking error.
+	//
+	// ADR-0412 D2: verifyPodMigration now classifies the matched migration into FOUR+ outcomes
+	// (accept-set → proceed; terminal-own → clean cold-start; terminal-not-own/Failed/RollingBack
+	// → fail-closed reject; wrong-node → fail-closed reject; genuinely mid-flight → transient
+	// retry). Only the mid-flight "phase is ..." outcome is transient, so terminal states break
+	// the retry loop immediately instead of spinning it to budget exhaustion.
 	if p.k8sClient != nil {
 		// ADR-0351 D4.2: verifyTimeout(antiSpoofVerifyBudget) + verifyInterval
 		// (antiSpoofVerifyPollInterval) are bounded WELL under the GROUNDED real
@@ -225,12 +359,13 @@ func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent)
 		verifyDeadline := time.Now().Add(antiSpoofVerifyBudget)
 		var verifyErr error
 		for time.Now().Before(verifyDeadline) {
-			verifyErr = p.verifyPodMigration(ctx, event.Namespace, checkpointRef)
+			verifyErr = p.verifyPodMigration(ctx, event.Namespace, event.Pod, checkpointRef)
 			if verifyErr == nil {
 				break
 			}
 			// Only retry on phase-ordering transients — fail fast on all other errors
-			// (missing/forged CR, node mismatch, List failure) with the same blocking error.
+			// (missing/forged CR, node mismatch, terminal phase, List failure). The terminal
+			// sentinels do NOT contain "phase is", so this breaks immediately on them.
 			if !isPhaseTransientErr(verifyErr) {
 				break
 			}
@@ -240,36 +375,46 @@ func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent)
 			case <-time.After(antiSpoofVerifyPollInterval):
 			}
 		}
+
+		// ADR-0412 D2 — terminal-own clean cold-start. The pod's OWN migration already reached
+		// Complete: the restore already landed during the migration, so a post-completion kubelet
+		// restart must cold-start the container WITHOUT re-restoring stale checkpoint memory. This
+		// is NOT a rejection — the container starts normally, which is what breaks the CrashLoop.
+		// Record the decision so HandlePostStartContainer consumes the SAME outcome (ADR-0412
+		// condition #1) and does not run the barrier/restore off a second independent read.
+		if errors.Is(verifyErr, errRestoreNotApplicableTerminalOwn) {
+			metrics.NRIRestoreGateOutcomeTotal.WithLabelValues("terminal_own_coldstart").Inc()
+			p.recordStartDecision(event.ID, restoreDecisionTerminalOwnColdStart)
+			log.Info("NRI StartContainer: pod's own migration already Complete — clean cold-start, no restore (ADR-0412 D2)",
+				"container", event.ID, "pod", event.Pod, "namespace", event.Namespace,
+				"checkpointRef", checkpointRef)
+			return nil // container starts normally; kubelet CrashLoop is broken
+		}
+
 		if verifyErr != nil {
+			// Classify the fail-closed outcome for the labeled counter (ADR-0412 condition #3).
+			// The detailed reason+phase log is emitted at the reject site inside verifyPodMigration
+			// (node-mismatch and terminal-not-own), where the matched phase is in scope.
+			switch {
+			case errors.Is(verifyErr, errNodeMismatch):
+				metrics.NRIRestoreGateOutcomeTotal.WithLabelValues("node_mismatch").Inc()
+			case errors.Is(verifyErr, errTerminalNotOwn):
+				metrics.NRIRestoreGateOutcomeTotal.WithLabelValues("terminal_reject_not_own").Inc()
+			case isPhaseTransientErr(verifyErr):
+				// Genuinely mid-flight when the budget expired (e.g. a slow OverlayHandoff). The
+				// container will CrashLoop and re-attempt on the next start — unchanged pre-ADR
+				// behavior for a real in-flight migration.
+				metrics.NRIRestoreGateOutcomeTotal.WithLabelValues("transient_wait").Inc()
+			}
 			log.Error(verifyErr, "NRI StartContainer: PodMigration verification failed — blocking restore",
 				"checkpointRef", checkpointRef, "container", event.ID)
 			return fmt.Errorf("NRI StartContainer: PodMigration verification failed: %w", verifyErr)
 		}
-	}
 
-	// ADR-0197 Rule D (agent side) — per-container restore-target gate.
-	// The pod-scoped checkpoint-ref above has no per-container discriminator, so this hook
-	// matches whichever container fires StartContainer FIRST — which is the cp-only
-	// podmotion-inject-holder init container, not the holder-running main container
-	// (gate-10: inject-holder=6, redis=0). Firing CRIU restore + the holder-quiescent barrier
-	// against the init container wedges it (the init container never runs the holder, never
-	// writes the sentinel), deadlocking the main container behind it → 50s timeout →
-	// RunContainerError → CrashLoopBackOff.
-	//
-	// Gate on container identity AFTER the verifyPodMigration anti-spoof check and BEFORE the
-	// restore trigger + barrier: proceed ONLY if event.Name is in the operator-stamped
-	// podmotion.io/restore-target-containers list (main container names; the init container is
-	// excluded by construction). For any non-listed container (the init container), return nil
-	// immediately — clean pass-through, no restore, no barrier — so the init container completes,
-	// the emptyDir is populated, and the main container starts. Its StartContainer then fires and
-	// restore+barrier engage against the holder-running container, which DOES write the sentinel.
-	const restoreTargetsKey = "podmotion.io/restore-target-containers"
-	if targets := event.Annotations[restoreTargetsKey]; targets != "" {
-		if !containerInList(event.Name, targets) {
-			log.Info("ADR-0197 Rule D: container is not a restore target — clean pass-through (no restore, no barrier)",
-				"container", event.ID, "name", event.Name, "restoreTargets", targets)
-			return nil
-		}
+		// Accept-set phase — restore is authorized. Record the proceed decision so
+		// HandlePostStartContainer runs the barrier + restore against the SAME decision.
+		metrics.NRIRestoreGateOutcomeTotal.WithLabelValues("proceed").Inc()
+		p.recordStartDecision(event.ID, restoreDecisionProceed)
 	}
 
 	// ADR-0198 Rule F — defer the holder-quiescent barrier + CRIU restore trigger to
@@ -337,7 +482,7 @@ func (p *Plugin) HandlePostStartContainer(_ context.Context, event ContainerEven
 
 	// Re-validate the ref before it touches the filesystem (defense-in-depth; HandleStartContainer
 	// already validated, but PostStartContainer is reachable independently via the NRI dispatch).
-	if !validCheckpointRef.MatchString(checkpointRef) {
+	if !ValidCheckpointRef.MatchString(checkpointRef) {
 		log.Error(nil, "NRI PostStartContainer: rejecting invalid checkpointRef — possible path traversal",
 			"checkpointRef", checkpointRef, "container", event.ID)
 		return fmt.Errorf("invalid checkpointRef %q: must match [a-z0-9][a-z0-9-]{0,61}[a-z0-9]", checkpointRef)
@@ -350,6 +495,37 @@ func (p *Plugin) HandlePostStartContainer(_ context.Context, event ContainerEven
 		if !containerInList(event.Name, targets) {
 			log.Info("ADR-0197 Rule D: container is not a restore target — clean pass-through (PostStartContainer)",
 				"container", event.ID, "name", event.Name, "restoreTargets", targets)
+			return nil
+		}
+	}
+
+	// ADR-0412 D2 / condition #1 — consume the decision HandleStartContainer already computed for
+	// this container so PostStartContainer acts on the SAME outcome instead of re-deriving it from
+	// a second, independent CR read (which a phase transition between the two synchronous hook
+	// calls could make disagree). This block runs ONLY when k8sClient != nil; in stub mode
+	// (unit-test / no verification) both hooks behave exactly as before this ADR.
+	if p.k8sClient != nil {
+		decision, found := p.takeStartDecision(event.ID)
+		if !found {
+			// The threaded decision is unavailable (e.g. the agent restarted between the two
+			// hooks, or PostStartContainer was dispatched independently of a preceding
+			// StartContainer decision). Re-derive fail-closed rather than blindly proceeding: run
+			// barrier + restore ONLY if the migration is verifiably in the restore accept-set. Any
+			// non-nil verify result — terminal-own, terminal-not-own, node-mismatch, mid-flight,
+			// missing CR — means "do NOT restore here", so we skip. This preserves the no-fail-open
+			// guarantee: a missing decision never authorizes a restore it did not earn.
+			if verifyErr := p.verifyPodMigration(context.Background(), event.Namespace, event.Pod, checkpointRef); verifyErr != nil {
+				log.Info("NRI PostStartContainer: no threaded StartContainer decision and re-derive is not restore-authorized — skipping barrier + restore (fail-closed)",
+					"container", event.ID, "pod", event.Pod, "namespace", event.Namespace,
+					"checkpointRef", checkpointRef, "reason", verifyErr.Error())
+				return nil
+			}
+			decision = restoreDecisionProceed
+		}
+		if decision == restoreDecisionTerminalOwnColdStart {
+			log.Info("NRI PostStartContainer: pod's own migration already Complete — skipping barrier + restore, clean cold-start (ADR-0412 D2)",
+				"container", event.ID, "pod", event.Pod, "namespace", event.Namespace,
+				"checkpointRef", checkpointRef)
 			return nil
 		}
 	}
@@ -436,9 +612,24 @@ func verifyCheckpointProvenanceSentinelImpl(checkpointRef string) error {
 	return nil
 }
 
-// verifyPodMigration ensures that a PodMigration CR matching the checkpointRef exists,
-// is in Restoring phase, and targets this node — blocking restore if not.
-func (p *Plugin) verifyPodMigration(ctx context.Context, namespace, checkpointRef string) error {
+// verifyPodMigration ensures that a PodMigration CR matching the checkpointRef exists and targets
+// this node, then classifies its phase into the ADR-0412 D2 outcome model:
+//
+//   - nil                                  → phase is in the restore accept-set {Restoring,
+//     RestoreSocketReattach, DisengageHold}; restore is authorized (UNCHANGED accept-set).
+//   - errRestoreNotApplicableTerminalOwn   → the pod's OWN migration is Complete; cold-start
+//     normally, do NOT re-restore (D2 own-completed branch).
+//   - error wrapping errNodeMismatch       → ref's destination node is not this node (fail-closed).
+//   - error wrapping errTerminalNotOwn     → ref points at a terminal/aborting migration this pod
+//     does not own (fail-closed; anti-spoof preserved).
+//   - "phase is ..." error                 → genuinely mid-flight, pre-FDB phase; transient, retry.
+//
+// podName is event.Pod (the replacement pod's name) — the "own" discriminator for the terminal
+// branch. Correctness of the integrity properties does NOT depend on the name binding: the
+// safety-critical action on the terminal branch (never re-trigger restore) holds for ALL terminal
+// phases unconditionally; the name match only gates cold-start-vs-block, and a mismatch fails safe
+// (a false block, never a false restore).
+func (p *Plugin) verifyPodMigration(ctx context.Context, namespace, podName, checkpointRef string) error {
 	// List PodMigrations in the pod's namespace looking for one whose CheckpointRef matches.
 	//
 	// ADR-0185 r1 C6 (cache-staleness): this List is served by the controller-runtime
@@ -459,47 +650,119 @@ func (p *Plugin) verifyPodMigration(ctx context.Context, namespace, checkpointRe
 		if pm.Name != checkpointRef {
 			continue
 		}
-		// ADR-0185 r1 (Option B): accept-set is NOT widened. OverlayHandoff is deliberately
-		// excluded — CRIU restore must not begin until the FDB barrier (conditionVXLANFDBUpdated)
-		// is confirmed. The bounded retry in HandleStartContainer waits for the operator to
-		// advance past OverlayHandoff into an accepted restore phase.
-		if err := verifyPhaseInAcceptSet(string(pm.Status.Phase)); err != nil {
-			return fmt.Errorf("PodMigration %s/%s %w", namespace, pm.Name, err)
-		}
-		// Prefer status.DestinationNodeName (set by controller after scheduling);
-		// fall back to spec.TargetNodeName for early-phase races.
+
+		// ADR-0412 D2: node identity is checked FIRST — ahead of phase classification — so a
+		// wrong-node ref fails fast as a PERMANENT node-mismatch instead of spinning as a transient
+		// "phase is ..." until the budget expires. Prefer status.DestinationNodeName (set by the
+		// controller after scheduling); fall back to spec.TargetNodeName for early-phase races.
 		destNode := pm.Status.DestinationNodeName
 		if destNode == "" {
 			destNode = pm.Spec.TargetNodeName
 		}
 		if p.nodeName != "" && destNode != p.nodeName {
-			return fmt.Errorf("PodMigration %s/%s destinationNode %s != this node %s",
-				namespace, pm.Name, destNode, p.nodeName)
+			// ADR-0412 condition #3 — fail-closed reject site (node-mismatch): log with migration
+			// ref, phase, and the specific reason.
+			log.Error(nil, "NRI StartContainer: fail-closed reject — checkpoint-ref destination node is not this node",
+				"reason", "node-mismatch",
+				"migrationRef", checkpointRef,
+				"namespace", namespace,
+				"phase", string(pm.Status.Phase),
+				"destinationNode", destNode,
+				"thisNode", p.nodeName)
+			return fmt.Errorf("PodMigration %s/%s destinationNode %s != this node %s: %w",
+				namespace, pm.Name, destNode, p.nodeName, errNodeMismatch)
 		}
-		return nil // found and verified
+
+		switch {
+		case isRestoreAcceptPhase(pm.Status.Phase):
+			// ADR-0185 r1 (Option B): accept-set is NOT widened. OverlayHandoff and every pre-FDB
+			// phase are excluded — CRIU restore must not begin until the FDB barrier
+			// (conditionVXLANFDBUpdated) is confirmed. Restore is authorized.
+			return nil
+
+		case pmv1.IsTerminalOrRollingBackPhase(pm.Status.Phase):
+			// ADR-0412 D2 — terminal/aborting phase. Monotonic: never re-enters the accept-set,
+			// so it must NOT be retried as a transient "phase is ..." blip.
+			if pm.Status.Phase == pmv1.MigrationPhaseComplete &&
+				pm.Status.ReplacementPodName != "" &&
+				pm.Status.ReplacementPodName == podName {
+				// This pod IS the migration's own destination replacement pod, on this node, and
+				// the migration COMPLETED. The restore already landed during the migration; a
+				// post-completion kubelet restart must cold-start normally, not re-restore stale
+				// checkpoint memory. Distinct, PERMANENT (non-"phase is") sentinel.
+				return errRestoreNotApplicableTerminalOwn
+			}
+			// Complete-but-not-own (stale/forged ref → unrelated completed migration), or Failed /
+			// RollingBack / DryRunComplete (aborted / never-restored → cold-starting risks a second
+			// live instance alongside the ADR-0157-thawed source: split-brain). Fail-closed,
+			// PERMANENT.
+			//
+			// ADR-0412 condition #3 — fail-closed reject site (terminal-not-own): log with
+			// migration ref, phase, and the specific reason (own-mismatch vs Failed/RollingBack).
+			// ADR-0412 condition #5 — a pod can land here by LEGITIMATE accident (e.g. a stale
+			// Status.ReplacementPodName from an interrupted ADR-0360 self-heal cycle). See
+			// docs/runbooks/adr-0412-terminal-not-own-recovery.md for the exact kubectl recipe to
+			// un-wedge such a pod.
+			log.Error(nil, "NRI StartContainer: fail-closed reject — checkpoint-ref points at a terminal/aborting migration this pod does not own",
+				"reason", terminalRejectReason(pm.Status.Phase),
+				"migrationRef", checkpointRef,
+				"namespace", namespace,
+				"phase", string(pm.Status.Phase),
+				"replacementPodName", pm.Status.ReplacementPodName,
+				"thisPod", podName,
+				"runbook", "docs/runbooks/adr-0412-terminal-not-own-recovery.md")
+			return fmt.Errorf("PodMigration %s/%s is in terminal phase %s and is not restorable — "+
+				"checkpoint-ref is stale or does not belong to this pod: %w",
+				namespace, pm.Name, pm.Status.Phase, errTerminalNotOwn)
+
+		default:
+			// Genuinely mid-flight, pre-FDB phase (Pending…OverlayHandoff, Verifying, …) that WILL
+			// advance. Transient "phase is ..." — the bounded retry loop waits for the operator to
+			// advance into an accepted restore phase. UNCHANGED behavior.
+			return fmt.Errorf("PodMigration %s/%s phase is %s, expected Restoring/RestoreSocketReattach/DisengageHold",
+				namespace, pm.Name, pm.Status.Phase)
+		}
 	}
 	// No matching PodMigration found — treat as spoofed annotation.
 	return fmt.Errorf("no PodMigration in %s with checkpointRef %q in Restoring phase", namespace, checkpointRef)
 }
 
-// verifyPhaseInAcceptSet returns nil if the given PodMigration phase is in the NRI
-// anti-spoof accept-set, or a "phase is ..." error otherwise.
+// terminalRejectReason names the specific reason a terminal/aborting migration is fail-closed
+// rejected (ADR-0412 condition #3 observability): "own-mismatch" when the migration is Complete
+// but its ReplacementPodName is not this pod (stale/forged ref), otherwise the aborting phase
+// itself (Failed / RollingBack / DryRunComplete).
+func terminalRejectReason(phase pmv1.MigrationPhase) string {
+	if phase == pmv1.MigrationPhaseComplete {
+		return "own-mismatch"
+	}
+	return string(phase)
+}
+
+// isRestoreAcceptPhase reports whether a phase is in the NRI anti-spoof restore accept-set.
 //
 // ADR-0185 r1 (Option B): the accept-set is EXACTLY the phases reachable after
-// conditionVXLANFDBUpdated=True — {Restoring, RestoreSocketReattach, DisengageHold}.
-// OverlayHandoff is NOT included (FDB not yet confirmed); FinalFreezeStateCapture and all
-// earlier phases are NOT included. The phase-mismatch error string contains "phase is" so the
-// bounded retry loop (isPhaseTransientErr) waits for the operator to advance, while forged/missing
-// CR errors (which do NOT contain "phase is") fail fast.
-func verifyPhaseInAcceptSet(phase string) error {
-	switch pmv1.MigrationPhase(phase) {
+// conditionVXLANFDBUpdated=True — {Restoring, RestoreSocketReattach, DisengageHold}. OverlayHandoff
+// is NOT included (FDB not yet confirmed); FinalFreezeStateCapture and all earlier phases are NOT
+// included. ADR-0412 does NOT widen this set — it only carves terminal phases out of the former
+// catch-all default into their own branch (see verifyPodMigration).
+func isRestoreAcceptPhase(phase pmv1.MigrationPhase) bool {
+	switch phase {
 	case pmv1.MigrationPhaseRestoring,
 		pmv1.MigrationPhaseRestoreSocketReattach,
 		pmv1.MigrationPhaseDisengageHold:
-		return nil
-	default:
-		return fmt.Errorf("phase is %s, expected Restoring/RestoreSocketReattach/DisengageHold", phase)
+		return true
 	}
+	return false
+}
+
+// verifyPhaseInAcceptSet is the error-returning wrapper around isRestoreAcceptPhase, retained so
+// the ADR-0185 accept-set contract test (TestVerifyPodMigrationAcceptSet) still anchors the
+// UNCHANGED accept-set by string ("phase is ..." → transient for the retry loop).
+func verifyPhaseInAcceptSet(phase string) error {
+	if isRestoreAcceptPhase(pmv1.MigrationPhase(phase)) {
+		return nil
+	}
+	return fmt.Errorf("phase is %s, expected Restoring/RestoreSocketReattach/DisengageHold", phase)
 }
 
 // isPhaseTransientErr returns true for phase-ordering errors where retry is safe.

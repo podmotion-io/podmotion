@@ -696,9 +696,20 @@ func TestFinalFreezeStateCaptureDoesNotHijackPipeline(t *testing.T) {
 				Labels:    map[string]string{replacementPodMigrationNameLabel: pm.Name},
 			},
 		}
+		// ADR-0365 Condition 1: reconcileCheckpointing's fast-path now re-validates the
+		// destination node (NMC readiness/capacity, drain label) immediately before
+		// ensureReplacementPodCreated — a live Node and a Ready, non-exhausted NMC for
+		// pm.Status.DestinationNodeName are required for that revalidation to pass and let
+		// this fixture reach the legacy-hijack ledger assertion it was written for.
+		destNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: pm.Status.DestinationNodeName}}
+		destNMC := &pmv1.NodeMigrationCapacity{
+			ObjectMeta: metav1.ObjectMeta{Name: pm.Status.DestinationNodeName},
+			Spec:       pmv1.NodeMigrationCapacitySpec{MaxConcurrentMigrationsDestination: 1},
+			Status:     pmv1.NodeMigrationCapacityStatus{Ready: true},
+		}
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
-			WithObjects(pm, srcPod, replPod).
+			WithObjects(pm, srcPod, replPod, destNode, destNMC).
 			WithStatusSubresource(pm).
 			Build()
 		ledger := &[]transition{}

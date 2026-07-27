@@ -1,0 +1,83 @@
+{{- if include "podmotion.evictionEnabled" . }}
+# ADR-0401: the eviction-interception webhook (meviction.podmotion.io,
+# /mutate-core-v1-pod-eviction, internal/webhook/eviction_webhook.go) deployed via the
+# AUTHORITATIVE Helm path. Previously this MutatingWebhookConfiguration existed ONLY in
+# config/webhook/manifests.yaml (the CRD-gen path) and had NO chart template, so on every
+# Helm-deployed cluster the source-pod eviction guard was never wired — a config-only fail-open
+# webhook that never ran (the same class as the Sprint52 pod-mutation gap). This template routes
+# real pods/eviction admission to the handler, which fails CLOSED on any unverifiable migration
+# state (deny with a retriable 429, never a silent allow).
+#
+# failurePolicy: Fail — if this webhook is unreachable, an eviction it matches is DENIED, never
+# admitted, so a stressed/partitioned control plane cannot evict an in-flight migration source
+# out from under the migration. The blast radius of Fail is bounded by:
+#   - the namespaceSelector NotIn exclusion below (the load-bearing anti-self-deadlock valve —
+#     the operator's own pods and core system pods stay evictable, so cluster self-healing and
+#     operator recovery are never wedged; those namespaces never host a PodMotion migration source);
+#   - timeoutSeconds: 5 (a slow webhook fails fast to the failurePolicy decision);
+#   - the handler's retriable 429 (kubectl drain / descheduler / autoscaler back off and retry
+#     rather than aborting the drain).
+# NOTE: the pods/eviction admitted object is a policy/v1 Eviction, which carries NO pod labels,
+# so objectSelector cannot scope this to migrating pods (unlike webhook-pod-mutation.yaml, which
+# selects on the replacement pod's podmotion.io/migration-name label). Narrower-than-namespace
+# scoping requires a controller-maintained namespace label + a new namespaces RBAC privilege and
+# is a recorded ADR-0401 follow-up, deliberately not bolted on here.
+#
+# Gated on webhook.eviction.enabled (default true), NOT on cert-manager (mirrors
+# webhook-pod-mutation.yaml / webhook-agent-exec-block.yaml): on the cert-manager path the
+# caBundle is injected by the cert-manager CA injector annotation; on the non-cert-manager path
+# (kind/KVM dev) the chart mints a self-signed serving cert (_webhook-certs.tpl +
+# webhook-selfsigned-secret.yaml, shared with the other webhooks) and inlines the matching CA
+# into clientConfig.caBundle below. Either way the operator is wired with --webhook-cert-path so
+# its webhook server actually serves the handler — a failurePolicy:Fail VWC must never point at a
+# non-serving backend.
+{{- $selfSigned := and (include "podmotion.evictionEnabled" .) (not .Values.webhook.certManager.enabled) }}
+{{- if $selfSigned }}
+{{- include "podmotion.webhookSelfSignedCert" . -}}
+{{- end }}
+{{- $caBundle := "" }}
+{{- if $selfSigned }}
+{{- $caBundle = ((index . "podmotionWebhookCert").CA | b64enc) }}
+{{- end }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: podmotion-eviction-webhook-configuration
+  {{- if .Values.webhook.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/podmotion-serving-cert
+  {{- end }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: operator
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+webhooks:
+  - name: meviction.podmotion.io
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      {{- if $caBundle }}
+      caBundle: {{ $caBundle }}
+      {{- end }}
+      service:
+        name: podmotion-webhook-service
+        namespace: {{ .Release.Namespace }}
+        path: /mutate-core-v1-pod-eviction
+    failurePolicy: Fail
+    matchPolicy: Equivalent
+    timeoutSeconds: 5
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - {{ .Release.Namespace }}
+            - kube-system
+            - kube-node-lease
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods/eviction"]
+        scope: Namespaced
+    sideEffects: None
+{{- end }}

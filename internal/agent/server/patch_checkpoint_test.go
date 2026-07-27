@@ -63,31 +63,29 @@ var dropPrefixes = []string{"/sys"}
 // so no orphan results). KEEP IN SYNC with server.go.
 // TestPatchScript_DropLogicInSyncWithProduction asserts every member here is
 // present in the production script source.
+// ADR-0415: this set carries the /proc and /sys STRUCTURAL carve-out ONLY. The pod-owned /
+// runtime-provided mounts that used to be dropped here — the serviceaccount token tmpfs,
+// /etc/{hosts,hostname,resolv.conf}, and /dev/termination-log — are NO LONGER dropped: they are
+// captured by default and internalized (owned => CRIU-owned + content). "/dev/shm" is likewise
+// absent (ADR-0382, generalized by ADR-0415). Keep in sync with the production DROP_PATHS.
 var dropMntsExact = map[string]struct{}{
-	"/var/run/secrets/kubernetes.io/serviceaccount": {},
-	"/run/secrets/kubernetes.io/serviceaccount":     {},
-	"/etc/hosts":           {},
-	"/etc/hostname":        {},
-	"/etc/resolv.conf":     {},
-	"/dev/termination-log": {},
-	"/dev/shm":             {},
-	"/proc/bus":            {},
-	"/proc/fs":             {},
-	"/proc/irq":            {},
-	"/proc/sys":            {},
-	"/proc/sysrq-trigger":  {},
-	"/proc/acpi":           {},
-	"/proc/scsi":           {},
-	"/proc/interrupts":     {},
-	"/proc/kcore":          {},
-	"/proc/keys":           {},
-	"/proc/latency_stats":  {},
-	"/proc/timer_list":     {},
-	"/proc/sched_debug":    {},
-	"/sys/firmware":        {},
-	"/sys/fs/pstore":       {},
-	"/sys/fs/bpf":          {},
-	"/sys/fs/cgroup":       {},
+	"/proc/bus":           {},
+	"/proc/fs":            {},
+	"/proc/irq":           {},
+	"/proc/sys":           {},
+	"/proc/sysrq-trigger": {},
+	"/proc/acpi":          {},
+	"/proc/scsi":          {},
+	"/proc/interrupts":    {},
+	"/proc/kcore":         {},
+	"/proc/keys":          {},
+	"/proc/latency_stats": {},
+	"/proc/timer_list":    {},
+	"/proc/sched_debug":   {},
+	"/sys/firmware":       {},
+	"/sys/fs/pstore":      {},
+	"/sys/fs/bpf":         {},
+	"/sys/fs/cgroup":      {},
 }
 
 // shouldDrop mirrors the production `_should_drop(mp)` predicate exactly.
@@ -218,10 +216,13 @@ func TestPatchCheckpointImages_SysSubtreeFullyDropped(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Both serviceaccount mount forms must be dropped.
+// 3. ADR-0415: the serviceaccount token tmpfs is NO LONGER dropped — it is a pod-owned mount
+//    captured by default (owned => internalized as CRIU-owned + content). Chad's explicit ruling:
+//    the SA token is NOT carved out; checkpoint confidentiality (0700, tmpfs, zeroize, ADR-0029
+//    encryption) is the uniform place that risk is handled, not a capture-time exclusion list.
 // ---------------------------------------------------------------------------
 
-func TestPatchCheckpointImages_ServiceAccountDropped(t *testing.T) {
+func TestPatchCheckpointImages_ServiceAccountRetained(t *testing.T) {
 	entries := []mountEntry{
 		{MntID: 9091, ParentMntID: 0, Mountpoint: "/"},
 		{MntID: 100, ParentMntID: 9091, Mountpoint: "/run/secrets/kubernetes.io/serviceaccount"},
@@ -232,11 +233,11 @@ func TestPatchCheckpointImages_ServiceAccountDropped(t *testing.T) {
 	assertNoOrphanParents(t, kept)
 
 	mp := mountpoints(kept)
-	if mp["/run/secrets/kubernetes.io/serviceaccount"] {
-		t.Errorf("/run/secrets/kubernetes.io/serviceaccount must be dropped (ADR-0190 canonical form)")
+	if !mp["/run/secrets/kubernetes.io/serviceaccount"] {
+		t.Errorf("ADR-0415: /run/secrets/kubernetes.io/serviceaccount must be RETAINED (captured as owned, not dropped)")
 	}
-	if mp["/var/run/secrets/kubernetes.io/serviceaccount"] {
-		t.Errorf("/var/run/secrets/kubernetes.io/serviceaccount must be dropped")
+	if !mp["/var/run/secrets/kubernetes.io/serviceaccount"] {
+		t.Errorf("ADR-0415: /var/run/secrets/kubernetes.io/serviceaccount must be RETAINED (captured as owned, not dropped)")
 	}
 }
 
@@ -282,8 +283,10 @@ func TestPatchCheckpointImages_ProcChildrenRetained(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. /dev/pts and /dev/mqueue have a present parent (/dev) and are not in the
-//    drop set → they must survive.
+// 5. /dev/pts, /dev/mqueue, and (ADR-0382) /dev/shm have a present parent (/dev)
+//    and are not in the drop set → they must all survive. /dev/termination-log
+//    remains explicitly dropped (it is re-provided as an --ext-mount-map bind by
+//    buildCRIURestoreArgs, not a private mount CRIU should recreate).
 // ---------------------------------------------------------------------------
 
 func TestPatchCheckpointImages_DevChildrenRetained(t *testing.T) {
@@ -292,8 +295,8 @@ func TestPatchCheckpointImages_DevChildrenRetained(t *testing.T) {
 		{MntID: 300, ParentMntID: 9091, Mountpoint: "/dev"},                // present parent
 		{MntID: 301, ParentMntID: 300, Mountpoint: "/dev/pts"},             // retained
 		{MntID: 302, ParentMntID: 300, Mountpoint: "/dev/mqueue"},          // retained
-		{MntID: 303, ParentMntID: 300, Mountpoint: "/dev/shm"},             // dropped by explicit list
-		{MntID: 304, ParentMntID: 300, Mountpoint: "/dev/termination-log"}, // dropped by explicit list
+		{MntID: 303, ParentMntID: 300, Mountpoint: "/dev/shm"},             // retained (owned)
+		{MntID: 304, ParentMntID: 300, Mountpoint: "/dev/termination-log"}, // ADR-0415: now retained (owned)
 	}
 
 	kept := mountpointKeptEntries(entries, nil)
@@ -306,11 +309,11 @@ func TestPatchCheckpointImages_DevChildrenRetained(t *testing.T) {
 	if !mp["/dev/mqueue"] {
 		t.Errorf("/dev/mqueue must be retained (valid parent /dev present, not in drop set)")
 	}
-	if mp["/dev/shm"] {
-		t.Errorf("/dev/shm must be dropped by the explicit list")
+	if !mp["/dev/shm"] {
+		t.Errorf("ADR-0382/0415: /dev/shm must be retained (owned mount) so its captured content survives into the restored image")
 	}
-	if mp["/dev/termination-log"] {
-		t.Errorf("/dev/termination-log must be dropped by the explicit list")
+	if !mp["/dev/termination-log"] {
+		t.Errorf("ADR-0415: /dev/termination-log is no longer dropped by DROP_PATHS — it is a pod-owned/runtime-provided mount captured by default, not an ad hoc exclusion")
 	}
 }
 
@@ -395,27 +398,32 @@ func gc21ColdBETopology() []mountEntry {
 	}
 }
 
-// simulateB2Drop drops the external /data entry from the kept set (mirrors the B-2 ext-drop
-// pass in the Python script). Returns the reduced set and the set of dropped mnt_ids.
-func simulateB2Drop(entries []mountEntry) (kept []mountEntry, droppedIDs map[int]struct{}) {
-	droppedIDs = map[int]struct{}{}
+// simulateOwnedInternalize mirrors the ADR-0415 external-mount pass in the Python script for the
+// no-reattach case: an external entry (ext_key set) that is NOT a storage-tier PVC re-attach is
+// INTERNALIZED — kept in the set with its ext_key cleared — rather than dropped. Returns the kept
+// set (all entries survive) and the set of internalized mnt_ids.
+func simulateOwnedInternalize(entries []mountEntry, reattach map[string]struct{}) (kept []mountEntry, internalizedIDs map[int]struct{}) {
+	internalizedIDs = map[int]struct{}{}
 	for _, e := range entries {
 		if e.ExtKey != "" {
-			droppedIDs[e.MntID] = struct{}{}
-		} else {
-			kept = append(kept, e)
+			if _, isReattach := reattach[e.Mountpoint]; !isReattach {
+				internalizedIDs[e.MntID] = struct{}{}
+				e.ExtKey = "" // internalized: CRIU owns it
+			}
 		}
+		kept = append(kept, e)
 	}
-	return kept, droppedIDs
+	return kept, internalizedIDs
 }
 
-// TestADR0194_B2_ExternalEntryDropped asserts that the /data (mnt_id 2951) external entry
-// is dropped by the B-2 pass and that AC-1 (no orphan parents) holds on the 5-entry
-// reduced set. (ADR-0194 §4.4 / C-PA-3 / H3(a)(b).)
-func TestADR0194_B2_ExternalEntryDropped(t *testing.T) {
+// TestADR0415_ExternalEntryInternalized asserts that under ADR-0415 the /data (mnt_id 2951)
+// external entry — when NOT in the storage-tier PVC re-attach set — is INTERNALIZED (kept with its
+// ext_key cleared, so CRIU owns and fills it), not dropped, and that AC-1 (no orphan parents) still
+// holds on the full kept set. This supersedes the ADR-0194 B-2 external-DROP behavior.
+func TestADR0415_ExternalEntryInternalized(t *testing.T) {
 	entries := gc21ColdBETopology()
 
-	// Verify premise: /data IS present in the kept set before the B-2 pass.
+	// Verify premise: /data IS present with an ext_key before the pass.
 	found2951 := false
 	for _, e := range entries {
 		if e.MntID == 2951 {
@@ -426,29 +434,34 @@ func TestADR0194_B2_ExternalEntryDropped(t *testing.T) {
 		t.Fatal("test premise violated: /data (mnt_id 2951) not in gc21ColdBETopology; update the test")
 	}
 
-	reduced, dropped := simulateB2Drop(entries)
+	kept, internalized := simulateOwnedInternalize(entries, nil)
 
-	// (a) /data must be dropped.
-	if _, ok := dropped[2951]; !ok {
-		t.Errorf("B-2: mnt_id 2951 (/data, ext_key set) must be in dropped set")
+	// (a) /data must be internalized, NOT dropped.
+	if _, ok := internalized[2951]; !ok {
+		t.Errorf("ADR-0415: mnt_id 2951 (/data, ext_key set, no re-attach mapping) must be internalized")
 	}
-	mp := mountpoints(reduced)
-	if mp["/data"] {
-		t.Errorf("B-2: /data must not appear in the reduced kept set after the drop pass")
+	mp := mountpoints(kept)
+	if !mp["/data"] {
+		t.Errorf("ADR-0415: /data must REMAIN in the kept set (internalized as CRIU-owned), not be dropped")
+	}
+	// Its ext_key must be cleared in the kept set.
+	for _, e := range kept {
+		if e.MntID == 2951 && e.ExtKey != "" {
+			t.Errorf("ADR-0415: internalized /data must have its ext_key cleared; got %q", e.ExtKey)
+		}
 	}
 
-	// (b) AC-1 (ADR-0191): no kept entry references a dropped mnt_id as parent_mnt_id.
-	// /data (2951) is a leaf — no kept entry has parent_mnt_id=2951.
-	assertNoOrphanParents(t, reduced)
+	// (b) AC-1 (ADR-0191): no orphan parents in the full kept set.
+	assertNoOrphanParents(t, kept)
 
-	// Verify the 5-entry reduced set is exactly: /, /proc, /dev, /dev/pts, /dev/mqueue.
-	expectedMountpoints := []string{"/", "/proc", "/dev", "/dev/pts", "/dev/mqueue"}
-	if len(reduced) != len(expectedMountpoints) {
-		t.Errorf("B-2 reduced set: expected %d entries, got %d", len(expectedMountpoints), len(reduced))
+	// The full 6-entry set survives: /, /proc, /dev, /dev/pts, /dev/mqueue, /data.
+	expectedMountpoints := []string{"/", "/proc", "/dev", "/dev/pts", "/dev/mqueue", "/data"}
+	if len(kept) != len(expectedMountpoints) {
+		t.Errorf("ADR-0415 kept set: expected %d entries, got %d", len(expectedMountpoints), len(kept))
 	}
 	for _, want := range expectedMountpoints {
 		if !mp[want] {
-			t.Errorf("B-2 reduced set: %q expected but absent", want)
+			t.Errorf("ADR-0415 kept set: %q expected but absent", want)
 		}
 	}
 }
@@ -490,19 +503,24 @@ func TestADR0194_B2_SharedMasterIDZero(t *testing.T) {
 func TestADR0194_B2_SourceSyncAnchors(t *testing.T) {
 	src := readPatchScriptSource(t)
 
+	// ADR-0415: the B-2 external-DROP of pod-owned mounts is removed (owned => internalize). So the
+	// CRIU_EXTERNAL_MOUNT_DROPPED and non_leaf_external drop tokens are gone by design; the
+	// load-bearing tokens are now the internalize path plus the retained atomic-write / hard-stop
+	// machinery for genuinely-unresolved externals and the PVC re-attach preserve/rewrite.
 	anchors := []struct {
 		token string
 		desc  string
 	}{
-		{"ext_drop_mnt_ids", "B-2 external drop mnt_id tracking dict (lockstep rebind key)"},
-		{"CRIU_EXTERNAL_MOUNT_DROPPED", "B-2 event token for H4 CRIUExternalMountDropped event"},
+		{"ext_drop_mnt_ids", "files.img reconciliation ctx key (retained; empty under ADR-0415)"},
+		{"internalizing owned mount", "ADR-0415 owned-mount internalize log line"},
+		{"internalized_mnt_ids", "ADR-0415 internalized-mount tracking set"},
 		{"EXTERNAL_MOUNT_UNRESOLVED", "P-0194-1 hard-stop event token (ExternalMountUnresolved)"},
 		{"mp_tmp", "atomic mountpoints temp file (H1 / SC-2 dual-write)"},
 		{"files_tmp", "atomic files.img temp file (H1 / SC-2 dual-write)"},
 		{"P-0194-1c", "P-0194-1c cross-image assertion reference"},
 		{"ext_key", "ext_key field read in the external-mount scan"},
-		{"non_leaf_external", "non-leaf external entry hard-stop reason (H2 re-entry guard)"},
-		{"b2-lockstep-ext-drop", "B-2 lockstep action label in files.img rebind log line"},
+		{"reattach_kept_mnt_ids", "storage-tier PVC re-attach preserve set (carve-out 2)"},
+		{"CRIU_REATTACH_EXT_MOUNT_MAP", "PVC re-attach ext-mount-map token (literal ext_key case)"},
 	}
 
 	for _, a := range anchors {

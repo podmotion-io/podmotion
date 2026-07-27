@@ -185,10 +185,17 @@ build-linux: ## Build operator and agent for linux/arm64 and linux/amd64 (no cgo
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/podmotion-criu-wrapper-amd64 ./cmd/criu-wrapper/main.go
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/podmotion-holder-arm64 ./cmd/holder/main.go
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/podmotion-holder-amd64 ./cmd/holder/main.go
+	# ADR-0363 B1: scheduler binary — package/directory pattern (./cmd/scheduler), matching
+	# manager/agent above (not the file-argument style criu-wrapper/holder use), gated by the
+	# `scheduler` build tag so the default build-linux invocation above stays untouched by the
+	# heavier k8s.io/kubernetes dependency this tag isolates.
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags scheduler -o bin/podmotion-scheduler-arm64 ./cmd/scheduler
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags scheduler -o bin/podmotion-scheduler-amd64 ./cmd/scheduler
 	cp bin/podmotion-criu-wrapper-amd64 bin/criu-wrapper-linux-amd64
 	cp bin/podmotion-agent-amd64 bin/agent-linux-amd64
 	cp bin/podmotion-manager-amd64 bin/manager-linux-amd64
 	cp bin/podmotion-holder-amd64 bin/holder-linux-amd64
+	cp bin/podmotion-scheduler-amd64 bin/scheduler-linux-amd64
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
@@ -203,6 +210,16 @@ GIT_SHA ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
 	$(CONTAINER_TOOL) build --build-arg GIT_SHA=$(GIT_SHA) -t ${IMG} .
+
+# ADR-0363 B1: makes images/scheduler/Dockerfile buildable on its own, analogous to
+# docker-build above, so SC_IMAGES' pre-existing "scheduler" entry (see ##@ Supply Chain below)
+# has a real image for `make sbom`/`make security-scan` to find instead of erroring on a
+# nonexistent tag. NOT wired into hack/kvm-cluster.sh's cmd_deploy_podmotion — that deploy-path
+# integration belongs to ADR-0363's B2 (chart) follow-up, not this target.
+IMG_SCHEDULER ?= ghcr.io/podmotion-io/podmotion-scheduler:latest
+.PHONY: docker-build-scheduler
+docker-build-scheduler: ## Build docker image for the custom scheduler.
+	$(CONTAINER_TOOL) build --build-arg GIT_SHA=$(GIT_SHA) -f images/scheduler/Dockerfile -t ${IMG_SCHEDULER} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -594,6 +611,11 @@ release-gate: crd-upgrade-check security-scan ## Run all release gate checks (CR
 	  bash scripts/check-kernel-config.sh || { echo "ERROR: check-kernel-config.sh FAILED"; exit 1; }; \
 	else \
 	  echo "  [SKIP] scripts/check-kernel-config.sh not found"; \
+	fi
+	@if [ -f scripts/check-manifest-hygiene.sh ]; then \
+	  bash scripts/check-manifest-hygiene.sh || { echo "ERROR: check-manifest-hygiene.sh FAILED"; exit 1; }; \
+	else \
+	  echo "  [SKIP] scripts/check-manifest-hygiene.sh not found"; \
 	fi
 	@echo "==> Running go test ./... -tags release..."
 	@go test -tags release ./... || { echo "ERROR: go test -tags release FAILED"; exit 1; }

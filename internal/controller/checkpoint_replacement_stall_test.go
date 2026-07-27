@@ -76,10 +76,20 @@ func stallFixture(t *testing.T) (*PodMigrationReconciler, *pmv1.PodMigration) {
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
+	// ADR-0365 Condition 1: reconcileCheckpointing's fast-path now re-validates the destination
+	// node (NMC readiness/capacity, drain label) immediately before ensureReplacementPodCreated —
+	// a live Node and a Ready, non-exhausted NMC for the destination are required for that
+	// revalidation to pass and let this test reach the code path it actually exercises.
+	destNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-b"}}
+	destNMC := &pmv1.NodeMigrationCapacity{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-b"},
+		Spec:       pmv1.NodeMigrationCapacitySpec{MaxConcurrentMigrationsDestination: 1},
+		Status:     pmv1.NodeMigrationCapacityStatus{Ready: true},
+	}
 
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&pmv1.PodMigration{}).
-		WithObjects(pm, sourcePod).Build()
+		WithObjects(pm, sourcePod, destNode, destNMC).Build()
 	r := &PodMigrationReconciler{Client: fakeClient, Scheme: scheme}
 	return r, pm
 }

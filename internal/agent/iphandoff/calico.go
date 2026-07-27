@@ -76,23 +76,38 @@ func (c *CalicoHandoff) WaitForWorkloadEndpointReady(ctx context.Context, namesp
 			return fmt.Errorf("timeout waiting for Calico WEP %s/%s to become active", namespace, podName)
 		}
 
-		// Probe: check if the WEP exists by attempting to get it via the API.
-		// Full WEP readiness check (ActivelyUsed) requires the Calico API; for now
-		// we treat WEP existence as a proxy for Felix having programmed the dataplane.
-		// M9 will replace this with a proper Calico API probe.
-		wepName := fmt.Sprintf("%s-k8s-%s-eth0", namespace, podName)
-		_, err := c.KubeClient.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
-		if err == nil {
-			// Pod exists; check if it has an IP assigned (Felix has processed it).
-			pod, getErr := c.KubeClient.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
-			if getErr == nil && pod.Status.PodIP != "" {
-				_ = wepName // used in M9 full check
-				return nil
-			}
+		ready, err := c.WorkloadEndpointReady(ctx, namespace, podName)
+		if err != nil {
+			return err
+		}
+		if ready {
+			return nil
 		}
 
 		time.Sleep(wepPollInterval)
 	}
+}
+
+// WorkloadEndpointReady is the SINGLE-SHOT core of WaitForWorkloadEndpointReady (ADR-0405 3B): one
+// read, no poll loop, so the Ready-gate call site can compose it with its own reconcile requeue
+// instead of blocking a controller worker for wepReadyTimeout. WaitForWorkloadEndpointReady above
+// is the blocking-poll wrapper around this core. Returns (true, nil) once Felix has programmed the
+// dataplane for the pod, (false, nil) while it has not yet, and (false, err) on a real read error.
+//
+// Full WEP readiness (ActivelyUsed) requires the Calico API; for now WEP existence + an assigned
+// PodIP is treated as the proxy for Felix having programmed the dataplane. M9 replaces this with a
+// proper Calico API probe.
+func (c *CalicoHandoff) WorkloadEndpointReady(ctx context.Context, namespace, podName string) (bool, error) {
+	wepName := fmt.Sprintf("%s-k8s-%s-eth0", namespace, podName)
+	pod, err := c.KubeClient.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		return false, nil // not visible yet — transient (matches the wrapper's prior swallow-and-retry)
+	}
+	if pod.Status.PodIP != "" {
+		_ = wepName // used in M9 full check
+		return true, nil
+	}
+	return false, nil
 }
 
 // PreserveSourceWEP is a no-op marker indicating that the source WorkloadEndpoint

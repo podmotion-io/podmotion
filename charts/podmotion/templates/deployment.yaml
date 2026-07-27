@@ -63,7 +63,7 @@ spec:
                    registers the exec-block handler when --webhook-cert-path is set (cmd/main.go
                    webhooksEnabled gate). Pass it on EITHER cert path so the SD-6 VWC has a live,
                    serving backend. Without this a failurePolicy:Fail VWC points at a dead :9443. */}}
-            {{- if or .Values.webhook.certManager.enabled (include "podmotion.execBlockEnabled" .) }}
+            {{- if or .Values.webhook.certManager.enabled (include "podmotion.execBlockEnabled" .) (include "podmotion.evictionEnabled" .) }}
             - --webhook-cert-path=/tmp/k8s-webhook-server/serving-certs
             {{- end }}
           ports:
@@ -101,7 +101,7 @@ spec:
                    HOLD-B (ADR-0039 SD-6): the non-cert-manager exec-block path mints its own
                    podmotion-webhook-tls secret (webhook-selfsigned-secret.yaml), so mount on that
                    path too — the secret name is identical on both paths. */}}
-            {{- if or .Values.webhook.certManager.enabled (include "podmotion.execBlockEnabled" .) }}
+            {{- if or .Values.webhook.certManager.enabled (include "podmotion.execBlockEnabled" .) (include "podmotion.evictionEnabled" .) }}
             - name: webhook-certs
               mountPath: /tmp/k8s-webhook-server/serving-certs
               readOnly: true
@@ -117,7 +117,7 @@ spec:
       volumes:
         {{- /* ADR-0222 (3h-SYM): symmetric with the volumeMount above. HOLD-B: same
                secret name on the cert-manager and self-signed exec-block paths. */}}
-        {{- if or .Values.webhook.certManager.enabled (include "podmotion.execBlockEnabled" .) }}
+        {{- if or .Values.webhook.certManager.enabled (include "podmotion.execBlockEnabled" .) (include "podmotion.evictionEnabled" .) }}
         - name: webhook-certs
           secret:
             secretName: podmotion-webhook-tls

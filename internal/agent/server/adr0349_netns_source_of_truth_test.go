@@ -432,8 +432,11 @@ func TestRestore_StrictUnresolvableSandbox_FailsClosedBeforeJoinNsRestore(t *tes
 	if resp == nil || resp.Success {
 		t.Fatalf("Restore = %+v, want Success:false (ADR-0325 fail-closed on unresolvable sandbox)", resp)
 	}
-	if !strings.Contains(resp.ErrorMessage, "could not resolve replacement pod sandbox netns (ADR-0325)") {
-		t.Errorf("ErrorMessage = %q, want the ADR-0325 fail-closed message", resp.ErrorMessage)
+	// ADR-0370 citation fix: this exact error string (server.go, one of the two Restore() call
+	// sites named in scope) now cites ADR-0125/ADR-0177/ADR-0349 instead of the mislabeled
+	// "ADR-0325" — see ADR-0370 First Finding / §P-VERIFY assertion 5.
+	if !strings.Contains(resp.ErrorMessage, "could not resolve replacement pod sandbox netns (ADR-0125/ADR-0177/ADR-0349)") {
+		t.Errorf("ErrorMessage = %q, want the ADR-0125/ADR-0177/ADR-0349 fail-closed message", resp.ErrorMessage)
 	}
 	if joinCalled {
 		t.Fatal("joinNsRestoreFn was called — the ADR-0325 gate must fail closed BEFORE joinNsRestore, not after")

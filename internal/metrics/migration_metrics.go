@@ -190,6 +190,62 @@ var (
 		},
 		[]string{"migration_name", "namespace"},
 	)
+
+	// NRISocketOwnershipMismatchTotal counts ADR-0370 secondary-finding NRI-socket-ownership
+	// cross-check failures: the PID currently holding a listener at the resolved NRI socket
+	// path does not match the discovered-authoritative containerd daemon's PID (or either PID
+	// could not be attributed). This is a strong candidate explanation for why the NRI-confirm
+	// path times out on a dual-containerd node (ADR-0370 "Secondary finding"). Warn/CRITICAL-log
+	// only — never blocks agent startup (NRI is documented as an enhancement,
+	// internal/agent/nri/plugin.go). Labels: reason ("pid_mismatch").
+	NRISocketOwnershipMismatchTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "podmotion",
+			Name:      "nri_socket_ownership_mismatch_total",
+			Help:      "Count of ADR-0370 NRI-socket-ownership cross-check mismatches between the resolved NRI socket's owning PID and the discovered-authoritative containerd daemon's PID.",
+		},
+		[]string{"reason"},
+	)
+
+	// EvictionWebhookFailClosedTotal counts ADR-0401 fail-closed eviction denials: the
+	// eviction interceptor could NOT verify whether a live migration is in progress for the
+	// target pod (migration-state lookup errored, or the eviction object would not decode) and
+	// denied the eviction to protect a possible in-flight migration rather than waving it
+	// through. A nonzero rate means the source-pod guard is firing blind — the control plane's
+	// read path or the webhook's reachability is degraded while migrations may be in flight, and
+	// operators should alert on it. Labels: reason ("api_error", "decode_error").
+	EvictionWebhookFailClosedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "podmotion",
+			Name:      "eviction_webhook_failclosed_total",
+			Help:      "Count of ADR-0401 fail-closed eviction denials where the eviction webhook could not verify migration state and denied to protect a possible in-flight migration.",
+		},
+		[]string{"reason"},
+	)
+
+	// NRIRestoreGateOutcomeTotal counts the terminal-outcome classification of the ADR-0412 NRI
+	// restore anti-spoof gate for each restore-target container start. The gate is the
+	// source-of-truth enforcement point for restore authorization; this counter makes its
+	// three-plus-outcome model directly observable so operators can distinguish a legitimate
+	// post-completion cold-start from a fail-closed reject of a stale/forged terminal ref.
+	// Labels: outcome —
+	//   "proceed"                  restore authorized (phase in the {Restoring,
+	//                              RestoreSocketReattach, DisengageHold} accept-set).
+	//   "terminal_own_coldstart"   pod's OWN migration reached Complete; restore already landed —
+	//                              container cold-starts normally, no re-restore (ADR-0412 D2).
+	//   "terminal_reject_not_own"  ref points at a terminal migration this pod does not own, or a
+	//                              Failed/RollingBack/DryRunComplete migration — fail-closed reject.
+	//   "node_mismatch"            ref's destination node is not this node — fail-closed reject.
+	//   "transient_wait"           genuinely mid-flight pre-FDB phase; the bounded retry budget
+	//                              expired still-transient (will be re-attempted on next start).
+	NRIRestoreGateOutcomeTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "podmotion",
+			Name:      "nri_restore_gate_outcome_total",
+			Help:      "Count of ADR-0412 NRI restore anti-spoof gate outcomes per restore-target container start, labeled by outcome (proceed|terminal_own_coldstart|terminal_reject_not_own|node_mismatch|transient_wait).",
+		},
+		[]string{"outcome"},
+	)
 )
 
 func init() {
@@ -206,5 +262,8 @@ func init() {
 		CgroupAnchorOutcomeTotal,
 		BrokerExecDeadlineAbortsTotal,
 		DisarmRelayFailedTotal,
+		NRISocketOwnershipMismatchTotal,
+		EvictionWebhookFailClosedTotal,
+		NRIRestoreGateOutcomeTotal,
 	)
 }

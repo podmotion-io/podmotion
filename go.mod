@@ -11,17 +11,42 @@ require (
 	github.com/onsi/gomega v1.38.2
 	k8s.io/apimachinery v0.35.0
 	k8s.io/client-go v0.35.0
+	k8s.io/kube-scheduler v0.0.0
 	sigs.k8s.io/controller-runtime v0.23.3
 )
 
 require (
+	github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161 // indirect
+	github.com/NYTimes/gziphandler v1.1.1 // indirect
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/containerd/ttrpc v1.2.7 // indirect
+	github.com/coreos/go-semver v0.3.1 // indirect
+	github.com/coreos/go-systemd/v22 v22.5.0 // indirect
+	github.com/distribution/reference v0.6.0 // indirect
+	github.com/gogo/protobuf v1.3.2 // indirect
+	github.com/golang/protobuf v1.5.4 // indirect
+	github.com/grpc-ecosystem/go-grpc-prometheus v1.2.0 // indirect
 	github.com/knqyf263/go-plugin v0.9.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
+	github.com/moby/term v0.5.0 // indirect
+	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/runtime-spec v1.3.0 // indirect
+	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/tetratelabs/wazero v1.11.0 // indirect
+	go.etcd.io/etcd/api/v3 v3.6.5 // indirect
+	go.etcd.io/etcd/client/pkg/v3 v3.6.5 // indirect
+	go.etcd.io/etcd/client/v3 v3.6.5 // indirect
+	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.60.0 // indirect
+	golang.org/x/crypto v0.46.0 // indirect
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
+	k8s.io/cloud-provider v0.0.0 // indirect
+	k8s.io/component-helpers v0.35.0 // indirect
+	k8s.io/controller-manager v0.35.0 // indirect
+	k8s.io/csi-translation-lib v0.0.0 // indirect
+	k8s.io/dynamic-resource-allocation v0.35.0 // indirect
+	k8s.io/kms v0.35.0 // indirect
+	k8s.io/kubelet v0.35.0 // indirect
 )
 
 require (
@@ -95,7 +120,7 @@ require (
 	golang.org/x/text v0.32.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
 	golang.org/x/tools v0.40.0 // indirect
-	gomodules.xyz/jsonpatch/v2 v2.4.0 // indirect
+	gomodules.xyz/jsonpatch/v2 v2.4.0
 	google.golang.org/genproto/googleapis/api v0.0.0-20250303144028-a0af3efb3deb // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250528174236-200df99c418a
 	google.golang.org/grpc v1.72.2
@@ -107,8 +132,9 @@ require (
 	k8s.io/apiextensions-apiserver v0.35.0 // indirect
 	k8s.io/apiserver v0.35.0 // indirect
 	k8s.io/component-base v0.35.0
-	k8s.io/klog/v2 v2.130.1
+	k8s.io/klog/v2 v2.130.1 // indirect
 	k8s.io/kube-openapi v0.0.0-20250910181357-589584f1c912 // indirect
+	k8s.io/kubernetes v1.35.0
 	k8s.io/utils v0.0.0-20251002143259-bc988d571ff4 // indirect
 	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.31.2 // indirect
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
@@ -116,3 +142,65 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.2-0.20260122202528-d9cc6641c482 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+replace k8s.io/api => k8s.io/api v0.35.0
+
+replace k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.35.0
+
+replace k8s.io/apimachinery => k8s.io/apimachinery v0.35.0
+
+replace k8s.io/apiserver => k8s.io/apiserver v0.35.0
+
+replace k8s.io/cli-runtime => k8s.io/cli-runtime v0.35.0
+
+replace k8s.io/client-go => k8s.io/client-go v0.35.0
+
+replace k8s.io/cloud-provider => k8s.io/cloud-provider v0.35.0
+
+replace k8s.io/cluster-bootstrap => k8s.io/cluster-bootstrap v0.35.0
+
+replace k8s.io/code-generator => k8s.io/code-generator v0.35.0
+
+replace k8s.io/component-base => k8s.io/component-base v0.35.0
+
+replace k8s.io/component-helpers => k8s.io/component-helpers v0.35.0
+
+replace k8s.io/controller-manager => k8s.io/controller-manager v0.35.0
+
+replace k8s.io/cri-api => k8s.io/cri-api v0.35.0
+
+replace k8s.io/cri-client => k8s.io/cri-client v0.35.0
+
+replace k8s.io/csi-translation-lib => k8s.io/csi-translation-lib v0.35.0
+
+replace k8s.io/dynamic-resource-allocation => k8s.io/dynamic-resource-allocation v0.35.0
+
+replace k8s.io/endpointslice => k8s.io/endpointslice v0.35.0
+
+replace k8s.io/externaljwt => k8s.io/externaljwt v0.35.0
+
+replace k8s.io/kms => k8s.io/kms v0.35.0
+
+replace k8s.io/kube-aggregator => k8s.io/kube-aggregator v0.35.0
+
+replace k8s.io/kube-controller-manager => k8s.io/kube-controller-manager v0.35.0
+
+replace k8s.io/kube-proxy => k8s.io/kube-proxy v0.35.0
+
+replace k8s.io/kube-scheduler => k8s.io/kube-scheduler v0.35.0
+
+replace k8s.io/kubectl => k8s.io/kubectl v0.35.0
+
+replace k8s.io/kubelet => k8s.io/kubelet v0.35.0
+
+replace k8s.io/metrics => k8s.io/metrics v0.35.0
+
+replace k8s.io/mount-utils => k8s.io/mount-utils v0.35.0
+
+replace k8s.io/pod-security-admission => k8s.io/pod-security-admission v0.35.0
+
+replace k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.35.0
+
+replace k8s.io/sample-cli-plugin => k8s.io/sample-cli-plugin v0.35.0
+
+replace k8s.io/sample-controller => k8s.io/sample-controller v0.35.0

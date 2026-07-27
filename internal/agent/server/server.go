@@ -344,6 +344,16 @@ func (s *AgentServer) EnsureXDPBridgeLoaded(ctx context.Context, hostIfname stri
 	return s.ebpfMgr.EnsureXDPBridgeLoaded(ctx, hostIfname, xdpBridgeCapable)
 }
 
+// NewBridgeMapReconciler builds the ADR-0400 node-scoped PM_BRIDGE_MAP reconciler
+// bound to this agent's eBPF manager. It deletes a bridge map entry only on the
+// verified source-of-truth event (SourceTeardownBlockReason == "", terminal phase, or
+// CR-absent), replacing the removed freeze-budget watchdog. reader MUST be the
+// agent's UNCACHED APIReader (cluster.GetAPIReader()) so the fail-closed D1(c)
+// absent-delete branch reads an authoritative snapshot, never a cold cache.
+func (s *AgentServer) NewBridgeMapReconciler(reader client.Reader) *network.BridgeMapReconciler {
+	return network.NewBridgeMapReconciler(reader, s.ebpfMgr)
+}
+
 // readReplVethMACFn is the production implementation of ReadReplVethMAC.
 // Overridable in tests to inject stub behaviour without spawning nsenter.
 var readReplVethMACFn = ReadReplVethMAC
@@ -4088,7 +4098,9 @@ func ResolveNetnsFromSandbox(ctx context.Context, containerdClient interface{}, 
 
 	// B2: open the path, then cross-check inodes (path stat vs fd fstat) to detect a netns
 	// that was recycled between resolution and open.
-	// ADR-0325: netnsPath is a HOST-namespace path. On the Cilium/containerd substrate it is now
+	// ADR-0125/ADR-0177/ADR-0349 (mislabeled "ADR-0325" prior to ADR-0370's citation fix — the
+	// real ADR-0325 governs an unrelated workload-liveness probe gate, see ADR-0370 First
+	// Finding): netnsPath is a HOST-namespace path. On the Cilium/containerd substrate it is now
 	// a stable bind mount /var/run/netns/cni-<id> (mapped by sandboxNetnsPath from the OCI
 	// /proc/<pid>/ns/net form via inode identity). The agent daemonset mounts the host
 	// /var/run/netns at /var/run/netns (HostToContainer), so this native os.Open/stat resolves
@@ -4148,7 +4160,8 @@ func sandboxNetnsPath(ctx context.Context, sandboxID string) (string, error) {
 	}
 	for _, ns := range rec.Spec.Linux.Namespaces {
 		if ns.Type == "network" {
-			// ADR-0325 UNIVERSAL POD-NETNS INTEGRATION: some CNIs (Cilium cluster-pool on
+			// UNIVERSAL POD-NETNS INTEGRATION (ADR-0125/ADR-0177/ADR-0349 — mislabeled "ADR-0325"
+			// prior to ADR-0370's citation fix; see ADR-0370 First Finding): some CNIs (Cilium cluster-pool on
 			// containerd 2.x) record the sandbox network namespace in the OCI spec as a
 			// per-process path "/proc/<pause-pid>/ns/net" rather than a stable bind mount. The
 			// agent (under its AppArmor profile, in its own mount namespace) cannot open another
@@ -4164,11 +4177,11 @@ func sandboxNetnsPath(ctx context.Context, sandboxID string) (string, error) {
 			// hand back a bind path).
 			if strings.HasPrefix(ns.Path, "/proc/") && strings.HasSuffix(ns.Path, "/ns/net") {
 				if bind := resolveNetnsBindByProcPath(ctx, ns.Path); bind != "" {
-					log.Info("sandboxNetnsPath: mapped /proc/<pid>/ns/net to stable /var/run/netns bind by inode (ADR-0325)",
+					log.Info("sandboxNetnsPath: mapped /proc/<pid>/ns/net to stable /var/run/netns bind by inode (ADR-0125/ADR-0177/ADR-0349)",
 						"sandboxID", sandboxID, "procPath", ns.Path, "bindPath", bind)
 					return bind, nil
 				}
-				log.Info("sandboxNetnsPath: could not map proc netns path to a /var/run/netns bind — returning raw proc path (ADR-0325 fallback)",
+				log.Info("sandboxNetnsPath: could not map proc netns path to a /var/run/netns bind — returning raw proc path (ADR-0125/ADR-0177/ADR-0349 fallback)",
 					"sandboxID", sandboxID, "procPath", ns.Path)
 			}
 			return ns.Path, nil
@@ -4267,18 +4280,36 @@ func resolveCtrDumpLogPath(taskID, ctrOutput string) string {
 	return filepath.Join(hostBundleDir(taskID), dumpLogName)
 }
 
-// remapWorkTargetToDumpLog re-roots a runc task `work` symlink target (an absolute
-// /var/lib/containerd/... host path) onto the agent-visible containerd-state mount
-// (/host-var-lib-containerd) and appends criu-dump.log. Returns "" if the target is not under
-// the containerd state prefix (nothing to remap). Pure string transform, split out so the
-// re-rooting is unit-testable without a real /host-run mount.
+// remapWorkTargetToDumpLog re-roots a runc task `work` symlink target (an absolute host path)
+// onto an agent-visible mount and appends criu-dump.log. Returns "" if the target is under
+// neither known root (nothing to remap).
+//
+// ADR-0370: containerdRunRoot/containerdStateRoot are now resolved at startup by
+// discoverContainerdSocket rather than a fixed chart default, and the two DIFFER by substrate:
+//   - kubeadm/system-containerd: runRoot=/run/containerd, stateRoot=/var/lib/containerd — two
+//     genuinely separate trees, so the target is matched against stateRoot and re-rooted onto
+//     the dedicated host-var-lib-containerd mount (chart-configured via
+//     agent.containerd.stateDir, unchanged by this ADR).
+//   - RKE2/k3s: runRoot == stateRoot == /run/k3s/containerd — a tree that ALREADY lives under
+//     the broad host-/run mount (/host-run, unconditionally present in the chart), so no new
+//     dedicated hostPath volume is needed for this substrate. The runRoot check is tried FIRST
+//     (and only ever matches when runRoot itself is a prefix of the target, which is true for
+//     RKE2/k3s and never true for kubeadm/system, since kubeadm's runRoot/stateRoot are
+//     disjoint trees) — this correctly routes RKE2/k3s through /host-run without touching the
+//     kubeadm case's existing behavior at all.
 func remapWorkTargetToDumpLog(workTarget string) string {
+	const hostRunPrefix = "/host-run"
 	const agentStatePrefix = "/host-var-lib-containerd"
-	if !strings.HasPrefix(workTarget, containerdStateRoot) {
-		return ""
+
+	if strings.HasPrefix(workTarget, containerdRunRoot) {
+		agentWork := hostRunPrefix + strings.TrimPrefix(workTarget, "/run")
+		return filepath.Join(agentWork, "criu-dump.log")
 	}
-	agentWork := agentStatePrefix + strings.TrimPrefix(workTarget, containerdStateRoot)
-	return filepath.Join(agentWork, "criu-dump.log")
+	if strings.HasPrefix(workTarget, containerdStateRoot) {
+		agentWork := agentStatePrefix + strings.TrimPrefix(workTarget, containerdStateRoot)
+		return filepath.Join(agentWork, "criu-dump.log")
+	}
+	return ""
 }
 
 // ctrReportedDumpLogPath extracts the criu-dump.log path that ctr reports in its own combined
@@ -4441,6 +4472,175 @@ func ctrCheckpoint(ctx context.Context, taskID, imagesDir string, tcpEstablished
 	return total, nil
 }
 
+// devShmContentImageName is the CRIU tmpfs-content image basename for a /dev/shm tmpfs whose
+// recorded root_dev is rootDev. CRIU tar-serializes every internally-owned tmpfs's content to
+// tmpfs-dev-<root_dev>.tar.gz.img (criu/tmpfs.c dump_tmpfs / restore_tmpfs), keyed by the root_dev
+// field in the mountpoints image — ground-truthed against a live ctr checkpoint on the KVM cluster
+// (the /dev tmpfs recorded root_dev=558 has its content in tmpfs-dev-558.tar.gz.img).
+func devShmContentImageName(rootDev int64) string {
+	return fmt.Sprintf("tmpfs-dev-%d.tar.gz.img", rootDev)
+}
+
+// devShmMountInfo carries the /dev/shm mountpoints-image facts captureCtrDevShmContent keys on.
+type devShmMountInfo struct {
+	Present bool  `json:"present"`
+	RootDev int64 `json:"root_dev"`
+	// ExtKey is the recorded external-mount key. A non-empty value ('/dev/shm' on the ctr fast
+	// path) means CRIU treated /dev/shm as an EXTERNAL mount and therefore skipped its content;
+	// empty means CRIU owns it internally and already content-captured it (raw-CRIU path, ADR-0382).
+	ExtKey string `json:"ext_key"`
+}
+
+// readDevShmMountInfo reads /dev/shm's root_dev and ext_key from the checkpoint's mountpoints image
+// via the same vendored pycriu decoder buildMaskedPathExtMountArgs uses (PYTHONPATH per ADR-0121).
+// imagesDir is passed as argv, never string-formatted into the script body (Security note, ADR-0121).
+func readDevShmMountInfo(ctx context.Context, imagesDir string) (devShmMountInfo, error) {
+	const scanScript = `
+import pycriu, glob, json, sys, os
+info = {'present': False, 'root_dev': 0, 'ext_key': ''}
+for img in sorted(glob.glob(os.path.join(sys.argv[1], 'mountpoints-*.img'))):
+    if not img.endswith('.img'):
+        continue
+    with open(img, 'rb') as f:
+        data = pycriu.images.load(f)
+    for e in data.get('entries', []):
+        if e.get('mountpoint') == '/dev/shm':
+            info = {'present': True, 'root_dev': e.get('root_dev', 0) or 0, 'ext_key': e.get('ext_key') or ''}
+print(json.dumps(info))
+`
+	scriptPath := "/dev/shm/pm-devshm-scan.py"
+	if err := os.WriteFile(scriptPath, []byte(scanScript), 0o600); err != nil {
+		return devShmMountInfo{}, fmt.Errorf("write devshm-scan script: %w", err)
+	}
+	defer os.Remove(scriptPath)
+
+	cmd := exec.CommandContext(ctx, "python3", scriptPath, imagesDir)
+	cmd.Env = append(os.Environ(), "PYTHONPATH=/usr/lib/python3/dist-packages")
+	out, err := cmd.Output()
+	if err != nil {
+		return devShmMountInfo{}, fmt.Errorf("devshm-scan script failed: %w\n%s", err, out)
+	}
+	var info devShmMountInfo
+	if err := json.Unmarshal(out, &info); err != nil {
+		return devShmMountInfo{}, fmt.Errorf("parse devshm-scan output: %w\n%s", err, out)
+	}
+	return info, nil
+}
+
+// devShmHostSourceDir returns the agent-visible path to the source pod's /dev/shm backing directory
+// — the pod-sandbox shm dir the CRI runtime bind-mounts at /dev/shm, recorded as the /dev/shm mount
+// SOURCE in config.json (e.g. /run/k3s/containerd/io.containerd.grpc.v1.cri/sandboxes/<id>/shm).
+// It is re-rooted onto the broad host-/run mount (/host-run) the daemonset always carries, exactly
+// as the criu-dump.log / bundle paths are (remapWorkTargetToDumpLog). Returns ok=false when
+// config.json is absent/unparseable, /dev/shm has no bind source, or the source is not under /run
+// (so unreachable from the agent) — every such case is a documented no-op for the caller.
+func devShmHostSourceDir(imagesDir string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(imagesDir, "config.json"))
+	if err != nil {
+		return "", false
+	}
+	var cfg struct {
+		Mounts []struct {
+			Destination string `json:"destination"`
+			Source      string `json:"source"`
+		} `json:"mounts"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return "", false
+	}
+	for _, m := range cfg.Mounts {
+		if m.Destination != "/dev/shm" {
+			continue
+		}
+		if !strings.HasPrefix(m.Source, "/run/") {
+			return "", false
+		}
+		return "/host-run" + strings.TrimPrefix(m.Source, "/run"), true
+	}
+	return "", false
+}
+
+// captureCtrDevShmContent captures the source pod's /dev/shm content as a CRIU-native tmpfs content
+// image so a restore that internalizes /dev/shm can populate it (ADR-0414 — the dump-side half).
+//
+// The containerd/ctr fast path records /dev/shm as an EXTERNAL bind mount (ext_key='/dev/shm',
+// source=<pod-sandbox>/shm — verified live on the KVM cluster: config.json carries /dev/shm as a
+// bind from the CRI sandbox shm dir, and the mountpoints image stamps ext_key='/dev/shm'). runc's
+// CRIU therefore never tar-serializes /dev/shm content: NO tmpfs-dev-<root_dev>.tar.gz.img is
+// written for it. A workload that keeps real state there — a PostgreSQL POSIX-shmem segment
+// dev/shm/PostgreSQL.<N> held mmap'd MAP_SHARED — loses that content at dump, so the restore-side
+// internalization (patch_checkpoint_script.go, ADR-0414) makes CRIU own an EMPTY /dev/shm tmpfs and
+// files-reg.c:2353 ENOENTs opening the recorded reg-file path (or, once owned+mounted with no
+// content to fill, tears the tmpfs down busy).
+//
+// /dev/shm is ordinary pod-local data, an owned mount captured with content by default like every
+// other owned mount (ADR-0415). This reads /dev/shm's recorded root_dev (the value CRIU names the
+// tmpfs content image by) and the sandbox shm source dir, then tar-serializes that dir's live
+// content into tmpfs-dev-<root_dev>.tar.gz.img in CRIU's own dump_tmpfs format — so the restore-side
+// internalization has real content to lay into the CRIU-owned /dev/shm tmpfs. Unconditional and
+// workload-agnostic: an empty /dev/shm (e.g. Redis) yields an empty tmpfs image, exactly what CRIU's
+// own dump_tmpfs writes for an empty owned tmpfs. The source is frozen/dumped by the just-completed
+// ctr checkpoint and the sandbox shm dir outlives the task, so its bytes are the checkpoint-instant
+// state.
+//
+// ADR-0415 fail-closed capture gate — FAIL CLOSED. Returns nil (a legitimate "nothing owned to capture here" state,
+// NOT a silent skip-and-continue over a real failure) only when: the image records no /dev/shm mount
+// (the pod owns none), or /dev/shm is already CRIU-internal (ext_key empty — the raw-CRIU dump path
+// already tar-captured it), or its content image already exists (do not clobber CRIU's own capture).
+// In every other case — the ctr fast path externalized an owned /dev/shm (runc's CRIU skipped its
+// content) and the agent CANNOT capture it (mountpoints scan failed, no root_dev to name the image,
+// the sandbox shm source is unreachable, or the tar failed) — it returns a wrapped
+// ErrMountContentCaptureFailed so the caller fails the checkpoint closed with the attributed
+// MountContentCaptureFailed reason. It NEVER fabricates zero-filled shared memory and NEVER lets a
+// failed capture pass as success.
+func captureCtrDevShmContent(ctx context.Context, imagesDir string) error {
+	fail := func(cause string) error {
+		return &MountContentCaptureFailedDetail{Mountpoint: "/dev/shm", Cause: cause}
+	}
+	info, err := readDevShmMountInfo(ctx, imagesDir)
+	if err != nil {
+		return fail(fmt.Sprintf("mountpoints scan failed: %v", err))
+	}
+	if !info.Present {
+		return nil // no /dev/shm mount recorded in the image — the pod owns none; nothing to capture
+	}
+	if info.ExtKey == "" {
+		return nil // /dev/shm already CRIU-internal (raw-CRIU path, ADR-0382): content already captured
+	}
+	outPath := filepath.Join(imagesDir, devShmContentImageName(info.RootDev))
+	if _, statErr := os.Stat(outPath); statErr == nil {
+		return nil // content image already present — do not clobber CRIU's own capture
+	}
+	if info.RootDev == 0 {
+		return fail("external /dev/shm has no root_dev in the mountpoints image — cannot name the CRIU tmpfs content image")
+	}
+	shmDir, ok := devShmHostSourceDir(imagesDir)
+	if !ok {
+		return fail("no agent-visible sandbox shm source in config.json — owned /dev/shm content is unreachable")
+	}
+	if tarErr := writeDevShmContentImage(ctx, shmDir, outPath); tarErr != nil {
+		return fail(fmt.Sprintf("tar of sandbox shm dir failed: %v", tarErr))
+	}
+	log.Info("Checkpoint: captured /dev/shm content as CRIU tmpfs image (ADR-0415 dump-side owned-mount capture for the ctr fast path)",
+		"image", devShmContentImageName(info.RootDev), "srcDir", shmDir, "rootDev", info.RootDev)
+	return nil
+}
+
+// writeDevShmContentImage tar-serializes the live sandbox /dev/shm directory (shmDir) into the
+// CRIU-native content image at outPath, matching CRIU's own dump_tmpfs invocation (gzip tar,
+// sparse, numeric owner, ./-relative from the mount dir) so restore_tmpfs extracts it into the
+// CRIU-owned /dev/shm tmpfs unchanged. On failure it removes any partial image so the checkpoint
+// never carries a torn content layer.
+func writeDevShmContentImage(ctx context.Context, shmDir, outPath string) error {
+	tarCmd := exec.CommandContext(ctx, "tar", "--create", "--gzip", "--sparse", "--numeric-owner",
+		"--file", outPath, "-C", shmDir, ".")
+	if tout, err := tarCmd.CombinedOutput(); err != nil {
+		_ = os.Remove(outPath)
+		return fmt.Errorf("tar /dev/shm content: %w\n%s", err, strings.TrimSpace(string(tout)))
+	}
+	return nil
+}
+
 // classifyCtrCheckpointFailure maps a failed `ctr tasks checkpoint` invocation to a typed error
 // so the Checkpoint RPC can decide whether to fall through to the raw go-criu Dump path. outStr is
 // ctr's combined output with the resolved criu-dump.log appended (or not, per dumpLogRead); rawErr
@@ -4497,6 +4697,12 @@ var containerdMaskedPaths = []string{
 	"/sys/firmware", "/sys/fs/pstore", "/sys/fs/bpf",
 }
 
+// ADR-0415: the obscuredParentExternalKeys bucket ("pm-dev" — the dump-side --external
+// mnt[/dev]:pm-dev obscured-parent placeholder) is REMOVED. /dev is now captured as pod-owned
+// content, not declared external, so no pm-dev entry survives into the mountpoints image for the
+// restore pre-scan to recognize. The pm-dev machinery this ADR retired is documented in
+// docs/adr/0415-capture-everything-by-default-mount-ownership.md.
+
 // standardPodMounts is the canonical set of external mounts that every Kubernetes
 // pod container carries and that buildCRIURestoreArgs maps explicitly by PATH (not to
 // /dev/null) via --ext-mount-map <mountpoint>:<host-target>. The pre-scan must recognise
@@ -4526,9 +4732,15 @@ var standardPodMounts = []string{
 // containerdMaskedPaths. Each qualifying entry yields "--ext-mount-map <mnt_id>:/dev/null"
 // (numeric mnt_id form — the form CRIU failed to resolve in "No mapping for 2288:...").
 //
-// Fail loud (ADR-0124 D4 / AC5): any external mount that is neither in containerdMaskedPaths
-// nor mappable to /dev/null returns an error naming each unmapped mnt_id and mountpoint, and
-// the caller must NOT invoke CRIU restore.
+// An entry is also covered, and not flagged unmapped, when it is a standardPodMounts /
+// reattachMountPaths entry (mapped elsewhere, by path).
+//
+// ADR-0415: the obscured-parent "pm-dev" bucket is gone — /dev is captured as pod-owned content and
+// internalized by patchCheckpointImages, never declared external, so it never reaches this pre-scan.
+//
+// Fail loud (ADR-0124 D4 / AC5): any external mount that is neither in containerdMaskedPaths,
+// standardPodMounts, nor reattachMountPaths returns an error naming each unmapped mnt_id and
+// mountpoint, and the caller must NOT invoke CRIU restore.
 //
 // pycriu is invoked as a python3 subprocess with PYTHONPATH set (ADR-0121); imagesDir is passed
 // as argv (never string-formatted into the script body — Security note).
@@ -4604,6 +4816,10 @@ print(json.dumps(results))
 		if reattach[e.Mountpoint] {
 			continue
 		}
+		// ADR-0415: the obscured-parent "pm-dev" ext_key recognition is removed — /dev is captured
+		// as pod-owned content and internalized by patchCheckpointImages, so no pm-dev external
+		// survives here. Any external that reaches this point is neither a structural /proc-/sys mask,
+		// a standard runtime-file bind, nor a storage-tier PVC re-attach — fail loud (D4).
 		// An external mount (root is external / ext_key set) that is neither a null bind, a known
 		// masked path, nor a standard pod mount is unsafe to restore — fail loud (D4).
 		unmapped = append(unmapped, fmt.Sprintf("mnt_id=%d mountpoint=%q root=%q", e.MntID, e.Mountpoint, e.Root))
@@ -4908,14 +5124,13 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		// survive into the image, so --skip-mnt for dmi/id/*, powercap, firmware are
 		// not needed and have been removed. Defense-in-depth --skip-mnt for service
 		// account paths is kept (see above).
-		// NOTE: no "--ext-mount-map /dev/shm:/dev/shm" here. The live restore.log proves
-		// /dev/shm is NOT a mount in the checkpointed container — it is a plain subdirectory
-		// inside the single /dev tmpfs, which the OCI runtime recreates empty on restore. A
-		// /dev/shm ext-mount-map is therefore a dead no-op (there is no /dev/shm mount to map),
-		// and PostgreSQL's dynamic shared memory is routed to SysV (dynamic_shared_memory_type=sysv)
-		// so CRIU content-captures it in the image rather than as a dangling /dev/shm/* files-reg
-		// reference that ENOENTs on restore (files-reg.c:2353). Removing the entry deletes a false
-		// signal that /dev/shm is being handled here.
+		// ADR-0415: no "--ext-mount-map /dev/shm:/dev/shm" and no "pm-dev:<rootfs>/dev" entry here.
+		// /dev and /dev/shm are pod-owned tmpfs captured with content at dump and restored as
+		// CRIU-owned mounts (patchCheckpointImages internalizes any external /dev/shm the ctr fast
+		// path recorded), so CRIU creates and fills them natively — needing neither --skip-mnt nor
+		// --ext-mount-map. The retired pm-dev obscured-parent /dev machinery (ADR-0384/0389/0392) is
+		// documented in docs/adr/0415-capture-everything-by-default-mount-ownership.md; declaring
+		// /dev external was exactly what suppressed the /dev/shm fill.
 		"--ext-mount-map", "/etc/resolv.conf:/etc/resolv.conf",
 		"--ext-mount-map", "/etc/hostname:/etc/hostname",
 		"--ext-mount-map", "/etc/hosts:/etc/hosts",
@@ -6673,11 +6888,50 @@ func priorRestoredPIDIfAliveSettle(dataDir string, settle time.Duration) (int, b
 	return pid, true
 }
 
-// pidNetnsMatchesPath is the ADR-0306 item (a) B2-style inode/dev cross-check: it stats
-// /proc/<pid>/ns/net and compares its inode/dev against a stat of expectedNetnsPath. Returns
-// (true, nil) only on a genuine match; any stat failure or mismatch returns (false, err/nil)
-// so the caller fails closed.
-func pidNetnsMatchesPath(pid int, expectedNetnsPath string) (bool, error) {
+// netnsMatchCheck reports whether pid's network namespace matches expectedNetnsPath.
+// Mirrors procAliveCheck's seam shape (type procAliveCheck above) so pidNetnsMatchesPath
+// can be redirected to a broker-delegated implementation in production and a same-process
+// implementation in tests, exactly like procAliveFn/localProcAlive below.
+type netnsMatchCheck func(pid int, expectedNetnsPath string) (bool, error)
+
+// netnsMatchFn is the seam pidNetnsMatchesPath calls through. Production delegates to the
+// privileged, unconfined netns-broker (brokerNetnsMatch): the de-privileged main agent's own
+// stat of /proc/<pid>/ns/net for a PID it did not spawn crosses a ptrace_may_access gate that
+// AppArmor mediates against the TARGET's peer profile — for a CRIU-restored workload root that
+// is the container runtime's default profile (a runtime-defined, unpredictable peer label; see
+// ADR-0312's comment on SignalPID's doc for the two prior GUESSED labels that both proved wrong
+// live), which the narrow `podmotion-agent` profile's ptrace(read) grants (peer=podmotion-agent,
+// peer=unconfined) do not cover — the exact same delegation class ProcAlive/ResolveVeth/
+// HolderSentinelReady were already fixed for (see their doc comments in netnsbroker/client.go
+// for the "denied read misread as process-exited/netns-changed" incident class this avoids). A
+// prior round attempted to close this instead by widening podmotion-agent.profile with a
+// ptrace(read) peer=cri-containerd.apparmor.d rule — REJECTED: ADR-0312 already proved that
+// exact guessed peer label unreliable (two prior guesses, including this one, were both wrong
+// against the live-observed peer="runc"), and profile-widening for a single call site repeats
+// the brittle-inference pattern this codebase's broker-delegation primitive exists to replace
+// (see ProcAlive/ResolveVeth/HolderSentinelReady doc comments — never widen the agent's own
+// profile for a cross-container /proc read; delegate to the unconfined broker instead).
+//
+// Tests override this to a same-process check (localNetnsMatch) — test PIDs are the test
+// binary's own process tree, where no cross-profile mediation is in play and no broker socket
+// is running.
+var netnsMatchFn netnsMatchCheck = brokerNetnsMatch
+
+// brokerNetnsMatch is netnsMatchFn's production implementation: delegates the netns identity
+// stat+compare to the unconfined netns-broker over the existing request/response protocol
+// (netnsbroker.Client.NetnsMatch), following the exact ProcAlive/ResolveVeth/MoveCgroup pattern
+// of routing a cross-container /proc read through the broker rather than the confined agent.
+func brokerNetnsMatch(pid int, expectedNetnsPath string) (bool, error) {
+	return netnsBrokerClientFn().NetnsMatch(context.Background(), pid, expectedNetnsPath)
+}
+
+// localNetnsMatch is the ORIGINAL direct-stat implementation, run in THIS process — the
+// pre-broker-delegation pidNetnsMatchesPath logic, kept as the test-only same-process
+// alternative to brokerNetnsMatch (no broker socket required). In production this direct stat
+// of a foreign PID's /proc/<pid>/ns/net is exactly the AppArmor-denied read netnsMatchFn's doc
+// comment above describes; it is safe here only because unit tests target the test binary's own
+// PID (or a PID with no confining profile), where no cross-profile ptrace mediation applies.
+func localNetnsMatch(pid int, expectedNetnsPath string) (bool, error) {
 	var pidStat, expStat syscall.Stat_t
 	pidNsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
 	if err := syscall.Stat(pidNsPath, &pidStat); err != nil {
@@ -6687,6 +6941,15 @@ func pidNetnsMatchesPath(pid int, expectedNetnsPath string) (bool, error) {
 		return false, fmt.Errorf("pidNetnsMatchesPath: stat %s: %w", expectedNetnsPath, err)
 	}
 	return pidStat.Ino == expStat.Ino && pidStat.Dev == expStat.Dev, nil
+}
+
+// pidNetnsMatchesPath is the ADR-0306 item (a) B2-style inode/dev cross-check: it compares
+// pid's /proc/<pid>/ns/net identity against a stat of expectedNetnsPath, delegated through
+// netnsMatchFn (see its doc comment for why this is broker-delegated in production rather than
+// a direct syscall.Stat here). Returns (true, nil) only on a genuine match; any stat failure or
+// mismatch returns (false, err/nil) so the caller fails closed.
+func pidNetnsMatchesPath(pid int, expectedNetnsPath string) (bool, error) {
+	return netnsMatchFn(pid, expectedNetnsPath)
 }
 
 // procStatStateChar reads field 3 (state) of /proc/<pid>/stat, e.g. 'R', 'S', 'D', 'T', 't', 'Z'.
@@ -6743,7 +7006,8 @@ func logCgroupAnchorOutcome(migrationName, outcome string, err error) {
 // ReattachVolumeNotYetPublishedError. resolveSandboxIDForMigration returns it when the replacement
 // pod is resolved (its UID is known via the authoritative podmotion.io/migration-name label) but the
 // destination kubelet has NOT yet created its containerd sandbox (pause container): the pod-sandbox
-// netns the ADR-0325 restore gate must join exists LATER, not never. The replacement pod is
+// netns the pod-netns-join restore gate (ADR-0125/ADR-0177/ADR-0349 — mislabeled "ADR-0325" prior to
+// ADR-0370's citation fix; see ADR-0370 First Finding) must join exists LATER, not never. The replacement pod is
 // NodeName-pinned to the destination node (createReplacementPod), so its sandbox materializes
 // asynchronously a few seconds after the scheduling gate is removed — a one-shot ctr lookup at
 // restore-dispatch time legitimately races the kubelet (grounded: live-proof-cycle1, the pm-w2
@@ -6762,7 +7026,8 @@ func (e *ReplacementSandboxNotYetCreatedError) Error() string {
 	return fmt.Sprintf("replacement pod sandbox not yet created: no containerd sandbox for replacement pod %s (uid=%s) present on the destination node yet", e.ReplacementPodName, e.PodUID)
 }
 
-// replacementSandboxWaitBudget bounds how long the ADR-0325 restore gate waits for the replacement
+// replacementSandboxWaitBudget bounds how long the pod-netns-join restore gate (ADR-0125/
+// ADR-0177/ADR-0349 — mislabeled "ADR-0325" prior to ADR-0370's citation fix) waits for the replacement
 // pod's real sandbox netns to appear before failing closed. It is a var (not const) so tests can
 // shrink it to exercise the budget-spent fail-closed leg without a real wait. Sized well under the
 // 120s live-migration hard bound (constitutional invariant #8): the sandbox appears in ~6s on the
@@ -6822,7 +7087,7 @@ func (s *AgentServer) resolveSandboxIDForMigration(ctx context.Context, migratio
 		// has not created the pause container at this instant. That is the benign "not yet" race edge
 		// (errNoSandboxForPodUID), NOT a detached/unresolvable namespace: surface the RETRYABLE
 		// sentinel so resolvePodNetnsSandboxWaiting bounded-waits for the real sandbox netns rather
-		// than failing the ADR-0325 gate closed on a race it wins within the migration budget. A hard
+		// than failing the pod-netns-join gate (ADR-0125/ADR-0177/ADR-0349) closed on a race it wins within the migration budget. A hard
 		// ctr error (containerd down, binary missing) is NOT errNoSandboxForPodUID and stays terminal.
 		if errors.Is(err, errNoSandboxForPodUID) {
 			return "", &ReplacementSandboxNotYetCreatedError{PodUID: string(pod.UID), ReplacementPodName: pod.Name}
@@ -6832,7 +7097,9 @@ func (s *AgentServer) resolveSandboxIDForMigration(ctx context.Context, migratio
 	return sandboxID, nil
 }
 
-// resolvePodNetnsSandboxOnce is the single-shot universal pod-netns-integration read (ADR-0325) for
+// resolvePodNetnsSandboxOnce is the single-shot universal pod-netns-integration read
+// (ADR-0125/ADR-0177/ADR-0349 — mislabeled "ADR-0325" prior to ADR-0370's citation fix; see
+// ADR-0370 First Finding) for
 // the gRPC Restore path. It decides which sandbox ID (if any) joinNsRestore should use to join the
 // restored process into its pod's network namespace, and returns the CLASSIFIED error alongside
 // (sandboxID, attempted) so resolvePodNetnsSandboxWaiting can distinguish a RETRYABLE
@@ -6849,26 +7116,27 @@ func (s *AgentServer) resolveSandboxIDForMigration(ctx context.Context, migratio
 // on this path: without a running k8s client there is no source of truth to resolve the replacement
 // pod's sandbox from, so self-resolve cannot even be attempted — that is a missing operator
 // connection, not evidence of a detached namespace. In that case it returns ("", false, nil) and the
-// caller falls back to its pre-ADR-0325 behavior (no pod-netns join attempted) rather than failing
+// caller falls back to its pre-pod-netns-join behavior (no pod-netns join attempted) rather than failing
 // the restore closed. When s.k8sClient != nil, resolution failure IS evidence-bearing (the source of
 // truth was consulted and came back empty/erroring) and the caller fails closed as designed.
 func (s *AgentServer) resolvePodNetnsSandboxOnce(ctx context.Context, migrationName string) (sandboxID string, attempted bool, err error) {
 	if s.k8sClient == nil {
-		log.Info("resolvePodNetnsSandbox: no k8sClient — skipping pod-netns self-resolve (ADR-0325); restore proceeds without pod-netns join",
+		log.Info("resolvePodNetnsSandbox: no k8sClient — skipping pod-netns self-resolve (ADR-0125/ADR-0177/ADR-0349); restore proceeds without pod-netns join",
 			"migration", migrationName)
 		return "", false, nil
 	}
 	id, rerr := s.resolveSandboxIDForMigration(ctx, migrationName)
 	if rerr != nil {
-		log.Error(rerr, "resolvePodNetnsSandbox: pod-sandbox self-resolve failed (ADR-0325) — pod-netns join cannot proceed", "migration", migrationName)
+		log.Error(rerr, "resolvePodNetnsSandbox: pod-sandbox self-resolve failed (ADR-0125/ADR-0177/ADR-0349) — pod-netns join cannot proceed", "migration", migrationName)
 		return "", true, rerr
 	}
-	log.Info("resolvePodNetnsSandbox: pod-netns join will use self-resolved replacement pod sandbox (ADR-0325)",
+	log.Info("resolvePodNetnsSandbox: pod-netns join will use self-resolved replacement pod sandbox (ADR-0125/ADR-0177/ADR-0349)",
 		"migration", migrationName, "sandboxID", id)
 	return id, true, nil
 }
 
-// resolvePodNetnsSandboxWaiting is the bounded-wait form of the ADR-0325 pod-netns self-resolve used
+// resolvePodNetnsSandboxWaiting is the bounded-wait form of the pod-netns self-resolve
+// (ADR-0125/ADR-0177/ADR-0349 — mislabeled "ADR-0325" prior to ADR-0370's citation fix) used
 // by the live restore gate. It mirrors resolveReattachMountsWaiting exactly — the sibling
 // kubelet-edge wait already on this Restore path (server.go ~L952) — retrying the source-of-truth
 // read (does the replacement pod's containerd sandbox exist on this node?) while AND ONLY WHILE the
@@ -6886,7 +7154,8 @@ func (s *AgentServer) resolvePodNetnsSandboxOnce(ctx context.Context, migrationN
 func (s *AgentServer) resolvePodNetnsSandboxWaiting(ctx context.Context, migrationName string) (sandboxID string, attempted bool) {
 	waitCtx, cancel := context.WithTimeout(ctx, replacementSandboxWaitBudget)
 	defer cancel()
-	// ADR-0325-remediation design §3.2 instrumentation: track attempt count + elapsed wait time
+	// ADR-0125/ADR-0177/ADR-0349-remediation design §3.2 instrumentation (mislabeled
+	// "ADR-0325-remediation" prior to ADR-0370's citation fix): track attempt count + elapsed wait time
 	// so that if this gate ever fires again on a verified-main deployment, the transcript shows
 	// whether it was "genuinely never appeared within the budget" (a real problem) versus
 	// "appeared on attempt N at t=Xms but we only tried once" (the one-shot-race bug this bounded
@@ -6909,9 +7178,10 @@ func (s *AgentServer) resolvePodNetnsSandboxWaiting(ctx context.Context, migrati
 		case <-waitCtx.Done():
 			// Budget spent: the replacement pod's sandbox never materialized within the bound. Fail
 			// closed exactly as the one-shot gate did (attempted=true, empty id) — a sandbox that
-			// never appears IS the detached/non-pod-namespace condition the ADR-0325 gate guards.
+			// never appears IS the detached/non-pod-namespace condition the pod-netns-join gate
+			// (ADR-0125/ADR-0177/ADR-0349) guards.
 			elapsed := time.Since(start)
-			log.Info("resolvePodNetnsSandboxWaiting: replacement pod sandbox did not appear within wait budget (ADR-0325) — failing closed",
+			log.Info("resolvePodNetnsSandboxWaiting: replacement pod sandbox did not appear within wait budget (ADR-0125/ADR-0177/ADR-0349) — failing closed",
 				"migration", migrationName, "budget", replacementSandboxWaitBudget.String(),
 				"attempts", attempts, "elapsedMs", elapsed.Milliseconds())
 			sandboxWaitObserveFn(migrationName, attempts, elapsed, false)
@@ -6923,21 +7193,22 @@ func (s *AgentServer) resolvePodNetnsSandboxWaiting(ctx context.Context, migrati
 
 // sandboxWaitObserveFn is a test seam (mirrors sandboxIDForPodUIDFn/joinNsRestoreFn) invoked once
 // per resolvePodNetnsSandboxWaiting call, on both the success and fail-closed legs, with the same
-// attempt-count/elapsed-time/resolved facts the paired log line above records — the ADR-0325-
-// remediation design §3.2 hardening instrumentation, made assertable from tests without parsing
-// log output. No-op by default.
+// attempt-count/elapsed-time/resolved facts the paired log line above records — the
+// ADR-0125/ADR-0177/ADR-0349-remediation design §3.2 hardening instrumentation, made assertable
+// from tests without parsing log output. No-op by default.
 var sandboxWaitObserveFn = func(migrationName string, attempts int, elapsed time.Duration, resolved bool) {}
 
 // errNoSandboxForPodUID is returned by sandboxIDForPodUID when the ctr query SUCCEEDS but no
 // containerd sandbox exists for the pod UID yet — the destination kubelet has not created the
 // replacement pod's pause container at this instant. It is deliberately distinct from a ctr command
 // error (containerd down, binary missing): the empty-result case is the benign "not yet" race edge
-// the ADR-0325 restore gate must bounded-wait on, NOT a detached/unresolvable namespace. Callers
-// classify it via errors.Is to build the retryable ReplacementSandboxNotYetCreatedError sentinel.
+// the pod-netns-join restore gate (ADR-0125/ADR-0177/ADR-0349) must bounded-wait on, NOT a
+// detached/unresolvable namespace. Callers classify it via errors.Is to build the retryable
+// ReplacementSandboxNotYetCreatedError sentinel.
 var errNoSandboxForPodUID = errors.New("no sandbox container found for pod uid")
 
 // sandboxIDForPodUIDFn is the production implementation of sandboxIDForPodUID. It is a package var
-// so the ADR-0325 bounded-wait tests can inject a sandbox that appears only after N polls (modelling
+// so the ADR-0125/ADR-0177/ADR-0349 bounded-wait tests can inject a sandbox that appears only after N polls (modelling
 // the real kubelet-driven sandbox-creation edge) without a live containerd.
 var sandboxIDForPodUIDFn = sandboxIDForPodUID
 
@@ -6969,14 +7240,11 @@ func sandboxIDForPodUID(ctx context.Context, podUID string) (string, error) {
 //   - netns:       remove the extRootNetNS ext_key (references the source host's net ns).
 //   - netdev:      remove VETH interfaces (peer ifindex doesn't exist on destination); keep lo.
 //
-// patchCheckpointImagesFn is the production implementation of patchCheckpointImages.
-// Tests can replace this variable to inject failures without requiring real CRIU images.
-// The function variable wraps patchCheckpointImages; it discards the dropped-mounts info
-// (callers that need events use patchCheckpointImages directly).
-var patchCheckpointImagesFn = func(checkpointDir string, inheritFdNames []string, reattachMountPaths []string, reattachHostTargets map[string]string, reattachTier1MountPaths []string) error {
-	_, _, err := patchCheckpointImages(checkpointDir, inheritFdNames, reattachMountPaths, reattachHostTargets, reattachTier1MountPaths)
-	return err
-}
+// ADR-0385: the standalone patchCheckpointImagesFn wrapper (a discard-return indirection over
+// patchCheckpointImages, previously used only by the raw-CRIU gRPC Restore branch's now-removed
+// duplicate pre-call) has been removed — it had no other production call site. All three restore
+// entry points now patch checkpoint images exactly once, via joinNsRestore's internal Step 1 call
+// to patchCheckpointImages directly. See docs/adr/0385-single-patch-invocation-raw-criu-restore.md.
 
 // classifyRegFdPy is the SINGLE files.img REG-fd classifier used by patchCheckpointImages.
 //
@@ -7821,6 +8089,58 @@ func (s *AgentServer) PreDumpRound(_ context.Context, req *agentpb.PreDumpRoundR
 	}, nil
 }
 
+// drainPodVolumesFailClosed runs the ADR-0394 below-app syncfs storage-I/O drain
+// for a pod immediately before a checkpoint seize. It returns a non-nil error
+// (already wrapped for the caller to return verbatim) if the flush failed or could
+// not be verified — HARD-STOPPING the checkpoint fail-closed rather than dumping
+// over an unproven-consistent volume. A pod with no CSI volume (or an empty podUID)
+// drains nothing and returns nil.
+//
+// ADR-0399 §Decision-3: this is called at BOTH live checkpoint seizes — once
+// immediately before the containerd-native `ctr tasks checkpoint` (the DEFAULT
+// path) and once immediately before the raw-CRIU Dump. A single shared helper
+// keeps the two sites' primitive, predicate, and disposition identical (no drift),
+// while the two call sites give each path its own last-instant drain. The two only
+// ever both run on the ctr recoverable-failure fallthrough, where the second
+// (pre-Dump) drain is correctness-required because the app runs on between the two
+// seizes — an earlier single flush would be stale by the raw seize.
+// drainPodVolumesFn is the storage-drain primitive the checkpoint seizes call,
+// indirected through a package var only so the fail-closed contract of
+// drainPodVolumesFailClosed can be exercised deterministically in unit tests
+// (the real resolver reads a fixed host path). Production value is the real
+// pmstorage.DrainPodVolumes; it is never reassigned outside tests.
+var drainPodVolumesFn = pmstorage.DrainPodVolumes
+
+func drainPodVolumesFailClosed(ctx context.Context, migrationName, podUID string) error {
+	if podUID == "" {
+		return nil
+	}
+	drainResults, drainErr := drainPodVolumesFn(ctx, podUID)
+	if drainErr != nil {
+		log.Error(drainErr, "storage drain: syncfs drain FAILED or UNVERIFIED before CRIU dump — aborting checkpoint (fail-closed)",
+			"migration", migrationName, "podUID", podUID)
+		return fmt.Errorf("checkpoint: storage I/O drain failed or unverified before CRIU dump (ADR-0394 fail-closed): %w", drainErr)
+	}
+	if len(drainResults) == 0 {
+		log.Info("storage drain: pod has no CSI volume mount to drain — skipping",
+			"migration", migrationName, "podUID", podUID)
+	}
+	for _, dr := range drainResults {
+		log.Info("storage drain: volume flushed and verified before CRIU dump",
+			"migration", migrationName,
+			"mountPath", dr.MountPath,
+			"synced", dr.Synced,
+			"isMountpoint", dr.IsMountpoint,
+			"fsType", fmt.Sprintf("0x%x", dr.FSType),
+			"durationMs", dr.DurationMs,
+			"dirtyBeforeKB", dr.DirtyBeforeKB,
+			"dirtyAfterKB", dr.DirtyAfterKB,
+			"dirtyDrainedKB", dr.DirtyBeforeKB-dr.DirtyAfterKB,
+		)
+	}
+	return nil
+}
+
 // Checkpoint performs the final (freezing) CRIU dump.
 // When PODMOTION_MOCK_CRIU=true (dev/kind env var), a graceful fallback writes a mock
 // checkpoint manifest so the end-to-end flow can proceed without real CRIU support.
@@ -7965,6 +8285,22 @@ func (s *AgentServer) Checkpoint(ctx context.Context, req *agentpb.CheckpointReq
 			// with "read config.json: no such file or directory".
 			resolvedTaskID = taskID
 			log.Info("Checkpoint: using containerd-native ctr checkpoint", "taskID", taskID)
+
+			// ADR-0399 §Decision-1: fail-closed storage-I/O drain on the DEFAULT
+			// containerd-native path. This path is tried FIRST and returns a completed
+			// CheckpointResponse below, before control ever reaches the raw-CRIU drain — so
+			// without this the common case dumps over unflushed writeback (fail-open by
+			// omission; ADR-0394 wired the drain only on the raw-CRIU fallback). Runs at the
+			// last instant PodMotion controls before ctr/runc/CRIU seizes the tree inside
+			// `ctr tasks checkpoint`, and BEFORE ctrCheckpoint creates imagesDir (its own
+			// MkdirAll) — so a fail-closed abort here leaves nothing on disk to zeroize
+			// (Standing Rule 7). §Decision-3: this is a SECOND symmetric drain to the
+			// raw-CRIU site below, NOT a hoist; both fire only on the recoverable-failure
+			// fallthrough, where the pre-Dump drain re-flushes after the app runs on.
+			if drainErr := drainPodVolumesFailClosed(ctx, req.MigrationName, podUID); drainErr != nil {
+				return nil, drainErr
+			}
+
 			freezeStart := time.Now()
 			sizeBytes, ctrErr := ctrCheckpoint(ctx, taskID, imagesDir, tcpEstablished)
 			freezeDurationMs := time.Since(freezeStart).Milliseconds()
@@ -7999,6 +8335,26 @@ func (s *AgentServer) Checkpoint(ctx context.Context, req *agentpb.CheckpointReq
 					return nil, fmt.Errorf("checkpoint: clearing partial ctr images before raw CRIU: %w", rmErr)
 				}
 			} else {
+				// ADR-0415: capture /dev/shm owned-mount content as a CRIU tmpfs image BEFORE the
+				// checksum/encrypt below, so it is transferred and restored with the rest of the
+				// image. The ctr fast path records /dev/shm as an external sandbox bind, so runc's
+				// CRIU never dumps its content; without this a workload with real /dev/shm state
+				// (PostgreSQL POSIX-shmem) loses it and the internalizing restore
+				// (patch_checkpoint_script.go) has an empty tmpfs to open the recorded reg-file in.
+				// fail-closed capture gate: this now FAILS CLOSED — a capture that should happen but cannot returns a
+				// typed MountContentCaptureFailed status so the migration fails with an attributed
+				// reason rather than shipping a non-restorable image (no silent skip-and-continue).
+				if capErr := captureCtrDevShmContent(ctx, imagesDir); capErr != nil {
+					log.Error(capErr, "Checkpoint: owned /dev/shm content capture failed — failing closed (ADR-0415 fail-closed capture gate)",
+						"migration", req.MigrationName)
+					// Zeroize the partial ctr image set before returning (Standing Rule 7): it
+					// contains live memory pages and must not linger recoverable on tmpfs.
+					if zErr := zeroizeDir(imagesDir); zErr != nil {
+						log.Error(zErr, "Checkpoint: zeroize after owned-mount capture failure", "migration", req.MigrationName)
+					}
+					return nil, newMountContentCaptureFailedStatus(capErr)
+				}
+
 				// SHA over the plaintext layer set, computed BEFORE finalizeCheckpointDir
 				// encrypts in place (parity with the raw-CRIU path, which likewise checksums
 				// before encryptCheckpointDir).
@@ -8125,6 +8481,39 @@ func (s *AgentServer) Checkpoint(ctx context.Context, req *agentpb.CheckpointReq
 				"connections", len(seqSnapshots),
 				"loopbackExcluded", len(repairEntries)-len(migratable))
 		}
+	}
+
+	// ADR-0394: below-app storage I/O drain (fail-closed). Immediately before the
+	// CRIU dump seizes the process tree, force any already-submitted writeback on
+	// the pod's volume mount(s) to complete via syncfs(2) and VERIFY the flush hit a
+	// real, distinct, populated filesystem — not the node root fs, and not merely a
+	// bare syscall return. Today's handoff relies on cgroup-freezer SIGSTOP plus
+	// whatever writeback the kernel happened to flush — assumed-consistent, not
+	// proven-drained. This closes that gap. It is a flush, not a copier: no new
+	// data-path authority, backend-agnostic across the Longhorn block device and an
+	// NFS mount alike.
+	//
+	// Placement: on this single-container raw-CRIU path CRIU owns the freeze (it
+	// seizes the tree inside Dump), so the drain runs at the last instant before
+	// that freeze. The production home for the multi-container path is INSIDE the
+	// cgroup-freeze barrier (see internal/agent/criu/multi_container_freeze.go
+	// Step 1b) so no new I/O can be issued after the flush.
+	//
+	// Fail-closed (ADR-0394 §Decision-3): a failed/unverified flush HARD-STOPS the
+	// checkpoint — we return an error rather than dumping over an
+	// unproven-consistent volume. A drain condition that could advance on an
+	// unverified flush would merely restate the assumed-consistent defect ADR-0394 exists to close.
+	//
+	// ADR-0399 §Decision-3: this raw-CRIU drain is left exactly where ADR-0394 placed
+	// it — the last instant before the raw seize. On the ctr recoverable-failure
+	// fallthrough it is the SECOND drain in this checkpoint (the first ran before
+	// ctrCheckpoint); it is correctness-required, not a de-duplicable duplicate,
+	// because the app ran on between the two seizes (failed ctr freeze/thaw,
+	// zeroizeDir, PID re-resolve, TCP_REPAIR), so an earlier single flush would be
+	// stale here. It shares the same fail-closed helper as the ctr-path drain so the
+	// two sites' primitive/predicate/disposition can never drift.
+	if drainErr := drainPodVolumesFailClosed(ctx, req.MigrationName, podUID); drainErr != nil {
+		return nil, drainErr
 	}
 
 	// SD-4 (ADR-0039, ADR-0148): open the ptrace window precisely around the CRIU dump.
@@ -8755,9 +9144,10 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		// P-0193-1 (2026-07-18): see appendHolderScaffoldReattachMount doc — same fold-in as the
 		// NRI join-ns restore path, for the gRPC Restore fallback.
 		reattachMounts = s.appendHolderScaffoldReattachMount(ctx, req.MigrationName, reattachMounts)
-		// UNIVERSAL POD-NETNS INTEGRATION (ADR-0325): joining the restored process into ITS
-		// pod's REAL network namespace (the CNI-wired sandbox netns that owns the new pod IP) is a
-		// property of the restore path, NOT of tcpPreservationMode. We resolve the replacement
+		// UNIVERSAL POD-NETNS INTEGRATION (ADR-0125/ADR-0177/ADR-0349 — mislabeled "ADR-0325"
+		// prior to ADR-0370's citation fix; see ADR-0370 First Finding): joining the restored
+		// process into ITS pod's REAL network namespace (the CNI-wired sandbox netns that owns
+		// the new pod IP) is a property of the restore path, NOT of tcpPreservationMode. We resolve the replacement
 		// pod's sandbox (pause-container) netns from the source-of-truth — the replacement pod UID
 		// → containerd sandbox label → sandbox OCI network/path (resolveSandboxIDForMigration →
 		// ResolveNetnsFromSandbox) — and hand THAT sandbox to joinNsRestore for None/BestEffort/
@@ -8770,7 +9160,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		// sandbox ID derives deterministically from the pod UID. Fail-closed on resolution failure.
 		joinSandboxID, sandboxAttempted := s.resolvePodNetnsSandboxWaiting(ctx, req.MigrationName)
 		if joinSandboxID == "" && sandboxAttempted {
-			msg := fmt.Sprintf("Restore: pod-netns integration failed for migration %s: could not resolve replacement pod sandbox netns (ADR-0325) — refusing to restore into a detached/non-pod namespace", req.MigrationName)
+			msg := fmt.Sprintf("Restore: pod-netns integration failed for migration %s: could not resolve replacement pod sandbox netns (ADR-0125/ADR-0177/ADR-0349) — refusing to restore into a detached/non-pod namespace", req.MigrationName)
 			log.Info(msg, "migration", req.MigrationName)
 			return &agentpb.RestoreResponse{Success: false, ErrorMessage: msg}, nil
 		}
@@ -8963,19 +9353,26 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// mount namespace, which has /sys. CRIU compat-mode tries to umount /sys → EBUSY.
 	// joinNsRestore runs CRIU via nsenter in the HOST mount namespace with --root pointing to
 	// the container's overlayfs, which avoids the agent namespace /sys issue entirely.
-	// Gate10: patch checkpoint images first (same as the config.json path).
 	//
-	// ADR-0049 Amendment D (A1): under tcpPreservationMode=Strict, patchCheckpointImages
-	// failure is a hard failure — proceeding on un-patched images is a security fail-open
-	// (source-pod IP / netns identity remnants survive per ADR-0125/0162). Abort and let
-	// the controller initiate rollback (source pod preserved per ADR-0012).
-	// Mode is now carried explicitly via req.TCPPreservationMode (field 9); this replaces
-	// the previous SeqSnapshots>0 proxy which failed-open when Strict had zero TCP connections.
-	// Under None/BestEffort: log clearly and continue (typed PATCH_ERROR from Python layer
-	// is surfaced in the error string via patchCheckpointImages return value).
-	// ADR-0193 C-R3-1: no early enumerate here (gRPC Restore path does not build cgroup inherit-fds
-	// at this layer; joinNsRestoreFn handles that internally when config.json branch is taken above).
-	// For the non-config.json gRPC path below, pass nil (degrade-and-continue on P-0193-1).
+	// ADR-0385: this branch used to run its OWN standalone patchCheckpointImages pass here
+	// ("Gate10: patch checkpoint images first") BEFORE calling joinNsRestoreFn below — which
+	// performs the identical patch step again internally as its unconditional Step 1
+	// (joinNsRestore is the ADR-0353 R2 sole CRIU-restore chokepoint). That made this the
+	// ONLY one of the three restore entry points (this branch, the config.json branch above,
+	// and the NRI path) that mutated the on-disk checkpoint images TWICE per restore attempt
+	// — and the two invocations disagreed on `inheritFdNames`: this removed call passed nil
+	// (no cgroup inherit-fds), while joinNsRestoreFn's internal call correctly enumerates and
+	// passes the real set (see cgInheritFdsEarly in joinNsRestore). A P-0193-1 orphan-fd
+	// classification made with the wrong (empty) inherit set could hard-stop on a fd the
+	// correct, real classification would have accepted as inherited. The removed call's own
+	// Strict/None-BestEffort mode split was also moot in practice: joinNsRestoreFn's internal
+	// patch call fails closed unconditionally on ANY patch error regardless of mode, so a
+	// "None/BestEffort degrade-and-continue" here never actually reached CRIU restore anyway
+	// — the second, real call inside joinNsRestoreFn re-ran the identical patch against the
+	// same checkpointDir and failed (or succeeded) again regardless of what this call decided.
+	// Fix: patch checkpoint images exactly once, via the single chokepoint, with parity to
+	// the other two restore paths. See docs/adr/0385-single-patch-invocation-raw-criu-restore.md.
+	//
 	// Shared/re-attach PVC mounts (Tier0 RWX) are preserved + re-attached on both paths.
 	// Bounded-wait on the kubelet-published mount (defense-in-depth for the gRPC fallback path).
 	rawReattachMounts, rawReErr := s.resolveReattachMountsWaiting(ctx, req.MigrationName)
@@ -8985,15 +9382,6 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// P-0193-1 (2026-07-18): see appendHolderScaffoldReattachMount doc — same fold-in as the other
 	// two restore paths, for the raw (non-config.json) gRPC Restore path.
 	rawReattachMounts = s.appendHolderScaffoldReattachMount(ctx, req.MigrationName, rawReattachMounts)
-	if patchErr := patchCheckpointImagesFn(imagesDir, nil, reattachContainerPaths(rawReattachMounts), reattachHostTargets(rawReattachMounts), reattachTier1ContainerPaths(rawReattachMounts)); patchErr != nil {
-		if req.TcpPreservationMode == "Strict" {
-			// Strict: fail closed. The controller will initiate rollback.
-			log.Error(patchErr, "Restore: patchCheckpointImages failed under Strict — aborting restore (ADR-0049 Amendment D A1)", "migration", req.MigrationName)
-			return nil, fmt.Errorf("restore aborted (strict): patchCheckpointImages: %w", patchErr)
-		}
-		// None/BestEffort: degrade-and-continue. Surface the typed PATCH_ERROR from pycriu.
-		log.Error(patchErr, "Restore: patchCheckpointImages failed (non-fatal under BestEffort/None, proceeding on un-patched images)", "migration", req.MigrationName)
-	}
 
 	t0 := time.Now()
 	// ADR-0168 B2: storedWorkloadImage replaces the empty imageName on the gRPC fallback path.
@@ -9002,7 +9390,8 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	s.destHostVethMu.RLock()
 	storedVeth2 := s.destHostVeth[req.MigrationName]
 	s.destHostVethMu.RUnlock()
-	// UNIVERSAL POD-NETNS INTEGRATION (ADR-0325): raw-CRIU gRPC path parity with the
+	// UNIVERSAL POD-NETNS INTEGRATION (ADR-0125/ADR-0177/ADR-0349 — mislabeled "ADR-0325" prior
+	// to ADR-0370's citation fix; see ADR-0370 First Finding): raw-CRIU gRPC path parity with the
 	// config.json branch above — resolve the replacement pod's REAL sandbox netns and join it so
 	// the restored process serves at its pod IP regardless of tcpPreservationMode. The synthetic
 	// migration netns (req.DestNetnsFd) is deliberately NOT joined (old-IP preservation is out of

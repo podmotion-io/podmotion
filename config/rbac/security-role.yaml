@@ -14,7 +14,7 @@ rules:
     resources: ["serviceaccounts/token"]
     verbs: ["create"]
   # Read NodeMigrationCapacity to look up dest node names for audience binding.
-  - apiGroups: ["podmotion.io"]
+  - apiGroups: ["migration.podmotion.io"]
     resources: ["nodemigrationcapacities"]
     verbs: ["get", "list", "watch"]
 ---

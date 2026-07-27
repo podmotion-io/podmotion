@@ -9,13 +9,16 @@ package nmcregistrar
 import (
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
+	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,22 +28,36 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	corev1 "k8s.io/api/core/v1"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	"github.com/podmotion-io/podmotion/internal/agent/netnsbroker"
 	"github.com/podmotion-io/podmotion/internal/agent/network"
 )
 
 // defaultAgentPort is the port the agent gRPC server listens on.
 const defaultAgentPort = "9090"
 
+// hostExecFunc runs argv to completion in the HOST mount namespace via the netns-broker's
+// synchronous "exec" op and returns the result (ADR-0366). nil ⇒ detectCRIU falls back to a
+// direct in-container exec (kind/dev/tests where node and container glibc match, and unit
+// tests) — the exact fallback convention criu.CRIUCheckpointer.hostNSRun already established.
+type hostExecFunc func(ctx context.Context, opTimeout time.Duration, argv ...string) netnsbroker.ExecResult
+
 // Registrar creates and updates the NodeMigrationCapacity CR for the local node.
 type Registrar struct {
 	client    client.Client
 	nodeName  string
-	agentPort string // gRPC listen port; defaults to defaultAgentPort
+	agentPort string       // gRPC listen port; defaults to defaultAgentPort
+	hostExec  hostExecFunc // nil ⇒ direct in-container exec fallback (ADR-0366)
 }
+
+// SetHostExecFunc installs the host-mount-namespace exec primitive used by detectCRIU
+// (ADR-0366). Must be called before Register/Heartbeat for the host-ns routing to take
+// effect; nil (the zero value) preserves today's direct in-container exec behavior.
+func (r *Registrar) SetHostExecFunc(f hostExecFunc) { r.hostExec = f }
 
 // New builds a controller-runtime client with the pmv1 scheme registered.
 func New(cfg *rest.Config, nodeName string) (*Registrar, error) {
@@ -80,10 +97,40 @@ const criuBinaryPath = "/usr/sbin/criu"
 // spec.criuVersion empty even though CRIU was genuinely installed on the host.
 const criuBinaryPathFallback = "/usr/local/sbin/criu"
 
-// detectCRIU runs criu --version and returns the version string (e.g. "3.17.1").
-// Tries the canonical path, then the /usr/local/sbin fallback, then finally searches PATH.
-// Returns an empty string on any error.
-func detectCRIU() string {
+// hostCRIUWrapperPath is the host-node install location of podmotion-criu-wrapper
+// (ADR-0181/0183: the install-criu-wrapper init container copies it here), already a
+// member of the netns-broker's synchronous "exec" op allowlist (ADR-0347,
+// internal/agent/netnsbroker/broker.go execAllowlist) for the restore path. ADR-0366
+// reuses this exact host-exec surface for CRIU-version detection instead of exec'ing
+// the dynamically-linked host CRIU binary directly in the older-glibc agent container
+// (the same glibc-mismatch fix internal/agent/criu/criu_checkpointer.go already applies
+// one layer up, for dump/pre-dump — see hostCRIUWrapperPath there).
+const hostCRIUWrapperPath = "/opt/podmotion/bin/podmotion-criu-wrapper"
+
+// criuDetectionError classifies why detectCRIU failed, so callers can attach the right
+// NMC status Condition reason (ADR-0366 Condition 2) without re-parsing a message string.
+type criuDetectionError struct {
+	reason string // pmv1.ReasonCRIUBrokerUnreachable or pmv1.ReasonCRIUExecFailed
+	err    error
+}
+
+func (e *criuDetectionError) Error() string { return e.err.Error() }
+func (e *criuDetectionError) Unwrap() error { return e.err }
+
+// criuBrokerMaxAttempts/RetryBackoff/AttemptTimeout bound the broker-unreachable retry
+// (ADR-0366 §3): a genuine startup race (broker sidecar still binding its socket) is
+// worth a few quick retries; a broker that never comes up must still give up promptly
+// and surface loudly rather than retry forever (zero-tech-debt: no fail-open fallback).
+const (
+	criuBrokerMaxAttempts    = 3
+	criuBrokerRetryBackoff   = 500 * time.Millisecond
+	criuBrokerAttemptTimeout = 5 * time.Second
+)
+
+// resolveCRIUBinaryPathForDirectExec finds the CRIU binary for the direct in-container
+// exec path (kind/dev/tests). Tries the canonical path, then the /usr/local/sbin
+// fallback, then finally searches PATH. Unchanged path-resolution logic (ADR-0366).
+func resolveCRIUBinaryPathForDirectExec() string {
 	bin := criuBinaryPath
 	if _, err := os.Stat(bin); err != nil {
 		if _, err2 := os.Stat(criuBinaryPathFallback); err2 == nil {
@@ -93,12 +140,15 @@ func detectCRIU() string {
 			bin = "criu"
 		}
 	}
-	out, err := exec.Command(bin, "--version").Output()
-	if err != nil {
-		return ""
-	}
-	// Output looks like: "Version: 4.2\n" or "CRIU version 4.2"
-	line := strings.TrimSpace(string(out))
+	return bin
+}
+
+// parseCRIUVersion extracts the version string from `criu --version` output, e.g.
+// "Version: 4.2\n" or "CRIU version 4.2". Unchanged parsing logic (ADR-0366), now
+// shared between the direct-exec and broker-exec paths (applied to ExecResult's
+// captured output instead of a local exec.Command's output on the broker path).
+func parseCRIUVersion(out string) string {
+	line := strings.TrimSpace(out)
 	for _, part := range strings.Fields(line) {
 		// First field that looks like a version number
 		if len(part) > 0 && part[0] >= '0' && part[0] <= '9' {
@@ -110,6 +160,132 @@ func detectCRIU() string {
 		return strings.TrimSpace(line[idx+1:])
 	}
 	return line
+}
+
+// detectCRIU resolves the installed CRIU version and returns (version, error). version
+// is "" on any failure; error is non-nil on any failure and nil on success — never both
+// zero (ADR-0366: replaces the old bare `return ""` silent-swallow with a genuinely
+// surfaced, classified error the caller uses to log AND set the CRIUDetected condition).
+func (r *Registrar) detectCRIU(ctx context.Context) (string, error) {
+	log := logf.FromContext(ctx).WithName("nmcregistrar")
+	bin := resolveCRIUBinaryPathForDirectExec()
+
+	if r.hostExec == nil {
+		// kind/dev/tests: node and container glibc match (or StubCheckpointer path) —
+		// same direct-exec behavior as today, minus the silent swallow.
+		return execDirectAndParse(bin, log)
+	}
+
+	// Production (KVM/RKE2): route through the host mount namespace via the SAME
+	// podmotion-criu-wrapper + broker exec surface criu_checkpointer.go uses for
+	// dump/pre-dump (ADR-0234), through the broker's synchronous Exec op.
+	return r.detectCRIUViaBroker(ctx, log)
+}
+
+// execDirectAndParse execs `bin --version` directly in the agent container (kind/dev/
+// tests). WARN-logs and returns a classified error on any failure — never a bare "".
+func execDirectAndParse(bin string, log logr.Logger) (string, error) {
+	out, err := exec.Command(bin, "--version").Output()
+	if err != nil {
+		log.Info("WARNING: CRIU version detection failed (direct in-container exec)",
+			"binary", bin, "error", err)
+		return "", &criuDetectionError{
+			reason: pmv1.ReasonCRIUExecFailed,
+			err:    fmt.Errorf("direct exec of %q --version: %w", bin, err),
+		}
+	}
+	return parseCRIUVersion(string(out)), nil
+}
+
+// detectCRIUViaBroker issues `argv = [hostCRIUWrapperPath, "--", criuBinaryPath,
+// "--version"]` through the broker's synchronous Exec op (ADR-0366 §1). It distinguishes
+// ExecResult.SpawnErr (broker unreachable — a startup race, retried bounded: 3 attempts,
+// 500ms backoff, 5s per-attempt timeout) from ExitCode != 0 (a genuine CRIU failure —
+// logged immediately, never retried: retrying a deterministic failure only delays an
+// equally-real WARN, and unbounded/infinite retry of either case would be exactly the
+// fail-open fallback the zero-tech-debt pillar forbids).
+func (r *Registrar) detectCRIUViaBroker(ctx context.Context, log logr.Logger) (string, error) {
+	argv := []string{hostCRIUWrapperPath, "--", criuBinaryPath, "--version"}
+
+	var lastSpawnErr error
+retryLoop:
+	for attempt := 1; attempt <= criuBrokerMaxAttempts; attempt++ {
+		res := r.hostExec(ctx, criuBrokerAttemptTimeout, argv...)
+
+		if res.SpawnErr == nil {
+			if res.ExitCode != 0 {
+				// Broker reached, wrapper/criu ran and failed for real — deterministic,
+				// not a startup race. No retry: log immediately.
+				log.Info("WARNING: CRIU version detection failed — host CRIU exec via broker exited nonzero",
+					"wrapper", hostCRIUWrapperPath, "criuBinary", criuBinaryPath,
+					"exitCode", res.ExitCode, "stderr", string(res.Stderr))
+				return "", &criuDetectionError{
+					reason: pmv1.ReasonCRIUExecFailed,
+					err: fmt.Errorf("broker exec of %v exited %d: %s",
+						argv, res.ExitCode, strings.TrimSpace(string(res.Stderr))),
+				}
+			}
+			out := res.Combined
+			if len(out) == 0 {
+				out = res.Stdout
+			}
+			return parseCRIUVersion(string(out)), nil
+		}
+
+		// broker unreachable this attempt — bounded retry.
+		lastSpawnErr = res.SpawnErr
+		if attempt == criuBrokerMaxAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			lastSpawnErr = ctx.Err()
+			break retryLoop
+		case <-time.After(criuBrokerRetryBackoff):
+		}
+	}
+
+	// Only the FINAL failed attempt logs here.
+	log.Info("WARNING: CRIU version detection failed — could not reach netns-broker",
+		"wrapper", hostCRIUWrapperPath, "criuBinary", criuBinaryPath,
+		"error", lastSpawnErr, "attempts", criuBrokerMaxAttempts)
+	return "", &criuDetectionError{
+		reason: pmv1.ReasonCRIUBrokerUnreachable,
+		err: fmt.Errorf("netns-broker unreachable after %d attempts: %w",
+			criuBrokerMaxAttempts, lastSpawnErr),
+	}
+}
+
+// criuDetectedCondition builds the ADR-0366 Condition-2 observability signal: a real NMC
+// status Condition (not just a log line) reflecting whether CRIU detection has a value.
+// version != "" is treated as success regardless of err (err is only consulted on
+// failure, to classify Reason); this mirrors the caller contract established by
+// detectCRIU/detectCRIUViaBroker (version and err are never both meaningfully set).
+func criuDetectedCondition(version string, err error) metav1.Condition {
+	if version != "" {
+		return metav1.Condition{
+			Type:    pmv1.ConditionCRIUDetected,
+			Status:  metav1.ConditionTrue,
+			Reason:  pmv1.ReasonCRIUVersionDetected,
+			Message: fmt.Sprintf("CRIU version %q detected.", version),
+		}
+	}
+	reason := pmv1.ReasonCRIUExecFailed
+	msg := "CRIU version detection failed."
+	var de *criuDetectionError
+	switch {
+	case errors.As(err, &de):
+		reason = de.reason
+		msg = de.Error()
+	case err != nil:
+		msg = err.Error()
+	}
+	return metav1.Condition{
+		Type:    pmv1.ConditionCRIUDetected,
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: msg,
+	}
 }
 
 // detectKernelFeatures probes /proc and /boot for kernel config flags.
@@ -324,12 +500,16 @@ func assertMagicTableCoverage(criuVersion string) {
 
 // Register creates or updates the NodeMigrationCapacity CR for this node.
 func (r *Registrar) Register(ctx context.Context) error {
-	criuVersion := detectCRIU()
+	criuVersion, criuErr := r.detectCRIU(ctx)
 	// N1: assert vendored pycriu magic table covers all expected CRIU image types.
 	assertMagicTableCoverage(criuVersion)
 	kernelFeatures := detectKernelFeatures()
 	longhornAvailable := detectLonghorn(ctx, r.client)
 	cni := detectCNI() // ADR-0313: single call, reused for CNIPlugin, IPMobilitySupported, CNICompatible
+	// ADR-0367: single computation reused for both IPMobilitySupported and
+	// LiveMigrationEligible — the two fields describe the same underlying fact and must
+	// never be independently derived (that is the exact drift shape ADR-0367 fixes).
+	mobile := ipMobilitySupported(cni, kernelFeatures)
 
 	// Resolve the node's InternalIP so the operator can reach this agent even when
 	// it runs as a systemd service (no pod IP discoverable via label selector).
@@ -362,9 +542,10 @@ func (r *Registrar) Register(ctx context.Context) error {
 				LocalPVMigratable: true,
 			},
 			NetworkCapability: pmv1.NetworkCapability{
-				CNIPlugin:           cni,
-				IPMobilitySupported: ipMobilitySupported(cni, kernelFeatures),
-				XDPBridgeCapable:    kernelFeatures.XDPSupported && kernelFeatures.BPFEnabled,
+				CNIPlugin:             cni,
+				IPMobilitySupported:   mobile,
+				LiveMigrationEligible: mobile,
+				XDPBridgeCapable:      kernelFeatures.XDPSupported && kernelFeatures.BPFEnabled,
 			},
 			MaxConcurrentMigrationsSource:      2,
 			MaxConcurrentMigrationsDestination: 2,
@@ -415,6 +596,11 @@ func (r *Registrar) Register(ctx context.Context) error {
 		Reason:  pmv1.ReasonCNISupported,
 		Message: fmt.Sprintf("CNI plugin %q is supported by PodMotion's live-migration datapath.", cni),
 	})
+
+	// ADR-0366 Condition 2: real observability for a CRIU-detection failure — not just
+	// the WARN log line already emitted inside detectCRIU — so this state is visible via
+	// `kubectl get nmc -o wide`/status without needing to go read agent pod logs.
+	meta.SetStatusCondition(&nmc.Status.Conditions, criuDetectedCondition(criuVersion, criuErr))
 
 	if err := r.client.Status().Update(ctx, nmc); err != nil {
 		return fmt.Errorf("updating NodeMigrationCapacity status: %w", err)
@@ -607,15 +793,39 @@ func ipMobilitySupported(cni string, kf pmv1.KernelFeatures) bool {
 	}
 }
 
-// Heartbeat patches status.lastHeartbeat and ready=true.
+// Heartbeat patches status.lastHeartbeat and ready=true. ADR-0366 §3 self-heal: it also
+// re-attempts detectCRIU (and re-PATCHes Spec.CRIUVersion) whenever the currently-stored
+// value is empty — making the pre-existing "NMC registration failed — will retry via
+// heartbeat" comment (cmd/agent/main.go) actually true for this field. detectCRIU is
+// deliberately NOT re-run when CRIUVersion is already populated (no needless host-ns
+// exec calls once detection has already succeeded).
 func (r *Registrar) Heartbeat(ctx context.Context) error {
+	log := logf.FromContext(ctx).WithName("nmcregistrar")
 	nmc := &pmv1.NodeMigrationCapacity{}
 	if err := r.client.Get(ctx, types.NamespacedName{Name: r.nodeName}, nmc); err != nil {
 		return fmt.Errorf("getting NodeMigrationCapacity for heartbeat: %w", err)
 	}
+
+	var detectErr error
+	if nmc.Spec.CRIUVersion == "" {
+		var version string
+		version, detectErr = r.detectCRIU(ctx)
+		if version != "" {
+			nmc.Spec.CRIUVersion = version
+			if err := r.client.Update(ctx, nmc); err != nil {
+				return fmt.Errorf("updating NodeMigrationCapacity spec.criuVersion (heartbeat self-heal): %w", err)
+			}
+			log.Info("CRIU version detected on heartbeat self-heal retry", "criuVersion", version)
+			detectErr = nil
+		}
+	}
+
 	now := metav1.Now()
 	nmc.Status.Ready = true
 	nmc.Status.LastHeartbeat = &now
+	// ADR-0366 Condition 2: keep the CRIUDetected condition current on every heartbeat,
+	// whether or not a re-attempt ran this cycle (reflects the currently-stored field).
+	meta.SetStatusCondition(&nmc.Status.Conditions, criuDetectedCondition(nmc.Spec.CRIUVersion, detectErr))
 	if err := r.client.Status().Update(ctx, nmc); err != nil {
 		return fmt.Errorf("updating NodeMigrationCapacity heartbeat: %w", err)
 	}

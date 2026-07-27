@@ -13,7 +13,7 @@
 CLANG       ?= clang
 CFLAGS      := -O2 -g -target bpf -D__TARGET_ARCH_x86 \
                -I/usr/include -I/usr/include/x86_64-linux-gnu \
-               -Wall -Werror
+               -Wall -Werror -Wno-pass-failed
 
 BPF_SRCS    := zero_window.c xdp_bridge.c pm_relay.c pm_sk_lookup.c pm_xdp_vtep.c
 BPF_OBJECTS := $(BPF_SRCS:.c=.bpf.o)
@@ -40,7 +40,14 @@ generate: $(BPF_OBJECTS)
 		-cc $(CLANG) \
 		-cflags "$(CFLAGS)" \
 		-output-dir ../internal/agent/network/bpfloader \
+		-output-stem pm_relay \
 		PmRelay ./pm_relay.c
+	# ADR-0403 C3: bpf2go with no -target emits BOTH pm_relay_bpfel.* and
+	# pm_relay_bpfeb.*. The committed tree is bpfel-only for pm_relay; the *.o
+	# gitignore drops the stray bpfeb.o but the bpfeb.go is NOT ignored and would
+	# be left behind (unlike xdpbridge, which already cleans up). Remove both.
+	rm -f ../internal/agent/network/bpfloader/pm_relay_bpfeb.go \
+	      ../internal/agent/network/bpfloader/pm_relay_bpfeb.o
 	go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc $(CLANG) \
 		-cflags "$(CFLAGS)" \

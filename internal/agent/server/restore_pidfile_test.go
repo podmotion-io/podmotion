@@ -311,6 +311,16 @@ func TestPriorRestoredPIDIfAlive_GarbageContent(t *testing.T) {
 // a pure unit test. This matches the file's existing style (unit coverage for the underlying
 // mechanism, not an end-to-end RPC harness) and is fully falsifiable: any regression in the
 // identity-comparison or state-check logic these tests cover will fail here.
+//
+// The three tests below target localNetnsMatch DIRECTLY (not pidNetnsMatchesPath's default
+// netnsMatchFn=brokerNetnsMatch routing) — they are same-process comparison-logic unit tests
+// against os.Getpid(), not broker-delegation tests, and setting netnsMatchFn here would just
+// dial a broker socket that does not exist in this test binary. The broker-delegation path
+// itself — the actual netns_match wire op, exercised against a genuinely SEPARATE process, not
+// the test binary's own PID — is covered by TestPidNetnsMatchesPath_BrokerDelegation_SeparateProcess
+// in netns_match_broker_test.go (closes the coverage gap the original ADR-0306 unit tests left:
+// none of them could ever go red if AppArmor mediation for this call regressed, because they
+// never crossed a process boundary).
 
 // TestPidNetnsMatchesPath_Mismatch: two different (but both real) netns paths for the current
 // process do not spuriously match a bogus "expected" path — the self-netns of this test binary
@@ -326,7 +336,7 @@ func TestPidNetnsMatchesPath_Mismatch(t *testing.T) {
 	if err := os.WriteFile(tmp, []byte("placeholder"), 0o600); err != nil {
 		t.Fatalf("write placeholder file: %v", err)
 	}
-	match, err := pidNetnsMatchesPath(self, tmp)
+	match, err := localNetnsMatch(self, tmp)
 	if err != nil {
 		t.Fatalf("pidNetnsMatchesPath returned unexpected error: %v", err)
 	}
@@ -341,7 +351,7 @@ func TestPidNetnsMatchesPath_Mismatch(t *testing.T) {
 func TestPidNetnsMatchesPath_SandboxIDUnobtainable(t *testing.T) {
 	self := os.Getpid()
 	bogus := "/proc/999999999/ns/net" // PID that cannot exist (pid_max far lower on Linux)
-	match, err := pidNetnsMatchesPath(self, bogus)
+	match, err := localNetnsMatch(self, bogus)
 	if err == nil {
 		t.Fatalf("pidNetnsMatchesPath(unresolvable path) returned nil error, want non-nil (fail-closed)")
 	}
@@ -357,7 +367,7 @@ func TestPidNetnsMatchesPath_SandboxIDUnobtainable(t *testing.T) {
 func TestPidNetnsMatchesPath_MatchRegressionGuard(t *testing.T) {
 	self := os.Getpid()
 	selfNetnsPath := fmt.Sprintf("/proc/%d/ns/net", self)
-	match, err := pidNetnsMatchesPath(self, selfNetnsPath)
+	match, err := localNetnsMatch(self, selfNetnsPath)
 	if err != nil {
 		t.Fatalf("pidNetnsMatchesPath(self, self) returned unexpected error: %v", err)
 	}

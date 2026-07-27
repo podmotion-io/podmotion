@@ -47,9 +47,20 @@ func TestServiceVerifying_Strict_TrafficVerifierSuccess_HoldsWithoutDataplaneRea
 	scheme := adr0210Scheme(t)
 
 	destPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "redis-src-m-1", Namespace: "default", UID: "uid-repl-1"},
-		Spec:       corev1.PodSpec{NodeName: "pm-w2"},
-		Status:     corev1.PodStatus{PodIP: "10.244.2.50"},
+		ObjectMeta: metav1.ObjectMeta{Name: "redis-src-m-1", Namespace: "default", UID: "uid-repl-1",
+			Labels: map[string]string{"app": "redis"}},
+		Spec:   corev1.PodSpec{NodeName: "pm-w2"},
+		Status: corev1.PodStatus{PodIP: "10.244.2.50"},
+	}
+	// ADR-0390: a real Service DOES select this pod (mirrors the live redis Service) — its
+	// EndpointSlice just hasn't converged yet. This is deliberately wired so
+	// establishServiceContinuity's ADR-0390 permanent-vs-transient check (anyServiceSelectsPod)
+	// correctly reads this as transient (keep holding), not permanent (no Service ever) — without
+	// it, this fixture would be indistinguishable from a pod no Service ever targets and the test
+	// would (correctly, per ADR-0390) advance instead of holding.
+	redisSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "redis", Namespace: "default"},
+		Spec:       corev1.ServiceSpec{Selector: map[string]string{"app": "redis"}, ClusterIP: "10.96.0.50"},
 	}
 
 	pm := &pmv1.PodMigration{
@@ -77,7 +88,7 @@ func TestServiceVerifying_Strict_TrafficVerifierSuccess_HoldsWithoutDataplaneRea
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(pm, destPod).
+		WithObjects(pm, destPod, redisSvc).
 		WithStatusSubresource(pm).
 		Build()
 
@@ -103,7 +114,7 @@ func TestServiceVerifying_Strict_TrafficVerifierSuccess_HoldsWithoutDataplaneRea
 		t.Fatalf("BUG (bypass): Strict advanced to CutoverComplete with ServiceContinuityVerified absent — the service-path verifier (TrafficVerified) is NOT a Strict cutover gate")
 	}
 	if meta.IsStatusConditionTrue(fresh.Status.Conditions, pmv1.ConditionServiceContinuityVerified) {
-		t.Fatalf("test invariant: ServiceContinuityVerified must remain unset (no Service/EndpointSlice fixture wired — D1 cannot converge)")
+		t.Fatalf("test invariant: ServiceContinuityVerified must remain unset (Service exists and selects the pod, but its EndpointSlice has not converged yet — D1 cannot converge; ADR-0390 correctly distinguishes this from the no-Service-at-all case, which trivially passes)")
 	}
 }
 
@@ -117,9 +128,16 @@ func TestServiceVerifying_Strict_FallthroughGuard_HoldsWhenProducerYieldsNoCross
 	scheme := adr0210Scheme(t)
 
 	destPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "repl-2", Namespace: "default", UID: "uid-repl-2"},
-		Spec:       corev1.PodSpec{NodeName: "pm-w2"},
-		Status:     corev1.PodStatus{PodIP: "10.244.2.51"},
+		ObjectMeta: metav1.ObjectMeta{Name: "repl-2", Namespace: "default", UID: "uid-repl-2",
+			Labels: map[string]string{"app": "redis"}},
+		Spec:   corev1.PodSpec{NodeName: "pm-w2"},
+		Status: corev1.PodStatus{PodIP: "10.244.2.51"},
+	}
+	// ADR-0390: see the sibling test above — a real Service selects this pod so the
+	// permanent-vs-transient check correctly reads this as transient (hold), not permanent.
+	redisSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "redis", Namespace: "default"},
+		Spec:       corev1.ServiceSpec{Selector: map[string]string{"app": "redis"}, ClusterIP: "10.96.0.51"},
 	}
 
 	pm := &pmv1.PodMigration{
@@ -145,7 +163,7 @@ func TestServiceVerifying_Strict_FallthroughGuard_HoldsWhenProducerYieldsNoCross
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(pm, destPod).
+		WithObjects(pm, destPod, redisSvc).
 		WithStatusSubresource(pm).
 		Build()
 

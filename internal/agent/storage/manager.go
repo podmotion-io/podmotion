@@ -71,6 +71,22 @@ type MigrationOptions struct {
 	DestinationNode string
 	// Classifications is the list of per-PVC tier decisions from StorageClassifier.
 	Classifications []TierClassification
+	// CutoverComplete is true when ConditionStorageCutoverComplete is (or, per
+	// cutoverSideEffectOccurred, was) True on the PodMigration at the moment this
+	// MigrationOptions was built — i.e. Cutover's tier-specific destination-side action
+	// (Longhorn attach, Ceph `rbd migration commit`, …) is known to have actually executed.
+	// Populated ONLY by buildMigrationOptionsFromCache (the read path ReleaseDestination uses),
+	// via the same meta.FindStatusCondition/meta.IsStatusConditionTrue pattern already used
+	// elsewhere in this controller (podmigration_controller.go:1050) — never inferred from tier
+	// identity alone (ADR-0368 CONDITION 2 / KVM Expert FINDING 1). Tier2/Tier3's
+	// ReleaseDestination implementations gate their point-of-no-return/not-implemented sentinel
+	// on this field: if cutover never actually ran, there is nothing destination-side to
+	// release, and returning the sentinel anyway would incorrectly terminate a recoverable
+	// failure that happened before Cutover ever fired (the common case: a Checkpointing- or
+	// Transferring-phase failure). Ignored by Tier0 (never creates a reservation) and Tier1
+	// (detachFromNode is idempotent against a volume that was never attached to the destination,
+	// so no gate is needed there — see LonghornMigrator.ReleaseDestination).
+	CutoverComplete bool
 }
 
 // Migrator is the interface implemented by each storage tier handler.
@@ -116,6 +132,26 @@ type Migrator interface {
 	// Tiers with no shared-attachment/dual-owner concept (RWX, snapshot-rsync)
 	// return nil immediately.
 	AwaitSingleOwner(ctx context.Context, opts MigrationOptions) error
+	// ReleaseDestination undoes whatever destination-side reservation Cutover created, as part
+	// of the rollback path (internal/rollback/rollback.go's StorageStep, called from
+	// reconcileRollingBack after ComputeRollback but governed by the same Network→Compute→Storage
+	// order as the forward pipeline — ADR-0014, unaffected by this ADR).
+	//
+	// Every tier MUST return one of exactly three outcomes, never anything else (ADR-0368 §5.1):
+	//   - nil: the destination-side reservation (if any) has been confirmed released, or the
+	//     tier never created one in the first place. This is the ONLY value that may cause the
+	//     rollback pipeline to treat storage as cleanly rolled back.
+	//   - a wrapped ErrRollbackPointOfNoReturn: undo is structurally impossible (the forward
+	//     Cutover already made an irrevocable choice). The caller MUST NOT retry.
+	//   - a wrapped ErrRollbackNotImplemented: undo has not been built for this tier yet. Must
+	//     be surfaced exactly as loudly as ErrRollbackPointOfNoReturn.
+	//   - any other non-nil error: a real, transient/operational failure attempting the undo.
+	//     Retriable via the normal reconcile requeue.
+	//
+	// ReleaseDestination MUST NEVER return nil for a tier/case where the destination-side
+	// reservation was NOT actually confirmed released. A fabricated nil here is exactly the
+	// failure mode this method exists to prevent — the live outage ADR-0368 documents.
+	ReleaseDestination(ctx context.Context, opts MigrationOptions) error
 }
 
 // StorageMigrationManager selects the appropriate Migrator based on the tier
@@ -182,12 +218,24 @@ func (m *StorageMigrationManager) RegisterMigrator(tier StorageTier, mg Migrator
 //
 // Intended to run in a goroutine — patches the CR directly via the k8s client.
 // The PodMigration controller re-evaluates the condition on the next reconcile.
-func (m *StorageMigrationManager) RunPreStage(ctx context.Context, pm *pmv1.PodMigration) error {
+//
+// coldRecreateArmed (ADR-0396) is the operator-computed, in-process arming boolean threaded to
+// ClassifyPod (via classifyFromLiveSourcePod). It is never re-derived here and never read from
+// status — the operator computes it before dispatch and passes it as this argument.
+//
+// claimToken (ADR-0398 D1) is the fencing token of the single-dispatch claim under which this
+// RunPreStage was launched. It is threaded into every terminal StorageReadyForFreeze write so that a
+// SUPERSEDED holder (whose claim a later reconcile re-claimed with a fresh token after a lease expiry)
+// cannot write a terminal verdict. This is defense-in-depth: the operator already guarantees
+// exactly-once launch by gating the goroutine on a fenced Complete-mark, so under normal operation the
+// token always still matches. An empty claimToken disables fencing (used by unit tests that call
+// RunPreStage directly, outside the operator's claim machinery).
+func (m *StorageMigrationManager) RunPreStage(ctx context.Context, pm *pmv1.PodMigration, coldRecreateArmed bool, claimToken string) error {
 	log := logf.FromContext(ctx).WithValues("migration", pm.Name)
 
-	highest, classifications, migrator, opts, err := m.classifyFromLiveSourcePod(ctx, pm)
+	highest, classifications, migrator, opts, err := m.classifyFromLiveSourcePod(ctx, pm, coldRecreateArmed)
 	if err != nil {
-		return m.patchStorageReady(ctx, pm, metav1.ConditionFalse, "ClassifyFailed", err.Error())
+		return m.patchStorageReady(ctx, pm, claimToken, metav1.ConditionFalse, "ClassifyFailed", err.Error())
 	}
 
 	// Persist the highest tier and the full per-PVC classification to status.
@@ -205,7 +253,7 @@ func (m *StorageMigrationManager) RunPreStage(ctx context.Context, pm *pmv1.PodM
 	}
 
 	if highest.Tier == TierBlocked {
-		return m.patchStorageReady(ctx, pm, metav1.ConditionFalse, "BlockedVolume",
+		return m.patchStorageReady(ctx, pm, claimToken, metav1.ConditionFalse, "BlockedVolume",
 			fmt.Sprintf("pod has un-migratable volume: %s", highest.Reason))
 	}
 
@@ -223,14 +271,14 @@ func (m *StorageMigrationManager) RunPreStage(ctx context.Context, pm *pmv1.PodM
 		if highest.Tier > TierRWX {
 			log.Info("no migrator registered for tier > TierRWX — blocking freeze",
 				"tier", highest.Tier)
-			return m.patchStorageReady(ctx, pm, metav1.ConditionFalse, "NoMigratorForTier",
+			return m.patchStorageReady(ctx, pm, claimToken, metav1.ConditionFalse, "NoMigratorForTier",
 				fmt.Sprintf("tier%d: no storage migrator registered — cannot stage "+
 					"destination storage; register a migrator for this tier before "+
 					"migrating (%s)", highest.Tier, highest.Reason))
 		}
 		log.Info("no migrator registered for TierRWX — emitting StorageReadyForFreeze immediately",
 			"tier", highest.Tier)
-		return m.patchStorageReady(ctx, pm, metav1.ConditionTrue, "NoOpTier",
+		return m.patchStorageReady(ctx, pm, claimToken, metav1.ConditionTrue, "NoOpTier",
 			fmt.Sprintf("tier%d: re-attach only — no data movement required", highest.Tier))
 	}
 
@@ -255,13 +303,25 @@ retryLoop:
 		}
 	}
 	if preStageErr != nil {
-		return m.patchStorageReady(ctx, pm, metav1.ConditionFalse, "PreStageFailed",
+		// ADR-0365 Decision §2.2/§2 item 3: distinguish the two fail-closed hardenings' errors
+		// from a generic PreStageFailed so Status.Conditions names WHY, not just that pre-stage
+		// failed — PreStageTimeout for the new bounded-dispatch-context expiring (§2.2), and
+		// EmptyDestinationNode for the migrator-level empty-DestinationNode guard (§2 item 3)
+		// firing, both distinct from an ordinary tier-migrator error.
+		reason := "PreStageFailed"
+		switch {
+		case errors.Is(preStageErr, context.DeadlineExceeded):
+			reason = "PreStageTimeout"
+		case errors.Is(preStageErr, errEmptyDestinationNode):
+			reason = "EmptyDestinationNode"
+		}
+		return m.patchStorageReady(ctx, pm, claimToken, metav1.ConditionFalse, reason,
 			fmt.Sprintf("tier%d pre-stage: %v", highest.Tier, preStageErr))
 	}
 
 	// PreStage succeeded — for Tier0 (RWX) this is sufficient.
 	// For tiers with a sync phase, PreStage blocks until ≥95% is reached internally.
-	return m.patchStorageReady(ctx, pm, metav1.ConditionTrue, "StorageReady",
+	return m.patchStorageReady(ctx, pm, claimToken, metav1.ConditionTrue, "StorageReady",
 		fmt.Sprintf("tier%d pre-stage complete: %s", highest.Tier, highest.Reason))
 }
 
@@ -279,13 +339,13 @@ retryLoop:
 //
 // migrator is nil when no Migrator is registered for the selected tier — RunPreStage has a
 // TierRWX-only no-op fallback for that case.
-func (m *StorageMigrationManager) classifyFromLiveSourcePod(ctx context.Context, pm *pmv1.PodMigration) (TierClassification, []TierClassification, Migrator, MigrationOptions, error) {
+func (m *StorageMigrationManager) classifyFromLiveSourcePod(ctx context.Context, pm *pmv1.PodMigration, coldRecreateArmed bool) (TierClassification, []TierClassification, Migrator, MigrationOptions, error) {
 	sourcePod, err := m.getSourcePod(ctx, pm)
 	if err != nil {
 		return TierClassification{}, nil, nil, MigrationOptions{}, fmt.Errorf("get source pod: %w", err)
 	}
 
-	classifications, err := m.Classifier.ClassifyPod(ctx, sourcePod)
+	classifications, err := m.Classifier.ClassifyPod(ctx, sourcePod, coldRecreateArmed)
 	if err != nil {
 		return TierClassification{}, nil, nil, MigrationOptions{}, fmt.Errorf("classify pod pvcs: %w", err)
 	}
@@ -313,16 +373,16 @@ func (m *StorageMigrationManager) classifyFromLiveSourcePod(ctx context.Context,
 // pod still existed remains valid for the rest of the migration.
 //
 // Re-fetches pm fresh so it observes RunPreStage's patch even if the caller's in-memory copy
-// predates it. Returns an error if no classification has been cached yet (RunPreStage has not
-// completed) — this is a recoverable, retryable condition, not a permanent failure.
+// predates it. Returns an error satisfying errors.Is(err, errNoCachedClassification) if no
+// classification has been cached yet (RunPreStage has not completed) — this is a recoverable,
+// retryable condition, not a permanent failure.
 func (m *StorageMigrationManager) buildMigrationOptionsFromCache(ctx context.Context, pm *pmv1.PodMigration) (TierClassification, Migrator, MigrationOptions, error) {
 	fresh := &pmv1.PodMigration{}
 	if err := m.Client.Get(ctx, client.ObjectKeyFromObject(pm), fresh); err != nil {
 		return TierClassification{}, nil, MigrationOptions{}, fmt.Errorf("re-fetch PodMigration for cached classification: %w", err)
 	}
 	if fresh.Status.StorageTier == nil {
-		return TierClassification{}, nil, MigrationOptions{}, errors.New(
-			"no cached PVC classification yet (RunPreStage has not completed) — cannot cutover before storage pre-stage classifies volumes")
+		return TierClassification{}, nil, MigrationOptions{}, errNoCachedClassification
 	}
 
 	classifications := make([]TierClassification, 0, len(fresh.Status.ClassifiedVolumes))
@@ -342,9 +402,57 @@ func (m *StorageMigrationManager) buildMigrationOptionsFromCache(ctx context.Con
 		SourceNode:      pm.Status.SourceNodeName,
 		DestinationNode: pm.Status.DestinationNodeName,
 		Classifications: classifications,
+		CutoverComplete: cutoverSideEffectOccurred(fresh.Status.Conditions),
 	}
 
 	return highest, m.Migrators[highest.Tier], opts, nil
+}
+
+// errNoCachedClassification is returned by buildMigrationOptionsFromCache when
+// pm.Status.StorageTier is nil — RunPreStage has not completed yet (or never ran, e.g. a
+// migration that failed before/during PreMigrating). Cutover/AwaitSingleOwner treat this as a
+// real, retryable failure (they should not be called before classification exists). Rollback's
+// ReleaseDestination treats it differently (see StorageMigrationManager.ReleaseDestination):
+// no classification means storage was never staged for this migration, so — exactly like Tier0's
+// "no reservation ever created" case — there is structurally nothing destination-side to release.
+var errNoCachedClassification = errors.New(
+	"no cached PVC classification yet (RunPreStage has not completed) — cannot cutover before storage pre-stage classifies volumes")
+
+// cutoverSideEffectOccurred reports whether Cutover's tier-specific destination-side action
+// (Longhorn attach, Ceph `rbd migration commit`, …) is known to have actually executed for this
+// PodMigration, read from the SAME ConditionStorageCutoverComplete condition/pattern already used
+// elsewhere in this controller (podmigration_controller.go:1050's
+// meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionStorageCutoverComplete) check) —
+// ADR-0368 CONDITION 2: ground this in the codebase's existing condition-reading pattern, never
+// infer it from tier identity alone.
+//
+// True in two cases:
+//   - the condition is already True: AwaitSingleOwner (manager.go's AwaitSingleOwner method,
+//     patchStorageCutover) confirmed the whole storage-cutover step, including the tier's
+//     Cutover call, completed successfully.
+//   - the condition is False with reason "AwaitSingleOwnerTimeout": this reason is set ONLY
+//     after migrator.Cutover(ctx, opts) already returned nil (manager.go's AwaitSingleOwner
+//     calls migrator.AwaitSingleOwner only once Cutover succeeded — see the Cutover/
+//     AwaitSingleOwner call sequence in reconcileOverlayHandoff) — the destination-side action
+//     itself already executed; only the post-Cutover collapse poll timed out. Treating this as
+//     "cutover happened" is the deliberately conservative direction: the alternative (treating
+//     it as "cutover did not happen") risks silently returning nil from ReleaseDestination for a
+//     tier whose irrevocable destination-side action already ran — the exact fabricated-success
+//     failure mode this whole ADR exists to close.
+//
+// Any other case (condition absent — the common case for a rollback that fired before
+// PreMigrating's Cutover phase ever ran, e.g. a Checkpointing/Transferring-phase failure; or
+// reason "CutoverFailed"/"ClassifyFailed"/etc — migrator.Cutover itself never returned nil)
+// reports false: Cutover's destination-side action never executed.
+func cutoverSideEffectOccurred(conditions []metav1.Condition) bool {
+	cond := meta.FindStatusCondition(conditions, pmv1.ConditionStorageCutoverComplete)
+	if cond == nil {
+		return false
+	}
+	if cond.Status == metav1.ConditionTrue {
+		return true
+	}
+	return cond.Reason == "AwaitSingleOwnerTimeout"
 }
 
 // Cutover looks up the classified tier's migrator and delegates to its
@@ -408,6 +516,48 @@ func (m *StorageMigrationManager) AwaitSingleOwner(ctx context.Context, pm *pmv1
 		fmt.Sprintf("tier%d: volume collapsed to single-owner mountable state", highest.Tier))
 }
 
+// ReleaseDestination looks up the classified tier's migrator and delegates to its
+// ReleaseDestination method, undoing whatever destination-side reservation Cutover created.
+// Called by rollback.RealStorageRollback (internal/rollback/rollback.go's StorageStep) from
+// reconcileRollingBack, after ComputeRollback but governed by the same Network→Compute→Storage
+// order as the forward pipeline (ADR-0014). Mirrors Cutover/AwaitSingleOwner's classify+dispatch
+// shape exactly (buildMigrationOptionsFromCache, same Migrators map) so ReleaseDestination is
+// dispatched through the SAME migrator instances Cutover/AwaitSingleOwner already used for this
+// migration (ADR-0368 §5.3/CONDITION 5) — never a second, independently constructed manager.
+//
+// Unlike Cutover/AwaitSingleOwner, a missing cached classification (errNoCachedClassification)
+// is NOT treated as an error here: it means RunPreStage never ran (or never completed) for this
+// migration — e.g. the migration failed and rolled back before/during PreMigrating — so, exactly
+// like Tier0's "no reservation ever created" case, there is structurally nothing destination-side
+// to release. Returning the real error in that case would fail every very-early rollback loudly
+// for no reason; returning nil here is honest, not a fabricated success, because no tier's
+// Cutover could possibly have run yet. TierBlocked is treated the same way: a blocked
+// classification always halts RunPreStage before Cutover can ever be reached, so nothing was
+// ever staged for that PVC either.
+//
+// A registered-but-nil migrator, in contrast, stays a real error: it is a configuration gap
+// this code cannot reason past, and per the fail-loud contract, an ambiguous case must never be
+// treated as "clearly nothing to release."
+func (m *StorageMigrationManager) ReleaseDestination(ctx context.Context, pm *pmv1.PodMigration) error {
+	highest, migrator, opts, err := m.buildMigrationOptionsFromCache(ctx, pm)
+	if err != nil {
+		if errors.Is(err, errNoCachedClassification) {
+			return nil
+		}
+		return fmt.Errorf("release destination: classify pod pvcs: %w", err)
+	}
+	if highest.Tier == TierBlocked {
+		return nil
+	}
+	if migrator == nil {
+		return fmt.Errorf("release destination: tier%d: no storage migrator registered", highest.Tier)
+	}
+	if err := migrator.ReleaseDestination(ctx, opts); err != nil {
+		return fmt.Errorf("tier%d release destination: %w", highest.Tier, err)
+	}
+	return nil
+}
+
 // patchStorageCutover updates the StorageCutoverComplete condition on the
 // PodMigration CR. Retries on optimistic-lock conflict, mirroring
 // patchStorageReady.
@@ -443,9 +593,17 @@ func (m *StorageMigrationManager) patchStorageCutover(
 
 // patchStorageReady updates the StorageReadyForFreeze condition on the PodMigration CR.
 // Retries on optimistic-lock conflict (resource version mismatch) using retry.RetryOnConflict.
+//
+// ADR-0398 D1 fencing: claimToken is the single-dispatch claim token this RunPreStage was launched
+// under. If it is non-empty and the live StoragePreStageDispatch marker records a DIFFERENT token, this
+// RunPreStage is a superseded holder (its claim was re-claimed by a later reconcile after a lease
+// expiry) and MUST NOT write a terminal verdict — the write is skipped. This is defense-in-depth atop
+// the operator's exactly-once launch gate (the fenced Complete-mark), so under normal operation the
+// token always matches. An empty claimToken disables fencing (direct unit-test callers).
 func (m *StorageMigrationManager) patchStorageReady(
 	ctx context.Context,
 	pm *pmv1.PodMigration,
+	claimToken string,
 	status metav1.ConditionStatus,
 	reason, message string,
 ) error {
@@ -454,6 +612,13 @@ func (m *StorageMigrationManager) patchStorageReady(
 		fresh := &pmv1.PodMigration{}
 		if err := m.Client.Get(ctx, key, fresh); err != nil {
 			return fmt.Errorf("get PodMigration for storage patch: %w", err)
+		}
+		if claimToken != "" {
+			if d := fresh.Status.StoragePreStageDispatch; d != nil && d.ClaimToken != claimToken {
+				logf.FromContext(ctx).Info("ADR-0398: storage pre-stage claim superseded — skipping terminal StorageReadyForFreeze write from a stale dispatch",
+					"migration", pm.Name, "reason", reason)
+				return nil
+			}
 		}
 		meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
 			Type:               conditionStorageReadyForFreeze,

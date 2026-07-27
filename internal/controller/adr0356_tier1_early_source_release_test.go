@@ -42,14 +42,25 @@ import (
 // earlyReleaseSourceForTier1Longhorn routes source termination through KillFrozenSource
 // (ADR-0356 round 2 fix) before ever deleting the source pod. It records whether/how many
 // times it was called so the test can assert call ORDER (kill before delete) and count.
+//
+// onCall, when non-nil, is invoked synchronously inside the RPC handler before resp is
+// returned to the caller. This lets a test simulate an event landing DURING the
+// KillFrozenSource RPC's real (in production, uncontrolled-latency) round trip — e.g.
+// ADR-0371's late-race regression test, which deletes the replacement pod here to prove the
+// controller's final pre-source-delete re-check (added to close that TOCTOU gap) catches a
+// race that lands strictly after the earlier confirm poll succeeded.
 type spyKillFrozenSourceAgentServer struct {
 	agentpb.UnimplementedMigrationAgentServiceServer
-	calls int
-	resp  *agentpb.KillFrozenSourceResponse
+	calls  int
+	resp   *agentpb.KillFrozenSourceResponse
+	onCall func()
 }
 
 func (s *spyKillFrozenSourceAgentServer) KillFrozenSource(_ context.Context, _ *agentpb.KillFrozenSourceRequest) (*agentpb.KillFrozenSourceResponse, error) {
 	s.calls++
+	if s.onCall != nil {
+		s.onCall()
+	}
 	return s.resp, nil
 }
 
@@ -226,7 +237,9 @@ func TestEarlyReleaseSourceForTier1Longhorn_DeletesWhenBothGuaranteesSatisfied(t
 		WithObjects(pod, srcAgentPod, pm, readyNMC("node-dst")).Build()
 	clientTLSCfg := &tls.Config{InsecureSkipVerify: true}
 	pool := agentclient.NewAgentClientPool(fakeClient, strconv.Itoa(port), clientTLSCfg)
-	r := &PodMigrationReconciler{Client: fakeClient, Scheme: scheme, AgentPool: pool}
+	// ADR-0393: the bare-pod early-release path captures a durable spec snapshot before the source
+	// kill; inject the operator-only HMAC signing key the production KubeClient path would supply.
+	r := &PodMigrationReconciler{Client: fakeClient, Scheme: scheme, AgentPool: pool, testOnlySnapshotHMACKey: adr0393TestKey()}
 
 	if err := r.earlyReleaseSourceForTier1Longhorn(context.Background(), pm); err != nil {
 		t.Fatalf("expected success, got: %v", err)

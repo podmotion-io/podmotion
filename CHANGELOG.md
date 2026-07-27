@@ -1,8 +1,8 @@
 # Changelog
 
-> **Note:** this changelog is not maintained past early PoC sprints. For current status see `HANDOFF-LOG.md` and `docs/proof/RESUME-STATE.yaml`.
-
-All notable changes to PodMotion are documented in this file.
+All notable changes to PodMotion are documented in this file. For the current
+milestone status and roadmap, see [`docs/ROADMAP.md`](docs/ROADMAP.md) and
+[`docs/FEATURES.md`](docs/FEATURES.md).
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).

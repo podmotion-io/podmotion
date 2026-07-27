@@ -70,6 +70,11 @@ type EBPFManager interface {
 	DisarmZeroWindowHold(ctx context.Context, ifindex uint32) error
 	ArmXDPBridge(ctx context.Context, srcIP, dstIP net.IP, genevePort uint16) error
 	DisarmXDPBridge(ctx context.Context, srcIP net.IP) error
+	// ListXDPBridgeKeys enumerates the source-IPv4 keys resident in the node-scoped
+	// pinned PM_BRIDGE_MAP. Used by the ADR-0400 node-scoped reconciler to sweep live
+	// entries against the PodMigration source-of-truth. Returns (nil, nil) when the
+	// bridge is not loaded (XDPBridgeCapable=false).
+	ListXDPBridgeKeys(ctx context.Context) ([]net.IP, error)
 	CheckXDPHookConflict(ctx context.Context, ifindex uint32) (bool, error)
 	// ArmRelay attaches PM_RELAY_TC_EGRESS and PM_RELAY_TC_INGRESS to flannel.1
 	// (or the interface named by ifname) and seeds PM_SEQ_XLAT with the provided entry.
@@ -120,6 +125,10 @@ type eBPFManager interface {
 	// DisarmXDPBridge deletes the srcIP entry from PM_BRIDGE_MAP.
 	// If the map is empty afterwards the XDP program is detached.
 	DisarmXDPBridge(ctx context.Context, srcIP net.IP) error
+
+	// ListXDPBridgeKeys enumerates the source-IPv4 keys resident in PM_BRIDGE_MAP
+	// (ADR-0400 node-scoped reconciler). Returns (nil, nil) when not loaded.
+	ListXDPBridgeKeys(ctx context.Context) ([]net.IP, error)
 
 	// CheckXDPHookConflict returns true when another XDP program (e.g. Cilium's
 	// kube-proxy-replacement XDP hook) is already attached to the interface
@@ -206,6 +215,11 @@ func (s *eBPFManagerStub) ArmXDPBridge(ctx context.Context, srcIP, dstIP net.IP,
 	logf.FromContext(ctx).Info("ebpf stub: ArmXDPBridge",
 		"srcIP", srcIP, "dstIP", dstIP, "genevePort", genevePort)
 	return nil
+}
+
+func (s *eBPFManagerStub) ListXDPBridgeKeys(ctx context.Context) ([]net.IP, error) {
+	logf.FromContext(ctx).Info("ebpf stub: ListXDPBridgeKeys (no-op, empty)")
+	return nil, nil
 }
 
 func (s *eBPFManagerStub) DisarmXDPBridge(ctx context.Context, srcIP net.IP) error {

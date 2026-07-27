@@ -396,3 +396,91 @@ func (f *failSecondDumpCheckpointer) Restore(ctx context.Context, opts RestoreOp
 func (f *failSecondDumpCheckpointer) Abort(ctx context.Context, cid, ns string) error {
 	return f.inner.Abort(ctx, cid, ns)
 }
+
+// TestConsistentFreeze_StorageDrainFailClosed covers ADR-0394 §Decision-3: a
+// failed/unverified VolumeDrainer inside the freeze barrier HARD-STOPS the freeze —
+// ConsistentFreeze returns an error, dumps NOTHING, and thaws the pod (so it is not
+// left stuck frozen). This is the fail-closed drain assertion at the freeze barrier (ADR-0394): an
+// unverified storage drain must not advance to the CRIU dump.
+func TestConsistentFreeze_StorageDrainFailClosed(t *testing.T) {
+	cgroupDir := fakeCgroupV2Dir(t, "populated 1\nfrozen 1\n")
+	baseDir := t.TempDir()
+
+	app := PodContainer{
+		Name:          "app",
+		Pid:           3001,
+		Role:          ContainerRoleApp,
+		SpecIndex:     0,
+		CheckpointDir: filepath.Join(baseDir, "app"),
+	}
+
+	cp := newStubbedFrozenCheckpointer()
+	drainErr := errors.New("simulated unverified storage drain")
+	opts := ConsistentFreezeOptions{
+		PodCgroupPath: cgroupDir,
+		CgroupVersion: CgroupV2,
+		Containers:    []PodContainer{app},
+		Checkpointer:  cp,
+		DumpOptions:   DumpOptions{ImagesDir: baseDir},
+		PodUID:        "pod-uid-fail-drain",
+		VolumeDrainer: func(ctx context.Context, podUID string) error { return drainErr },
+	}
+
+	result, err := consistentFreezeImpl(context.Background(), opts)
+	if err == nil {
+		t.Fatalf("expected fail-closed error when VolumeDrainer fails, got nil (result=%+v)", result)
+	}
+	if !errors.Is(err, drainErr) {
+		t.Fatalf("expected wrapped drain error, got: %v", err)
+	}
+	// Must NOT have dumped any container.
+	if len(cp.stub.DumpCalls) != 0 {
+		t.Fatalf("no container may be dumped after a failed drain, got %d dump calls", len(cp.stub.DumpCalls))
+	}
+	// Must have thawed the pod (fail-closed must not leave it frozen).
+	freezeState, rerr := os.ReadFile(filepath.Join(cgroupDir, "cgroup.freeze"))
+	if rerr != nil {
+		t.Fatalf("read cgroup.freeze: %v", rerr)
+	}
+	if got := string(freezeState); got != "0" {
+		t.Fatalf("pod must be thawed (cgroup.freeze=0) after fail-closed drain abort, got %q", got)
+	}
+}
+
+// TestConsistentFreeze_StorageDrainSucceeds asserts the happy path: a VolumeDrainer
+// that verifies the flush lets the freeze proceed to the CRIU dump normally.
+func TestConsistentFreeze_StorageDrainSucceeds(t *testing.T) {
+	cgroupDir := fakeCgroupV2Dir(t, "populated 1\nfrozen 1\n")
+	baseDir := t.TempDir()
+
+	app := PodContainer{
+		Name:          "app",
+		Pid:           3101,
+		Role:          ContainerRoleApp,
+		SpecIndex:     0,
+		CheckpointDir: filepath.Join(baseDir, "app"),
+	}
+
+	cp := newStubbedFrozenCheckpointer()
+	called := false
+	opts := ConsistentFreezeOptions{
+		PodCgroupPath: cgroupDir,
+		CgroupVersion: CgroupV2,
+		Containers:    []PodContainer{app},
+		Checkpointer:  cp,
+		DumpOptions:   DumpOptions{ImagesDir: baseDir},
+		PodUID:        "pod-uid-ok-drain",
+		VolumeDrainer: func(ctx context.Context, podUID string) error { called = true; return nil },
+	}
+
+	result, err := consistentFreezeImpl(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("ConsistentFreeze with a passing drain returned error: %v", err)
+	}
+	if !called {
+		t.Fatalf("VolumeDrainer was not invoked inside the freeze barrier")
+	}
+	if len(result.DumpResults) != 1 {
+		t.Fatalf("expected 1 DumpResult after a successful drain, got %d", len(result.DumpResults))
+	}
+}

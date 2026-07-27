@@ -33,6 +33,7 @@
 
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
+#include <linux/in.h>
 #include <linux/ip.h>
 #include <linux/udp.h>
 #include <linux/tcp.h>
@@ -122,19 +123,6 @@ static __always_inline __sum16 csum_diff32(__sum16 old_csum, __be32 old_val, __b
     return bpf_htons((__u16)~csum);
 }
 
-/*
- * csum_diff16: incremental checksum update for a 16-bit field change.
- */
-static __always_inline __sum16 csum_diff16(__sum16 old_csum, __be16 old_val, __be16 new_val)
-{
-    __u32 csum = (~bpf_ntohs(old_csum)) & 0xffff;
-    csum -= bpf_ntohs(old_val);
-    csum += bpf_ntohs(new_val);
-    csum = (csum >> 16) + (csum & 0xffff);
-    csum += (csum >> 16);
-    return bpf_htons((__u16)~csum);
-}
-
 /* ── VXLAN/UDP frame parsing ─────────────────────────────────────────────── */
 
 /*
@@ -146,24 +134,45 @@ static __always_inline __sum16 csum_diff16(__sum16 old_csum, __be16 old_val, __b
  *   [outer ETH] [outer IP] [UDP dport=4789] [VXLAN hdr 8B]
  *   [inner ETH] [inner IP] [inner TCP]
  */
-static __always_inline int parse_vxlan_inner_tcp(
+/*
+ * ADR-0403 D1 (load-corrected): __noinline, and returns byte OFFSETS from
+ * skb->data — NOT packet pointers.
+ *
+ * Two coupled reasons:
+ *  1. off=14 hoist: under __always_inline the LLVM BPF backend hoists the
+ *     guarded outer_ip->ihl read (:160) above its own bounds check (:154) and
+ *     CSE-merges it with the epilogue's duplicate read, producing off=14.
+ *     A BPF-to-BPF call keeps that read in the callee frame, guarded first.
+ *  2. But a __noinline callee CANNOT hand a packet pointer back to its caller:
+ *     a pkt pointer spilled into the caller frame is reloaded as an opaque
+ *     scalar, and the caller's first dereference rejects with
+ *     "R1 invalid mem access 'scalar'". Scalars survive the call boundary, so
+ *     the helper returns bounded offsets (inner IP, inner TCP, outer UDP) and
+ *     each caller re-derives the pointer from a fresh skb->data with its own
+ *     > data_end bounds check after a constant offset clamp (see PM_MAX_*_OFF).
+ * The epilogue outer-UDP re-derivation (below) uses out_outer_udp_off and no
+ * longer re-reads outer_ip->ihl — removing the duplicate read that fed the CSE
+ * merge. Both TC programs load-proven on kernel 6.8.0-136-generic; see
+ * docs/proof/PM-RELAY-CODEGEN-INVESTIGATION.md and ADR-0403 §P-VERIFY RESULTS.
+ */
+static __noinline int parse_vxlan_inner_tcp(
     struct __sk_buff *skb,
-    struct iphdr    **out_inner_ip,
-    struct tcphdr   **out_tcp,
-    void            **data_end)
+    __u32            *out_inner_ip_off,
+    __u32            *out_tcp_off,
+    __u32            *out_outer_udp_off)
 {
-    void *data = (void *)(long)skb->data;
-    *data_end  = (void *)(long)skb->data_end;
+    void *data     = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
 
     struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > *data_end)
+    if ((void *)(eth + 1) > data_end)
         return TC_ACT_OK;
 
     if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
         return TC_ACT_OK;
 
     struct iphdr *outer_ip = (void *)(eth + 1);
-    if ((void *)(outer_ip + 1) > *data_end)
+    if ((void *)(outer_ip + 1) > data_end)
         return TC_ACT_OK;
 
     if (outer_ip->protocol != IPPROTO_UDP)
@@ -171,7 +180,7 @@ static __always_inline int parse_vxlan_inner_tcp(
 
     __u32 outer_ip_hlen = outer_ip->ihl * 4;
     struct udphdr *udp = (void *)outer_ip + outer_ip_hlen;
-    if ((void *)(udp + 1) > *data_end)
+    if ((void *)(udp + 1) > data_end)
         return TC_ACT_OK;
 
     if (bpf_ntohs(udp->dest) != VXLAN_UDP_PORT)
@@ -180,14 +189,14 @@ static __always_inline int parse_vxlan_inner_tcp(
     /* Skip VXLAN header (8 bytes) + inner Ethernet header. */
     void *vxlan_inner_eth = (void *)(udp + 1) + VXLAN_HDR_LEN;
     struct ethhdr *inner_eth = vxlan_inner_eth;
-    if ((void *)(inner_eth + 1) > *data_end)
+    if ((void *)(inner_eth + 1) > data_end)
         return TC_ACT_OK;
 
     if (bpf_ntohs(inner_eth->h_proto) != ETH_P_IP)
         return TC_ACT_OK;
 
     struct iphdr *inner_ip = (void *)(inner_eth + 1);
-    if ((void *)(inner_ip + 1) > *data_end)
+    if ((void *)(inner_ip + 1) > data_end)
         return TC_ACT_OK;
 
     if (inner_ip->protocol != IPPROTO_TCP)
@@ -195,13 +204,22 @@ static __always_inline int parse_vxlan_inner_tcp(
 
     __u32 inner_ip_hlen = inner_ip->ihl * 4;
     struct tcphdr *tcp = (void *)inner_ip + inner_ip_hlen;
-    if ((void *)(tcp + 1) > *data_end)
+    if ((void *)(tcp + 1) > data_end)
         return TC_ACT_OK;
 
-    *out_inner_ip = inner_ip;
-    *out_tcp      = tcp;
+    *out_inner_ip_off  = (__u32)((__u8 *)inner_ip - (__u8 *)data);
+    *out_tcp_off       = (__u32)((__u8 *)tcp      - (__u8 *)data);
+    *out_outer_udp_off = (__u32)((__u8 *)udp      - (__u8 *)data);
     return 0;
 }
+
+/* Upper bounds (compile-time constants) for the offsets the parse helper returns,
+ * so each re-derived caller pointer carries a tight umax for the verifier. Outer
+ * IP ≤ 60, inner IP ≤ 60; the deepest header (inner TCP) sits at
+ * 14+60+8+8+14+60 = 164 < 192. */
+#define PM_MAX_INNER_IP_OFF  128u
+#define PM_MAX_TCP_OFF       192u
+#define PM_MAX_OUTER_UDP_OFF 80u
 
 /* ── TCP option rewriting ─────────────────────────────────────────────────── */
 
@@ -283,41 +301,59 @@ static __always_inline __u32 rewrite_tcp_options(
     __s32 sack_edge_delta = is_egress ? seq_delta : -seq_delta;
 
     __u32 csum_acc = 0; /* accumulated one's-complement partial sum */
-    __u32 i = 0;
+
+    /*
+     * ADR-0403 D2: cursor-POINTER scan (was integer-index scan). Advance a single
+     * packet pointer `cur`, and guard every read on the exact register it
+     * dereferences. The prior form re-materialized `opts + i` at each access from
+     * an integer `i` whose only re-narrowing was a lossy reg-vs-reg `i >= opts_len`
+     * compare plus a data_end compare on an accumulating value (`len` is an
+     * unbounded-above packet byte). The verifier could not carry the proven range
+     * across the separately re-derived read pointer and rejected at off=64 with the
+     * index scalar widened to [33..286]. Advancing a pointer keeps the accessible-
+     * range fact attached to the register that is read. All rewrite arithmetic
+     * below (ts_delta, sack_edge_delta, opt_csum_add32) is byte-for-byte identical
+     * to the index form; only the addressing changes. See
+     * docs/proof/PM-RELAY-CODEGEN-INVESTIGATION.md.
+     */
+    __u8 *cur      = opts;
+    __u8 *opts_end = opts + opts_len; /* logical end of options region */
 
 #pragma unroll
     for (int iter = 0; iter < 10; iter++) {
-        if (i >= opts_len)
+        /* kind byte — guard the exact cursor we read. */
+        if (cur + 1 > opts_end)
             break;
-        if ((__u8 *)opts + i + 1 > (__u8 *)data_end)
+        if (cur + 1 > (__u8 *)data_end)
             break;
 
-        __u8 kind = opts[i];
+        __u8 kind = cur[0];
         if (kind == TCPOPT_EOL)
             break;
         if (kind == TCPOPT_NOP) {
-            i++;
+            cur += 1;
             continue;
         }
 
-        if ((__u8 *)opts + i + 2 > (__u8 *)data_end)
+        /* length byte. */
+        if (cur + 2 > (__u8 *)data_end)
             break;
-        __u8 len = opts[i + 1];
+        __u8 len = cur[1];
         if (len < 2)
             break;
 
         if (kind == TCPOPT_TS && len == 10) {
-            if ((__u8 *)opts + i + 10 > (__u8 *)data_end)
+            if (cur + 10 > (__u8 *)data_end)
                 break;
             if (is_egress) {
                 /* TSval is at offset +2 within the option. */
-                __be32 *tsval = (__be32 *)(opts + i + 2);
+                __be32 *tsval = (__be32 *)(cur + 2);
                 __be32 old = *tsval;
                 *tsval = bpf_htonl(bpf_ntohl(old) + ts_delta);
                 csum_acc = opt_csum_add32(csum_acc, old, *tsval);
             } else {
                 /* TSecr is at offset +6 within the option. */
-                __be32 *tsecr = (__be32 *)(opts + i + 6);
+                __be32 *tsecr = (__be32 *)(cur + 6);
                 __be32 old = *tsecr;
                 *tsecr = bpf_htonl(bpf_ntohl(old) + ts_delta);
                 csum_acc = opt_csum_add32(csum_acc, old, *tsecr);
@@ -328,25 +364,27 @@ static __always_inline __u32 rewrite_tcp_options(
             __u8 num_blocks = (len - 2) / 8;
             if (num_blocks > 4)
                 num_blocks = 4;
+            __u8 *blk = cur + 2; /* first block; advanced by a POINTER below */
 #pragma unroll
             for (int b = 0; b < 4; b++) {
                 if (b >= num_blocks)
                     break;
-                __u32 off = i + 2 + b * 8;
-                if ((__u8 *)opts + off + 8 > (__u8 *)data_end)
+                /* Guard the exact block pointer we read (8 bytes: 2×__be32). */
+                if (blk + 8 > (__u8 *)data_end)
                     break;
-                __be32 *left  = (__be32 *)(opts + off);
-                __be32 *right = (__be32 *)(opts + off + 4);
+                __be32 *left  = (__be32 *)blk;
+                __be32 *right = (__be32 *)(blk + 4);
                 __be32 old_l = *left;
                 __be32 old_r = *right;
                 *left  = bpf_htonl(bpf_ntohl(old_l) + sack_edge_delta);
                 *right = bpf_htonl(bpf_ntohl(old_r) + sack_edge_delta);
                 csum_acc = opt_csum_add32(csum_acc, old_l, *left);
                 csum_acc = opt_csum_add32(csum_acc, old_r, *right);
+                blk += 8;
             }
         }
 
-        i += len;
+        cur += len;
     }
 
     return csum_acc;
@@ -363,11 +401,22 @@ static __always_inline __u32 rewrite_tcp_options(
 SEC("tc")
 int pm_relay_tc_egress(struct __sk_buff *skb)
 {
-    struct iphdr  *inner_ip;
-    struct tcphdr *tcp;
-    void          *data_end;
+    __u32 inner_ip_off = 0, tcp_off = 0, outer_udp_off = 0;
+    if (parse_vxlan_inner_tcp(skb, &inner_ip_off, &tcp_off, &outer_udp_off) != 0)
+        return TC_ACT_OK;
 
-    if (parse_vxlan_inner_tcp(skb, &inner_ip, &tcp, &data_end) != 0)
+    void *data     = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+
+    /* Re-derive inner IP / TCP from the helper's scalar offsets with fresh
+     * bounds checks (offsets survive the __noinline call; packet pointers do not). */
+    if (inner_ip_off > PM_MAX_INNER_IP_OFF || tcp_off > PM_MAX_TCP_OFF)
+        return TC_ACT_OK;
+    struct iphdr *inner_ip = data + inner_ip_off;
+    if ((void *)(inner_ip + 1) > data_end)
+        return TC_ACT_OK;
+    struct tcphdr *tcp = data + tcp_off;
+    if ((void *)(tcp + 1) > data_end)
         return TC_ACT_OK;
 
     struct four_tuple key = {
@@ -408,14 +457,14 @@ int pm_relay_tc_egress(struct __sk_buff *skb)
         }
     }
 
-    /* Zero outer UDP checksum (RFC 7348 §6 permits this for VXLAN-in-UDP). */
-    void *data = (void *)(long)skb->data;
-    struct ethhdr *eth = data;
-    struct iphdr *outer_ip = (void *)(eth + 1);
-    __u32 outer_ip_hlen = outer_ip->ihl * 4;
-    struct udphdr *udp = (void *)outer_ip + outer_ip_hlen;
-    if ((void *)(udp + 1) <= data_end)
-        udp->check = 0;
+    /* Zero outer UDP checksum (RFC 7348 §6 permits this for VXLAN-in-UDP).
+     * Re-derive the outer UDP header from the helper's offset; no re-read of
+     * outer_ip->ihl here (that duplicate read is what CSE-merged and hoisted). */
+    if (outer_udp_off <= PM_MAX_OUTER_UDP_OFF) {
+        struct udphdr *udp = data + outer_udp_off;
+        if ((void *)(udp + 1) <= data_end)
+            udp->check = 0;
+    }
 
     return TC_ACT_OK;
 }
@@ -430,11 +479,22 @@ int pm_relay_tc_egress(struct __sk_buff *skb)
 SEC("tc")
 int pm_relay_tc_ingress(struct __sk_buff *skb)
 {
-    struct iphdr  *inner_ip;
-    struct tcphdr *tcp;
-    void          *data_end;
+    __u32 inner_ip_off = 0, tcp_off = 0, outer_udp_off = 0;
+    if (parse_vxlan_inner_tcp(skb, &inner_ip_off, &tcp_off, &outer_udp_off) != 0)
+        return TC_ACT_OK;
 
-    if (parse_vxlan_inner_tcp(skb, &inner_ip, &tcp, &data_end) != 0)
+    void *data     = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+
+    /* Re-derive inner IP / TCP from the helper's scalar offsets with fresh
+     * bounds checks (offsets survive the __noinline call; packet pointers do not). */
+    if (inner_ip_off > PM_MAX_INNER_IP_OFF || tcp_off > PM_MAX_TCP_OFF)
+        return TC_ACT_OK;
+    struct iphdr *inner_ip = data + inner_ip_off;
+    if ((void *)(inner_ip + 1) > data_end)
+        return TC_ACT_OK;
+    struct tcphdr *tcp = data + tcp_off;
+    if ((void *)(tcp + 1) > data_end)
         return TC_ACT_OK;
 
     /* Ingress: swap src/dst to look up the local-side entry. */
@@ -476,14 +536,12 @@ int pm_relay_tc_ingress(struct __sk_buff *skb)
         }
     }
 
-    /* Zero outer UDP checksum. */
-    void *data = (void *)(long)skb->data;
-    struct ethhdr *eth = data;
-    struct iphdr *outer_ip = (void *)(eth + 1);
-    __u32 outer_ip_hlen = outer_ip->ihl * 4;
-    struct udphdr *udp = (void *)outer_ip + outer_ip_hlen;
-    if ((void *)(udp + 1) <= data_end)
-        udp->check = 0;
+    /* Zero outer UDP checksum. Re-derive from the helper's offset. */
+    if (outer_udp_off <= PM_MAX_OUTER_UDP_OFF) {
+        struct udphdr *udp = data + outer_udp_off;
+        if ((void *)(udp + 1) <= data_end)
+            udp->check = 0;
+    }
 
     return TC_ACT_OK;
 }

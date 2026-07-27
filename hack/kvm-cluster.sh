@@ -217,6 +217,20 @@ RKE2_CNI_CONF_DIR="${RKE2_CNI_CONF_DIR:-}"                                      
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# ── Demo/test apps wired into the standard deploy flow ──────────────────────
+# podmotion-demo (C&C/observability portal) and migration-demo-stack
+# (nginx/redis/postgres test workload) each live in their own sibling
+# checkout next to this repo, not inside it — same "../podmotion-demo"
+# sibling convention hack/quickstart-kvm.sh already uses. Override either path
+# if your checkouts live somewhere else. Namespaces are independent of
+# podmotion-system: both apps are deployed as their OWN standalone Helm
+# releases (see cmd_deploy_podmotion_demo's header comment for why, re:
+# podmotion-demo's cluster-scoped RBAC objects and the subchart path).
+PODMOTION_DEMO_REPO="${PODMOTION_DEMO_REPO:-$(dirname "$REPO_ROOT")/podmotion-demo}"
+MIGRATION_DEMO_REPO="${MIGRATION_DEMO_REPO:-$(dirname "$REPO_ROOT")/podmotion-migration-demo-app}"
+PODMOTION_DEMO_NAMESPACE="${PODMOTION_DEMO_NAMESPACE:-podmotion-demo}"
+MIGRATION_DEMO_NAMESPACE="${MIGRATION_DEMO_NAMESPACE:-migration-demo}"
+
 # ── IP discovery (DHCP — never hardcode) ─────────────────────────────────────
 # Prefer hosts.env (CP1=/W1=/W2=); fall back to virsh net-dhcp-leases default.
 load_ips() {
@@ -239,6 +253,44 @@ nsh() {   # node ssh: nsh <ip> "<cmd>"
   local ip="$1"; shift
   ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       -o ConnectTimeout=5 -o LogLevel=ERROR "$SSH_USER@$ip" "$@"
+}
+
+# ── containerd-socket detection primitive (confirmed live 2026-07-22) ───────
+# Every `ctr -n k8s.io ...` call in this script MUST target the socket the
+# node's actual kubelet reads images from — NOT `ctr`'s compiled-in default
+# (/run/containerd/containerd.sock, the plain SYSTEM containerd every Ubuntu
+# 24.04 base image ships alongside a distro's own embedded one). Confirmed
+# live this round against the standing cluster: it is actually running RKE2
+# (v1.35.6+rke2r1), not vanilla kubeadm, and RKE2's kubelet is launched with
+# --containerd=/run/k3s/containerd/containerd.sock — a plain `ctr images
+# import` (no -a flag) lands the image on the WRONG (system) containerd,
+# where kubelet never looks: `ctr -n k8s.io images ls` on the SYSTEM socket
+# falsely shows the image present, while the kubelet reports "pull access
+# denied" / ErrImageNeverPull trying to actually run it.
+#
+# Rather than infer which socket is right from which reset-cluster-* command
+# was last run (a brittle chain — the caller can forget, exactly what
+# happened here) or require CONTAINERD_ADDRESS to be set by hand every time,
+# ask the node directly: RKE2 and k3s share the identical embedded-containerd
+# socket path (both are Rancher's own packaging — see the RKE2_CONTAINERD_SOCKET
+# comment above), so testing for that one socket file's existence on the node
+# is a real, general primitive that covers both distros without hardcoding
+# which one is active. An explicit CONTAINERD_ADDRESS override always wins
+# (e.g. for a distro/layout this detection doesn't yet know about); the
+# kubeadm path (no k3s/RKE2 socket present) is unaffected — ctr_addr_flag
+# comes back empty and `ctr` keeps using its own compiled-in default, exactly
+# the pre-existing behavior.
+detect_ctr_addr_flag() {   # detect_ctr_addr_flag <ip>
+  local ip="$1"
+  if [[ -n "${CONTAINERD_ADDRESS:-}" ]]; then
+    echo "-a $CONTAINERD_ADDRESS"
+    return
+  fi
+  if nsh "$ip" "sudo test -S $RKE2_CONTAINERD_SOCKET" 2>/dev/null; then
+    echo "-a $RKE2_CONTAINERD_SOCKET"
+  else
+    echo ""
+  fi
 }
 
 # ── Safety guard: never destroy/undefine a pm-* VM ───────────────────────────
@@ -669,7 +721,13 @@ token: $rke2_token"
   echo "    RKE2 containerd socket:  $RKE2_CONTAINERD_SOCKET (confirmed live against pm-cp1/pm-w1/pm-w2)"
   echo "    RKE2 containerd state:   $RKE2_CONTAINERD_STATE_DIR (confirmed live — same run root as socket)"
   echo "    RKE2 CNI conf dir:       canonical /etc/cni/net.d — no extraConfDir override needed (confirmed live)"
-  echo "    Deploy PodMotion against this cluster with:"
+  echo "    ADR-0370: the agent now self-discovers the authoritative containerd socket at"
+  echo "    startup — CONTAINERD_ADDRESS (this script's own ctr calls) is still required, but"
+  echo "    AGENT_CONTAINERD_SOCKET_PATH/AGENT_CONTAINERD_STATE_DIR are now OPTIONAL explicit"
+  echo "    overrides, not a required workaround. Plain deploy (self-discovering agent):"
+  echo "      CONTAINERD_ADDRESS=$RKE2_CONTAINERD_SOCKET \\"
+  echo "      TAG=<tag> bash hack/kvm-cluster.sh deploy-podmotion"
+  echo "    Forcing an explicit agent-side override instead of self-discovery:"
   echo "      CONTAINERD_ADDRESS=$RKE2_CONTAINERD_SOCKET \\"
   echo "      AGENT_CONTAINERD_SOCKET_PATH=$RKE2_CONTAINERD_SOCKET \\"
   echo "      AGENT_CONTAINERD_STATE_DIR=$RKE2_CONTAINERD_STATE_DIR \\"
@@ -684,11 +742,13 @@ cmd_deploy_podmotion() {
   # you intend to test" — a stale/wrong-branch image tag can silently keep serving traffic
   # indefinitely. This is now a structural build/deploy identity contract, not a one-off check.
   local allow_dirty=0
+  local skip_demo_apps=0
   local arg
   for arg in "$@"; do
     case "$arg" in
       --allow-dirty) allow_dirty=1 ;;
-      *) echo "ERROR: deploy-podmotion: unrecognized argument '$arg' (only --allow-dirty is accepted)" >&2; exit 2 ;;
+      --skip-demo-apps) skip_demo_apps=1 ;;
+      *) echo "ERROR: deploy-podmotion: unrecognized argument '$arg' (only --allow-dirty/--skip-demo-apps are accepted)" >&2; exit 2 ;;
     esac
   done
 
@@ -699,6 +759,15 @@ cmd_deploy_podmotion() {
   local TAG="${TAG:-kvm-dev}"
   local OP_IMG="podmotion-operator:$TAG"
   local AGENT_IMG="podmotion-agent:$TAG"
+  # ADR-0363/0364 Part B2 follow-up: the podmotion-scheduler Deployment
+  # (charts/podmotion/templates/scheduler-deployment.yaml) has been rendered
+  # since scheduler.enabled defaults true, but until now nothing in this
+  # function pointed it at a locally-built image the way operator/agent are —
+  # it fell through to the chart default (ghcr.io/podmotion/podmotion-scheduler:latest,
+  # values.yaml scheduler.image.*), a remote image that does not exist, giving
+  # ImagePullBackOff/403 on every deploy. Build/import/override it exactly like
+  # operator and agent below.
+  local SCHEDULER_IMG="podmotion-scheduler:$TAG"
 
   # ── §2.1 build-time provenance ───────────────────────────────────────────────
   # Compute the revision from the WORKTREE ACTUALLY BEING BUILT (this script's own repo
@@ -728,7 +797,7 @@ cmd_deploy_podmotion() {
   # this is the most likely mechanism by which a tag silently keeps pointing at stale content
   # across branches (a same-tag re-deploy from a different branch/checkout than intended).
   local existing_rev img
-  for img in "$OP_IMG" "$AGENT_IMG"; do
+  for img in "$OP_IMG" "$AGENT_IMG" "$SCHEDULER_IMG"; do
     if docker image inspect "$img" >/dev/null 2>&1; then
       existing_rev="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$img" 2>/dev/null || echo "")"
       if [[ -n "$existing_rev" && "$existing_rev" != "$GIT_SHA" ]]; then
@@ -738,28 +807,57 @@ cmd_deploy_podmotion() {
       fi
     fi
   done
-  # sprint50 (k3s compat, plan §1 Q2 item 1): this script's own `ctr` calls below
-  # (image rm/import/ls, distinct from the agent's own ctr invocations — see
-  # internal/agent/server/containerd_paths.go) fall back to ctr's compiled-in
-  # default socket (/run/containerd/containerd.sock) when no address is given,
-  # which is wrong on a k3s node. Set CONTAINERD_ADDRESS (e.g. to
-  # $K3S_CONTAINERD_SOCKET after a reset-cluster-k3s run) to target the right
-  # socket; empty (the kubeadm-path default) leaves ctr's own default in effect,
-  # unchanged from before this sprint.
-  local CONTAINERD_ADDRESS="${CONTAINERD_ADDRESS:-}"
-  local ctr_addr_flag=""
-  if [[ -n "$CONTAINERD_ADDRESS" ]]; then
-    ctr_addr_flag="-a $CONTAINERD_ADDRESS"
+  # sprint50 (k3s compat, plan §1 Q2 item 1) / ADR-0325-remediation (RKE2, 2026-07-22):
+  # this script's own `ctr` calls below (image rm/import/ls, distinct from the
+  # agent's own ctr invocations — see internal/agent/server/containerd_paths.go)
+  # fall back to ctr's compiled-in default socket (/run/containerd/containerd.sock)
+  # when no address is given, which is wrong on a k3s/RKE2 node — see
+  # detect_ctr_addr_flag above. Confirmed live 2026-07-22: relying on a caller
+  # to remember to export CONTAINERD_ADDRESS by hand is exactly the omission
+  # that caused a prior deploy to import operator/agent images onto the wrong
+  # (system) containerd, where kubelet never looks. Detect it from the node
+  # itself instead (still overridable via CONTAINERD_ADDRESS for a layout this
+  # detection doesn't know about); on a plain kubeadm node this comes back
+  # empty and ctr keeps using its own default, unchanged from before.
+  local ctr_addr_flag
+  ctr_addr_flag="$(detect_ctr_addr_flag "$CP1_IP")"
+  if [[ -n "$ctr_addr_flag" ]]; then
+    echo "  -- detected non-default containerd socket for ctr calls: $ctr_addr_flag"
   fi
   # AGENT_CONTAINERD_SOCKET_PATH / AGENT_CONTAINERD_STATE_DIR: passed straight
-  # through to the Helm chart's agent.containerd.* values (the containerd-socket
-  # hostPath mount + the agent's env-driven path roots — see
-  # charts/podmotion/values.yaml and internal/agent/server/containerd_paths.go).
-  # Default to the same standard-containerd paths the chart itself defaults to,
-  # so a plain kubeadm deploy-podmotion call is byte-identical to before this
-  # sprint; a k3s deploy sets both (reset-cluster-k3s prints the exact values).
+  # through to the Helm chart's agent.containerd.socketPath/stateDir values (the
+  # containerd-socket + host-var-lib-containerd hostPath VOLUME MOUNTS only —
+  # see charts/podmotion/values.yaml). Default to the same standard-containerd
+  # paths the chart itself defaults to, so a plain kubeadm deploy-podmotion call
+  # is byte-identical to before this sprint.
+  #
+  # ADR-0370: these two no longer drive the agent's OWN idea of which containerd
+  # is authoritative — the agent self-discovers that empirically at startup
+  # (internal/agent/server/containerd_discovery.go), fixing exactly the failure
+  # mode this script used to require an operator to remember to work around (a
+  # deploy-podmotion call that forgot to export AGENT_CONTAINERD_SOCKET_PATH
+  # silently wired the agent to the wrong containerd on RKE2/k3s — 100% of
+  # restores failed, never loudly). AGENT_CONTAINERD_SOCKET_PATH_WAS_SET /
+  # AGENT_CONTAINERD_STATE_DIR_WAS_SET below capture whether the CALLER actually
+  # exported an override BEFORE the default fills in below, so the Helm
+  # `agent.containerd.override.*` fields (the explicit-override signal
+  # discoverContainerdSocket treats as "tried first and exclusively") are only
+  # populated when an operator genuinely asked for one — never a byte-for-byte
+  # copy of these mount-path values, which would otherwise silently defeat
+  # self-discovery on every deploy (mount paths are always non-empty).
+  local AGENT_CONTAINERD_SOCKET_PATH_WAS_SET=0
+  local AGENT_CONTAINERD_STATE_DIR_WAS_SET=0
+  [[ -n "${AGENT_CONTAINERD_SOCKET_PATH:-}" ]] && AGENT_CONTAINERD_SOCKET_PATH_WAS_SET=1
+  [[ -n "${AGENT_CONTAINERD_STATE_DIR:-}" ]] && AGENT_CONTAINERD_STATE_DIR_WAS_SET=1
   local AGENT_CONTAINERD_SOCKET_PATH="${AGENT_CONTAINERD_SOCKET_PATH:-/run/containerd/containerd.sock}"
   local AGENT_CONTAINERD_STATE_DIR="${AGENT_CONTAINERD_STATE_DIR:-/var/lib/containerd}"
+  local -a AGENT_CONTAINERD_OVERRIDE_SET_ARGS=()
+  if [[ "$AGENT_CONTAINERD_SOCKET_PATH_WAS_SET" -eq 1 ]]; then
+    AGENT_CONTAINERD_OVERRIDE_SET_ARGS+=(--set "agent.containerd.override.socket=$AGENT_CONTAINERD_SOCKET_PATH")
+  fi
+  if [[ "$AGENT_CONTAINERD_STATE_DIR_WAS_SET" -eq 1 ]]; then
+    AGENT_CONTAINERD_OVERRIDE_SET_ARGS+=(--set "agent.containerd.override.stateRoot=$AGENT_CONTAINERD_STATE_DIR")
+  fi
   # AGENT_CNI_EXTRA_CONF_DIR: passed through to agent.cni.extraConfDir (Helm chart
   # values.yaml / daemonset.yaml host-cni-conf-extra mount). Some distros do not
   # populate the canonical /etc/cni/net.d that nmcregistrar.detectCNI() scans by
@@ -772,12 +870,13 @@ cmd_deploy_podmotion() {
   echo "==> Building binaries (make build-linux)..."
   make build-linux   # emits bin/{manager,agent,criu-wrapper}-linux-amd64 (auto-renamed)
 
-  echo "==> Building operator + agent images..."
+  echo "==> Building operator + agent + scheduler images..."
   # Stamp images with the git commit they were built from (computed once, above, as the
   # §2.1 provenance gate's GIT_SHA — includes the "-dirty" suffix under --allow-dirty) so
   # deployed images can be verified against source provenance.
-  docker build --build-arg GIT_SHA="$GIT_SHA" -f images/operator/Dockerfile -t "$OP_IMG" .
-  docker build --build-arg GIT_SHA="$GIT_SHA" -f images/agent/Dockerfile   -t "$AGENT_IMG" .
+  docker build --build-arg GIT_SHA="$GIT_SHA" -f images/operator/Dockerfile  -t "$OP_IMG" .
+  docker build --build-arg GIT_SHA="$GIT_SHA" -f images/agent/Dockerfile    -t "$AGENT_IMG" .
+  docker build --build-arg GIT_SHA="$GIT_SHA" -f images/scheduler/Dockerfile -t "$SCHEDULER_IMG" .
 
   echo "==> Importing images into each node's k8s.io containerd namespace (no registry)..."
   # NOTE: CRIU 4.2 is already installed at /usr/sbin/criu on every node, and the
@@ -811,9 +910,10 @@ cmd_deploy_podmotion() {
     # running despite a clean deploy + rollout restart). Remove the tag first
     # so there is no ambiguity about overwrite semantics — the import that
     # follows is then the ONLY thing that can make the tag resolve.
-    nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images rm '$OP_IMG' '$AGENT_IMG' >/dev/null 2>&1 || true"
-    docker save "$OP_IMG"    | nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images import -"
-    docker save "$AGENT_IMG" | nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images import -"
+    nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images rm '$OP_IMG' '$AGENT_IMG' '$SCHEDULER_IMG' >/dev/null 2>&1 || true"
+    docker save "$OP_IMG"        | nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images import -"
+    docker save "$AGENT_IMG"     | nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images import -"
+    docker save "$SCHEDULER_IMG" | nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images import -"
     # Verify each tag actually landed in this node's k8s.io namespace.
     if ! nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images ls -q | grep -q ':$TAG'"; then
       echo "ERROR: image tag ':$TAG' not present in k8s.io containerd namespace on node $ip after import." >&2
@@ -836,14 +936,16 @@ cmd_deploy_podmotion() {
     --namespace podmotion-system --create-namespace \
     --set operator.image.repository=podmotion-operator --set operator.image.tag="$TAG" --set operator.image.pullPolicy=IfNotPresent \
     --set agent.image.repository=podmotion-agent --set agent.image.tag="$TAG" --set agent.image.pullPolicy=IfNotPresent \
+    --set scheduler.image.repository=podmotion-scheduler --set scheduler.image.tag="$TAG" --set scheduler.image.pullPolicy=IfNotPresent \
     --set operator.replicas=1 \
     --set webhook.certManager.enabled=false \
-    --set scheduler.enabled=false \
-    --set webhook.podMutation.enabled=false \
+    --set scheduler.enabled=true \
+    --set webhook.podMutation.enabled=true \
     --set installCRDs=false \
     --set operator.featureGates="TCPPreservation=true" \
     --set agent.containerd.socketPath="$AGENT_CONTAINERD_SOCKET_PATH" \
     --set agent.containerd.stateDir="$AGENT_CONTAINERD_STATE_DIR" \
+    "${AGENT_CONTAINERD_OVERRIDE_SET_ARGS[@]}" \
     ${AGENT_CNI_EXTRA_CONF_DIR:+--set agent.cni.extraConfDir="$AGENT_CNI_EXTRA_CONF_DIR"}
 
   # A re-deploy within the same sprint reuses the same $TAG (see the image
@@ -855,11 +957,12 @@ cmd_deploy_podmotion() {
   # produce fresh pods, not just a "diff detected" one (confirmed live
   # 2026-07-14 as the root cause of a stale-binary false-negative gate).
   echo "==> Forcing rollout restart (same-tag deploys are otherwise a silent no-op)..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system rollout restart deploy/podmotion-operator ds/podmotion-agent
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system rollout restart deploy/podmotion-operator ds/podmotion-agent deploy/podmotion-scheduler
 
   echo "==> Waiting for rollout (failure/timeout is a real error, not swallowed)..."
   KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system rollout status deploy/podmotion-operator --timeout=180s
   KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system rollout status ds/podmotion-agent --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system rollout status deploy/podmotion-scheduler --timeout=180s
 
   # ── §2.2 deploy-time provenance ──────────────────────────────────────────────
   # Make provenance queryable from the cluster itself, not just from whoever ran the deploy:
@@ -871,10 +974,13 @@ cmd_deploy_podmotion() {
     "podmotion.io/deployed-revision=$GIT_SHA" "podmotion.io/deployed-branch=$GIT_BRANCH" --overwrite
   KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system annotate ds/podmotion-agent \
     "podmotion.io/deployed-revision=$GIT_SHA" "podmotion.io/deployed-branch=$GIT_BRANCH" --overwrite
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system annotate deploy/podmotion-scheduler \
+    "podmotion.io/deployed-revision=$GIT_SHA" "podmotion.io/deployed-branch=$GIT_BRANCH" --overwrite
 
-  local op_digest agent_digest
+  local op_digest agent_digest scheduler_digest
   op_digest="$(docker image inspect --format '{{.Id}}' "$OP_IMG" 2>/dev/null || echo unknown)"
   agent_digest="$(docker image inspect --format '{{.Id}}' "$AGENT_IMG" 2>/dev/null || echo unknown)"
+  scheduler_digest="$(docker image inspect --format '{{.Id}}' "$SCHEDULER_IMG" 2>/dev/null || echo unknown)"
   local manifest_out="$KVM_DIR/deploy-manifest.json"
   cat > "$manifest_out" <<EOF
 {
@@ -886,12 +992,245 @@ cmd_deploy_podmotion() {
   "operator_image_digest": "$op_digest",
   "agent_image": "$AGENT_IMG",
   "agent_image_digest": "$agent_digest",
+  "scheduler_image": "$SCHEDULER_IMG",
+  "scheduler_image_digest": "$scheduler_digest",
   "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
   echo "==> Wrote deploy provenance manifest: $manifest_out"
 
+  if [[ "$skip_demo_apps" -eq 1 ]]; then
+    echo "==> Skipping demo/test app deploy (--skip-demo-apps)."
+  else
+    echo "==> Deploying demo/test apps (podmotion-demo + migration-demo-stack)..."
+    cmd_deploy_demo_apps "$TAG"
+  fi
+
   echo "==> deploy-podmotion complete."
+}
+
+# ── deploy-podmotion-demo: podmotion-demo C&C/observability portal ──────────
+# Wired into the standard flow (cmd_deploy_podmotion calls cmd_deploy_demo_apps,
+# which calls this) and independently dispatchable as its own subcommand for a
+# faster iteration loop while only the demo app itself is changing.
+#
+# DEVIATION FROM THE ORIGINAL "podmotion-demo as a Helm subchart of the
+# podmotion release" plan: charts/podmotion/Chart.yaml lists podmotion-demo as
+# a file:// dependency specifically so it CAN ride the same release/namespace
+# as the operator (`--set podmotion-demo.enabled=true` on the main `helm
+# upgrade --install podmotion ...`) — that is what hack/quickstart-kvm.sh and
+# terraform/kubeadm-ec2-quickstart/bootstrap.sh both do, and was this task's
+# starting plan. But charts/podmotion-demo/templates/clusterrole.yaml +
+# clusterrolebinding.yaml are CLUSTER-SCOPED and NOT release-name-templated
+# (literal names "podmotion-demo-api-role" / "podmotion-demo-api-rolebinding").
+# CONFIRMED LIVE against the standing cluster this round: it already has a
+# STANDALONE "podmotion-demo" Helm release (namespace podmotion-demo) from
+# prior manual testing that owns those two cluster-scoped objects, and Helm
+# refuses to let a second release (the subchart path runs under the
+# "podmotion" release) take them over:
+#   Error: UPGRADE FAILED: Unable to continue with update: ClusterRole
+#   "podmotion-demo-api-role" in namespace "" exists and cannot be imported
+#   into the current release: invalid ownership metadata; annotation
+#   validation error: key "meta.helm.sh/release-name" must equal "podmotion":
+#   current value is "podmotion-demo"; ... release-namespace ... current
+#   value is "podmotion-demo" ...
+# Forcing ownership away from that release risks disrupting whatever is
+# already using it — possibly the exact live test-orchestration entry point
+# CLAUDE.md rule 15 routes through — and is not a call this script gets to
+# make unilaterally. charts/podmotion-demo/values.yaml's own header already
+# documents standalone installation as a first-class supported mode ("It can
+# also be installed standalone"), so that is what this function does: deploy
+# it as its OWN release, in its OWN namespace — idempotent (helm
+# upgrade --install on the same release name converges, does not duplicate),
+# non-destructive, zero ownership conflict with what is already live, and it
+# still satisfies "deploys automatically alongside core PodMotion."
+cmd_deploy_podmotion_demo() {
+  load_ips
+  local TAG="${1:-${TAG:-kvm-dev}}"
+  local WEB_IMG="podmotion-demo-web:$TAG"
+  local API_IMG="podmotion-demo-api:$TAG"
+
+  if [[ ! -d "$PODMOTION_DEMO_REPO" ]]; then
+    echo "ERROR: deploy-podmotion-demo: podmotion-demo checkout not found at $PODMOTION_DEMO_REPO (override with PODMOTION_DEMO_REPO=<path>)." >&2
+    exit 1
+  fi
+  local f
+  for f in deploy/Dockerfile.backend deploy/Dockerfile.frontend; do
+    if [[ ! -e "$PODMOTION_DEMO_REPO/$f" ]]; then
+      echo "ERROR: deploy-podmotion-demo: $PODMOTION_DEMO_REPO is missing '$f'." >&2
+      exit 1
+    fi
+  done
+
+  local ctr_addr_flag
+  ctr_addr_flag="$(detect_ctr_addr_flag "$CP1_IP")"
+
+  echo "==> [podmotion-demo] Building web+api images from $PODMOTION_DEMO_REPO (TAG=$TAG)..."
+  ( cd "$PODMOTION_DEMO_REPO" && \
+    docker build -f deploy/Dockerfile.backend  -t "$API_IMG" . && \
+    docker build -f deploy/Dockerfile.frontend -t "$WEB_IMG" . )
+
+  echo "==> [podmotion-demo] Importing images into each node's k8s.io containerd namespace (no registry)..."
+  local ip
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    echo "  -- import into $ip"
+    # Same remove-before-import discipline as deploy-podmotion's own image
+    # loop (a same-tag re-import's overwrite semantics are unverified on this
+    # containerd version — see that loop's comment).
+    nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images rm '$API_IMG' '$WEB_IMG' >/dev/null 2>&1 || true"
+    docker save "$API_IMG" | nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images import -"
+    docker save "$WEB_IMG" | nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images import -"
+    if ! nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images ls -q | grep -q ':$TAG'"; then
+      echo "ERROR: deploy-podmotion-demo: image tag ':$TAG' not present in k8s.io containerd namespace on node $ip after import." >&2
+      exit 1
+    fi
+  done
+
+  echo "==> [podmotion-demo] Helm upgrade --install (standalone release, namespace $PODMOTION_DEMO_NAMESPACE)..."
+  KUBECONFIG="$KUBECONFIG_OUT" helm upgrade --install podmotion-demo charts/podmotion-demo \
+    --namespace "$PODMOTION_DEMO_NAMESPACE" --create-namespace \
+    --set enabled=true \
+    --set web.image.repository=podmotion-demo-web --set web.image.tag="$TAG" --set web.image.pullPolicy=IfNotPresent \
+    --set api.image.repository=podmotion-demo-api --set api.image.tag="$TAG" --set api.image.pullPolicy=IfNotPresent \
+    --set api.podmotionNamespace=podmotion-system
+
+  # Same same-tag-is-otherwise-a-silent-no-op reasoning as deploy-podmotion's
+  # own forced restart — scoped to web+api only (the two images this function
+  # actually rebuilds every call); postgres/redis/jaeger use fixed upstream
+  # tags and don't need churning on every re-run.
+  echo "==> [podmotion-demo] Forcing rollout restart of web+api (same-tag deploys are otherwise a silent no-op)..."
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$PODMOTION_DEMO_NAMESPACE" rollout restart deploy/podmotion-demo-web deploy/podmotion-demo-api
+
+  echo "==> [podmotion-demo] Waiting for rollout (failure/timeout is a real error, not swallowed)..."
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$PODMOTION_DEMO_NAMESPACE" rollout status deploy/podmotion-demo-web --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$PODMOTION_DEMO_NAMESPACE" rollout status deploy/podmotion-demo-api --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$PODMOTION_DEMO_NAMESPACE" rollout status deploy/podmotion-demo-postgres --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$PODMOTION_DEMO_NAMESPACE" rollout status deploy/podmotion-demo-redis --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$PODMOTION_DEMO_NAMESPACE" rollout status deploy/podmotion-demo-jaeger --timeout=180s
+
+  # ── Local access: always via the idempotent helper, never a hand-typed
+  # `kubectl port-forward` ────────────────────────────────────────────────
+  # Recurring bug (podmotion/docs/proof/SESSION-HANDOFF-2026-07-24.md §5, hit
+  # at least 3 times in one session): a manually-typed port-forward after this
+  # function returns has repeatedly ended up pointed at svc/podmotion-demo-api
+  # (backend only, 404s on "/") instead of svc/podmotion-demo-web (the
+  # frontend, which also reverse-proxies /api/* — the only correct target for
+  # localhost:8080). deploy/port-forward-web.sh in the podmotion-demo repo
+  # removes that decision entirely: it hardcodes svc/podmotion-demo-web,
+  # kills any existing forward pointed at either service (matched on the
+  # actual service name + namespace in argv, not on the bare port number, so
+  # a stale wrong-target forward can't survive undetected), and verifies with
+  # a real curl that the portal's HTML comes back before it returns.
+  if [[ -x "$PODMOTION_DEMO_REPO/deploy/port-forward-web.sh" ]]; then
+    echo "==> [podmotion-demo] Setting up localhost:8080 -> svc/podmotion-demo-web via deploy/port-forward-web.sh..."
+    NAMESPACE="$PODMOTION_DEMO_NAMESPACE" KUBECONFIG="$KUBECONFIG_OUT" \
+      "$PODMOTION_DEMO_REPO/deploy/port-forward-web.sh"
+  else
+    echo "==> [podmotion-demo] Ready. Access:"
+    echo "      WARNING: deploy/port-forward-web.sh not found at $PODMOTION_DEMO_REPO/deploy/ — falling back to the raw command."
+    echo "      Do NOT substitute svc/podmotion-demo-api here — that Service has no '/' route and 404s (see SESSION-HANDOFF-2026-07-24.md §5)."
+    echo "      kubectl port-forward -n $PODMOTION_DEMO_NAMESPACE svc/podmotion-demo-web 8080:80   # portal -> http://localhost:8080"
+  fi
+  echo "      Jaeger UI is NodePort-reachable directly, no port-forward needed: http://<any-node-ip>:30686"
+}
+
+# ── deploy-migration-demo-stack: nginx/redis/postgres test workload ─────────
+# Standalone chart living in the sibling podmotion-migration-demo-app repo
+# (charts/migration-demo-stack/Chart.yaml is explicit: "NOT the podmotion-demo
+# control portal and NOT part of the governed PodMotion operator datapath" —
+# there is no subchart relationship to this repo's own charts/podmotion/ to
+# preserve, unlike podmotion-demo). Deployed as its own release + namespace,
+# matching what is already live on this cluster from prior manual testing.
+#
+# postgres has a REAL PVC (charts/migration-demo-stack/templates/pvc-postgres.yaml,
+# 5Gi hard cap) with no explicit storageClassName set by default
+# (values.yaml: storageClassName: "" -> cluster default StorageClass) — hard
+# fail before building or deploying anything if no default StorageClass
+# exists, rather than let the PVC hang Pending silently (zero-tech-debt: this
+# must be a real, visible error). Run 'provision-longhorn' first, or set
+# MIGRATION_DEMO_STORAGE_CLASS to an explicit StorageClass name to bypass the
+# "must be cluster-default" requirement entirely.
+cmd_deploy_migration_demo() {
+  load_ips
+  local TAG="${1:-${TAG:-kvm-dev}}"
+  local WEB_IMG="migration-demo-web:$TAG"
+  local BACKEND_IMG="migration-demo-backend:$TAG"
+
+  if [[ ! -d "$MIGRATION_DEMO_REPO" ]]; then
+    echo "ERROR: deploy-migration-demo-stack: checkout not found at $MIGRATION_DEMO_REPO (override with MIGRATION_DEMO_REPO=<path>)." >&2
+    exit 1
+  fi
+  local f
+  for f in deploy/Dockerfile.backend deploy/Dockerfile.web charts/migration-demo-stack/Chart.yaml; do
+    if [[ ! -e "$MIGRATION_DEMO_REPO/$f" ]]; then
+      echo "ERROR: deploy-migration-demo-stack: $MIGRATION_DEMO_REPO is missing '$f'." >&2
+      exit 1
+    fi
+  done
+
+  if [[ -z "${MIGRATION_DEMO_STORAGE_CLASS:-}" ]]; then
+    local default_sc
+    default_sc="$(KUBECONFIG="$KUBECONFIG_OUT" kubectl get storageclass \
+      -o jsonpath='{.items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")].metadata.name}' 2>/dev/null || true)"
+    if [[ -z "$default_sc" ]]; then
+      echo "ERROR: deploy-migration-demo-stack: no default StorageClass found in the cluster — migration-demo-stack's postgres PVC (values.yaml storageClassName: \"\") needs one to bind, and would otherwise hang Pending silently." >&2
+      echo "       Run 'bash hack/kvm-cluster.sh provision-longhorn' first, or set MIGRATION_DEMO_STORAGE_CLASS=<name> to target an explicit StorageClass." >&2
+      exit 1
+    fi
+    echo "  -- default StorageClass present: $default_sc"
+  fi
+
+  local ctr_addr_flag
+  ctr_addr_flag="$(detect_ctr_addr_flag "$CP1_IP")"
+
+  echo "==> [migration-demo-stack] Building web(nginx)+backend images from $MIGRATION_DEMO_REPO (TAG=$TAG)..."
+  ( cd "$MIGRATION_DEMO_REPO" && \
+    docker build -f deploy/Dockerfile.backend -t "$BACKEND_IMG" . && \
+    docker build -f deploy/Dockerfile.web      -t "$WEB_IMG" . )
+
+  echo "==> [migration-demo-stack] Importing images into each node's k8s.io containerd namespace (no registry)..."
+  local ip
+  for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
+    echo "  -- import into $ip"
+    nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images rm '$BACKEND_IMG' '$WEB_IMG' >/dev/null 2>&1 || true"
+    docker save "$BACKEND_IMG" | nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images import -"
+    docker save "$WEB_IMG"     | nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images import -"
+    if ! nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images ls -q | grep -q ':$TAG'"; then
+      echo "ERROR: deploy-migration-demo-stack: image tag ':$TAG' not present in k8s.io containerd namespace on node $ip after import." >&2
+      exit 1
+    fi
+  done
+
+  echo "==> [migration-demo-stack] Helm upgrade --install (standalone chart+release, namespace $MIGRATION_DEMO_NAMESPACE)..."
+  KUBECONFIG="$KUBECONFIG_OUT" helm upgrade --install migration-demo "$MIGRATION_DEMO_REPO/charts/migration-demo-stack" \
+    --namespace "$MIGRATION_DEMO_NAMESPACE" --create-namespace \
+    --set web.nginx.image.repository=migration-demo-web --set web.nginx.image.tag="$TAG" --set web.nginx.image.pullPolicy=IfNotPresent \
+    --set web.app.image.repository=migration-demo-backend --set web.app.image.tag="$TAG" --set web.app.image.pullPolicy=IfNotPresent \
+    ${MIGRATION_DEMO_STORAGE_CLASS:+--set postgres.persistence.storageClassName="$MIGRATION_DEMO_STORAGE_CLASS"}
+
+  echo "==> [migration-demo-stack] Forcing rollout restart of web (same-tag deploys are otherwise a silent no-op; redis/postgres use fixed upstream images and don't need churning)..."
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$MIGRATION_DEMO_NAMESPACE" rollout restart deploy/migration-demo-web
+
+  echo "==> [migration-demo-stack] Waiting for rollout (failure/timeout is a real error, not swallowed)..."
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$MIGRATION_DEMO_NAMESPACE" rollout status deploy/migration-demo-web --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$MIGRATION_DEMO_NAMESPACE" rollout status deploy/migration-demo-redis --timeout=180s
+  echo "  -- waiting for postgres (PVC bind can take longer than redis/web)..."
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$MIGRATION_DEMO_NAMESPACE" rollout status deploy/migration-demo-postgres --timeout=240s
+
+  echo "==> [migration-demo-stack] Ready. Access:"
+  echo "      kubectl port-forward -n $MIGRATION_DEMO_NAMESPACE svc/migration-demo-web 8080:8080   # -> http://localhost:8080 (basic auth user 'demo', default password 'migration-demo')"
+}
+
+# ── deploy-demo-apps: both demo/test apps, in the proven order (podmotion-demo ──
+# then migration-demo-stack — matches quickstart-kvm.sh/bootstrap.sh: core
+# first, demo apps after core is healthy). This is what cmd_deploy_podmotion
+# calls automatically; also dispatchable standalone for a faster iteration
+# loop when only the demo apps are changing (skips the operator/agent/
+# scheduler build+deploy entirely).
+cmd_deploy_demo_apps() {
+  local TAG="${1:-${TAG:-kvm-dev}}"
+  cmd_deploy_podmotion_demo "$TAG"
+  cmd_deploy_migration_demo "$TAG"
 }
 
 # ── verify-deployed-revision: ADR-0325-remediation Fix 1 §2.3 test-orchestration-time gate ────
@@ -950,6 +1289,18 @@ cmd_wipe() {
   KUBECONFIG="$KUBECONFIG_OUT" helm uninstall podmotion -n podmotion-system 2>/dev/null || true
   KUBECONFIG="$KUBECONFIG_OUT" kubectl delete podmigrations.podmotion.io --all -A 2>/dev/null || true
   KUBECONFIG="$KUBECONFIG_OUT" kubectl delete ns podmotion-system 2>/dev/null || true
+
+  # Demo/test apps wired into the standard deploy flow (cmd_deploy_demo_apps)
+  # are their own standalone releases in their own namespaces (see
+  # cmd_deploy_podmotion_demo's header comment for why podmotion-demo is NOT
+  # part of the podmotion release/namespace above) — clean them symmetrically
+  # so a wipe leaves no PodMotion-adjacent state behind, matching this
+  # command's existing "state on the VMs, not the VMs" contract.
+  echo "==> WIPE: removing demo/test app releases (podmotion-demo, migration-demo)..."
+  KUBECONFIG="$KUBECONFIG_OUT" helm uninstall podmotion-demo -n "$PODMOTION_DEMO_NAMESPACE" 2>/dev/null || true
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl delete ns "$PODMOTION_DEMO_NAMESPACE" 2>/dev/null || true
+  KUBECONFIG="$KUBECONFIG_OUT" helm uninstall migration-demo -n "$MIGRATION_DEMO_NAMESPACE" 2>/dev/null || true
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl delete ns "$MIGRATION_DEMO_NAMESPACE" 2>/dev/null || true
 
   # On each VM: clear checkpoint tmpfs debris + wrapper install (datapath artifact
   # cleanup only — never touch the VM definition, disks, or the base OS).
@@ -1160,13 +1511,20 @@ cmd_provision_cilium() {
   done
   for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
     echo "  -- import into $ip"
-    docker save "$CILIUM_IMG"          | nsh "$ip" "sudo ctr -n k8s.io images import -"
-    docker save "$CILIUM_OPERATOR_IMG" | nsh "$ip" "sudo ctr -n k8s.io images import -"
-    if ! nsh "$ip" "sudo ctr -n k8s.io images ls -q | grep -q 'cilium:v${CILIUM_VERSION}'"; then
+    # Same containerd-socket detection as cmd_deploy_podmotion's ctr_addr_flag
+    # (see detect_ctr_addr_flag above) — a plain `ctr images import` with no
+    # -a flag lands on the wrong (system) containerd on a k3s/RKE2 node,
+    # leaving the CNI images invisible to kubelet even though `ctr images ls`
+    # on the wrong socket falsely shows them present.
+    local ctr_addr_flag
+    ctr_addr_flag="$(detect_ctr_addr_flag "$ip")"
+    docker save "$CILIUM_IMG"          | nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images import -"
+    docker save "$CILIUM_OPERATOR_IMG" | nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images import -"
+    if ! nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images ls -q | grep -q 'cilium:v${CILIUM_VERSION}'"; then
       echo "ERROR: cilium:v${CILIUM_VERSION} not present in k8s.io containerd namespace on node $ip after import." >&2
       exit 1
     fi
-    if ! nsh "$ip" "sudo ctr -n k8s.io images ls -q | grep -q 'operator-generic:v${CILIUM_VERSION}'"; then
+    if ! nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images ls -q | grep -q 'operator-generic:v${CILIUM_VERSION}'"; then
       echo "ERROR: operator-generic:v${CILIUM_VERSION} not present in k8s.io containerd namespace on node $ip after import." >&2
       exit 1
     fi
@@ -1325,14 +1683,18 @@ cmd_provision_calico() {
   done
   for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
     echo "  -- import into $ip"
+    # Same containerd-socket detection as cmd_deploy_podmotion/cmd_provision_cilium
+    # (see detect_ctr_addr_flag above) — required on k3s/RKE2 nodes.
+    local ctr_addr_flag
+    ctr_addr_flag="$(detect_ctr_addr_flag "$ip")"
     for img in "$CALICO_OPERATOR_IMG" "$CALICO_NODE_IMG" "$CALICO_KUBE_CONTROLLERS_IMG" \
                "$CALICO_CNI_IMG" "$CALICO_CSI_IMG" "$CALICO_CSI_REGISTRAR_IMG"; do
-      docker save "$img" | nsh "$ip" "sudo ctr -n k8s.io images import -"
+      docker save "$img" | nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images import -"
     done
     for tag in "operator:v${CALICO_OPERATOR_VERSION}" "node:v${CALICO_VERSION}" \
                "kube-controllers:v${CALICO_VERSION}" "cni:v${CALICO_VERSION}" \
                "csi:v${CALICO_VERSION}" "node-driver-registrar:v${CALICO_VERSION}"; do
-      if ! nsh "$ip" "sudo ctr -n k8s.io images ls -q | grep -q '${tag}'"; then
+      if ! nsh "$ip" "sudo ctr $ctr_addr_flag -n k8s.io images ls -q | grep -q '${tag}'"; then
         echo "ERROR: ${tag} not present in k8s.io containerd namespace on node $ip after import." >&2
         exit 1
       fi
@@ -1764,13 +2126,16 @@ cmd_cutover_canal_rke2() {
 
 usage() {
   cat >&2 <<EOF
-Usage: hack/kvm-cluster.sh <verify|reset-cluster|reset-cluster-k3s|reset-cluster-rke2|deploy-podmotion|provision-shared-storage|provision-longhorn|provision-cilium|cutover|provision-calico|cutover-calico|provision-cilium-rke2|cutover-canal-rke2|wipe|ssh <node-ip> [cmd]>
+Usage: hack/kvm-cluster.sh <verify|reset-cluster|reset-cluster-k3s|reset-cluster-rke2|deploy-podmotion|deploy-demo-apps|deploy-podmotion-demo|deploy-migration-demo-stack|provision-shared-storage|provision-longhorn|provision-cilium|cutover|provision-calico|cutover-calico|provision-cilium-rke2|cutover-canal-rke2|wipe|ssh <node-ip> [cmd]>
 
   verify            assert 3 nodes Ready via $KUBECONFIG_OUT
   reset-cluster     kubeadm reset+reinit+flannel+join ON the standing VMs (NEVER destroys VMs)
   reset-cluster-k3s k3s install (stock, embedded Flannel) ON the standing VMs (NEVER destroys VMs) — sprint50
   reset-cluster-rke2 RKE2 install (stock, default canal CNI) ON the standing VMs (NEVER destroys VMs) — sprint51
-  deploy-podmotion  build+import images, mint mTLS, apply CRDs, helm install (TAG=<tag>; CONTAINERD_ADDRESS/AGENT_CONTAINERD_SOCKET_PATH/AGENT_CONTAINERD_STATE_DIR for k3s/RKE2)
+  deploy-podmotion  build+import images, mint mTLS, apply CRDs, helm install, then deploy-demo-apps (TAG=<tag>; --allow-dirty; --skip-demo-apps to opt out; CONTAINERD_ADDRESS/AGENT_CONTAINERD_SOCKET_PATH/AGENT_CONTAINERD_STATE_DIR for k3s/RKE2)
+  deploy-demo-apps  deploy-podmotion-demo + deploy-migration-demo-stack, in that order (TAG=<tag>; standalone re-run / faster iteration loop)
+  deploy-podmotion-demo      build+import podmotion-demo web+api images, helm upgrade --install standalone release in ns $PODMOTION_DEMO_NAMESPACE (PODMOTION_DEMO_REPO=<path> override)
+  deploy-migration-demo-stack build+import migration-demo-stack web images, helm upgrade --install standalone release in ns $MIGRATION_DEMO_NAMESPACE (MIGRATION_DEMO_REPO=<path>/MIGRATION_DEMO_STORAGE_CLASS=<sc> override; requires a default StorageClass)
   provision-shared-storage  NFS server on cp + nfs-common on all + RWX StorageClass $NFS_STORAGE_CLASS
   provision-longhorn  attach $LH_DISK_SIZE $LH_DISK_TARGET per node + Longhorn + SCs ($LH_STORAGE_CLASS, $LH_MIGRATABLE_SC)
   provision-cilium  pre-import Cilium images + helm install cilium/cilium $CILIUM_CHART_VERSION (cluster-pool/geneve/kube-proxy-replacement)
@@ -1799,6 +2164,9 @@ main() {
     reset-cluster-k3s) cmd_reset_cluster_k3s ;;
     reset-cluster-rke2) cmd_reset_cluster_rke2 ;;
     deploy-podmotion) cmd_deploy_podmotion "$@" ;;
+    deploy-demo-apps) cmd_deploy_demo_apps "$@" ;;
+    deploy-podmotion-demo) cmd_deploy_podmotion_demo "$@" ;;
+    deploy-migration-demo-stack) cmd_deploy_migration_demo "$@" ;;
     verify-deployed-revision) cmd_verify_deployed_revision "$@" ;;
     provision-shared-storage) cmd_provision_shared_storage ;;
     provision-longhorn) cmd_provision_longhorn ;;

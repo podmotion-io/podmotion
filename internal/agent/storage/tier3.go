@@ -169,6 +169,31 @@ func (m *SnapshotRsyncMigrator) AwaitSingleOwner(_ context.Context, _ MigrationO
 	return nil
 }
 
+// ReleaseDestination returns a wrapped ErrRollbackNotImplemented when opts.CutoverComplete
+// confirms Cutover's final rsync pass actually ran for this migration (ADR-0368 §5.2/
+// CONDITION 2); nil otherwise. Reverse-rsync (ADR-0086 §3) is not implemented by this ADR — see
+// ADR-0368 §4's judgment call — so this is a real, disclosed gap, not a silent one: a Tier3
+// rollback whose Cutover ran now fails closed with a message naming exactly why, instead of the
+// pre-existing behavior of silently claiming success while the destination clone PVC
+// (destPVCName, created in PreStage) and any post-cutover writes are simply abandoned with no
+// signal at all.
+//
+// Known, disclosed limitation (not silently glossed over): PreStage creates the destination
+// clone PVC BEFORE Cutover ever runs, so a rollback that fires between PreStage completing and
+// Cutover running (e.g. a Checkpointing/Transferring-phase failure — the common case
+// CONDITION 2 targets) still leaves that clone PVC behind even though this method returns nil in
+// that case. This is the same pre-existing "abandoned destination-clone PVC" gap the ADR's own
+// Consequences section names — CONDITION 2 explicitly scopes the point-of-no-return/
+// not-implemented gate to Cutover's own irrevocable action (the final rsync pass), not to
+// PreStage's clone creation, so this is not a new gap introduced here; it is called out for
+// anyone reasoning about what "nil" actually guarantees for Tier3.
+func (m *SnapshotRsyncMigrator) ReleaseDestination(_ context.Context, opts MigrationOptions) error {
+	if !opts.CutoverComplete {
+		return nil
+	}
+	return fmt.Errorf("tier3: %w", ErrRollbackNotImplemented)
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 func snapshotName(migrationName, pvcName string) string {
@@ -297,6 +322,8 @@ type SnapshotRsyncStubMigrator struct {
 	InjectPreStageError error
 	// InjectAwaitSingleOwnerError causes AwaitSingleOwner to return this error.
 	InjectAwaitSingleOwnerError error
+	// ReleaseDestinationCalled records whether ReleaseDestination was called.
+	ReleaseDestinationCalled bool
 }
 
 // Tier returns TierSnapshotRsync.
@@ -332,4 +359,17 @@ func (s *SnapshotRsyncStubMigrator) Cutover(_ context.Context, _ MigrationOption
 func (s *SnapshotRsyncStubMigrator) AwaitSingleOwner(_ context.Context, _ MigrationOptions) error {
 	s.AwaitSingleOwnerCalled = true
 	return s.InjectAwaitSingleOwnerError
+}
+
+// ReleaseDestination matches SnapshotRsyncMigrator.ReleaseDestination's semantics exactly
+// (ADR-0368 CONDITION 1): returns a wrapped ErrRollbackNotImplemented only when
+// opts.CutoverComplete confirms cutover actually ran; nil otherwise. Never nil when cutover
+// happened — this stub is what is ACTUALLY deployed for TierSnapshotRsync in the real operator
+// today (cmd/main.go only wires the real Longhorn migrator).
+func (s *SnapshotRsyncStubMigrator) ReleaseDestination(_ context.Context, opts MigrationOptions) error {
+	s.ReleaseDestinationCalled = true
+	if !opts.CutoverComplete {
+		return nil
+	}
+	return fmt.Errorf("tier3 stub: %w", ErrRollbackNotImplemented)
 }

@@ -44,8 +44,10 @@ package server
 // therefore cannot faithfully exercise the tmpfs-rebind REBIND_TO_ROOT branch (it DECLINEs on the
 // int). That path is grounded ONLY by a corpus produced by real CRIU 4.2 on a cluster node, which
 // does not produce in-sandbox (a new-mount-ns dump fails on the dev host's unsupported
-// filesystems). TestRealCorpus_TmpfsShmRebind_RequiresRealCRIUImage records this explicitly and
-// skips rather than assert a shape the substrate cannot honestly produce.
+// filesystems). This remains true for OTHER tmpfs mounts that still take the drop/rebind path;
+// ADR-0382 removes /dev/shm specifically from that path (see
+// TestRealCorpus_DevShmContentPreserved_NotRebound below), so this boundary no longer applies to
+// /dev/shm itself.
 
 import (
 	"context"
@@ -253,47 +255,48 @@ func runProductionPatchScriptHT(t *testing.T, pypath string, extraEnv []string, 
 	return string(out), err
 }
 
-// TestRealCorpus_ParentMntGraphClosureAndExternalDrop drives the shipped patch script against a
-// real-shape corpus and asserts the parent_mnt_id graph closure + external-mount B-2 drop fire.
+// TestRealCorpus_ParentMntGraphClosureAndOwnedInternalize drives the shipped patch script against a
+// real-shape corpus and asserts the parent_mnt_id graph closure (the /proc-/sys structural carve-out)
+// AND the ADR-0415 owned-mount internalize (the external /data mount, with no re-attach mapping, is
+// internalized as CRIU-owned rather than B-2-dropped).
 //
 // This is the "test that would have caught the bug" for the mount.c:381 / mount.c:3141 family: a
-// zero-entry synthetic (the old fixture) has no parent_mnt_id graph and no external mount, so it
-// could never observe either behavior. Here the /sys subtree (2 entries) and the external /data
-// mount are all present in the input and must be gone from the kept set after the patch.
-func TestRealCorpus_ParentMntGraphClosureAndExternalDrop(t *testing.T) {
+// zero-entry synthetic has no parent_mnt_id graph, so it could never observe the closure. Here the
+// /sys subtree (structural carve-out) is dropped by the closure, while /data is internalized — so its
+// open REG-fd stays consistent (no P-0193-1 hard-stop) and the script runs to success.
+func TestRealCorpus_ParentMntGraphClosureAndOwnedInternalize(t *testing.T) {
 	ckptDir := t.TempDir()
 	pypath, extraEnv := generateRealShapeCorpus(t, ckptDir, "full")
 
-	// masked=["/data"] mirrors containerdMaskedPaths carrying /data; inherit empty.
-	out, err := runProductionPatchScript(t, pypath, extraEnv, ckptDir, []string{"/data"}, nil)
+	// masked=["/data"] mirrors containerdMaskedPaths; inherit empty; EMPTY re-attach set so /data is
+	// not a storage-tier PVC re-attach and is therefore internalized (owned-capture).
+	//
+	// NOTE: the `full` corpus ALSO carries an unrelated /sys/fs/cgroup/cpu.max REG-fd (fd_id 3, mnt_id
+	// 9107=/sys). /sys is the structural carve-out and IS dropped by the graph closure, so that fd
+	// hard-stops as a non-tmpfs orphan (in production it is covered by the ADR-0180 --inherit-fd
+	// contract, not exercised here). So the script may still exit non-zero for THAT fd; this test
+	// asserts ONLY the mountpoints-pass behavior for /data (internalize) and that the /data REG-fd
+	// (backing_mnt_id 2951) does NOT orphan.
+	out, _ := runProductionPatchScript(t, pypath, extraEnv, ckptDir, []string{"/data"}, nil)
 
-	// The /data orphan REG-fd (fd_id 1, mnt_id 2951) must hard-stop with a typed inconsistency
-	// error — the external /data mount is dropped, orphaning that fd, and a non-tmpfs orphan
-	// DECLINEs (P-0193-1). So the script exits non-zero here; that is the CORRECT shape.
-	if err == nil {
-		t.Fatalf("expected P-0193-1 hard-stop (exit!=0) on /data orphan REG-fd, but script succeeded; output: %s", out)
+	// (a) parent_mnt_id graph closure: the /sys subtree (structural carve-out) is dropped. /data is
+	// internalized (kept), so the kept set is root + /proc + /dev/shm + /data = 4 entries.
+	if !strings.Contains(out, "mountpoints-10.img") || !strings.Contains(out, "kept 4 entries") {
+		t.Errorf("expected mountpoints graph closure to keep exactly 4 entries (root + /proc + /dev/shm + internalized /data); got: %s", out)
 	}
 
-	// (a) parent_mnt_id graph closure: the mountpoints reduced from 6 to 2 kept entries
-	// (root + /proc). The /sys subtree and dropped/external mounts are gone.
-	if !strings.Contains(out, "mountpoints-10.img") || !strings.Contains(out, "kept 2 entries") {
-		t.Errorf("expected mountpoints graph closure to keep exactly 2 entries (root + /proc); got: %s", out)
+	// (b) ADR-0415 owned internalize: /data must be internalized (not dropped).
+	if !strings.Contains(out, "internalizing owned mount") || !strings.Contains(out, "mnt_id=2951") || !strings.Contains(out, "mountpoint=/data") {
+		t.Errorf("expected 'internalizing owned mount mnt_id=2951 mountpoint=/data' (ADR-0415); got: %s", out)
+	}
+	// The retired B-2 drop token must NOT appear for /data.
+	if strings.Contains(out, `CRIU_EXTERNAL_MOUNT_DROPPED:`) {
+		t.Errorf("ADR-0415: /data must be internalized, not B-2-dropped — no CRIU_EXTERNAL_MOUNT_DROPPED expected; got: %s", out)
 	}
 
-	// (b) external-mount B-2 drop: /data must emit CRIU_EXTERNAL_MOUNT_DROPPED with its mnt_id. The
-	// ext_key is the real CRIU:AUTOGENERATED constant (every auto-external shares it), so mnt_id is
-	// the distinguishing field, not the ext_key string.
-	if !strings.Contains(out, `CRIU_EXTERNAL_MOUNT_DROPPED:`) || !strings.Contains(out, `"mnt_id":2951`) {
-		t.Errorf("expected CRIU_EXTERNAL_MOUNT_DROPPED for /data (mnt_id 2951); got: %s", out)
-	}
-
-	// (c) the /data orphan REG-fd P-0193-1 hard-stop must be structured and name the fd + backing.
-	if !strings.Contains(out, `CRIU_IMAGE_INCONSISTENCY:`) || !strings.Contains(out, `"fd_id":1`) || !strings.Contains(out, `"backing_mnt_id":2951`) {
-		t.Errorf("expected CRIU_IMAGE_INCONSISTENCY for the /data orphan REG-fd (fd_id 1, backing_mnt_id 2951); got: %s", out)
-	}
-	// P-0193-1 grounding: the decoded backing mountpoint must be reported (not just the bare mnt_id).
-	if !strings.Contains(out, `"backing_mountpoint":"/data"`) {
-		t.Errorf("expected decoded backing_mountpoint=/data in the P-0193-1 marker (grounding); got: %s", out)
+	// (c) the /data REG-fd must NOT hard-stop (it is backed by the kept, internalized /data mount).
+	if strings.Contains(out, `CRIU_IMAGE_INCONSISTENCY:`) && strings.Contains(out, `"backing_mnt_id":2951`) {
+		t.Errorf("ADR-0415: the /data REG-fd must NOT P-0193-1 hard-stop once /data is internalized; got: %s", out)
 	}
 }
 
@@ -388,17 +391,26 @@ func TestRealCorpus_ReattachExternalMountPreserved(t *testing.T) {
 	if !strings.Contains(isoOut, "P-0194-1c dual-write verified") {
 		t.Errorf("expected the P-0194-1c dual-write consistency check to PASS on the preserved mount; got:\n%s", isoOut)
 	}
-	// Negative control on the SAME isolated corpus: WITHOUT /data in the reattach set, the data-file
-	// fd on the (now dropped) external mount must hard-stop — proving the assertion is not vacuous.
+	// Contrast control on the SAME isolated corpus (ADR-0415): WITHOUT /data in the re-attach set,
+	// /data is not a storage-tier PVC re-attach, so it is INTERNALIZED (CRIU-owned + content), not
+	// dropped-and-hard-stopped. The data-file fd on the now-internal mount stays consistent (its
+	// mnt_id is kept), so the script runs to SUCCESS — the ADR-0415 owned-capture end-state that
+	// supersedes the former B-2 drop + P-0193-1 hard-stop. (The distinction between "PVC re-attach"
+	// and "internalize" comes solely from the re-attach set, per carve-out 2.)
 	ncDir := t.TempDir()
 	ncPy, ncEnv := generateRealShapeCorpus(t, ncDir, "reattach_only")
 	ncOut, ncErr := runProductionPatchScript(t, ncPy, ncEnv, ncDir, nil, nil, []string{})
-	if ncErr == nil {
-		t.Errorf("negative control (empty reattach set): expected the /data orphan fd to hard-stop, "+
-			"but script succeeded — the preserve path would be vacuous. output:\n%s", ncOut)
+	if ncErr != nil {
+		t.Errorf("ADR-0415 contrast control (empty reattach set): expected /data to be INTERNALIZED "+
+			"and the script to succeed (owned-capture), got error %v; output:\n%s", ncErr, ncOut)
 	}
-	if !strings.Contains(ncOut, `"backing_mnt_id":2951`) {
-		t.Errorf("negative control: expected P-0193-1 on the /data fd (backing_mnt_id 2951); got:\n%s", ncOut)
+	if !strings.Contains(ncOut, "internalizing owned mount") || !strings.Contains(ncOut, "mountpoint=/data") {
+		t.Errorf("ADR-0415 contrast control: expected an 'internalizing owned mount ... mountpoint=/data' "+
+			"log line (owned => CRIU-owned + content); got:\n%s", ncOut)
+	}
+	if strings.Contains(ncOut, `"backing_mnt_id":2951`) {
+		t.Errorf("ADR-0415 contrast control: /data internalized — its data-file fd must NOT orphan "+
+			"(no P-0193-1 for backing_mnt_id 2951); got:\n%s", ncOut)
 	}
 }
 
@@ -653,28 +665,35 @@ func TestRealCorpus_InheritFdNameExcludesFromFiringClass(t *testing.T) {
 	})
 }
 
-// TestRealCorpus_TmpfsShmRebind_IntegerFstypeIsFixturable closes the grounding boundary that the
-// prior skip-test (TestRealCorpus_TmpfsShmRebind_RequiresRealCRIUImage) left open, and pins the
-// ROOT CAUSE of the postgres restore-frontier live failure (decoded 2026-07-10).
+// TestRealCorpus_DevShmContentPreserved_NotRebound is the ADR-0382 replacement for the former
+// TestRealCorpus_TmpfsShmRebind_IntegerFstypeIsFixturable (renamed; the REBIND behavior it
+// asserted is exactly the behavior ADR-0382 removes for /dev/shm specifically).
 //
-// The prior test PROVED that vendored pycriu round-trips mnt_entry.fstype as the raw INT 5 (not
-// the enum-NAME 'TMPFS'), then SKIPPED — because the ADR-0311 classifier only matched the string
-// 'TMPFS'/'DEVTMPFS', so a real image (int 5) DECLINEd and the rebind was "un-fixturable" without
-// real CRIU. That skip WAS the bug hiding in plain sight: production always feeds the int, so the
-// rebind never fired live (postgres /dev/shm PostgreSQL.* → P-0193-1 hard-stop, restore failed).
+// BACKGROUND: prior to ADR-0382, /dev/shm was unconditionally dropped from mountpoints.img by
+// this patch script's DROP_PATHS (in lockstep with an unconditional dump-side --skip-mnt
+// /dev/shm), so a REG fd backed by /dev/shm (e.g. a PostgreSQL POSIX-shmem segment) always
+// orphaned and had to be rescued by the ADR-0311 REBIND_TO_ROOT classifier — a metadata-only
+// fix that let the pre-flight consistency check pass but could not manufacture file content
+// dump never captured, so CRIU restore's files-reg.c still ENOENTed on the recorded
+// /dev/shm/* path (the live postgres migration failure this ADR fixes).
 //
-// The fix makes classify_reg_fd accept BOTH the enum-name string AND the raw int enum codes
-// (TMPFS=5, DEVTMPFS=3). This test therefore does what the old one declared impossible: it dumps a
-// tmpfs /dev/shm mount + a /dev/shm orphan REG-fd through the REAL vendored pycriu (so fstype is
-// the honest int 5, not a hand-written string), runs the SHIPPED assembled patch script, and
-// asserts the fd is REBOUND (CRIU_IMAGE_DIR_FD_REBOUND with entry_type=REG, label tmpfs-shmem-regfd)
-// and does NOT hard-stop (no CRIU_IMAGE_INCONSISTENCY). The path is now grounded in-sandbox against
-// a pycriu-faithful image — no MUST_ROUTE_BROKER deferral, no synthetic string spelling.
-func TestRealCorpus_TmpfsShmRebind_IntegerFstypeIsFixturable(t *testing.T) {
+// ADR-0382 removes BOTH skips (dump-side and this patch script's DROP_PATHS), so /dev/shm is now
+// a normal, privately-owned mount that survives the patch step untouched: its mnt_id stays in
+// kept_mnt_ids, so classify_reg_fd's very first non-trivial check ("mnt_id in kept_mnt_ids ->
+// KEEP") fires before the REBIND_TO_ROOT tmpfs-rebind branch is ever reached. This test proves
+// that shape: it builds the exact real-shape corpus the old test used (root/dev/dev-shm mount
+// chain, mnt_ids 1/2/3, plus a /dev/shm PostgreSQL.* REG-fd on mnt_id 3) and asserts the shipped
+// script (a) does not hard-stop, (b) does NOT emit CRIU_IMAGE_DIR_FD_REBOUND for this fd (there
+// is no orphan to rebind), and (c) leaves both the /dev/shm mountpoints entry and the REG fd's
+// original mnt_id=3 intact in the images it writes back to disk — i.e. the content-preserving
+// path, not the metadata-patched rescue path.
+func TestRealCorpus_DevShmContentPreserved_NotRebound(t *testing.T) {
 	pypath, extraEnv := pycriuEnv(t)
 
 	// 1. Confirm the vendored pycriu still renders fstype as the honest int 5 (if a future env
-	//    upgrade makes it render the name, that is a benign change — the classifier accepts both).
+	//    upgrade makes it render the name, that is a benign change — kept as a groundedness
+	//    sanity check even though this test's main path no longer depends on fstype resolution
+	//    for /dev/shm specifically, since /dev/shm no longer takes the tmpfs-rebind branch).
 	probeDir := t.TempDir()
 	probe := `
 import sys, os
@@ -704,10 +723,10 @@ print('FSTYPE_RENDER=%r' % (back['entries'][0]['fstype'],))
 	}
 	t.Logf("vendored pycriu renders /dev/shm mnt_entry.fstype as: %s", rendered)
 
-	// 2. Build a REAL-SHAPE corpus with a tmpfs /dev/shm mount (fstype int 5) whose mnt_id is NOT
-	//    is_drop_root-seeded into tmpfs_drop_mnt_ids on its own — resolution must come from the
-	//    mnt_id->fstype map — plus a /dev/shm PostgreSQL.* orphan REG-fd in files.img. Run the
-	//    shipped patch script and assert REBIND, not hard-stop.
+	// 2. Build the same REAL-SHAPE corpus as before ADR-0382: a tmpfs /dev/shm mount (fstype
+	//    int 5) plus a /dev/shm PostgreSQL.* REG-fd on its mnt_id in files.img. Run the shipped
+	//    patch script and assert the mount and fd both PASS THROUGH UNTOUCHED (ADR-0382), not
+	//    that the fd gets rebound (the pre-ADR-0382 behavior this test used to assert).
 	corpusDir := t.TempDir()
 	gen := `
 import sys, os
@@ -757,19 +776,61 @@ print('CORPUS_OK')
 	patchOut, patchErr := patchCmd.CombinedOutput()
 	outStr := string(patchOut)
 	if patchErr != nil {
-		t.Fatalf("shipped patch script hard-stopped on the /dev/shm shm orphan (the live P-0193-1 "+
+		t.Fatalf("shipped patch script hard-stopped on the /dev/shm content-preserved fd (ADR-0382 "+
 			"regression): %v\noutput:\n%s", patchErr, outStr)
 	}
 	if strings.Contains(outStr, "CRIU_IMAGE_INCONSISTENCY") {
-		t.Fatalf("shm orphan fd fired P-0193-1 hard-stop instead of rebinding — int-fstype regression:\n%s", outStr)
+		t.Fatalf("shm fd fired a P-0193-1 hard-stop — ADR-0382 regression (it should classify KEEP, "+
+			"needing neither rebind nor decline):\n%s", outStr)
 	}
-	if !strings.Contains(outStr, "CRIU_IMAGE_DIR_FD_REBOUND") {
-		t.Fatalf("expected the /dev/shm shm orphan REG-fd to REBIND (CRIU_IMAGE_DIR_FD_REBOUND), got:\n%s", outStr)
+	if strings.Contains(outStr, "CRIU_IMAGE_DIR_FD_REBOUND") {
+		t.Fatalf("ADR-0382 regression: the /dev/shm fd was rebound (CRIU_IMAGE_DIR_FD_REBOUND) — "+
+			"it should pass through as KEEP now that /dev/shm is no longer dropped:\n%s", outStr)
 	}
-	if !strings.Contains(outStr, "tmpfs-shmem-regfd") {
-		t.Fatalf("expected the tmpfs-shmem-regfd label on the rebind, got:\n%s", outStr)
+
+	// 3. Decode the images the script wrote back to disk and confirm actual preservation, not
+	//    just the absence of a rebind token: the /dev/shm mountpoints entry (mnt_id 3) must
+	//    still be present, and the REG fd's mnt_id must be UNCHANGED (still 3, not rewritten to
+	//    the root mnt_id — that rewrite is exactly what REBIND_TO_ROOT would have done).
+	decode := `
+import sys, os, json
+import pycriu
+d = sys.argv[1]
+with open(os.path.join(d, 'mountpoints-12.img'), 'rb') as f:
+    mp = pycriu.images.load(f)
+mountpoints = sorted(e.get('mountpoint') for e in mp.get('entries', []))
+with open(os.path.join(d, 'files.img'), 'rb') as f:
+    files = pycriu.images.load(f)
+reg_mnt_ids = [e.get('reg', {}).get('mnt_id') for e in files.get('entries', []) if e.get('type') == 'REG']
+print(json.dumps({'mountpoints': mountpoints, 'reg_mnt_ids': reg_mnt_ids}))
+`
+	decodePath := filepath.Join(t.TempDir(), "pm-decode.py")
+	if err := os.WriteFile(decodePath, []byte(decode), 0o600); err != nil {
+		t.Fatalf("write decode script: %v", err)
 	}
-	if !strings.Contains(outStr, `"entry_type":"REG"`) {
-		t.Fatalf("expected entry_type REG on the rebind token, got:\n%s", outStr)
+	decodeCmd := exec.Command("python3", decodePath, corpusDir)
+	decodeCmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
+	decodeOut, decodeErr := decodeCmd.CombinedOutput()
+	if decodeErr != nil {
+		t.Fatalf("decode of patched images failed: %v\noutput: %s", decodeErr, decodeOut)
+	}
+	var decoded struct {
+		Mountpoints []string `json:"mountpoints"`
+		RegMntIDs   []int    `json:"reg_mnt_ids"`
+	}
+	if err := json.Unmarshal(decodeOut, &decoded); err != nil {
+		t.Fatalf("parse decode output %q: %v", string(decodeOut), err)
+	}
+	foundShm := false
+	for _, mp := range decoded.Mountpoints {
+		if mp == "/dev/shm" {
+			foundShm = true
+		}
+	}
+	if !foundShm {
+		t.Fatalf("ADR-0382 regression: /dev/shm mountpoints entry was dropped from the patched image; got mountpoints: %v", decoded.Mountpoints)
+	}
+	if len(decoded.RegMntIDs) != 1 || decoded.RegMntIDs[0] != 3 {
+		t.Fatalf("ADR-0382 regression: /dev/shm REG fd's mnt_id must remain 3 (untouched, content-preserving path), got: %v", decoded.RegMntIDs)
 	}
 }
