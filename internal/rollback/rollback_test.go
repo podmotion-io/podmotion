@@ -84,7 +84,7 @@ func TestDefaultRollbacker_Rollback_ErrorsIsTraversesPointOfNoReturn(t *testing.
 
 // TestDefaultRollbacker_Rollback_ErrorsIsTraversesNotImplemented mirrors the PointOfNoReturn
 // case for the ErrRollbackNotImplemented sentinel, and additionally proves the traversal still
-// works when MULTIPLE steps fail simultaneously (the §P-VERIFY assertion's "not just through an
+// works when MULTIPLE steps fail simultaneously (the verification assertion's "not just through an
 // individual step's error" requirement) — a real scenario if e.g. NetworkRollback also failed on
 // the same reconcile.
 func TestDefaultRollbacker_Rollback_ErrorsIsTraversesNotImplemented_MultiStepFailure(t *testing.T) {

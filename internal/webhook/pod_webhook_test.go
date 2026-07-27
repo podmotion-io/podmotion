@@ -197,7 +197,7 @@ func TestPodMutatingWebhookDestNodeFallbackChain(t *testing.T) {
 
 // TestPodMutatingWebhookNoDestNodeResolvedFallsThroughToNoAnnotation covers the case
 // where none of Status.DestinationNodeName, Spec.TargetNodeName, or Spec.DestinationNode
-// are set: the webhook must not error, and must not write a CNI annotation (P-VERIFY-C
+// are set: the webhook must not error, and must not write a CNI annotation (verification check C
 // catches the unpinned case downstream, not the webhook).
 func TestPodMutatingWebhookNoDestNodeResolvedFallsThroughToNoAnnotation(t *testing.T) {
 	const ns = "default"

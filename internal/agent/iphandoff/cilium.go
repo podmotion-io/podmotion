@@ -47,7 +47,7 @@ var ciliumEndpointGVR = schema.GroupVersionResource{
 //
 // After restore, CiliumEndpoint regeneration is required so that Cilium's eBPF
 // ipcache and kube-proxy-replacement tables are updated for the new node location.
-// ADR-0322 (strengthened per ADR-0324 P-VERIFY-C, sprint46B2): ConfirmEndpointOwnsPreservedIP
+// ADR-0322 (strengthened per ADR-0324 verification check C, sprint46B2): ConfirmEndpointOwnsPreservedIP
 // polls the CiliumEndpoint CRD directly via DynamicClient rather than treating pod IP assignment
 // as a proxy for endpoint regeneration — the cross-node reachability gate is released only when
 // status.state=="ready" AND status.identity.id!=0 (non-zero identity confirms ipcache
@@ -115,7 +115,7 @@ func (c *CiliumHandoff) AnnotateDestPodIPAM(ctx context.Context, namespace, dest
 // source-node dial — the read is not confounded by ADR-0012 holding the source pod alive with the
 // same IP on the source node. It STRENGTHENS ADR-0322's ready-only check: a ready endpoint that
 // received a DIFFERENT IP (ipam.cilium.io/ip pin not honored under cluster-pool — ADR-0324
-// P-VERIFY-C) is correctly rejected here instead of falsely crediting a dataplane that never moved
+// verification check C) is correctly rejected here instead of falsely crediting a dataplane that never moved
 // the IP. Returns the node IP the endpoint lives on (observability) and nil ONLY when all three
 // predicates hold; otherwise a classified, fail-closed error whose message carries a stable token
 // ("lookup error" | "does not advertise preserved IP" | "not ready") the caller maps to a Reason.
@@ -163,7 +163,7 @@ func (c *CiliumHandoff) ConfirmEndpointOwnsPreservedIP(ctx context.Context, name
 //     the caller should retry / requeue.
 //   - ("", false, err)   — a DECIDED negative that must not be retried into a false-ready: nil
 //     DynamicClient, empty wantIP, a real API lookup error, or ready-but-advertising-a-different-IP
-//     (the unhonored ipam.cilium.io/ip pin, ADR-0324 P-VERIFY-C). Fail-closed.
+//     (the unhonored ipam.cilium.io/ip pin, ADR-0324 verification check C). Fail-closed.
 func (c *CiliumHandoff) EndpointReadyAdvertisesIP(ctx context.Context, namespace, podName, wantIP string) (string, bool, error) {
 	if c.DynamicClient == nil {
 		return "", false, fmt.Errorf("EndpointReadyAdvertisesIP: DynamicClient is nil (not wired)")
@@ -193,7 +193,7 @@ func (c *CiliumHandoff) EndpointReadyAdvertisesIP(ctx context.Context, namespace
 	// Ready with a non-zero identity but NOT advertising wantIP. This is a DECIDED outcome, not a
 	// transient: cilium-agent only marks an endpoint ready after its addressing is populated, so the
 	// IP it owns is settled. Under cluster-pool IPAM this is the expected result of an unhonored
-	// ipam.cilium.io/ip pin (ADR-0324 P-VERIFY-C). Return immediately with a specific, actionable
+	// ipam.cilium.io/ip pin (ADR-0324 verification check C). Return immediately with a specific, actionable
 	// error rather than crediting a dataplane that never programmed wantIP.
 	return "", false, fmt.Errorf("CiliumEndpoint %s/%s is ready on node %s but does not advertise preserved IP %s (addressing=%v) — ipam.cilium.io/ip pin not honored",
 		namespace, podName, node, wantIP, endpointAddresses(obj))

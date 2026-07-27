@@ -241,7 +241,7 @@ func TestReconcileVerifying_Strict_NeverInvokesRetiredProducers(t *testing.T) {
 }
 
 // TestEstablishServiceContinuity_NoServiceSelectsPod_TriviallySatisfied is the ADR-0390
-// regression test for §P-MECHANISM's stuck-ServiceVerifying finding: a pod that no Service in
+// regression test for the mechanism's stuck-ServiceVerifying finding: a pod that no Service in
 // its namespace ever selects (e.g. a standalone pod with no owning Service — the live
 // podmotion-demo-6vf5f/default/nginx case) must NOT requeue establishServiceContinuity
 // indefinitely waiting for an EndpointSlice that will never exist. Because no EndpointSlice will

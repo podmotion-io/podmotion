@@ -26,7 +26,7 @@ spec:
         # fsGroup 65532 (distroless nonroot UID/GID) so the kubelet chowns mounted
         # secret volumes to this GID. Without it the operator (runAsNonRoot, UID 65532)
         # cannot read the root:root 0400 operator-agent-client-tls cert and CrashLoops
-        # ("open /etc/podmotion/tls/tls.crt: permission denied"). Sprint 34 §P-VERIFY-D fix.
+        # ("open /etc/podmotion/tls/tls.crt: permission denied"). Sprint 34 verification fix.
         fsGroup: 65532
       terminationGracePeriodSeconds: 10
       containers:

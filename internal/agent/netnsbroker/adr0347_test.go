@@ -487,5 +487,4 @@ func createNetnsLeaf(t *testing.T, netnsPath string) func() {
 }
 
 // T9 — build/vet green is a CI/discharge step (go build ./..., go vet ./...,
-// GOOS=darwin go build ./...), not test code. See docs/sprints/sprint46/
-// validation-tests/adr0347_discharge.sh.
+// GOOS=darwin go build ./...), not test code.

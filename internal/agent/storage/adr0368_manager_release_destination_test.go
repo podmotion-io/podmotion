@@ -188,7 +188,7 @@ func TestStorageMigrationManager_ReleaseDestination_CutoverCompleteGrounding(t *
 // TestStorageMigrationManager_ReleaseDestination_PropagatesMigratorSentinelError proves a
 // tier's sentinel error returned by Migrator.ReleaseDestination survives the manager's own %w
 // wrap un-mangled (errors.Is must still resolve after passing through this layer — mirrors the
-// §P-VERIFY assertion for StorageMigrationManager.ReleaseDestination).
+// verification assertion for StorageMigrationManager.ReleaseDestination).
 func TestStorageMigrationManager_ReleaseDestination_PropagatesMigratorSentinelError(t *testing.T) {
 	scheme := newManagerScheme(t)
 	pm := makeMigration("mig-propagate", "default", "src-pod")

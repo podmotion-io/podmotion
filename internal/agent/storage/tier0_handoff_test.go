@@ -27,7 +27,7 @@ func (f *fakeHandoffClient) StorageHandoffReady(_ context.Context, _ *storage.St
 	return f.resp, f.err
 }
 
-// TestRWXReattachMigratorCutover_HandoffConfirmed exercises ADR-0344 §P-VERIFY
+// TestRWXReattachMigratorCutover_HandoffConfirmed exercises ADR-0344 verification
 // case (a): with a fake StorageHandoffReady responder returning
 // source_readonly:true, Cutover returns nil.
 func TestRWXReattachMigratorCutover_HandoffConfirmed(t *testing.T) {
@@ -49,7 +49,7 @@ func TestRWXReattachMigratorCutover_HandoffConfirmed(t *testing.T) {
 	}
 }
 
-// TestRWXReattachMigratorCutover_HandoffRefused exercises ADR-0344 §P-VERIFY
+// TestRWXReattachMigratorCutover_HandoffRefused exercises ADR-0344 verification
 // case (b): with the responder returning false, Cutover returns an error and
 // no destination-mount side effect occurs (this migrator performs no
 // destination-mount side effect itself — that guarantee is enforced by the

@@ -15,8 +15,8 @@ package controller
 // CHECKPOINT-HANG-IDLE-WORKLOAD-MECHANISM-MAP.md): completeStoragePreStageDispatch treated any 409 on the
 // finalize Patch as supersession and returned completed=false, leaving the marker permanently InFlight so
 // RunPreStage never launched — a deterministic idle-pod livelock. These tests prove the fix at the
-// finalize-function boundary. They are NECESSARY BUT NOT SUFFICIENT (§P-VERIFY-1): the load-bearing
-// acceptance fact is the live idle-pod reconcile-storm completion proof (§P-VERIFY-2), which is OWED.
+// finalize-function boundary. They are NECESSARY BUT NOT SUFFICIENT (verification assertion 1): the load-bearing
+// acceptance fact is the live idle-pod reconcile-storm completion proof (verification assertion 2), which is OWED.
 //
 // Proves, against the real completeStoragePreStageDispatch (no mock of the code under test):
 //   - a transient (one-shot) 409 on the finalize Patch is retried in place — the holder re-Gets,

@@ -2,7 +2,7 @@
 # W7 — multi-container-envoy
 # ADR-0112 §5: app listens 127.0.0.1:8080 only; Envoy listens 0.0.0.0:9090 and proxies to app.
 # Service targets Envoy port 9090. Envoy admin exposed on 9901 for ADR-0113 §5 assertion.
-# Images must be pinned by digest before gate run (see docs/sprints/m27-image-pins.md).
+# Images must be pinned by digest before gate run.
 apiVersion: v1
 kind: Namespace
 metadata:

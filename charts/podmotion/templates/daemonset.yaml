@@ -257,7 +257,7 @@ spec:
             # /run/netns (the CNI bind dir), so EvalSymlinks fails with
             # `lstat /run/netns: no such file or directory` and the gate REJECTS a valid handle
             # BEFORE the op ever runs — the gate validates a filesystem view the operation does
-            # not use. Live-decoded on pm-w2 (docs/sprints/sprint46B2/live-proof-cycle1.md: the
+            # not use. Live-decoded on pm-w2 (the
             # agent-side ReadReplVethMAC bind read returned empty via that exact lstat error;
             # broker mount-ns probe confirms `ls /run/netns` -> "No such file or directory").
             # The agent container already mounts host-var-run-netns for the same reason (its

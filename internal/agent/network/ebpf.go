@@ -259,7 +259,7 @@ func (s *eBPFManagerStub) PatchRelayTsDelta(ctx context.Context, key SeqXlatKey,
 
 // LookupSeqXlat on the stub always reports found=false: there is no real kernel map behind a
 // stub manager (non-Linux, kernel <5.9, or an explicit test opt-out), so a stub-backed migration
-// can never truthfully claim PM_SEQ_XLAT is seeded (ADR-0357 D1.2/§P-VERIFY assertion 1). This
+// can never truthfully claim PM_SEQ_XLAT is seeded (ADR-0357 D1.2/verification assertion 1). This
 // is intentional fail-closed behavior, not an oversight: callers depending on a verified seed
 // (network.SeedRelayFromSnapshots) must fail rather than silently pass on a stub.
 func (s *eBPFManagerStub) LookupSeqXlat(ctx context.Context, key SeqXlatKey) (SeqXlatEntry, bool, error) {

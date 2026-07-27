@@ -210,7 +210,7 @@ func TestHeartbeat_ReattemptsDetection_WhenCRIUVersionEmpty(t *testing.T) {
 
 // TestHeartbeat_DoesNotReattempt_WhenCRIUVersionAlreadySet verifies Heartbeat() does
 // NOT re-run detectCRIU (no needless host-ns exec call) once Spec.CRIUVersion is
-// already populated — P-VERIFY assertion 6 of ADR-0366.
+// already populated — verification assertion 6 of ADR-0366.
 func TestHeartbeat_DoesNotReattempt_WhenCRIUVersionAlreadySet(t *testing.T) {
 	nmc := &pmv1.NodeMigrationCapacity{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-b"},

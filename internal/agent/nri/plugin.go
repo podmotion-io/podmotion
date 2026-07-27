@@ -47,7 +47,7 @@ var ValidCheckpointRef = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{0,61}[a-z0-9]$`
 var log = logf.Log.WithName("nri-plugin")
 
 // nriPluginRequestTimeout is the real containerd NRI plugin_request_timeout, GROUNDED live
-// (ADR-0351 G0.3, docs/sprints/sprint46B7/g0-probe-adr0351-transcript.md — `containerd config
+// (ADR-0351 G0.3 — `containerd config
 // dump` on pm-w1, 2026-07-15) — not assumed. This ONE value pins the three previously
 // contradictory in-tree comments this constant replaces ("60s required on all nodes"; "2s on
 // the standing containerd 2.2.1 substrate"; "default 30s"). D4.1.

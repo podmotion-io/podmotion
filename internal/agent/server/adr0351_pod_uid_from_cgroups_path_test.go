@@ -21,7 +21,7 @@ func TestPodUIDFromCgroupsPath(t *testing.T) {
 	const wantUID = "34b0b99f-b322-4cd8-b4e2-6b3003963468"
 
 	t.Run("systemd underscore-encoded slice token", func(t *testing.T) {
-		// The live-captured shape (G0.2, docs/sprints/sprint46B7/g0-probe-adr0351-transcript.md)
+		// The live-captured shape (G0.2)
 		// every current platform (kind/kubeadm/KVM/k3s/RKE2) actually emits.
 		path := "kubepods-besteffort-pod34b0b99f_b322_4cd8_b4e2_6b3003963468.slice:cri-containerd:6aa6e1e43a48"
 		got, err := podUIDFromCgroupsPath(path)

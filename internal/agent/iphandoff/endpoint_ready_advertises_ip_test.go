@@ -32,7 +32,7 @@ func TestEndpointReadyAdvertisesIP_Programmed(t *testing.T) {
 		ns     = "migration-demo"
 		pod    = "postgres-repl-m-abc123"
 		wantIP = "10.244.2.55" // the replacement's actually-assigned dest IP (cluster-pool /24 on pm-w2)
-		node   = "192.168.122.243"
+		node   = "203.0.113.243"
 	)
 	ch := fakeCiliumHandoff(ciliumEndpoint(ns, pod, "ready", 4242, node, wantIP))
 
@@ -71,7 +71,7 @@ func TestEndpointReadyAdvertisesIP_NotYet_NotReady(t *testing.T) {
 		ns     = "migration-demo"
 		pod    = "postgres-repl-m-abc123"
 		wantIP = "10.244.2.55"
-		node   = "192.168.122.243"
+		node   = "203.0.113.243"
 	)
 	ch := fakeCiliumHandoff(ciliumEndpoint(ns, pod, "regenerating", 4242, node, wantIP))
 	_, ok, err := ch.EndpointReadyAdvertisesIP(context.Background(), ns, pod, wantIP)
@@ -92,7 +92,7 @@ func TestEndpointReadyAdvertisesIP_Decided_WrongIP(t *testing.T) {
 		pod    = "postgres-repl-m-abc123"
 		wantIP = "10.244.2.55"
 		gotIP  = "10.244.2.99"
-		node   = "192.168.122.243"
+		node   = "203.0.113.243"
 	)
 	ch := fakeCiliumHandoff(ciliumEndpoint(ns, pod, "ready", 4242, node, gotIP))
 	_, ok, err := ch.EndpointReadyAdvertisesIP(context.Background(), ns, pod, wantIP)
@@ -127,7 +127,7 @@ func TestEndpointReadyAdvertisesIP_IsSingleShot(t *testing.T) {
 	const (
 		ns   = "migration-demo"
 		pod  = "postgres-repl-m-abc123"
-		node = "192.168.122.243"
+		node = "203.0.113.243"
 	)
 	ch := fakeCiliumHandoff(ciliumEndpoint(ns, pod, "regenerating", 4242, node, "10.244.2.55"))
 	// Force a large poll bound: if the core (wrongly) looped, it would sleep on this.
@@ -152,7 +152,7 @@ func TestConfirmEndpointOwnsPreservedIP_StillPollsViaCore(t *testing.T) {
 		ns     = "migration-demo"
 		pod    = "postgres-repl-m-abc123"
 		wantIP = "10.244.1.178"
-		node   = "192.168.122.243"
+		node   = "203.0.113.243"
 	)
 	scheme := runtime.NewScheme()
 	gvrToListKind := map[schema.GroupVersionResource]string{ciliumEndpointGVR: "CiliumEndpointList"}

@@ -88,8 +88,7 @@ const (
 // mounts the host /run at /host-run (server.go hostBundleDir), so the live OCI spec
 // (config.json) for a container lives under this tree, NOT bare /run. Standard
 // kubeadm/containerd installs use /run/containerd; k3s's embedded containerd uses a different
-// root (UNVERIFIED-EXTERNAL — see docs/sprints/sprint50-k3s/K3S-COMPATIBILITY-PLAN.md §0 item
-// 4). Override via PODMOTION_CONTAINERD_RUN_ROOT (same env var server.go reads — set from
+// root (UNVERIFIED-EXTERNAL). Override via PODMOTION_CONTAINERD_RUN_ROOT (same env var server.go reads — set from
 // Helm value agent.containerd.socketPath's directory), so a k3s deploy needs a values
 // override, not a code change.
 var hostBundleBase = "/host-run" + strings.TrimPrefix(containerdRunRootEnv(), "/run") + "/io.containerd.runtime.v2.task/k8s.io"

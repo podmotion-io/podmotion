@@ -9,8 +9,7 @@ package server
 // parsePausePIDFromTaskTable precedent this ADR retires: pull the testable logic out of the I/O
 // wrapper so it doesn't require a real host cgroupfs or driving joinNsRestore's untestable body.
 //
-// Shapes used below are the LIVE G0.1/G0.2-captured values (docs/sprints/sprint46B7/
-// g0-probe-adr0351-transcript.md), not invented formats — per D2.2's own requirement.
+// Shapes used below are the LIVE G0.1/G0.2-captured values, not invented formats — per D2.2's own requirement.
 
 import (
 	"os"
@@ -249,8 +248,7 @@ func TestCgroupAnchor_NoSecondOwnershipLock(t *testing.T) {
 // (Open verification #6): moveProcessToPodCgroup's single cgroup.procs write moves only the
 // written PID's thread-group, not necessarily every descendant TGID of a multi-process restored
 // tree. This is a PRE-EXISTING moveProcessToPodCgroup property this ADR does not change (only the
-// anchor TARGET changes) — the live D2.6 proof script (docs/sprints/sprint46B7/validation-tests/
-// run-adr0351-cgroup-anchor-live-proof.sh) is what actually MEASURES whole-tree containment
+// anchor TARGET changes) — the live D2.6 proof script is what actually MEASURES whole-tree containment
 // against a real multi-process workload; this unit test asserts the documented single-write
 // property structurally so a future silent change to move multiple PIDs is visible here too.
 //

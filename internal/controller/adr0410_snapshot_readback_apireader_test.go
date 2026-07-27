@@ -12,10 +12,10 @@ package controller
 // "refuse source kill" gate observes authoritative server truth immediately after the direct
 // Status().Patch, instead of a not-read-after-write-consistent informer cache.
 //
-// These unit tests are NECESSARY BUT NOT SUFFICIENT (ADR-0410 §7 P-VERIFY-2): a fake client is
+// These unit tests are NECESSARY BUT NOT SUFFICIENT (ADR-0410 §7 verification assertion 2): a fake client is
 // read-after-write consistent and CANNOT reproduce informer cache-lag, so they prove the wiring,
 // the nil-fallback, and that the gate still fails closed — NOT that the live cold-start transient is
-// gone. That is the OWED live §P-VERIFY-3 proof.
+// gone. That is the OWED live verification assertion 3 proof.
 //
 // Proves:
 //   - the read-back Get is dispatched through r.APIReader (not r.Client) when APIReader is set;

@@ -12,9 +12,9 @@ package controller
 // immune to the whole-.status blob overwrite in statusUpdate, exactly as ADR-0398's dispatch marker
 // already is.
 //
-// These unit tests are NECESSARY BUT NOT SUFFICIENT (ADR-0408 §6.1 / §P-VERIFY-1): they prove field
+// These unit tests are NECESSARY BUT NOT SUFFICIENT (ADR-0408 §6.1 / verification assertion 1): they prove field
 // immunity in isolation; the load-bearing acceptance is the live idle-pod/bare-Longhorn
-// PreCopyMemory-advances-to-Complete proof under a reproduced reconcile storm (§P-VERIFY-2, OWED).
+// PreCopyMemory-advances-to-Complete proof under a reproduced reconcile storm (verification assertion 2, OWED).
 //
 // Proves:
 //   - a snapshot captured via patchSourcePodSpecSnapshot SURVIVES a subsequent concurrent blob

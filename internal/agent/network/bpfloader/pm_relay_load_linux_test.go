@@ -20,7 +20,7 @@ import (
 )
 
 // TestLoadPmRelayObjects_ActuallyLoads is the ASSERTING load-time regression
-// guard mandated by ADR-0403 §P-VERIFY assertion 2. Unlike TestLoadPmRelaySpec
+// guard mandated by ADR-0403 verification assertion 2. Unlike TestLoadPmRelaySpec
 // (which only parses the ELF and treats a load error as acceptable — the exact
 // hole that let the off=14/off=64 verifier-rejection class ship and be
 // misdiagnosed twice), this test drives the real
@@ -33,7 +33,7 @@ import (
 // Honesty boundary (ADR-0403): a *verifier* rejection is always a FAIL — never a
 // skip. The ONLY tolerated skip is when the test host cannot exercise BPF at all
 // because it lacks privilege (CAP_BPF/CAP_NET_ADMIN); that is an environment
-// limitation, not a pass. §P-VERIFY assertion 1/2 is only truly satisfied when
+// limitation, not a pass. verification assertion 1/2 is only truly satisfied when
 // this test runs green on a privileged BPF-capable 6.8.x kernel (e.g. the KVM
 // nodes / a privileged CI runner). A skip here does NOT satisfy the gate.
 func TestLoadPmRelayObjects_ActuallyLoads(t *testing.T) {
@@ -62,10 +62,10 @@ func TestLoadPmRelayObjects_ActuallyLoads(t *testing.T) {
 	// Distinguish "cannot test here due to privilege" from a genuine load defect.
 	// An unprivileged host returns EPERM from the BPF syscall before the verifier
 	// runs. That is the only tolerated non-fatal outcome — and it is a SKIP, not
-	// a pass: the §P-VERIFY live-load gate remains UNMET until this runs green on
+	// a pass: the verification live-load gate remains UNMET until this runs green on
 	// a privileged kernel.
 	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
-		t.Skipf("SKIP (NOT a pass — ADR-0403 §P-VERIFY gate UNMET): host lacks BPF privilege "+
+		t.Skipf("SKIP (NOT a pass — ADR-0403 verification gate UNMET): host lacks BPF privilege "+
 			"(CAP_BPF/CAP_NET_ADMIN); run on a privileged BPF-capable 6.8.x kernel to satisfy the gate: %v", err)
 	}
 

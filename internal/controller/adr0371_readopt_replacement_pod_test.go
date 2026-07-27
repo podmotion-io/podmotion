@@ -176,7 +176,7 @@ func TestReadopt_SuccessfulReadoptConfirmDeleteSequence(t *testing.T) {
 		WithObjects(sourcePod, replacementPod, pm, readyNMC("node-dst"), rs, srcAgentPod).Build()
 
 	// Captured the instant r.Delete(sourcePod) fires, to prove ordering (ADR-0371
-	// §P-VERIFY assertion 2): the readopt condition must already be True by then.
+	// verification assertion 2): the readopt condition must already be True by then.
 	var conditionTrueBeforeDelete atomic.Bool
 	var deleteCalled atomic.Bool
 	fakeClient := interceptor.NewClient(baseClient, interceptor.Funcs{
@@ -267,7 +267,7 @@ func agentClientPoolForTestWithHook(t *testing.T, fakeClient client.Client, resp
 
 // TestReadopt_ConfirmTimeout_FailsClosed_SourceNotDeleted proves ADR-0371's fail-closed
 // requirement (§3): if the bounded confirm poll never observes a definitive read (a test
-// double that delays the confirm read, per §P-VERIFY assertion 3, here simulated by an
+// double that delays the confirm read, per verification assertion 3, here simulated by an
 // interceptor that returns a STALE pre-patch snapshot of the replacement pod on every read
 // after the initial patch's own Get), the source pod is NOT deleted and the replacement pod
 // is re-stripped back to its CR-owned/label-stripped state.

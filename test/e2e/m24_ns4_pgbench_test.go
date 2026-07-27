@@ -33,6 +33,7 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -770,12 +771,38 @@ func parsePgbenchFailedTxn(logOutput string) int {
 // internal/bpf/relay_unit_test.go via BPF_PROG_TEST_RUN. They are compiled
 // separately and the results are captured here as an integration-level gate.
 
+// findRepoRoot resolves the module root so the BPF unit tests can be invoked
+// with the correct working directory regardless of where the suite is run from.
+// It honors PODMOTION_REPO_ROOT when set; otherwise it walks up from the current
+// working directory to the directory containing go.mod.
+func findRepoRoot() (string, error) {
+	if root := os.Getenv("PODMOTION_REPO_ROOT"); root != "" {
+		return root, nil
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	for {
+		if _, statErr := os.Stat(filepath.Join(dir, "go.mod")); statErr == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("go.mod not found walking up from working directory; set PODMOTION_REPO_ROOT")
+		}
+		dir = parent
+	}
+}
+
 var _ = Describe("M24 BPF_PROG_TEST_RUN relay unit tests", Ordered, Label("m24", "bpf-unit"), func() {
 
 	It("all BPF relay unit tests pass", func() {
 		cmd := exec.Command("go", "test", "-v", "-tags=bpf_unit", "-count=1",
 			"./internal/bpf/...")
-		cmd.Dir = "/Users/cingle/projects/podmotion/podmotion"
+		repoRoot, rootErr := findRepoRoot()
+		Expect(rootErr).NotTo(HaveOccurred(), "resolving repo root for BPF unit test invocation")
+		cmd.Dir = repoRoot
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			// BPF unit tests require a Linux host with BPF support; skip on macOS.

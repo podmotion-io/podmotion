@@ -148,9 +148,6 @@ docs/design/
 
 docs/security/
 !docs/security/SECURITY-ARCHITECTURE.md
-!docs/security/podmotion-usb-backup.service
-!docs/security/podmotion-usb-backup.timer
-!docs/security/usb-backup.sh
 
 # Terraform local state, generated keys, provider cache.
 # Configs (.tf) and .terraform.lock.hcl are meant to be tracked.

@@ -9,7 +9,7 @@ you may not use this file except in compliance with the License.
 
 package podmigration_test
 
-// ADR-0363 B1 §P-VERIFY follow-up: these tests exercise the
+// ADR-0363 B1 verification follow-up: these tests exercise the
 // adapter's OWN translation code (adapter.go) — the framework<->hand-rolled-type mapping —
 // not just filter.go/score.go's pre-existing business logic (already covered by
 // filter_test.go/score_test.go/filter_cpu_test.go, untouched here). Specifically:

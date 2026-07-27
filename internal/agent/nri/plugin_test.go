@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-// TestVerifyPodMigrationAcceptSet is the P-VERIFY-NRI-PHASE-ORDER contract test (ADR-0185 C2).
+// TestVerifyPodMigrationAcceptSet is the NRI-phase-order verification contract test (ADR-0185 C2).
 //
 // It asserts the NRI anti-spoof accept-set equals EXACTLY the set of phases reachable after
 // conditionVXLANFDBUpdated=True — an equality/closure check, not a subset check. Under Option B

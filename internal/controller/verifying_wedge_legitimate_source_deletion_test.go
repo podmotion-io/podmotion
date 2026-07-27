@@ -7,7 +7,7 @@ you may not use this file except in compliance with the License.
 
 package controller
 
-// verifying_wedge_legitimate_source_deletion_test.go is the §P-VERIFY acceptance test for the
+// verifying_wedge_legitimate_source_deletion_test.go is the verification acceptance test for the
 // round-2 fix to the legacy None-mode Verifying-phase wedge.
 //
 // Real scenario reproduced live on pm-e2e/podmotion-demo-wgbzz (see round-1 diagnosis, carried
@@ -52,7 +52,7 @@ import (
 )
 
 // TestReconcile_VerifyingWedge_LegitimateSourceDeletion_ClosesOutInsteadOfRollback is the
-// §P-VERIFY acceptance test for the round-2 Verifying-phase wedge fix.
+// verification acceptance test for the round-2 Verifying-phase wedge fix.
 func TestReconcile_VerifyingWedge_LegitimateSourceDeletion_ClosesOutInsteadOfRollback(t *testing.T) {
 	logf.SetLogger(zap.New(zap.UseDevMode(true)))
 	scheme := adr0210Scheme(t)

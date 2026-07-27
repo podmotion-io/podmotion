@@ -21,7 +21,7 @@ package server
 //   1. Both the ctr-native corpus (config.json present) and the raw-CRIU corpus (no config.json)
 //      reach encryptCheckpointDir: after finalizeCheckpointDir every plaintext layer is replaced
 //      by ciphertext and a .pm-encrypted marker (checkpointEncMarkerFile) is written.
-//   2. §P-VERIFY: the .pm-encrypted marker exists on the CTR path — the exact plaintext-shipping
+//   2. Verification: the .pm-encrypted marker exists on the CTR path — the exact plaintext-shipping
 //      bug (C-1) is what its absence would prove.
 //   3. guard-BEFORE-encrypt ordering: a corpus whose anon-shared VMA has NO matching
 //      pagemap-shmem image fails the shmem guard (typed FailedPrecondition) and does NOT encrypt
@@ -169,7 +169,7 @@ func assertEncrypted(t *testing.T, dir string, plaintextMM []byte) {
 	t.Helper()
 	markerPath := filepath.Join(dir, checkpointEncMarkerFile)
 	if _, statErr := os.Stat(markerPath); statErr != nil {
-		t.Fatalf("§P-VERIFY: expected %s marker after finalizeCheckpointDir (proves encryptCheckpointDir ran); stat err: %v", checkpointEncMarkerFile, statErr)
+		t.Fatalf("Verification: expected %s marker after finalizeCheckpointDir (proves encryptCheckpointDir ran); stat err: %v", checkpointEncMarkerFile, statErr)
 	}
 	nowMM, err := os.ReadFile(filepath.Join(dir, "mm-9.img"))
 	if err != nil {

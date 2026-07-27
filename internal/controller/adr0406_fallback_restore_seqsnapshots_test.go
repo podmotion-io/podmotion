@@ -22,9 +22,9 @@ package controller
 // single-authority buildRestoreSeqSnapshots helper. A refactor that drops the plumbing — or a
 // future proto field added to only one call site — goes red here instead of shipping green.
 //
-// These are the wiring assertions (ADR-0406 P-VERIFY notes 1 and 4). They are NECESSARY but NOT
+// These are the wiring assertions (ADR-0406 verification notes 1 and 4). They are NECESSARY but NOT
 // SUFFICIENT to close the ADR: closing it additionally requires the REAL live fallback-path
-// seeding proof (P-VERIFY assertion 2, SeqXlatSeeded=True on a held connection), which no unit
+// seeding proof (verification assertion 2, SeqXlatSeeded=True on a held connection), which no unit
 // test can substitute for.
 
 import (

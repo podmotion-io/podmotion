@@ -119,7 +119,7 @@ func TestTryEstablish_Cilium_CrossNode_ConfirmsFromAuthoritativeRead(t *testing.
 	const replPod = "redis-src-m-5604a0fb"
 	pm := strictCrossNodePM("live-proof-c2-mig1", preservedIP, replPod)
 	r := reconcilerForDataplane(t, pm, ciliumNMC("pm-w2", "cilium"),
-		fakeCiliumEndpointObj("pm-live-proof-c2", replPod, "ready", 12345, "192.168.122.243", preservedIP))
+		fakeCiliumEndpointObj("pm-live-proof-c2", replPod, "ready", 12345, "203.0.113.243", preservedIP))
 
 	res, err, done, handled := r.tryEstablishDataplaneReachability(context.Background(), pm, "pm-w2")
 	if err != nil {
@@ -140,7 +140,7 @@ func TestTryEstablish_Cilium_CrossNode_ConfirmsFromAuthoritativeRead(t *testing.
 	}
 }
 
-// TestTryEstablish_Cilium_WrongIP_FailsClosed: ADR-0324 P-VERIFY-C. A ready endpoint that received a
+// TestTryEstablish_Cilium_WrongIP_FailsClosed: ADR-0324 verification check C. A ready endpoint that received a
 // DIFFERENT IP (pin not honored) must fail closed (done=false, condition False,
 // PreservedIPNotOnCiliumEndpoint) — never falsely credit a dataplane that did not move the IP.
 func TestTryEstablish_Cilium_WrongIP_FailsClosed(t *testing.T) {
@@ -148,7 +148,7 @@ func TestTryEstablish_Cilium_WrongIP_FailsClosed(t *testing.T) {
 	const replPod = "redis-src-m-5604a0fb"
 	pm := strictCrossNodePM("live-proof-c2-mig1", preservedIP, replPod)
 	r := reconcilerForDataplane(t, pm, ciliumNMC("pm-w2", "cilium"),
-		fakeCiliumEndpointObj("pm-live-proof-c2", replPod, "ready", 12345, "192.168.122.243", "10.244.2.99"))
+		fakeCiliumEndpointObj("pm-live-proof-c2", replPod, "ready", 12345, "203.0.113.243", "10.244.2.99"))
 
 	_, _, done, handled := r.tryEstablishDataplaneReachability(context.Background(), pm, "pm-w2")
 	if !handled {

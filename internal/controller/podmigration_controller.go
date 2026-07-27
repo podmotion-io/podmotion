@@ -421,7 +421,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// gate over the WHOLE phase machine). A live migration that never reaches a terminal phase is the
 	// exact forever-wedge invariant #8 forbids: the sprint46B3 live-proof cycle-2 migration wedged in
 	// phase=Verifying past the 120s cap with its finalizer intact and the namespace stuck Terminating
-	// (docs/sprints/sprint46B3/live-proof-c2-transcript.txt: DisengageHold→Verifying→…→watch rc=124 at
+	// (DisengageHold→Verifying→…→watch rc=124 at
 	// 125s, MIG1_FINAL_PHASE=Verifying), because NO phase on that path enforced a wall-clock terminal
 	// bound. The pre-existing bound in reconcileServiceVerifying is phase-LOCAL and never runs here —
 	// the live Strict path (fresh CRs) is DisengageHold→TCPVerifying→ServiceVerifying
@@ -6075,8 +6075,7 @@ func (r *PodMigrationReconciler) injectIPHandoff(ctx context.Context, pm *pmv1.P
 // (DataplaneReachabilityVerified) from the destination CNI's own AUTHORITATIVE readiness
 // write-back instead of the ADR-0210 source-node nonce round-trip.
 //
-// SUBSTRATE ROOT CAUSE (sprint46B2, decoded from source — see docs/sprints/sprint46B2/
-// live-proof-cycle2.md): the ADR-0210 producer establishes the condition with a nonce round-trip
+// SUBSTRATE ROOT CAUSE (sprint46B2, decoded from source): the ADR-0210 producer establishes the condition with a nonce round-trip
 // dialed FROM the source-node agent (ProbeDataplaneReachability, server.go: net.Dialer.DialContext
 // + `ip route get`) TO the preserved IP. But ADR-0012 holds the SOURCE pod alive on the SOURCE
 // node with that exact IP until this very condition is True, so on the source node the preserved
@@ -6221,7 +6220,7 @@ func (r *PodMigrationReconciler) verifyDataplaneReachability(ctx context.Context
 		// block (former ADR-0210 behavior) caused a structural deadlock: DataplaneReachabilityVerified
 		// was held False forever, and the safety block in reconcileCutoverComplete (line 1377) requeued
 		// every 10s indefinitely — source pod was never deleted (Sprint 37 carry-forward, gate-redis-s35
-		// ran 14+ hours post-CutoverComplete). §P-MECHANISM: docs/sprints/SPRINT38-PMECHANISM-FINALIZATION.md
+		// ran 14+ hours post-CutoverComplete).
 		//
 		// Fix: in the same-node case, TrafficVerified=True (set by injectIPHandoff, reason=HandoffInstalled)
 		// is the strongest available proof that the preserved IP is configured on this node. A cross-node

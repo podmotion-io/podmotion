@@ -7,7 +7,7 @@ you may not use this file except in compliance with the License.
 
 package server
 
-// adr0357_conntrack_disarm_symmetry_test.go — ADR-0357 D3 / AC4 / §P-VERIFY assertion 3
+// adr0357_conntrack_disarm_symmetry_test.go — ADR-0357 D3 / AC4 / verification assertion 3
 // regression coverage: disarmConntrackNotrackForHold must be the ONE place that removes the
 // ADR-0224 conntrack NOTRACK rule, called from BOTH the watchdog-fired path and
 // DisarmZeroWindow's normal path — closing the leak where a watchdog-fired disarm reached
@@ -69,7 +69,7 @@ func TestDisarmConntrackNotrackForHold_CallsSeamWithCorrectRule(t *testing.T) {
 	}
 }
 
-// TestDisarmConntrackNotrackForHold_TwoNonTestCallSites is the literal §P-VERIFY assertion 3
+// TestDisarmConntrackNotrackForHold_TwoNonTestCallSites is the literal verification assertion 3
 // grep-verification this ADR requires: disarmConntrackNotrackForHold must have >=2 non-test
 // call sites in server.go — the watchdog-fired goroutine (inside ArmZeroWindow) and
 // DisarmZeroWindow's normal path — and there must be zero remaining inline duplicate of the

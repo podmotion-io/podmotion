@@ -197,7 +197,7 @@ func TestStubEBPFManagerPatchRelayTsDelta(t *testing.T) {
 	}
 }
 
-// TestStubEBPFManagerLookupSeqXlat is ADR-0357 §P-VERIFY assertion 1: the stub implementation
+// TestStubEBPFManagerLookupSeqXlat is ADR-0357 verification assertion 1: the stub implementation
 // (non-Linux/test) must return (_, false, nil) — never panic, never report found=true — because
 // there is no real kernel map behind a stub manager. A stub-backed migration can never
 // truthfully claim PM_SEQ_XLAT is seeded.

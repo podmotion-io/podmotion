@@ -156,8 +156,7 @@ func TestResolveReattachMounts_ResolvesHostTargetByLabelWhenStatusEmpty(t *testi
 
 // TestResolveReattachMounts_BareNFSVolumeNoPVC is the sprint53-kind EC2/ADR-0193-P-0193-1 regression:
 // a pod spec whose volume is a BARE pod-spec `nfs:` source with NO PersistentVolumeClaim wrapper —
-// the exact shape used on a cluster with no StorageClass/CSI (see
-// docs/sprints/sprint53-kind/STATUS-EC2-KUBEADM.md), where the postgres PGDATA mount was pointed at
+// the exact shape used on a cluster with no StorageClass/CSI, where the postgres PGDATA mount was pointed at
 // a raw NFS export instead of a PVC. Before the fix, resolveReattachMountsImpl was keyed exclusively
 // on v.PersistentVolumeClaim, so this pod's PGDATA volume never entered pvcVolToClaim, the function
 // returned an EMPTY reattach set, and patch_checkpoint_script.go's ADR-0194 B-2 drop pass discarded

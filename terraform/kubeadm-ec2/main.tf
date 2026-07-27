@@ -220,7 +220,7 @@ resource "aws_instance" "worker" {
 # Written on every apply so this workstation can immediately SSH into both
 # nodes (to run kubeadm bootstrap, repair failures, deploy PodMotion, etc.)
 # without any manual key/IP wrangling — same hosts.env + ssh.sh pattern
-# already used for the KVM substrate (/home/chad/podmotion-kvm/), so the
+# already used for the KVM substrate ($HOME/podmotion-kvm/), so the
 # same muscle memory and scripts work against either substrate.
 
 resource "local_file" "hosts_env" {
@@ -238,7 +238,7 @@ resource "local_file" "ssh_helper" {
   content         = <<-EOT
     #!/usr/bin/env bash
     # ssh.sh <ip> "<cmd>" — same calling convention as the KVM substrate's
-    # own /home/chad/podmotion-kvm/ssh.sh. Usage: bash ssh.sh $CP1 "sudo systemctl status kubelet"
+    # own $HOME/podmotion-kvm/ssh.sh. Usage: bash ssh.sh $CP1 "sudo systemctl status kubelet"
     set -euo pipefail
     ip="$1"; shift
     exec ssh -i "$(dirname "$0")/${local.name_prefix}-ssh-key.pem" \

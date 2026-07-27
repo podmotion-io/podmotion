@@ -643,8 +643,7 @@ func (s *AgentServer) finalizeRestore(ctx context.Context, pid int, netnsPath, i
 	// an AUTHORITATIVE at-restore-time CAPTURE taken from the restored process's OWN netns
 	// (captureRestoredVethMAC, invoked by joinNsRestore the instant CRIU brings the process up) and
 	// WRITTEN BACK into the per-migration record. finalizeRestore SERVES that VALUE — it does NOT
-	// re-enter a recorded netns PATH after the fact. The live-proof
-	// (docs/sprints/sprint46B2/live-proof-cycle1.md) falsified the record-a-pointer / re-read-the-path
+	// re-enter a recorded netns PATH after the fact. The live-proof falsified the record-a-pointer / re-read-the-path
 	// design: the controller re-invoked Restore ~25 times over ~75s, each re-reading `eth0` against
 	// the recorded /var/run/netns/cni-<id> handle via the broker's path-mode nsenter and getting
 	// empty — even though the restored pod was reachable at its pod IP — the exact poll-and-hope
@@ -1283,7 +1282,7 @@ type reattachMount struct {
 // This replaces the PRIOR pvcIsTier0RWX helper, which checked ONLY pvc.Spec.AccessModes and never
 // consulted the StorageClass at all. PodMotion's own `longhorn-migratable` StorageClass IS
 // ReadWriteMany (RWX is required so Longhorn can hold the volume dual-attached during its dual-engine
-// live migration — see docs/sprints/sprint46*/state.yaml and storage/tier1.go), so that narrower
+// live migration — see storage/tier1.go), so that narrower
 // check silently misclassified a Tier1-Longhorn PVC as Tier0 and threaded it through
 // patch_checkpoint_script.go's generic "Tier0 RWX cross-node" path — the exact mislabeling this fixes.
 // Conversely, had a deployment used a non-RWX Longhorn StorageClass, the old AccessModes-only check
@@ -1706,8 +1705,7 @@ func (s *AgentServer) resolveReattachMountsImpl(callerCtx context.Context, migra
 	// PVC-backed Tier0 RWX volumes are: per ADR-0007, NFS is Tier0 (ReadWriteMany, re-attach only,
 	// zero data movement) regardless of whether it arrives through a PersistentVolumeClaim or a raw
 	// pod-spec `nfs:` volume source. Prior to this, this function was keyed exclusively on
-	// v.PersistentVolumeClaim, so a bare-NFS pod (the shape used on clusters with no StorageClass/CSI —
-	// see docs/sprints/sprint53-kind/STATUS-EC2-KUBEADM.md) always produced an EMPTY reattach set here,
+	// v.PersistentVolumeClaim, so a bare-NFS pod (the shape used on clusters with no StorageClass/CSI) always produced an EMPTY reattach set here,
 	// even though internal/agent/storage.classifier's StorageReadyForFreeze precondition gate reported
 	// it as Tier0/RWX-ready. That divergence let a genuinely re-attachable NFS mount reach
 	// patchCheckpointImages with no reattachMountPaths entry, so it was ADR-0194 B-2 dropped as an
@@ -2598,7 +2596,7 @@ var (
 // /var/run/netns/cni-<id> handle and the restored process's netns are the SAME namespace, but they
 // differ in ACCESS METHOD. The broker's path-mode nsenter EvalSymlink-resolves the bind and, on the
 // live substrate, returned empty `ip link show eth0` for ~75s across ~25 controller re-invocations
-// even though the pod was reachable at its pod IP (docs/sprints/sprint46B2/live-proof-cycle1.md). The
+// even though the pod was reachable at its pod IP. The
 // SrcPID entry (/proc/<pid>/ns/net, routed through the broker — the agent never spawns nsenter
 // directly) is the reliable one: it is exactly what the lo-up uses successfully, with zero AppArmor
 // nsenter denials (live-proof criterion 3). Reading the process's own namespace is also the true
@@ -5596,8 +5594,7 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	if destNetnsFd == "" {
 		if sandboxID == "" {
 			// tcpPreservationMode=None on the gRPC Restore path (or any path where
-			// s.k8sClient == nil at the caller and no self-resolve was attempted — see
-			// docs/sprints/sprint46B2/template-adr-1.md §0.2 for the precise gating): no
+			// s.k8sClient == nil at the caller and no self-resolve was attempted): no
 			// sandbox ID is supplied. For cold migration (no TCP state to preserve) the
 			// --join-ns net:<path> is not required — petnsPath stays empty and
 			// buildCRIURestoreArgs omits --join-ns. The NRI hook path always supplies a
@@ -6342,8 +6339,7 @@ var cgroupFsRoot = "/sys/fs/cgroup"
 
 // isSliceToken reports whether containerCgroupsPath is a systemd cgroup-driver slice token
 // ("<slice>.slice:<runtime-prefix>:<id>", 3 colon-separated fields) rather than a raw
-// /sys/fs/cgroup-relative filesystem path. ADR-0351 D2.2, shape GROUNDED live (G0.2,
-// docs/sprints/sprint46B7/g0-probe-adr0351-transcript.md): on this substrate
+// /sys/fs/cgroup-relative filesystem path. ADR-0351 D2.2, shape GROUNDED live (G0.2): on this substrate
 // container.GetLinux().GetCgroupsPath() always arrives in this form
 // ("kubepods-burstable-pod<uid>.slice:cri-containerd:<containerID>"), never a raw path — but the
 // check is written generically (colon-count + a leading path separator disqualifies) so a future

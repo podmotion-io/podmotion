@@ -295,7 +295,7 @@ func (n *notFoundEBPFStub) LookupSeqXlat(_ context.Context, _ SeqXlatKey) (SeqXl
 	return SeqXlatEntry{}, false, nil
 }
 
-// TestSeedRelayFromSnapshots_LookupVerificationFailure is the ADR-0357 D1.2 / §P-VERIFY
+// TestSeedRelayFromSnapshots_LookupVerificationFailure is the ADR-0357 D1.2 / verification
 // assertion 1 fault-injection regression: when ArmRelay succeeds (returns nil) but the
 // follow-up LookupSeqXlat reports the entry is not resident, SeedRelayFromSnapshots MUST fail
 // closed — an ArmRelay Update() call returning without error is not sufficient evidence the
