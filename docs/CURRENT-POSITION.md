@@ -15,14 +15,14 @@
    baseline + scope matrix) — **NOT yet proven.** Its controller-wiring gate (G1) passed
    14/14 (commit `5e76312`), but its core capability gate (G6, multi-container consistent
    freeze) has no code yet and is not started.
-3. **Active work is pre-M22 hardening, not M22 itself:** three parallel Vorns —
+3. **Active work is pre-M22 hardening, not M22 itself:** three parallel workstreams —
    Workstream-40A (chaos-backlog catch-up), Workstream-40B-1 (Docker/containerd runtime certification),
    Workstream-40B-2 (KVM certification, spike-gated) — each declares `serves_milestone` in its
    own header (see those docs). This hardens the substrate M22's future proof will run on;
    it does not itself close M22.
 4. **Current global sprint: Sprint 40**, Step 2, closed `GATE_PASS` (commit `cfc1450`).
 5. **Spine state:** `phase: C`, `phase_state: closed`, `next_action: RESUME`.
-6. **Next action:** resume Sprint 40 Step 3 across the three active Vorns (Workstream-40A,
+6. **Next action:** resume Sprint 40 Step 3 across the three active workstreams (Workstream-40A,
    Workstream-40B-1 in parallel; Workstream-40B-2 remains spike-gated pending its architecture spike).
 
 ## History (append one row per sprint close; newest at the bottom)
