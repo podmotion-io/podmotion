@@ -21,6 +21,7 @@ package rollback
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -67,7 +68,16 @@ func (r *DefaultRollbacker) Rollback(ctx context.Context, pm *pmv1.PodMigration)
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("rollback partial failure (%d/%d steps failed): %v", len(errs), len(steps), errs)
+		// ADR-0368 CONDITION 4 (§9 runtime-dependency audit finding): this outer combine used to
+		// interpolate errs with %v, which does NOT preserve errors.Is-traversal through the
+		// combined error — errors.Join wraps the []error slice with an Unwrap() []error method
+		// that errors.Is/As correctly walks, and %w threads that joined error through this
+		// message's own wrapping so both the message AND errors.Is(returnedErr,
+		// storage.ErrRollbackPointOfNoReturn/ErrRollbackNotImplemented) work. Without this fix the
+		// controller-side errors.Is check this whole ADR depends on (reconcileRollingBack) is dead
+		// code — it would never match, because the sentinel was wrapped one layer per-step
+		// (fmt.Errorf("%s: %w", ...) above) but then flattened to a plain string by %v here.
+		return fmt.Errorf("rollback partial failure (%d/%d steps failed): %w", len(errs), len(steps), errors.Join(errs...))
 	}
 	return nil
 }
@@ -131,23 +141,70 @@ func (s *StubComputeRollback) Execute(ctx context.Context, pm *pmv1.PodMigration
 	return nil
 }
 
-// StubStorageRollback releases the destination volume reservation and tears down
-// any pre-staged storage. For Longhorn: cancel dual-engine migration. For Ceph RBD:
-// abort the rbd migration. For snapshot+rsync: delete the destination PVC clone.
+// StubStorageRollback is the pre-ADR-0368 no-op storage rollback step. RETAINED only for any
+// caller that genuinely wants a no-storage-managed rollback pipeline (e.g. a unit test with no
+// StorageMgr at all); NewStubRollbacker no longer uses it — see RealStorageRollback below.
+// Deliberately NOT the default anymore: this type unconditionally returning nil regardless of
+// whether a destination-side reservation actually needs releasing is exactly the "fabricated
+// success" failure mode ADR-0368 exists to close (see that ADR's §1 for the live outage this
+// caused). Do not wire this into the production rollback pipeline.
 type StubStorageRollback struct{}
 
 func (s *StubStorageRollback) Name() string { return "StorageRollback" }
 func (s *StubStorageRollback) Execute(ctx context.Context, pm *pmv1.PodMigration) error {
-	ctrl.LoggerFrom(ctx).Info("stub: storage rollback — no-op in M2", "migration", pm.Name)
+	ctrl.LoggerFrom(ctx).Info("stub: storage rollback — no-op (StubStorageRollback, not wired by NewRollbacker)", "migration", pm.Name)
 	return nil
 }
 
-// NewStubRollbacker returns a DefaultRollbacker wired with all stub steps.
-// Used in cmd/main.go for M2; swap individual steps for real implementations as agents land.
-// sourceAgentClient may be nil in stub/test mode. CORRECTED (ADR-0248): passing nil here
-// means the live rollback path CANNOT thaw a frozen source — there is no watchdog. Thaw
-// only happens via an Abort RPC (thawFrozenSource) or a source-agent restart
-// (ReconcileOrphanedFrozenSources). Wire a real Abort-capable client per ADR-0248 D2.
+// StorageDestinationReleaser is the interface RealStorageRollback dispatches through —
+// implemented by *storage.StorageMigrationManager
+// (internal/agent/storage/manager.go's ReleaseDestination method). Declared narrowly here,
+// rather than depending on the concrete StorageMigrationManager type (and its client.Client/
+// Classifier dependencies) directly in this package, so rollback_test.go can inject a minimal
+// fake — while cmd/main.go still passes the SAME *storage.StorageMigrationManager instance the
+// forward storage-cutover pipeline (the controller's StorageMgr field) already holds
+// (ADR-0368 §5.3/CONDITION 5), guaranteeing Cutover's attach and rollback's ReleaseDestination
+// dispatch through the identical, already-configured Migrator instances — never a second,
+// independently constructed manager that only happens to be configured the same way today.
+type StorageDestinationReleaser interface {
+	ReleaseDestination(ctx context.Context, pm *pmv1.PodMigration) error
+}
+
+// RealStorageRollback replaces StubStorageRollback as the production StorageStep (ADR-0368): it
+// dispatches to the SAME StorageMigrationManager/Migrator instances the forward storage-cutover
+// pipeline already used for this migration, undoing whatever destination-side reservation
+// Cutover created via Migrator.ReleaseDestination. A non-nil error here — including the two
+// sentinel errors, storage.ErrRollbackPointOfNoReturn/storage.ErrRollbackNotImplemented —
+// propagates through DefaultRollbacker.Rollback's now-%w-wrapped combine (CONDITION 4) to
+// reconcileRollingBack, which errors.Is-checks for them and sets a distinct, human-actionable
+// condition (ADR-0368 §6 item 3). This step itself does no condition-setting; it only reports
+// StorageMgr's verdict, exactly as StubComputeRollback/StubNetworkRollback report theirs.
+type RealStorageRollback struct {
+	// StorageMgr is the shared StorageMigrationManager instance — see StorageDestinationReleaser's
+	// doc comment for why it MUST be the same instance the forward pipeline uses, not a second one.
+	StorageMgr StorageDestinationReleaser
+}
+
+func (s *RealStorageRollback) Name() string { return "StorageRollback" }
+func (s *RealStorageRollback) Execute(ctx context.Context, pm *pmv1.PodMigration) error {
+	if s.StorageMgr == nil {
+		// Fail loud, never silently no-op: an un-wired StorageMgr is a real configuration gap,
+		// not "nothing needed releasing." A fail-open fallback here is exactly the class of bug
+		// the zero-tech-debt pillar prohibits and this ADR exists to close.
+		ctrl.LoggerFrom(ctx).Error(nil, "RealStorageRollback: no StorageMgr wired — cannot attempt to release destination storage", "migration", pm.Name)
+		return fmt.Errorf("storage rollback: no StorageMgr wired for migration %s", pm.Name)
+	}
+	return s.StorageMgr.ReleaseDestination(ctx, pm)
+}
+
+// NewStubRollbacker returns a DefaultRollbacker wired with the NetworkStep/ComputeStep stubs
+// unchanged, and StubStorageRollback (the pre-ADR-0368 no-op) for StorageStep. RETAINED for any
+// caller that explicitly wants no storage-rollback behavior (e.g. isolating a Network/Compute-only
+// test) — production wiring (cmd/main.go) uses NewRollbacker instead. sourceAgentClient may be nil
+// in stub/test mode. CORRECTED (ADR-0248): passing nil here means the live rollback path CANNOT
+// thaw a frozen source — there is no watchdog. Thaw only happens via an Abort RPC
+// (thawFrozenSource) or a source-agent restart (ReconcileOrphanedFrozenSources). Wire a real
+// Abort-capable client per ADR-0248 D2.
 func NewStubRollbacker(sourceAgentClient interface {
 	Abort(ctx context.Context, migrationName, reason string) error
 }) *DefaultRollbacker {
@@ -155,5 +212,22 @@ func NewStubRollbacker(sourceAgentClient interface {
 		NetworkStep: &StubNetworkRollback{},
 		ComputeStep: &StubComputeRollback{SourceAgentClient: sourceAgentClient},
 		StorageStep: &StubStorageRollback{},
+	}
+}
+
+// NewRollbacker returns a DefaultRollbacker wired with the real storage-undo step
+// (RealStorageRollback) in place of NewStubRollbacker's StubStorageRollback no-op (ADR-0368).
+// sourceAgentClient may be nil in stub/test mode (see StubComputeRollback's doc comment —
+// ADR-0248 D2 remains open, unaffected by this ADR). storageMgr MUST be the SAME
+// *storage.StorageMigrationManager instance the caller's forward storage-cutover pipeline (the
+// controller's StorageMgr field) already holds — see StorageDestinationReleaser's doc comment
+// for why passing a second, independently constructed manager would defeat the whole point.
+func NewRollbacker(sourceAgentClient interface {
+	Abort(ctx context.Context, migrationName, reason string) error
+}, storageMgr StorageDestinationReleaser) *DefaultRollbacker {
+	return &DefaultRollbacker{
+		NetworkStep: &StubNetworkRollback{},
+		ComputeStep: &StubComputeRollback{SourceAgentClient: sourceAgentClient},
+		StorageStep: &RealStorageRollback{StorageMgr: storageMgr},
 	}
 }

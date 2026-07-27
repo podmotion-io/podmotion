@@ -241,9 +241,11 @@ func TestPodMutatingWebhookNoDestNodeResolvedFallsThroughToNoAnnotation(t *testi
 // value (labels only allow alphanumeric, '-', '_', '.') — every replacement pod CREATE
 // was rejected by the API server with "a valid label must be an empty string or
 // consist of alphanumeric characters, '-', '_' or '.'", making live migration fail
-// 100% of the time. The annotation (which allows arbitrary values) must still carry
-// the full path; only the label must switch to pm.Name, matching the controller's own
-// convention in createReplacementPod (replacementPodMigrationNameLabel = pm.Name).
+// 100% of the time. Per ADR-0369, both the annotation and the label must carry
+// pm.Name (the bare migration identifier, not the checkpoint path) — matching the
+// controller's own convention in createReplacementPod
+// (replacementPodMigrationNameLabel = pm.Name) and what every other reader of this
+// annotation (NRI plugin regex, path-joiner, anti-spoof comparator) already assumes.
 func TestPodMutatingWebhookCheckpointRefLabelIsLegal(t *testing.T) {
 	const ns = "default"
 	const migName = "mig-3"
@@ -290,8 +292,8 @@ func TestPodMutatingWebhookCheckpointRefLabelIsLegal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("looking for %s annotation patch: %v", AnnotationCheckpointRef, err)
 	}
-	if gotAnn != checkpointPath {
-		t.Fatalf("annotation %s = %q, want %q (full path preserved)", AnnotationCheckpointRef, gotAnn, checkpointPath)
+	if gotAnn != migName {
+		t.Fatalf("annotation %s = %q, want %q (pm.Name, not the checkpoint path)", AnnotationCheckpointRef, gotAnn, migName)
 	}
 
 	gotLabel, err := findLabelInPatches(resp.Patches, AnnotationCheckpointRef)

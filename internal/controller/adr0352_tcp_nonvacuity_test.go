@@ -7,17 +7,23 @@ you may not use this file except in compliance with the License.
 
 package controller
 
-// adr0352_tcp_nonvacuity_test.go — ADR-0352 B8-DR-2 / D6(i) / DR-23 NON-VACUITY regression.
+// adr0352_tcp_nonvacuity_test.go — ADR-0352 B8-DR-2 / D6(i) / DR-23 NON-VACUITY regression,
+// updated per ADR-0388 (docs/adr/0388-strict-vacuous-pass-and-default.md), which corrects
+// ADR-0352 B8-DR-2.
 //
-// The sprint46B8 live-proof reached phase=Complete but certified
-// TCPSequenceContinuityVerified=True over "0/0 connections" (ConnectionsExpected=0): a VACUOUS
-// pass the ADR declares a hard FAIL, because seq_delta==0 is trivially true over zero connections
-// and TCPSequenceContinuityVerified is a REQUIRED Strict source-teardown predicate
-// (api/v1alpha1/source_teardown.go:80-84) — so a 0/0 pass authorises deleting the source on a
-// proof of nothing (invariant #1). reconcileTCPVerifying now gates the final True-write on
-// strictTCPContinuityVacuityReason, which reads the agent's source-of-truth held-connection count
-// (ConnectionsExpected) directly and fails CLOSED under Strict. This test pins that predicate so a
-// future regression that re-admits the 0/0 vacuity goes red here, not silently green live.
+// The sprint46B8 live-proof reached phase=Complete and certified
+// TCPSequenceContinuityVerified=True over "0/0 connections" (ConnectionsExpected=0). Prior to
+// ADR-0388 this was declared a VACUOUS proof / hard FAIL under Strict. Chad's standing direction
+// (2026-07-23) corrected that premise: a genuine, positively-observed zero means there was nothing
+// to preserve, so Strict is TRIVIALLY SATISFIED, not unprovable — a 0/0 completion is now an
+// intended PASS, not a defect. What remains vacuous (still fails closed) is the NEGATIVE
+// missing-snapshot sentinel (ConnectionsExpected<0): source SeqSnapshots absent while the
+// destination reports live ESTABLISHED connections is an infra/proto problem, not a confirmed
+// zero, and absence of evidence is still not proof of continuity (ADR-0049).
+// strictTCPContinuityVacuityReason now reads the agent's source-of-truth held-connection count
+// (ConnectionsExpected) directly and fails CLOSED under Strict only for that negative-sentinel
+// case. This test pins that predicate so a future regression that re-admits the sentinel as a
+// pass, or that re-fails a genuine zero, goes red here, not silently wrong live.
 
 import (
 	"strings"
@@ -35,11 +41,13 @@ func TestStrictTCPContinuityVacuityReason(t *testing.T) {
 		wantVacuous bool
 	}{
 		{
-			// The exact live-proof case: Strict, VerifyTCP Verified=true, 0/0 connections.
-			name:        "Strict_zero_connections_is_vacuous",
+			// ADR-0388: the exact live-proof case — Strict, VerifyTCP Verified=true, a genuine
+			// 0/0 — is now TRIVIALLY SATISFIED (not vacuous). Nothing was held, nothing needed
+			// to be preserved.
+			name:        "Strict_zero_connections_is_not_vacuous",
 			mode:        pmv1.TCPPreservationModeStrict,
 			resp:        &agentpb.VerifyTCPResponse{Verified: true, ConnectionsVerified: 0, ConnectionsExpected: 0},
-			wantVacuous: true,
+			wantVacuous: false,
 		},
 		{
 			// A real held connection: non-vacuous, must be allowed to certify.
@@ -49,7 +57,8 @@ func TestStrictTCPContinuityVacuityReason(t *testing.T) {
 			wantVacuous: false,
 		},
 		{
-			// server.go:7599 sentinel (snapshots missing) — fail closed under Strict too.
+			// server.go negative sentinel (snapshots missing, NOT a genuine zero) — this is an
+			// infra/proto problem, still fails closed under Strict even after ADR-0388.
 			name:        "Strict_negative_sentinel_is_vacuous",
 			mode:        pmv1.TCPPreservationModeStrict,
 			resp:        &agentpb.VerifyTCPResponse{Verified: false, ConnectionsVerified: 0, ConnectionsExpected: -1},
@@ -88,8 +97,8 @@ func TestStrictTCPContinuityVacuityReason(t *testing.T) {
 				t.Fatalf("expected NON-vacuous (empty block reason) for mode=%s ConnectionsExpected=%d, got %q (would wrongly roll back a valid migration)",
 					tc.mode, tc.resp.GetConnectionsExpected(), got)
 			}
-			if tc.wantVacuous && !strings.Contains(got, "vacuous 0/0 proof") {
-				t.Fatalf("vacuity reason must name the 0/0 proof for operator triage, got %q", got)
+			if tc.wantVacuous && !strings.Contains(got, "missing-snapshot sentinel") {
+				t.Fatalf("vacuity reason must name the missing-snapshot sentinel for operator triage, got %q", got)
 			}
 		})
 	}

@@ -193,3 +193,12 @@ func (m *RWXReattachMigrator) Cutover(ctx context.Context, opts MigrationOptions
 func (m *RWXReattachMigrator) AwaitSingleOwner(_ context.Context, _ MigrationOptions) error {
 	return nil
 }
+
+// ReleaseDestination returns nil unconditionally (ADR-0368 §5.2). Tier0's Cutover performs no
+// destination-side manager-level reservation — only a source-side StorageHandoffReady
+// confirmation — so there is structurally nothing to release. This is a real "no-op is correct"
+// case, not a stub: no future volume-shape or classification path can make Tier0's Cutover start
+// creating a destination-side reservation without also changing this comment.
+func (m *RWXReattachMigrator) ReleaseDestination(_ context.Context, _ MigrationOptions) error {
+	return nil
+}

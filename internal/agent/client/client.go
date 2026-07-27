@@ -141,6 +141,17 @@ func (p *AgentClientPool) resolveAgentPodIP(ctx context.Context, nodeName string
 	return "", fmt.Errorf("no running agent pod found for node %q in namespace %q", nodeName, agentNamespace)
 }
 
+// SeedConnForTest injects a pre-established *grpc.ClientConn into the pool's connection cache for
+// nodeName, so a subsequent ForNode(nodeName) returns a client backed by that connection instead
+// of dialing a resolved pod/NMC address. Test-only: lets integration tests exercise the real
+// AgentPool.ForNode -> MigrationAgentServiceClient call path (e.g. RunPreCopyLoop) against an
+// in-process (bufconn) fake agent server without needing a routable network address.
+func SeedConnForTest(p *AgentClientPool, nodeName string, conn *grpc.ClientConn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.conns[nodeName] = conn
+}
+
 // InvalidateNode drops a cached connection for the given node so the next ForNode
 // call will re-resolve the pod IP and re-dial. Call this when a gRPC call fails.
 func (p *AgentClientPool) InvalidateNode(nodeName string) {

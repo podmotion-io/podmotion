@@ -56,6 +56,9 @@ func (m *mockEBPFManager) ArmXDPBridge(_ context.Context, _, _ net.IP, _ uint16)
 	return nil
 }
 func (m *mockEBPFManager) DisarmXDPBridge(_ context.Context, _ net.IP) error { return nil }
+func (m *mockEBPFManager) ListXDPBridgeKeys(_ context.Context) ([]net.IP, error) {
+	return nil, nil
+}
 func (m *mockEBPFManager) CheckXDPHookConflict(_ context.Context, _ uint32) (bool, error) {
 	return false, nil
 }

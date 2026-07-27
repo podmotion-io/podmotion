@@ -109,6 +109,18 @@ type ConsistentFreezeOptions struct {
 	// DumpOptions provides default CRIU dump options (Pid and CheckpointDir are
 	// overridden per container).
 	DumpOptions DumpOptions
+	// PodUID, when set together with VolumeDrainer, enables the ADR-0394 below-app
+	// storage I/O drain: after the cgroup freeze confirms (no new I/O can be issued)
+	// and before any CRIU dump begins, the pod's volume mount(s) are syncfs(2)-drained
+	// and verified inside the freeze barrier. Empty = no drain.
+	PodUID string
+	// VolumeDrainer, when non-nil and PodUID is set, drains and verifies the pod's
+	// volume writeback inside the freeze barrier (ADR-0394). It returns a non-nil
+	// error on a failed/unverified flush, which HARD-STOPS the freeze (the barrier
+	// thaws and returns) rather than dumping over an unproven-consistent volume.
+	// Injected as a function to avoid a criu→storage import edge; server wiring
+	// passes storage.DrainPodVolumesErr.
+	VolumeDrainer func(ctx context.Context, podUID string) error
 }
 
 // ConsistentFreeze atomically freezes all containers in the pod using the cgroup
@@ -171,6 +183,26 @@ func consistentFreezeImpl(ctx context.Context, opts ConsistentFreezeOptions) (Fr
 		"freezeDurationMs", freezeDurationMs,
 		"containerCount", len(opts.Containers),
 	)
+
+	// ── Step 1b (ADR-0394): below-app storage I/O drain, fail-closed ─────────────
+	// The cgroup is now FROZEN — no container in the pod can issue new I/O. This is
+	// the correct barrier position for the syncfs(2) drain: flush already-submitted
+	// writeback to disk and verify it before CRIU dumps, so the checkpoint reflects
+	// a proven-drained volume, not merely whatever writeback the kernel happened to
+	// flush. A failed/unverified flush HARD-STOPS the freeze: we thaw the pod and
+	// return, rather than dumping over an unproven-consistent volume (ADR-0394
+	// §Decision-3). Runs only when both PodUID and VolumeDrainer are set.
+	if opts.PodUID != "" && opts.VolumeDrainer != nil {
+		if drainErr := opts.VolumeDrainer(ctx, opts.PodUID); drainErr != nil {
+			// Thaw before returning so the pod is not stuck frozen.
+			_ = writeCgroupThaw(opts.PodCgroupPath, opts.CgroupVersion)
+			logger.Error(drainErr, "ConsistentFreeze: storage drain FAILED or UNVERIFIED inside freeze barrier — thawed and aborting (fail-closed)",
+				"podUID", opts.PodUID)
+			return FreezeResult{}, fmt.Errorf("ConsistentFreeze: storage I/O drain failed or unverified (ADR-0394 fail-closed): %w", drainErr)
+		}
+		logger.Info("ConsistentFreeze: storage drain completed and verified inside freeze barrier",
+			"podUID", opts.PodUID)
+	}
 
 	// ── Step 2: CRIU dump each container in spec order (sidecars first, app last) ─
 

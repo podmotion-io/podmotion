@@ -55,8 +55,10 @@ var ptraceWindowDir = "/run/podmotion/ptrace-window"
 
 // defaultFreezeWindowBudgetMs is the fallback freeze-window budget used by the stale-window
 // sweeper when no per-request FreezeWindowBudgetMs is available to size the staleness bound.
-// It mirrors the agent freeze budget (network.ebpf defaultFreezeBudget = 5000ms); the
-// sweeper closes any window older than 2x this (SweepStaleWindows below).
+// It mirrors the historical 5000ms agent freeze budget; the sweeper closes any window
+// older than 2x this (SweepStaleWindows below). (The network.ebpf freeze-budget watchdog
+// that once shared this constant was removed by ADR-0400 — this is an independent local
+// constant, not a reference to it.)
 const defaultFreezeWindowBudgetMs = 5000
 
 // ptraceWindowPath returns the marker path for a container. containerID is sanitized to a

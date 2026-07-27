@@ -137,13 +137,28 @@ func (r *ReplicationManager) RunPreCopyLoop(
 		})
 		if err != nil {
 			// Pre-dump RPC failed (e.g. CRIU "Unable to interrupt task" on aarch64 daemon
-			// processes). Treat as ForceFreeze — no dirty pages to track, proceed to final
-			// checkpoint. This sets MemorySynced=True so the next reconcile does not launch
-			// another goroutine (goroutine-launch-leak fix).
-			log.Info("PreDumpRound failed — treating as ForceFreeze and proceeding to final checkpoint",
+			// processes, a transient agent-unreachable/timeout, or a decodeCRIUStats
+			// failure propagated as a gRPC error from PreDump). This is NOT the ADR-0011
+			// ForceFreeze-exhausted-rounds case (no real measurement backs it, possibly
+			// zero rounds completed) — it is a genuine "could not measure" state and must
+			// be kept distinguishable from a real bounded-downtime ForceFreeze decision
+			// (an unmeasured state must never be conflated with a real, bounded-downtime
+			// ForceFreeze decision). We still set
+			// MemorySynced=True so the next reconcile does not relaunch another pre-copy
+			// goroutine (goroutine-launch-leak fix), but we (1) use a distinct reason
+			// ("MeasurementFailed", never "ForceFreeze") and (2) explicitly persist a
+			// PreCopyStats record with DirtyStatsValid=false so the controller's TCP
+			// freeze-go gate has a real, non-nil state to fail closed on instead of
+			// inferring "no stats yet" from a nil pointer. For a TCP-preserving migration
+			// this makes the gate block/requeue (see preCopyTCPGatePassed) rather than
+			// silently passing with zero validated dirty-page measurement.
+			log.Info("PreDumpRound failed — measurement unavailable, proceeding to final checkpoint without a validated dirty-page measurement",
 				"round", round, "err", err)
-			return r.patchMemorySynced(ctx, pm, metav1.ConditionTrue, "ForceFreeze",
-				fmt.Sprintf("pre-dump round %d failed (%v): skipping pre-copy, proceeding to final freeze", round, err))
+			if statsErr := r.updatePreCopyStatsMeasurementFailed(ctx, pm, int(round)); statsErr != nil {
+				log.Error(statsErr, "failed to persist measurement-failed PreCopyStats")
+			}
+			return r.patchMemorySynced(ctx, pm, metav1.ConditionTrue, pmv1.ReasonMemorySyncedMeasurementFailed,
+				fmt.Sprintf("pre-dump round %d failed (%v): no validated measurement, proceeding to final freeze", round, err))
 		}
 
 		elapsedMs := time.Since(start).Milliseconds()
@@ -177,7 +192,7 @@ func (r *ReplicationManager) RunPreCopyLoop(
 			if err := r.updatePreCopyStats(ctx, pm, conv, rounds); err != nil {
 				log.Error(err, "failed to update PreCopyStats")
 			}
-			return r.patchMemorySynced(ctx, pm, metav1.ConditionTrue, "Converged",
+			return r.patchMemorySynced(ctx, pm, metav1.ConditionTrue, pmv1.ReasonMemorySyncedConverged,
 				fmt.Sprintf("%s: %dMB remaining after %d rounds", conv.Reason, conv.FinalDirtyMB, conv.Rounds))
 		}
 	}
@@ -187,7 +202,7 @@ func (r *ReplicationManager) RunPreCopyLoop(
 	if err := r.updatePreCopyStats(ctx, pm, conv, rounds); err != nil {
 		log.Error(err, "failed to update PreCopyStats on loop exit")
 	}
-	return r.patchMemorySynced(ctx, pm, metav1.ConditionTrue, "ForceFreeze",
+	return r.patchMemorySynced(ctx, pm, metav1.ConditionTrue, pmv1.ReasonMemorySyncedForceFreeze,
 		fmt.Sprintf("max rounds exhausted: %dMB remaining", conv.FinalDirtyMB))
 }
 
@@ -237,11 +252,60 @@ func truncateConditionMsg(s string, max int) string {
 }
 
 // updatePreCopyStats persists pre-copy metrics to pm.Status.PreCopyStats.
+//
+// InitialDirtyPagesMB is captured from round 0's real DirtyMB (rounds[0]) — every entry in
+// rounds reflects a REAL, successfully-decoded CRIU measurement: PreDumpRound only ever returns
+// a RoundStats to this loop when the source agent's PreDump call succeeded, and PreDump itself
+// fails closed (returns a Go error, never a fabricated DirtyPagesMB: 0) on any stats-decode
+// failure — see internal/agent/criu/criu_stats.go. A failed PreDumpRound RPC short-circuits the
+// loop via the MeasurementFailed branch above (updatePreCopyStatsMeasurementFailed, not this
+// function) and never reaches this function, so by construction every call here is backed by
+// real measurements.
+//
+// DirtyStatsValid is therefore true on every write this function makes — it exists as the
+// CRD-persisted, structurally fail-closed signal the controller's freeze-go gate reads: its Go
+// zero-value is false, so an undetected CRD-regen/pruning gap (the field silently dropped)
+// degrades to "gate always blocks/requeues," never to a silent pass.
 func (r *ReplicationManager) updatePreCopyStats(
 	ctx context.Context,
 	pm *pmv1.PodMigration,
 	conv ConvergenceResult,
 	rounds []RoundStats,
+) error {
+	key := client.ObjectKeyFromObject(pm)
+	var initialDirtyMB int64
+	if len(rounds) > 0 {
+		initialDirtyMB = rounds[0].DirtyMB
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &pmv1.PodMigration{}
+		if err := r.Client.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		fresh.Status.PreCopyStats = &pmv1.PreCopyStats{
+			RoundsCompleted:     int32(conv.Rounds),
+			FinalDirtyPagesMB:   int32(conv.FinalDirtyMB),
+			InitialDirtyPagesMB: int32(initialDirtyMB),
+			DirtyStatsValid:     len(rounds) > 0,
+			FreezeDurationMs:    0, // updated by Checkpointing phase after the real dump
+		}
+		return r.Client.Status().Update(ctx, fresh)
+	})
+}
+
+// updatePreCopyStatsMeasurementFailed persists an explicit "could not measure" PreCopyStats
+// record for the PreDumpRound-RPC-failure path. Unlike updatePreCopyStats — which
+// is only ever called with a real, successfully-decoded CRIU measurement — this function is
+// called precisely when NO real measurement exists for the round that failed. It writes
+// DirtyStatsValid=false explicitly rather than leaving PreCopyStats nil, so the controller's TCP
+// freeze-go gate (preCopyTCPGatePassed) has a real, non-nil, structurally-invalid state to key
+// its fail-closed decision on instead of having to infer "no measurement" from the absence of a
+// status field — the same "an explicit signal beats an absent one" primitive that motivated
+// DirtyStatsValid in the first place (see updatePreCopyStats doc comment).
+func (r *ReplicationManager) updatePreCopyStatsMeasurementFailed(
+	ctx context.Context,
+	pm *pmv1.PodMigration,
+	failedRound int,
 ) error {
 	key := client.ObjectKeyFromObject(pm)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -250,9 +314,11 @@ func (r *ReplicationManager) updatePreCopyStats(
 			return err
 		}
 		fresh.Status.PreCopyStats = &pmv1.PreCopyStats{
-			RoundsCompleted:   int32(conv.Rounds),
-			FinalDirtyPagesMB: int32(conv.FinalDirtyMB),
-			FreezeDurationMs:  0, // updated by Checkpointing phase after the real dump
+			RoundsCompleted:     int32(failedRound),
+			FinalDirtyPagesMB:   0,
+			InitialDirtyPagesMB: 0,
+			DirtyStatsValid:     false,
+			FreezeDurationMs:    0,
 		}
 		return r.Client.Status().Update(ctx, fresh)
 	})

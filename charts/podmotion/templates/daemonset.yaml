@@ -290,21 +290,38 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            # sprint50 (k3s compat): standard kubeadm/containerd installs use
-            # /run/containerd/{containerd.sock,io.containerd.runtime.v2.task/k8s.io/...} and
-            # /var/lib/containerd/io.containerd.runtime.v2.task/k8s.io/... . k3s's embedded
-            # containerd uses different roots (UNVERIFIED-EXTERNAL — see
-            # docs/sprints/sprint50-k3s/K3S-COMPATIBILITY-PLAN.md §0 items 1-4; confirm against
-            # a live k3s node before relying on a non-default override). These three values
-            # drive every containerd socket/bundle-path construction in the agent
-            # (internal/agent/server/containerd_paths.go, internal/agent/seccomp/manager.go) —
-            # override via agent.containerd.* on a k3s deploy instead of patching Go code.
-            - name: PODMOTION_CONTAINERD_RUN_ROOT
-              value: {{ dir .Values.agent.containerd.socketPath | quote }}
+            # ADR-0370: ground truth for the containerd self-discovery primitive
+            # (internal/agent/server/containerd_discovery.go) — the agent's OWN pod UID, used to
+            # find which containerd daemon actually owns this agent's own pod sandbox. Mirrors
+            # NODE_NAME above (both downward-API fields, no new RBAC/API-call surface).
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            # ADR-0370: PODMOTION_CONTAINERD_SOCKET/RUN_ROOT/STATE_ROOT are the EXPLICIT
+            # OPERATOR OVERRIDE path only, sourced from agent.containerd.override.* — a
+            # DIFFERENT set of values from agent.containerd.socketPath/stateDir above (those
+            # always render non-empty, driving the static volume mounts; tying the override
+            # signal to them would mean every deploy looks like an explicit override and
+            # self-discovery could never run). Emitted ONLY when the operator actually sets
+            # override.socket/runRoot/stateRoot (values.yaml default is ""). When unset, the
+            # agent self-discovers the authoritative containerd socket at startup instead of
+            # trusting a hardcoded default (containerd_discovery.go) — this is what fixes the
+            # RKE2/k3s dual-containerd case (kubelet drives only ONE of the two containerd
+            # daemons on the node) without silently mis-wiring a plain kubeadm/
+            # system-containerd deploy.
+            {{- if .Values.agent.containerd.override.socket }}
             - name: PODMOTION_CONTAINERD_SOCKET
-              value: {{ .Values.agent.containerd.socketPath | quote }}
+              value: {{ .Values.agent.containerd.override.socket | quote }}
+            {{- end }}
+            {{- if .Values.agent.containerd.override.runRoot }}
+            - name: PODMOTION_CONTAINERD_RUN_ROOT
+              value: {{ .Values.agent.containerd.override.runRoot | quote }}
+            {{- end }}
+            {{- if .Values.agent.containerd.override.stateRoot }}
             - name: PODMOTION_CONTAINERD_STATE_ROOT
-              value: {{ .Values.agent.containerd.stateDir | quote }}
+              value: {{ .Values.agent.containerd.override.stateRoot | quote }}
+            {{- end }}
             {{- if .Values.agent.cni.extraConfDir }}
             # detectCNI() (internal/agent/nmcregistrar/registrar.go) also scans this
             # container-local path (mounted from host-cni-conf-extra above) in addition to

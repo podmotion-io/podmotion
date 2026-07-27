@@ -147,6 +147,42 @@ const (
 	MigrationPhaseCutoverComplete         MigrationPhase = "CutoverComplete"
 )
 
+// IsTerminalOrRollingBackPhase is the CANONICAL classifier for "this migration has reached a
+// terminal outcome or is already on the absorbing rollback path" — the set
+// {Complete, Failed, DryRunComplete, RollingBack}. These phases are monotonic: the controller
+// never transitions out of them back into an in-flight phase.
+//
+// It is hoisted here (the shared api package that already owns the MigrationPhase constants and
+// is imported by every consumer) so callers share ONE definition rather than each keeping a
+// near-duplicate. Introduced for ADR-0412 to give the NRI restore gate a terminal-phase branch
+// without adding a fourth site-local copy (ADR-0412 condition #4).
+//
+// Cross-reference — three pre-existing local predicates classify "terminal" for DIFFERENT
+// purposes and MUST NOT be blindly collapsed into this one:
+//   - internal/controller/podmigration_controller.go isTerminalOrRollingBackPhase — SAME set
+//     (Complete/Failed/DryRunComplete/RollingBack); now delegates to this function.
+//   - internal/controller/migrationpolicy_controller.go isTerminal — the NARROWER set WITHOUT
+//     RollingBack {Complete, Failed, DryRunComplete}; RollingBack is still "in flight" for the
+//     scheduling/policy view, so it deliberately differs and is left independent.
+//   - internal/webhook/podmigration_webhook.go isTerminalPodMigrationPhase — also the narrower
+//     set WITHOUT RollingBack (a rolling-back migration still holds the source pod, so it counts
+//     as in-flight for the concurrent-migration admission guard) — left independent.
+//   - internal/controller/podmigration_controller.go isTerminalMigrationPhase — narrower set
+//     WITHOUT RollingBack for the ADR-0244 sibling-reclaim guard — left independent.
+//
+// The NRI restore gate (ADR-0412) needs the WITH-RollingBack set: a RollingBack migration is
+// aborting and must never cold-start a restore-target replacement (split-brain risk), so it is
+// treated as terminal-and-fail-closed exactly like Failed.
+func IsTerminalOrRollingBackPhase(p MigrationPhase) bool {
+	switch p {
+	case MigrationPhaseComplete, MigrationPhaseFailed,
+		MigrationPhaseRollingBack, MigrationPhaseDryRunComplete:
+		return true
+	default:
+		return false
+	}
+}
+
 // AffinityMode controls how PodMotion handles hard nodeAffinity and nodeSelector rules
 // that pin the source pod to its current node.
 // +kubebuilder:validation:Enum=strict;patch;ignore
@@ -222,9 +258,13 @@ type PodMigrationSpec struct {
 
 	// TCPPreservationMode controls TCP connection continuity behavior during migration.
 	// Strict triggers hard rollback if TCPSequenceContinuityVerified=False (ADR-0019 Amendment A).
+	// A pod with zero ESTABLISHED TCP connections at inventory/verification time has nothing to
+	// preserve, so Strict is trivially satisfied rather than failed in that case (ADR-0388,
+	// corrects ADR-0379 / ADR-0352 B8-DR-2). Strict is the default (ADR-0388, corrects the prior
+	// None default) precisely because it degrades safely to a no-op guarantee on a stateless pod.
 	// BestEffort emits a warning condition only.
 	// None skips the TCPVerifying phase entirely (stateless workloads).
-	// +kubebuilder:default=None
+	// +kubebuilder:default=Strict
 	TCPPreservationMode TCPPreservationMode `json:"tcpPreservationMode,omitempty"`
 
 	// FreezeWindowBudgetMs is the maximum allowed wall-clock milliseconds for the full
@@ -253,9 +293,14 @@ type PodMigrationSpec struct {
 	// +optional
 	DestinationCluster string `json:"destinationCluster,omitempty"`
 
-	// DestinationNode is the pre-selected destination node for the replacement pod.
-	// Set by the controller after capacity reservation; read by the scheduler plugin
-	// and MutatingAdmissionWebhook to enforce exclusive node placement.
+	// DestinationNode is a last-resort fallback in the destination-node resolution
+	// chain (Status.DestinationNodeName -> Spec.TargetNodeName -> Spec.DestinationNode)
+	// used by the scheduler plugin and MutatingAdmissionWebhook to enforce exclusive
+	// node placement. It has no writers in the controller today — the real
+	// controller-written destination is Status.DestinationNodeName (populated by
+	// cacheDestinationNodeFromSpec), and a user-pinned destination is
+	// Spec.TargetNodeName. This field is retained only as the final link in that
+	// chain; do not rely on it being set.
 	// +optional
 	DestinationNode string `json:"destinationNode,omitempty"`
 
@@ -331,6 +376,40 @@ const (
 	// bounded-downtime recovery. Every other storage tier is untouched and keeps ADR-0012's
 	// full guarantee. Reason=Tier1LonghornEarlyRelease when True.
 	ConditionTier1EarlySourceRelease = "Tier1EarlySourceRelease"
+	// ConditionReplacementPodReadopted is True when the replacement pod has been re-adopted
+	// into its source pod's owning ReplicaSet's bookkeeping (stripped selector labels restored,
+	// OwnerReferences swapped from the PodMigration CR back to the ReplicaSet) and that
+	// re-adopt has been CONFIRMED via a bounded, real re-read of the replacement pod object
+	// itself — not inferred from the RS's aggregate status.replicas — immediately before
+	// earlyReleaseSourceForTier1Longhorn deletes the source pod (ADR-0371). This closes the
+	// ADR-0356 gap-fill deadlock: without this, the RS's own reconcile observes a shortfall the
+	// instant the source pod is deleted (the replacement pod is deliberately invisible to it
+	// while gated) and creates a competing, uncoordinated pod that can win the volume race
+	// against PodMotion's own gated replacement.
+	//
+	// Set True only once the bounded confirm poll succeeds (Reason=ReadoptConfirmed) —
+	// NEVER set optimistically. Left False (never True) on any other outcome:
+	//   - Reason=ReadoptRaceLost: the RS's own surplus-deletion reconcile won the race and
+	//     deleted the re-adopted replacement pod before the confirm read observed it intact.
+	//   - Reason=ReadoptConfirmTimeout: the bounded poll exhausted without a definitive read
+	//     either way — treated as a loss, per the fail-closed rule (an inconclusive read is
+	//     not a confirmed success).
+	//   - Reason=ReadoptReStripFailed: the re-strip patch that reverts a failed/unconfirmed
+	//     re-adopt (or a confirmed re-adopt undone by a later failure before source delete)
+	//     back to CR-owned/label-stripped state itself failed — a hard, loud failure; the
+	//     replacement pod may be left straddling both ownership states and requires
+	//     investigation, never silent retry.
+	//   - Reason=ReadoptRestrippedAfterFailure: the re-adopt WAS confirmed (briefly True),
+	//     but a subsequent failure before the source pod delete actually completed (source
+	//     agent unreachable, KillFrozenSource RPC failure, or the delete call itself failing)
+	//     required re-stripping the replacement pod back to CR-owned/label-stripped state —
+	//     the rollback-symmetry path (ADR-0371 §2 step 4). The re-strip itself succeeded here;
+	//     only the source release did not complete this attempt.
+	//
+	// Scoped to ReplicaSet-owned (Deployment-backed) TierLonghorn targets only (ADR-0371 §5).
+	// StatefulSet- and DaemonSet-owned targets, and bare pods with no owning controller, never
+	// have this condition set at all — the re-adopt step is a structural no-op for them.
+	ConditionReplacementPodReadopted = "ReplacementPodReadopted"
 	// ConditionTCPSequenceContinuityVerified is True when all migrated connections
 	// have been confirmed to have seq_delta=0 post-restore (ADR-0049).
 	ConditionTCPSequenceContinuityVerified = "TCPSequenceContinuityVerified"
@@ -453,7 +532,7 @@ const (
 	// ConditionCni0CleanupVerified, which is scoped only to CUTOVER_COMPLETE objects.
 	ConditionIPReclaimComplete = "IPReclaimComplete"
 	// ConditionSourceStorageWriteRestored: NAME IS ASPIRATIONAL — READ THIS BEFORE
-	// TREATING True AS A STORAGE GUARANTEE (ADR-0344 sign-off finding, 2026-07-12).
+	// TREATING True AS A STORAGE GUARANTEE (ADR-0344, 2026-07-12).
 	//
 	// As implemented today this condition is CONNECTIVITY-ONLY. For Tier0 (RWX)
 	// migrations it is set True once the source agent's gRPC connection is
@@ -503,12 +582,39 @@ const (
 	// pod's endpoint has been confirmed absent from all EndpointSlices in the namespace (the
 	// happens-before split-brain guard). Single-sited write at podmigration_controller.go:4658.
 	ConditionRolledBack = "RolledBack"
+	// ConditionRollbackRecreatePending is True while reconcileRollingBack is driving ADR-0393's
+	// cold-recreate of a bare (no owning controller) source pod from a durable
+	// SourcePodSpecSnapshot and the recreated pod's create has not yet been confirmed. It is
+	// persisted BEFORE the r.Create so a re-entrant reconcile after an operator crash mid-recreate
+	// re-enters the recreate path from persisted state alone; because the recreate pod name is
+	// deterministic (bound to pm.UID), the create-succeeded-but-unrecorded interleaving recovers
+	// idempotently without a second pod (ADR-0393 D-ACCEPT).
+	ConditionRollbackRecreatePending = "RollbackRecreatePending"
 	// ConditionFailed is True when the migration has terminated in hard failure
 	// (podmigration_controller.go:4888, failMigration). Distinct from ConditionRolledBack —
 	// failMigration reaps the replacement pod best-effort but does NOT gate on or set
 	// ConditionRolledBack (ADR-0350 arch_b finding: the two deleteReplacementPod call sites
 	// terminate in different conditions).
 	ConditionFailed = "Failed"
+	// ConditionStorageRollbackImpossible is True when the rollback pipeline's StorageStep
+	// (internal/rollback/rollback.go) received storage.ErrRollbackPointOfNoReturn from
+	// Migrator.ReleaseDestination: the forward Cutover already made an irrevocable
+	// destination-side change (e.g. Tier2's `rbd migration commit` deleted the source image)
+	// and undo is structurally impossible, not merely unbuilt. Set by reconcileRollingBack via
+	// errors.Is against the combined rollback error (ADR-0368 §6 item 3) — distinct from the
+	// generic ConditionFailed so an operator/alert rule can tell "never retry this, the
+	// destination is now authoritative" apart from an ordinary transient rollback failure.
+	// Reuses ADR-0086 §4's condition name verbatim (no contradiction found there).
+	ConditionStorageRollbackImpossible = "StorageRollbackImpossible"
+	// ConditionStorageRollbackNotSupported is True when the rollback pipeline's StorageStep
+	// received storage.ErrRollbackNotImplemented from Migrator.ReleaseDestination: this tier's
+	// undo has not been built yet (a real, closeable gap — distinct from
+	// ConditionStorageRollbackImpossible's structural impossibility) but must be surfaced just
+	// as loudly, since from the rollback caller's perspective an un-implemented undo and an
+	// impossible undo have the same practical consequence — storage was not actually rolled
+	// back. Set by reconcileRollingBack via errors.Is against the combined rollback error
+	// (ADR-0368 §6 item 3).
+	ConditionStorageRollbackNotSupported = "StorageRollbackNotSupported"
 	// ConditionReplacementEndpointsRemoved is the ADR-0350 D6 observability signal for the
 	// removal-confirm state. True (reason ReplacementEndpointsAbsent) records the audited
 	// happens-before predecessor of RolledBack=True, set from the same in-memory confirm
@@ -568,12 +674,54 @@ const (
 	ReasonCalicoDataplaneProgrammed = "CalicoDataplaneProgrammed"
 )
 
+// MemorySynced condition Reason vocabulary (ADR-0011 / TCP freeze-go gate,
+// internal/controller/podmigration_controller.go preCopyTCPGatePassed and
+// internal/agent/replication/replication.go RunPreCopyLoop). Exported and shared between the
+// writer (replication.go, which patches MemorySynced) and the reader (podmigration_controller.go,
+// which evaluates the freeze-go gate) so the two packages can never drift onto independently
+// re-typed literals for the same Reason string.
+const (
+	// ReasonMemorySyncedConverged: a real pre-copy round measured FinalDirtyPagesMB below the
+	// configured convergence threshold. PreCopyStats is always populated with
+	// DirtyStatsValid=true when this Reason is set.
+	ReasonMemorySyncedConverged = "Converged"
+	// ReasonMemorySyncedForceFreeze: ADR-0011's PreCopyMaxRounds-exhausted escape valve — rounds
+	// were genuinely run and PreCopyStats IS populated with DirtyStatsValid=true, but
+	// FinalDirtyPagesMB may still be at/above budget. preCopyTCPGatePassed exempts this Reason
+	// from the strict dirty-convergence recheck ONLY when PreCopyStats also confirms
+	// DirtyStatsValid=true and RoundsCompleted > 0 (the Reason string alone is not
+	// proof a measurement backs it if the stats write upstream failed).
+	ReasonMemorySyncedForceFreeze = "ForceFreeze"
+	// ReasonMemorySyncedMeasurementFailed: a PreDumpRound RPC error (transient network blip,
+	// agent-unreachable, timeout, or a decodeCRIUStats failure surfaced as a gRPC error). NO real
+	// measurement backs this state; PreCopyStats is written explicitly with
+	// DirtyStatsValid=false (never left nil) precisely so preCopyTCPGatePassed has a real signal
+	// to fail closed on. This Reason must NOT be exempted from the strict recheck.
+	ReasonMemorySyncedMeasurementFailed = "MeasurementFailed"
+)
+
 // PreCopyStats records metrics from the iterative pre-copy phase.
 type PreCopyStats struct {
 	// RoundsCompleted is the number of pre-dump rounds completed.
 	RoundsCompleted int32 `json:"roundsCompleted"`
-	// FinalDirtyPagesMB is the dirty page delta at the start of the final freeze.
+	// FinalDirtyPagesMB is the dirty page delta at the start of the final freeze, taken
+	// from the latest round's real, CRIU-measured stats-dump decode (never fabricated).
 	FinalDirtyPagesMB int32 `json:"finalDirtyPagesMB"`
+	// InitialDirtyPagesMB is the real, CRIU-measured dirty-page count from round 0 of the
+	// pre-copy loop, captured once at the first successful measurement. Retained for
+	// observability/telemetry (round-0 baseline reporting) ONLY — it does not, and must
+	// not, feed the freeze-go decision: a baseline-relative ratio is the wrong primitive;
+	// the gate is an absolute latest-round threshold check.
+	InitialDirtyPagesMB int32 `json:"initialDirtyPagesMB"`
+	// DirtyStatsValid is true only when FinalDirtyPagesMB (and, if populated,
+	// InitialDirtyPagesMB) came from a successful CriuGetDumpStats decode for the round
+	// being reported. It is false on any read/magic-mismatch/unmarshal failure, and false
+	// by Go zero-value default if this field is ever pruned or left unset by a CRD-schema
+	// gap — so an undetected regen gap degrades to always-block/requeue behavior, never to
+	// a silent pass. A genuinely idle round (real DirtyPagesMB == 0) still sets this true:
+	// "measured zero" and "could not measure" are distinct facts, and only the latter may
+	// block.
+	DirtyStatsValid bool `json:"dirtyStatsValid"`
 	// FreezeDurationMs is the wall-clock time the pod was frozen for final dump.
 	FreezeDurationMs int64 `json:"freezeDurationMs"`
 }
@@ -721,6 +869,15 @@ type PodMigrationStatus struct {
 	// +optional
 	CheckpointTransferred bool `json:"checkpointTransferred,omitempty"`
 
+	// Cni0CleanupVerifyAttempts is the ADR-0241 item 1 bounded-retry attempt counter for
+	// VerifyCleanup(CUTOVER_COMPLETE). Persisted via the status subresource (not a spec/metadata
+	// annotation) so this progress marker never depends on repassing spec admission — the
+	// validating webhook is registered only on the "podmigrations" resource, not
+	// "podmigrations/status" (config/webhook/manifests.yaml), so a status-only write never
+	// invokes it (part of the Verifying-phase wedge fix).
+	// +optional
+	Cni0CleanupVerifyAttempts int32 `json:"cni0CleanupVerifyAttempts,omitempty"`
+
 	// SourceFreezeTimestampNs is CLOCK_REALTIME nanoseconds at the exact freeze instant,
 	// captured by the source agent after the CRIU dump completes with --leave-stopped.
 	// Passed as source_freeze_timestamp_ns in the RestoreRequest so the destination agent
@@ -782,6 +939,155 @@ type PodMigrationStatus struct {
 	// can compute the PAWS ts_delta for PM_SEQ_XLAT (ADR-0049).
 	// +optional
 	SourceClockNs int64 `json:"sourceClockNs,omitempty"`
+
+	// Tier1EarlyReleaseSourceOwnerKind records the Kind (e.g. "ReplicaSet") of the source
+	// pod's owning controller, captured by earlyReleaseSourceForTier1Longhorn at the moment
+	// ConditionTier1EarlySourceRelease is set True — i.e. immediately before the source pod
+	// object (which carries the authoritative OwnerReferences) is deleted and this
+	// information becomes otherwise unrecoverable. Left empty when the source pod had no
+	// owning controller (a bare/standalone pod).
+	//
+	// ADR-0387: this exists so reconcileRollingBack can report the truth about what recovery
+	// actually happened for THIS migration, rather than unconditionally asserting the
+	// generic ADR-0356 recovery story ("checkpoint-guaranteed... recreating a fresh
+	// replacement via the source pod's owning controller"). That recreation is performed by
+	// the owning controller, not by PodMotion — when this field is empty, no such controller
+	// ever existed, so nothing recreates the pod, and rollback must say so plainly instead of
+	// implying a recovery path that cannot occur.
+	// +optional
+	Tier1EarlyReleaseSourceOwnerKind string `json:"tier1EarlyReleaseSourceOwnerKind,omitempty"`
+
+	// SourcePodSpecSnapshot is a durable, operator-captured serialization of the source pod's
+	// PodSpec plus the identity needed to recreate it on rollback (ADR-0393). It is captured by
+	// the operator from the live source pod object BEFORE any irreversible source action
+	// (KillFrozenSource / early source-pod delete) on the Tier1-Longhorn early-release path, and
+	// is consumed ONLY by reconcileRollingBack's fail-closed cold-recreate path for a bare (no
+	// owning controller) pod. Operator-written only; never written by the node agent. Fail-closed:
+	// absent/tampered/stale ⇒ no cold-recreate (degrades to the honest RollbackCompleteNoOwning
+	// Controller outage), and at capture time an unpersistable snapshot ⇒ no source kill. Its
+	// integrity is protected by an operator-KEYED HMAC (IntegrityHMAC) whose key the node agent —
+	// a co-writer of this subresource at the RBAC layer — cannot read, so a co-writer cannot forge
+	// a valid snapshot. See ADR-0393.
+	// +optional
+	SourcePodSpecSnapshot *SourcePodSpecSnapshot `json:"sourcePodSpecSnapshot,omitempty"`
+
+	// StoragePreStageDispatch is the durable, operator-owned single-dispatch marker for the storage
+	// pre-stage arm-and-dispatch step (ADR-0398). It exists so that AT MOST ONE storage pre-stage
+	// dispatch happens per migration — no matter how many concurrent reconciles controller-runtime
+	// fires, across operator replicas, and across an operator restart (an in-memory guard cannot
+	// survive a restart; the restart case is the primary single-replica justification for a durable
+	// field) — and so ADR-0380's fail-fast can key on the AUTHORITATIVE recorded dispatch verdict
+	// rather than a momentary, asynchronously-written condition. It is claimed via an
+	// optimistic-concurrency (compare-and-swap) status patch and carries a fencing ClaimToken, so a
+	// superseded holder cannot stamp Complete or write a terminal verdict even if it is slow-but-alive
+	// past the lease. Fail-safe: nil ⇒ "no dispatch yet" (pre-ADR-0398 CRs and fresh migrations read
+	// nil and the first reconcile claims). Operator-written only. See ADR-0398.
+	// +optional
+	StoragePreStageDispatch *StoragePreStageDispatch `json:"storagePreStageDispatch,omitempty"`
+}
+
+// StoragePreStageDispatchPhase is the lifecycle phase of the storage pre-stage single-dispatch marker.
+type StoragePreStageDispatchPhase string
+
+const (
+	// StoragePreStageInFlight means a reconcile has claimed the dispatch (arming may still be running
+	// or a transient failure may cause the claim to be released for a prompt re-claim).
+	StoragePreStageInFlight StoragePreStageDispatchPhase = "InFlight"
+	// StoragePreStageComplete means the single authoritative dispatch has been finalized with a
+	// recorded verdict and (in the same claim-holding reconcile) launched. Only Complete authorizes
+	// ADR-0380's fail-fast to treat a BlockedVolume as terminal.
+	StoragePreStageComplete StoragePreStageDispatchPhase = "Complete"
+)
+
+// StoragePreStageDispatch is the durable single-dispatch marker for the storage pre-stage
+// arm-and-dispatch step (ADR-0398). Operator-written only; claimed by optimistic-concurrency patch and
+// fenced by ClaimToken. See PodMigrationStatus.StoragePreStageDispatch.
+type StoragePreStageDispatch struct {
+	// Phase is "InFlight" once a reconcile has claimed the dispatch and "Complete" once the single
+	// authoritative dispatch has been finalized with a recorded verdict. Only "Complete" authorizes
+	// ADR-0380's fail-fast (as corrected by ADR-0398) to treat a BlockedVolume as terminal.
+	Phase StoragePreStageDispatchPhase `json:"phase"`
+
+	// ClaimToken is the fencing token minted by the claiming reconcile. It is a CORRECTNESS input:
+	// the Complete-mark and the terminal StorageReadyForFreeze write both compare-and-swap against it,
+	// so a superseded holder (e.g. an old leader partitioned but still alive past the lease, whose
+	// claim a new leader re-claimed with a fresh token) cannot finalize a dispatch or write a terminal
+	// verdict. This is what demotes ClaimedAt/the lease from a safety guess to a pure liveness knob.
+	ClaimToken string `json:"claimToken"`
+
+	// ClaimedAt is when the current holder claimed (Phase=InFlight). Used only as a LIVENESS lease: if
+	// a holder dies after claiming but before reaching Complete, a later reconcile may re-claim once
+	// ClaimedAt is older than the lease. Because ClaimToken fences finalization, the lease value is a
+	// liveness knob (how fast a dead holder's claim frees) and NOT a safety bound — an over-short lease
+	// at worst triggers a redundant, token-fenced (and therefore harmless) re-claim.
+	ClaimedAt metav1.Time `json:"claimedAt"`
+
+	// HolderReconcileID is a diagnostic identifier of the claiming pass. Never a correctness input —
+	// correctness comes from the CAS resourceVersion precondition plus ClaimToken.
+	// +optional
+	HolderReconcileID string `json:"holderReconcileID,omitempty"`
+
+	// ArmAttempted records whether the finalized dispatch actually ran arming (true only for a
+	// bare-Longhorn-eligible pod; false for the arming no-op paths — owned pods, non-Longhorn pods).
+	// +optional
+	ArmAttempted bool `json:"armAttempted,omitempty"`
+
+	// ColdRecreateArmed is the authoritative armed verdict of the single finalized dispatch. ADR-0380's
+	// fail-fast (as corrected by ADR-0398) treats Complete && ColdRecreateArmed as an invariant that a
+	// BlockedVolume cannot coexist with, and Complete && !ColdRecreateArmed as the only state in which
+	// a BlockedVolume is terminal.
+	// +optional
+	ColdRecreateArmed bool `json:"coldRecreateArmed,omitempty"`
+}
+
+// SourcePodSpecSnapshot is the durable operator-captured recovery input for ADR-0393's
+// Tier1-Longhorn bare-pod cold-recreate. See PodMigrationStatus.SourcePodSpecSnapshot. It
+// recovers to a COLD-RECREATED pod (fresh container + on-disk/WAL recovery; in-memory and TCP
+// connection state are lost) — ReplicaSet parity, NOT a zero-downtime rollback.
+type SourcePodSpecSnapshot struct {
+	// PodSpecJSON is the JSON-serialized corev1.PodSpec captured from the live source pod,
+	// pre-cleared of scheduler-assigned fields (SchedulerName/SchedulingGates/NodeName) exactly as
+	// createReplacementPod clears them, so the mutating webhook re-injects them on recreate.
+	PodSpecJSON []byte `json:"podSpecJSON"`
+
+	// BaseName is the source pod's name; the deterministic cold-recreate pod name is derived from
+	// it plus a pm.UID-bound suffix.
+	BaseName string `json:"baseName"`
+
+	// Namespace is the source pod's namespace (the recreate lands here).
+	Namespace string `json:"namespace"`
+
+	// Labels is the source pod's label set, re-applied on recreate (plus a distinct recreate marker).
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
+
+	// Annotations is the source pod's annotation set, re-applied on recreate.
+	// +optional
+	Annotations map[string]string `json:"annotations,omitempty"`
+
+	// SourcePodUID is the UID this snapshot was captured from; bound into IntegrityHMAC and
+	// re-checked against pm.Status.SourcePodUID at consume time (staleness / mis-binding guard).
+	SourcePodUID string `json:"sourcePodUID"`
+
+	// ServiceAccountName captured explicitly and re-asserted on recreate.
+	// +optional
+	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+
+	// SecurityContextDigest is a SHA256 over the JSON-serialized pod SecurityContext, re-checked on
+	// recreate so a widened context is detectable, not merely trusted.
+	// +optional
+	SecurityContextDigest string `json:"securityContextDigest,omitempty"`
+
+	// CapturedAtGeneration is pm.Generation at capture, retained for staleness diagnostics.
+	CapturedAtGeneration int64 `json:"capturedAtGeneration"`
+
+	// IntegrityHMAC is a hex HMAC-SHA256, KEYED by an operator-only-held key the node agent SA
+	// cannot read, over (podSpecJSON ‖ sourcePodUID ‖ pm.UID ‖ securityContextDigest ‖
+	// serviceAccountName). Because the key is not readable by any co-writer of the
+	// podmigrations/status subresource (including the node agent), a co-writer cannot forge a valid
+	// snapshot — this is a keyed signature, NOT a keyless hash a co-writer could recompute. Re-verified
+	// at consume time; mismatch ⇒ fail-closed.
+	IntegrityHMAC string `json:"integrityHMAC"`
 }
 
 // TCPSeqSnapshot captures the TCP sequence state for a single ESTABLISHED connection

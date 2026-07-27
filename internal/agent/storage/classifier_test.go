@@ -70,6 +70,21 @@ func makePodWithPVC(namespace, pvcName string) *corev1.Pod {
 	}
 }
 
+// trueBoolPtr mirrors internal/controller/adr0387_tier1_owner_kind_test.go's helper of the
+// same shape — OwnerReference.Controller is *bool, and there is no addressable literal.
+func trueBoolPtr() *bool { b := true; return &b }
+
+// makeOwnedPodWithPVC is identical to makePodWithPVC except the pod carries a
+// Controller=true OwnerReference (e.g. a ReplicaSet), for ADR-0391 test fixtures that need
+// to distinguish "has an owning controller" from the bare-pod case makePodWithPVC produces.
+func makeOwnedPodWithPVC(namespace, pvcName string) *corev1.Pod {
+	pod := makePodWithPVC(namespace, pvcName)
+	pod.OwnerReferences = []metav1.OwnerReference{
+		{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "test-rs", UID: "test-rs-uid", Controller: trueBoolPtr()},
+	}
+	return pod
+}
+
 func TestStorageClassifier_Tier0_RWX(t *testing.T) {
 	pvc := makePVC("my-pvc", "default", "nfs-sc",
 		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
@@ -82,7 +97,7 @@ func TestStorageClassifier_Tier0_RWX(t *testing.T) {
 		Build()
 
 	classifier := storage.NewStorageClassifier(fakeClient)
-	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -94,7 +109,14 @@ func TestStorageClassifier_Tier0_RWX(t *testing.T) {
 	}
 }
 
-func TestStorageClassifier_Tier1_Longhorn(t *testing.T) {
+// TestStorageClassifier_Tier1Longhorn_RWO_IsBlocked is the regression test for ADR-0387: a
+// Longhorn-backed PVC that is NOT ReadWriteMany (the cluster's default single-attach
+// `longhorn` StorageClass) must be classified TierBlocked, never TierLonghorn. Longhorn's
+// dual-engine live migration does not exist for a ReadWriteOnce volume regardless of
+// StorageClass name — before this fix, this exact fixture was classified TierLonghorn and
+// routed through ADR-0356's early-source-release path, whose recovery guarantee is
+// structurally unmet for a standalone pod (see docs/adr/0387-longhorn-tier-requires-rwx.md).
+func TestStorageClassifier_Tier1Longhorn_RWO_IsBlocked(t *testing.T) {
 	pvc := makePVC("lh-pvc", "default", "longhorn",
 		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce})
 	sc := makeSC("longhorn", "driver.longhorn.io", nil)
@@ -106,15 +128,16 @@ func TestStorageClassifier_Tier1_Longhorn(t *testing.T) {
 		Build()
 
 	classifier := storage.NewStorageClassifier(fakeClient)
-	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(clsfs) != 1 {
 		t.Fatalf("expected 1 classification, got %d", len(clsfs))
 	}
-	if clsfs[0].Tier != storage.TierLonghorn {
-		t.Errorf("expected TierLonghorn (1), got %d", clsfs[0].Tier)
+	if clsfs[0].Tier != storage.TierBlocked {
+		t.Errorf("expected TierBlocked (4) for a ReadWriteOnce Longhorn PVC, got %d (reason=%q)",
+			clsfs[0].Tier, clsfs[0].Reason)
 	}
 }
 
@@ -130,7 +153,7 @@ func TestStorageClassifier_Tier3_GenericRWO(t *testing.T) {
 		Build()
 
 	classifier := storage.NewStorageClassifier(fakeClient)
-	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -159,7 +182,7 @@ func TestStorageClassifier_Tier4_HostPath(t *testing.T) {
 
 	fakeClient := fake.NewClientBuilder().WithScheme(newScheme()).Build()
 	classifier := storage.NewStorageClassifier(fakeClient)
-	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -190,7 +213,7 @@ func TestStorageClassifier_Tier4_MemoryEmptyDir(t *testing.T) {
 
 	fakeClient := fake.NewClientBuilder().WithScheme(newScheme()).Build()
 	classifier := storage.NewStorageClassifier(fakeClient)
-	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -227,7 +250,7 @@ func TestStorageClassifier_DiskEmptyDir_IsBlocked(t *testing.T) {
 
 	fakeClient := fake.NewClientBuilder().WithScheme(newScheme()).Build()
 	classifier := storage.NewStorageClassifier(fakeClient)
-	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -270,7 +293,7 @@ func TestStorageClassifier_PodmotionHolderVolume_NotBlocked(t *testing.T) {
 
 	fakeClient := fake.NewClientBuilder().WithScheme(newScheme()).Build()
 	classifier := storage.NewStorageClassifier(fakeClient)
-	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -301,7 +324,7 @@ func TestStorageClassifier_TransparentVolumes_NotClassified(t *testing.T) {
 
 	fakeClient := fake.NewClientBuilder().WithScheme(newScheme()).Build()
 	classifier := storage.NewStorageClassifier(fakeClient)
-	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -337,7 +360,7 @@ func TestStorageClassifier_BareNFSVolume_EarnsTier0(t *testing.T) {
 
 	fakeClient := fake.NewClientBuilder().WithScheme(newScheme()).Build()
 	classifier := storage.NewStorageClassifier(fakeClient)
-	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -406,7 +429,7 @@ func TestStorageClassifier_PostgresPGDataOnRWX_ReachesTier0(t *testing.T) {
 		Build()
 
 	classifier := storage.NewStorageClassifier(fakeClient)
-	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -434,11 +457,16 @@ func TestStorageClassifier_PostgresPGDataOnRWX_ReachesTier0(t *testing.T) {
 // PVC was misrouted into the Longhorn-incompatible generic path and hit a Longhorn
 // CSI "invalid controller count 2" error during a live test. A Longhorn-backed
 // StorageClass must route to TierLonghorn regardless of accessMode.
+//
+// Uses an owned pod (ADR-0391): TierLonghorn additionally requires an owning
+// controller (see TestStorageClassifier_Tier1Longhorn_NoOwningController_IsBlocked for
+// the bare-pod case), so this fixture needs one to keep testing what it says it tests —
+// RWX-vs-accessMode routing — rather than incidentally tripping the ADR-0391 gate.
 func TestStorageClassifier_Tier1_LonghornRWX(t *testing.T) {
 	pvc := makePVC("lh-rwx-pvc", "default", "longhorn-migratable",
 		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
 	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
-	pod := makePodWithPVC("default", "lh-rwx-pvc")
+	pod := makeOwnedPodWithPVC("default", "lh-rwx-pvc")
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(newScheme()).
@@ -446,7 +474,7 @@ func TestStorageClassifier_Tier1_LonghornRWX(t *testing.T) {
 		Build()
 
 	classifier := storage.NewStorageClassifier(fakeClient)
-	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -462,13 +490,15 @@ func TestStorageClassifier_Tier1_LonghornRWX(t *testing.T) {
 // TestStorageClassifier_Tier1_LonghornRWX_AnnotationOnly covers a Longhorn
 // StorageClass identified only via a longhorn.io/* annotation (not the provisioner
 // string) still routes RWX to TierLonghorn ahead of the generic RWX check.
+//
+// Uses an owned pod for the same ADR-0391 reason as TestStorageClassifier_Tier1_LonghornRWX.
 func TestStorageClassifier_Tier1_LonghornRWX_AnnotationOnly(t *testing.T) {
 	pvc := makePVC("lh-rwx-annot-pvc", "default", "lh-annot-sc",
 		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
 	sc := makeSC("lh-annot-sc", "some.other.provisioner", map[string]string{
 		"longhorn.io/last-applied-configmap": "unused",
 	})
-	pod := makePodWithPVC("default", "lh-rwx-annot-pvc")
+	pod := makeOwnedPodWithPVC("default", "lh-rwx-annot-pvc")
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(newScheme()).
@@ -476,7 +506,7 @@ func TestStorageClassifier_Tier1_LonghornRWX_AnnotationOnly(t *testing.T) {
 		Build()
 
 	classifier := storage.NewStorageClassifier(fakeClient)
-	clsfs, err := classifier.ClassifyPod(context.Background(), pod)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -485,6 +515,102 @@ func TestStorageClassifier_Tier1_LonghornRWX_AnnotationOnly(t *testing.T) {
 	}
 	if clsfs[0].Tier != storage.TierLonghorn {
 		t.Errorf("expected TierLonghorn (1) for a Longhorn-annotated RWX StorageClass, got %d", clsfs[0].Tier)
+	}
+}
+
+// TestStorageClassifier_Tier1Longhorn_NoOwningController_IsBlocked is the regression test
+// for ADR-0391: a genuinely ReadWriteMany/migratable Longhorn PVC — the case ADR-0387 left
+// routing to TierLonghorn — must be classified TierBlocked instead when the pod has no
+// owning controller (ReplicaSet/Deployment), because ADR-0356's early-source-release
+// recovery story (ADR-0387: "an owning controller recreates the pod") is structurally unmet
+// for a bare pod. Before this fix, this exact fixture (RWX Longhorn + bare pod) was
+// classified TierLonghorn and reached earlyReleaseSourceForTier1Longhorn, deleting the
+// source pod with no path back if restore then failed — the live mechanism behind migration
+// attempt podmotion-demo-4prxx (migration-demo-postgres).
+func TestStorageClassifier_Tier1Longhorn_NoOwningController_IsBlocked(t *testing.T) {
+	pvc := makePVC("lh-rwx-bare-pvc", "default", "longhorn-migratable",
+		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
+	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+	pod := makePodWithPVC("default", "lh-rwx-bare-pvc") // bare pod — no OwnerReferences
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(newScheme()).
+		WithObjects(pvc, sc).
+		Build()
+
+	classifier := storage.NewStorageClassifier(fakeClient)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(clsfs) != 1 {
+		t.Fatalf("expected 1 classification, got %d", len(clsfs))
+	}
+	if clsfs[0].Tier != storage.TierBlocked {
+		t.Errorf("expected TierBlocked (4) for RWX Longhorn on a pod with no owning controller, got %d (reason=%q)",
+			clsfs[0].Tier, clsfs[0].Reason)
+	}
+}
+
+// ADR-0396 D3: the SAME bare-pod + RWX-Longhorn fixture as
+// TestStorageClassifier_Tier1Longhorn_NoOwningController_IsBlocked, but classified with
+// coldRecreateArmed=true, keeps TierLonghorn — the downgrade is skipped because the operator has
+// (by construction of the armed boolean) captured and re-verified ADR-0393's operator-keyed-HMAC
+// cold-recreate snapshot for this migration, so a failed restore has a real recovery path. This is
+// the single behavioral flip ADR-0396 introduces; the unarmed regression is asserted directly above.
+func TestStorageClassifier_Tier1Longhorn_BarePod_ArmedKeepsLonghorn(t *testing.T) {
+	pvc := makePVC("lh-rwx-bare-pvc", "default", "longhorn-migratable",
+		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
+	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+	pod := makePodWithPVC("default", "lh-rwx-bare-pvc") // bare pod — no OwnerReferences
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(newScheme()).
+		WithObjects(pvc, sc).
+		Build()
+
+	classifier := storage.NewStorageClassifier(fakeClient)
+	clsfs, err := classifier.ClassifyPod(context.Background(), pod, true) // ADR-0396: armed
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(clsfs) != 1 {
+		t.Fatalf("expected 1 classification, got %d", len(clsfs))
+	}
+	if clsfs[0].Tier != storage.TierLonghorn {
+		t.Errorf("ADR-0396: expected TierLonghorn (1) for an ARMED bare-pod RWX Longhorn PVC, got %d (reason=%q)",
+			clsfs[0].Tier, clsfs[0].Reason)
+	}
+}
+
+// ADR-0396: an OWNED pod is unaffected by coldRecreateArmed in BOTH directions — ownership
+// short-circuits the gate, exactly as ADR-0391. An owned RWX Longhorn pod stays TierLonghorn whether
+// armed or not; arming is a no-op for it (owned pods recover via their controller and are never
+// eligible for arming in the first place).
+func TestStorageClassifier_Tier1Longhorn_OwnedPod_UnaffectedByArming(t *testing.T) {
+	for _, armed := range []bool{false, true} {
+		pvc := makePVC("lh-rwx-owned-pvc", "default", "longhorn-migratable",
+			[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
+		sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+		pod := makeOwnedPodWithPVC("default", "lh-rwx-owned-pvc")
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(newScheme()).
+			WithObjects(pvc, sc).
+			Build()
+
+		classifier := storage.NewStorageClassifier(fakeClient)
+		clsfs, err := classifier.ClassifyPod(context.Background(), pod, armed)
+		if err != nil {
+			t.Fatalf("armed=%v: unexpected error: %v", armed, err)
+		}
+		if len(clsfs) != 1 {
+			t.Fatalf("armed=%v: expected 1 classification, got %d", armed, len(clsfs))
+		}
+		if clsfs[0].Tier != storage.TierLonghorn {
+			t.Errorf("armed=%v: expected TierLonghorn (1) for an OWNED RWX Longhorn pod (unaffected by arming), got %d (reason=%q)",
+				armed, clsfs[0].Tier, clsfs[0].Reason)
+		}
 	}
 }
 

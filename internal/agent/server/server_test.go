@@ -148,13 +148,12 @@ func hasAdjacentPair(args []string, flag, value string) bool {
 	return false
 }
 
-// TestBuildCRIURestoreArgs_NoDevShmExtMountMap asserts that buildCRIURestoreArgs no
-// longer emits the dead "--ext-mount-map /dev/shm:/dev/shm" entry. The live restore.log
-// proves there is no /dev/shm mount in the checkpointed container (/dev/shm is a plain
-// subdirectory inside the single /dev tmpfs the OCI runtime recreates empty on restore),
-// so that entry was a proven-inert no-op that falsely signaled /dev/shm was handled here.
-// PostgreSQL's dynamic shared memory is instead routed to a SysV segment (fixture arg
-// dynamic_shared_memory_type=sysv) that CRIU content-captures in the image. The retained
+// TestBuildCRIURestoreArgs_NoDevShmExtMountMap asserts that buildCRIURestoreArgs never
+// emits a "--ext-mount-map /dev/shm:..." entry. Pre-ADR-0382, /dev/shm was unconditionally
+// skipped/dropped, so such an entry would have been a dead no-op. Post-ADR-0382, /dev/shm
+// is a normal, privately-owned, non-external CRIU mount (like / or /proc) that CRIU dumps
+// and restores natively with its real content — it needs neither --skip-mnt nor
+// --ext-mount-map here either. See docs/adr/0382-devshm-content-capture.md. The retained
 // ext-mount-map entries (auto, /dev/null, resolv.conf, hostname, hosts) must remain.
 func TestBuildCRIURestoreArgs_NoDevShmExtMountMap(t *testing.T) {
 	args, err := buildCRIURestoreArgs(
@@ -181,12 +180,12 @@ func TestBuildCRIURestoreArgs_NoDevShmExtMountMap(t *testing.T) {
 	}
 
 	// Stronger guard: NO ext-mount-map value may reference /dev/shm in ANY form (not just the
-	// exact /dev/shm:/dev/shm pair). /dev/shm is a subdirectory of the single /dev tmpfs, not a
-	// mount, so there is nothing to map — any /dev/shm ext-mount-map is a dead no-op and a false
-	// signal that /dev/shm is handled here. The no-/dev/shm guarantee holds because PostgreSQL's
-	// dynamic shared memory is routed to a SysV segment (dynamic_shared_memory_type=sysv, a
-	// postgres-specific config primitive) that CRIU content-captures in the checkpoint image,
-	// leaving no /dev/shm/* files-reg path to reopen on restore.
+	// exact /dev/shm:/dev/shm pair). /dev/shm IS its own tmpfs mount (ADR-0382 corrects the
+	// prior "not a mount" assumption — see a real corpus decode in
+	// patch_checkpoint_realcorpus_test.go), but it is a normal, privately-owned (non-external)
+	// mount that CRIU dumps and restores natively — an --ext-mount-map is for externals CRIU
+	// cannot resolve on its own, which /dev/shm is not, so any entry referencing it would still
+	// be a dead no-op / false signal.
 	for i := 0; i+1 < len(args); i++ {
 		if args[i] == "--ext-mount-map" && strings.Contains(args[i+1], "/dev/shm") {
 			t.Errorf("no --ext-mount-map value may reference /dev/shm; found %q; got: %s", args[i+1], strings.Join(args, " "))
@@ -204,6 +203,41 @@ func TestBuildCRIURestoreArgs_NoDevShmExtMountMap(t *testing.T) {
 	for _, r := range retained {
 		if !hasAdjacentPair(args, r.flag, r.value) {
 			t.Errorf("expected retained %s %s in args; got: %s", r.flag, r.value, strings.Join(args, " "))
+		}
+	}
+}
+
+// TestBuildCRIURestoreArgs_NoDevObscuredParentExtMountMap asserts that buildCRIURestoreArgs no
+// longer emits any "pm-dev:<rootfsDir>/dev" --ext-mount-map pair (ADR-0415). /dev is a pod-owned
+// tmpfs captured with content and restored as a CRIU-owned mount, not declared external, so the
+// retired pm-dev obscured-parent machinery (ADR-0384/0389/0392) produces no restore-argv entry.
+// Declaring /dev external was exactly what suppressed CRIU's fill of its /dev/shm child.
+func TestBuildCRIURestoreArgs_NoDevObscuredParentExtMountMap(t *testing.T) {
+	rootfsDir := "/var/lib/podmotion/restore/test/bundle/rootfs"
+	args, err := buildCRIURestoreArgs(
+		"/run/podmotion/checkpoints/test/final",
+		rootfsDir,
+		"/var/lib/podmotion/restore/test/data",
+		"/var/lib/podmotion/restore/test/termination-log",
+		"/var/lib/podmotion/restore/test/secrets",
+		"/run/podmotion/checkpoints/test/final/restore.log",
+		"",
+		"/var/run/netns/cni-abc123",
+		"",
+		false,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("buildCRIURestoreArgs returned error: %v", err)
+	}
+
+	// No ext-mount-map value may reference a pod-owned /dev target or the retired "pm-dev" key.
+	badValue := "pm-dev:" + rootfsDir + "/dev"
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--ext-mount-map" && (args[i+1] == badValue || strings.HasPrefix(args[i+1], "pm-dev:")) {
+			t.Errorf("ADR-0415: buildCRIURestoreArgs must NOT emit a pm-dev /dev ext-mount-map; got %q in: %s",
+				args[i+1], strings.Join(args, " "))
 		}
 	}
 }

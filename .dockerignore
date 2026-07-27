@@ -17,6 +17,8 @@
 !bin/criu-wrapper-linux-amd64
 # Re-include holder binary (ADR-0195 Rule A — universal no-op holder for replacement pods)
 !bin/holder-linux-amd64
+# Re-include scheduler binary (ADR-0363 B1 — images/scheduler/Dockerfile)
+!bin/scheduler-linux-amd64
 
 # Re-include pycriu Python package (required by agent Dockerfile)
 !pycriu/

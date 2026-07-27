@@ -186,9 +186,14 @@ spec:
                     type: string
                   destinationNode:
                     description: |-
-                      DestinationNode is the pre-selected destination node for the replacement pod.
-                      Set by the controller after capacity reservation; read by the scheduler plugin
-                      and MutatingAdmissionWebhook to enforce exclusive node placement.
+                      DestinationNode is a last-resort fallback in the destination-node resolution
+                      chain (Status.DestinationNodeName -> Spec.TargetNodeName -> Spec.DestinationNode)
+                      used by the scheduler plugin and MutatingAdmissionWebhook to enforce exclusive
+                      node placement. It has no writers in the controller today — the real
+                      controller-written destination is Status.DestinationNodeName (populated by
+                      cacheDestinationNodeFromSpec), and a user-pinned destination is
+                      Spec.TargetNodeName. This field is retained only as the final link in that
+                      chain; do not rely on it being set.
                     type: string
                   dryRun:
                     default: false
@@ -280,10 +285,14 @@ spec:
                       the scheduler plugin selects.
                     type: string
                   tcpPreservationMode:
-                    default: None
+                    default: Strict
                     description: |-
                       TCPPreservationMode controls TCP connection continuity behavior during migration.
                       Strict triggers hard rollback if TCPSequenceContinuityVerified=False (ADR-0019 Amendment A).
+                      A pod with zero ESTABLISHED TCP connections at inventory/verification time has nothing to
+                      preserve, so Strict is trivially satisfied rather than failed in that case (ADR-0388,
+                      corrects ADR-0379 / ADR-0352 B8-DR-2). Strict is the default (ADR-0388, corrects the prior
+                      None default) precisely because it degrades safely to a no-op guarantee on a stateless pod.
                       BestEffort emits a warning condition only.
                       None skips the TCPVerifying phase entirely (stateless workloads).
                     enum:

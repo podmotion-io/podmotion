@@ -1,0 +1,39 @@
+{{- /*
+ADR-0401 (review condition C3): PodDisruptionBudget for the operator.
+
+Once the eviction webhook is failurePolicy: Fail (ADR-0401), cluster-wide user-namespace
+API-eviction availability depends on the webhook being reachable. All operator replicas serve
+the webhook behind podmotion-webhook-service (the webhook server runs independent of leader
+election), so "webhook fully unreachable" requires ALL replicas down at once. This PDB
+(minAvailable: 1) ensures a voluntary disruption — a node drain of the operator's own nodes,
+autoscaler consolidation — can never take every webhook backend down simultaneously and
+transiently wedge cluster-wide evictions.
+
+The operator's own pods remain evictable throughout: the eviction webhook's namespaceSelector
+excludes {{ .Release.Namespace }}, so this PDB governs the ORDERING/CONCURRENCY of operator
+disruption, it never hard-blocks it (no self-deadlock).
+
+Rendered only when there is more than one replica AND enabled (default true). At operator.replicas
+== 1 (dev/kind) a minAvailable:1 PDB would block draining the single operator node, so it is a
+no-op there by design — single-replica deployments are explicitly called out as widening the
+"webhook unreachable" window in ADR-0401 §Consequences.
+*/ -}}
+{{- $pdb := (.Values.operator).podDisruptionBudget | default dict -}}
+{{- $enabled := true -}}
+{{- if hasKey $pdb "enabled" -}}{{- $enabled = $pdb.enabled -}}{{- end -}}
+{{- if and $enabled (gt (int .Values.operator.replicas) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: podmotion-operator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: operator
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: podmotion-operator
+{{- end }}

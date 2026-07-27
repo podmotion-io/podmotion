@@ -10,6 +10,7 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+// errEmptyDestinationNode is returned by PreStage/addDestReplica when opts.DestinationNode (or
+// the destNode argument, respectively) is empty (ADR-0365 Decision §2 item 3 — fail-closed
+// hardening #3). Before this guard, an empty DestinationNode was silently accepted and forwarded
+// into a Longhorn updateReplicaCount call as nodeSelector:[""], depending on Longhorn's own
+// (unverified, not fail-fast) handling of that input. This guard is a backstop independent of
+// ADR-0365's other hardenings (the early destination decision in reconcileValidating, the hoisted
+// destNode-required gate in reconcileDestinationPrewarm) — even if a future code path reaches
+// PreStage with an empty destination through some route none of those anticipated, it fails at
+// this boundary instead of silently proceeding. RunPreStage's existing error-handling path
+// surfaces this the same way it already surfaces ClassifyFailed/BlockedVolume/PreStageFailed, via
+// a distinct "EmptyDestinationNode" condition reason.
+var errEmptyDestinationNode = errors.New("empty destination node: refusing to issue a Longhorn " +
+	"nodeSelector call with no destination (ADR-0365 fail-closed guard)")
 
 const (
 	// longhornReadyThreshold is the replica sync percentage that triggers
@@ -98,6 +113,12 @@ func (m *LonghornMigrator) Tier() StorageTier { return TierLonghorn }
 // PreStage adds a replica on the destination node for each Tier1 PVC and polls
 // until the replica is healthy enough to allow compute freeze (≥95% synced).
 func (m *LonghornMigrator) PreStage(ctx context.Context, opts MigrationOptions) error {
+	if opts.DestinationNode == "" {
+		// ADR-0365 Decision §2 item 3: fail closed rather than proceeding with an empty
+		// destination — see errEmptyDestinationNode's doc comment.
+		return errEmptyDestinationNode
+	}
+
 	log := logf.FromContext(ctx).WithValues("migration", opts.MigrationName, "tier", "Longhorn")
 
 	for _, clsf := range opts.Classifications {
@@ -167,22 +188,27 @@ func (m *LonghornMigrator) SyncPercent(ctx context.Context, opts MigrationOption
 // volume — the real trigger for Longhorn's dual-engine collapse below) but
 // strictly before CRIU restore is permitted to run on the destination.
 //
-// NOTE (sprint49 root-cause finding): Longhorn's real dual-engine live
-// migration is driven entirely by the CSI attachment tickets on
+// NOTE (sprint49 root-cause finding, CORRECTED post-ADR-0368 live outage — see
+// docs/adr/0368-storage-rollback-undo-migrator-releasedestination.md §1): Longhorn's real
+// dual-engine live migration is driven entirely by the CSI attachment tickets on
 // volumeattachments.longhorn.io (spec.attachmentTickets, keyed by the
 // csi-attacher ticket type) — a second pod referencing the PVC on a
 // different node is what makes longhorn-manager populate
 // spec.migrationNodeID and start the second engine; that is a GET-only,
-// observable signal with no REST POST involved. The detachFromNode/
-// attachToNode calls below issue the legacy `?action=detach`/`?action=attach`
-// REST calls, which operate on a DIFFERENT ticket type and have been
-// confirmed (live cluster testing) to have no observed effect on that real
-// csi-attacher-driven attachment state for a migratable:true RWX Longhorn
-// volume. They are left in place rather than removed: they are harmless
-// (dead weight, not wrong), Tier2/Ceph-RBD and Tier3/snapshot-rsync still
-// need their own real Cutover actions through this same tier-agnostic
-// interface, and the actual gate that matters is AwaitSingleOwner below,
-// which polls the real GET-only replica-collapse signal.
+// observable signal with no REST POST involved. The detachFromNode/attachToNode calls below
+// issue the legacy `?action=detach`/`?action=attach` REST calls, which operate on a DIFFERENT
+// ticket type and do NOT drive that CSI-attacher dual-engine collapse signal — AwaitSingleOwner
+// below correctly does not depend on them, and that narrow claim stands.
+//
+// The broader claim this comment used to make — "no observed effect… harmless (dead weight, not
+// wrong)" — was FALSE and directly caused a live production outage (ADR-0368 §1, 2026-07-23):
+// the `?action=attach` call sets real, load-bearing Longhorn manager state
+// (spec.nodeID/status.currentNodeID) that Longhorn's CSI driver reads and enforces a strict
+// single-attach constraint against on every subsequent AttachVolume call, for ANY future
+// claimant of that volume — a different migration's destination, or the original source pod
+// trying to reattach after a rollback that never issued the symmetric detach. It is NOT dead
+// weight: it is a real reservation that MUST be released on rollback. ReleaseDestination
+// (below) is that symmetric undo — see its doc comment for the fix.
 func (m *LonghornMigrator) Cutover(ctx context.Context, opts MigrationOptions) error {
 	log := logf.FromContext(ctx).WithValues("migration", opts.MigrationName, "tier", "Longhorn")
 
@@ -296,6 +322,109 @@ func (m *LonghornMigrator) pollUntilSingleOwner(ctx context.Context, volumeName,
 	}
 }
 
+// ErrTier1DetachReleaseTimedOut is returned by ReleaseDestination when detachFromNode's HTTP call
+// succeeded (2xx) but the destination attach reservation was not confirmed released within
+// longhornDetachTimeout. This is a real, distinct, non-nil error — never nil — per ADR-0368
+// CONDITION 3 (KVM Expert FINDING 2): a 2xx response only proves the detach was REQUESTED, not
+// that it COMPLETED, exactly the class of bug (trusting a request-sent signal as a confirmed-done
+// signal) that caused the live outage this ADR fixes. Retriable via the normal rollback requeue —
+// this is an operational timeout, not a structural ErrRollbackPointOfNoReturn/
+// ErrRollbackNotImplemented case.
+var ErrTier1DetachReleaseTimedOut = errors.New(
+	"tier1: detach requested but not confirmed released from the destination node within the timeout")
+
+// longhornDetachTimeout bounds how long ReleaseDestination polls to confirm a rollback detach
+// has actually taken effect, mirroring longhornSingleOwnerTimeout's bounded-poll shape (never an
+// unbounded/forever wait).
+const longhornDetachTimeout = 2 * time.Minute
+
+// ReleaseDestination undoes Cutover's attachToNode call by issuing the symmetric detachFromNode
+// request against opts.DestinationNode, then polling (bounded by longhornDetachTimeout) until the
+// volume is CONFIRMED actually released — not merely requested — before returning nil (ADR-0368
+// §5.2/CONDITION 3). detachFromNode's own HTTP call only proves Longhorn ACCEPTED the detach
+// request (a 2xx response); it does not prove the destination-node engine was actually torn down.
+// Trusting the 2xx alone as "released" is exactly the class of bug (a request-sent signal
+// mistaken for a confirmed-done signal) that produced the live outage this ADR fixes — and is the
+// same class of bug the emergency recovery this session had to work around by polling the volume's
+// real attachment state instead of trusting the original attach call's own 2xx response.
+//
+// No opts.CutoverComplete gate is needed here (unlike Tier2/Tier3 — see CONDITION 2): Longhorn's
+// `?action=detach` on an already-detached (or never-attached) volume is a safe, idempotent
+// no-op server-side (the same idempotency assumption Cutover's own attachToNode call already
+// relies on across reconciles — ADR-0368 §5.2). So calling detachFromNode unconditionally is
+// itself the correct behavior for "if cutover never happened, there's nothing to release": the
+// detach call and its poll simply confirm-and-return immediately with no state change.
+//
+// A detach HTTP failure (detachFromNode itself erroring) returns a plain wrapped error — a real,
+// retriable, operational failure, not a point-of-no-return; so does a confirmed-release-timeout
+// (ErrTier1DetachReleaseTimedOut). Neither is nil, per the interface's fail-loud contract.
+func (m *LonghornMigrator) ReleaseDestination(ctx context.Context, opts MigrationOptions) error {
+	if opts.DestinationNode == "" {
+		// Mirrors PreStage/addDestReplica's identical fail-closed guard — see
+		// errEmptyDestinationNode's doc comment. Refuse to issue a detach against an
+		// unspecified node rather than letting Longhorn interpret an empty hostId.
+		return errEmptyDestinationNode
+	}
+
+	log := logf.FromContext(ctx).WithValues("migration", opts.MigrationName, "tier", "Longhorn")
+
+	for _, clsf := range opts.Classifications {
+		if clsf.Tier != TierLonghorn {
+			continue
+		}
+
+		volumeName, err := m.resolveVolumeName(ctx, opts.PodNamespace, clsf.PVCName)
+		if err != nil {
+			return fmt.Errorf("tier1: resolve volume name for pvc %s: %w", clsf.PVCName, err)
+		}
+
+		log.Info("releasing destination attach reservation (rollback)", "volume", volumeName, "destNode", opts.DestinationNode)
+		if err := m.detachFromNode(ctx, volumeName, opts.DestinationNode); err != nil {
+			return fmt.Errorf("tier1: rollback detach %s from %s: %w", volumeName, opts.DestinationNode, err)
+		}
+
+		deadlineCtx, cancel := context.WithTimeout(ctx, longhornDetachTimeout)
+		pollErr := m.pollUntilDetached(deadlineCtx, volumeName, opts.DestinationNode)
+		cancel()
+		if pollErr != nil {
+			return fmt.Errorf("tier1: %w: volume %s on %s: %v", ErrTier1DetachReleaseTimedOut, volumeName, opts.DestinationNode, pollErr)
+		}
+		log.Info("destination attach reservation confirmed released", "volume", volumeName, "destNode", opts.DestinationNode)
+	}
+
+	return nil
+}
+
+// pollUntilDetached polls fetchVolume until no running controller (engine) remains on destNode,
+// or ctx is done (a timeout/cancellation is returned as an error — fail closed, never assume
+// release from an unconfirmed request). Reuses the same Controllers[].NodeID/Running signal
+// pollUntilSingleOwner already trusts as the real, GET-only attachment-state primitive — not a
+// new signal invented for this method.
+func (m *LonghornMigrator) pollUntilDetached(ctx context.Context, volumeName, destNode string) error {
+	for {
+		vol, err := m.fetchVolume(ctx, volumeName)
+		if err == nil {
+			stillAttached := false
+			for _, c := range vol.Controllers {
+				if c.Running && c.NodeID == destNode {
+					stillAttached = true
+					break
+				}
+			}
+			if !stillAttached {
+				return nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timed out waiting for volume %s to actually release from %s: %w",
+				volumeName, destNode, ctx.Err())
+		case <-time.After(longhornPollInterval):
+		}
+	}
+}
+
 // ── Longhorn HTTP helpers ───────────────────────────────────────────────────
 
 // longhornVolume is the subset of the Longhorn volume API response we care about.
@@ -398,6 +527,13 @@ func (m *LonghornMigrator) fetchVolume(ctx context.Context, volumeName string) (
 // Longhorn to SHRINK the replica set from 3 to 2 — the opposite of what
 // PreStage needs — right as the migration needed the replica set stable.
 func (m *LonghornMigrator) addDestReplica(ctx context.Context, volumeName, destNode string) error {
+	if destNode == "" {
+		// ADR-0365 Decision §2 item 3: independent backstop guard — see PreStage's identical
+		// guard and errEmptyDestinationNode's doc comment. PreStage already rejects an empty
+		// opts.DestinationNode before ever reaching this call in the normal path; this catches
+		// any future caller that reaches addDestReplica some other way.
+		return errEmptyDestinationNode
+	}
 	log := logf.FromContext(ctx).WithValues("volume", volumeName, "destNode", destNode)
 
 	vol, err := m.fetchVolume(ctx, volumeName)
@@ -549,6 +685,12 @@ type LonghornStubMigrator struct {
 	AwaitSingleOwnerCalled bool
 	// InjectAwaitSingleOwnerError causes AwaitSingleOwner to return this error.
 	InjectAwaitSingleOwnerError error
+	// ReleaseDestinationCalled records whether ReleaseDestination was called.
+	ReleaseDestinationCalled bool
+	// InjectReleaseDestinationError, if non-nil, is returned verbatim by ReleaseDestination
+	// instead of the default ErrRollbackNotImplemented — lets tests exercise the plain
+	// operational-error return path distinct from the sentinel.
+	InjectReleaseDestinationError error
 }
 
 // Tier returns TierLonghorn.
@@ -575,4 +717,24 @@ func (s *LonghornStubMigrator) Cutover(_ context.Context, _ MigrationOptions) er
 func (s *LonghornStubMigrator) AwaitSingleOwner(_ context.Context, _ MigrationOptions) error {
 	s.AwaitSingleOwnerCalled = true
 	return s.InjectAwaitSingleOwnerError
+}
+
+// ReleaseDestination records the call and, when cutover actually happened for this migration
+// (opts.CutoverComplete), returns a wrapped ErrRollbackNotImplemented — NEVER a bare nil
+// (ADR-0368 CONDITION 1). This stub has no real Longhorn backend to talk to, so unlike the
+// production LonghornMigrator (which performs and verifies a real detach) it cannot honestly
+// claim to have confirmed a release; "not implemented" is the truthful answer for a fake that
+// never touches any backend. If cutover never happened there is nothing to release, matching
+// every other tier's "no cutover, no reservation" case — returns nil.
+// InjectReleaseDestinationError overrides the default for tests that need a plain operational
+// error instead of the sentinel.
+func (s *LonghornStubMigrator) ReleaseDestination(_ context.Context, opts MigrationOptions) error {
+	s.ReleaseDestinationCalled = true
+	if s.InjectReleaseDestinationError != nil {
+		return s.InjectReleaseDestinationError
+	}
+	if !opts.CutoverComplete {
+		return nil
+	}
+	return fmt.Errorf("tier1 stub: %w", ErrRollbackNotImplemented)
 }

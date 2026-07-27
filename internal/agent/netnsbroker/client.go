@@ -371,6 +371,33 @@ func (c *Client) NetnsExecStart(ctx context.Context, srcPID int, netnsPath strin
 	return resp.WrapperPID, nil
 }
 
+// NetnsMatch asks the privileged, UNCONFINED broker to stat pid's /proc/<pid>/ns/net
+// and expectedNetnsPath and report whether they identify the same network namespace
+// (ADR-0306 item (a) restart-durable identity cross-check, delegated). The main
+// agent's own read of another PID's /proc/<pid>/ns/net crosses a ptrace_may_access
+// gate that AppArmor mediates against the TARGET's peer profile — for the
+// CRIU-restored workload root that is the container runtime's default profile,
+// which the narrow `podmotion-agent` profile's ptrace(read) grants (peer=
+// podmotion-agent, peer=unconfined) do not cover — the same delegation class as
+// ProcAlive/ResolveVeth/HolderSentinelReady above (see their doc comments for the
+// prior misdiagnosis-as-dead incident this pattern exists to avoid). A denied
+// direct stat is indistinguishable from "the namespace changed" to a plain
+// syscall.Stat caller, which is exactly the failure mode this delegation closes.
+// expectedNetnsPath must match the broker's /run/netns|/var/run/netns bind-mount
+// convention (SC-1) — the broker rejects anything else server-side. A stat
+// failure on either side is reported via a non-nil error (fail-closed); match is
+// only ever true on a genuinely verified identity comparison.
+func (c *Client) NetnsMatch(ctx context.Context, pid int, expectedNetnsPath string) (bool, error) {
+	resp, err := c.do(ctx, Request{Op: "netns_match", SignalPID: pid, ExpectedNetnsPath: expectedNetnsPath})
+	if err != nil {
+		return false, fmt.Errorf("netns-broker netns_match %d %s: %w", pid, expectedNetnsPath, err)
+	}
+	if resp.Error != "" {
+		return false, fmt.Errorf("netns-broker netns_match %d %s: %s", pid, expectedNetnsPath, resp.Error)
+	}
+	return resp.Match, nil
+}
+
 // Teardown requests unmount+removal of the per-migration netns. Idempotent broker-side.
 func (c *Client) Teardown(ctx context.Context, migrationUID string) error {
 	resp, err := c.do(ctx, Request{Op: "teardown", MigrationUID: migrationUID})

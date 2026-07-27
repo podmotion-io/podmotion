@@ -265,8 +265,12 @@ func (c *CRIUCheckpointer) PreDump(ctx context.Context, opts PreDumpOptions) (Ch
 	}
 
 	// CRIU uses -t for pid (short form) — --pid is not recognized for pre-dump.
-	// --stats (-S) makes CRIU write a stats-dump image into ImagesDir carrying the real
-	// dirty-page accounting (decoded below by decodeCRIUStats) — see criu_stats.go.
+	// CRIU 4.2 has no --stats flag (verified live against the cluster's installed binary:
+	// `criu --help` lists only --display-stats/--no-display-stats, and passing --stats
+	// aborts pre-dump before it even seizes the process — "unrecognized option '--stats'").
+	// CRIU writes the stats-dump image into ImagesDir unconditionally, on every successful
+	// pre-dump/dump, with no CLI flag required — decoded below by decodeCRIUStats via the
+	// go-criu in-process reader (see criu_stats.go).
 	args := []string{
 		"pre-dump",
 		"-t", strconv.Itoa(int(opts.Pid)),
@@ -274,7 +278,6 @@ func (c *CRIUCheckpointer) PreDump(ctx context.Context, opts PreDumpOptions) (Ch
 		"--log-file", "predump.log",
 		"-v4",
 		"--pre-dump-mode", "read",
-		"--stats",
 	}
 
 	if opts.PrevImagesDir != "" {
@@ -308,8 +311,9 @@ func (c *CRIUCheckpointer) PreDump(ctx context.Context, opts PreDumpOptions) (Ch
 			runErr, string(stderrBytes), string(predumpLog))
 	}
 
-	// fail-closed phase-gate (item 1a/1b): read CRIU's own --stats output for the real dirty-page count.
-	// PreDump must NEVER report DirtyPagesMB: 0 as a stand-in for "couldn't measure" — a
+	// fail-closed phase-gate (item 1a/1b): read CRIU's unconditionally-written stats-dump
+	// image for the real dirty-page count. PreDump must NEVER report DirtyPagesMB: 0 as a
+	// stand-in for "couldn't measure" — a
 	// decode failure here fails the whole call closed, because 0 is indistinguishable from
 	// "genuinely no dirty pages" to every caller (EstimateCheckpoint chief among them).
 	dirtyMB, statsErr := decodeCRIUStats(opts.ImagesDir)
@@ -324,6 +328,89 @@ func (c *CRIUCheckpointer) PreDump(ctx context.Context, opts PreDumpOptions) (Ch
 		RoundNumber:      0,
 		CheckpointedAt:   time.Now(),
 	}, nil
+}
+
+// sysSubtreeSkips returns the CRIU --skip-mnt argument set that carves out the ENTIRE /sys
+// subtree for the target process, discovered from its live mount table (/proc/<pid>/mountinfo).
+//
+// ADR-0415 follow-up: CRIU's --skip-mnt is path-literal and NON-recursive — it removes exactly the
+// one named mount from the collected tree, not a subtree. /sys is sysfs mounted at /sys with
+// SEPARATE filesystems mounted beneath it (tmpfs /sys/firmware, cgroup2 /sys/fs/cgroup, bpf
+// /sys/fs/bpf, tracefs/debugfs under /sys/kernel, …), each a distinct mount whose parent is the
+// sysfs /sys. Naming only "/sys" leaves those children KEPT while removing their parent, and CRIU's
+// mount-tree build aborts on the orphaned child ("No parent found for mountpoint … @./sys/…",
+// mount.c:381). Enumerating the subtree from the live table keeps the skip set downward-closed —
+// every mount under /sys is skipped alongside /sys itself — without a static child list that drifts
+// as kernels/runtimes add sysfs submounts. It is a structural subtree carve-out, not the per-mount
+// workload classification ADR-0415 retired.
+//
+// Fails CLOSED: any error reading the mount table is returned so the caller aborts the dump rather
+// than proceeding with a partial /sys skip that would orphan a child and abort mid-dump anyway.
+func sysSubtreeSkips(pid int32) ([]string, error) {
+	if pid <= 0 {
+		return nil, fmt.Errorf("invalid pid %d", pid)
+	}
+	// /proc/<pid>/mountinfo reflects the TARGET's own mount namespace with mountpoints expressed
+	// relative to the target's root — exactly the container-relative form ("/sys", "/sys/firmware")
+	// CRIU reports and --skip-mnt matches against (CRIU is invoked with --root /proc/<pid>/root).
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/mountinfo", pid))
+	if err != nil {
+		return nil, fmt.Errorf("reading mount table: %w", err)
+	}
+	return parseSysSubtreeMounts(data), nil
+}
+
+// parseSysSubtreeMounts extracts, from raw mountinfo bytes, every mountpoint that is exactly /sys or
+// nested beneath /sys/, deduplicated and preserving mount-table order. Pure/deterministic (no I/O)
+// so it is unit-testable without a live mount namespace.
+//
+// proc(5): each mountinfo line is `mountID parentID major:minor root MOUNTPOINT …`, so the
+// mountpoint is field index 4 (0-based). The kernel octal-escapes space (\040), tab (\011),
+// newline (\012) and backslash (\134) in the mountpoint; /sys paths contain none of these, but the
+// field is decoded so a matched path is emitted verbatim as the real mountpoint CRIU sees.
+func parseSysSubtreeMounts(mountinfo []byte) []string {
+	const sysRoot = "/sys"
+	var out []string
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(string(mountinfo), "\n") {
+		fields := strings.Split(line, " ")
+		if len(fields) < 5 {
+			continue
+		}
+		mp := unescapeMountinfoField(fields[4])
+		if mp != sysRoot && !strings.HasPrefix(mp, sysRoot+"/") {
+			continue
+		}
+		if !seen[mp] {
+			seen[mp] = true
+			out = append(out, mp)
+		}
+	}
+	return out
+}
+
+// unescapeMountinfoField decodes the octal escapes the kernel writes into mountinfo path fields
+// (\040 space, \011 tab, \012 newline, \134 backslash). Any other backslash sequence is left
+// verbatim.
+func unescapeMountinfoField(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		// An escape is a backslash followed by exactly three octal digits.
+		if s[i] == '\\' && i+3 < len(s) {
+			d0, d1, d2 := s[i+1], s[i+2], s[i+3]
+			if d0 >= '0' && d0 <= '7' && d1 >= '0' && d1 <= '7' && d2 >= '0' && d2 <= '7' {
+				b.WriteByte((d0-'0')<<6 | (d1-'0')<<3 | (d2 - '0'))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // Dump performs the final (freezing) CRIU dump. The container is frozen for
@@ -371,68 +458,63 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	}
 	logger.Info("CRIU ptrace preflight passed", "pid", opts.Pid)
 
-	// Kubernetes-injected file bind-mounts that CRIU cannot map to a proper root inside
-	// the container's mount namespace. These are re-provided by the container runtime on
-	// restore and must not be saved into the checkpoint image.
-	skipMnts := []string{
-		"/dev/termination-log",
-		"/etc/resolv.conf",
-		"/etc/hostname",
-		"/etc/hosts",
-		"/data", // container volume mount (e.g. Redis /data) — no proper root mount in container mnt ns; re-attached by storage tier on restore (Sprint 31 root_cause=b)
-		// /sys and all children: skip the entire sysfs subtree at dump time.
-		//
-		// Gate10 analysis: neither including /sys as external (ext_key='pm-sys') nor
-		// skip-at-dump prevents compat-mode from trying to umount the destination's /sys.
-		// CRIU 4.2 compat-mode umount pass iterates the destination's mount table and
-		// umounts entries not in the source image's NON-EXTERNAL mounts — external image
-		// entries (E) do NOT prevent umount of the destination's corresponding mount.
-		// Fix: skip /sys at dump time AND add /sys to SkipMnt on restore. SkipMnt on
-		// restore tells compat-mode to leave that mountpoint alone (no umount, no mount).
-		"/sys",
-		"/sys/fs/cgroup",
-		"/sys/fs/bpf",
-		"/sys/kernel/tracing",
-		"/sys/kernel/debug",
-		"/sys/fs/fuse/connections",
-		"/sys/kernel/config",
-		"/sys/devices/virtual/dmi/id/product_name",
-		"/sys/devices/virtual/dmi/id/product_uuid",
-		"/sys/devices/virtual/dmi/id/board_serial",
-		"/sys/devices/virtual/dmi/id/chassis_serial",
-		"/sys/devices/virtual/dmi/id/sys_vendor",
-		"/sys/devices/virtual/powercap",
-		"/sys/firmware",
-		// ADR-0228: container-runtime masking tmpfs mounts over /proc/*.
-		//
-		// containerd/runc inject small read-only tmpfs mounts (type tmpfs, source tmpfs,
-		// mode=755, size=65536k) over these /proc paths to hide host kernel internals from
-		// the container (the CRI "maskedPaths" default set). They appear in the dump-side
-		// mount table as e.g.:
-		//   type tmpfs source tmpfs mnt_id 12198 s_dev 0x38d / @ ./proc/scsi flags ... mode=755
-		//
-		// CRIU's mountpoint dump pass (criu/filesystems.c dump_tmpfs) tar-serializes the
-		// CONTENT of every tmpfs mount it does not skip. For these masking mounts it shells
-		// out to `tar` (via /bin/sh) to capture the (empty) tmpfs content. In the constrained
-		// agent container that fork is denied:
-		//   mnt: Dumping mountpoints
-		//   mnt: 	12198: 38d:/ @ ./proc/scsi
-		//   /bin/sh: 1: Cannot fork
-		//   tar: Child returned status 2
-		//   tar: Error is not recoverable: exiting now
-		//   Error (criu/util.c:657): exited, status=2
-		//   Error (criu/filesystems.c:426): Can't dump tmpfs content
-		//   Error (criu/cr-dump.c:2128): Dumping FAILED.
-		// This is the t=15s frontier that surfaced once ADR-0227 (--manage-cgroups=ignore)
-		// cleared the earlier cgroup-walk wall: the dump advanced from the cgroup stage into
-		// the mountpoint stage and hit the FIRST masking tmpfs it tried to tar.
-		//
-		// These masking mounts carry NO workload state — they are empty tmpfs the runtime
-		// re-provides from its own bundle on restore. The restore-side SkipMnt list (below)
-		// ALREADY skips this exact set; the dump side did not, so the dump tried to tar them.
-		// removal/skip-symmetry: skip them at dump time too so CRIU never tar-dumps
-		// their content. Skipping the content does not lose state (tmpfs is empty) and keeps
-		// the dump/restore skip sets symmetric. No `tar` fork is attempted for a skipped mount.
+	// ADR-0415: capture EVERYTHING the pod owns, unconditionally, by default. skipMnts is NOT an
+	// allowlist of "runtime-provided / environment-managed" mounts to exclude anymore — that ad hoc
+	// per-mount classification (the /dev/termination-log, /etc/resolv.conf, /etc/hosts, /data,
+	// /run/secrets/... serviceaccount token tmpfs, /dev/mqueue, /dev/pts, and the /dev
+	// external-placeholder machinery it went with) IS the bug: any owned OS construct the list
+	// forgot to enumerate was silently mishandled (the /dev/shm data-loss class). It is removed.
+	//
+	// skipMnts now carries EXACTLY the two structural carve-outs — and they are carve-outs because
+	// their content is not capturable, not because of any judgment about whether it matters:
+	//
+	//  1. /proc and /sys — live kernel-synthesized views, not real data. They regenerate fresh on
+	//     restore, so there is nothing to capture; skip the whole subtree so CRIU's mountpoint pass
+	//     never tries to tar-serialize a synthesized/masked bind (the historical "Can't dump tmpfs
+	//     content"/"doesn't have a proper root mount" aborts). --skip-mnt removes the mount from the
+	//     collected tree entirely — but it is PATH-LITERAL and NON-RECURSIVE: it removes exactly the
+	//     one named mount, never a subtree. /sys is not a single mount: sysfs is mounted at /sys and
+	//     separate filesystems (tmpfs at /sys/firmware, cgroup2 at /sys/fs/cgroup, bpf at /sys/fs/bpf,
+	//     tracefs/debugfs under /sys/kernel, …) are mounted UNDER it, each with its own mnt_id whose
+	//     parent_mnt_id is the sysfs /sys. Naming only "/sys" removes the parent while leaving those
+	//     children KEPT in the collected set; CRIU's "Building plain mount tree" pass then cannot
+	//     resolve their now-absent parent ("No parent found for mountpoint … @./sys/firmware",
+	//     mount.c:381) and aborts the dump (ADR-0415 follow-up). The whole /sys subtree must therefore
+	//     be named. Rather than re-hardcode a static child enumeration (which drifts and is the exact
+	//     brittleness ADR-0415 retired), the subtree is discovered from the target's LIVE mount table
+	//     (sysSubtreeSkips) so the carve-out tracks whatever the kernel/runtime actually mounted and
+	//     stays downward-closed — no kept child can orphan its skipped parent. This mirrors the
+	//     post-dump patch step's mnt_id-graph subtree closure (ADR-0190), applied at capture time
+	//     against the mount table CRIU itself reads. It is a structural subtree carve-out, NOT the
+	//     per-mount workload classification ADR-0415 removed.
+	//  2. PVC-backed volumes — NOT skipped here. They are re-attached by PodMotion's separate,
+	//     already-working storage tier (Longhorn dual-engine etc.), captured via
+	//     --external mnt[]{:AUTO_OPTIONS} below and re-attached on restore, never tarred into the
+	//     checkpoint. That is the storage tier's carve-out, not a skipMnts entry.
+	//
+	// Every other pod-local mount — /dev, /dev/shm, /dev/mqueue, /dev/pts, the serviceaccount token
+	// tmpfs, any pod-local tmpfs, and whatever construct a future runtime injects — is captured with
+	// content by default (no entry here). Checkpoint confidentiality (0700 images, tmpfs, zeroize on
+	// exit, and the ADR-0029 checkpoint encryption feature) is the uniform place that risk is
+	// handled, NOT a capture-time exclusion list.
+	// (1) /sys — kernel-synthesized; the ENTIRE subtree is carved out. Discovered from the target's
+	// live mount table (see sysSubtreeSkips) because --skip-mnt is path-literal/non-recursive and
+	// /sys's separately-mounted children would otherwise orphan on the skipped /sys parent and abort
+	// the dump. Fail CLOSED: if the mount table cannot be read we cannot prove the /sys subtree is
+	// fully carved out, so we abort rather than dump with a partial skip set that would orphan.
+	sysSkips, err := sysSubtreeSkips(opts.Pid)
+	if err != nil {
+		return CheckpointResult{}, fmt.Errorf("enumerating /sys subtree mounts to skip for pid %d: %w", opts.Pid, err)
+	}
+	skipMnts := make([]string, 0, len(sysSkips)+15)
+	skipMnts = append(skipMnts, sysSkips...)
+	skipMnts = append(skipMnts,
+		// (1) /proc masked/synthesized submounts — kernel-synthesized; carved out. /proc's ROOT is
+		// kept (CRIU restores /proc natively); only these runtime-masked or kernel-synthesized
+		// submounts are skipped, exactly as the restore side does. Unlike /sys these are NOT a subtree
+		// carve-out: /proc itself is KEPT, so naming individual leaf submounts orphans nothing (their
+		// parent /proc stays in the collected set). They are enumerated statically because they are a
+		// fixed kernel/runtime masking set under a kept parent, not a live-varying subtree.
 		"/proc/acpi",
 		"/proc/asound",
 		"/proc/kcore",
@@ -440,18 +522,6 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		"/proc/latency_stats",
 		"/proc/scsi",
 		"/proc/timer_list",
-		// dump/restore skip symmetry: the restore-side SkipMnt list (below) skips these
-		// masked /proc/* mounts too, but the dump side historically did not. On the raw
-		// go-criu Dump path this asymmetry is latent — a masked bind CRIU cannot resolve to
-		// a proper root (e.g. /proc/interrupts) aborts the mountpoint-dump pass at
-		// criu/mount.c:753 "doesn't have a proper root mount" BEFORE the network pass. This
-		// is the exact class of failure that hard-fails postgres via `ctr tasks checkpoint`
-		// (which does not carry this list at all) and is routed to this raw path via
-		// ErrCtrMaskedMount. containerd/runc bind these masked /proc entries per the OCI
-		// default maskedPaths set; they carry no migratable workload state and are re-provided
-		// by the destination runtime on restore. Skip them at dump so the mount pass never
-		// tries to resolve their root, keeping the dump and restore skip sets symmetric
-		// (mirrors the restore-side SkipMnt block below — do not let the two drift).
 		"/proc/interrupts",
 		"/proc/timer_stats",
 		"/proc/sched_debug",
@@ -460,70 +530,7 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		"/proc/irq",
 		"/proc/sys",
 		"/proc/sysrq-trigger",
-		// ADR-0228: Kubernetes projected service-account token tmpfs.
-		//
-		// The kubelet mounts the projected SA token as its own tmpfs:
-		//   type tmpfs source tmpfs mnt_id 12345 s_dev 0x32b / @ ./run/secrets/kubernetes.io/serviceaccount
-		//   flags 0x200001 options size=32548448k,inode64,noswap
-		// It is the SAME failure class as the /proc/* masking mounts above: CRIU's
-		// mountpoint dump pass tar-serializes its content and the `tar`/`/bin/sh` fork
-		// is denied in the constrained agent container, producing the identical
-		// filesystems.c:426 "Can't dump tmpfs content" abort — just one mount later in
-		// the dump order once the /proc/* masking mounts are skipped (healthy-descent
-		// frontier advance). The projected token is NOT migrated state: it is
-		// re-provided by the DESTINATION kubelet's own projected-volume plumbing on
-		// restore, which is exactly why the restore-side SkipMnt list below already
-		// skips /var/run/secrets/kubernetes.io/serviceaccount. Skip it at dump too to
-		// keep the dump/restore skip sets symmetric. Both /run and /var/run
-		// spellings are listed because the path appears as /run/... in this pod's mount
-		// table while the restore side carries the canonical /var/run/... form
-		// (/var/run is conventionally a symlink to /run); --skip-mnt matches the path
-		// literally, so list both to be robust across runtimes.
-		"/run/secrets/kubernetes.io/serviceaccount",
-		"/var/run/secrets/kubernetes.io/serviceaccount",
-		// ADR-0230: container /dev tmpfs + its overmounting tmpfs children.
-		//
-		// runc/containerd mounts the container's /dev as a fresh tmpfs (mode=755,
-		// size=65536k) and then OVERMOUNTS it with /dev/shm, /dev/mqueue, /dev/pts and
-		// the /dev/termination-log bind. Those child mounts obscure the parent /dev
-		// tmpfs, so CRIU's per-mount dump pass (criu/mount.c dump_one_mountpoint ->
-		// mnt_is_fully_visible) classifies /dev as NOT fully visible:
-		//   mnt: 	12334: 384:/ @ ./dev
-		//   mnt: Mount is not fully visible ./dev(12334)
-		// For an obscured tmpfs CRIU cannot read the real content through the agent's
-		// view, so it falls back to entering the SOURCE mount namespace directly to
-		// read it — criu/namespaces.c restore_ns()/switch_ns_by_fd() issues
-		// setns(<mnt-ns-fd>, CLONE_NEWNS). In the constrained agent container that
-		// setns is denied:
-		//   Error (criu/namespaces.c:258): Can't setns 12/mnt: Operation not permitted
-		//   Error (criu/mount.c:1809): mnt: Unable to dump a file system for 12334:./dev
-		//   Error (criu/cr-dump.c:2128): Dumping FAILED.
-		// EPERM here is NOT a missing capability (the agent holds CAP_SYS_ADMIN, and
-		// setns is seccomp-allowed): setns(CLONE_NEWNS) is gated by CAP_SYS_ADMIN
-		// EFFECTIVE in the USER NAMESPACE THAT OWNS the target mount namespace. The
-		// workload pod's mount ns is owned by its own user namespace, not the agent's,
-		// so the agent's host-userns CAP_SYS_ADMIN does not carry into it — exactly the
-		// constraint the daemonset HOLD-A comment documents for the netns-broker. We do
-		// NOT escalate the agent to privileged to win that setns; instead we eliminate
-		// the need for it. ADR-0227's --manage-cgroups=ignore and ADR-0228's masked-tmpfs
-		// skips advanced the dump frontier into the mountpoint pass; /dev is the FIRST
-		// obscured-parent tmpfs CRIU tries to read via setns (healthy-descent frontier
-		// advance).
-		//
-		// The container /dev tmpfs carries NO migratable workload state: it is the
-		// standard device-node set (/dev/null, /dev/zero, /dev/urandom, /dev/console,
-		// ...) that the DESTINATION runtime re-provides verbatim from the OCI spec on
-		// restore, and its tmpfs children (shm/mqueue/pts) are likewise runtime-provided.
-		// Redis opens none of /dev as persistent state. Skip /dev (and its overmounting
-		// tmpfs children, for removal symmetry so no child is dumped without its
-		// parent) at dump time. --skip-mnt short-circuits dump_one_mountpoint BEFORE the
-		// visibility check fires, so CRIU never attempts the setns. The restore-side
-		// SkipMnt below mirrors this exact set (dump/restore skip symmetry).
-		"/dev",
-		"/dev/shm",
-		"/dev/mqueue",
-		"/dev/pts",
-	}
+	)
 
 	// Build CLI args. We use exec (not swrk RPC) for the final dump because CRIU 4.2
 	// swrk mode does not honour AutoExtMnt / External["mnt[]{:AUTO_OPTIONS}"] for some
@@ -544,8 +551,13 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 		// is opened (empty dump.log) — which masked the real failure on Sprint 31.
 		// CRIU 4.2 handles shared/master mounts automatically via --external below.
 		"--external", "mnt[]{:AUTO_OPTIONS}",
-		// /sys is in skipMnts — no external declaration needed for /sys.
-		// compat-mode umount is prevented via SkipMnt on restore side.
+		// ADR-0415: the "--external mnt[/dev]:pm-dev" obscured-parent placeholder is REMOVED. /dev is
+		// a pod-owned tmpfs and is captured with content by default like every other owned mount, not
+		// declared external. Declaring /dev external was exactly what suppressed CRIU's fill of its
+		// /dev/shm child (the data-loss class this ADR eliminates). --external mnt[]{:AUTO_OPTIONS}
+		// remains only to name genuinely-external, host-provided bind sources (the storage-tier PVC
+		// mounts), never pod-owned trees. /proc and /sys are the only structural exclusions and live
+		// in skipMnts above.
 		"--network-lock", "skip",
 		// ADR-0227: --manage-cgroups=ignore. CRIU's default cgroup mode walks and
 		// serializes the source pod's full cgroup membership. On a cgroup-v2 kind node
@@ -827,10 +839,11 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 		// the image had external mounts with a non-standard root. With the stripped image
 		// (5 regular entries: /, /proc, /dev, /dev/pts, /dev/mqueue) mount-v2 should work.
 		MntnsCompatMode: proto.Bool(false),
-		// SkipMnt: skip restoring Kubernetes masked-path mounts (tmpfs bind-mounts of /dev/null)
-		// and the service-account tmpfs that references source-node-specific device IDs.
-		// These mounts have null-resolvable sources on the destination and cause "No mapping"
-		// errors. Skipping them is safe: Redis does not use any of these paths.
+		// SkipMnt: ADR-0415 — mirror the dump-side structural carve-outs only (/proc and /sys
+		// kernel-synthesized submounts). Every pod-owned mount (/dev, /dev/shm, /dev/mqueue,
+		// /dev/pts, the serviceaccount token tmpfs, PVC /data) is captured with content and restored
+		// as CRIU-owned, not skipped. PVC volumes are re-attached by the storage tier, not here.
+		// (This RPC Restore path is dead code — the live restore is server.go buildCRIURestoreArgs.)
 		SkipMnt: []string{
 			"/proc/interrupts",
 			"/proc/kcore",
@@ -840,18 +853,6 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 			"/proc/timer_stats",
 			"/proc/sched_debug",
 			"/proc/scsi",
-			"/sys/firmware",
-			"/sys/fs/pstore",
-			// NOTE: /sys is NOT in SkipMnt — CRIU 4.2 SkipMnt is dump-only (--skip-mnt
-			// help says "ignore this mountpoint when dumping the mount namespace"). It has no
-			// effect on the restore-side compat-mode umount pass. /sys is skipped at dump via
-			// skipMnts; compat-mode is disabled (MntnsCompatMode=false) to avoid the umount pass.
-			"/var/run/secrets/kubernetes.io/serviceaccount",
-			// Additional containerd/runc-injected proc submounts that CRIU autodetects as
-			// external mounts with a (null) source on restore (mount.c:3120). These are
-			// re-provided by the destination runtime's own bundle, so skipping them on
-			// restore is safe — Redis does not depend on them. Without this the restore
-			// hard-fails with "is autodetected external mount" (ADR-0131 restore path).
 			"/proc/bus",
 			"/proc/fs",
 			"/proc/irq",
@@ -859,25 +860,14 @@ func (c *CRIUCheckpointer) Restore(ctx context.Context, opts RestoreOptions) (Re
 			"/proc/sysrq-trigger",
 			"/proc/acpi",
 			"/proc/asound",
+			"/sys/firmware",
+			"/sys/fs/pstore",
 			"/sys/fs/bpf",
 			"/sys/fs/cgroup",
-			// Container-runtime VOLUME mount (e.g. Redis /data) — skipped on dump (no proper
-			// root in container mnt ns) and re-attached by the destination storage tier on
-			// restore. Mirror the dump-side skip so CRIU does not try to restore it.
-			"/data",
-			// ADR-0230: mirror the dump-side /dev skip set. The /dev tmpfs and
-			// its tmpfs children (shm/mqueue/pts) are not in the dump image (skipped at
-			// dump to avoid the obscured-parent setns), so the restore must not expect to
-			// recreate them — the destination runtime re-provides /dev from the OCI spec.
-			// Keeping the dump and restore skip sets identical preserves removal symmetry.
-			"/dev",
-			"/dev/shm",
-			"/dev/mqueue",
-			"/dev/pts",
 		},
-		// pm-sys reverse-maps the dump-side --external mnt[/sys]:pm-sys declaration. Without this,
-		// compat-mode treats /sys as a stale mount and umounts it; the host-bind-mounted sysfs
-		// returns EBUSY. Key must match criu_checkpointer.go dump args exactly.
+		// ADR-0415: only /sys retains the reverse-mapped external placeholder (pm-sys is still the
+		// dump-side --external mnt[/sys]:pm-sys declaration for the structural /sys carve-out). The
+		// pm-dev /dev placeholder is removed — /dev is captured as owned content, not external.
 		External: []string{"mnt[pm-sys]:/sys"},
 	}
 

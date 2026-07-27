@@ -1,0 +1,64 @@
+{{- /*
+ADR-0364 (Part B2 of Task #20): runs podmotion-scheduler as a SECOND scheduler alongside the
+cluster's stock kube-scheduler — not a replacement for it. Only migration-labeled replacement
+pods carry spec.schedulerName: podmotion-scheduler (set by the mutating webhook, ADR-0362 Part
+C); every other pod in the cluster continues to be scheduled by the stock kube-scheduler,
+unaffected.
+
+Depends on ADR-0362 Part B1 (cmd/scheduler/main.go un-stubbed + image/build wiring) for a
+functioning image — until B1 lands, .Values.scheduler.image.* points at a placeholder/no image
+and this Deployment is inert (ImagePullBackOff) by design; see ADR-0364 Consequences. Not this
+ADR's scope to fix.
+*/ -}}
+{{- if .Values.scheduler.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podmotion-scheduler
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: scheduler
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  replicas: {{ .Values.scheduler.replicas }}
+  selector:
+    matchLabels:
+      app: podmotion-scheduler
+  template:
+    metadata:
+      labels:
+        app: podmotion-scheduler
+        app.kubernetes.io/name: podmotion
+        app.kubernetes.io/component: scheduler
+    spec:
+      serviceAccountName: podmotion-scheduler
+      securityContext:
+        runAsNonRoot: true
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: scheduler
+          image: "{{ .Values.scheduler.image.repository }}:{{ .Values.scheduler.image.tag }}"
+          imagePullPolicy: {{ .Values.scheduler.image.pullPolicy }}
+          # Standard upstream kube-scheduler/scheduler-plugins invocation convention: the
+          # KubeSchedulerConfiguration (scheduler-configmap.yaml) carries the profile, so no
+          # other CLI flags are needed.
+          command: [/scheduler]
+          args:
+            - --config=/etc/podmotion/scheduler/scheduler-config.yaml
+          resources:
+            {{- toYaml .Values.scheduler.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: scheduler-config
+              mountPath: /etc/podmotion/scheduler
+              readOnly: true
+      volumes:
+        - name: scheduler-config
+          configMap:
+            name: podmotion-scheduler-config
+{{- end }}

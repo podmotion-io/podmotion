@@ -15,6 +15,7 @@ Current version: **v0.1.0-alpha**
 | 🔨 In Progress | Active implementation underway |
 | 🔲 Planned | Scoped but not started |
 | 💡 For Consideration | Research complete; not yet scoped into a milestone; requires approval before sprints begin |
+| 🔶 Built, Not Wired *(proposed 2026-07-23 — not yet confirmed by Chad, see M19 note)* | Deliverables are merged and the code paths exist, but the production activation this milestone claims is not actually connected at runtime (e.g. always falls through to a no-op) |
 
 ---
 
@@ -64,6 +65,21 @@ During migration: a single transition line where **only the NODE column changes*
 
 ADR-0048, ADR-0082, ADR-0085, ADR-0033, ADR-0119, and `docs/kep/kep-XXXX-kubelet-restore-api.md` are all directly load-bearing for this milestone. Read before scoping sprints.
 
+**Cross-reference (2026-07-23):** the `podmotion-ipam` CNI meta-plugin and `IPAMOwnershipTransferred` condition proposed here are exactly the pod-IP-pin / IPAM-ownership-transfer mechanism that `CLAUDE.md` records as explicitly out of roadmap scope for the time being (Chad, standing, 2026-07-11/07-20 — "THE BAR IS SERVICE-IP," not pod IP). This proposal is still correctly gated "requires approval" above; approving it as a milestone would need to first revisit that standing descope.
+
+---
+
+## 🚫 Out of Scope — Current Alpha Descopes
+
+These are standing descopes for the current alpha — confirmed this session (2026-07-23) — not deferred gaps, so milestones written as if they were in scope (M16, M19) should be read against them.
+
+- **Multi-container pod migration.** Out of scope for the current alpha, same future-roadmap bucket as the descopes below.
+- **Storage motion (PVC migration itself).** Migrating a pod whose PVC itself must move is out of scope for the current alpha — distinct from migrating a pod whose PVC is already on shared/RWX-visible storage, which M6/M7 already handle.
+- **Controller-owned pod migration (Deployment/ReplicaSet/StatefulSet).** Out of scope for the current alpha. Verified this session: the controller and PodMotion end up as two racing reconcile loops sharing the same pod object — a real, unresolved ReplicaSet-ownership race, not a labeling or annotation fix. A new single-owner CRD primitive would be needed before controller-owned migration (including StatefulSet-orchestrated migration) can be considered live. M16 and M19 as written assume controller-owned workloads and should be read as "designed, not currently operative for the alpha scope."
+- **M19 / GitOps-aware migration.** Postponed — not part of the current alpha (Chad-directed, 2026-07-24). M19's entire mechanism (sub-controller migration via scheduler-plugin + NRI hook, so a Deployment/ReplicaSet/StatefulSet-owned replacement pod is steered without patching the controller spec) assumes controller-owned workloads — which is itself already out of scope per the bullet above. So this is doubly out: GitOps-awareness has no live foothold to build on until controller-owned pod migration returns to scope first.
+
+All four sit in the same future-roadmap bucket as the existing pod-IP-pin / MAC-preservation descope recorded in `CLAUDE.md` ("THE BAR IS SERVICE-IP").
+
 ---
 
 ## M1 — CRDs, Node Image, Webhooks ✅ Complete
@@ -90,6 +106,8 @@ ADR-0048, ADR-0082, ADR-0085, ADR-0033, ADR-0119, and `docs/kep/kep-XXXX-kubelet
 - Eviction webhook interceptor (blocks eviction of actively-migrating pods)
 - Leader election (3 replicas, coordination.k8s.io/v1 Lease)
 - Completion timeout with auto-abort
+
+**Note (2026-07-23):** production wiring in `cmd/main.go:311` uses `estimation.StubProber`, not the real `estimation.GRPCProber` (`internal/estimation/grpc_prober.go`) — dry-run estimation in the running operator is currently synthetic, not live dirty-page sampling.
 
 **Dependencies:** M1 (CRDs must exist).
 
@@ -158,6 +176,8 @@ ADR-0048, ADR-0082, ADR-0085, ADR-0033, ADR-0119, and `docs/kep/kep-XXXX-kubelet
 - Tier 3: VolumeSnapshot → clone → rsync delta (for local PVs and AWS EBS)
 - NodeFencingEmitter: stuck RWO volume event emission and recovery guidance
 
+**Note (2026-07-23):** `internal/agent/storage/tier2.go` (`imageNames`, ~lines 273-286) still resolves Ceph RBD image names via the `pvc-<uid>` PVCName convention rather than the PV's real `spec.csi.volumeHandle`, per the code's own comment. This is unfixed Sprint-43-audit finding H-11 — not addressed by the Sprint 43 remediation worklist.
+
 **Dependencies:** M6.
 
 ---
@@ -219,6 +239,8 @@ ADR-0048, ADR-0082, ADR-0085, ADR-0033, ADR-0119, and `docs/kep/kep-XXXX-kubelet
 - Envoy/Istio drain coordination
 - NetworkBridgeArmed CR condition (gates cutover; ADR-0028)
 - bpfman DaemonSet for eBPF program lifecycle management
+
+**Note (2026-07-23):** `pm_relay_bpfel.o`, `pm_sk_lookup_bpfel.o`, and `pm_xdp_vtep_bpfel.o` (`internal/agent/network/bpfloader/`) are committed to git as 0-byte files — not build artifacts, not gitignored — which breaks all TCP-preserving migrations with an active connection (RESUME-STATE open task #21, HIGH IMPACT).
 
 **Dependencies:** M9.
 
@@ -296,6 +318,8 @@ ADR-0048, ADR-0082, ADR-0085, ADR-0033, ADR-0119, and `docs/kep/kep-XXXX-kubelet
 - PVC follow-along: each pod's PVCs migrate with its pod
 - Ordinal integrity preserved across rollback
 
+**Note (2026-07-23):** no StatefulSet controller/watcher is ever started in `cmd/main.go` (zero matches); `BuildMigrationPlan` (`internal/controller/statefulset/orchestrator.go`) is dead code outside its own file and tests. The admission webhook itself emits a runtime warning that "no StatefulSet orchestrator is managing this migration" (`internal/webhook/podmigration_webhook.go`). Controller-owned pod migration (Deployment/ReplicaSet/StatefulSet) is now an explicit descope for the current alpha — see "Out of Scope — Current Alpha Descopes" below. This milestone as written assumed controller-owned migration was live; read it as designed, not currently operative for the alpha scope.
+
 **Dependencies:** M7, M8.
 
 ---
@@ -326,7 +350,11 @@ ADR-0048, ADR-0082, ADR-0085, ADR-0033, ADR-0119, and `docs/kep/kep-XXXX-kubelet
 
 ---
 
-## M19 — GitOps-Aware Migration (ADR-0046)
+## M19 — GitOps-Aware Migration (ADR-0046) 🚫 POSTPONED — Out of Alpha Scope
+
+**Note (2026-07-24, Chad-directed):** M19 is postponed and is NOT part of the current alpha — see the fourth bullet under "🚫 Out of Scope — Current Alpha Descopes" above. This joins the other three standing alpha descopes (multi-container pod migration, storage motion, controller-owned pod migration) recorded in that section. The technical content below (ADR-0046 design, deliverables, dependencies, user-friction inventory) remains valid future-roadmap design work and is kept as-is — it is not being deleted, just deferred. Do not schedule sprint work against this milestone under the current alpha.
+
+**Note (2026-07-23):** this milestone previously carried no status marker at all, unlike every other milestone in this file. The `GitOpsSuspender` dispatch is always `gitops.NoopSuspender` (`internal/gitops/suspender.go`) — it is never wired to a real ArgoCD or Flux client at runtime, regardless of whether either tool is present on the cluster. The 🔶 "Built, Not Wired" marker that was proposed at that time is superseded by the 🚫 POSTPONED marker above (2026-07-24) — the wiring gap is now moot since the milestone is out of alpha scope entirely. Controller-owned pod migration is also now descoped for the current alpha — see "Out of Scope — Current Alpha Descopes" below.
 
 **Problem statement:** GitOps tools (ArgoCD, Flux CD) continuously reconcile workload
 controller objects (Deployments, StatefulSets, ReplicaSets) toward Git-declared state. Any
@@ -640,10 +668,10 @@ M1 ──► M2 ──► M3 ──► M4 ──► M5 ──► M6 ──► M7
 
 | Version | Milestones | Description |
 |---------|-----------|-------------|
-| v0.1.0-alpha | M1–M5, M8, M11 | Cold + iterative pre-copy; TIER_4 network (reconnect); no TCP preservation |
+| v0.1.0-alpha | M1–M5, M8, M11 | Cold + iterative pre-copy; TIER_4 network (reconnect); `tcpPreservationMode` now defaults to `Strict` (ADR-0388) and a zero-connection pod passes trivially — real held-connection TCP preservation is not currently functional (eBPF relay/XDP objects are 0 bytes, RESUME-STATE task #21); TIER_4 network reconnect remains the operative behavior for pods with live connections |
 | v0.1.0 | M1–M12 | Full intra-cluster migration; eBPF network bridge; all storage tiers |
 | v0.2.0 | M13, M15, M16, M17 | Post-copy, GPU, StatefulSet, spot automation; TCP_REPAIR preservation |
-| v1.0.0 | M1–M19 | Production-ready; GitOps-aware; OperatorHub; upstream KEPs submitted |
+| v1.0.0 | M1–M19 | Production-ready; GitOps-aware; OperatorHub; upstream KEPs submitted. **Note (2026-07-24):** M19 is postponed / out of current-alpha scope (Chad-directed) pending controller-owned pod migration returning to scope first — this milestone range and description are the original design target, not a confirmed timeline; the v1.0.0 date/scope may need revisiting once M19's prerequisite (controller-owned migration) is re-scoped |
 | v1.1.0 | +M20 | Istio service mesh certification |
 | v1.2.0 | +M21 | Automated certification matrix; agentic version validation; beta gate |
 | v1.x+ | Multi-cluster GA | M14 graduated from experimental |
@@ -652,26 +680,6 @@ M1 ──► M2 ──► M3 ──► M4 ──► M5 ──► M6 ──► M7
 
 ## PoC Sprint Log
 
-| Sprint | Status | Key Achievement |
-|--------|--------|-----------------|
-| Sprint 1 | Complete | First nginx migration end-to-end (state machine wired, gRPC skeleton) |
-| Sprint 2 | Complete | AgentPool wired, all 3 workloads (nginx/redis/postgres) reach Complete |
-| Sprint 3 | Complete | Privileged DaemonSet, source pod deletion, Postgres data integrity via PVC |
-| Sprint 4 | Complete | Checkpoint + Restore gRPC fully wired; CheckpointRef set; PrepareDestination called; destination node pinning enforced |
-| Sprint 5 | Complete | CRIU opts corrected for containers; PID resolution via /proc cgroup scan; mock fallback gated on env var; CRIU errors surfaced at ERROR level; ADR-0042 written |
-| Sprint 6 | Complete | Optimistic-lock conflict fixed (6 call sites); state machine reaches Checkpointing; CRIU 3.17.1 confirmed invoked; restore failed — checkpoint images missing/empty |
-| Sprint 7 | Complete | Dump path fixed; transfer wired; NetworkLock=SKIP; TcpSkipInFlight=true; CRIU restore invoked but dump still empty |
-| Sprint 8 | Complete | Seccomp unconfined + CAP_SYS_PTRACE confirmed; CRIU dump succeeds; restore blocked by ARM64 linuxkit hard wall; Multipass pivot |
-| Sprint 9 | Complete | Multipass Ubuntu 24.04 ARM64 + k3s; CRIU 4.2 installed; real CRIU restore invoked; dump never executed (controller reconcile race) |
-| Sprint 10 | Complete | Reconcile race fixed; CRIU dump succeeded; inventory.img confirmed (13 artifacts); restore failed — wrong directory path; dataIntact=false |
-| Sprint 11 | Complete | CheckpointRef path fixed (full filesystem path stored); crash-safe restart path fired before Checkpoint gRPC — dump never made; dataIntact=false |
-| Sprint 12 | Failed | Crash-safe restart nil-guard added (CheckpointRef check); blocker: crash-safe restart path fired on brand-new migration — Checkpointing phase skipped entirely, no gRPC CheckpointPod call made, no CRIU dump written |
-| Sprint 13 | Failed | data transfer wired; blocker: CRIU not reached — container root PID resolved as 0; agent in-memory migrationPodUID map empty at Checkpoint time (agent restarted between PrepareSource and Checkpoint calls) |
-
-## Sprint 14 Target
-
-**Blocker:** `migrationPodUID` map in `internal/agent/server/server.go` is in-memory only. When the agent DaemonSet pod restarts between the `PrepareSource` and `Checkpoint` RPC calls, the stored pod UID is lost and `FindContainerPID` receives an empty string, returning PID 0. CRIU `Dump()` fast-fails on PID 0.
-
-**Fix:** In `AgentServer.Checkpoint()` (`internal/agent/server/server.go`), when `podUID == ""` (map miss due to restart), fall back to resolving the pod UID directly from the Kubernetes API using the migration name and namespace passed in the `CheckpointRequest`. The `AgentServer` already holds a `k8sClient`; use it to `Get` the `PodMigration` CR and extract `spec.podName` + `spec.namespace`, then `Get` the Pod and use `pod.UID`. Store the resolved UID back in the map so subsequent calls are fast. This eliminates the in-memory-only gap without requiring persistent storage.
-
-**Acceptance criteria:** CRIU dump writes `inventory.img`; `sprint14_key=hello_podmotion` survives migration; `dataIntact=true`, `realCRIU=true`, `inventory.img` present.
+Sprints 1–14 (pre-M1 proof-of-concept log, predating this milestone register) have been moved to
+[`docs/proof/archive/poc-sprint-log-sprints-1-14.md`](proof/archive/poc-sprint-log-sprints-1-14.md) —
+this file now tracks milestone definitions only, not the historical PoC sprint-by-sprint log.

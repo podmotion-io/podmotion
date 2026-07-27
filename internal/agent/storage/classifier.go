@@ -11,10 +11,21 @@ you may not use this file except in compliance with the License.
 // Tier hierarchy (ADR-0007):
 //
 //	Tier0: ReadWriteMany (NFS, CephFS) — re-attach only, zero data movement
-//	Tier1: Longhorn dual-engine live migration
+//	Tier1: Longhorn dual-engine live migration — ReadWriteMany/migratable Longhorn
+//	       PVCs ONLY (ADR-0387); a Longhorn PVC that is ReadWriteOnce (the cluster's
+//	       default single-attach StorageClass) cannot use Longhorn's dual-engine
+//	       mechanism and is classified TierBlocked instead, never TierLonghorn.
+//	       Even when RWX, TierLonghorn additionally requires the pod to have an
+//	       owning controller (ReplicaSet/Deployment) — ADR-0356's early-source-release
+//	       recovery story is structurally unmet for a standalone pod, so a bare pod's
+//	       RWX Longhorn PVC is also classified TierBlocked instead (ADR-0391).
 //	Tier2: Ceph RBD (rbd.csi.ceph.com) — live migration via CSI
 //	Tier3: RWO generic — snapshot + rsync
-//	Tier4: hostPath / memory emptyDir — blocked by webhook before we get here
+//	Tier4: hostPath / memory emptyDir / disk-backed emptyDir — blocked by webhook
+//	       before we get here (ADR-0383; see detectTier4Volume in
+//	       internal/webhook/podmigration_webhook.go) — also emitted directly by
+//	       classifyPVC for a ReadWriteOnce Longhorn PVC (ADR-0387), and by ClassifyPod
+//	       for an owning-controller-less pod's otherwise-valid RWX Longhorn PVC (ADR-0391).
 package storage
 
 import (
@@ -82,11 +93,25 @@ func NewStorageClassifier(c client.Client) *StorageClassifier {
 // ClassifyPod returns a TierClassification for each PVC mounted by the pod.
 // If the pod has no PVCs it returns an empty slice — Tier0 re-attach logic applies.
 // The highest-cost tier across all PVCs determines the overall migration strategy.
-func (sc *StorageClassifier) ClassifyPod(ctx context.Context, pod *corev1.Pod) ([]TierClassification, error) {
+//
+// coldRecreateArmed (ADR-0396) narrows ADR-0391's unconditional bare-pod
+// TierLonghorn→TierBlocked downgrade. It is an in-process boolean the OPERATOR computes,
+// immediately before dispatching pre-stage, by actually capturing and read-back-verifying
+// ADR-0393's operator-keyed-HMAC cold-recreate snapshot for THIS migration
+// (armTier1ColdRecreateIfEligible, internal/controller). It is threaded here as a plain
+// function argument — never a status field, so there is nothing on the wire for a lower-trust
+// co-writer to forge. When true, the bare-pod downgrade below is skipped (a verified recovery
+// parachute exists for this pod); when false — the default and the value on every non-arming
+// path (owned pod, bare non-Longhorn pod, failed/failed-verify capture, missing key) — the
+// downgrade fires exactly as ADR-0391 does today. The fail-closed default is preserved verbatim.
+func (sc *StorageClassifier) ClassifyPod(ctx context.Context, pod *corev1.Pod, coldRecreateArmed bool) ([]TierClassification, error) {
 	var results []TierClassification
 
 	for _, vol := range pod.Spec.Volumes {
-		// hostPath and memory emptyDir are caught by the webhook, but guard defensively.
+		// hostPath, memory emptyDir, and disk-backed emptyDir (ADR-0383) are all caught by
+		// the webhook's detectTier4Volume before a PodMigration is even admitted — the checks
+		// below are a defensive second layer (e.g. a pod whose spec changed after admission),
+		// not the primary enforcement point.
 		if vol.HostPath != nil {
 			results = append(results, TierClassification{
 				Tier:    TierBlocked,
@@ -162,7 +187,87 @@ func (sc *StorageClassifier) ClassifyPod(ctx context.Context, pod *corev1.Pod) (
 		results = append(results, clsf)
 	}
 
+	// ADR-0391: TierLonghorn is only safe to hand a migration to when ADR-0356's
+	// early-source-release path (earlyReleaseSourceForTier1Longhorn,
+	// internal/controller/podmigration_controller.go) is itself recoverable. That
+	// function's own doc comment states the recovery story plainly: once the source pod
+	// is deleted ahead of TrafficVerified, recovery from a failed restore is "recreate
+	// from the durably-verified checkpoint" — and per ADR-0387, that recreate is only
+	// ever actually performed by an owning controller (ReplicaSet/Deployment) noticing
+	// the shortfall. ADR-0387 already closed this gap for the ReadWriteOnce-Longhorn
+	// case (classified TierBlocked above, never reaching TierLonghorn at all), but a
+	// genuinely ReadWriteMany/migratable Longhorn PVC still routes to TierLonghorn
+	// regardless of the pod's ownership — and a pod with NO owning controller (a bare
+	// pod, currently the ONLY pod shape this project supports per CLAUDE.md's standing
+	// scope note, 2026-07-23) can reach earlyReleaseSourceForTier1Longhorn, have its
+	// source deleted, and then have nothing anywhere recreate it if restore fails: a
+	// guaranteed, not merely possible, unrecovered outage on that one failure path. This
+	// is the live mechanism behind migration attempt podmotion-demo-4prxx
+	// (migration-demo-postgres): RolledBack=True/RollbackCompleteNoOwningController with
+	// no replacement ever created. Block it here, at classification time — before
+	// checkpoint/freeze ever starts — exactly as ADR-0387 already does for the RWO case,
+	// rather than let the migration proceed to a point where failure is unrecoverable by
+	// design. This does not touch TierLonghorn for a pod that DOES have an owning
+	// controller (ReplicaSet/Deployment) — that combination's recovery story remains
+	// real and this block is a no-op for it.
+	//
+	// ADR-0396: the downgrade is now CONDITIONAL. It is skipped when coldRecreateArmed==true —
+	// i.e. when the operator has itself captured and read-back-verified ADR-0393's operator-keyed
+	// -HMAC cold-recreate snapshot for this specific migration, so a failed restore has a real,
+	// verified recovery path (a cold-recreated pod from the durable snapshot) rather than an
+	// unrecoverable outage. When coldRecreateArmed==false (the default and every non-arming path)
+	// the block fires exactly as ADR-0391 authored it. true can ONLY have been produced by an
+	// operator-side keyed-HMAC verification the agent cannot forge (no signing key), so relaxing on
+	// it authorizes the early-release datapath on a re-verified fact, never on field presence.
+	if !podHasControllerOwner(pod) && !coldRecreateArmed {
+		for i := range results {
+			if results[i].Tier != TierLonghorn {
+				continue
+			}
+			results[i] = TierClassification{
+				Tier: TierBlocked,
+				Reason: fmt.Sprintf("Longhorn-backed StorageClass %q is ReadWriteMany/migratable, "+
+					"but this pod has no owning controller (ReplicaSet/Deployment) — "+
+					"ADR-0356's early-source-release path for Tier1-Longhorn deletes the source "+
+					"pod ahead of TrafficVerified, and per ADR-0387 the only recovery from a "+
+					"subsequently failed restore is an owning controller recreating the pod; a "+
+					"standalone pod has no such recovery path, making any restore failure an "+
+					"unrecoverable outage by design rather than a narrowed-but-real guarantee "+
+					"(ADR-0391)", results[i].StorageClass),
+				PVCName:      results[i].PVCName,
+				StorageClass: results[i].StorageClass,
+			}
+		}
+	}
+
 	return results, nil
+}
+
+// podHasControllerOwner reports whether pod has any OwnerReference with Controller=true
+// (a ReplicaSet, Deployment-via-ReplicaSet, StatefulSet, DaemonSet, Job, etc. actually
+// managing this pod's lifecycle) — mirroring the exact same check
+// earlyReleaseSourceForTier1Longhorn uses to capture
+// pm.Status.Tier1EarlyReleaseSourceOwnerKind (internal/controller/podmigration_controller.go),
+// so classification time and early-release time agree on what "has an owning controller"
+// means.
+func podHasControllerOwner(pod *corev1.Pod) bool {
+	for i := range pod.OwnerReferences {
+		ref := pod.OwnerReferences[i]
+		if ref.Controller != nil && *ref.Controller {
+			return true
+		}
+	}
+	return false
+}
+
+// PodHasControllerOwner is the exported form of podHasControllerOwner, for callers outside this
+// package (ADR-0396's operator-side arming eligibility, internal/controller) that must decide
+// "is this pod bare?" using the EXACT same predicate the classifier's gate uses — so arming-time
+// and classification-time can never disagree on which pods are "bare" (ADR-0396 D5, no-drift). It
+// mirrors the IsLonghornStorageClass/isLonghornStorageClass exported-wrapper idiom already in this
+// file, rather than re-deriving the ownership rule in a second place.
+func PodHasControllerOwner(pod *corev1.Pod) bool {
+	return podHasControllerOwner(pod)
 }
 
 // HighestTier returns the most expensive tier from a slice of classifications.
@@ -215,7 +320,41 @@ func (sc *StorageClassifier) classifyPVC(ctx context.Context, namespace, name st
 			// check regardless of accessMode — Longhorn supports live migration
 			// via its own dual-engine mechanism, so a Longhorn RWX PVC must
 			// still go to TierLonghorn, not the generic RWX/Tier0 path.
+			//
+			// ADR-0387: TierLonghorn is ONLY valid for a PVC that actually declares
+			// ReadWriteMany. Longhorn's real dual-engine live-migration mode requires
+			// RWX — it does not exist for a ReadWriteOnce (single-attach) volume, no
+			// matter which StorageClass name is used. Before this fix, ANY
+			// Longhorn-provisioned PVC was classified TierLonghorn regardless of
+			// access mode, so an RWO PVC on the cluster's default single-attach
+			// `longhorn` StorageClass was silently promised the same live-migration
+			// path as a genuinely-migratable RWX volume. That promise cannot be kept:
+			// Longhorn's own CSI attacher only frees the source node's
+			// VolumeAttachment once no pod on that node references the PVC, so the
+			// only way to unblock the destination mount was ADR-0356's early source
+			// release (deleting/killing the source pod BEFORE TrafficVerified,
+			// ahead of the normal ADR-0012 ordering) — a narrow, risky exception
+			// whose own stated recovery guarantee ("recreate from the durably
+			// verified checkpoint via the source pod's owning controller") is
+			// structurally unmet for a standalone pod with no owning controller,
+			// which is the ONLY pod shape this project currently supports (see
+			// CLAUDE.md standing scope note, 2026-07-23). Requiring RWX here means an
+			// RWO Longhorn PVC is refused up front (TierBlocked, below) instead of
+			// being routed through a live-migration path it cannot safely deliver.
 			if isLonghornStorageClass(sc2) {
+				if !isRWX {
+					return TierClassification{
+						Tier: TierBlocked,
+						Reason: fmt.Sprintf("Longhorn-backed StorageClass %q (provisioner %s) is not "+
+							"ReadWriteMany — PodMotion only supports live migration of Longhorn volumes "+
+							"on an RWX/migratable StorageClass (e.g. \"longhorn-migratable\"); the default "+
+							"single-attach ReadWriteOnce Longhorn class cannot support Longhorn's dual-engine "+
+							"live migration and is not eligible for the Tier1-Longhorn early-source-release "+
+							"path (ADR-0356/ADR-0387)", scName, sc2.Provisioner),
+						PVCName:      name,
+						StorageClass: scName,
+					}, nil
+				}
 				return TierClassification{
 					Tier:         TierLonghorn,
 					Reason:       reasonForTier(TierLonghorn, sc2.Provisioner),

@@ -120,12 +120,6 @@ func (c *CiliumHandoff) AnnotateDestPodIPAM(ctx context.Context, namespace, dest
 // predicates hold; otherwise a classified, fail-closed error whose message carries a stable token
 // ("lookup error" | "does not advertise preserved IP" | "not ready") the caller maps to a Reason.
 func (c *CiliumHandoff) ConfirmEndpointOwnsPreservedIP(ctx context.Context, namespace, podName, wantIP string) (string, error) {
-	if c.DynamicClient == nil {
-		return "", fmt.Errorf("ConfirmEndpointOwnsPreservedIP: DynamicClient is nil (not wired)")
-	}
-	if wantIP == "" {
-		return "", fmt.Errorf("ConfirmEndpointOwnsPreservedIP: wantIP (preserved SourcePodIP) is empty")
-	}
 	deadline := time.Now().Add(c.readyTimeout())
 	for {
 		select {
@@ -138,31 +132,71 @@ func (c *CiliumHandoff) ConfirmEndpointOwnsPreservedIP(ctx context.Context, name
 				namespace, podName, wantIP)
 		}
 
-		obj, err := c.DynamicClient.Resource(ciliumEndpointGVR).Namespace(namespace).Get(ctx, podName, metav1.GetOptions{})
+		node, ok, err := c.EndpointReadyAdvertisesIP(ctx, namespace, podName, wantIP)
 		if err != nil {
-			// Fail-closed on any error other than the object not yet existing — a transient API
-			// error must not be swallowed into a false-ready result.
-			if !isNotFound(err) {
-				return "", fmt.Errorf("CiliumEndpoint lookup error for %s/%s: %w", namespace, podName, err)
-			}
-			// Not found yet — cilium-agent has not created the endpoint object; retry until deadline.
-		} else if ready(obj) {
-			node, _, _ := unstructured.NestedString(obj.Object, "status", "networking", "node")
-			if endpointOwnsIP(obj, wantIP) {
-				return node, nil
-			}
-			// Ready with a non-zero identity but NOT advertising the preserved IP. This is a DECIDED
-			// outcome, not a transient: cilium-agent only marks an endpoint ready after its addressing
-			// is populated, so the IP it owns is settled. Under cluster-pool IPAM this is the expected
-			// result of an unhonored ipam.cilium.io/ip pin (ADR-0324 P-VERIFY-C). Return immediately
-			// with a specific, actionable error rather than crediting a dataplane that never moved the
-			// preserved IP (or waiting out the whole timeout).
-			return "", fmt.Errorf("CiliumEndpoint %s/%s is ready on node %s but does not advertise preserved IP %s (addressing=%v) — ipam.cilium.io/ip pin not honored",
-				namespace, podName, node, wantIP, endpointAddresses(obj))
+			// A DECIDED negative (nil DynamicClient / empty wantIP / real lookup error / ready-but-
+			// wrong-IP) — return immediately rather than polling out the deadline. This preserves the
+			// original wrapper's early-return-on-decided-error behavior byte-for-byte.
+			return "", err
 		}
-
+		if ok {
+			return node, nil
+		}
+		// Not yet programmed (object not found or not ready) — transient; retry until deadline.
 		time.Sleep(c.pollInterval())
 	}
+}
+
+// EndpointReadyAdvertisesIP is the SINGLE-SHOT core of the CiliumEndpoint readiness read (ADR-0405
+// 3B): it issues exactly ONE Get and returns immediately, with no internal poll loop and no
+// deadline. It answers the class question — "has cilium-agent programmed this endpoint's dataplane
+// so wantIP is cluster-routable?" — once, so a caller can compose it with its own retry cadence
+// (e.g. controller-runtime RequeueAfter on the reconcile loop, which must NOT be blocked for
+// seconds per pass). ConfirmEndpointOwnsPreservedIP above is the blocking-poll wrapper around this
+// core, retained for callers (the pod-IP-pin dataplane-reachability path) that want to block until
+// ready. Both callers therefore read through this single source-of-truth core.
+//
+// Returns:
+//   - (node, true, nil)  — programmed: status.state=="ready" AND status.identity.id!=0 AND
+//     status.networking.addressing advertises wantIP.
+//   - ("", false, nil)   — NOT YET programmed this pass (object missing, or not ready). Transient;
+//     the caller should retry / requeue.
+//   - ("", false, err)   — a DECIDED negative that must not be retried into a false-ready: nil
+//     DynamicClient, empty wantIP, a real API lookup error, or ready-but-advertising-a-different-IP
+//     (the unhonored ipam.cilium.io/ip pin, ADR-0324 P-VERIFY-C). Fail-closed.
+func (c *CiliumHandoff) EndpointReadyAdvertisesIP(ctx context.Context, namespace, podName, wantIP string) (string, bool, error) {
+	if c.DynamicClient == nil {
+		return "", false, fmt.Errorf("EndpointReadyAdvertisesIP: DynamicClient is nil (not wired)")
+	}
+	if wantIP == "" {
+		return "", false, fmt.Errorf("EndpointReadyAdvertisesIP: wantIP is empty")
+	}
+
+	obj, err := c.DynamicClient.Resource(ciliumEndpointGVR).Namespace(namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		// Fail-closed on any error other than the object not yet existing — a transient API
+		// error must not be swallowed into a false-ready result.
+		if !isNotFound(err) {
+			return "", false, fmt.Errorf("CiliumEndpoint lookup error for %s/%s: %w", namespace, podName, err)
+		}
+		// Not found yet — cilium-agent has not created the endpoint object.
+		return "", false, nil
+	}
+	if !ready(obj) {
+		// Object exists but is still regenerating / has no allocated identity.
+		return "", false, nil
+	}
+	node, _, _ := unstructured.NestedString(obj.Object, "status", "networking", "node")
+	if endpointOwnsIP(obj, wantIP) {
+		return node, true, nil
+	}
+	// Ready with a non-zero identity but NOT advertising wantIP. This is a DECIDED outcome, not a
+	// transient: cilium-agent only marks an endpoint ready after its addressing is populated, so the
+	// IP it owns is settled. Under cluster-pool IPAM this is the expected result of an unhonored
+	// ipam.cilium.io/ip pin (ADR-0324 P-VERIFY-C). Return immediately with a specific, actionable
+	// error rather than crediting a dataplane that never programmed wantIP.
+	return "", false, fmt.Errorf("CiliumEndpoint %s/%s is ready on node %s but does not advertise preserved IP %s (addressing=%v) — ipam.cilium.io/ip pin not honored",
+		namespace, podName, node, wantIP, endpointAddresses(obj))
 }
 
 // endpointAddresses returns every non-empty ipv4 address in the CiliumEndpoint's

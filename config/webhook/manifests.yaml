@@ -37,7 +37,23 @@ webhooks:
         name: podmotion-webhook-service
         namespace: podmotion-system
         path: /mutate-core-v1-pod-eviction
-    failurePolicy: Ignore
+    # ADR-0401: fail CLOSED. When the webhook is unreachable/times out, the apiserver must
+    # DENY the eviction (protecting a possible in-flight migration source), not admit it.
+    # The blast radius of Fail is bounded by the namespaceSelector exclusion below (the
+    # operator/system namespaces stay evictable so cluster self-healing is never wedged) and
+    # timeoutSeconds. A denied eviction is retriable (handler returns 429).
+    failurePolicy: Fail
+    timeoutSeconds: 5
+    # Load-bearing anti-self-deadlock valve: never let a webhook outage block eviction of the
+    # operator's own pods or core system pods (they are never PodMotion migration sources).
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - podmotion-system
+            - kube-system
+            - kube-node-lease
     rules:
       - apiGroups: [""]
         apiVersions: ["v1"]

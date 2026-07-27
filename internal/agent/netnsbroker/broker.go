@@ -151,7 +151,7 @@ func validateNetnsPath(netnsPath string) error {
 
 // Request is the JSON wire request accepted on the broker socket.
 type Request struct {
-	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal" | "signal_pid" | "kill_source_pid" | "proc_alive" | "resolve_veth" | "holder_sentinel" | "netns_exec" | "netns_exec_start" | "move_cgroup"
+	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal" | "signal_pid" | "kill_source_pid" | "proc_alive" | "resolve_veth" | "holder_sentinel" | "netns_exec" | "netns_exec_start" | "move_cgroup" | "netns_match"
 	// MigrationUID names the per-migration netns dir. Validated by migrationUIDRe.
 	// Required on create/teardown; ignored on exec*.
 	MigrationUID string `json:"migrationUID"`
@@ -227,6 +227,29 @@ type Request struct {
 	// before being used verbatim as the nsenter --net= target. SrcPID takes
 	// precedence when both are supplied.
 	NetnsPath string `json:"netnsPath,omitempty"`
+
+	// ExpectedNetnsPath (netns_match op) is the netns bind-mount path the caller
+	// expects SignalPID's network namespace to be a member of — the ADR-0306 item
+	// (a) restart-durable identity cross-check on the Restore idempotent-confirm
+	// path (server.go's pidNetnsMatchesPath). The de-privileged SD-1 agent cannot
+	// stat /proc/<SignalPID>/ns/net itself: that crosses a ptrace_may_access gate
+	// AppArmor mediates against the TARGET's peer profile — for the CRIU-restored
+	// workload root that is the container runtime's default profile, which the
+	// narrow `podmotion-agent` profile's ptrace(read) grants (peer=podmotion-agent,
+	// peer=unconfined) do not cover — the same delegation class as proc_alive/
+	// resolve_veth/holder_sentinel above (see their doc comments for the incident
+	// history this pattern exists to avoid). The unconfined broker performs BOTH
+	// stats (SignalPID's /proc/<pid>/ns/net and this path) and the inode/dev
+	// compare itself, returning only the boolean Match — never raw stat data — so
+	// no additional client-side trust is required. Validated by netnsPathRe (the
+	// same closed, traversal-safe /run/netns|/var/run/netns convention netns_exec's
+	// NetnsPath already enforces) — ADR-0325 documents sandboxNetnsPath as always
+	// producing exactly this bind-mount shape, so no legitimate caller needs a
+	// wider pattern. A separate field from NetnsPath rather than reusing it: NetnsPath
+	// selects the namespace an op executes IN (netns_exec/netns_exec_start); this
+	// field is a value to COMPARE against, a distinct role worth keeping visually
+	// distinct on the wire even though both are validated identically.
+	ExpectedNetnsPath string `json:"expectedNetnsPath,omitempty"`
 
 	// ContainerID (holder_sentinel op) is the containerd container ID of the
 	// replacement pod's restore-target (holder-running) container. The de-privileged
@@ -337,6 +360,14 @@ type Response struct {
 	// of this check, returned so the CALLER can capture it as the ExpectedStartTime
 	// for a later re-check (PID-reuse guard), mirroring signal_pid's own guard.
 	StartTime uint64 `json:"startTime,omitempty"`
+
+	// Match (netns_match op only): true only when SignalPID's /proc/<pid>/ns/net
+	// inode/dev genuinely matches a stat of ExpectedNetnsPath. Any stat failure on
+	// either side (target gone, path unresolvable) is reported via Error instead,
+	// never a silent Match:false — the caller's identity check must fail closed on
+	// "could not verify," not conflate it with "verified and different" (mirrors
+	// pidNetnsMatchesPath's original (bool, error) contract on the agent side).
+	Match bool `json:"match,omitempty"`
 }
 
 // netnsPathFor returns the broker-computed bind target for a migrationUID.
@@ -565,8 +596,14 @@ func Handle(req Request) Response {
 		// exec_poll/exec_signal already reap/signal netns_exec_start children
 		// exactly as they do exec_start children (ADR-0326 Decision item 4).
 		return doNetnsExecStart(req.SrcPID, req.NetnsPath, req.Argv)
+	case "netns_match":
+		// ADR-0306 item (a) delegation (round 2, replacing the withdrawn AppArmor
+		// profile-widening approach): stat SignalPID's /proc/<pid>/ns/net and
+		// ExpectedNetnsPath in the unconfined broker and report whether they
+		// identify the same netns — see ExpectedNetnsPath's doc comment on Request.
+		return doNetnsMatch(req.SignalPID, req.ExpectedNetnsPath)
 	default:
-		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal|signal_pid|kill_source_pid|proc_alive|resolve_veth|holder_sentinel|netns_exec|netns_exec_start|move_cgroup)", req.Op))
+		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal|signal_pid|kill_source_pid|proc_alive|resolve_veth|holder_sentinel|netns_exec|netns_exec_start|move_cgroup|netns_match)", req.Op))
 	}
 }
 
@@ -1435,6 +1472,39 @@ func doProcAlive(pid int, expectedStartTime uint64) Response {
 		return Response{Alive: false, StartTime: liveStart}
 	}
 	return Response{Alive: !processZombieOrDead(pid), StartTime: liveStart}
+}
+
+// doNetnsMatch is the netns_match op's pure logic: stat pid's /proc/<pid>/ns/net
+// and expectedNetnsPath, and report whether they identify the same netns (same
+// inode+dev on the nsfs pseudo-filesystem). Both stats run in THIS unconfined
+// broker process, so neither crosses the ptrace_may_access gate that denies the
+// de-privileged agent's own direct stat of a foreign PID's /proc/<pid>/ns/net —
+// see ExpectedNetnsPath's doc comment on Request for the full rationale. This is
+// a direct broker-side port of the agent's original pidNetnsMatchesPath
+// (server.go), moved here unchanged in comparison logic — only the caller
+// changed, not the identity check itself.
+//
+// expectedNetnsPath is validated against netnsPathRe (the same closed
+// /run/netns|/var/run/netns convention netns_exec's NetnsPath already enforces)
+// before use — SC-1: the broker never stats an arbitrary client-supplied path.
+// Any stat failure on either side fails closed with Error set (never a silent
+// Match:false), mirroring pidNetnsMatchesPath's original (bool, error) contract.
+func doNetnsMatch(pid int, expectedNetnsPath string) Response {
+	if pid <= 0 {
+		return Response{Error: fmt.Sprintf("netns_match: pid %d must be positive", pid)}
+	}
+	if !netnsPathRe.MatchString(expectedNetnsPath) {
+		return Response{Error: fmt.Sprintf("netns_match: expectedNetnsPath %q does not match the required /run/netns|/var/run/netns bind-mount convention", expectedNetnsPath)}
+	}
+	var pidStat, expStat unix.Stat_t
+	pidNsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+	if err := unix.Stat(pidNsPath, &pidStat); err != nil {
+		return Response{Error: fmt.Sprintf("netns_match: stat %s: %v", pidNsPath, err)}
+	}
+	if err := unix.Stat(expectedNetnsPath, &expStat); err != nil {
+		return Response{Error: fmt.Sprintf("netns_match: stat %s: %v", expectedNetnsPath, err)}
+	}
+	return Response{Match: pidStat.Ino == expStat.Ino && pidStat.Dev == expStat.Dev}
 }
 
 // processAlive reports whether /proc/<pid> still exists (the process has not been

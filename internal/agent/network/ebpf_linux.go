@@ -19,7 +19,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
-	"time"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
@@ -31,11 +30,16 @@ import (
 const (
 	// bpfPinDir is the root BPF FS pin directory (ADR-0155 Decision 4).
 	bpfPinDir = "/sys/fs/bpf/podmotion"
-
-	// xdpWatchdogMargin is added to FreezeWindowBudgetMs before the watchdog fires.
-	// Mirrors zwWatchdogMargin (server.go). ADR-0155 Decision 7.
-	xdpWatchdogMargin = 500 * time.Millisecond
 )
+
+// ADR-0400: the per-migration freeze-budget watchdog (ADR-0155 Decision 7) is removed.
+// It deleted the live PM_BRIDGE_MAP entry on a hardcoded 5.5s wall-clock — a timing
+// guess, not a completion signal — and, as an in-process goroutine, could not survive
+// the agent-crash case it was justified by. The node-scoped BridgeMapReconciler
+// (bridge_reconciler.go) now deletes an entry only on the verified source-of-truth
+// event (TrafficVerified via SourceTeardownBlockReason, terminal phase, or CR-absent),
+// and survives agent restart. The xdpWatchdogMargin/defaultFreezeBudget constants and
+// the bridgeWatchdogs cancel map are removed with it.
 
 // ciliumEBPFManager is the production eBPFManager backed by the cilium/ebpf
 // library.  The zero_window BPF collection is loaded lazily on first
@@ -64,10 +68,9 @@ type ciliumEBPFManager struct {
 	// Node-scoped; loaded once at agent startup (ADR-0155 Decision 1).
 	bridgeObjs        *bpfloader.XdpBridgeObjects
 	bridgeHostIfindex uint32 // ifindex the XDP prog is attached to
-	// bridgeWatchdogs tracks per-migration watchdog cancel functions keyed by
-	// srcIP string.  Watchdog fires xdpWatchdogMargin after the freeze budget
-	// expires and auto-deletes the PM_BRIDGE_MAP key (ADR-0155 Decision 7).
-	bridgeWatchdogs map[string]context.CancelFunc
+	// ADR-0400: bridgeWatchdogs (per-migration freeze-budget watchdog cancel map,
+	// ADR-0155 Decision 7) is removed. Map-entry teardown is now driven by the
+	// node-scoped BridgeMapReconciler against the PodMigration source-of-truth.
 }
 
 func newCiliumEBPFManager() eBPFManager {
@@ -77,7 +80,6 @@ func newCiliumEBPFManager() eBPFManager {
 		relayIngressFilters: make(map[uint32]uint32),
 		vtepXDPLinks:        make(map[uint32]struct{}),
 		srcGuardXDPLinks:    make(map[uint32]struct{}),
-		bridgeWatchdogs:     make(map[string]context.CancelFunc),
 	}
 }
 
@@ -226,8 +228,9 @@ func (m *ciliumEBPFManager) DisarmZeroWindowHold(ctx context.Context, ifindex ui
 }
 
 // ArmXDPBridge writes srcIP→{dstIP, genevePort} to the already-pinned PM_BRIDGE_MAP
-// (ADR-0155 Decision 3).  No load/attach work.  Registers a watchdog that auto-deletes
-// the map key after defaultFreezeBudget+xdpWatchdogMargin (ADR-0155 Decision 7).
+// (ADR-0155 Decision 3).  No load/attach work.  ADR-0400: no freeze-budget watchdog is
+// armed — teardown is driven by the node-scoped reconciler on the verified
+// source-of-truth event (bridge_reconciler.go), not a wall-clock timer.
 func (m *ciliumEBPFManager) ArmXDPBridge(ctx context.Context, srcIP, dstIP net.IP, genevePort uint16) error {
 	log := logf.FromContext(ctx)
 	m.mu.Lock()
@@ -259,30 +262,39 @@ func (m *ciliumEBPFManager) ArmXDPBridge(ctx context.Context, srcIP, dstIP net.I
 	log.Info("ebpf cilium: ArmXDPBridge: map update",
 		"srcIP", srcIP, "dstIP", dstIP, "genevePort", genevePort)
 
-	// Register per-migration watchdog (ADR-0155 Decision 7).
-	const defaultFreezeBudget = 5000 * time.Millisecond
-	wdCtx, wdCancel := context.WithCancel(context.Background())
-	srcKey := srcIP.String()
-	if prev, ok := m.bridgeWatchdogs[srcKey]; ok {
-		prev()
-	}
-	m.bridgeWatchdogs[srcKey] = wdCancel
-	capturedKey := key
-	capturedObjs := m.bridgeObjs
-	go func() {
-		select {
-		case <-wdCtx.Done():
-			return
-		case <-time.After(defaultFreezeBudget + xdpWatchdogMargin):
-			log.Info("ArmXDPBridge: watchdog triggered — emergency map-key delete", "srcIP", srcIP)
-			_ = capturedObjs.PM_BRIDGE_MAP.Delete(capturedKey)
-		}
-	}()
-
+	// ADR-0400: no per-migration freeze-budget watchdog is armed here. The entry is
+	// torn down on the verified source-of-truth event by the node-scoped
+	// BridgeMapReconciler, or by the controller-driven Teardown/Rollback disarm —
+	// never on a wall-clock guess.
 	return nil
 }
 
-// DisarmXDPBridge removes the srcIP entry from PM_BRIDGE_MAP and cancels the watchdog.
+// ListXDPBridgeKeys enumerates the source-IPv4 keys resident in PM_BRIDGE_MAP.
+// Returns (nil, nil) when the bridge is not loaded. Used by the ADR-0400 reconciler.
+func (m *ciliumEBPFManager) ListXDPBridgeKeys(ctx context.Context) ([]net.IP, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.bridgeObjs == nil {
+		return nil, nil
+	}
+
+	var out []net.IP
+	var key [4]byte
+	var val [8]byte
+	it := m.bridgeObjs.PM_BRIDGE_MAP.Iterate()
+	for it.Next(&key, &val) {
+		ip := make(net.IP, net.IPv4len)
+		copy(ip, key[:])
+		out = append(out, ip)
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("ListXDPBridgeKeys: iterate PM_BRIDGE_MAP: %w", err)
+	}
+	return out, nil
+}
+
+// DisarmXDPBridge removes the srcIP entry from PM_BRIDGE_MAP.
 // Missing key is not an error (ADR-0155 Decision 5).
 func (m *ciliumEBPFManager) DisarmXDPBridge(ctx context.Context, srcIP net.IP) error {
 	log := logf.FromContext(ctx)
@@ -305,12 +317,7 @@ func (m *ciliumEBPFManager) DisarmXDPBridge(ctx context.Context, srcIP net.IP) e
 		return fmt.Errorf("DisarmXDPBridge: PM_BRIDGE_MAP delete srcIP=%s: %w", srcIP, err)
 	}
 
-	srcKey := srcIP.String()
-	if cancel, ok := m.bridgeWatchdogs[srcKey]; ok {
-		cancel()
-		delete(m.bridgeWatchdogs, srcKey)
-	}
-
+	// ADR-0400: no watchdog goroutine to cancel — the reconciler drives teardown.
 	log.Info("ebpf cilium: DisarmXDPBridge: map delete", "srcIP", srcIP)
 	return nil
 }

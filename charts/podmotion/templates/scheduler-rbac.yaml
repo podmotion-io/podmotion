@@ -1,0 +1,153 @@
+{{- /*
+ADR-0364 (Part B2 of Task #20): RBAC for the podmotion-scheduler second-scheduler Deployment,
+ported in substance from config/scheduler/rbac.yaml, with one adaptation (ADR-0364 Decision §3):
+
+  - ServiceAccount namespace: adapted from the kustomize tree's `namespace: kube-system` to
+    {{ .Release.Namespace }}, matching this chart's own convention (podmotion-operator/
+    podmotion-agent both live in {{ .Release.Namespace }}, serviceaccount.yaml) — there is no
+    operational reason for the scheduler SA specifically to live outside the chart's namespace
+    scoping, so the kube-system placement is not carried forward.
+
+The ClusterRole rule set is a straight port of the standard scheduler verbs (nodes/pods/
+replicationcontrollers/services/PVCs/PVs/namespaces, events, pods/status, statefulsets/
+replicasets/daemonsets, PDBs, storageclasses/csinodes/csidrivers/csistoragecapacities,
+coordination.k8s.io/leases for leader election) PLUS the PodMotion extension —
+migration.podmotion.io/nodemigrationcapacities get/list/watch — the grant
+filterForMigrationLabel/scoreForMigrationLabel (scheduler-plugins/pkg/podmigration/filter.go,
+score.go) need to read NodeMigrationCapacity objects. No verb changes from the kustomize source.
+
+Added 2026-07-22 (Chad-approved, task #20 live-validation finding): a live deploy showed the
+scheduler pod repeatedly failing to watch resource.k8s.io/{resourceslices,resourceclaims,
+deviceclasses} and storage.k8s.io/volumeattachments (forbidden), plus a forbidden read on the
+kube-system ConfigMap "extension-apiserver-authentication" — both are part of upstream
+kube-scheduler's own default informer/config set (this scheduler wraps the real upstream
+scheduler binary via app.NewSchedulerCommand, so it inherits upstream's watch list). Added the
+minimum matching grants: get/list/watch on those 4 resources on the existing ClusterRole, plus a
+namespaced Role/RoleBinding in kube-system scoped to the single named ConfigMap only.
+*/ -}}
+{{- if .Values.scheduler.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: podmotion-scheduler
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: scheduler
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: podmotion-scheduler-role
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: scheduler
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+rules:
+  # Standard scheduler RBAC — required to read nodes, pods, and run leader election.
+  - apiGroups: [""]
+    resources: [nodes, pods, replicationcontrollers, services, persistentvolumeclaims, persistentvolumes, namespaces]
+    verbs: [get, list, watch]
+  # Added 2026-07-23 (Chad-approved, task #20 live-validation finding): the standard
+  # permission every kube-scheduler needs to actually carry out its placement decision.
+  # Without it the scheduler can decide a destination node but the DefaultBinder plugin can
+  # never bind the pod there -- every live-validation attempt this session deterministically
+  # stalled at RestoreSocketReattach with "pods/binding ... is forbidden" until this landed.
+  - apiGroups: [""]
+    resources: [pods/binding]
+    verbs: [create]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [create, patch, update]
+  - apiGroups: [""]
+    resources: [pods/status]
+    verbs: [update, patch]
+  - apiGroups: [apps]
+    resources: [statefulsets, replicasets, daemonsets]
+    verbs: [get, list, watch]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, delete]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses, csinodes, csidrivers, csistoragecapacities]
+    verbs: [get, list, watch]
+  # PodMotion extension — read NodeMigrationCapacity so the MigrationAware filter/score
+  # plugins (scheduler-plugins/pkg/podmigration/filter.go, score.go) can make decisions.
+  - apiGroups: [migration.podmotion.io]
+    resources: [nodemigrationcapacities]
+    verbs: [get, list, watch]
+  # Added 2026-07-23 (Chad-approved, task #20 live-validation finding): the scheduler must
+  # read the PodMigration object itself to resolve the destination node
+  # (scheduler-plugins/pkg/podmigration/filter.go's resolveDestinationNode), across ALL
+  # namespaces workloads may live in — every prior live-validation attempt deterministically
+  # failed at replacement-pod scheduling with "podmigrations ... is forbidden" without this.
+  - apiGroups: [migration.podmotion.io]
+    resources: [podmigrations]
+    verbs: [get, list, watch]
+  # Upstream kube-scheduler default informer set (see file header, 2026-07-22 addition) —
+  # this scheduler wraps the real upstream scheduler command and inherits its watch list.
+  - apiGroups: [resource.k8s.io]
+    resources: [resourceslices, resourceclaims, deviceclasses]
+    verbs: [get, list, watch]
+  - apiGroups: [storage.k8s.io]
+    resources: [volumeattachments]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: podmotion-scheduler-rolebinding
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: scheduler
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: podmotion-scheduler-role
+subjects:
+  - kind: ServiceAccount
+    name: podmotion-scheduler
+    namespace: {{ .Release.Namespace }}
+---
+# Upstream kube-scheduler needs to read its own client-CA/requestheader config from this single
+# named ConfigMap in kube-system (2026-07-22 addition, see file header) — scoped to that one
+# object only, not all configmaps in kube-system.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: podmotion-scheduler-extension-apiserver-authentication-reader
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: scheduler
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [extension-apiserver-authentication]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: podmotion-scheduler-extension-apiserver-authentication-reader
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: podmotion
+    app.kubernetes.io/component: scheduler
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: podmotion-scheduler-extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: podmotion-scheduler
+    namespace: {{ .Release.Namespace }}
+{{- end }}

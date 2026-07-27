@@ -275,6 +275,14 @@ func main() {
 	// before a destination replica has actually been created — silent data loss on any
 	// Longhorn-backed volume. Ceph RBD and SnapshotRsync stay on their stub defaults here;
 	// this sprint's live testing only exercised and confirmed the Longhorn path.
+	//
+	// ADR-0368 CONDITION 1: because TierCephRBD/TierSnapshotRsync
+	// stay on CephRBDStubMigrator/SnapshotRsyncStubMigrator in THIS actually-deployed operator,
+	// those two stub types' ReleaseDestination methods (tier2.go/tier3.go) are the ones that
+	// actually run rollback for those tiers today — they now return the same loud
+	// storage.ErrRollbackPointOfNoReturn/storage.ErrRollbackNotImplemented sentinels their
+	// real-migrator counterparts would, never a bare nil, so a Tier2/Tier3 rollback on THIS
+	// wiring is loud-and-correct rather than a silently fabricated success.
 	storageMgr.RegisterMigrator(storage.TierLonghorn, storage.NewLonghornMigrator(longhornManagerURL, mgr.GetClient()))
 
 	// ADR-0322: dynamic client for the Cilium CiliumEndpoint readiness poll
@@ -295,7 +303,12 @@ func main() {
 	}
 
 	if err := (&controller.PodMigrationReconciler{
-		Client:        mgr.GetClient(),
+		Client: mgr.GetClient(),
+		// ADR-0410: uncached apiserver reader for the ADR-0393 capture read-back gate. The
+		// informer cache is not read-after-write consistent with the direct Status().Patch that
+		// persists the snapshot, so the fail-closed read-back must observe authoritative server
+		// state (matching the eviction webhook / agent bridge reconciler precedent).
+		APIReader:     mgr.GetAPIReader(),
 		Scheme:        mgr.GetScheme(),
 		DynamicClient: dynamicClient,
 		KubeClient:    kubeClient,
@@ -310,8 +323,17 @@ func main() {
 		// (Status.SourceNodeName) and dispatches Abort via the same AgentPool used for
 		// the destination agent. There is no freeze-deadline watchdog; this is the
 		// controller-driven thaw path.
-		Rollbacker: rollback.NewStubRollbacker(
+		//
+		// ADR-0368 §5.3/CONDITION 5: rollback.NewRollbacker (not NewStubRollbacker) wires the
+		// rollback pipeline's StorageStep to the SAME storageMgr instance constructed above —
+		// previously the rollback pipeline was built with no reference to storageMgr at all
+		// (NewStubRollbacker's signature does not accept one), so Cutover's attach and rollback's
+		// ReleaseDestination could never be guaranteed to run against the identical, already-
+		// configured Migrator instances (same ManagerURL, same client.Client, same in-flight HTTP
+		// client) — see storageMgr's own wiring above for which tiers are actually registered.
+		Rollbacker: rollback.NewRollbacker(
 			agentclient.NewSourceRollbackClient(agentPool, mgr.GetClient()),
+			storageMgr,
 		),
 		AgentPool:       agentPool,
 		TrafficVerifier: compositeVerifier,

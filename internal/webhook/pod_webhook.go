@@ -29,8 +29,12 @@ const (
 	// Its presence at admission triggers this webhook.
 	LabelMigrationName = "podmotion.io/migration-name"
 
-	// AnnotationCheckpointRef carries the images-dir path so the NRI plugin can locate
-	// the checkpoint without a controller-runtime cache call at restore time.
+	// AnnotationCheckpointRef carries the bare migration identifier (pm.Name), matching
+	// the label and the controller's own convention (podmigration_controller.go:6534).
+	// The NRI plugin/agent reconstruct the full checkpoint path by joining the fixed
+	// /run/podmotion/checkpoints/<ref>/final prefix onto this identifier — mirroring
+	// the comment at podmigration_controller.go:6528-6533 for the controller's own
+	// write of this annotation.
 	AnnotationCheckpointRef = "podmotion.io/checkpoint-ref"
 
 	// SchedulingGateName is the gate injected to hold the replacement pod at scheduling
@@ -158,10 +162,10 @@ func (w *PodMutatingWebhook) Handle(ctx context.Context, req admission.Request) 
 	}
 
 	// 3. Inject checkpoint-ref annotation and label so the NRI plugin can locate images.
-	// Annotation: human-visible, used by the NRI plugin when containerd forwards pod
-	// annotations into sandbox annotations (real NRI v2 gRPC path).
-	// Label: also set so the NRI JSON stub path (event.Labels) and any label-selector
-	// tooling can see it. Both must be kept in sync.
+	// Annotation and label carry the identical value and convention (the bare
+	// migration identifier, pm.Name — not a path); both are set so the NRI v2 gRPC
+	// annotation path and the NRI JSON stub path (event.Labels)/label-selector tooling
+	// can each see it. Both must be kept in sync.
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
 	}
@@ -169,12 +173,9 @@ func (w *PodMutatingWebhook) Handle(ctx context.Context, req admission.Request) 
 		pod.Labels = make(map[string]string)
 	}
 	if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
-		pod.Annotations[AnnotationCheckpointRef] = pm.Status.CheckpointRef.Name
-		// Label values must be valid Kubernetes label values (alphanumeric, '-', '_',
-		// '.') — CheckpointRef.Name is a filesystem path (e.g.
-		// /run/podmotion/checkpoints/<migration>/final) and is NOT legal there, so the
-		// label must use pm.Name instead (short, DNS-label-safe, matches the
-		// controller's own convention in createReplacementPod).
+		pod.Annotations[AnnotationCheckpointRef] = pm.Name
+		// Both annotation and label use pm.Name (short, DNS-label-safe identifier),
+		// matching the controller's own convention in createReplacementPod.
 		pod.Labels[AnnotationCheckpointRef] = pm.Name
 	}
 

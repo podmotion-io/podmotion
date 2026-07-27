@@ -300,6 +300,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// ADR-0370: POD_UID (downward API, fieldRef: metadata.uid) is the ground-truth signal the
+	// containerd self-discovery primitive anchors on — see EnsureContainerdDiscovered below.
+	// Required, same fail-loud posture as NODE_NAME above: without it, discovery cannot even be
+	// attempted, and running with the previous blind envOrDefault default is exactly the
+	// silently-wrong behavior this ADR removes.
+	podUID := os.Getenv("POD_UID")
+	if podUID == "" {
+		log.Error(nil, "POD_UID env var not set (ADR-0370 containerd self-discovery requires it — add the downward-API field to the DaemonSet pod spec)")
+		os.Exit(1)
+	}
+
 	// Fail-closed CNI runtime-dependency preflight (matches the netnsbroker ADR-0347 A1
 	// startup-pin pattern for nsenter/ip): if this node's detected CNI is Calico, calicoctl
 	// must be present and reachable on PATH before the agent serves anything — otherwise
@@ -338,6 +349,31 @@ func main() {
 	defer cancel()
 
 	log.Info("PodMotion agent starting", "node", nodeName)
+
+	// ADR-0370: self-discover the authoritative containerd socket BEFORE anything below reads
+	// containerdSocketPath/containerdRunRoot/containerdStateRoot (internal/agent/server/
+	// containerd_paths.go) — specifically before nmcregistrar.Register publishes
+	// NMC.status.Ready=true and before the gRPC server (started further below) begins accepting
+	// Restore/Checkpoint/PrepareDestination RPCs. Fails loud (process exit, never reaches Ready)
+	// on any anomaly per the zero-tech-debt pillar: a node that cannot prove which containerd is
+	// authoritative must not advertise migration capacity. discoveryCtx is bounded so a wedged
+	// broker sidecar cannot hang agent startup forever.
+	discoveryCtx, discoveryCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	discoveryErr := server.EnsureContainerdDiscovered(discoveryCtx, podUID)
+	discoveryCancel()
+	if discoveryErr != nil {
+		log.Error(discoveryErr, "ADR-0370 containerd self-discovery failed — refusing to start (never guessing a default)")
+		os.Exit(1)
+	}
+
+	// ADR-0370 secondary finding, minimum bar: cross-check NRI socket ownership against the
+	// just-discovered authoritative containerd, best-effort and non-blocking (logs CRITICAL +
+	// increments a metric on mismatch; never fails agent startup — NRI is an enhancement).
+	go func() {
+		nriCtx, nriCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer nriCancel()
+		server.CrossCheckNRISocketOwnership(nriCtx, server.CurrentContainerdSocketPath())
+	}()
 
 	// Surface the authoritative build identity so a live-migration proof run can be
 	// bound to the exact source tree this binary was built from, instead of inferring
@@ -395,6 +431,23 @@ func main() {
 			return &brokerHostNSProcess{pid: pid}, nil
 		})
 		checkpointer = cp
+
+		// ADR-0366: route nmcregistrar's CRIU-version detection through the SAME
+		// netns-broker host-mount-ns exec surface (synchronous Exec op) rather than a
+		// direct in-container exec of the host CRIU binary, fixing the identical
+		// glibc-mismatch failure the checkpointer's SetHostNSRunner wiring above
+		// already fixes one layer up (dump/pre-dump). Narratively adjacent to that
+		// wiring because both configure host-ns broker routing at startup; strictly
+		// required to run before Register/Heartbeat are ever called (both below).
+		// Guarded on linux for the same reason as SetHostNSRunner above: macOS dev
+		// machines have neither the broker sidecar nor /proc-based Linux exec
+		// semantics — registrar.hostExec stays nil there, falling back to direct
+		// exec exactly as it does today.
+		if registrar != nil {
+			registrar.SetHostExecFunc(func(ctx context.Context, opTimeout time.Duration, argv ...string) netnsbroker.ExecResult {
+				return netnsbroker.NewClient().Exec(ctx, opTimeout, argv...)
+			})
+		}
 	} else {
 		log.Info("CRIU not available on this OS — using StubCheckpointer (dev mode)",
 			"os", runtime.GOOS)
@@ -586,6 +639,17 @@ func main() {
 				"hostIfname", hostIfname, "xdpBridgeCapable", xdpBridgeCapable)
 		}
 		xdpCancel()
+	}
+
+	// ADR-0400: start the node-scoped PM_BRIDGE_MAP reconciler. It sweeps live bridge
+	// map entries against the PodMigration source-of-truth and deletes an entry only
+	// on the verified-cutover / terminal / CR-absent event — replacing the removed
+	// per-migration freeze-budget watchdog. Uses the UNCACHED APIReader (never the
+	// informer cache) so the fail-closed absent-delete branch reads an authoritative
+	// snapshot even on the agent's first post-restart pass. Requires the cluster
+	// client; if it failed to build, teardown falls back to controller-driven disarm.
+	if cl != nil {
+		go agentSrv.NewBridgeMapReconciler(cl.GetAPIReader()).Run(ctx, 0)
 	}
 
 	// TODO(podmotion-io/podmotion#<issue>, M1): start metrics server on :9091 (Prometheus /metrics endpoint for agent DaemonSet scraping).
