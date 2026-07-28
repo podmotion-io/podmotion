@@ -2,7 +2,7 @@
 
 Standing capability, stood up 2026-07-03. A static export of the marketing
 website (sibling repo at `../website`, i.e.
-`/home/chad/Desktop/projects/podmotion/website` on the dev server) is built
+`<path-to-podmotion-website-checkout>` on the dev server) is built
 and served locally via nginx in Docker, independent of the GitHub Pages
 deployment described in `website/README.md`.
 
@@ -14,7 +14,7 @@ in the website repo still owns the real `podmotion.io` publish to
 ## Start / stop
 
 ```bash
-cd /home/chad/Desktop/projects/podmotion/website
+cd <path-to-podmotion-website-checkout>
 npm run build              # produces the static export in ./out
 sudo docker compose up -d  # starts nginx:alpine serving ./out
 ```
@@ -22,7 +22,7 @@ sudo docker compose up -d  # starts nginx:alpine serving ./out
 Stop with:
 
 ```bash
-cd /home/chad/Desktop/projects/podmotion/website
+cd <path-to-podmotion-website-checkout>
 sudo docker compose down
 ```
 
@@ -38,7 +38,7 @@ is harmless if the container's cache seems stale).
   `/usr/share/nginx/html`, publishes host port **80**, `restart:
   unless-stopped` (survives reboots and Docker daemon restarts).
 - Verified running: `sudo docker compose -f
-  /home/chad/Desktop/projects/podmotion/website/docker-compose.yml ps` and
+  <path-to-podmotion-website-checkout>/docker-compose.yml ps` and
   `curl http://localhost/` (expect `200`).
 
 ## Access
