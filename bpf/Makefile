@@ -11,8 +11,15 @@
 # are generated from the .o files via bpf2go and are also committed.
 
 CLANG       ?= clang
+# -fdebug-prefix-map rewrites the compilation-directory / source-path strings that
+# clang embeds in DWARF (and that bpf2go/bpftool then carry into BTF) so the
+# committed .o files never leak a builder's local absolute filesystem path
+# (e.g. /home/<user>/... or /Users/<user>/...). We keep -g (and therefore DWARF)
+# because CO-RE relies on BTF derived from it — this maps the path, it does not
+# strip debug info.
 CFLAGS      := -O2 -g -target bpf -D__TARGET_ARCH_x86 \
                -I/usr/include -I/usr/include/x86_64-linux-gnu \
+               -fdebug-prefix-map=$(CURDIR)=bpf \
                -Wall -Werror -Wno-pass-failed
 
 BPF_SRCS    := zero_window.c xdp_bridge.c pm_relay.c pm_sk_lookup.c pm_xdp_vtep.c
@@ -31,12 +38,12 @@ all: $(BPF_OBJECTS)
 # Must run on Linux with clang ≥14 and bpf2go installed:
 #   go install github.com/cilium/ebpf/cmd/bpf2go@latest
 generate: $(BPF_OBJECTS)
-	go run github.com/cilium/ebpf/cmd/bpf2go \
+	GOPACKAGE=bpfloader go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc $(CLANG) \
 		-cflags "$(CFLAGS)" \
 		-output-dir ../internal/agent/network/bpfloader \
 		ZeroWindow ./zero_window.c
-	go run github.com/cilium/ebpf/cmd/bpf2go \
+	GOPACKAGE=bpfloader go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc $(CLANG) \
 		-cflags "$(CFLAGS)" \
 		-output-dir ../internal/agent/network/bpfloader \
@@ -48,12 +55,12 @@ generate: $(BPF_OBJECTS)
 	# be left behind (unlike xdpbridge, which already cleans up). Remove both.
 	rm -f ../internal/agent/network/bpfloader/pm_relay_bpfeb.go \
 	      ../internal/agent/network/bpfloader/pm_relay_bpfeb.o
-	go run github.com/cilium/ebpf/cmd/bpf2go \
+	GOPACKAGE=bpfloader go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc $(CLANG) \
 		-cflags "$(CFLAGS)" \
 		-output-dir ../internal/agent/network/bpfloader \
 		PmSkLookup ./pm_sk_lookup.c
-	go run github.com/cilium/ebpf/cmd/bpf2go \
+	GOPACKAGE=bpfloader go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc $(CLANG) \
 		-cflags "$(CFLAGS)" \
 		-output-dir ../internal/agent/network/bpfloader \
