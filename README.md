@@ -1,7 +1,10 @@
 # PodMotion
 
-**Live pod migration for stock Kubernetes.** Move a running pod from one node to
-another with zero downtime — the container-native equivalent of live VM migration.
+**Live-migrate running pods. Move them across platforms entirely.** One
+checkpoint/restore engine, two co-equal goals: live-migrate a running pod between
+nodes with zero downtime — the container-native equivalent of live VM migration —
+and move containers between hosting platforms and back, or restore from a full
+backup.
 
 Every container in the pod keeps running. Every client with an open TCP connection
 stays connected: no RST, no reconnect, no retry. The application sees nothing. It
@@ -12,16 +15,30 @@ changes to its clients.
 
 ## What it does
 
-PodMotion is a Kubernetes operator that migrates a live pod between nodes while
-preserving in-memory process state and active network connections:
+PodMotion is a Kubernetes operator built around a single checkpoint/restore engine
+serving two goals:
 
-- **Process state** is captured with CRIU 4.x iterative pre-copy checkpoint/restore,
-  keeping the freeze window under ~100 ms.
-- **TCP connections** survive the move via TCP_REPAIR sequence-number preservation, an
-  eBPF sequence-translation relay (PM_SEQ_XLAT), and a TCP zero-window hold that pauses
-  senders on both endpoints across the critical handoff window.
-- **The whole pod** is checkpointed and restored atomically — every sidecar, init
-  container, and service-mesh proxy — not just the primary container.
+1. **Live node-to-node migration (proven, the flagship capability).** A live pod
+   moves between nodes while preserving in-memory process state and active network
+   connections:
+   - **Process state** is captured with CRIU 4.x iterative pre-copy checkpoint/restore,
+     keeping the freeze window under ~100 ms.
+   - **TCP connections** survive the move via TCP_REPAIR sequence-number preservation, an
+     eBPF sequence-translation relay (PM_SEQ_XLAT), and a TCP zero-window hold that pauses
+     senders on both endpoints across the critical handoff window.
+   - **The whole pod** is checkpointed and restored atomically — every sidecar, init
+     container, and service-mesh proxy — not just the primary container.
+
+   Live TCP-connection survival is proven: a single held connection survived a
+   migration byte-exact (seq_delta 0/0, Strict mode) at Sprint 46 on a real
+   multi-node cluster. Broader multi-flow, multi-CNI coverage is not yet proven.
+
+2. **Cross-platform portability and backup/restore (roadmap, not yet implemented).**
+   The same checkpoint/restore foundation is architected to move containers between
+   different hosting platforms and back — for example AWS ECS ↔ EC2/Docker, or
+   EKS ↔ EC2 — and to take a full pod backup that's ready for restore. No code for
+   this goal exists yet; it shares pillar 1's checkpoint/restore engine but has no
+   implementation, migration path, or proof today.
 
 Migration is driven as a first-class Kubernetes object with status conditions,
 rollback, and observability, orchestrated by a controller-runtime operator, an
@@ -34,7 +51,9 @@ long-running ML training jobs, transaction processors. "Redesign it to be statel
 is not an answer when the application is PostgreSQL or a 68-hours-in training run.
 At the VM layer, live migration made node maintenance, cost optimization, and failure
 remediation routine. At the container layer the answer has been "drain the node and
-accept the downtime." PodMotion closes that gap.
+accept the downtime." PodMotion closes that gap for node-to-node migration today, and
+is architected to close the same gap across hosting platforms and for backup/restore
+as that second pillar is built out.
 
 See [`docs/why-podmotion.md`](docs/why-podmotion.md) for the full rationale.
 
