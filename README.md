@@ -1,5 +1,11 @@
 # PodMotion
 
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Go Version](https://img.shields.io/badge/go-1.25.7-00ADD8.svg)](go.mod)
+[![CI](https://github.com/podmotion-io/podmotion/actions/workflows/ci.yaml/badge.svg)](https://github.com/podmotion-io/podmotion/actions/workflows/ci.yaml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/podmotion-io/podmotion.svg)](https://pkg.go.dev/github.com/podmotion-io/podmotion)
+[![GitHub stars](https://img.shields.io/github/stars/podmotion-io/podmotion.svg?style=social&label=Star)](https://github.com/podmotion-io/podmotion)
+
 **Live-migrate running pods. Move them across platforms entirely.** One
 checkpoint/restore engine, two co-equal goals: live-migrate a running pod between
 nodes with zero downtime — the container-native equivalent of live VM migration —
