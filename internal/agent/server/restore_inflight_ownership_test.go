@@ -69,7 +69,7 @@ func TestRestoreInFlightSingleOwner_NotYetAliveRace(t *testing.T) {
 		// ADR-0354 round 7: JoinNsRestore now takes a leading ctx; this test harness has no real
 		// upstream NRI ctx to thread (it drives JoinNsRestore directly, not through the NRI
 		// plugin), so context.Background() is used deliberately — test-only, not a live path.
-		_, _, _ = s.JoinNsRestore(context.Background(), migName, "default", "/tmp/does-not-matter", "", "container-1", "sandbox-1", "", "", "None")
+		_, _, _ = s.JoinNsRestore(context.Background(), migName, "default", "/tmp/does-not-matter", "", "container-1", "sandbox-1", "", "", "None", nil)
 	}()
 
 	<-entered // wait until the NRI restore is genuinely mid-CRIU (claim held, not confirmed)

@@ -129,7 +129,7 @@ func TestJoinNsRestore_SeedsPMSeqXlat_NRIPath(t *testing.T) {
 	s.destWorkloadImage[migration] = "docker.io/library/redis:7-alpine"
 	s.destWorkloadImageMu.Unlock()
 
-	_, _, err := s.JoinNsRestore(context.Background(), migration, namespace, "/tmp/fake-checkpoint", "", "", "", "", "", "None")
+	_, _, err := s.JoinNsRestore(context.Background(), migration, namespace, "/tmp/fake-checkpoint", "", "", "", "", "", "None", nil)
 	if err != nil {
 		t.Fatalf("JoinNsRestore returned unexpected error: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestJoinNsRestore_SeedFailure_FailsClosed(t *testing.T) {
 	s.destWorkloadImage[migration] = "docker.io/library/redis:7-alpine"
 	s.destWorkloadImageMu.Unlock()
 
-	_, _, err := s.JoinNsRestore(context.Background(), migration, namespace, "/tmp/fake-checkpoint", "", "", "", "", "", "None")
+	_, _, err := s.JoinNsRestore(context.Background(), migration, namespace, "/tmp/fake-checkpoint", "", "", "", "", "", "None", nil)
 	if err == nil {
 		t.Fatal("expected JoinNsRestore to fail closed when SeedRelayFromSnapshots fails, got nil error")
 	}

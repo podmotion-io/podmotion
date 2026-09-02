@@ -151,7 +151,7 @@ func validateNetnsPath(netnsPath string) error {
 
 // Request is the JSON wire request accepted on the broker socket.
 type Request struct {
-	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal" | "signal_pid" | "kill_source_pid" | "proc_alive" | "resolve_veth" | "holder_sentinel" | "netns_exec" | "netns_exec_start" | "move_cgroup" | "netns_match"
+	Op string `json:"op"` // "create" | "teardown" | "exec" | "exec_start" | "exec_poll" | "exec_signal" | "signal_pid" | "kill_source_pid" | "proc_alive" | "resolve_veth" | "holder_sentinel" | "netns_exec" | "netns_exec_start" | "move_cgroup" | "netns_match" | "host_realpath"
 	// MigrationUID names the per-migration netns dir. Validated by migrationUIDRe.
 	// Required on create/teardown; ignored on exec*.
 	MigrationUID string `json:"migrationUID"`
@@ -250,6 +250,27 @@ type Request struct {
 	// field is a value to COMPARE against, a distinct role worth keeping visually
 	// distinct on the wire even though both are validated identically.
 	ExpectedNetnsPath string `json:"expectedNetnsPath,omitempty"`
+
+	// HostRealpathTarget (host_realpath op, ADR-0419 D9) is an absolute host-mount-
+	// namespace path whose fully symlink-resolved realpath the caller needs before it
+	// will admit that path into CRIU's `--ext-mount-map` argv. The de-privileged SD-1
+	// agent cannot resolve it itself: the kubelet pod tree and the containerd CRI
+	// sandbox tree are NOT present in the agent's own mount namespace at all (the
+	// DaemonSet carries no /var/lib/kubelet volume — see server.go's own note that its
+	// "own mount ns does not carry /var/lib/kubelet"), so filepath.EvalSymlinks there
+	// returns ENOENT for exactly the two path families that matter and any confinement
+	// check built on it silently degrades to a no-op.
+	//
+	// The broker resolves it through /proc/1/root — the HOST mount namespace root,
+	// reachable because the broker is hostPID:true and unconfined — which is the same
+	// namespace CRIU itself is nsenter'd into, so the answer is the one that actually
+	// governs. This is a SINGLE typed read of ONE value at argv-construction time, not
+	// a poll: it replaces no bounded wait and reinstates no `sh -c '[ -f ... ]'` chain.
+	// Server-pinned to a closed path family (hostRealpathAllowed) so a compromised
+	// agent cannot use it as a general host-filesystem oracle, and the RESOLVED value
+	// is returned in a typed field (RealPath) so "escaped the allowlist" and "could not
+	// resolve" are different facts on the wire rather than one ambiguous string.
+	HostRealpathTarget string `json:"hostRealpathTarget,omitempty"`
 
 	// ContainerID (holder_sentinel op) is the containerd container ID of the
 	// replacement pod's restore-target (holder-running) container. The de-privileged
@@ -360,6 +381,15 @@ type Response struct {
 	// of this check, returned so the CALLER can capture it as the ExpectedStartTime
 	// for a later re-check (PID-reuse guard), mirroring signal_pid's own guard.
 	StartTime uint64 `json:"startTime,omitempty"`
+
+	// RealPath (host_realpath op only, ADR-0419 D9): the fully symlink-resolved
+	// HOST-mount-namespace realpath of HostRealpathTarget, with the /proc/1/root
+	// prefix stripped so the value is expressed in host coordinates. Set ONLY on a
+	// genuinely successful resolution; every failure (malformed target, outside the
+	// server-pinned path family, unresolvable) sets Error instead. There is
+	// deliberately no "" success case: the caller must fail CLOSED on "could not
+	// resolve" rather than conflate it with "resolved to nothing".
+	RealPath string `json:"realPath,omitempty"`
 
 	// Match (netns_match op only): true only when SignalPID's /proc/<pid>/ns/net
 	// inode/dev genuinely matches a stat of ExpectedNetnsPath. Any stat failure on
@@ -596,6 +626,11 @@ func Handle(req Request) Response {
 		// exec_poll/exec_signal already reap/signal netns_exec_start children
 		// exactly as they do exec_start children (ADR-0326 Decision item 4).
 		return doNetnsExecStart(req.SrcPID, req.NetnsPath, req.Argv)
+	case "host_realpath":
+		// ADR-0419 D9: resolve one --ext-mount-map candidate target to its real
+		// HOST-mount-namespace path so the caller can prefix-confine the RESOLVED
+		// value, not merely the lexical one. See HostRealpathTarget's doc comment.
+		return doHostRealpath(req.HostRealpathTarget)
 	case "netns_match":
 		// ADR-0306 item (a) delegation (round 2, replacing the withdrawn AppArmor
 		// profile-widening approach): stat SignalPID's /proc/<pid>/ns/net and
@@ -603,7 +638,7 @@ func Handle(req Request) Response {
 		// identify the same netns — see ExpectedNetnsPath's doc comment on Request.
 		return doNetnsMatch(req.SignalPID, req.ExpectedNetnsPath)
 	default:
-		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal|signal_pid|kill_source_pid|proc_alive|resolve_veth|holder_sentinel|netns_exec|netns_exec_start|move_cgroup|netns_match)", req.Op))
+		return toResponse("", fmt.Errorf("unknown op %q (want create|teardown|exec|exec_start|exec_poll|exec_signal|signal_pid|kill_source_pid|proc_alive|resolve_veth|holder_sentinel|netns_exec|netns_exec_start|move_cgroup|netns_match|host_realpath)", req.Op))
 	}
 }
 
@@ -816,6 +851,77 @@ func doHolderSentinel(containerID string) Response {
 		return Response{Found: true}
 	}
 	return Response{Found: false}
+}
+
+// hostMountNsRoot is the HOST mount namespace's root as seen from the broker. The
+// broker runs hostPID:true, so PID 1 is the host init and /proc/1/root is its mount
+// namespace root — the SAME namespace joinNsRestore nsenters CRIU into. Resolving a
+// candidate --ext-mount-map target here therefore answers the question that actually
+// governs ("what will CRIU open?"), not the question the agent's own namespace could
+// answer ("what would I open, in a namespace CRIU never enters?").
+const hostMountNsRoot = "/proc/1/root"
+
+// criSandboxDirMarker is the CRI plugin's sandbox subtree, matched as an interior
+// path segment. The containerd ROOT dir it hangs off is discovered at runtime
+// (ADR-0370) and differs per distro (/var/lib/containerd on kubeadm,
+// /var/lib/rancher/rke2/agent/containerd on RKE2), so the broker — which does not
+// perform that discovery — pins the invariant SUBTREE rather than a full prefix.
+const criSandboxDirMarker = "/io.containerd.grpc.v1.cri/sandboxes/"
+
+// hostRealpathAllowed is the host_realpath op's SERVER-PINNED path family (SC-1).
+// The client never widens it. It is deliberately COARSER than the agent's own
+// allowedExtMountHostTargetPrefixes check — the broker's job is to refuse to act as a
+// general host-filesystem oracle for a compromised agent, while the agent applies the
+// precise, discovery-derived prefix check to the RESOLVED value this op returns.
+// Two independent bounds, neither trusted alone.
+func hostRealpathAllowed(p string) bool {
+	if p == "" || !filepath.IsAbs(p) || filepath.Clean(p) != p {
+		return false
+	}
+	for _, r := range p {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	switch {
+	case strings.HasPrefix(p, "/var/lib/kubelet/pods/"):
+		return true
+	case strings.HasPrefix(p, "/var/lib/podmotion/"):
+		return true
+	case strings.Contains(p, criSandboxDirMarker):
+		return true
+	}
+	return false
+}
+
+// doHostRealpath resolves one absolute path to its fully symlink-resolved realpath in
+// the HOST mount namespace and returns it in a typed field (ADR-0419 D9).
+//
+// FAIL CLOSED BY CONSTRUCTION: every non-success leg sets Error and leaves RealPath
+// empty, so the caller cannot mistake "I could not resolve this" for "this resolved
+// and was fine". That distinction is the whole point of the op — the branch it
+// replaces (validateExtMountToken's `if real, err := EvalSymlinks(t); err == nil && ...`)
+// skipped the entire escape check on resolve error, and because the agent's mount
+// namespace carries neither the kubelet pod tree nor the containerd sandbox tree, that
+// error was the ONLY outcome for both path families that matter.
+func doHostRealpath(target string) Response {
+	if !hostRealpathAllowed(target) {
+		return Response{Error: fmt.Sprintf("host_realpath: target %q is outside the server-pinned path family", target)}
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Join(hostMountNsRoot, target))
+	if err != nil {
+		return Response{Error: fmt.Sprintf("host_realpath %s: %v", target, err)}
+	}
+	// A target that symlinks its way back out of /proc/1/root is not expressible in
+	// host coordinates and must never be reported as a host path.
+	if resolved != hostMountNsRoot && !strings.HasPrefix(resolved, hostMountNsRoot+"/") {
+		return Response{Error: fmt.Sprintf("host_realpath %s: resolved outside the host mount namespace root", target)}
+	}
+	real := strings.TrimPrefix(resolved, hostMountNsRoot)
+	if real == "" {
+		real = "/"
+	}
+	return Response{RealPath: real}
 }
 
 // findContainerInitPIDByCgroup scans /proc for a process whose cgroup membership

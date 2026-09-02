@@ -6,19 +6,32 @@ Licensed under the Apache License, Version 2.0 (the "License");
 
 package server
 
-// adr0417_destination_rebind_test.go — coverage for the ADR-0417 Class DESTINATION-REBIND
-// resolve→probe→wait path, the --ext-mount-map token validator, and the positive fstype allowlist.
+// adr0417_destination_rebind_test.go — coverage for what ADR-0417 DECIDED and ADR-0419 PRESERVES:
+// the --ext-mount-map token validator, the positive fstype recreatability allowlist, the
+// destination-rebind emission mapping, and the stdout-injection exploit block.
 //
-// These exercise the REAL production functions (appendDestinationRebindReattachMounts,
-// resolveDestinationRebindTargetsOnce, buildCRIURestoreArgs, validateExtMountToken) against a
-// fake Kubernetes client and the existing package test seams (sandboxIDForPodUIDFn,
-// hostRegularFileExistsFn, resolveContainerdRootDirFn) — not a re-implementation, and not only the
-// patch-script subprocess tests.
+// ADR-0419 REPLACED ADR-0417's target RESOLUTION mechanism, and §P-VERIFY #6 requires this suite to
+// stop defending the defect against its own fix. Five tests were removed here, each because the
+// behaviour it asserted no longer exists — not because it became inconvenient:
 //
-// The workload fixture is deliberately REDIS-SHAPED: a pod with ZERO volumes and no PVC at all.
-// resolveReattachMounts returns early with (nil, nil) for such a pod, so if destination-rebind
-// resolution rode that path it would never run for redis. It does not — it is appended
-// unconditionally on all three restore paths — and these tests are what pins that.
+//   - _ProbeFailureIsItsOwnClass asserted `gotAttempts != 1` is a failure, i.e. it pinned FM5's
+//     inversion (one transient exec deadline kills a live migration on first occurrence) as the
+//     INTENDED contract. Leaving it would have made the suite actively defend the defect. §P-VERIFY #6(a).
+//   - _NeverIsTerminalAndNamesTheFile and _UnresolvableContainerdRootFailsClosed asserted the
+//     DestinationRebindTargetNotStagedError / DestinationRebindProbeError classes and the
+//     containerd-root reconstruction. All three are deleted by ADR-0419 D6. §P-VERIFY #6(c).
+//   - _ResolvesRealWriterPaths and _StagesAndProbesTerminationLog asserted the writer taxonomy and
+//     the bounded probe. Their successors live in adr0419_destination_mounts_test.go and assert
+//     against a FAKE NRI EVENT rather than against production's own path formula.
+//   - adr0417ExpectedTargets computed its expectation with production's own filepath.Join formula,
+//     so the assertion was tautological — it would have passed against any wrong path production
+//     happened to build. §P-VERIFY #6(b) replaces it with a fixture whose expected Source values
+//     come from the fake event.
+//
+// Everything ADR-0419 explicitly preserves is still asserted here, unmodified:
+// TestValidateExtMountToken_RejectsHostileTokens and TestBuildCRIURestoreArgs_RejectsForgedExtMountMapToken
+// (§P-VERIFY #4 / #16 both require these to keep passing), the DESTINATION-REBIND emission mapping,
+// the conflicting-target rejection, and the whole fstype allowlist corpus.
 
 import (
 	"context"
@@ -28,9 +41,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,21 +49,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
+	"github.com/podmotion-io/podmotion/internal/agent/nri"
 )
 
 // TestMain redirects the agent-owned restore staging tree into a writable temp dir for the whole
 // package. Production writes /var/lib/podmotion/restore/<migration>/; a unit test process is not
 // root and cannot mkdir /var/lib/podmotion, which would otherwise turn every restore-path test into
-// an ADR-0417 "probe mechanism failed" (mkdir: permission denied) rather than exercising the logic
-// under test.
-// It also installs PACKAGE-DEFAULT stubs for the two host-environment seams the ADR-0417
-// destination-rebind resolution depends on (the containerd root dir, read from the winning
-// daemon's config.toml, and the host-namespace file probe). A unit-test process has neither a
-// containerd daemon nor a kubelet pod tree, so without these every restore-path test in the package
-// — including ones that predate ADR-0417 and are about something else entirely — would spend the
-// full bounded-wait budget and then fail with a destination-rebind probe error. The tests that
-// actually exercise this path (installADR0417Seams below) override both seams with their own
-// oracles, so these defaults never make a real assertion vacuous.
+// a staging failure rather than exercising the logic under test.
+//
+// It also installs PACKAGE-DEFAULT stubs for the host-environment seams the restore path depends
+// on. A unit-test process has no containerd, no kubelet pod tree, and no netns broker, so without
+// these every restore-path test in the package — including ones that predate ADR-0417/ADR-0419 and
+// are about something else entirely — would fail on a missing socket. Tests that actually exercise
+// these paths override the seams with their own oracles, so the defaults never make a real
+// assertion vacuous.
 func TestMain(m *testing.M) {
 	tmp, err := os.MkdirTemp("", "pm-restore-staging-")
 	if err != nil {
@@ -60,11 +70,22 @@ func TestMain(m *testing.M) {
 	}
 	restoreStagingRoot = tmp
 	resolveContainerdRootDirFn = func(context.Context, string) string { return adr0417ContainerdRoot }
-	hostRegularFileExistsFn = func(context.Context, string) (bool, error) { return true, nil }
-	// sandboxIDForPodUIDFn's production implementation shells out to `ctr` through the netns broker,
+	// ADR-0419 D4: default to "this checkpoint demands nothing", so tests about other things do not
+	// need a real checkpoint image or a python3/pycriu decode on the box.
+	destinationRebindDemandSetFn = func(context.Context, string, string) ([]string, error) { return nil, nil }
+	// ADR-0419 D5: no containerd in a unit-test process.
+	containerdRuntimeMountsOnceFn = func(context.Context, string, string) ([]nri.ContainerMount, error) { return nil, nil }
+	// ADR-0419 D8: no containerd in a unit-test process; one RUNNING sandbox is the healthy shape.
+	runningPodSandboxesForPodUIDFn = func(_ context.Context, podUID string) ([]string, error) {
+		return []string{"sandbox-for-" + podUID}, nil
+	}
+	// ADR-0419 D9: the typed broker host_realpath op has no broker here. Identity is the correct
+	// default — it models "this path is not a symlink", which is the real shape for every legitimate
+	// target — and the tests that assert D9's escape and fail-closed legs override it explicitly.
+	hostRealpathFn = func(target string) (string, error) { return target, nil }
+	// sandboxIDForPodUIDFn's production implementation now issues a typed containerd round-trip,
 	// which no unit-test process has. Every test that cares about sandbox resolution already
-	// overrides this seam explicitly (adr0325_sandbox_wait_test.go, adr0349_*, installADR0417Seams);
-	// the default just keeps tests about OTHER things from failing on a missing broker socket.
+	// overrides this seam explicitly; the default just keeps tests about OTHER things working.
 	sandboxIDForPodUIDFn = func(_ context.Context, podUID string) (string, error) {
 		return "sandbox-for-" + podUID, nil
 	}
@@ -85,6 +106,11 @@ const (
 
 // newADR0417Server builds an AgentServer whose fake client holds the PodMigration plus a REDIS-shaped
 // (zero-volume, no-PVC) replacement pod carrying the authoritative migration-name label.
+//
+// The workload fixture is deliberately REDIS-SHAPED: a pod with ZERO volumes and no PVC at all.
+// resolveReattachMounts returns early with (nil, nil) for such a pod, so if destination-rebind
+// resolution rode that path it would never run for redis. It does not — it is appended
+// unconditionally on all three restore paths — and these tests are what pins that.
 func newADR0417Server(t *testing.T) *AgentServer {
 	t.Helper()
 	scheme := newSandboxWaitScheme(t)
@@ -104,267 +130,6 @@ func newADR0417Server(t *testing.T) *AgentServer {
 	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pm, replPod).Build()
 	return &AgentServer{k8sClient: cl}
-}
-
-// adr0417ExpectedTargets is the destination target set the §P-PREMISE decode says must be produced:
-// /etc/hosts from the KUBELET pod dir, /etc/hostname and /etc/resolv.conf from the CONTAINERD CRI
-// sandbox dir (NOT the kubelet pod dir — the defect this fixes), /dev/termination-log from the
-// agent's own restore staging dir.
-func adr0417ExpectedTargets(migration string) map[string]string {
-	sandboxDir := filepath.Join(adr0417ContainerdRoot, criSandboxDirRel, adr0417SandboxID)
-	return map[string]string{
-		"/etc/hosts":           "/var/lib/kubelet/pods/" + adr0417ReplUID + "/etc-hosts",
-		"/etc/hostname":        filepath.Join(sandboxDir, "hostname"),
-		"/etc/resolv.conf":     filepath.Join(sandboxDir, "resolv.conf"),
-		"/dev/termination-log": restoreTerminationLogPath(migration),
-	}
-}
-
-// installADR0417Seams wires the containerd-root and sandbox-id seams to the live-decoded values and
-// installs the caller's file-presence oracle. Returns a restore func.
-func installADR0417Seams(t *testing.T, presence func(path string) (bool, error)) func() {
-	t.Helper()
-	origRoot := resolveContainerdRootDirFn
-	origSandbox := sandboxIDForPodUIDFn
-	origProbe := hostRegularFileExistsFn
-	origPoll := destinationRebindPollInterval
-	origBudget := destinationRebindWaitBudget
-	resolveContainerdRootDirFn = func(context.Context, string) string { return adr0417ContainerdRoot }
-	sandboxIDForPodUIDFn = func(_ context.Context, podUID string) (string, error) {
-		if podUID != adr0417ReplUID {
-			return "", errNoSandboxForPodUID
-		}
-		return adr0417SandboxID, nil
-	}
-	hostRegularFileExistsFn = func(_ context.Context, path string) (bool, error) { return presence(path) }
-	destinationRebindPollInterval = 5 * time.Millisecond
-	destinationRebindWaitBudget = 2 * time.Second
-	return func() {
-		resolveContainerdRootDirFn = origRoot
-		sandboxIDForPodUIDFn = origSandbox
-		hostRegularFileExistsFn = origProbe
-		destinationRebindPollInterval = origPoll
-		destinationRebindWaitBudget = origBudget
-	}
-}
-
-// TestAppendDestinationRebindReattachMounts_ResolvesRealWriterPaths is the Condition-2 assertion:
-// for a NO-PVC (redis-shaped) workload, the four Class DESTINATION-REBIND targets resolve to the
-// paths their REAL writers own — and specifically NOT to /var/lib/kubelet/pods/<uid>/etc-hostname
-// or .../resolv.conf, which do not exist on any node (live-verified: `ls -A` on a kubelet pod dir
-// returns exactly `containers etc-hosts plugins volumes`).
-func TestAppendDestinationRebindReattachMounts_ResolvesRealWriterPaths(t *testing.T) {
-	defer installADR0417Seams(t, func(string) (bool, error) { return true, nil })()
-	s := newADR0417Server(t)
-
-	got, err := s.appendDestinationRebindReattachMounts(context.Background(), adr0417Migration, nil)
-	if err != nil {
-		t.Fatalf("appendDestinationRebindReattachMounts returned error: %v", err)
-	}
-	want := adr0417ExpectedTargets(adr0417Migration)
-	if len(got) != len(want) {
-		t.Fatalf("resolved %d destination-rebind mounts, want %d: %+v", len(got), len(want), got)
-	}
-	for _, m := range got {
-		if m.Tier != reattachTierDestinationRebind {
-			t.Errorf("%s: Tier=%v, want reattachTierDestinationRebind", m.ContainerPath, m.Tier)
-		}
-		if w, ok := want[m.ContainerPath]; !ok {
-			t.Errorf("unexpected destination-rebind mount for %s", m.ContainerPath)
-		} else if m.HostTarget != w {
-			t.Errorf("%s host target: got %q, want %q", m.ContainerPath, m.HostTarget, w)
-		}
-	}
-	// The specific falsified assumption: neither of these may ever be produced again.
-	for _, m := range got {
-		bad := "/var/lib/kubelet/pods/" + adr0417ReplUID + "/"
-		if (m.ContainerPath == "/etc/hostname" || m.ContainerPath == "/etc/resolv.conf") &&
-			strings.HasPrefix(m.HostTarget, bad) {
-			t.Errorf("%s must resolve to the containerd CRI sandbox dir, not the kubelet pod dir; got %q", m.ContainerPath, m.HostTarget)
-		}
-	}
-}
-
-// TestAppendDestinationRebindReattachMounts_StagesAndProbesTerminationLog covers the functional
-// regression the fstype-keyed classifier introduced: /dev/termination-log is an ext4-backed bind on
-// every container, so it lands in Class DESTINATION-REBIND on EVERY migration. Without a resolved
-// target the patch script hard-stops, which is a deterministic hard-stop of every migration. Its
-// target is the file this agent stages itself — and the staging must have happened BEFORE the probe
-// reads it.
-func TestAppendDestinationRebindReattachMounts_StagesAndProbesTerminationLog(t *testing.T) {
-	var probedTermlog atomic.Bool
-	termlog := restoreTerminationLogPath(adr0417Migration)
-	defer installADR0417Seams(t, func(path string) (bool, error) {
-		if path == termlog {
-			// The probe must observe a file this function already created — read it off the real
-			// filesystem rather than answering from the oracle, so "staged before probed" is a fact
-			// and not a stub.
-			probedTermlog.Store(true)
-			st, err := os.Stat(path)
-			return err == nil && st.Mode().IsRegular(), nil
-		}
-		return true, nil
-	})()
-	_ = os.RemoveAll(restoreStagingDir(adr0417Migration))
-	s := newADR0417Server(t)
-
-	got, err := s.appendDestinationRebindReattachMounts(context.Background(), adr0417Migration, nil)
-	if err != nil {
-		t.Fatalf("appendDestinationRebindReattachMounts returned error: %v", err)
-	}
-	if !probedTermlog.Load() {
-		t.Fatal("/dev/termination-log was never probed — the destination-file edge was not read")
-	}
-	var found bool
-	for _, m := range got {
-		if m.ContainerPath == "/dev/termination-log" {
-			found = true
-			if m.HostTarget != termlog {
-				t.Errorf("/dev/termination-log host target: got %q, want %q (the same path buildCRIURestoreArgs maps)", m.HostTarget, termlog)
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("/dev/termination-log has no destination-rebind target — every migration would hard-stop; got %+v", got)
-	}
-	if st, err := os.Stat(termlog); err != nil || !st.Mode().IsRegular() {
-		t.Errorf("agent-staged termination-log %s was not created: stat err=%v", termlog, err)
-	}
-}
-
-// TestAppendDestinationRebindReattachMounts_NotYetThenResolved is the "NOT YET" leg: a destination
-// file that its writer has not staged at the first probe must be WAITED for, not collapsed into a
-// terminal failure. Both the informer-lag shape (replacement pod not listed) and the
-// writer-lag shape (file absent) are covered — the first by the sandbox seam, the second here.
-func TestAppendDestinationRebindReattachMounts_NotYetThenResolved(t *testing.T) {
-	var probes int32
-	defer installADR0417Seams(t, func(path string) (bool, error) {
-		// /etc/resolv.conf appears only after several polls — the real containerd write edge.
-		if strings.HasSuffix(path, "/resolv.conf") {
-			return atomic.AddInt32(&probes, 1) >= 4, nil
-		}
-		return true, nil
-	})()
-	s := newADR0417Server(t)
-
-	var gotAttempts int
-	var gotOutcome string
-	orig := destinationRebindObserveFn
-	destinationRebindObserveFn = func(_ string, attempts int, _ time.Duration, outcome string) {
-		gotAttempts, gotOutcome = attempts, outcome
-	}
-	defer func() { destinationRebindObserveFn = orig }()
-
-	got, err := s.appendDestinationRebindReattachMounts(context.Background(), adr0417Migration, nil)
-	if err != nil {
-		t.Fatalf("a winnable not-yet race must resolve within the budget, not fail: %v", err)
-	}
-	if len(got) != len(destinationRebindWellKnownTargets) {
-		t.Fatalf("resolved %d mounts, want %d", len(got), len(destinationRebindWellKnownTargets))
-	}
-	if gotOutcome != "resolved" {
-		t.Errorf("outcome: got %q, want %q", gotOutcome, "resolved")
-	}
-	if gotAttempts < 2 {
-		t.Errorf("expected the bounded wait to re-probe (attempts>1); got %d — a one-shot read would have failed this race", gotAttempts)
-	}
-}
-
-// TestAppendDestinationRebindReattachMounts_NeverIsTerminalAndNamesTheFile is the "NEVER" leg: the
-// budget expires with the file still genuinely absent. The error must be the not-staged class (NOT
-// the probe-failed class) and must name the specific file and its writer.
-func TestAppendDestinationRebindReattachMounts_NeverIsTerminalAndNamesTheFile(t *testing.T) {
-	defer installADR0417Seams(t, func(path string) (bool, error) {
-		return !strings.HasSuffix(path, "/hostname"), nil
-	})()
-	destinationRebindWaitBudget = 150 * time.Millisecond
-	s := newADR0417Server(t)
-
-	var gotOutcome string
-	orig := destinationRebindObserveFn
-	destinationRebindObserveFn = func(_ string, _ int, _ time.Duration, outcome string) { gotOutcome = outcome }
-	defer func() { destinationRebindObserveFn = orig }()
-
-	got, err := s.appendDestinationRebindReattachMounts(context.Background(), adr0417Migration, nil)
-	if err == nil {
-		t.Fatalf("a destination file that never appears must be terminal; got mounts %+v", got)
-	}
-	var notStaged *DestinationRebindTargetNotStagedError
-	if !errors.As(err, &notStaged) {
-		t.Fatalf("want *DestinationRebindTargetNotStagedError (the NEVER class); got %T: %v", err, err)
-	}
-	var probeErr *DestinationRebindProbeError
-	if errors.As(err, &probeErr) {
-		t.Errorf("NEVER must not be reported as the probe-failed class — they are different facts")
-	}
-	if notStaged.ContainerPath != "/etc/hostname" {
-		t.Errorf("terminal error must name the missing target; got ContainerPath=%q", notStaged.ContainerPath)
-	}
-	if notStaged.Writer != rebindWriterContainerdSandboxDir.String() {
-		t.Errorf("terminal error must name the writer that owns the missing file; got %q", notStaged.Writer)
-	}
-	if gotOutcome != "never" {
-		t.Errorf("outcome: got %q, want %q", gotOutcome, "never")
-	}
-	if len(got) != 0 {
-		t.Errorf("no mounts may be returned on the terminal leg; got %+v", got)
-	}
-}
-
-// TestAppendDestinationRebindReattachMounts_ProbeFailureIsItsOwnClass is the third leg: the read
-// MECHANISM failed, so we never learned whether the file exists. It must be terminal IMMEDIATELY
-// (retrying a broken read is poll-and-hope) and must be a distinct error class from "never".
-func TestAppendDestinationRebindReattachMounts_ProbeFailureIsItsOwnClass(t *testing.T) {
-	defer installADR0417Seams(t, func(string) (bool, error) {
-		return false, errors.New("broker exec rejected: sh not in allowlist")
-	})()
-	s := newADR0417Server(t)
-
-	var gotOutcome string
-	var gotAttempts int
-	orig := destinationRebindObserveFn
-	destinationRebindObserveFn = func(_ string, attempts int, _ time.Duration, outcome string) {
-		gotAttempts, gotOutcome = attempts, outcome
-	}
-	defer func() { destinationRebindObserveFn = orig }()
-
-	_, err := s.appendDestinationRebindReattachMounts(context.Background(), adr0417Migration, nil)
-	var probeErr *DestinationRebindProbeError
-	if !errors.As(err, &probeErr) {
-		t.Fatalf("want *DestinationRebindProbeError (the PROBE-FAILED class); got %T: %v", err, err)
-	}
-	var notStaged *DestinationRebindTargetNotStagedError
-	if errors.As(err, &notStaged) {
-		t.Errorf("a failed read mechanism must not be reported as 'the file was never staged'")
-	}
-	if probeErr.Stage != "host_file_probe" {
-		t.Errorf("probe error must name the failing stage; got %q", probeErr.Stage)
-	}
-	if gotOutcome != "probe_failed" {
-		t.Errorf("outcome: got %q, want %q", gotOutcome, "probe_failed")
-	}
-	if gotAttempts != 1 {
-		t.Errorf("a broken read mechanism must be terminal on the first attempt, not retried; got %d attempts", gotAttempts)
-	}
-}
-
-// TestAppendDestinationRebindReattachMounts_UnresolvableContainerdRootFailsClosed: if the winning
-// containerd daemon's own root dir cannot be read authoritatively, we do not know where its CRI
-// sandbox tree lives. Guessing would rewrite a mount's recorded source to a nonexistent path and
-// ENOENT mid-restore — the exact defect ADR-0417 exists to fix — so this fails closed.
-func TestAppendDestinationRebindReattachMounts_UnresolvableContainerdRootFailsClosed(t *testing.T) {
-	defer installADR0417Seams(t, func(string) (bool, error) { return true, nil })()
-	resolveContainerdRootDirFn = func(context.Context, string) string { return "" }
-	s := newADR0417Server(t)
-
-	_, err := s.appendDestinationRebindReattachMounts(context.Background(), adr0417Migration, nil)
-	var probeErr *DestinationRebindProbeError
-	if !errors.As(err, &probeErr) {
-		t.Fatalf("want *DestinationRebindProbeError; got %T: %v", err, err)
-	}
-	if probeErr.Stage != "containerd_root_dir" {
-		t.Errorf("stage: got %q, want %q", probeErr.Stage, "containerd_root_dir")
-	}
 }
 
 // TestContainerdRootFromConfig_TopLevelKeyOnly pins the parse against the REAL RKE2-generated

@@ -51,6 +51,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/grpclimits"
 	"github.com/podmotion-io/podmotion/internal/agent/netnsbroker"
 	"github.com/podmotion-io/podmotion/internal/agent/network"
+	"github.com/podmotion-io/podmotion/internal/agent/nri"
 	"github.com/podmotion-io/podmotion/internal/agent/provenance"
 	"github.com/podmotion-io/podmotion/internal/agent/seccomp"
 	pmstorage "github.com/podmotion-io/podmotion/internal/agent/storage"
@@ -856,7 +857,11 @@ func setConditionOnPM(pm *pmv1.PodMigration, condType string, status metav1.Cond
 // enforces, rather than an arbitrary or re-guessed number.
 const restoreInvariantBudget = 120 * time.Second
 
-func (s *AgentServer) JoinNsRestore(ctx context.Context, migrationName, namespace, checkpointDir, imageName, containerID, sandboxID, containerCgroupsPath, podCgroupParent, tcpPreservationMode string) (int, string, error) {
+// runtimeMounts is the ADR-0419 D1 NRI-carried mount list — the migrated container's OWN OCI
+// mount list, read directly off the NRI ContainerEvent by the caller (cmd/agent/main.go) and
+// threaded here as a plain parameter exactly as containerCgroupsPath/podCgroupParent are. Zero
+// query, zero poll, zero side-map. It is the authoritative destination-mount source on this path.
+func (s *AgentServer) JoinNsRestore(ctx context.Context, migrationName, namespace, checkpointDir, imageName, containerID, sandboxID, containerCgroupsPath, podCgroupParent, tcpPreservationMode string, runtimeMounts []nri.ContainerMount) (int, string, error) {
 	// ADR-0353 R2/R3: acquire the single-owner in-flight restore claim before driving CRIU. A
 	// second actor (the gRPC Restore fallback) racing this same migration MUST NOT proceed —
 	// decline with the TRANSIENT-RETRY ErrRestoreInFlight and leave this owner as sole authority.
@@ -975,10 +980,16 @@ func (s *AgentServer) JoinNsRestore(ctx context.Context, migrationName, namespac
 	// REBIND_TO_ROOT that ENOENTs on a second-or-later migration (see doc on
 	// appendHolderScaffoldReattachMount).
 	reattachMounts = s.appendHolderScaffoldReattachMount(joinNsRestoreCtx, migrationName, reattachMounts)
-	// ADR-0417: fold in the kubelet-staged /etc/hosts, /etc/hostname, /etc/resolv.conf destination
-	// targets (Class DESTINATION-REBIND) — see appendDestinationRebindReattachMounts doc.
+	// ADR-0419 (correcting ADR-0417's resolution mechanism): fold in the Class DESTINATION-REBIND
+	// targets this checkpoint actually demands, resolved by lookup in the container's OWN OCI mount
+	// list — see appendDestinationRebindReattachMounts doc. SITE 1 of 3. Every input is already
+	// held here, unambiguously: checkpointDir and sandboxID are live parameters of this function
+	// (sandboxID is the NRI pod sandbox object's own pod.GetId(), documented in-tree as
+	// "unambiguous per pod", and is passed to joinNsRestoreFn nine lines below), and runtimeMounts
+	// came straight off the same NRI event. Nothing here is re-derived.
 	var drErr error
-	reattachMounts, drErr = s.appendDestinationRebindReattachMounts(joinNsRestoreCtx, migrationName, reattachMounts)
+	reattachMounts, drErr = s.appendDestinationRebindReattachMounts(
+		joinNsRestoreCtx, migrationName, checkpointDir, sandboxID, runtimeMounts, reattachMounts)
 	if drErr != nil {
 		return 0, "", drErr
 	}
@@ -1530,52 +1541,13 @@ func (s *AgentServer) appendHolderScaffoldReattachMount(ctx context.Context, mig
 // so the recorded root/source and the ext-mount-map now agree on one real, agent-owned path.
 // ---------------------------------------------------------------------------------------------
 
-// destinationRebindWriter identifies WHICH component on the destination node creates a given
-// well-known file — i.e. which real edge the bounded probe below has to be ordered after.
-type destinationRebindWriter int
-
-const (
-	// rebindWriterKubeletPodDir: kubelet, at /var/lib/kubelet/pods/<replUID>/<leaf>.
-	rebindWriterKubeletPodDir destinationRebindWriter = iota
-	// rebindWriterContainerdSandboxDir: containerd's CRI plugin, at
-	// <containerd root>/io.containerd.grpc.v1.cri/sandboxes/<sandboxID>/<leaf>.
-	rebindWriterContainerdSandboxDir
-	// rebindWriterAgentStaged: this agent, at /var/lib/podmotion/restore/<migration>/<leaf>.
-	rebindWriterAgentStaged
-)
-
-func (w destinationRebindWriter) String() string {
-	switch w {
-	case rebindWriterKubeletPodDir:
-		return "kubelet pod dir"
-	case rebindWriterContainerdSandboxDir:
-		return "containerd CRI sandbox dir"
-	case rebindWriterAgentStaged:
-		return "podmotion agent restore staging dir"
-	default:
-		return "unknown"
-	}
-}
-
-// destinationRebindWellKnownTarget binds one in-container mountpoint to its destination writer and
-// leaf filename. This is target RESOLUTION only, never the classification rule:
-// patch_checkpoint_script.go's Class DESTINATION-REBIND classifier is fstype-keyed (a positive
-// allowlist of CRIU's construct-and-fill fstypes) and applies to any runtime-injected block-fs file
-// bind with no new code. A member of that class with no entry here resolves no target and
-// hard-stops, fail-closed.
-type destinationRebindWellKnownTarget struct {
-	ContainerPath string
-	Writer        destinationRebindWriter
-	Leaf          string
-}
-
-var destinationRebindWellKnownTargets = []destinationRebindWellKnownTarget{
-	{ContainerPath: "/etc/hosts", Writer: rebindWriterKubeletPodDir, Leaf: "etc-hosts"},
-	{ContainerPath: "/etc/hostname", Writer: rebindWriterContainerdSandboxDir, Leaf: "hostname"},
-	{ContainerPath: "/etc/resolv.conf", Writer: rebindWriterContainerdSandboxDir, Leaf: "resolv.conf"},
-	{ContainerPath: "/dev/termination-log", Writer: rebindWriterAgentStaged, Leaf: "termination-log"},
-}
-
+// ADR-0419 D6 items 1 and 2: the destinationRebindWriter taxonomy (kubelet pod dir / containerd
+// CRI sandbox dir / agent staging dir) and the hardcoded four-entry destinationRebindWellKnownTargets
+// table are DELETED. Both existed solely to RECONSTRUCT a destination host path the runtime already
+// hands us — and a static demand set is a demand the checkpoint never made. Target resolution is now
+// a lookup in the container's own OCI mount list, keyed by the checkpoint's own recorded demand set:
+// see adr0419_destination_mounts.go (D3/D4).
+//
 // restoreStagingDir / restoreTerminationLogPath are the single definition of the agent-owned restore
 // staging paths. joinNsRestore's own ext-mount-map target and the Class DESTINATION-REBIND target
 // for /dev/termination-log MUST be the identical string, or CRIU gets a recorded source and an
@@ -1614,65 +1586,20 @@ func ensureRestoreTerminationLogFile(migrationName string) (string, error) {
 	return path, nil
 }
 
-// destinationRebindWaitBudget bounds the wait on the destination-file edge.
+// ADR-0419 D6 items 5 and 7. The bounded-wait pair (destinationRebindWaitBudget /
+// destinationRebindPollInterval) is REPLACED, not merely removed: its successors on the gRPC path
+// are destinationMountLookupBudget / destinationMountLookupInterval, which carry the same "strictly
+// under both sibling budgets" invariant forward (adr0419_destination_mounts.go, D5.2). The NRI path
+// needs no successor at all — it has no wait, because containerd could not have created the
+// container without resolving its binds.
 //
-// GROUNDED IN A REAL MEASUREMENT, not copied from a neighbouring constant. Measured on the standing
-// KVM cluster (pm-w1, RKE2 v1.35.6+rke2r1) by creating a no-PVC redis pod pinned to the node and
-// timestamping, on the node itself, when each edge became observable relative to the pod object
-// first being readable from the API server (5 samples):
+// Both bespoke error types (DestinationRebindTargetNotStagedError, DestinationRebindProbeError) are
+// DELETED. Their successors state facts rather than unobserved edges: DestinationRuntimeMountAbsentError
+// ("the runtime did not give this container this mount") and DestinationRuntimeMountLookupTimeoutError
+// ("the runtime never answered"). Repo-wide grep confirmed neither deleted type had any controller,
+// operator, metrics or Kubernetes-Event consumer — unlike CRIUImageInconsistencyError and
+// ExternalMountUnresolvedError, which do and are untouched.
 //
-//	kubelet /var/lib/kubelet/pods/<uid>/etc-hosts : 0.507s 0.521s 0.539s 0.590s 0.729s
-//	containerd sandbox dir hostname/resolv.conf   : 0.457s 0.464s 0.472s 0.505s  (1 sample: not
-//	                                                observed within the sample window)
-//
-// So the healthy edge lands in ~0.5s, and the tail is unbounded (the un-observed sample is exactly
-// the "never" case this budget has to terminate rather than hang on). 30s is ~40x the measured
-// worst healthy sample — enough headroom for a loaded node, a cold image pull, or CNI delay — while
-// staying strictly under both sibling budgets on this same restore path (the 60s sandbox-creation
-// wait and the 85s reattach-mount wait), so this probe can never be the component that consumes the
-// restore budget. Poll interval is 250ms rather than the siblings' 1s because the measured edge is
-// sub-second: a 1s cadence would spend two whole poll periods on a 0.5s edge.
-var destinationRebindWaitBudget = 30 * time.Second
-
-// destinationRebindPollInterval is the re-probe cadence (var for tests). See the budget doc above.
-var destinationRebindPollInterval = 250 * time.Millisecond
-
-// DestinationRebindTargetNotStagedError is the "NEVER" terminal outcome: the replacement pod and its
-// sandbox both resolved, but a destination file its writer owns was still absent when the bounded
-// wait expired. Distinct from the "probe mechanism failed" class below — this one says the read
-// succeeded and the answer was genuinely "not there".
-type DestinationRebindTargetNotStagedError struct {
-	ContainerPath string
-	HostTarget    string
-	Writer        string
-	Attempts      int
-	Waited        time.Duration
-}
-
-func (e *DestinationRebindTargetNotStagedError) Error() string {
-	return fmt.Sprintf("destination rebind target for %s never appeared: %s (written by the %s) was still absent after %d probes over %s — refusing to rewrite a checkpointed mount's recorded source to a path that does not exist on this node (ADR-0417)",
-		e.ContainerPath, e.HostTarget, e.Writer, e.Attempts, e.Waited.Round(time.Millisecond))
-}
-
-// DestinationRebindProbeError is the "PROBE MECHANISM FAILED" terminal outcome: we never learned
-// whether the destination file exists, because the read itself did not complete (broker exec error,
-// unresolvable containerd root, hard containerd error). Deliberately NOT collapsed into
-// DestinationRebindTargetNotStagedError: "the file is not there" and "we could not look" are
-// different facts and must not read the same in a failure transcript.
-type DestinationRebindProbeError struct {
-	ContainerPath string
-	HostTarget    string
-	Stage         string
-	Err           error
-}
-
-func (e *DestinationRebindProbeError) Error() string {
-	return fmt.Sprintf("destination rebind probe failed at stage %q for %s (target %s): %v — the read mechanism itself failed, so the destination-file edge was never observed either way (ADR-0417)",
-		e.Stage, e.ContainerPath, e.HostTarget, e.Err)
-}
-
-func (e *DestinationRebindProbeError) Unwrap() error { return e.Err }
-
 // ---------------------------------------------------------------------------------------------
 // ADR-0417 S2(b): --ext-mount-map token validation.
 // ---------------------------------------------------------------------------------------------
@@ -1773,172 +1700,106 @@ func validateExtMountToken(key, target string, resolvedHostTargets map[string]bo
 	if !allowed {
 		return fmt.Errorf("--ext-mount-map host target %q for key %q is outside every allowed destination prefix %v", target, key, extMountTokenPrefixesFn())
 	}
-	// Symlink resolution: these host paths live in the HOST mount namespace, which the agent's own
-	// mount namespace generally cannot traverse, so EvalSymlinks is applied where it CAN resolve
-	// (the agent-staged /var/lib/podmotion tree, which this process itself writes) and skipped where
-	// it cannot. The kubelet/containerd targets are instead resolved and existence-probed in the
-	// host namespace at resolution time (resolveDestinationRebindTargetsOnce /
-	// resolveKubeletVolumeHostPath), so the value reaching argv is one a host-namespace read already
-	// confirmed. A resolvable path whose realpath escapes the allowed prefixes is rejected.
-	if real, err := filepath.EvalSymlinks(target); err == nil && real != target {
-		var realAllowed bool
-		for _, p := range extMountTokenPrefixesFn() {
-			if strings.HasPrefix(real, p) {
-				realAllowed = true
-				break
-			}
-		}
-		if !realAllowed {
-			return fmt.Errorf("--ext-mount-map host target %q for key %q resolves through a symlink to %q, which is outside every allowed destination prefix", target, key, real)
-		}
-	}
-	return nil
+	// ADR-0419 D9 — REAL path-confinement in the HOST mount namespace, FAIL CLOSED.
+	//
+	// This replaces a fail-OPEN branch that read
+	//     if real, err := filepath.EvalSymlinks(target); err == nil && real != target { ... }
+	// i.e. on resolve error the entire escape check was SKIPPED. Its licensing comment claimed the
+	// kubelet/containerd targets were "resolved and existence-probed in the host namespace at
+	// resolution time (resolveDestinationRebindTargetsOnce / resolveKubeletVolumeHostPath)" — and
+	// ADR-0419 D6 DELETES resolveDestinationRebindTargetsOnce, so that compensating control no
+	// longer exists. That comment is corrected here, in the same change as the deletion, because
+	// leaving it would assert a control that is gone.
+	//
+	// The fail-open was already dead code for the two prefixes that matter: the agent's DaemonSet
+	// mounts no /var/lib/kubelet and carries no containerd CRI sandbox tree, so EvalSymlinks in
+	// THIS process's mount namespace always errored for them and only the agent-staged
+	// /var/lib/podmotion prefix ever received a real check. It becomes live rather than latent
+	// under ADR-0419 because D3+D4 change this validator's INPUT PROVENANCE: resolvedHostTargets
+	// moves from a closed, agent-constructed four-entry table to runtime-supplied host paths, with
+	// the checkpoint's own mountpoints image — attacker-influenceable under the threat model this
+	// file already models at the addExtMountMap doc — deciding which entries are admitted. There is
+	// also a TOCTOU window D3's own argument creates: the runtime proves the source existed at event
+	// delivery; CRIU resolves it later.
+	//
+	// So the resolution is delegated to the typed netns-broker host_realpath op, which resolves
+	// through /proc/1/root — the SAME mount namespace joinNsRestore nsenters CRIU into — and the
+	// RESOLVED path is prefix-checked. Unresolvable is a REJECTION, matching ADR-0351's own
+	// confinement (EvalSymlinks, then `if err != nil { return }`, then prefix-check the resolved
+	// path). ADR-0419 copies ADR-0351's confinement, not only its plumbing.
+	return confineExtMountTargetRealpath(key, target)
 }
 
-// hostRegularFileExistsFn is a test seam (mirrors sandboxIDForPodUIDFn/hostSocketExistsFn).
-var hostRegularFileExistsFn = hostRegularFileExists
+// ADR-0419 D6 item 3: hostRegularFileExistsFn / hostRegularFileExists are DELETED along with the
+// bounded probe loop they served. Their whole purpose was to observe a destination file's write
+// edge before trusting a RECONSTRUCTED path — and there is no reconstructed path any more. The
+// runtime's own mount list is delivered only AFTER containerd resolved every bind source in it, so
+// each Source's existence is a precondition of that delivery rather than a condition to wait on.
+//
+// Their removal also deletes the last `sh -c '[ -f ... ]'` consumer on this path (§P-VERIFY #9).
+// The broker's `sh` allowlist entry is deliberately NOT shrunk: it has other legitimate consumers
+// on other paths, and shrinking it would need its own removal-symmetry audit. This ADR removes a USER of
+// that allowlist entry, never the entry.
+//
+// NOTE the one host-namespace read that is ADDED rather than removed: the typed host_realpath
+// broker op D9 requires. It is one typed read of one value at argv-construction time — not a poll,
+// and not a reinstatement of this deleted chain.
 
-// hostRegularFileExists reports whether path is an existing REGULAR FILE in the HOST mount namespace.
+// ADR-0419 D6 item 6: resolveDestinationRebindTargetsOnce, describeMissingDestinationRebindTarget
+// and destinationRebindMissing are DELETED, along with the NOT-YET / NEVER / PROBE-FAILED timing
+// classifier they implemented.
 //
-// Three-way by construction: the shell always exits 0 and prints one of two definite tokens, so
-// "absent" is reported as (false, nil) and can never be confused with "the probe did not run"
-// (returned as a non-nil error). A bare `test -f` exit code cannot make that distinction — exit 1
-// means both "absent" and "the broker rejected the exec".
-func hostRegularFileExists(ctx context.Context, path string) (bool, error) {
-	// The netns-broker's exec allowlist permits "sh" but not a bare "test" — the same constraint
-	// resolveHolderScaffoldHostPathFn and resolveNetnsBindByProcPath already work within.
-	script := fmt.Sprintf(`if [ -f %q ]; then echo PM_PRESENT; else echo PM_ABSENT; fi`, path)
-	out, err := nsenterCmd(ctx, "sh", "-c", script).Output()
-	if err != nil {
-		return false, fmt.Errorf("host file probe %s: %w", path, err)
-	}
-	s := strings.TrimSpace(string(out))
-	switch {
-	case strings.Contains(s, "PM_PRESENT"):
-		return true, nil
-	case strings.Contains(s, "PM_ABSENT"):
-		return false, nil
-	default:
-		return false, fmt.Errorf("host file probe %s: neither presence token in output %q", path, s)
-	}
-}
+// describeMissingDestinationRebindTarget in particular re-resolved the replacement pod AND the
+// sandbox ID from scratch on the terminal leg, so the target it named could be resolved against a
+// different pod/sandbox than the loop had actually been blocked on: THE REPORTED FACT WAS NOT THE
+// FACT THAT FAILED. That is why the named target walked /etc/hosts -> /etc/hostname across
+// consecutive gate cycles with nothing underneath changing. It is not replaced by a better-worded
+// version — the condition it described no longer exists.
+//
+// destinationRebindObserveFn moves to adr0419_destination_mounts.go with its new, fact-shaped
+// outcome vocabulary.
 
-// resolveDestinationRebindTargetsOnce is one full resolve-and-verify pass. It returns the resolved
-// mounts, or exactly one of the two terminal error classes, or (nil, nil, notYet=true) when the
-// destination state has not reached the required edge YET and the caller should re-probe.
+// appendDestinationRebindReattachMounts (ADR-0419, correcting ADR-0417's resolution mechanism)
+// resolves the destination node's real backing file for every mount THIS CHECKPOINT classifies as
+// Class DESTINATION-REBIND, and appends them to mounts with Tier=reattachTierDestinationRebind.
 //
-// The three-way classification the migration-correctness seat requires is made HERE, once, per
-// stage — and every stage's classification is derived from what the read actually returned, never
-// from a timeout:
+// THE PRIMITIVE (D3): for each mount the checkpoint demands (D4), find the entry in the container's
+// OWN OCI mount list whose Destination equals that in-container path and take its Source. That is
+// the whole resolution. No writer taxonomy, no hardcoded target table, no
+// <containerd root>/io.containerd.grpc.v1.cri/sandboxes/<id> reconstruction, no existence probe, no
+// bounded wait, no three-way timing classifier.
 //
-//	NOT YET       — replacement pod not listed yet (informer lag); containerd sandbox not created
-//	                yet (errNoSandboxForPodUID); a destination file's writer has not written it yet.
-//	NEVER         — only decided by the caller, when the bounded budget expires with the last
-//	                observation still "not yet" (DestinationRebindTargetNotStagedError).
-//	PROBE FAILED  — the read mechanism itself did not complete: a hard containerd error, an
-//	                unresolvable containerd root dir, a broker exec failure, or an ambiguous probe
-//	                result (DestinationRebindProbeError). Terminal immediately — retrying a broken
-//	                read mechanism is the poll-and-hope shape this project's primitive bias forbids.
-func (s *AgentServer) resolveDestinationRebindTargetsOnce(ctx context.Context, migrationName, podNs, termlogPath string) (resolved []reattachMount, notYet bool, err error) {
-	replPod := s.resolveReplacementPod(ctx, migrationName, podNs)
-	if replPod == nil || replPod.UID == "" {
-		// NOT YET: the controller stamps the migration-name label at replacement-pod creation, so an
-		// empty result here is an informer/cache lag on a pod that is being created — a race we win
-		// inside the budget. Collapsing this into a terminal "never" (the pre-fix behavior) turned a
-		// transient list miss into a hard-stopped migration.
-		return nil, true, nil
-	}
-
-	// The containerd CRI sandbox must exist before its sandbox dir (and the hostname/resolv.conf
-	// files inside it) can exist. Reuse the SAME authoritative pod-UID → sandbox read the pod-netns
-	// join gate already depends on, with the same retryable/terminal classification.
-	sandboxID, sErr := sandboxIDForPodUIDFn(ctx, string(replPod.UID))
-	if sErr != nil {
-		if errors.Is(sErr, errNoSandboxForPodUID) {
-			return nil, true, nil // NOT YET: kubelet has not created the pause container at this instant.
-		}
-		// PROBE FAILED: containerd down, ctr missing, broker unreachable — we did not learn anything.
-		return nil, false, &DestinationRebindProbeError{
-			ContainerPath: "(sandbox resolution)", Stage: "sandbox_id_for_pod_uid", Err: sErr}
-	}
-	sandboxDir := containerdCRISandboxDir(ctx, sandboxID)
-	if sandboxDir == "" {
-		// PROBE FAILED: we could not authoritatively read the winning containerd daemon's own root
-		// dir from its own config, so we do not know where its CRI sandbox tree lives. Never guess a
-		// path here — a wrong guess rewrites a mount's recorded source to a nonexistent path and
-		// ENOENTs mid-restore, which is the exact defect ADR-0417 exists to fix.
-		return nil, false, &DestinationRebindProbeError{
-			ContainerPath: "(containerd root)", Stage: "containerd_root_dir",
-			Err: fmt.Errorf("could not resolve the containerd root dir for socket %s (unknown socket, or its config.toml was unreadable)", containerdSocketPath)}
-	}
-	kubeletPodDir := fmt.Sprintf("/var/lib/kubelet/pods/%s", replPod.UID)
-
-	out := make([]reattachMount, 0, len(destinationRebindWellKnownTargets))
-	for _, t := range destinationRebindWellKnownTargets {
-		var hostTarget string
-		switch t.Writer {
-		case rebindWriterKubeletPodDir:
-			hostTarget = filepath.Join(kubeletPodDir, t.Leaf)
-		case rebindWriterContainerdSandboxDir:
-			hostTarget = filepath.Join(sandboxDir, t.Leaf)
-		case rebindWriterAgentStaged:
-			hostTarget = termlogPath
-		default:
-			return nil, false, &DestinationRebindProbeError{
-				ContainerPath: t.ContainerPath, Stage: "writer_dispatch",
-				Err: fmt.Errorf("no destination writer mapping for %s", t.ContainerPath)}
-		}
-		// THE REAL EDGE. Not "the replacement Pod object exists", not "a string was concatenated" —
-		// does the file its writer owns actually exist, right now, on this node?
-		present, pErr := hostRegularFileExistsFn(ctx, hostTarget)
-		if pErr != nil {
-			return nil, false, &DestinationRebindProbeError{
-				ContainerPath: t.ContainerPath, HostTarget: hostTarget, Stage: "host_file_probe", Err: pErr}
-		}
-		if !present {
-			return nil, true, nil // NOT YET: the writer has not staged this file at this instant.
-		}
-		out = append(out, reattachMount{
-			ContainerPath: t.ContainerPath,
-			HostTarget:    hostTarget,
-			Tier:          reattachTierDestinationRebind,
-		})
-	}
-	return out, false, nil
-}
-
-// appendDestinationRebindReattachMounts (ADR-0417) resolves the destination node's real
-// /etc/hosts, /etc/hostname, /etc/resolv.conf and /dev/termination-log backing files — each from
-// its OWN writer's directory (see destinationRebindWellKnownTargets) — and appends them to mounts
-// with Tier=reattachTierDestinationRebind.
+// WHY THERE IS NOTHING TO WAIT ON: containerd could not have created this container without
+// resolving every bind source in that list, so each Source's existence is a PRECONDITION of the
+// mount list's own delivery. ADR-0417 spent ~97-120 poll iterations and ~580 privileged broker
+// round-trips per restore — issued against the very containerd control socket the in-flight CRIU
+// restore depends on — establishing a fact the runtime had already handed us. On the NRI path that
+// is now ZERO round-trips; on the gRPC paths it is ONE typed round-trip on the healthy path.
 //
-// ORDERING (the correctness property, not an incidental one): this function does not return a
-// target until it has OBSERVED that target's file on this node. The probe is therefore ordered
-// after the real destination-side write edge by construction, wherever the call site happens to sit
-// in the restore sequence — including for /dev/termination-log, whose writer is this agent and
-// whose write is performed here, immediately before its own probe. The previous implementation
-// string-built <podDir>/<leaf> from the replacement pod's UID with no existence check at all, which
-// confirmed only that a string had been concatenated.
+// WHERE THE MOUNT LIST COMES FROM, per call site:
+//   - NRI restore (JoinNsRestore): runtimeMounts is the live nri.ContainerEvent.Mounts, read
+//     directly off the hook payload already delivered to this restore (D1). Zero query.
+//   - gRPC restore (both the config.json and the raw-CRIU branch): runtimeMounts is nil, and the
+//     list is fetched with ONE typed containerd containers-service round-trip (D5). Never a `ctr`
+//     scrape — a CLI exit code cannot distinguish a transient control-plane blip from a structural
+//     failure, and collapsing the two is precisely FM5.
 //
-// Appending to the SAME []reattachMount slice threaded through to patchCheckpointImages means:
-//   - reattachHostTargets (unchanged, not Tier-filtered) includes these entries in the
-//     {ContainerPath: HostTarget} map threaded into patchCheckpointImages as reattach_host_targets
-//     (argv[5]) — the SAME map carve-out (a) already uses.
-//   - reattachContainerPaths EXCLUDES Tier==reattachTierDestinationRebind, so these mountpoints do
-//     NOT land in reattach_mount_paths (argv[4]) — carve-out (a)'s unconditional-preserve membership
-//     set stays storage-tier-scoped. Whether /etc/hosts et al. actually land in Class
-//     DESTINATION-REBIND (vs Class RECREATABLE) is decided by their recorded fstype inside
-//     patch_checkpoint_script.go, never by membership in this Go-side list.
-//
-// It is invoked unconditionally on all restore paths and does NOT ride resolveReattachMounts' no-PVC
-// early return, so a no-PVC workload (redis) exercises the identical resolve → probe → wait path a
-// PVC-backed one does. TestAppendDestinationRebindReattachMounts_* pin that with a redis-shaped
-// (zero-volume) pod fixture.
+// PARAMETERS, NOT RE-DERIVATION (D2): sandboxID and checkpointDir are already held, unambiguously,
+// at all three call sites. This function used to accept neither and re-derive the sandbox ID from
+// `ctr containers list` filtered ONLY on the pod UID — a query kubelet stamps on the pod sandbox AND
+// on every workload container, so it returned whichever row containerd listed first. That is root
+// cause (A): a deterministic identifier bug that presented for six gate cycles as a timing failure.
 //
 // Returns mounts unchanged, with no error, ONLY when there is no source of truth to consult at all
-// (no k8s client, no migration name, no PodMigration CR). Every other outcome is either a resolved
-// set or a terminal, classified error.
-func (s *AgentServer) appendDestinationRebindReattachMounts(ctx context.Context, migrationName string, mounts []reattachMount) ([]reattachMount, error) {
+// (no k8s client, no migration name, no PodMigration CR). That early return is deliberately NOT
+// extended to cover an empty sandboxID (§P-VERIFY #15b): doing so would silently drop the
+// DESTINATION-REBIND targets from --ext-mount-map, leaving CRIU to restore against the SOURCE
+// node's recorded /etc/hosts source and ENOENT mid-restore — the exact defect ADR-0417 exists to
+// fix, reintroduced as a fail-open. Every other outcome is a resolved set or a named terminal.
+func (s *AgentServer) appendDestinationRebindReattachMounts(
+	ctx context.Context, migrationName, checkpointDir, sandboxID string,
+	runtimeMounts []nri.ContainerMount, mounts []reattachMount,
+) ([]reattachMount, error) {
 	if s.k8sClient == nil || migrationName == "" {
 		return mounts, nil
 	}
@@ -1950,106 +1811,83 @@ func (s *AgentServer) appendDestinationRebindReattachMounts(ctx context.Context,
 	if podNs == "" {
 		podNs = pm.Namespace
 	}
-	// Perform this agent's OWN destination-side write first, so the probe below reads it after its
-	// real edge rather than before it.
-	termlogPath, tErr := ensureRestoreTerminationLogFile(migrationName)
-	if tErr != nil {
-		return mounts, &DestinationRebindProbeError{
-			ContainerPath: "/dev/termination-log", Stage: "agent_stage_termination_log", Err: tErr}
-	}
-
-	waitCtx, cancel := context.WithTimeout(ctx, destinationRebindWaitBudget)
-	defer cancel()
 	start := time.Now()
-	attempts := 0
-	for {
-		attempts++
-		resolved, notYet, err := s.resolveDestinationRebindTargetsOnce(waitCtx, migrationName, podNs, termlogPath)
-		if err != nil {
-			// PROBE FAILED — terminal immediately, and reported as its own class.
-			log.Error(err, "appendDestinationRebindReattachMounts: destination-rebind probe mechanism failed (ADR-0417)",
-				"migration", migrationName, "attempts", attempts, "elapsedMs", time.Since(start).Milliseconds())
-			destinationRebindObserveFn(migrationName, attempts, time.Since(start), "probe_failed")
-			return mounts, err
-		}
-		if !notYet {
-			log.Info("appendDestinationRebindReattachMounts: all destination-rebind targets observed on this node (ADR-0417)",
-				"migration", migrationName, "attempts", attempts, "elapsedMs", time.Since(start).Milliseconds(), "targets", len(resolved))
-			destinationRebindObserveFn(migrationName, attempts, time.Since(start), "resolved")
-			return append(mounts, resolved...), nil
-		}
-		select {
-		case <-waitCtx.Done():
-			// NEVER — budget spent with the last observation still "not yet". Re-run one final pass
-			// with cancellation severed from the expired deadline so the terminal error can name the
-			// exact target that was missing rather than reporting a generic timeout (same
-			// WithoutCancel primitive reattachMountsUnresolvedForTerminal uses on its terminal leg).
-			finalCtx, finalCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			missing := s.describeMissingDestinationRebindTarget(finalCtx, migrationName, podNs, termlogPath)
-			finalCancel()
-			waited := time.Since(start)
-			nerr := &DestinationRebindTargetNotStagedError{
-				ContainerPath: missing.ContainerPath, HostTarget: missing.HostTarget,
-				Writer: missing.Writer, Attempts: attempts, Waited: waited,
-			}
-			log.Error(nerr, "appendDestinationRebindReattachMounts: destination-rebind target never appeared within the bounded wait (ADR-0417)",
-				"migration", migrationName, "attempts", attempts, "elapsedMs", waited.Milliseconds(),
-				"budget", destinationRebindWaitBudget.String())
-			destinationRebindObserveFn(migrationName, attempts, waited, "never")
-			return mounts, nerr
-		case <-time.After(destinationRebindPollInterval):
+
+	// D7: the agent's OWN destination-side write for /dev/termination-log. The WRITE survives (it
+	// is the real edge, and ensureRestoreTerminationLogFile has a second independent caller); only
+	// the PROBE of its result is gone. Re-verifying through a privileged shell exec a file this
+	// process created two statements earlier could only ADD a failure mode to a fact already held
+	// with certainty — its existence is a postcondition of the agent's own os.OpenFile.
+	if _, tErr := ensureRestoreTerminationLogFile(migrationName); tErr != nil {
+		destinationRebindObserveFn(migrationName, 1, time.Since(start), "runtime_lookup_failed")
+		return mounts, fmt.Errorf("destination rebind: stage agent-owned termination-log for migration %s: %w", migrationName, tErr)
+	}
+
+	// D4 — intersect against the DEMAND set this checkpoint actually recorded, not a hardcoded list.
+	demanded, dErr := destinationRebindDemandSetFn(ctx, migrationName, checkpointDir)
+	if dErr != nil {
+		destinationRebindObserveFn(migrationName, 1, time.Since(start), "runtime_lookup_failed")
+		return mounts, dErr
+	}
+	// A mountpoint already resolved by an earlier tier (storage-tier PVC re-attach, holder scaffold)
+	// is NOT a destination-rebind demand: patch_checkpoint_script.go checks its re-attach carve-out
+	// FIRST and would use that tier's target anyway. Emitting a second, differently-resolved target
+	// for the same key is how a conflicting --ext-mount-map pair gets built.
+	already := make(map[string]bool, len(mounts))
+	for _, m := range mounts {
+		already[m.ContainerPath] = true
+	}
+	pending := make([]string, 0, len(demanded))
+	for _, d := range demanded {
+		if !already[d] {
+			pending = append(pending, d)
 		}
 	}
+	if len(pending) == 0 {
+		// The outcome ADR-0417's hardcoded four-entry table structurally could not produce: this
+		// checkpoint demands no destination-rebind mount, so none is required. A workload whose
+		// checkpoint has no /etc/hostname mount now restores cleanly instead of hard-stopping on a
+		// demand it never made.
+		log.Info("ADR-0419 D4: this checkpoint demands no Class DESTINATION-REBIND mount — nothing to resolve",
+			"migration", migrationName, "checkpointDir", checkpointDir)
+		destinationRebindObserveFn(migrationName, 1, time.Since(start), "not_demanded")
+		return mounts, nil
+	}
+
+	// Resolve the runtime mount list for this restore-target container.
+	source := "NRI ContainerEvent"
+	attempts := 1
+	if runtimeMounts == nil {
+		source = "containerd containers service"
+		replPod := s.resolveReplacementPod(ctx, migrationName, podNs)
+		if replPod == nil || replPod.UID == "" {
+			destinationRebindObserveFn(migrationName, attempts, time.Since(start), "runtime_lookup_failed")
+			return mounts, fmt.Errorf("destination rebind: no replacement pod resolved for migration %s in namespace %s (label %s) — cannot ask the runtime for its mount list (ADR-0419 D5)",
+				migrationName, podNs, replacementPodLabelKey)
+		}
+		var rErr error
+		runtimeMounts, rErr = s.resolveRuntimeMountsWaiting(ctx, string(replPod.UID), sandboxID, pending)
+		if rErr != nil {
+			destinationRebindObserveFn(migrationName, attempts, time.Since(start), "runtime_lookup_failed")
+			return mounts, rErr
+		}
+	}
+
+	// D3 — the lookup. Every demanded path resolves to a runtime-supplied Source, or this fails
+	// closed naming the path the runtime did not supply.
+	resolved, rErr := resolveDestinationRebindTargets(pending, runtimeMounts, migrationName, sandboxID, source)
+	if rErr != nil {
+		log.Error(rErr, "ADR-0419 D3: a checkpoint-demanded mount has no entry in the runtime's own mount list — failing closed",
+			"migration", migrationName, "sandboxID", sandboxID, "source", source)
+		destinationRebindObserveFn(migrationName, attempts, time.Since(start), "runtime_mount_absent")
+		return mounts, rErr
+	}
+	log.Info("ADR-0419: destination-rebind targets resolved from the runtime's own mount list — zero probes, zero waits",
+		"migration", migrationName, "sandboxID", sandboxID, "source", source,
+		"demanded", len(pending), "resolved", len(resolved), "elapsedMs", time.Since(start).Milliseconds())
+	destinationRebindObserveFn(migrationName, attempts, time.Since(start), "resolved")
+	return append(mounts, resolved...), nil
 }
-
-// destinationRebindMissing names the first target that was still absent on the terminal leg.
-type destinationRebindMissing struct{ ContainerPath, HostTarget, Writer string }
-
-// describeMissingDestinationRebindTarget re-walks the target set once, best-effort, purely to make
-// the terminal "never" error name a concrete file instead of a generic deadline. Any failure here
-// degrades the message only — it never changes the outcome, which is already terminal.
-func (s *AgentServer) describeMissingDestinationRebindTarget(ctx context.Context, migrationName, podNs, termlogPath string) destinationRebindMissing {
-	unknown := destinationRebindMissing{ContainerPath: "(unresolved)", HostTarget: "(unresolved)", Writer: "unknown"}
-	replPod := s.resolveReplacementPod(ctx, migrationName, podNs)
-	if replPod == nil || replPod.UID == "" {
-		return destinationRebindMissing{
-			ContainerPath: "(all)", HostTarget: "(replacement pod never listed)",
-			Writer: "kubernetes API (replacement pod labelled " + replacementPodLabelKey + ")"}
-	}
-	sandboxID, sErr := sandboxIDForPodUIDFn(ctx, string(replPod.UID))
-	if sErr != nil {
-		return destinationRebindMissing{
-			ContainerPath: "(all)", HostTarget: "(containerd sandbox never created for pod uid " + string(replPod.UID) + ")",
-			Writer: "kubelet/containerd RunPodSandbox"}
-	}
-	sandboxDir := containerdCRISandboxDir(ctx, sandboxID)
-	kubeletPodDir := fmt.Sprintf("/var/lib/kubelet/pods/%s", replPod.UID)
-	for _, t := range destinationRebindWellKnownTargets {
-		var hostTarget string
-		switch t.Writer {
-		case rebindWriterKubeletPodDir:
-			hostTarget = filepath.Join(kubeletPodDir, t.Leaf)
-		case rebindWriterContainerdSandboxDir:
-			if sandboxDir == "" {
-				return destinationRebindMissing{ContainerPath: t.ContainerPath,
-					HostTarget: "(containerd root dir unresolved)", Writer: t.Writer.String()}
-			}
-			hostTarget = filepath.Join(sandboxDir, t.Leaf)
-		case rebindWriterAgentStaged:
-			hostTarget = termlogPath
-		}
-		present, pErr := hostRegularFileExistsFn(ctx, hostTarget)
-		if pErr != nil || !present {
-			return destinationRebindMissing{ContainerPath: t.ContainerPath, HostTarget: hostTarget, Writer: t.Writer.String()}
-		}
-	}
-	return unknown
-}
-
-// destinationRebindObserveFn is a test seam (mirrors sandboxWaitObserveFn), invoked exactly once per
-// appendDestinationRebindReattachMounts call with the attempt count, elapsed time, and the three-way
-// outcome ("resolved" | "not_yet"→"never" | "probe_failed"). No-op by default.
-var destinationRebindObserveFn = func(migrationName string, attempts int, elapsed time.Duration, outcome string) {}
 
 // replacementPodLabelKey is the label the controller stamps on the replacement pod at creation
 // time (podmigration_controller.go). It equals the PodMigration name. It is the authoritative,
@@ -8102,25 +7940,75 @@ var errNoSandboxForPodUID = errors.New("no sandbox container found for pod uid")
 // the real kubelet-driven sandbox-creation edge) without a live containerd.
 var sandboxIDForPodUIDFn = sandboxIDForPodUID
 
-// sandboxIDForPodUID resolves the containerd sandbox (pause container) task ID for the given
-// pod UID via `ctr --namespace k8s.io containers list`, filtering by the io.kubernetes.pod.uid
-// label. Mirrors the existing ctr-based lookup idiom (sandboxNetnsPath) — no
-// new external binary dependency. Returns errNoSandboxForPodUID (wrapped) when the query succeeds
-// but no sandbox exists yet, so callers can distinguish that retryable race from a hard ctr error.
+// sandboxIDForPodUID resolves the containerd POD SANDBOX (pause container) ID for the given pod UID.
+//
+// ADR-0419 D8 — HARDENED, CONTRACT-PRESERVING. The pre-ADR-0419 implementation ran
+//
+//	ctr --namespace k8s.io containers list -q labels."io.kubernetes.pod.uid"==<uid>
+//
+// and returned THE FIRST NON-EMPTY LINE. kubelet stamps io.kubernetes.pod.uid on the pod sandbox
+// AND on every workload container, and there was no kind filter anywhere in the tree, so this
+// returned whichever row containerd happened to list first. Live evidence from the origin
+// diagnosis: for one pod UID the listing order was <container>, <container>, <sandbox> — sandbox
+// LAST — and 6 of 7 multi-container pod UIDs returned a workload container first. A
+// workload-container ID then yielded a sandbox directory that does not exist, every existence probe
+// correctly reported absent, and a deterministic identifier bug presented as a 30-second timeout.
+// That is FM1's root cause (A).
+//
+// This function is no longer on the destination-rebind path at all — ADR-0419 removes it from
+// there. It is hardened anyway, unconditionally, because its THIRD consumer survives: the ADR-0306
+// pod-netns join gate (resolveSandboxIDForMigration), whose correctness rests on the same latent
+// defect and which would otherwise be the next place it surfaced.
+//
+// THE CONTRACT IS TRI-STATE AND THE ZERO-MATCH LEG IS INVARIANT:
+//
+//	exactly one RUNNING sandbox -> that ID. Never "the first row".
+//	ZERO matches                -> wrapped errNoSandboxForPodUID, UNCHANGED. This is the benign
+//	                               "not yet" race edge (the destination kubelet has not created the
+//	                               pause container at this instant) that resolveSandboxIDForMigration
+//	                               converts into ReplacementSandboxNotYetCreatedError and that the
+//	                               60s bounded wait in resolvePodNetnsSandboxWaiting engages on.
+//	                               Introducing a distinct hard error here would sever that chain at
+//	                               its ONLY construction site repo-wide and collapse the gate from
+//	                               "bounded-wait 60s for the kubelet" to "fail terminal on first
+//	                               look" — on the very ~6s race it was built to win.
+//	>1 RUNNING sandbox          -> AmbiguousPodSandboxError naming BOTH. Genuinely ambiguous,
+//	                               correctly terminal.
+//	transport/typed failure     -> terminal wrapped error, unchanged. NOT errNoSandboxForPodUID.
+//
+// Note the zero-match window WIDENS under the kind+state filter: the interval in which workload
+// containers are listed but the sandbox is not yet RUNNING used to return a wrong-but-non-empty ID
+// and now returns zero. That makes preserving the retryable leg MORE load-bearing after this
+// change, not less.
+//
+// WHY A TYPED CLIENT RATHER THAN `ctr`: the RUNNING requirement cannot be expressed by
+// `ctr containers list` at all (it has no state column; state lives in `ctr tasks list`), so
+// satisfying D8 over the CLI would mean a SECOND scrape and a client-side join — more of exactly
+// what FM5 condemns. ListPodSandbox is inherently kind-filtered (it lists sandboxes, nothing else)
+// and takes the state filter directly, so one typed call answers both halves.
+//
+// §P-VERIFY #8c SETTLED LIVE before this leg shipped, on pm-w1 AND pm-w2: 27 pod UIDs across the
+// two nodes carry TWO sandbox rows each — including all four the ADR named
+// (047ae64e…, 110670f4…, 162477b6…, 3634f6ab…) — but ZERO carry more than one in SANDBOX_READY.
+// The second row is always a stale, not-ready sandbox. So two-RUNNING is NOT a steady state this
+// substrate produces, the >1 leg does not terminalize a gate that works today, and it ships as
+// specified. The multiplicity itself is real, which is exactly why the state filter — not the kind
+// filter alone — is what makes the answer unique.
 func sandboxIDForPodUID(ctx context.Context, podUID string) (string, error) {
-	out, err := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "containers", "list",
-		"-q", "labels.\"io.kubernetes.pod.uid\"=="+podUID)...).Output()
+	sandboxes, err := runningPodSandboxesForPodUIDFn(ctx, podUID)
 	if err != nil {
-		return "", fmt.Errorf("ctr containers list for pod uid %s: %w", podUID, err)
+		// A transport/typed failure is NOT errNoSandboxForPodUID and must never become it: "we
+		// could not ask" and "the answer is not yet" are different facts (root cause D).
+		return "", fmt.Errorf("pod sandbox lookup for pod uid %s: %w", podUID, err)
 	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	for _, line := range lines {
-		id := strings.TrimSpace(line)
-		if id != "" {
-			return id, nil
-		}
+	switch len(sandboxes) {
+	case 0:
+		return "", fmt.Errorf("%w %s", errNoSandboxForPodUID, podUID)
+	case 1:
+		return sandboxes[0], nil
+	default:
+		return "", &AmbiguousPodSandboxError{PodUID: podUID, SandboxIDs: sandboxes}
 	}
-	return "", fmt.Errorf("%w %s", errNoSandboxForPodUID, podUID)
 }
 
 // patchCheckpointImages modifies the CRIU image files in checkpointDir to remove entries
@@ -10062,7 +9950,12 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		// rather than racing it, and a genuinely unresolvable sandbox is reported by the gate that
 		// owns that condition instead of surfacing as a rebind-probe failure.
 		var drErr error
-		reattachMounts, drErr = s.appendDestinationRebindReattachMounts(ctx, req.MigrationName, reattachMounts)
+		// SITE 2 of 3. joinSandboxID is resolved fourteen lines above by the pod-netns sandbox gate
+		// and is threaded in rather than re-derived; imagesDir is this path's checkpointDir.
+		// runtimeMounts is nil here — there is no NRI ContainerEvent on the gRPC path — so the
+		// resolver takes its D5 typed-containerd branch.
+		reattachMounts, drErr = s.appendDestinationRebindReattachMounts(
+			ctx, req.MigrationName, imagesDir, joinSandboxID, nil, reattachMounts)
 		if drErr != nil {
 			return nil, fmt.Errorf("resolve destination-rebind mounts: %w", drErr)
 		}
@@ -10284,9 +10177,36 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// P-0193-1 (2026-07-18): see appendHolderScaffoldReattachMount doc — same fold-in as the other
 	// two restore paths, for the raw (non-config.json) gRPC Restore path.
 	rawReattachMounts = s.appendHolderScaffoldReattachMount(ctx, req.MigrationName, rawReattachMounts)
-	// ADR-0417: see appendDestinationRebindReattachMounts doc — same fold-in as the other two
-	// restore paths, for the raw (non-config.json) gRPC Restore path.
-	rawReattachMounts, rawDRErr := s.appendDestinationRebindReattachMounts(ctx, req.MigrationName, rawReattachMounts)
+	// UNIVERSAL POD-NETNS INTEGRATION (ADR-0125/ADR-0177/ADR-0349 — mislabeled "ADR-0325" prior
+	// to ADR-0370's citation fix; see ADR-0370 First Finding): raw-CRIU gRPC path parity with the
+	// config.json branch above — resolve the replacement pod's REAL sandbox netns and join it so
+	// the restored process serves at its pod IP regardless of tcpPreservationMode. The synthetic
+	// migration netns (req.DestNetnsFd) is deliberately NOT joined (old-IP preservation is out of
+	// scope). See the config.json branch for the full rationale. Fail-closed on resolution failure.
+	//
+	// ADR-0419 D2b — THIS GATE IS HOISTED, deliberately. It previously sat EIGHTEEN LINES BELOW the
+	// destination-rebind fold-in, making this branch the outlier: the config.json branch already
+	// runs the sandbox gate FIRST and documents that ordering as deliberate ("a genuinely
+	// unresolvable sandbox is reported by the gate that owns that condition instead of surfacing as
+	// a rebind-probe failure"). Hoisting converges all three sites on that order, and the rebind
+	// resolver now REQUIRES it: D3's lookup needs the sandbox ID to narrow the runtime mount list to
+	// the right container. The two are independent reads — nothing between them writes state the
+	// other consumes — so this is a reordering into the dependency order, on the one branch that
+	// had them backwards. Passing "" instead, or widening the resolver's early return to tolerate an
+	// empty sandbox ID, are both explicitly rejected shapes: the second is a FAIL-OPEN that silently
+	// drops the targets from --ext-mount-map.
+	joinSandboxID2, sandboxAttempted2 := s.resolvePodNetnsSandboxWaiting(ctx, req.MigrationName)
+	if joinSandboxID2 == "" && sandboxAttempted2 {
+		msg := fmt.Sprintf("Restore: pod-netns integration failed for migration %s: could not resolve replacement pod sandbox netns (ADR-0325) — refusing to restore into a detached/non-pod namespace", req.MigrationName)
+		log.Info(msg, "migration", req.MigrationName)
+		return nil, fmt.Errorf("%s", msg)
+	}
+	// ADR-0419: see appendDestinationRebindReattachMounts doc — same fold-in as the other two
+	// restore paths, for the raw (non-config.json) gRPC Restore path. SITE 3 of 3. imagesDir is
+	// this path's checkpointDir; joinSandboxID2 is the sandbox the gate immediately above confirmed;
+	// runtimeMounts is nil (no NRI event on the gRPC path) so the D5 typed branch runs.
+	rawReattachMounts, rawDRErr := s.appendDestinationRebindReattachMounts(
+		ctx, req.MigrationName, imagesDir, joinSandboxID2, nil, rawReattachMounts)
 	if rawDRErr != nil {
 		return nil, fmt.Errorf("resolve destination-rebind mounts: %w", rawDRErr)
 	}
@@ -10298,18 +10218,6 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	s.destHostVethMu.RLock()
 	storedVeth2 := s.destHostVeth[req.MigrationName]
 	s.destHostVethMu.RUnlock()
-	// UNIVERSAL POD-NETNS INTEGRATION (ADR-0125/ADR-0177/ADR-0349 — mislabeled "ADR-0325" prior
-	// to ADR-0370's citation fix; see ADR-0370 First Finding): raw-CRIU gRPC path parity with the
-	// config.json branch above — resolve the replacement pod's REAL sandbox netns and join it so
-	// the restored process serves at its pod IP regardless of tcpPreservationMode. The synthetic
-	// migration netns (req.DestNetnsFd) is deliberately NOT joined (old-IP preservation is out of
-	// scope). See the config.json branch for the full rationale. Fail-closed on resolution failure.
-	joinSandboxID2, sandboxAttempted2 := s.resolvePodNetnsSandboxWaiting(ctx, req.MigrationName)
-	if joinSandboxID2 == "" && sandboxAttempted2 {
-		msg := fmt.Sprintf("Restore: pod-netns integration failed for migration %s: could not resolve replacement pod sandbox netns (ADR-0325) — refusing to restore into a detached/non-pod namespace", req.MigrationName)
-		log.Info(msg, "migration", req.MigrationName)
-		return nil, fmt.Errorf("%s", msg)
-	}
 	// ADR-0351 D3.1: same rationale as the config.json branch above — pass the incoming gRPC
 	// Restore handler ctx (D_restore).
 	// P-0193-2 (2026-07-18): same rationale as the primary gRPC branch above — no NRI event on

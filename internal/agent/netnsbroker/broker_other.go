@@ -43,6 +43,12 @@ func (c *Client) HolderSentinelReady(_ context.Context, _ string) (bool, error) 
 	return false, fmt.Errorf("netns-broker: unsupported on this OS (linux only)")
 }
 
+// HostRealpath errors on non-linux (broker is linux-only). Fail-closed on every
+// platform: callers treat the error as a rejection (ADR-0419 D9).
+func (c *Client) HostRealpath(_ context.Context, _ string) (string, error) {
+	return "", fmt.Errorf("netns-broker: unsupported on this OS (linux only)")
+}
+
 // NetnsExec errors on non-linux (ADR-0346 D6).
 func (c *Client) NetnsExec(_ context.Context, _ int, _ string, _ ...string) ExecResult {
 	return ExecResult{ExitCode: -1, SpawnErr: fmt.Errorf("netns-broker: unsupported on this OS (linux only)")}

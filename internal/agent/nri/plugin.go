@@ -107,6 +107,40 @@ type ContainerEvent struct {
 	// validation bound (reject an anchor target that equals or escapes it) — NEVER a write
 	// target (writing a PID into a non-leaf cgroup with children EBUSYs, cgroup v2).
 	PodCgroupParent string `json:"podCgroupParent,omitempty"`
+	// Mounts is the migrated container's OWN OCI mount list, read directly from
+	// container.GetMounts() (NRI Container.Mounts). ADR-0419 D1: this is the
+	// authoritative restore-path destination-mount source — zero query, zero poll,
+	// zero retry. containerd could not have created this container without resolving
+	// every bind source below, so each Source's existence is a PRECONDITION of this
+	// event's delivery, not a condition to wait on.
+	//
+	// Live-verified populated (G0, §P-VERIFY #1) on pm-w1 AND pm-w2, at BOTH
+	// StartContainer and PostStartContainer, containerd 2.2.5-k3s2: 13 mounts per
+	// container, all three /etc/* binds present with non-empty absolute host Sources,
+	// and zero exceptions across all 57 running containers on the two nodes. The two
+	// writers are distinct and must never be reconstructed from one root:
+	//   /etc/hosts       -> /var/lib/kubelet/pods/<podUID>/etc-hosts        (kubelet)
+	//   /etc/hostname    -> <containerd root>/io.containerd.grpc.v1.cri/
+	//   /etc/resolv.conf     sandboxes/<sandboxID>/{hostname,resolv.conf}   (containerd CRI)
+	Mounts []ContainerMount `json:"mounts,omitempty"`
+}
+
+// ContainerMount mirrors the subset of nriapi.Mount this package cares about, under the
+// same "mirrors the subset we care about" convention ContainerEvent itself is declared
+// with. Field names track the OCI/NRI spelling (Destination = in-container path,
+// Source = host path) rather than the CRI spelling (container_path/host_path) — the two
+// differ, and ADR-0419 D5.1 requires the gRPC fallback path to map them EXPLICITLY
+// rather than assume symmetry.
+type ContainerMount struct {
+	// Destination is the path INSIDE the container (e.g. /etc/hosts).
+	Destination string `json:"destination"`
+	// Type is the mount type as recorded in the OCI spec (e.g. "bind").
+	Type string `json:"type,omitempty"`
+	// Source is the path on the HOST that Destination is bound from. This is the
+	// value ADR-0419 D3 takes as the destination rebind target, verbatim.
+	Source string `json:"source,omitempty"`
+	// Options are the OCI mount options (e.g. rbind, rprivate, rw).
+	Options []string `json:"options,omitempty"`
 }
 
 // ADR-0412 D2 — sentinel errors for the terminal-phase restore-gate classification. They are
@@ -856,6 +890,11 @@ func buildContainerEvent(pod *nriapi.PodSandbox, container *nriapi.Container) Co
 		ContainerCgroupsPath: container.GetLinux().GetCgroupsPath(),
 		// PodCgroupParent is used ONLY as a D2.3/D2.4 validation bound — never a write target.
 		PodCgroupParent: pod.GetLinux().GetCgroupParent(),
+		// ADR-0419 D1: read the container's OWN OCI mount list directly off the same NRI
+		// hook payload — zero query, zero poll, zero retry, exactly as ContainerCgroupsPath
+		// above. Nil-safe by construction: GetMounts() returns nil on a nil receiver and a
+		// nil slice is a valid empty mount list.
+		Mounts: containerMounts(container.GetMounts()),
 	}
 	// Also merge container-level annotations (containerd may forward them on either).
 	if cAnnotations := container.GetAnnotations(); len(cAnnotations) > 0 {
@@ -871,6 +910,31 @@ func buildContainerEvent(pod *nriapi.PodSandbox, container *nriapi.Container) Co
 	return event
 }
 
+// containerMounts converts the NRI mount list into this package's mirror type
+// (ADR-0419 D1). Nil in, nil out — an empty mount list is a legitimate value, and the
+// decision to treat an empty list as fatal belongs to the RESTORE path (which knows
+// which mounts the checkpoint actually demands), never to this event-shaping helper.
+// Entries with an empty Destination are skipped: they cannot be looked up by
+// in-container path and so cannot satisfy any demand.
+func containerMounts(in []*nriapi.Mount) []ContainerMount {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]ContainerMount, 0, len(in))
+	for _, m := range in {
+		if m == nil || m.GetDestination() == "" {
+			continue
+		}
+		out = append(out, ContainerMount{
+			Destination: m.GetDestination(),
+			Type:        m.GetType(),
+			Source:      m.GetSource(),
+			Options:     m.GetOptions(),
+		})
+	}
+	return out
+}
+
 // fetchContainerImage queries containerd for the image name associated with the given
 // container ID using `ctr --namespace k8s.io containers info`. Returns an empty string
 // if the query fails — callers fall back to a default image name.
@@ -878,7 +942,12 @@ func fetchContainerImage(containerID string) string {
 	if containerID == "" {
 		return ""
 	}
-	out, err := exec.Command("ctr", "--namespace", "k8s.io", "containers", "info", containerID).Output()
+	// ADR-0419 D5 / §P-VERIFY #17: pinned to the ABSOLUTE path, matching every other
+	// `ctr` invocation in this tree. This was the only PATH-resolved one, running inside
+	// a hostPID:true pod — i.e. a binary-shadowing primitive: anything that could place a
+	// `ctr` earlier on PATH would have had its output parsed as containerd's. The path is
+	// the same one the netns-broker's own exec allowlist pins.
+	out, err := exec.Command("/usr/local/bin/ctr", "--namespace", "k8s.io", "containers", "info", containerID).Output()
 	if err != nil {
 		return ""
 	}

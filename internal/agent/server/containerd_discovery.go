@@ -467,18 +467,19 @@ func resolveContainerdRootDir(ctx context.Context, winnerSocket string) string {
 	return defaultContainerdRootDir
 }
 
-// containerdCRISandboxDir returns the CRI plugin's persistent sandbox directory for sandboxID, or
-// "" when the containerd root dir could not be resolved authoritatively.
-func containerdCRISandboxDir(ctx context.Context, sandboxID string) string {
-	if sandboxID == "" {
-		return ""
-	}
-	root := resolveContainerdRootDirFn(ctx, containerdSocketPath)
-	if root == "" {
-		return ""
-	}
-	return filepath.Join(root, criSandboxDirRel, sandboxID)
-}
+// ADR-0419 D6 item 4: containerdCRISandboxDir is DELETED. It existed only to RECONSTRUCT
+// <containerd root>/io.containerd.grpc.v1.cri/sandboxes/<id> so a destination file could be probed
+// inside it — and ADR-0419 never reconstructs that path: the runtime hands us the resolved Source
+// directly. (As a side effect this moots the origin synthesis' unresolved root-vs-state-dir
+// question entirely; the live mount lists confirm the sandbox files do sit under the `root` dir,
+// but nothing in this codebase depends on that being true any more.)
+//
+// ITS TWO DEPENDENCIES ARE DELIBERATELY RETAINED — deleting them alongside it is the specific
+// asymmetric-removal error this note exists to prevent. resolveContainerdRootDirFn and
+// criSandboxDirRel EACH have an independent surviving consumer in
+// allowedExtMountHostTargetPrefixes (server.go), which needs the containerd root to authorize
+// sandbox-dir prefixes for --ext-mount-map token validation. That need is unrelated to destination
+// target RESOLUTION and outlives this ADR.
 
 // pidOwningUnixSocketFn is a test seam. Production implementation: pidOwningUnixSocket.
 var pidOwningUnixSocketFn = pidOwningUnixSocket
