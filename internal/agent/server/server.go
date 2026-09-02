@@ -5519,8 +5519,18 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		tcpFlag,
 		// --mntns-compat-mode is intentionally OMITTED here (gate-fix B1).
 		// Compat-mode runs an umount pass inside the destination container's mount namespace
-		// that tries to remove /sys → EBUSY (sysfs is kernel-referenced and cannot be
-		// unmounted even with MNT_DETACH when it has active references from the host).
+		// that tries to remove /sys → EBUSY.
+		//
+		// The inherited explanation for that EBUSY is the following assertion, kept verbatim:
+		// UNDECODED (ADR-0420 D3a / M2a): sysfs is kernel-referenced and cannot be unmounted even with MNT_DETACH when it has active references from the host.
+		// The line above is an INHERITED, UNVERIFIED claim about kernel behavior — status
+		// UNKNOWN, neither established nor negated. It is NOT a decoded mechanism claim: nothing
+		// in this corpus grounds it and no §P-VERIFY assertion in any prior ADR tests it. It is
+		// scheduled to be decided by the ADR-0420 §5.5 extension item (5) spike. Do NOT build a
+		// fail-closed gate, a convergence condition, or any other load-bearing logic on top of it
+		// until that spike lands — ADR-0420's struck D2 was authored against exactly this
+		// sentence read as though it were established mechanism.
+		//
 		// This causes CRIU to exit code 1 on kind control-plane nodes where the placeholder
 		// container has a different sysfs mount topology than the worker nodes used in
 		// Sprint 31. Without --mntns-compat-mode, CRIU uses mount-v2 mode
@@ -6164,72 +6174,18 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	}
 	criuArgs = append(criuArgs, maskedArgs...)
 
-	// Gate10 fix: pre-lazy-umount /sys from the placeholder container's mount namespace
-	// before CRIU runs compat-mode cleanup.
-	//
-	// Background: CRIU compat-mode enters the destination container's mount namespace
-	// and runs an "umount pass" to remove mounts not present in the checkpoint image.
-	// /sys is mounted in every container by containerd/runc. CRIU can't restore /sys as
-	// external because CRIU 4.2 does not write ext_key for sysfs mounts when declared via
-	// --external mnt[/sys]:pm-sys (path-form matches at walk time but doesn't persist).
-	// Without ext_key, compat-mode treats /sys as a non-external regular mount and calls
-	// umount2(./sys, 0) → EBUSY (sysfs has a kernel reference from the host bind mount).
-	//
-	// Solution: before CRIU runs, enter the placeholder container's mount namespace and
-	// lazy-umount /sys (MNT_DETACH — detaches from namespace tree even if busy). CRIU then
-	// enters the namespace, doesn't find /sys, skips the umount for it, and proceeds.
-	// After CRIU restores, /sys is not in the image (skipped at dump), so the restored
-	// process inherits whatever the container runtime provides at container start time
-	// (containerd/runc re-mounts /sys when the replacement pod starts).
-	//
-	// Implementation: get the placeholder PID via `ctr task ls`, find its mount namespace
-	// fd at /proc/<pid>/ns/mnt (accessible from host mount namespace via nsenter), then
-	// use nsenter --mount=<ns> to run umount -l /sys inside it.
-	placeholderIDForUmount := "pm-placeholder-" + migrationName
-	if placeholderPIDOut, pidErr := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "ls", "--quiet")...).Output(); pidErr == nil {
-		// `ctr task ls --quiet` lists running task IDs (not PIDs). Get the PID from `ctr task info`.
-		if strings.Contains(string(placeholderPIDOut), placeholderIDForUmount) {
-			if pidInfo, piErr := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "task", "ls")...).Output(); piErr == nil {
-				for _, line := range strings.Split(string(pidInfo), "\n") {
-					if strings.Contains(line, placeholderIDForUmount) {
-						fields := strings.Fields(line)
-						if len(fields) >= 2 {
-							placeholderPID := fields[1]
-							nsMntPath := fmt.Sprintf("/proc/%s/ns/mnt", placeholderPID)
-							log.Info("gate10 fix: lazy-umounting /sys from placeholder container namespace",
-								"placeholderID", placeholderIDForUmount, "pid", placeholderPID)
-							// Lazy-umount children of /sys first (in case kernel requires bottom-up)
-							sysMounts := []string{
-								"/sys/firmware", "/sys/devices/virtual/powercap",
-								"/sys/devices/virtual/dmi/id/sys_vendor",
-								"/sys/devices/virtual/dmi/id/chassis_serial",
-								"/sys/devices/virtual/dmi/id/board_serial",
-								"/sys/devices/virtual/dmi/id/product_uuid",
-								"/sys/devices/virtual/dmi/id/product_name",
-								"/sys/kernel/config", "/sys/fs/fuse/connections",
-								"/sys/kernel/debug", "/sys/kernel/tracing",
-								"/sys/fs/bpf", "/sys/fs/cgroup", "/sys",
-							}
-							for _, mnt := range sysMounts {
-								umountOut, umountErr := exec.Command("nsenter", "--mount="+nsMntPath, "--", "umount", "-l", mnt).CombinedOutput()
-								if umountErr != nil {
-									// Non-fatal: some mounts may not exist in this container
-									log.Info("gate10 fix: lazy-umount skipped (mount absent or error)",
-										"mount", mnt, "err", umountErr, "output", string(umountOut))
-								} else {
-									log.Info("gate10 fix: lazy-umounted successfully", "mount", mnt)
-								}
-							}
-						}
-						break
-					}
-				}
-			}
-		} else {
-			log.Info("gate10 fix: placeholder not found in running tasks — skipping pre-umount (NRI path or already cleaned up)",
-				"placeholderID", placeholderIDForUmount)
-		}
-	}
+	// ADR-0420 D3: the pre-CRIU destination-namespace lazy-umount mitigation that used to sit
+	// here is DELETED and deliberately replaced with nothing. It justified itself as a mitigation
+	// for CRIU compat-mode's umount pass, but buildCRIURestoreArgs omits --mntns-compat-mode
+	// (see the argv comment above), so the pass it existed to survive never runs on this path.
+	// It also acted on the placeholder container's mount namespace rather than the host mount
+	// namespace CRIU actually restores into (--root rootfsDir, run via nsenter below), read a
+	// hardcoded mountpoint list rather than the kernel, swallowed every umount failure, and never
+	// re-read to confirm any effect — so it could neither report failure nor observe success.
+	// No successor primitive is added: no evidence in this corpus shows destination mount residue
+	// ever causing a restore failure, and building a mitigation for an unobserved failure mode
+	// would be scaffolding. See ADR-0420 (D3, and the struck D2 for the prerequisites any future
+	// residue-reconciliation successor must discharge first).
 
 	// Run CRIU in the host mount namespace via nsenter. The agent container cannot join
 	// the replacement pod's netns directly (nested container user namespace restriction);
@@ -10144,10 +10100,15 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	}
 
 	// Raw CRIU restore via joinNsRestore (same path as ctr checkpoint, but without config.json).
-	// The raw CRIU path (go-criu swrk) fails because it runs CRIU in the agent container's
-	// mount namespace, which has /sys. CRIU compat-mode tries to umount /sys → EBUSY.
 	// joinNsRestore runs CRIU via nsenter in the HOST mount namespace with --root pointing to
-	// the container's overlayfs, which avoids the agent namespace /sys issue entirely.
+	// the container's overlayfs, rather than in the agent container's own mount namespace.
+	//
+	// ADR-0420 D3: this note used to justify that choice by the compat-mode umount pass tripping
+	// over /sys → EBUSY. That rationale is STALE: buildCRIURestoreArgs omits --mntns-compat-mode,
+	// so CRIU runs the mount-v2 engine and no umount pass runs on this path at all. The
+	// host-mount-namespace choice stands on its own grounds — CRIU's child must setns() from a
+	// namespace where the checkpoint dir and rootfsDir are both resolvable, which the agent
+	// container's namespace does not satisfy — and is NOT contingent on any compat-mode behavior.
 	//
 	// ADR-0385: this branch used to run its OWN standalone patchCheckpointImages pass here
 	// ("Gate10: patch checkpoint images first") BEFORE calling joinNsRestoreFn below — which

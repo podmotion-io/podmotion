@@ -33,9 +33,15 @@ import (
 // Structural regression check (ADR-0348 discharge grep §2/§9-A): zero of the twelve former
 // direct-nsenter `--net=` sites in server.go may still spawn nsenter directly — either as a
 // same-line `"--net="+netnsPath` concat or a `Sprintf("--net=...")` on a following line (the
-// pattern that previously hid site #10, joinNsRestore's lo-up). The one legitimate remaining
-// direct nsenter call (`--mount=`, host mount-ns bind-mount cleanup, out of ADR-0348 scope)
-// must still be present, exactly once.
+// pattern that previously hid site #10, joinNsRestore's lo-up).
+//
+// COUNT UPDATED 1 -> 0 by ADR-0420 D3 (removal symmetry, recorded rather than silently flipped).
+// The single direct `exec.Command("nsenter", "--mount=...")` site this test used to require was
+// the gate10 pre-CRIU lazy-umount block's per-mountpoint `umount -l` exec. ADR-0420 D3 deletes
+// that block in full and replaces it with nothing, so server.go now spawns nsenter directly
+// ZERO times — a strict tightening of the very property ADR-0347/ADR-0348 exist to enforce, not
+// a weakening of it. The assertion stays falsifiable in the direction that matters: any
+// reintroduced direct-nsenter site in server.go fails this test.
 func TestNetnsExec_RoutesThroughBrokerNotDirectAgentNsenter(t *testing.T) {
 	path := filepath.Join("..", "server", "server.go")
 	b, err := os.ReadFile(path)
@@ -50,13 +56,13 @@ func TestNetnsExec_RoutesThroughBrokerNotDirectAgentNsenter(t *testing.T) {
 	}
 
 	mountRe := regexp.MustCompile(`exec\.Command\("nsenter", "--mount=`)
-	if got := len(mountRe.FindAllString(src, -1)); got != 1 {
-		t.Fatalf("exec.Command(\"nsenter\", \"--mount=...\") count = %d, want exactly 1 (host mount-ns site, out of ADR-0348 scope)", got)
+	if got := len(mountRe.FindAllString(src, -1)); got != 0 {
+		t.Fatalf("exec.Command(\"nsenter\", \"--mount=...\") count = %d, want exactly 0 (the sole former site was the gate10 lazy-umount block, deleted by ADR-0420 D3)", got)
 	}
 
 	nsenterRe := regexp.MustCompile(`exec\.Command\("nsenter`)
-	if got := len(nsenterRe.FindAllString(src, -1)); got != 1 {
-		t.Fatalf("exec.Command(\"nsenter...\") count = %d, want exactly 1 (13 -> 1 per ADR-0348 discharge)", got)
+	if got := len(nsenterRe.FindAllString(src, -1)); got != 0 {
+		t.Fatalf("exec.Command(\"nsenter...\") count = %d, want exactly 0 (13 -> 1 per ADR-0348 discharge, 1 -> 0 per ADR-0420 D3)", got)
 	}
 }
 
