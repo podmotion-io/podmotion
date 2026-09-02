@@ -154,7 +154,22 @@ func hasAdjacentPair(args []string, flag, value string) bool {
 // is a normal, privately-owned, non-external CRIU mount (like / or /proc) that CRIU dumps
 // and restores natively with its real content — it needs neither --skip-mnt nor
 // --ext-mount-map here either. See docs/adr/0382-devshm-content-capture.md. The retained
-// ext-mount-map entries (auto, /dev/null, resolv.conf, hostname, hosts) must remain.
+// ext-mount-map entries (auto, /dev/null, /dev/termination-log) must remain.
+//
+// ADR-0417 UPDATE: the three self-mapping entries this test used to require —
+// /etc/resolv.conf:/etc/resolv.conf, /etc/hostname:/etc/hostname, /etc/hosts:/etc/hosts — are GONE,
+// and must stay gone, for two independent reasons.
+//
+//  1. They are no longer unconditional. Under Class DESTINATION-REBIND these mountpoints only get an
+//     --ext-mount-map when they were actually resolved as destination-rebind mounts for THIS restore,
+//     which is a property of reattachMountPaths, not of the argv skeleton. With a nil reattach set
+//     (this test) there is nothing to map.
+//  2. The self-mapping VALUE was wrong. A P-PREMISE decode of a real mountpoints image shows these
+//     binds carry a LITERAL ext_key equal to their mountpoint, so CRIU does NOT bypass
+//     ext_mount_lookup for them — "/etc/hosts:/etc/hosts" bound the DESTINATION NODE's own
+//     /etc/hosts into the restored container. The correct form is
+//     <containerPath>:<resolved destination host target>, asserted in
+//     TestBuildCRIURestoreArgs_DestinationRebindMapsToHostTargetNotItself.
 func TestBuildCRIURestoreArgs_NoDevShmExtMountMap(t *testing.T) {
 	args, err := buildCRIURestoreArgs(
 		"/run/podmotion/checkpoints/test/final",
@@ -196,13 +211,27 @@ func TestBuildCRIURestoreArgs_NoDevShmExtMountMap(t *testing.T) {
 	retained := []struct{ flag, value string }{
 		{"--ext-mount-map", "auto"},
 		{"--ext-mount-map", "/dev/null:/dev/null"},
-		{"--ext-mount-map", "/etc/resolv.conf:/etc/resolv.conf"},
-		{"--ext-mount-map", "/etc/hostname:/etc/hostname"},
-		{"--ext-mount-map", "/etc/hosts:/etc/hosts"},
+		{"--ext-mount-map", "/var/lib/podmotion/restore/test/termination-log"},
 	}
 	for _, r := range retained {
-		if !hasAdjacentPair(args, r.flag, r.value) {
+		found := false
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] == r.flag && strings.Contains(args[i+1], r.value) {
+				found = true
+				break
+			}
+		}
+		if !found {
 			t.Errorf("expected retained %s %s in args; got: %s", r.flag, r.value, strings.Join(args, " "))
+		}
+	}
+
+	// ADR-0417 (reason 2 above): the self-mapping form must never be emitted again for any of the
+	// three well-known runtime-injected file binds. Mapping a mountpoint to ITSELF resolves, on a
+	// literal-ext_key entry, to the destination NODE's own file rather than the pod's.
+	for _, selfMap := range []string{"/etc/hosts:/etc/hosts", "/etc/hostname:/etc/hostname", "/etc/resolv.conf:/etc/resolv.conf"} {
+		if hasAdjacentPair(args, "--ext-mount-map", selfMap) {
+			t.Errorf("--ext-mount-map %s binds the destination node's own file into the container (ADR-0417); got: %s", selfMap, strings.Join(args, " "))
 		}
 	}
 }

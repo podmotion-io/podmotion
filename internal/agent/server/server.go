@@ -976,7 +976,11 @@ func (s *AgentServer) JoinNsRestore(ctx context.Context, migrationName, namespac
 	reattachMounts = s.appendHolderScaffoldReattachMount(joinNsRestoreCtx, migrationName, reattachMounts)
 	// ADR-0417: fold in the kubelet-staged /etc/hosts, /etc/hostname, /etc/resolv.conf destination
 	// targets (Class DESTINATION-REBIND) — see appendDestinationRebindReattachMounts doc.
-	reattachMounts = s.appendDestinationRebindReattachMounts(joinNsRestoreCtx, migrationName, reattachMounts)
+	var drErr error
+	reattachMounts, drErr = s.appendDestinationRebindReattachMounts(joinNsRestoreCtx, migrationName, reattachMounts)
+	if drErr != nil {
+		return 0, "", drErr
+	}
 	// ADR-0355 D2/D3: read the authoritative preserved source IP (pm.Spec.SourcePodIP — the same
 	// field SingleHomeRestoredPod single-homes on) and thread it into joinNsRestore so the pre-CRIU
 	// bind-prep can make it locally bindable before soccr's bind() on an established-TCP restore.
@@ -1497,72 +1501,554 @@ func (s *AgentServer) appendHolderScaffoldReattachMount(ctx context.Context, mig
 	})
 }
 
-// destinationRebindWellKnownTargets (ADR-0417) maps the in-container mountpoint of a well-known
-// kubelet-injected file bind to the LEAF filename kubelet stages it under at
-// /var/lib/kubelet/pods/<podUID>/<leaf> — §P-MECHANISM (2) of ADR-0417: kubelet bind-mounts a
-// REGULAR FILE from this exact pod-dir shape onto the container's /etc/hosts (siblings:
-// etc-hostname, resolv.conf). This map is a target-RESOLUTION convenience only, not the
-// classification rule: patch_checkpoint_script.go's Class DESTINATION-REBIND classifier is
-// fstype-keyed and applies to any future runtime-injected block-fs file bind with no new code —
-// this map only supplies the destination HOST PATH for the three well-known members that surfaced
-// the ADR-0417 defect, exactly as ADR-0417's Decision states.
-var destinationRebindWellKnownTargets = map[string]string{
-	"/etc/hosts":       "etc-hosts",
-	"/etc/hostname":    "etc-hostname",
-	"/etc/resolv.conf": "resolv.conf",
+// ---------------------------------------------------------------------------------------------
+// ADR-0417 Class DESTINATION-REBIND target resolution.
+//
+// §P-PREMISE decode (performed against a REAL mountpoints-13.img taken off this project's standing
+// cluster — pm-w2, RKE2 v1.35.6+rke2r1, a running postgres workload — not inferred). The recorded
+// pre-patch root/source for every fstype-0 external in that image:
+//
+//	mountpoint            fstype  recorded root                                              source
+//	/etc/hosts            0       /var/lib/kubelet/pods/<podUID>/etc-hosts                    /dev/vda1
+//	/etc/hostname         0       <containerd root>/io.containerd.grpc.v1.cri/sandboxes/<sbx>/hostname
+//	/etc/resolv.conf      0       <containerd root>/io.containerd.grpc.v1.cri/sandboxes/<sbx>/resolv.conf
+//	/dev/termination-log  0       /var/lib/kubelet/pods/<podUID>/containers/<ctr>/<8-hex>     /dev/vda1
+//	/var/lib/postgresql/data 0    /                                                           <nfs export>
+//
+// Three separate writers, three separate directory shapes. The prior implementation assumed all
+// three of /etc/{hosts,hostname,resolv.conf} were kubelet-staged siblings under the pod dir; a live
+// `ls -A /var/lib/kubelet/pods/<uid>` on that node returns exactly `containers etc-hosts plugins
+// volumes` — no etc-hostname, no resolv.conf, on any pod. Two of the three targets pointed at paths
+// that do not exist on the destination node.
+//
+// /dev/termination-log is the fourth member, and it cannot be derived at all from the replacement
+// pod: kubelet's leaf is a per-container-instance random id (two are present on a restarted
+// container), and the replacement pod's workload container has not been created when restore runs.
+// Its destination target is instead the file the AGENT itself stages and already maps into the
+// restore (buildCRIURestoreArgs' pre-existing "--ext-mount-map /dev/termination-log:<termlogFile>"),
+// so the recorded root/source and the ext-mount-map now agree on one real, agent-owned path.
+// ---------------------------------------------------------------------------------------------
+
+// destinationRebindWriter identifies WHICH component on the destination node creates a given
+// well-known file — i.e. which real edge the bounded probe below has to be ordered after.
+type destinationRebindWriter int
+
+const (
+	// rebindWriterKubeletPodDir: kubelet, at /var/lib/kubelet/pods/<replUID>/<leaf>.
+	rebindWriterKubeletPodDir destinationRebindWriter = iota
+	// rebindWriterContainerdSandboxDir: containerd's CRI plugin, at
+	// <containerd root>/io.containerd.grpc.v1.cri/sandboxes/<sandboxID>/<leaf>.
+	rebindWriterContainerdSandboxDir
+	// rebindWriterAgentStaged: this agent, at /var/lib/podmotion/restore/<migration>/<leaf>.
+	rebindWriterAgentStaged
+)
+
+func (w destinationRebindWriter) String() string {
+	switch w {
+	case rebindWriterKubeletPodDir:
+		return "kubelet pod dir"
+	case rebindWriterContainerdSandboxDir:
+		return "containerd CRI sandbox dir"
+	case rebindWriterAgentStaged:
+		return "podmotion agent restore staging dir"
+	default:
+		return "unknown"
+	}
 }
 
-// appendDestinationRebindReattachMounts (ADR-0417) resolves the destination replacement pod's
-// kubelet-staged /etc/hosts, /etc/hostname, /etc/resolv.conf files and appends them to mounts with
-// Tier=reattachTierDestinationRebind, using the SAME deterministic replacement-pod-UID resolution
-// (resolveReplacementPod) resolveReattachMountsWaiting/resolvePodNetnsSandboxWaiting already rely
-// on — no new discovery mechanism.
+// destinationRebindWellKnownTarget binds one in-container mountpoint to its destination writer and
+// leaf filename. This is target RESOLUTION only, never the classification rule:
+// patch_checkpoint_script.go's Class DESTINATION-REBIND classifier is fstype-keyed (a positive
+// allowlist of CRIU's construct-and-fill fstypes) and applies to any runtime-injected block-fs file
+// bind with no new code. A member of that class with no entry here resolves no target and
+// hard-stops, fail-closed.
+type destinationRebindWellKnownTarget struct {
+	ContainerPath string
+	Writer        destinationRebindWriter
+	Leaf          string
+}
+
+var destinationRebindWellKnownTargets = []destinationRebindWellKnownTarget{
+	{ContainerPath: "/etc/hosts", Writer: rebindWriterKubeletPodDir, Leaf: "etc-hosts"},
+	{ContainerPath: "/etc/hostname", Writer: rebindWriterContainerdSandboxDir, Leaf: "hostname"},
+	{ContainerPath: "/etc/resolv.conf", Writer: rebindWriterContainerdSandboxDir, Leaf: "resolv.conf"},
+	{ContainerPath: "/dev/termination-log", Writer: rebindWriterAgentStaged, Leaf: "termination-log"},
+}
+
+// restoreStagingDir / restoreTerminationLogPath are the single definition of the agent-owned restore
+// staging paths. joinNsRestore's own ext-mount-map target and the Class DESTINATION-REBIND target
+// for /dev/termination-log MUST be the identical string, or CRIU gets a recorded source and an
+// --ext-mount-map that disagree.
+// restoreStagingRoot is the agent-owned per-migration staging tree. CRIU (running in the host mount
+// namespace) reaches it through the /var/lib/podmotion bind mount the DaemonSet already carries. It
+// is a package var solely so unit tests can redirect it into a writable temp dir; production never
+// reassigns it.
+var restoreStagingRoot = "/var/lib/podmotion/restore"
+
+func restoreStagingDir(migrationName string) string {
+	return filepath.Join(restoreStagingRoot, migrationName)
+}
+
+func restoreTerminationLogPath(migrationName string) string {
+	return filepath.Join(restoreStagingDir(migrationName), "termination-log")
+}
+
+// ensureRestoreTerminationLogFile creates the agent-staged termination-log file if absent. This IS
+// the destination-side write edge for the /dev/termination-log rebind target, and it is performed
+// here — before the probe below reads it — so the probe is ordered after its real edge exactly as
+// it is for the kubelet- and containerd-written members. Create-if-absent (never truncate): the
+// file is also (re)created later in joinNsRestore, and a truncate on an already-rebound path would
+// be a write we do not need.
+func ensureRestoreTerminationLogFile(migrationName string) (string, error) {
+	dir := restoreStagingDir(migrationName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create restore staging dir %s: %w", dir, err)
+	}
+	path := restoreTerminationLogPath(migrationName)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return "", fmt.Errorf("stage termination-log %s: %w", path, err)
+	}
+	_ = f.Close()
+	return path, nil
+}
+
+// destinationRebindWaitBudget bounds the wait on the destination-file edge.
+//
+// GROUNDED IN A REAL MEASUREMENT, not copied from a neighbouring constant. Measured on the standing
+// KVM cluster (pm-w1, RKE2 v1.35.6+rke2r1) by creating a no-PVC redis pod pinned to the node and
+// timestamping, on the node itself, when each edge became observable relative to the pod object
+// first being readable from the API server (5 samples):
+//
+//	kubelet /var/lib/kubelet/pods/<uid>/etc-hosts : 0.507s 0.521s 0.539s 0.590s 0.729s
+//	containerd sandbox dir hostname/resolv.conf   : 0.457s 0.464s 0.472s 0.505s  (1 sample: not
+//	                                                observed within the sample window)
+//
+// So the healthy edge lands in ~0.5s, and the tail is unbounded (the un-observed sample is exactly
+// the "never" case this budget has to terminate rather than hang on). 30s is ~40x the measured
+// worst healthy sample — enough headroom for a loaded node, a cold image pull, or CNI delay — while
+// staying strictly under both sibling budgets on this same restore path (the 60s sandbox-creation
+// wait and the 85s reattach-mount wait), so this probe can never be the component that consumes the
+// restore budget. Poll interval is 250ms rather than the siblings' 1s because the measured edge is
+// sub-second: a 1s cadence would spend two whole poll periods on a 0.5s edge.
+var destinationRebindWaitBudget = 30 * time.Second
+
+// destinationRebindPollInterval is the re-probe cadence (var for tests). See the budget doc above.
+var destinationRebindPollInterval = 250 * time.Millisecond
+
+// DestinationRebindTargetNotStagedError is the "NEVER" terminal outcome: the replacement pod and its
+// sandbox both resolved, but a destination file its writer owns was still absent when the bounded
+// wait expired. Distinct from the "probe mechanism failed" class below — this one says the read
+// succeeded and the answer was genuinely "not there".
+type DestinationRebindTargetNotStagedError struct {
+	ContainerPath string
+	HostTarget    string
+	Writer        string
+	Attempts      int
+	Waited        time.Duration
+}
+
+func (e *DestinationRebindTargetNotStagedError) Error() string {
+	return fmt.Sprintf("destination rebind target for %s never appeared: %s (written by the %s) was still absent after %d probes over %s — refusing to rewrite a checkpointed mount's recorded source to a path that does not exist on this node (ADR-0417)",
+		e.ContainerPath, e.HostTarget, e.Writer, e.Attempts, e.Waited.Round(time.Millisecond))
+}
+
+// DestinationRebindProbeError is the "PROBE MECHANISM FAILED" terminal outcome: we never learned
+// whether the destination file exists, because the read itself did not complete (broker exec error,
+// unresolvable containerd root, hard containerd error). Deliberately NOT collapsed into
+// DestinationRebindTargetNotStagedError: "the file is not there" and "we could not look" are
+// different facts and must not read the same in a failure transcript.
+type DestinationRebindProbeError struct {
+	ContainerPath string
+	HostTarget    string
+	Stage         string
+	Err           error
+}
+
+func (e *DestinationRebindProbeError) Error() string {
+	return fmt.Sprintf("destination rebind probe failed at stage %q for %s (target %s): %v — the read mechanism itself failed, so the destination-file edge was never observed either way (ADR-0417)",
+		e.Stage, e.ContainerPath, e.HostTarget, e.Err)
+}
+
+func (e *DestinationRebindProbeError) Unwrap() error { return e.Err }
+
+// ---------------------------------------------------------------------------------------------
+// ADR-0417 S2(b): --ext-mount-map token validation.
+// ---------------------------------------------------------------------------------------------
+
+// allowedExtMountHostTargetPrefixes is the closed set of destination-node directory trees a
+// --ext-mount-map target may live under. Every legitimate target this agent produces is either a
+// kubelet-staged pod path (PVC volume dirs, EmptyDir scaffold dirs, /etc/hosts), a containerd CRI
+// sandbox path (hostname/resolv.conf — the real §P-PREMISE-decoded writer), or a path this agent
+// staged itself under /var/lib/podmotion. Anything outside these trees — /, /etc, /root, a host
+// device node — is not a target this code path can legitimately produce, so it is rejected before
+// argv regardless of how plausible the string looks.
+//
+// The containerd entries are derived from the DISCOVERED daemon (ADR-0370) rather than hardcoded,
+// so this stays correct on kubeadm-containerd, k3s, and RKE2 alike.
+func allowedExtMountHostTargetPrefixes(ctx context.Context) []string {
+	prefixes := []string{
+		"/var/lib/kubelet/pods/",
+		filepath.Clean(restoreStagingRoot) + "/",
+	}
+	for _, root := range []string{
+		resolveContainerdRootDirFn(ctx, containerdSocketPath),
+		containerdRunRoot,
+		containerdStateRoot,
+	} {
+		if root == "" {
+			continue
+		}
+		prefixes = append(prefixes, filepath.Join(root, criSandboxDirRel)+"/")
+	}
+	return prefixes
+}
+
+// extMountTokenPrefixesFn is a test seam over allowedExtMountHostTargetPrefixes so the validator can
+// be exercised without a live containerd. Production implementation reads the discovered daemon.
+var extMountTokenPrefixesFn = func() []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return allowedExtMountHostTargetPrefixes(ctx)
+}
+
+// hasControlChars reports whether s contains any C0/C1 control character (including '\n', '\r' and
+// NUL). These are exactly the bytes that let an image-derived value forge a line in the patch
+// script's line-oriented stdout protocol, or split an argv token.
+func hasControlChars(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateExtMountToken enforces the S2(b) preconditions on one `--ext-mount-map <key>:<target>`
+// token before it can reach CRIU's argv. See the addExtMountMap doc in buildCRIURestoreArgs for why
+// each rule exists.
+//
+// resolvedHostTargets is the set of host targets THIS AGENT resolved for this restore. It is the
+// load-bearing check against a forged marker line: an attacker who controls the checkpoint image
+// controls the ext_key and can attempt to control the host_target, but cannot make a target of
+// their choosing appear in a set the agent built from Kubernetes/containerd/filesystem reads.
+func validateExtMountToken(key, target string, resolvedHostTargets map[string]bool) error {
+	switch {
+	case key == "":
+		return fmt.Errorf("empty --ext-mount-map key")
+	case len(key) > 4096:
+		return fmt.Errorf("--ext-mount-map key exceeds %d bytes", 4096)
+	case strings.Contains(key, ":"):
+		return fmt.Errorf("--ext-mount-map key %q contains ':', the token delimiter", key)
+	case hasControlChars(key):
+		return fmt.Errorf("--ext-mount-map key contains a control character (raw bytes withheld)")
+	case strings.HasPrefix(key, "/") && filepath.Clean(key) != key:
+		return fmt.Errorf("--ext-mount-map key %q is a path but is not lexically clean (traversal or redundant separators)", key)
+	}
+	switch {
+	case target == "":
+		return fmt.Errorf("empty --ext-mount-map host target for key %q", key)
+	case len(target) > 4096:
+		return fmt.Errorf("--ext-mount-map host target for key %q exceeds %d bytes", key, 4096)
+	case strings.Contains(target, ":"):
+		return fmt.Errorf("--ext-mount-map host target for key %q contains ':', the token delimiter", key)
+	case hasControlChars(target):
+		return fmt.Errorf("--ext-mount-map host target for key %q contains a control character (raw bytes withheld)", key)
+	case !filepath.IsAbs(target):
+		return fmt.Errorf("--ext-mount-map host target %q for key %q is not an absolute path", target, key)
+	case filepath.Clean(target) != target:
+		return fmt.Errorf("--ext-mount-map host target %q for key %q is not lexically clean (traversal or redundant separators)", target, key)
+	}
+	if !resolvedHostTargets[target] {
+		return fmt.Errorf("--ext-mount-map host target %q for key %q was not resolved by this agent — refusing a target that did not come from this restore's own destination resolution (a checkpoint image cannot choose what CRIU binds)", target, key)
+	}
+	var allowed bool
+	for _, p := range extMountTokenPrefixesFn() {
+		if strings.HasPrefix(target, p) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return fmt.Errorf("--ext-mount-map host target %q for key %q is outside every allowed destination prefix %v", target, key, extMountTokenPrefixesFn())
+	}
+	// Symlink resolution: these host paths live in the HOST mount namespace, which the agent's own
+	// mount namespace generally cannot traverse, so EvalSymlinks is applied where it CAN resolve
+	// (the agent-staged /var/lib/podmotion tree, which this process itself writes) and skipped where
+	// it cannot. The kubelet/containerd targets are instead resolved and existence-probed in the
+	// host namespace at resolution time (resolveDestinationRebindTargetsOnce /
+	// resolveKubeletVolumeHostPath), so the value reaching argv is one a host-namespace read already
+	// confirmed. A resolvable path whose realpath escapes the allowed prefixes is rejected.
+	if real, err := filepath.EvalSymlinks(target); err == nil && real != target {
+		var realAllowed bool
+		for _, p := range extMountTokenPrefixesFn() {
+			if strings.HasPrefix(real, p) {
+				realAllowed = true
+				break
+			}
+		}
+		if !realAllowed {
+			return fmt.Errorf("--ext-mount-map host target %q for key %q resolves through a symlink to %q, which is outside every allowed destination prefix", target, key, real)
+		}
+	}
+	return nil
+}
+
+// hostRegularFileExistsFn is a test seam (mirrors sandboxIDForPodUIDFn/hostSocketExistsFn).
+var hostRegularFileExistsFn = hostRegularFileExists
+
+// hostRegularFileExists reports whether path is an existing REGULAR FILE in the HOST mount namespace.
+//
+// Three-way by construction: the shell always exits 0 and prints one of two definite tokens, so
+// "absent" is reported as (false, nil) and can never be confused with "the probe did not run"
+// (returned as a non-nil error). A bare `test -f` exit code cannot make that distinction — exit 1
+// means both "absent" and "the broker rejected the exec".
+func hostRegularFileExists(ctx context.Context, path string) (bool, error) {
+	// The netns-broker's exec allowlist permits "sh" but not a bare "test" — the same constraint
+	// resolveHolderScaffoldHostPathFn and resolveNetnsBindByProcPath already work within.
+	script := fmt.Sprintf(`if [ -f %q ]; then echo PM_PRESENT; else echo PM_ABSENT; fi`, path)
+	out, err := nsenterCmd(ctx, "sh", "-c", script).Output()
+	if err != nil {
+		return false, fmt.Errorf("host file probe %s: %w", path, err)
+	}
+	s := strings.TrimSpace(string(out))
+	switch {
+	case strings.Contains(s, "PM_PRESENT"):
+		return true, nil
+	case strings.Contains(s, "PM_ABSENT"):
+		return false, nil
+	default:
+		return false, fmt.Errorf("host file probe %s: neither presence token in output %q", path, s)
+	}
+}
+
+// resolveDestinationRebindTargetsOnce is one full resolve-and-verify pass. It returns the resolved
+// mounts, or exactly one of the two terminal error classes, or (nil, nil, notYet=true) when the
+// destination state has not reached the required edge YET and the caller should re-probe.
+//
+// The three-way classification the migration-correctness seat requires is made HERE, once, per
+// stage — and every stage's classification is derived from what the read actually returned, never
+// from a timeout:
+//
+//	NOT YET       — replacement pod not listed yet (informer lag); containerd sandbox not created
+//	                yet (errNoSandboxForPodUID); a destination file's writer has not written it yet.
+//	NEVER         — only decided by the caller, when the bounded budget expires with the last
+//	                observation still "not yet" (DestinationRebindTargetNotStagedError).
+//	PROBE FAILED  — the read mechanism itself did not complete: a hard containerd error, an
+//	                unresolvable containerd root dir, a broker exec failure, or an ambiguous probe
+//	                result (DestinationRebindProbeError). Terminal immediately — retrying a broken
+//	                read mechanism is the poll-and-hope shape this project's primitive bias forbids.
+func (s *AgentServer) resolveDestinationRebindTargetsOnce(ctx context.Context, migrationName, podNs, termlogPath string) (resolved []reattachMount, notYet bool, err error) {
+	replPod := s.resolveReplacementPod(ctx, migrationName, podNs)
+	if replPod == nil || replPod.UID == "" {
+		// NOT YET: the controller stamps the migration-name label at replacement-pod creation, so an
+		// empty result here is an informer/cache lag on a pod that is being created — a race we win
+		// inside the budget. Collapsing this into a terminal "never" (the pre-fix behavior) turned a
+		// transient list miss into a hard-stopped migration.
+		return nil, true, nil
+	}
+
+	// The containerd CRI sandbox must exist before its sandbox dir (and the hostname/resolv.conf
+	// files inside it) can exist. Reuse the SAME authoritative pod-UID → sandbox read the pod-netns
+	// join gate already depends on, with the same retryable/terminal classification.
+	sandboxID, sErr := sandboxIDForPodUIDFn(ctx, string(replPod.UID))
+	if sErr != nil {
+		if errors.Is(sErr, errNoSandboxForPodUID) {
+			return nil, true, nil // NOT YET: kubelet has not created the pause container at this instant.
+		}
+		// PROBE FAILED: containerd down, ctr missing, broker unreachable — we did not learn anything.
+		return nil, false, &DestinationRebindProbeError{
+			ContainerPath: "(sandbox resolution)", Stage: "sandbox_id_for_pod_uid", Err: sErr}
+	}
+	sandboxDir := containerdCRISandboxDir(ctx, sandboxID)
+	if sandboxDir == "" {
+		// PROBE FAILED: we could not authoritatively read the winning containerd daemon's own root
+		// dir from its own config, so we do not know where its CRI sandbox tree lives. Never guess a
+		// path here — a wrong guess rewrites a mount's recorded source to a nonexistent path and
+		// ENOENTs mid-restore, which is the exact defect ADR-0417 exists to fix.
+		return nil, false, &DestinationRebindProbeError{
+			ContainerPath: "(containerd root)", Stage: "containerd_root_dir",
+			Err: fmt.Errorf("could not resolve the containerd root dir for socket %s (unknown socket, or its config.toml was unreadable)", containerdSocketPath)}
+	}
+	kubeletPodDir := fmt.Sprintf("/var/lib/kubelet/pods/%s", replPod.UID)
+
+	out := make([]reattachMount, 0, len(destinationRebindWellKnownTargets))
+	for _, t := range destinationRebindWellKnownTargets {
+		var hostTarget string
+		switch t.Writer {
+		case rebindWriterKubeletPodDir:
+			hostTarget = filepath.Join(kubeletPodDir, t.Leaf)
+		case rebindWriterContainerdSandboxDir:
+			hostTarget = filepath.Join(sandboxDir, t.Leaf)
+		case rebindWriterAgentStaged:
+			hostTarget = termlogPath
+		default:
+			return nil, false, &DestinationRebindProbeError{
+				ContainerPath: t.ContainerPath, Stage: "writer_dispatch",
+				Err: fmt.Errorf("no destination writer mapping for %s", t.ContainerPath)}
+		}
+		// THE REAL EDGE. Not "the replacement Pod object exists", not "a string was concatenated" —
+		// does the file its writer owns actually exist, right now, on this node?
+		present, pErr := hostRegularFileExistsFn(ctx, hostTarget)
+		if pErr != nil {
+			return nil, false, &DestinationRebindProbeError{
+				ContainerPath: t.ContainerPath, HostTarget: hostTarget, Stage: "host_file_probe", Err: pErr}
+		}
+		if !present {
+			return nil, true, nil // NOT YET: the writer has not staged this file at this instant.
+		}
+		out = append(out, reattachMount{
+			ContainerPath: t.ContainerPath,
+			HostTarget:    hostTarget,
+			Tier:          reattachTierDestinationRebind,
+		})
+	}
+	return out, false, nil
+}
+
+// appendDestinationRebindReattachMounts (ADR-0417) resolves the destination node's real
+// /etc/hosts, /etc/hostname, /etc/resolv.conf and /dev/termination-log backing files — each from
+// its OWN writer's directory (see destinationRebindWellKnownTargets) — and appends them to mounts
+// with Tier=reattachTierDestinationRebind.
+//
+// ORDERING (the correctness property, not an incidental one): this function does not return a
+// target until it has OBSERVED that target's file on this node. The probe is therefore ordered
+// after the real destination-side write edge by construction, wherever the call site happens to sit
+// in the restore sequence — including for /dev/termination-log, whose writer is this agent and
+// whose write is performed here, immediately before its own probe. The previous implementation
+// string-built <podDir>/<leaf> from the replacement pod's UID with no existence check at all, which
+// confirmed only that a string had been concatenated.
 //
 // Appending to the SAME []reattachMount slice threaded through to patchCheckpointImages means:
-//   - reattachHostTargets (unchanged, not Tier-filtered) includes these three entries in the
+//   - reattachHostTargets (unchanged, not Tier-filtered) includes these entries in the
 //     {ContainerPath: HostTarget} map threaded into patchCheckpointImages as reattach_host_targets
-//     (argv[5]) — the SAME map carve-out (a) already uses (ADR-0417's "reuses carve-out (a)
-//     machinery unmodified" mechanism).
-//   - reattachContainerPaths (ADR-0417) EXCLUDES Tier==reattachTierDestinationRebind, so these
-//     mountpoints do NOT land in reattach_mount_paths (argv[4]) — carve-out (a)'s unconditional-
-//     preserve membership set stays storage-tier-scoped. Whether /etc/hosts et al. actually land in
-//     Class DESTINATION-REBIND (vs Class RECREATABLE) is decided by their recorded fstype inside
+//     (argv[5]) — the SAME map carve-out (a) already uses.
+//   - reattachContainerPaths EXCLUDES Tier==reattachTierDestinationRebind, so these mountpoints do
+//     NOT land in reattach_mount_paths (argv[4]) — carve-out (a)'s unconditional-preserve membership
+//     set stays storage-tier-scoped. Whether /etc/hosts et al. actually land in Class
+//     DESTINATION-REBIND (vs Class RECREATABLE) is decided by their recorded fstype inside
 //     patch_checkpoint_script.go, never by membership in this Go-side list.
-//   - buildCRIURestoreArgs' existing fail-closed precondition loop (unchanged — it already ranges
-//     over ALL reattachMountPaths, storage-tier or not) refuses to invoke CRIU when any of these
-//     three has an unresolved HostTarget — the ADR-0417 fail-closed requirement, with no new guard
-//     code needed.
 //
-// Returns mounts unchanged when the replacement pod cannot be resolved — patch_checkpoint_script.go
-// then fails closed (EXTERNAL_MOUNT_UNRESOLVED, reason destination_rebind_target_unresolved) on any
-// Class DESTINATION-REBIND entry it cannot resolve a target for, rather than falling back to the
-// disproven ADR-0415 carve-out (b) unconditional-internalize behavior.
-func (s *AgentServer) appendDestinationRebindReattachMounts(ctx context.Context, migrationName string, mounts []reattachMount) []reattachMount {
+// It is invoked unconditionally on all restore paths and does NOT ride resolveReattachMounts' no-PVC
+// early return, so a no-PVC workload (redis) exercises the identical resolve → probe → wait path a
+// PVC-backed one does. TestAppendDestinationRebindReattachMounts_* pin that with a redis-shaped
+// (zero-volume) pod fixture.
+//
+// Returns mounts unchanged, with no error, ONLY when there is no source of truth to consult at all
+// (no k8s client, no migration name, no PodMigration CR). Every other outcome is either a resolved
+// set or a terminal, classified error.
+func (s *AgentServer) appendDestinationRebindReattachMounts(ctx context.Context, migrationName string, mounts []reattachMount) ([]reattachMount, error) {
 	if s.k8sClient == nil || migrationName == "" {
-		return mounts
+		return mounts, nil
 	}
 	pm, ok := s.lookupPodMigration(ctx, migrationName)
 	if !ok {
-		return mounts
+		return mounts, nil
 	}
 	podNs := pm.Spec.PodNamespace
 	if podNs == "" {
 		podNs = pm.Namespace
 	}
+	// Perform this agent's OWN destination-side write first, so the probe below reads it after its
+	// real edge rather than before it.
+	termlogPath, tErr := ensureRestoreTerminationLogFile(migrationName)
+	if tErr != nil {
+		return mounts, &DestinationRebindProbeError{
+			ContainerPath: "/dev/termination-log", Stage: "agent_stage_termination_log", Err: tErr}
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, destinationRebindWaitBudget)
+	defer cancel()
+	start := time.Now()
+	attempts := 0
+	for {
+		attempts++
+		resolved, notYet, err := s.resolveDestinationRebindTargetsOnce(waitCtx, migrationName, podNs, termlogPath)
+		if err != nil {
+			// PROBE FAILED — terminal immediately, and reported as its own class.
+			log.Error(err, "appendDestinationRebindReattachMounts: destination-rebind probe mechanism failed (ADR-0417)",
+				"migration", migrationName, "attempts", attempts, "elapsedMs", time.Since(start).Milliseconds())
+			destinationRebindObserveFn(migrationName, attempts, time.Since(start), "probe_failed")
+			return mounts, err
+		}
+		if !notYet {
+			log.Info("appendDestinationRebindReattachMounts: all destination-rebind targets observed on this node (ADR-0417)",
+				"migration", migrationName, "attempts", attempts, "elapsedMs", time.Since(start).Milliseconds(), "targets", len(resolved))
+			destinationRebindObserveFn(migrationName, attempts, time.Since(start), "resolved")
+			return append(mounts, resolved...), nil
+		}
+		select {
+		case <-waitCtx.Done():
+			// NEVER — budget spent with the last observation still "not yet". Re-run one final pass
+			// with cancellation severed from the expired deadline so the terminal error can name the
+			// exact target that was missing rather than reporting a generic timeout (same
+			// WithoutCancel primitive reattachMountsUnresolvedForTerminal uses on its terminal leg).
+			finalCtx, finalCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			missing := s.describeMissingDestinationRebindTarget(finalCtx, migrationName, podNs, termlogPath)
+			finalCancel()
+			waited := time.Since(start)
+			nerr := &DestinationRebindTargetNotStagedError{
+				ContainerPath: missing.ContainerPath, HostTarget: missing.HostTarget,
+				Writer: missing.Writer, Attempts: attempts, Waited: waited,
+			}
+			log.Error(nerr, "appendDestinationRebindReattachMounts: destination-rebind target never appeared within the bounded wait (ADR-0417)",
+				"migration", migrationName, "attempts", attempts, "elapsedMs", waited.Milliseconds(),
+				"budget", destinationRebindWaitBudget.String())
+			destinationRebindObserveFn(migrationName, attempts, waited, "never")
+			return mounts, nerr
+		case <-time.After(destinationRebindPollInterval):
+		}
+	}
+}
+
+// destinationRebindMissing names the first target that was still absent on the terminal leg.
+type destinationRebindMissing struct{ ContainerPath, HostTarget, Writer string }
+
+// describeMissingDestinationRebindTarget re-walks the target set once, best-effort, purely to make
+// the terminal "never" error name a concrete file instead of a generic deadline. Any failure here
+// degrades the message only — it never changes the outcome, which is already terminal.
+func (s *AgentServer) describeMissingDestinationRebindTarget(ctx context.Context, migrationName, podNs, termlogPath string) destinationRebindMissing {
+	unknown := destinationRebindMissing{ContainerPath: "(unresolved)", HostTarget: "(unresolved)", Writer: "unknown"}
 	replPod := s.resolveReplacementPod(ctx, migrationName, podNs)
 	if replPod == nil || replPod.UID == "" {
-		return mounts
+		return destinationRebindMissing{
+			ContainerPath: "(all)", HostTarget: "(replacement pod never listed)",
+			Writer: "kubernetes API (replacement pod labelled " + replacementPodLabelKey + ")"}
 	}
-	base := fmt.Sprintf("/var/lib/kubelet/pods/%s", replPod.UID)
-	for containerPath, leaf := range destinationRebindWellKnownTargets {
-		mounts = append(mounts, reattachMount{
-			ContainerPath: containerPath,
-			HostTarget:    base + "/" + leaf,
-			Tier:          reattachTierDestinationRebind,
-		})
+	sandboxID, sErr := sandboxIDForPodUIDFn(ctx, string(replPod.UID))
+	if sErr != nil {
+		return destinationRebindMissing{
+			ContainerPath: "(all)", HostTarget: "(containerd sandbox never created for pod uid " + string(replPod.UID) + ")",
+			Writer: "kubelet/containerd RunPodSandbox"}
 	}
-	return mounts
+	sandboxDir := containerdCRISandboxDir(ctx, sandboxID)
+	kubeletPodDir := fmt.Sprintf("/var/lib/kubelet/pods/%s", replPod.UID)
+	for _, t := range destinationRebindWellKnownTargets {
+		var hostTarget string
+		switch t.Writer {
+		case rebindWriterKubeletPodDir:
+			hostTarget = filepath.Join(kubeletPodDir, t.Leaf)
+		case rebindWriterContainerdSandboxDir:
+			if sandboxDir == "" {
+				return destinationRebindMissing{ContainerPath: t.ContainerPath,
+					HostTarget: "(containerd root dir unresolved)", Writer: t.Writer.String()}
+			}
+			hostTarget = filepath.Join(sandboxDir, t.Leaf)
+		case rebindWriterAgentStaged:
+			hostTarget = termlogPath
+		}
+		present, pErr := hostRegularFileExistsFn(ctx, hostTarget)
+		if pErr != nil || !present {
+			return destinationRebindMissing{ContainerPath: t.ContainerPath, HostTarget: hostTarget, Writer: t.Writer.String()}
+		}
+	}
+	return unknown
 }
+
+// destinationRebindObserveFn is a test seam (mirrors sandboxWaitObserveFn), invoked exactly once per
+// appendDestinationRebindReattachMounts call with the attempt count, elapsed time, and the three-way
+// outcome ("resolved" | "not_yet"→"never" | "probe_failed"). No-op by default.
+var destinationRebindObserveFn = func(migrationName string, attempts int, elapsed time.Duration, outcome string) {}
 
 // replacementPodLabelKey is the label the controller stamps on the replacement pod at creation
 // time (podmigration_controller.go). It equals the PodMigration name. It is the authoritative,
@@ -5278,20 +5764,75 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 				m.ContainerPath, replacementPodLabelKey)
 		}
 	}
+	// ADR-0417 S2(b): every --ext-mount-map token emitted from here down carries values that
+	// originate, at least partly, in the CHECKPOINT IMAGE — i.e. in data an image-supplying
+	// adversary controls. `--ext-mount-map <key>:<target>` is a ':'-delimited, argv-positional
+	// token, and the reattachExtMountMap entries specifically are parsed back out of the patch
+	// script's stdout, so an unvalidated key or target is a direct argv-injection primitive against
+	// CRIU. Everything below therefore goes through addExtMountMap, which:
+	//
+	//	(1) rejects an ExtKey or HostTarget containing ':' or any control character (the token
+	//	    delimiter and the line delimiter of the stdout protocol);
+	//	(2) requires HostTarget to be an absolute, lexically-clean, traversal-free path under one of
+	//	    the allowed destination prefixes (allowedExtMountHostTargetPrefixes) — the paths this
+	//	    agent legitimately stages or reads on a destination node, nothing else;
+	//	(3) refuses any HostTarget that is not one THIS AGENT itself resolved (resolvedHostTargets
+	//	    below). The Go side already knows the authoritative {containerPath: hostTarget} map; the
+	//	    script's token is needed only to learn the mnt_id/ext_key that go with it. So a forged
+	//	    CRIU_REATTACH_EXT_MOUNT_MAP line injected through the script's stdout cannot introduce a
+	//	    host target of its own choosing — e.g. the demonstrated `--ext-mount-map /etc/hosts:/`,
+	//	    which would bind the destination node's ROOT FILESYSTEM into the restored container;
+	//	(4) collapses byte-identical duplicates and hard-fails on two DIFFERENT targets for the same
+	//	    key, so CRIU's ext_mount_lookup (first-match) can never silently pick the wrong one.
+	//
+	// This is defense in depth over the script-side fix (all marker lines are json.dumps-encoded, so
+	// no image-derived byte can forge a line at all) — neither layer is load-bearing alone.
+	resolvedHostTargets := make(map[string]bool, len(reattachMountPaths))
+	for _, m := range reattachMountPaths {
+		if m.HostTarget != "" {
+			resolvedHostTargets[m.HostTarget] = true
+		}
+	}
+	// The unconditional literal entries emitted above are agent-owned, not image-derived; register
+	// their targets so the dedupe/consistency check below sees the complete picture.
+	resolvedHostTargets[termlogFile] = true
+	emittedExtMounts := make(map[string]string, len(reattachMountPaths)+len(reattachExtMountMap))
+	emittedExtMounts["/dev/null"] = "/dev/null"
+	emittedExtMounts["/dev/termination-log"] = termlogFile
+	addExtMountMap := func(key, target, origin string) error {
+		if err := validateExtMountToken(key, target, resolvedHostTargets); err != nil {
+			return fmt.Errorf("refusing to build CRIU restore argv from %s: %w", origin, err)
+		}
+		if prev, dup := emittedExtMounts[key]; dup {
+			if prev == target {
+				return nil // byte-identical duplicate — one token is enough
+			}
+			return fmt.Errorf("refusing to build CRIU restore argv from %s: conflicting --ext-mount-map targets for key %q (%q vs %q); CRIU's ext_mount_lookup takes the first match, so one of them would be silently ignored", origin, key, prev, target)
+		}
+		emittedExtMounts[key] = target
+		args = append(args, "--ext-mount-map", key+":"+target)
+		return nil
+	}
 	// ADR-0417: RE-ACTIVATE the path-form --ext-mount-map for the Class DESTINATION-REBIND
 	// mountpoints (see removed literal entries above) — but ONLY for the mounts that actually
 	// landed in reattachTierDestinationRebind (the fail-closed loop just above already guarantees
-	// HostTarget is non-empty for every entry here, so no separate unresolved check is needed).
-	// Defense-in-depth alongside the mi->source-direct-bind rewrite patch_checkpoint_script.go
-	// already applies: for the common ext_key=="CRIU:AUTOGENERATED" case CRIU bypasses this map
-	// (same reasoning as the Tier0 RWX loop below), and for the rare literal-ext_key case the
-	// reattachExtMountMap loop below already supplies the required mapping generically. This loop
-	// costs nothing to keep live and directly matches what the recorded entry now says on disk.
+	// HostTarget is non-empty for every entry here).
+	//
+	// The mapping is <containerPath>:<HOST TARGET>, NOT the <containerPath>:<containerPath> this
+	// loop emitted before. These entries have a LITERAL ext_key equal to their mountpoint (the real
+	// §P-PREMISE decode records ext_key="/etc/hosts" for the /etc/hosts bind, not
+	// "CRIU:AUTOGENERATED"), so CRIU does NOT bypass the lookup for them — it consults this map and
+	// binds whatever it finds. Mapping /etc/hosts to /etc/hosts therefore bound the DESTINATION
+	// NODE's own /etc/hosts into the restored container, and because this loop runs before the
+	// reattachExtMountMap loop below, that wrong entry won the first-match lookup over the correct
+	// one. Same key, same value on both loops now, so the dedupe collapses them.
 	for _, m := range reattachMountPaths {
 		if m.Tier != reattachTierDestinationRebind || m.ContainerPath == "" || m.HostTarget == "" {
 			continue
 		}
-		args = append(args, "--ext-mount-map", fmt.Sprintf("%s:%s", m.ContainerPath, m.ContainerPath))
+		if err := addExtMountMap(m.ContainerPath, m.HostTarget, "resolved destination-rebind mount"); err != nil {
+			return nil, err
+		}
 	}
 	// Tier1-Longhorn mount.c:3141 fix: for any preserved reattach mount whose REAL on-disk
 	// ext_key is NOT the CRIU AUTODETECTED_MOUNT constant (see ReattachExtMountMapEntry doc — the
@@ -5305,7 +5846,9 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		if m.ExtKey == "" || m.HostTarget == "" {
 			continue
 		}
-		args = append(args, "--ext-mount-map", fmt.Sprintf("%s:%s", m.ExtKey, m.HostTarget))
+		if err := addExtMountMap(m.ExtKey, m.HostTarget, "patch-script CRIU_REATTACH_EXT_MOUNT_MAP token"); err != nil {
+			return nil, err
+		}
 	}
 	if destNetnsFd != "" {
 		args = append(args, "--join-ns", "net:"+destNetnsFd)
@@ -5609,12 +6152,19 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	// Step 3: Create ext-mount-map target paths in the agent container's filesystem.
 	// These paths are used as ext-mount-map targets for CRIU; CRIU (running in the host
 	// mount namespace) can access /var/lib/podmotion via the bind-mount (shared filesystem).
-	dataDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/data", migrationName)
-	secretsDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/secrets", migrationName)
-	termlogFile := fmt.Sprintf("/var/lib/podmotion/restore/%s/termination-log", migrationName)
+	dataDir := filepath.Join(restoreStagingDir(migrationName), "data")
+	secretsDir := filepath.Join(restoreStagingDir(migrationName), "secrets")
 	_ = os.MkdirAll(dataDir, 0o700)
 	_ = os.MkdirAll(secretsDir, 0o700)
-	_ = os.WriteFile(termlogFile, nil, 0o644)
+	// ADR-0417: the termination-log target now has TWO consumers that must agree byte-for-byte —
+	// this --ext-mount-map argument AND the Class DESTINATION-REBIND recorded-source rewrite
+	// (appendDestinationRebindReattachMounts). Both go through restoreTerminationLogPath, and the
+	// file is create-if-absent (never truncated) because the rebind resolution already staged and
+	// PROBED it upstream; truncating a path CRIU is about to bind from would be a pointless write.
+	termlogFile, termlogErr := ensureRestoreTerminationLogFile(migrationName)
+	if termlogErr != nil {
+		return 0, nil, fmt.Errorf("stage restore termination-log: %w", termlogErr)
+	}
 
 	// Create required directories and files inside the rootfs in the HOST mount namespace
 	// via nsenterCmd. The rootfsDir is an overlayfs mounted in the host namespace; the agent
@@ -9269,9 +9819,6 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		// P-0193-1 (2026-07-18): see appendHolderScaffoldReattachMount doc — same fold-in as the
 		// NRI join-ns restore path, for the gRPC Restore fallback.
 		reattachMounts = s.appendHolderScaffoldReattachMount(ctx, req.MigrationName, reattachMounts)
-		// ADR-0417: see appendDestinationRebindReattachMounts doc — same fold-in as the NRI join-ns
-		// restore path, for the gRPC Restore config.json branch.
-		reattachMounts = s.appendDestinationRebindReattachMounts(ctx, req.MigrationName, reattachMounts)
 		// UNIVERSAL POD-NETNS INTEGRATION (ADR-0125/ADR-0177/ADR-0349 — mislabeled "ADR-0325"
 		// prior to ADR-0370's citation fix; see ADR-0370 First Finding): joining the restored
 		// process into ITS pod's REAL network namespace (the CNI-wired sandbox netns that owns
@@ -9291,6 +9838,18 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 			msg := fmt.Sprintf("Restore: pod-netns integration failed for migration %s: could not resolve replacement pod sandbox netns (ADR-0125/ADR-0177/ADR-0349) — refusing to restore into a detached/non-pod namespace", req.MigrationName)
 			log.Info(msg, "migration", req.MigrationName)
 			return &agentpb.RestoreResponse{Success: false, ErrorMessage: msg}, nil
+		}
+		// ADR-0417: fold in the Class DESTINATION-REBIND targets — see
+		// appendDestinationRebindReattachMounts doc. Deliberately placed AFTER the pod-netns
+		// sandbox gate above, not before it: the containerd CRI sandbox dir that holds
+		// /etc/hostname and /etc/resolv.conf cannot exist before the sandbox does, so waiting here
+		// starts the destination-file wait on the far side of an edge that is already CONFIRMED
+		// rather than racing it, and a genuinely unresolvable sandbox is reported by the gate that
+		// owns that condition instead of surfacing as a rebind-probe failure.
+		var drErr error
+		reattachMounts, drErr = s.appendDestinationRebindReattachMounts(ctx, req.MigrationName, reattachMounts)
+		if drErr != nil {
+			return nil, fmt.Errorf("resolve destination-rebind mounts: %w", drErr)
 		}
 		// ADR-0351 D3.1: pass the incoming gRPC Restore handler ctx — the operator-set restore-RPC
 		// deadline D_restore is the real budget source on this path; no new derivation needed.
@@ -9512,7 +10071,10 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	rawReattachMounts = s.appendHolderScaffoldReattachMount(ctx, req.MigrationName, rawReattachMounts)
 	// ADR-0417: see appendDestinationRebindReattachMounts doc — same fold-in as the other two
 	// restore paths, for the raw (non-config.json) gRPC Restore path.
-	rawReattachMounts = s.appendDestinationRebindReattachMounts(ctx, req.MigrationName, rawReattachMounts)
+	rawReattachMounts, rawDRErr := s.appendDestinationRebindReattachMounts(ctx, req.MigrationName, rawReattachMounts)
+	if rawDRErr != nil {
+		return nil, fmt.Errorf("resolve destination-rebind mounts: %w", rawDRErr)
+	}
 
 	t0 := time.Now()
 	// ADR-0168 B2: storedWorkloadImage replaces the empty imageName on the gRPC fallback path.

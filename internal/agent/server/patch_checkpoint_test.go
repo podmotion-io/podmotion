@@ -512,8 +512,13 @@ func TestADR0194_B2_SourceSyncAnchors(t *testing.T) {
 		desc  string
 	}{
 		{"ext_drop_mnt_ids", "files.img reconciliation ctx key (retained; empty under ADR-0415)"},
-		{"internalizing owned mount", "ADR-0415 owned-mount internalize log line"},
+		{"internalizing RECREATABLE mount", "ADR-0417 recreatable-mount internalize log line (supersedes ADR-0415's ownership-keyed wording)"},
 		{"internalized_mnt_ids", "ADR-0415 internalized-mount tracking set"},
+		{"RECREATABLE_FSTYPES", "ADR-0417 positive construct-and-fill fstype allowlist"},
+		{"destination_rebind_mnt_ids", "ADR-0417 Class DESTINATION-REBIND preserve set"},
+		{"reattach_target_unresolved", "ADR-0417 S1(a) carve-out (a) fail-closed hard-stop reason"},
+		{"destination_rebind_target_unresolved", "ADR-0417 Class DESTINATION-REBIND fail-closed hard-stop reason"},
+		{"json.dumps(payload, sort_keys=True)", "ADR-0417 S2(c) injection-proof marker encoding"},
 		{"EXTERNAL_MOUNT_UNRESOLVED", "P-0194-1 hard-stop event token (ExternalMountUnresolved)"},
 		{"mp_tmp", "atomic mountpoints temp file (H1 / SC-2 dual-write)"},
 		{"files_tmp", "atomic files.img temp file (H1 / SC-2 dual-write)"},
