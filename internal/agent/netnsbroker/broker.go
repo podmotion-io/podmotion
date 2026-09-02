@@ -894,6 +894,105 @@ func hostRealpathAllowed(p string) bool {
 	return false
 }
 
+// maxSymlinkHops bounds symlink traversal in evalSymlinksUnderRoot, matching the
+// kernel's own ELOOP budget class. A cycle must terminate as an error, never as a hang.
+const maxSymlinkHops = 40
+
+// evalSymlinksUnderRoot resolves target — an absolute path expressed in ROOT's OWN
+// coordinates — component by component beneath root, following symlinks the way the
+// kernel would inside that root, and returns the resolved path back in root's
+// coordinates (leading "/", root itself is "/").
+//
+// WHY THIS EXISTS INSTEAD OF filepath.EvalSymlinks (ADR-0419, gate attempt 1 root cause).
+// The previous implementation called filepath.EvalSymlinks(filepath.Join("/proc/1/root",
+// target)) and believed that resolved in the host mount namespace. It does not, and it
+// cannot: /proc/<pid>/root is a MAGIC symlink whose readlink(2) value is the literal
+// string "/". Go's resolver is textual — on reaching an ABSOLUTE link target it discards
+// everything resolved so far and restarts at its OWN "/". So the /proc/1/root gateway was
+// erased at the very first component and every remaining component was resolved in the
+// BROKER's own mount namespace, which carries neither /var/lib/podmotion nor
+// /var/lib/kubelet nor the containerd sandbox tree. Live signature on the standing
+// cluster: `host_realpath /var/lib/podmotion/restore/<migration>/termination-log` failed
+// with "lstat /var/lib/podmotion: no such file or directory" — note the TOP-LEVEL
+// component and the absent /proc/1/root prefix, both of which are only possible after the
+// restart — while /proc/1/root/var/lib/podmotion existed the whole time and the restore
+// staging dir was present on the host, mode 0700, exactly as the agent created it. D9 then
+// correctly refused an unverifiable target and every restore failed closed.
+//
+// The kernel resolves paths BENEATH /proc/1/root in that namespace's mount tree correctly;
+// only Go's textual handling of the gateway symlink is wrong. So the fix is to walk the
+// components ourselves and re-anchor at root (never at the caller's "/") whenever a link
+// target is absolute — the same rule a chroot imposes. ".." at root clamps to root.
+//
+// Escape is therefore impossible BY CONSTRUCTION rather than by a post-hoc prefix check:
+// the returned value is assembled from components that were each resolved beneath root, so
+// there is no path expressible here that lies outside it. That is why the "resolved outside
+// the host mount namespace root" guard this replaces is not carried forward — its condition
+// can no longer be produced, and keeping an unreachable guard would misrepresent which check
+// is load-bearing.
+func evalSymlinksUnderRoot(root, target string) (string, error) {
+	if !filepath.IsAbs(target) {
+		return "", fmt.Errorf("target %q is not absolute", target)
+	}
+	split := func(p string) []string {
+		out := make([]string, 0, 8)
+		for _, c := range strings.Split(p, "/") {
+			if c != "" {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+
+	resolved := make([]string, 0, 8) // components resolved so far, in root coordinates
+	rest := split(target)
+	hops := 0
+	for len(rest) > 0 {
+		name := rest[0]
+		rest = rest[1:]
+		switch name {
+		case ".":
+			continue
+		case "..":
+			if len(resolved) > 0 {
+				resolved = resolved[:len(resolved)-1]
+			}
+			continue
+		}
+
+		next := append(append(make([]string, 0, len(resolved)+1), resolved...), name)
+		abs := filepath.Join(append([]string{root}, next...)...)
+		fi, err := os.Lstat(abs)
+		if err != nil {
+			return "", err
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			resolved = next
+			continue
+		}
+
+		hops++
+		if hops > maxSymlinkHops {
+			return "", fmt.Errorf("too many levels of symbolic links resolving %q under %s", target, root)
+		}
+		link, err := os.Readlink(abs)
+		if err != nil {
+			return "", err
+		}
+		if filepath.IsAbs(link) {
+			// Re-anchor at ROOT, not at the broker's own "/" — this single line is the
+			// whole defect filepath.EvalSymlinks could not express.
+			resolved = resolved[:0]
+		}
+		rest = append(split(link), rest...)
+	}
+
+	if len(resolved) == 0 {
+		return "/", nil
+	}
+	return "/" + strings.Join(resolved, "/"), nil
+}
+
 // doHostRealpath resolves one absolute path to its fully symlink-resolved realpath in
 // the HOST mount namespace and returns it in a typed field (ADR-0419 D9).
 //
@@ -908,18 +1007,9 @@ func doHostRealpath(target string) Response {
 	if !hostRealpathAllowed(target) {
 		return Response{Error: fmt.Sprintf("host_realpath: target %q is outside the server-pinned path family", target)}
 	}
-	resolved, err := filepath.EvalSymlinks(filepath.Join(hostMountNsRoot, target))
+	real, err := evalSymlinksUnderRoot(hostMountNsRoot, target)
 	if err != nil {
 		return Response{Error: fmt.Sprintf("host_realpath %s: %v", target, err)}
-	}
-	// A target that symlinks its way back out of /proc/1/root is not expressible in
-	// host coordinates and must never be reported as a host path.
-	if resolved != hostMountNsRoot && !strings.HasPrefix(resolved, hostMountNsRoot+"/") {
-		return Response{Error: fmt.Sprintf("host_realpath %s: resolved outside the host mount namespace root", target)}
-	}
-	real := strings.TrimPrefix(resolved, hostMountNsRoot)
-	if real == "" {
-		real = "/"
 	}
 	return Response{RealPath: real}
 }

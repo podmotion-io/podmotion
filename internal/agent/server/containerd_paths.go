@@ -7,6 +7,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 package server
 
 import (
+	"fmt"
 	"os"
 	"strings"
 )
@@ -63,13 +64,51 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
+// hostRunMountRoot is where charts/podmotion/templates/daemonset.yaml bind-mounts the host's
+// /run into the AGENT container (read-only). It is the agent's only view of the host /run
+// tree: the agent's own /run carries just the handful of paths the chart mounts individually.
+const hostRunMountRoot = "/host-run"
+
 // hostRunMountPath re-roots a bare host path under containerdRunRoot (e.g.
 // "<containerdRunRoot>/io.containerd.runtime.v2.task/k8s.io/<id>") onto the agent-visible
 // /host-run bind mount (charts/podmotion/templates/daemonset.yaml mounts host /run at
 // /host-run — see hostBundleDir's doc comment for why the bare path is unreadable from the
 // agent's own mount namespace).
 func hostRunMountPath(rel string) string {
-	return "/host-run" + strings.TrimPrefix(containerdRunRoot, "/run") + "/" + strings.TrimPrefix(rel, "/")
+	return hostRunMountRoot + strings.TrimPrefix(containerdRunRoot, "/run") + "/" + strings.TrimPrefix(rel, "/")
+}
+
+// containerdDialPath translates containerdSocketPath — a HOST mount-namespace path — into the
+// path that reaches the SAME socket from the AGENT container's own mount namespace.
+//
+// WHY EVERY IN-PROCESS DIAL NEEDS THIS (ADR-0419, gate attempt 1 root cause). containerdSocketPath
+// is documented above as "the host-side containerd control socket", and until ADR-0419 every
+// consumer honored that: `ctr --address <socket>` runs through nsenterCmd/the broker, i.e. IN the
+// host mount namespace, where the bare path is correct. ADR-0419 introduced the package's first
+// IN-PROCESS consumers (the typed containerd containers/tasks clients), which dial from the agent's
+// OWN mount namespace — and there the bare path is not reachable. The chart mounts exactly one
+// containerd socket into the agent, at the STATIC Helm value agent.containerd.socketPath
+// (/run/containerd/containerd.sock by default), while ADR-0370 discovers the AUTHORITATIVE socket
+// at runtime. On RKE2 those disagree by construction: discovery correctly selects
+// /run/k3s/containerd/containerd.sock (kubelet's containerd, live-confirmed present on the host),
+// the chart mounted the system one, and the dial failed "no such file or directory" — a namespace
+// mismatch, not a wrong socket. Re-rooting onto /host-run is what makes the discovered answer and
+// the dialable path the same fact on every distro, with no second static value to keep in sync.
+// (The /host-run bind is read-only; connect(2) to a Unix socket is not a filesystem write and is
+// not refused by MS_RDONLY — verified live on this project's standing cluster.)
+//
+// Fails loud when the discovered socket does not live under /run: /host-run reaches the host's /run
+// and nothing else, so a socket elsewhere (an operator override outside /run) has no agent-namespace
+// spelling at all, and inventing one would be a guess.
+func containerdDialPath() (string, error) {
+	sock := containerdSocketPath
+	if sock == "" {
+		return "", fmt.Errorf("containerd socket path is empty — ADR-0370 discovery has not run or adopted a socket")
+	}
+	if !strings.HasPrefix(sock, "/run/") {
+		return "", fmt.Errorf("containerd socket %q is not under /run — the agent container reaches the host /run tree only through the %s bind mount (charts/podmotion/templates/daemonset.yaml), so this socket has no agent-mount-namespace path; refusing to guess one", sock, hostRunMountRoot)
+	}
+	return hostRunMountRoot + strings.TrimPrefix(sock, "/run"), nil
 }
 
 // ctrTaskBundleRoot returns the bare host-namespace path (as seen by nsenterCmd, which runs in

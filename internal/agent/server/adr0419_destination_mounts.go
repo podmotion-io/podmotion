@@ -336,10 +336,14 @@ var containerdRuntimeMountsOnceFn = containerdRuntimeMountsOnce
 // been created yet. That is a NOT-YET, and the caller re-probes; it is NOT an error, and must
 // never be collapsed into one.
 func containerdRuntimeMountsOnce(ctx context.Context, podUID, sandboxID string) ([]nri.ContainerMount, error) {
-	conn, err := grpc.NewClient("unix://"+containerdSocketPath,
+	dialPath, err := containerdDialPath()
+	if err != nil {
+		return nil, fmt.Errorf("containerd containers client: %w", err)
+	}
+	conn, err := grpc.NewClient("unix://"+dialPath,
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return nil, fmt.Errorf("containerd containers client for %s: %w", containerdSocketPath, err)
+		return nil, fmt.Errorf("containerd containers client for %s (host socket %s): %w", dialPath, containerdSocketPath, err)
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -398,10 +402,14 @@ var runningPodSandboxesForPodUIDFn = runningPodSandboxesForPodUID
 // Ordering is normalized so a caller can never depend on containerd's listing order for meaning;
 // with the filters applied, order carries no information and the count is what decides.
 func runningPodSandboxesForPodUID(ctx context.Context, podUID string) ([]string, error) {
-	conn, err := grpc.NewClient("unix://"+containerdSocketPath,
+	dialPath, err := containerdDialPath()
+	if err != nil {
+		return nil, fmt.Errorf("containerd client: %w", err)
+	}
+	conn, err := grpc.NewClient("unix://"+dialPath,
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return nil, fmt.Errorf("containerd client for %s: %w", containerdSocketPath, err)
+		return nil, fmt.Errorf("containerd client for %s (host socket %s): %w", dialPath, containerdSocketPath, err)
 	}
 	defer func() { _ = conn.Close() }()
 
