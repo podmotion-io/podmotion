@@ -974,6 +974,9 @@ func (s *AgentServer) JoinNsRestore(ctx context.Context, migrationName, namespac
 	// REBIND_TO_ROOT that ENOENTs on a second-or-later migration (see doc on
 	// appendHolderScaffoldReattachMount).
 	reattachMounts = s.appendHolderScaffoldReattachMount(joinNsRestoreCtx, migrationName, reattachMounts)
+	// ADR-0417: fold in the kubelet-staged /etc/hosts, /etc/hostname, /etc/resolv.conf destination
+	// targets (Class DESTINATION-REBIND) — see appendDestinationRebindReattachMounts doc.
+	reattachMounts = s.appendDestinationRebindReattachMounts(joinNsRestoreCtx, migrationName, reattachMounts)
 	// ADR-0355 D2/D3: read the authoritative preserved source IP (pm.Spec.SourcePodIP — the same
 	// field SingleHomeRestoredPod single-homes on) and thread it into joinNsRestore so the pre-CRIU
 	// bind-prep can make it locally bindable before soccr's bind() on an established-TCP restore.
@@ -1261,6 +1264,16 @@ const (
 	reattachTierNone reattachTierKind = iota
 	reattachTierTier0RWX
 	reattachTierTier1Longhorn
+	// reattachTierDestinationRebind (ADR-0417) marks a mount resolved for the Class
+	// DESTINATION-REBIND rewrite — a runtime-injected file bind (e.g. /etc/hosts, /etc/hostname,
+	// /etc/resolv.conf) whose recorded fstype is not CRIU-recreatable, so patch_checkpoint_script.go
+	// preserves+rewrites it via the SAME mechanism as a Tier0/Tier1 PVC re-attach rather than
+	// internalizing it. UNLIKE the storage tiers, an entry with this Tier is deliberately EXCLUDED
+	// from reattachContainerPaths (argv[4] / reattach_mount_paths) — see that function's doc —
+	// because DESTINATION-REBIND classification is fstype-keyed inside the patch script, not
+	// membership-keyed; this Tier only feeds the destination-target LOOKUP (reattachHostTargets),
+	// never the unconditional-preserve membership set.
+	reattachTierDestinationRebind
 )
 
 type reattachMount struct {
@@ -1324,13 +1337,25 @@ func classifyReattachTier(ctx context.Context, k8sClient client.Client, pvc *cor
 }
 
 // reattachContainerPaths projects the in-container paths from a []reattachMount (the set the patch
-// classifier needs). Order-preserving.
+// classifier needs) — specifically, patch_checkpoint_script.go's reattach_mount_paths (argv[4]),
+// the carve-out (a) UNCONDITIONAL-preserve membership set. Order-preserving.
+//
+// ADR-0417: entries tagged reattachTierDestinationRebind are deliberately EXCLUDED. That class's
+// whole point is a classification rule keyed on the mount's own recorded fstype (evaluated inside
+// patch_checkpoint_script.go), not on membership in a Go-side path allowlist — putting these
+// mountpoints in reattach_mount_paths would make them carve-out (a) unconditionally regardless of
+// fstype, silently reintroducing exactly the kind of per-path special-casing ADR-0417 avoids.
+// Their destination targets still reach the patch script — see reattachHostTargets below, which is
+// NOT filtered by Tier.
 func reattachContainerPaths(ms []reattachMount) []string {
 	if len(ms) == 0 {
 		return nil
 	}
 	paths := make([]string, 0, len(ms))
 	for _, m := range ms {
+		if m.Tier == reattachTierDestinationRebind {
+			continue
+		}
 		paths = append(paths, m.ContainerPath)
 	}
 	return paths
@@ -1470,6 +1495,73 @@ func (s *AgentServer) appendHolderScaffoldReattachMount(ctx context.Context, mig
 		// rewritten, both of which are identical across tiers.
 		Tier: reattachTierTier1Longhorn,
 	})
+}
+
+// destinationRebindWellKnownTargets (ADR-0417) maps the in-container mountpoint of a well-known
+// kubelet-injected file bind to the LEAF filename kubelet stages it under at
+// /var/lib/kubelet/pods/<podUID>/<leaf> — §P-MECHANISM (2) of ADR-0417: kubelet bind-mounts a
+// REGULAR FILE from this exact pod-dir shape onto the container's /etc/hosts (siblings:
+// etc-hostname, resolv.conf). This map is a target-RESOLUTION convenience only, not the
+// classification rule: patch_checkpoint_script.go's Class DESTINATION-REBIND classifier is
+// fstype-keyed and applies to any future runtime-injected block-fs file bind with no new code —
+// this map only supplies the destination HOST PATH for the three well-known members that surfaced
+// the ADR-0417 defect, exactly as ADR-0417's Decision states.
+var destinationRebindWellKnownTargets = map[string]string{
+	"/etc/hosts":       "etc-hosts",
+	"/etc/hostname":    "etc-hostname",
+	"/etc/resolv.conf": "resolv.conf",
+}
+
+// appendDestinationRebindReattachMounts (ADR-0417) resolves the destination replacement pod's
+// kubelet-staged /etc/hosts, /etc/hostname, /etc/resolv.conf files and appends them to mounts with
+// Tier=reattachTierDestinationRebind, using the SAME deterministic replacement-pod-UID resolution
+// (resolveReplacementPod) resolveReattachMountsWaiting/resolvePodNetnsSandboxWaiting already rely
+// on — no new discovery mechanism.
+//
+// Appending to the SAME []reattachMount slice threaded through to patchCheckpointImages means:
+//   - reattachHostTargets (unchanged, not Tier-filtered) includes these three entries in the
+//     {ContainerPath: HostTarget} map threaded into patchCheckpointImages as reattach_host_targets
+//     (argv[5]) — the SAME map carve-out (a) already uses (ADR-0417's "reuses carve-out (a)
+//     machinery unmodified" mechanism).
+//   - reattachContainerPaths (ADR-0417) EXCLUDES Tier==reattachTierDestinationRebind, so these
+//     mountpoints do NOT land in reattach_mount_paths (argv[4]) — carve-out (a)'s unconditional-
+//     preserve membership set stays storage-tier-scoped. Whether /etc/hosts et al. actually land in
+//     Class DESTINATION-REBIND (vs Class RECREATABLE) is decided by their recorded fstype inside
+//     patch_checkpoint_script.go, never by membership in this Go-side list.
+//   - buildCRIURestoreArgs' existing fail-closed precondition loop (unchanged — it already ranges
+//     over ALL reattachMountPaths, storage-tier or not) refuses to invoke CRIU when any of these
+//     three has an unresolved HostTarget — the ADR-0417 fail-closed requirement, with no new guard
+//     code needed.
+//
+// Returns mounts unchanged when the replacement pod cannot be resolved — patch_checkpoint_script.go
+// then fails closed (EXTERNAL_MOUNT_UNRESOLVED, reason destination_rebind_target_unresolved) on any
+// Class DESTINATION-REBIND entry it cannot resolve a target for, rather than falling back to the
+// disproven ADR-0415 carve-out (b) unconditional-internalize behavior.
+func (s *AgentServer) appendDestinationRebindReattachMounts(ctx context.Context, migrationName string, mounts []reattachMount) []reattachMount {
+	if s.k8sClient == nil || migrationName == "" {
+		return mounts
+	}
+	pm, ok := s.lookupPodMigration(ctx, migrationName)
+	if !ok {
+		return mounts
+	}
+	podNs := pm.Spec.PodNamespace
+	if podNs == "" {
+		podNs = pm.Namespace
+	}
+	replPod := s.resolveReplacementPod(ctx, migrationName, podNs)
+	if replPod == nil || replPod.UID == "" {
+		return mounts
+	}
+	base := fmt.Sprintf("/var/lib/kubelet/pods/%s", replPod.UID)
+	for containerPath, leaf := range destinationRebindWellKnownTargets {
+		mounts = append(mounts, reattachMount{
+			ContainerPath: containerPath,
+			HostTarget:    base + "/" + leaf,
+			Tier:          reattachTierDestinationRebind,
+		})
+	}
+	return mounts
 }
 
 // replacementPodLabelKey is the label the controller stamps on the replacement pod at creation
@@ -4702,11 +4794,22 @@ var containerdMaskedPaths = []string{
 // docs/adr/0415-capture-everything-by-default-mount-ownership.md.
 
 // standardPodMounts is the canonical set of external mounts that every Kubernetes
-// pod container carries and that buildCRIURestoreArgs maps explicitly by PATH (not to
-// /dev/null) via --ext-mount-map <mountpoint>:<host-target>. The pre-scan must recognise
-// these as covered — they are legitimately restorable external mounts, not unmapped ones.
-// This list MUST stay in lockstep with the path-form --ext-mount-map entries in
-// buildCRIURestoreArgs (ADR-0124 R2 / AC6 — single source of truth, no divergent copy).
+// pod container carries and that the pre-scan below must recognise as covered — they are
+// legitimately restorable external mounts, not unmapped ones.
+//
+// CORRECTED (ADR-0417): /etc/resolv.conf, /etc/hostname, /etc/hosts are NO LONGER "mapped
+// elsewhere, by path" via an unconditional buildCRIURestoreArgs literal — ADR-0417 replaced that
+// unconditional internalize/path-map with a recreatability-keyed classifier. These three
+// mountpoints are now Class DESTINATION-REBIND external mounts (patch_checkpoint_script.go, keyed
+// on recorded fstype): patchCheckpointImages preserves+rewrites them via
+// appendDestinationRebindReattachMounts/reattachHostTargets, the same mechanism as a storage-tier
+// PVC re-attach, not the standardPodMounts/unmapped-mount hard-stop this list feeds. They remain
+// listed here only so this pre-scan does not flag them as unmapped (they are still an external
+// mount CRIU records for every pod, just handled through the re-attach path now, exactly like a
+// reattachMountPaths entry — see the reattach[e.Mountpoint] check below, which they no longer even
+// need to fall through to since standardPodMounts still recognizes them first).
+// This list MUST stay in lockstep with buildCRIURestoreArgs' handling of these paths (ADR-0124 R2 /
+// AC6 — single source of truth, no divergent copy).
 var standardPodMounts = []string{
 	"/data",
 	"/dev/termination-log",
@@ -4731,7 +4834,11 @@ var standardPodMounts = []string{
 // (numeric mnt_id form — the form CRIU failed to resolve in "No mapping for 2288:...").
 //
 // An entry is also covered, and not flagged unmapped, when it is a standardPodMounts /
-// reattachMountPaths entry (mapped elsewhere, by path).
+// reattachMountPaths entry — CORRECTED (ADR-0417): "mapped elsewhere, by path" no longer means an
+// unconditional buildCRIURestoreArgs literal for /etc/resolv.conf, /etc/hostname, /etc/hosts;
+// those three are now Class DESTINATION-REBIND external mounts patchCheckpointImages preserves and
+// rewrites via the reattach mechanism (see standardPodMounts doc). They are still recognized here
+// via standardPodMounts, so this pre-scan does not need reattachMountPaths to also list them.
 //
 // ADR-0415: the obscured-parent "pm-dev" bucket is gone — /dev is captured as pod-owned content and
 // internalized by patchCheckpointImages, never declared external, so it never reaches this pre-scan.
@@ -5129,9 +5236,16 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		// --ext-mount-map. The retired pm-dev obscured-parent /dev machinery (ADR-0384/0389/0392) is
 		// documented in docs/adr/0415-capture-everything-by-default-mount-ownership.md; declaring
 		// /dev external was exactly what suppressed the /dev/shm fill.
-		"--ext-mount-map", "/etc/resolv.conf:/etc/resolv.conf",
-		"--ext-mount-map", "/etc/hostname:/etc/hostname",
-		"--ext-mount-map", "/etc/hosts:/etc/hosts",
+		//
+		// ADR-0417: the unconditional "--ext-mount-map /etc/resolv.conf:/etc/resolv.conf" (and the
+		// /etc/hostname, /etc/hosts siblings) that used to sit here are REMOVED from this
+		// unconditional literal set. Under ADR-0415 carve-out (b), patch_checkpoint_script.go
+		// ALWAYS popped these entries' ext_key (internalize), so CRIU never had an external left to
+		// consult and the args were dead weight that merely read as "handled" (ADR-0417
+		// §P-MECHANISM (3)). Under ADR-0417's Class DESTINATION-REBIND, these three mountpoints now
+		// PRESERVE their ext_key when their recorded fstype is not CRIU-recreatable — so the entries
+		// are live again, RE-ACTIVATED below as a conditional loop keyed on the mount actually
+		// having landed in reattachTierDestinationRebind, not emitted unconditionally.
 		// NetworkLock: the dump uses --network-lock skip unconditionally (criu_checkpointer.go:233),
 		// so the restore MUST also pass --network-lock skip to honor the dump/restore-pair invariant.
 		// A restore must not replay lock state the paired dump never captured (ADR-0192 Site A, R2).
@@ -5163,6 +5277,21 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 			return nil, fmt.Errorf("reattach host target unresolved for %s: the destination kubelet volume dir for this re-attach (Tier0 RWX) mount could not be resolved (replacement pod not found by label %s, or its kubelet volume dir not yet mounted); refusing to restore a checkpoint whose recorded external source was not rewritten to a destination path (CRIU would open_tree the source-node path and abort with ENOENT)",
 				m.ContainerPath, replacementPodLabelKey)
 		}
+	}
+	// ADR-0417: RE-ACTIVATE the path-form --ext-mount-map for the Class DESTINATION-REBIND
+	// mountpoints (see removed literal entries above) — but ONLY for the mounts that actually
+	// landed in reattachTierDestinationRebind (the fail-closed loop just above already guarantees
+	// HostTarget is non-empty for every entry here, so no separate unresolved check is needed).
+	// Defense-in-depth alongside the mi->source-direct-bind rewrite patch_checkpoint_script.go
+	// already applies: for the common ext_key=="CRIU:AUTOGENERATED" case CRIU bypasses this map
+	// (same reasoning as the Tier0 RWX loop below), and for the rare literal-ext_key case the
+	// reattachExtMountMap loop below already supplies the required mapping generically. This loop
+	// costs nothing to keep live and directly matches what the recorded entry now says on disk.
+	for _, m := range reattachMountPaths {
+		if m.Tier != reattachTierDestinationRebind || m.ContainerPath == "" || m.HostTarget == "" {
+			continue
+		}
+		args = append(args, "--ext-mount-map", fmt.Sprintf("%s:%s", m.ContainerPath, m.ContainerPath))
 	}
 	// Tier1-Longhorn mount.c:3141 fix: for any preserved reattach mount whose REAL on-disk
 	// ext_key is NOT the CRIU AUTODETECTED_MOUNT constant (see ReattachExtMountMapEntry doc — the
@@ -9140,6 +9269,9 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		// P-0193-1 (2026-07-18): see appendHolderScaffoldReattachMount doc — same fold-in as the
 		// NRI join-ns restore path, for the gRPC Restore fallback.
 		reattachMounts = s.appendHolderScaffoldReattachMount(ctx, req.MigrationName, reattachMounts)
+		// ADR-0417: see appendDestinationRebindReattachMounts doc — same fold-in as the NRI join-ns
+		// restore path, for the gRPC Restore config.json branch.
+		reattachMounts = s.appendDestinationRebindReattachMounts(ctx, req.MigrationName, reattachMounts)
 		// UNIVERSAL POD-NETNS INTEGRATION (ADR-0125/ADR-0177/ADR-0349 — mislabeled "ADR-0325"
 		// prior to ADR-0370's citation fix; see ADR-0370 First Finding): joining the restored
 		// process into ITS pod's REAL network namespace (the CNI-wired sandbox netns that owns
@@ -9378,6 +9510,9 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// P-0193-1 (2026-07-18): see appendHolderScaffoldReattachMount doc — same fold-in as the other
 	// two restore paths, for the raw (non-config.json) gRPC Restore path.
 	rawReattachMounts = s.appendHolderScaffoldReattachMount(ctx, req.MigrationName, rawReattachMounts)
+	// ADR-0417: see appendDestinationRebindReattachMounts doc — same fold-in as the other two
+	// restore paths, for the raw (non-config.json) gRPC Restore path.
+	rawReattachMounts = s.appendDestinationRebindReattachMounts(ctx, req.MigrationName, rawReattachMounts)
 
 	t0 := time.Now()
 	// ADR-0168 B2: storedWorkloadImage replaces the empty imageName on the gRPC fallback path.
