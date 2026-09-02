@@ -9,6 +9,7 @@ package server
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -6508,6 +6509,11 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	var agentPIDsErr error
 	criuWrapperPID := criuCmd.Pid()
 	var workloadLive bool
+	// ADR-0418 Decision item 1: the last successfully-observed exited/exitCode from
+	// criuCmd.poll(), captured here rather than discarded, so the :6582-equivalent leg below can
+	// gate cause-naming on CRIU's own terminal verdict instead of log content or ctx state.
+	var lastPollExited bool
+	var lastPollExitCode int
 	// ADR-0354 D2b(iii): the cgroup-liveness wait is bounded by min(now+cgroupPollTimeout,
 	// ctx.Deadline()), not a fixed 60s clock divorced from the caller's migration deadline —
 	// this is the actual invariant-#8 overshoot fix (the fixed 60s + fixed 30s poll clocks
@@ -6526,15 +6532,19 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 			time.Sleep(cgroupPollInterval)
 			continue
 		}
+		lastPollExited, lastPollExitCode = exited, exitCode
 		if exited {
 			if exitCode != 0 {
 				stderrTail := strings.TrimSpace(criuStderr.String())
 				if len(stderrTail) > 4096 {
 					stderrTail = stderrTail[len(stderrTail)-4096:]
 				}
-				logTail := restoreLogTail(restoreLogPath, 4096)
-				return 0, nil, fmt.Errorf("criu restore exited (exit code %d): broker-delegated wrapper\ncriu restore.log tail:\n%s\ncriu stderr:\n%s",
-					exitCode, logTail, stderrTail)
+				// ADR-0418: CRIU's own terminal exit status (exited && exitCode != 0) is already
+				// this leg's own gate — name the causal-first error from the full restore.log
+				// rather than a byte-offset tail window. The checkpoint-dir copy (server.go:6592)
+				// has not run yet at this point in the function — cite only restoreLogPath.
+				cause := criuRestoreFailureCause(restoreLogPath, checkpointDir, false, exited, exitCode, nil, stderrTail)
+				return 0, nil, fmt.Errorf("criu restore exited (exit code %d): broker-delegated wrapper\n%s", exitCode, cause)
 			}
 			// Exit 0 means restore succeeded and CRIU is done (detached-like path or early exit).
 			workloadLive = true
@@ -6579,9 +6589,16 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 		if len(stderrTail) > 4096 {
 			stderrTail = stderrTail[len(stderrTail)-4096:]
 		}
-		logTail := restoreLogTail(restoreLogPath, 4096)
-		return 0, nil, fmt.Errorf("criu restore did not produce workload PIDs in agent cgroup within %s: criu restore.log tail:\n%s\ncriu stderr:\n%s",
-			cgroupPollTimeout, logTail, stderrTail)
+		// ADR-0418 Decision item 1: this leg is reached when CRIU has NOT reached a terminal
+		// state (deadline/ctx abort with exited==false) or the poll round-trip itself is
+		// persistently failing — never when exited && exitCode != 0 (that returns immediately
+		// above). Gate on the last-observed criuCmd.poll() verdict, not on log content or
+		// "Restoring FAILED." presence, and surface a persistently-failing broker round-trip as
+		// its own distinct mechanism-failure class rather than folding it into either other case.
+		// The checkpoint-dir copy has not run yet at this point — cite only restoreLogPath.
+		cause := criuRestoreFailureCause(restoreLogPath, checkpointDir, false, lastPollExited, lastPollExitCode, agentPIDsErr, stderrTail)
+		return 0, nil, fmt.Errorf("criu restore did not produce workload PIDs in agent cgroup within %s\n%s",
+			cgroupPollTimeout, cause)
 	}
 
 	// Copy restore.log to checkpointDir so gate checks can find it under
@@ -6622,12 +6639,25 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	// caller-deadline/cancel exit (D7) from a genuine "CRIU never wrote a pidfile" failure.
 	pidfileBudget := remainingOrCeiling(ctx, 30*time.Second)
 	pidfileCtxAborted := false
+	// ADR-0418 Decision item 1 / Runtime-dependency audit row 2: exited/exitCode are already read
+	// here via criuCmd.poll() and were previously discarded to `_` — capture the last-observed
+	// verdict instead of synthesizing one, so the error branch below can gate cause-naming on
+	// CRIU's own terminal exit status.
+	var lastPidfilePollExited bool
+	var lastPidfilePollExitCode int
+	var lastPidfilePollErr error
 	pidfilePoll := func() (bool, error) {
 		if ctx.Err() != nil {
 			pidfileCtxAborted = true
 			return true, nil
 		}
-		exited, _, _, perr := criuCmd.poll()
+		exited, exitCode, _, perr := criuCmd.poll()
+		if perr == nil {
+			lastPidfilePollExited, lastPidfilePollExitCode = exited, exitCode
+			lastPidfilePollErr = nil
+		} else {
+			lastPidfilePollErr = perr
+		}
 		return exited, perr
 	}
 	pid, err = readRestoredPIDFromPidfile(pidfilePath, pidfileBudget, pidfilePoll)
@@ -6642,13 +6672,14 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 				"migration", migrationName, "ctxErr", ctx.Err())
 		} else {
 			// Fail loud — never fall back to comm-scan or cgroup-diff (ADR-0228 NRI/gRPC symmetry).
-			// Surface the CRIU restore.log tail: a missing pidfile is usually the DOWNSTREAM symptom
-			// of a restore that aborted earlier (e.g. mount-v2 open_tree on an external mount), and the
-			// real cause is only in restore.log — not in this wrapper message.
 			metrics.MigrationsFailedTotal.WithLabelValues("restore_pidfile_missing").Inc()
 		}
-		logTail := restoreLogTail(restoreLogPath, 4096)
-		return 0, nil, fmt.Errorf("resolve restored PID via CRIU --pidfile: %w\ncriu restore.log tail:\n%s", err, logTail)
+		// ADR-0418: name the causal-first error from the full restore.log rather than a
+		// byte-offset tail window, gated on CRIU's own last-observed terminal exit status. The
+		// checkpoint-dir copy (server.go:6592-6593) has already run by the time this leg is
+		// reached — cite it too.
+		cause := criuRestoreFailureCause(restoreLogPath, checkpointDir, true, lastPidfilePollExited, lastPidfilePollExitCode, lastPidfilePollErr, "")
+		return 0, nil, fmt.Errorf("resolve restored PID via CRIU --pidfile: %w\n%s", err, cause)
 	}
 	// ADR-0228 Invariant 1: identity is guaranteed by --pidfile (CRIU reports the PID it
 	// restored — never the wrapper/holder stub); the residual check is liveness. Defense in
@@ -6767,6 +6798,190 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 
 // readLogTail was removed: ADR-0127 scaffold (restore.log success-signal) removed per ADR-0192.
 // The liveness signal is now the cgroup-PID diff (see joinNsRestore above).
+
+// ADR-0418: criuKnownNonFatalLinePatterns is the causal-attribution known-non-fatal allowlist.
+// Each entry is a CRIU restore.log diagnostic line that is structurally void-helper/cosmetic
+// teardown output and must NEVER be surfaced as THE cause of a restore failure, even when it is
+// the first (or only) line matching "Error (criu/" in the log. Amendable only by ADR (Decision
+// item 5) — each entry requires a recorded per-entry disassembly proof against every deployed
+// CRIU binary before it is added.
+var criuKnownNonFatalLinePatterns = []string{
+	// cleanup_mnt_ns: disassembly-proven void helper at both call sites
+	// (depopulate_roots_yard+380, prepare_namespace_before_tasks+415) — runs during restore
+	// teardown, after the real failure has already been decided; its own error text is
+	// structurally incapable of being the cause. See ADR-0418 Context.
+	"Error (criu/mount.c:3700)",
+	// cgroupd teardown diagnostic, independently observed after the terminal "Restoring FAILED."
+	// line in three real restore logs in this repo's own corpus (docs/sprints/criu-restore.log:305,
+	// criu-restore-attempt5.log:59, criu-restore-attempt7.log:321).
+	"Error (criu/cgroup.c:1998)",
+}
+
+// isKnownNonFatalCRIULine reports whether line matches an ADR-0418 known-non-fatal pattern.
+func isKnownNonFatalCRIULine(line string) bool {
+	for _, p := range criuKnownNonFatalLinePatterns {
+		if strings.Contains(line, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// criuRestoreFailureAttribution is the result of an ADR-0418 forward causal-order scan of a CRIU
+// restore.log.
+type criuRestoreFailureAttribution struct {
+	found           bool   // a non-allowlisted "Error (criu/" line was found — causeLine is authoritative
+	causeLine       string // the named cause line, verbatim (set only when found)
+	terminalLine    string // the first line containing "Restoring FAILED.", if present
+	demoted         bool   // the very first matching line was allowlisted and a later real match exists
+	demotedLine     string // the skipped allowlisted line, verbatim (set when demoted OR onlyAllowlisted)
+	onlyAllowlisted bool   // every matching line found was allowlisted — no real cause present in the log
+	matchCount      int    // total count of "Error (criu/"-matching lines found
+}
+
+// scanCRIURestoreLogForFirstError implements ADR-0418 Decision items 2, 3 and 5: a forward
+// (never reverse), causal-order scan of the FULL restore.log for the first line containing the
+// substring "Error (criu/" — matched via strings.Contains, never strings.HasPrefix, because
+// CRIU's own -v4 line format carries a "(SS.mmmmmm) " timestamp and an optional "<task>: " prefix
+// before the message, so the token is never at column 0 (ADR-0418 Context, corrected line-format
+// grounding). Lines matching the known-non-fatal allowlist are skipped in favor of a later real
+// match unless they are the only match found (Decision item 5, "only-match"/"demotion" cases).
+// The terminal "Restoring FAILED." line, if present, is recorded as informational context only —
+// never a gating condition (ADR-0354 D2b/D7 caveat: a genuine failure can omit it entirely).
+//
+// Implemented on bufio.Scanner with a capped per-line buffer and an overall byte ceiling, not
+// os.ReadFile (the primitive restoreLogTail uses) — per the ADR-0418 implementation note,
+// restore.log volume under -v4 scales with the checkpointed workload's fd/mount/VMA count, which
+// is adversary-influenceable on a multi-tenant node, and a first-match forward scan needs no
+// full-file buffer in the privileged node agent.
+func scanCRIURestoreLogForFirstError(restoreLogPath string) criuRestoreFailureAttribution {
+	var result criuRestoreFailureAttribution
+	if restoreLogPath == "" {
+		return result
+	}
+	f, err := os.Open(restoreLogPath)
+	if err != nil {
+		return result
+	}
+	defer f.Close()
+
+	const maxLineBytes = 64 * 1024        // per-line cap — bufio.Scanner's token buffer ceiling
+	const maxScanBytes = 32 * 1024 * 1024 // overall byte ceiling across the whole scan
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 4096), maxLineBytes)
+
+	var firstMatch, firstNonAllowlisted string
+	firstMatchAllowlisted := false
+	var scanned int64
+	for scanner.Scan() {
+		line := scanner.Text()
+		scanned += int64(len(line)) + 1
+		if scanned > maxScanBytes {
+			break
+		}
+		if result.terminalLine == "" && strings.Contains(line, "Restoring FAILED.") {
+			result.terminalLine = line
+		}
+		if strings.Contains(line, "Error (criu/") {
+			result.matchCount++
+			allowlisted := isKnownNonFatalCRIULine(line)
+			if firstMatch == "" {
+				firstMatch = line
+				firstMatchAllowlisted = allowlisted
+			}
+			if !allowlisted && firstNonAllowlisted == "" {
+				firstNonAllowlisted = line
+			}
+		}
+	}
+
+	if result.matchCount == 0 {
+		return result
+	}
+	if firstNonAllowlisted != "" {
+		result.found = true
+		result.causeLine = firstNonAllowlisted
+		if firstMatchAllowlisted && firstMatch != firstNonAllowlisted {
+			// Decision item 5, demotion case: the first match was allowlisted and a later real
+			// match exists — never silently promote the later line without disclosing this.
+			result.demoted = true
+			result.demotedLine = firstMatch
+		}
+		return result
+	}
+	// Every matching line found was allowlisted — Decision item 5, only-match case: the envelope
+	// must say so explicitly rather than silently reporting the cosmetic line as the cause.
+	result.onlyAllowlisted = true
+	result.demotedLine = firstMatch
+	return result
+}
+
+// criuRestoreFailureCause implements ADR-0418 Decision item 1: CRIU's own terminal exit status
+// (exited && exitCode != 0, from criuCmd.poll(), server.go:8511) gates whether a cause is named
+// at all. mechanismErr, when non-nil, means the poll/broker round-trip itself failed persistently
+// — the read mechanism failed and no CRIU log line is attributable; this is a third class distinct
+// from "CRIU ran and failed" and "CRIU has not finished" and must be reported as such, never
+// folded into either. checkpointDir/checkpointLogCopied cite the checkpoint-dir copy of the log
+// (server.go:6591-6592) only when that copy has already been written by the time the caller's
+// call site executes — citing it before it exists would be an inaccurate path citation
+// (§P-VERIFY #9). stderrTail is the existing bounded byte-offset excerpt (restoreLogTail or the
+// broker stderr capture); retained per the Decision's Retention note as supplementary,
+// non-attributing context ALONGSIDE the causal citation — never the attribution basis itself.
+func criuRestoreFailureCause(restoreLogPath, checkpointDir string, checkpointLogCopied bool, exited bool, exitCode int, mechanismErr error, stderrTail string) string {
+	var b strings.Builder
+
+	switch {
+	case mechanismErr != nil:
+		// Third class: the broker round-trip/poll mechanism itself is persistently failing. No
+		// CRIU verdict was ever obtained, so no CRIU log line is attributable at all.
+		fmt.Fprintf(&b, "criu poll/broker round-trip failed (mechanism failure — no CRIU verdict obtained, no cause attributable from restore.log): %v\n", mechanismErr)
+	case !exited:
+		// CRIU has not reached a terminal state (e.g. a deadline/ctx abort fired first). Per
+		// Decision item 1, a cause MUST NOT be named here — only CRIU's own exit status gates
+		// cause-naming, never log content or the presence/absence of "Restoring FAILED.".
+		fmt.Fprintf(&b, "criu had not terminated when this restore leg aborted — no cause is named (CRIU has not rendered a verdict)\n")
+		attr := scanCRIURestoreLogForFirstError(restoreLogPath)
+		if attr.found {
+			fmt.Fprintf(&b, "last CRIU error observed while restore was still in flight (NOT the cause): %s\n", attr.causeLine)
+		}
+	case exitCode == 0:
+		// Should not normally reach this helper (exit 0 is the success path), but stay honest if
+		// it ever does: no cause to name.
+		fmt.Fprintf(&b, "criu exited 0 — no failure to attribute\n")
+	default:
+		fmt.Fprintf(&b, "criu exited (exit code %d)\n", exitCode)
+		attr := scanCRIURestoreLogForFirstError(restoreLogPath)
+		switch {
+		case attr.found:
+			fmt.Fprintf(&b, "first causal error (earliest \"Error (criu/\" line in restore.log): %s\n", attr.causeLine)
+			if attr.demoted {
+				fmt.Fprintf(&b, "note: an earlier known-non-fatal CRIU diagnostic was demoted, not treated as cause: %s\n", attr.demotedLine)
+			}
+			fmt.Fprintf(&b, "total \"Error (criu/\" lines found in restore.log: %d\n", attr.matchCount)
+		case attr.onlyAllowlisted:
+			fmt.Fprintf(&b, "only a known-non-fatal CRIU diagnostic found; true cause not present in restore.log: %s\n", attr.demotedLine)
+			fmt.Fprintf(&b, "total \"Error (criu/\" lines found in restore.log: %d\n", attr.matchCount)
+		default:
+			fmt.Fprintf(&b, "no \"Error (criu/\" line found in restore.log\n")
+		}
+		if attr.terminalLine != "" {
+			fmt.Fprintf(&b, "terminal line: %s\n", attr.terminalLine)
+		}
+	}
+
+	fmt.Fprintf(&b, "full restore.log: %s", restoreLogPath)
+	if checkpointLogCopied {
+		fmt.Fprintf(&b, " (also copied to %s — available until checkpoint GC, zeroized on release per rule 7)", filepath.Join(checkpointDir, "restore.log"))
+	}
+	b.WriteString("\n")
+
+	if stderrTail != "" {
+		fmt.Fprintf(&b, "criu stderr (bounded excerpt, supplementary/non-attributing):\n%s", stderrTail)
+	}
+
+	return b.String()
+}
 
 // restoreLogTail reads the tail of CRIU's restore.log (written by criu -o restoreLogPath, running
 // via nsenter in the host mount ns) so the REAL restore failure — e.g. the mount-v2 open_tree
