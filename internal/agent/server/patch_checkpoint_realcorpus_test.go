@@ -146,6 +146,28 @@ elif shape == 'reattach_only':
     ])
     dump('fdinfo-2.img', 'FDINFO', [fd(1, 10), fd(2, 11)])
 
+elif shape == 'fstype_int_forms':
+    # ADR-0417 dead-comparison regression (Chad-grounded, 2026-09-02): DROP_ROOT_FSTYPES seeds
+    # is_drop_root() by fstype, and tmpfs_drop_mnt_ids seeds is_drop_root()-AND-tmpfs mounts. Both
+    # predicates used to compare fstype against STRING values ('sysfs' / 'TMPFS'), but pycriu
+    # decodes mnt_entry.fstype as the raw protobuf uint32 int CRIU wrote (sysfs=2, tmpfs=5), never
+    # the name — so both comparisons were always False on a real image and the code they guarded
+    # never fired.
+    #   - /alt-sysfs: fstype=2 (SYSFS), NOT any DROP_PATHS path — dropped as a root ONLY if
+    #     DROP_ROOT_FSTYPES matches the int form (mirrors "a second sysfs instance in kind", the
+    #     documented reason DROP_ROOT_FSTYPES exists instead of relying on DROP_PATHS' literal '/sys').
+    #   - /sys/fs/cgroup: fstype=5, landed deliberately on an exact DROP_PATHS entry (real cgroup2
+    #     is fstype 23; the tmpfs fstype here is fabricated purely to make this entry BOTH
+    #     is_drop_root()==True and tmpfs-typed) — its mnt_id seeds tmpfs_drop_mnt_ids ONLY if that
+    #     seed's fstype comparison matches the int form.
+    dump('mountpoints-10.img', 'MNTS', [
+        mnt(1, 0, '/',              17, src='overlay'),
+        mnt(2, 1, '/alt-sysfs',     2,  src='sysfs'),
+        mnt(3, 1, '/sys/fs/cgroup', 5,  src='tmpfs'),
+    ])
+    dump('files.img', 'FILES', [])
+    dump('fdinfo-2.img', 'FDINFO', [])
+
 elif shape == 'inherit_only':
     # Same mounts, but the ONLY files.img entry is the /data orphan fd, and the test passes its
     # slash-stripped name as an --inherit-fd name (argv[3]) so classify_reg_fd returns KEEP.
@@ -856,5 +878,86 @@ print(json.dumps({'mountpoints': mountpoints, 'reg_mnt_ids': reg_mnt_ids}))
 	}
 	if len(decoded.RegMntIDs) != 1 || decoded.RegMntIDs[0] != 3 {
 		t.Fatalf("ADR-0382 regression: /dev/shm REG fd's mnt_id must remain 3 (untouched, content-preserving path), got: %v", decoded.RegMntIDs)
+	}
+}
+
+// TestRealCorpus_FstypeIntVsStringDropRootAndTmpfsSeed is the direct regression for the ADR-0417
+// dead-comparison bug (Chad-grounded, 2026-09-02): DROP_ROOT_FSTYPES (is_drop_root()'s sysfs-by-type
+// seed) and the tmpfs_drop_mnt_ids seed both compared mnt_entry.fstype against STRING values
+// ('sysfs' / 'TMPFS'), but pycriu.images.load renders fstype as the raw protobuf uint32 int CRIU
+// wrote (sysfs=2, tmpfs=5) — never the name — on every real image (confirmed live against
+// mountpoints-13.img decoded off the standing KVM cluster). Both comparisons were therefore always
+// False and the code they guard was dead: /sys was dropped only because '/sys' is ALSO a literal
+// DROP_PATHS entry (masking the bug for the one instance that happens to sit at that exact path),
+// and tmpfs_drop_mnt_ids — the ADR-0311 seed set classify_reg_fd's REBIND_TO_ROOT decision
+// consults — was ALWAYS EMPTY.
+//
+// This test runs the ACTUAL assembled production script (assemblePatchScript(), the same string
+// production writes to disk) against a real-shape mountpoints image built with integer fstype
+// codes exactly as pycriu renders them, then reads back the two production-computed sets directly
+// (DROP_ROOT_FSTYPES, tmpfs_drop_mnt_ids leak as module-level names after the single-iteration
+// mountpoints for-loop exits — no hand-copied mirror of the predicate is used, so this cannot drift
+// from production the way the pre-fix string-only comparison did).
+func TestRealCorpus_FstypeIntVsStringDropRootAndTmpfsSeed(t *testing.T) {
+	ckptDir := t.TempDir()
+	pypath, extraEnv := generateRealShapeCorpus(t, ckptDir, "fstype_int_forms")
+
+	// Append a diagnostic tail to the REAL production script (never a hand-copy) that reports the
+	// two sets under test. DROP_ROOT_FSTYPES and tmpfs_drop_mnt_ids are plain assignments inside a
+	// top-level `for mp_path in glob.glob(...)` loop in a script run as __main__ — Python for-loops
+	// do not introduce a new scope, so after the (single-image) loop exits these names are still
+	// live module globals holding the production-computed values.
+	script := assemblePatchScript() + "\n" +
+		"print('PM_TEST_MARKER drop_root_fstypes_has_int_2=%s tmpfs_drop_mnt_ids=%s' % (2 in DROP_ROOT_FSTYPES, sorted(tmpfs_drop_mnt_ids)))\n"
+	scriptPath := filepath.Join(t.TempDir(), "pm-patch-ckpt-diag.py")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o600); err != nil {
+		t.Fatalf("write diagnostic patch script: %v", err)
+	}
+	cmd := exec.Command("python3", scriptPath, ckptDir, "[]", "[]")
+	cmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("production patch script failed: %v\noutput: %s", err, out)
+	}
+
+	const wantMarker = "PM_TEST_MARKER drop_root_fstypes_has_int_2=True tmpfs_drop_mnt_ids=[3]"
+	if !strings.Contains(string(out), wantMarker) {
+		t.Errorf("ADR-0417 dead-comparison regression:\n"+
+			"  DROP_ROOT_FSTYPES must contain the int fstype code 2 (SYSFS), not only the string 'sysfs'\n"+
+			"  tmpfs_drop_mnt_ids must be seeded with mnt_id=3 (the fstype=5 TMPFS entry at /sys/fs/cgroup,\n"+
+			"  which IS is_drop_root()==True via the exact DROP_PATHS match) — the int form of TMPFS must match too\n"+
+			"want marker: %s\ngot output:\n%s", wantMarker, out)
+	}
+
+	// Corroborate via observable behavior: /alt-sysfs (fstype=2, NOT any DROP_PATHS path) must be
+	// dropped from the FINAL patched mountpoints image — the only way it can be dropped is via the
+	// DROP_ROOT_FSTYPES int-match, since it never matches DROP_PATHS by name or the parent_mnt_id
+	// closure (its parent, '/', is never dropped).
+	decode := `
+import sys, os, json
+import pycriu
+d = sys.argv[1]
+with open(os.path.join(d, 'mountpoints-10.img'), 'rb') as f:
+    mp = pycriu.images.load(f)
+print(json.dumps(sorted(e.get('mountpoint') for e in mp.get('entries', []))))
+`
+	decodePath := filepath.Join(t.TempDir(), "pm-decode-fstype.py")
+	if err := os.WriteFile(decodePath, []byte(decode), 0o600); err != nil {
+		t.Fatalf("write decode script: %v", err)
+	}
+	decodeCmd := exec.Command("python3", decodePath, ckptDir)
+	decodeCmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
+	decodeOut, decodeErr := decodeCmd.CombinedOutput()
+	if decodeErr != nil {
+		t.Fatalf("decode of patched mountpoints image failed: %v\noutput: %s", decodeErr, decodeOut)
+	}
+	var mountpoints []string
+	if err := json.Unmarshal(decodeOut, &mountpoints); err != nil {
+		t.Fatalf("parse decode output %q: %v", string(decodeOut), err)
+	}
+	for _, mp := range mountpoints {
+		if mp == "/alt-sysfs" {
+			t.Fatalf("ADR-0417: /alt-sysfs (fstype=2, SYSFS by int code, not a DROP_PATHS path) must be dropped via DROP_ROOT_FSTYPES' int-fstype match; got mountpoints: %v", mountpoints)
+		}
 	}
 }

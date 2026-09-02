@@ -180,8 +180,15 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     # /proc and /dev are NOT in DROP_ROOT_FSTYPES — policy keeps /proc root and /dev;
     # only specific submounts listed in DROP_PATHS are removed exactly.
 
+    # ADR-0417 int-vs-string fix: mnt_entry.fstype (criu/images/mnt.proto) is a plain protobuf
+    # uint32 field, NOT a TYPE_ENUM field, so pycriu.images.load returns the raw integer CRIU
+    # wrote (sysfs=2), never the decoded enum-name string 'sysfs' — same grounding as
+    # RECREATABLE_FSTYPES below and the _fst in (...) fix at the REBIND_TO_ROOT site. Both the
+    # int code and the string are listed so a pycriu build that ever DOES decode names (e.g.
+    # pretty=True) still matches, matching the ('TMPFS', 'DEVTMPFS', 5, 3) convention used there.
+    FSTYPE_SYSFS = 2
     DROP_ROOT_FSTYPES = {
-        'sysfs',   # /sys — re-provided by destination runtime; catches both sysfs instances in kind
+        FSTYPE_SYSFS, 'sysfs',   # /sys — re-provided by destination runtime; catches both sysfs instances in kind
         # NOTE: procfs NOT here — policy keeps /proc root, drops only named submounts
     }
 
@@ -215,7 +222,15 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
         mp = entry.get('mountpoint')
         if mp in DROP_PATHS:
             return True
-        if entry.get('fstype') in DROP_ROOT_FSTYPES:
+        # The fstype-based seed is scoped to CRIU-NATIVE mounts only (no ext_key) — it exists to
+        # catch a genuine kernel-mounted sysfs instance that CRIU did NOT record as an external
+        # (e.g. a second /sys-shaped mount under a different path in kind), which DROP_PATHS'
+        # literal '/sys' string cannot. An EXTERNAL entry (ext_key set) that happens to carry the
+        # same fstype code is a different animal — an auto-detected bind/PVC mount — and is left
+        # for the ADR-0417 external-mount classification pass below (reattach / RECREATABLE
+        # internalize / DESTINATION-REBIND), which already has its own fstype-driven predicate
+        # (RECREATABLE_FSTYPES, which also lists 2/SYSFS) for exactly that case.
+        if entry.get('fstype') in DROP_ROOT_FSTYPES and not entry.get('ext_key'):
             return True
         return False
 
@@ -232,7 +247,13 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     # tmpfs_drop_mnt_ids, so its REG orphan fds DECLINE rather than rebind — documented
     # fail-closed narrowing (ADR-0311 decision 1), not a regression, out of scope to widen here.
     # Disjoint by construction from any DROP_ROOT_FSTYPES(sysfs) match (TMPFS != sysfs).
-    tmpfs_drop_mnt_ids = {e['mnt_id'] for e in img['entries'] if is_drop_root(e) and 'mnt_id' in e and e.get('fstype') == 'TMPFS'}
+    #
+    # ADR-0417 int-vs-string fix: same grounding as DROP_ROOT_FSTYPES above and the _fst in (...)
+    # fix at the REBIND_TO_ROOT site — fstype is a raw protobuf uint32 (tmpfs=5), not the decoded
+    # enum-name string 'TMPFS', so the string-only comparison this set used to use never matched
+    # a real pycriu-decoded image and this seed set was always empty. Accept both forms.
+    FSTYPE_TMPFS = 5
+    tmpfs_drop_mnt_ids = {e['mnt_id'] for e in img['entries'] if is_drop_root(e) and 'mnt_id' in e and e.get('fstype') in (FSTYPE_TMPFS, 'TMPFS')}
 
     # PodMotion's own holder-bin scaffold mount, seeded by MOUNTPOINT (not by drop-pass
     # membership — this mount is bind-mounted into the container, so it survives Phase A/B and is
@@ -311,7 +332,8 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
         for p in DROP_PATHS:
             if mp == p or mp.startswith(p + '/'):
                 return True
-        if entry.get('fstype') in DROP_ROOT_FSTYPES:
+        # Same ext_key scoping as is_drop_root() above — see that function's comment.
+        if entry.get('fstype') in DROP_ROOT_FSTYPES and not entry.get('ext_key'):
             return True
         return False
 
