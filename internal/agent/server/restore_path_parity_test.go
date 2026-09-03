@@ -199,7 +199,7 @@ func TestJoinNsRestore_ReturnsMACToCaller(t *testing.T) {
 	// upstream NRI/gRPC ctx to thread (it drives JoinNsRestore directly, not through the NRI
 	// plugin), so context.Background() is used deliberately — this is a test-only call site,
 	// not a live production path.
-	_, gotMAC, err := s.JoinNsRestore(context.Background(), "test-nri-migration", "default", "/tmp/fake-checkpoint", "", "", "", "", "", "None")
+	_, gotMAC, err := s.JoinNsRestore(context.Background(), "test-nri-migration", "default", "/tmp/fake-checkpoint", "", "", "", "", "", "None", nil)
 	if err != nil {
 		t.Fatalf("JoinNsRestore returned unexpected error: %v", err)
 	}

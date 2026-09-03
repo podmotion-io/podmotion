@@ -89,7 +89,21 @@ func TestJoinNsRestore_SeedsPMSeqXlat_NRIPath(t *testing.T) {
 			},
 		},
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pm).WithStatusSubresource(pm).Build()
+	// ADR-0417: the NRI restore path resolves Class DESTINATION-REBIND targets from the replacement
+	// pod (its UID keys the kubelet pod dir and its containerd sandbox). Production always has one by
+	// the time restore runs — the controller creates it and stamps the migration-name label — so the
+	// fixture carries one too. Without it this test would exercise a state the live path never
+	// reaches. The host-environment seams are stubbed package-wide in TestMain
+	// (adr0417_destination_rebind_test.go).
+	replPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "redis-src-r-seed",
+			Namespace: namespace,
+			UID:       types.UID("seed-repl-uid"),
+			Labels:    map[string]string{replacementPodLabelKey: migration},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pm, replPod).WithStatusSubresource(pm).Build()
 
 	s := New("test-node", &criu.StubCheckpointer{}, fakeClient)
 	mock := &trackingRelayManager{}
@@ -115,7 +129,7 @@ func TestJoinNsRestore_SeedsPMSeqXlat_NRIPath(t *testing.T) {
 	s.destWorkloadImage[migration] = "docker.io/library/redis:7-alpine"
 	s.destWorkloadImageMu.Unlock()
 
-	_, _, err := s.JoinNsRestore(context.Background(), migration, namespace, "/tmp/fake-checkpoint", "", "", "", "", "", "None")
+	_, _, err := s.JoinNsRestore(context.Background(), migration, namespace, "/tmp/fake-checkpoint", "", "", "", "", "", "None", nil)
 	if err != nil {
 		t.Fatalf("JoinNsRestore returned unexpected error: %v", err)
 	}
@@ -194,7 +208,7 @@ func TestJoinNsRestore_SeedFailure_FailsClosed(t *testing.T) {
 	s.destWorkloadImage[migration] = "docker.io/library/redis:7-alpine"
 	s.destWorkloadImageMu.Unlock()
 
-	_, _, err := s.JoinNsRestore(context.Background(), migration, namespace, "/tmp/fake-checkpoint", "", "", "", "", "", "None")
+	_, _, err := s.JoinNsRestore(context.Background(), migration, namespace, "/tmp/fake-checkpoint", "", "", "", "", "", "None", nil)
 	if err == nil {
 		t.Fatal("expected JoinNsRestore to fail closed when SeedRelayFromSnapshots fails, got nil error")
 	}

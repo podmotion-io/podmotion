@@ -246,6 +246,38 @@ var (
 		},
 		[]string{"outcome"},
 	)
+
+	// MountContentAvailabilityOutcomeTotal counts the ADR-0420 D1 content-availability decision,
+	// once per classified content-bearing recreatable EXTERNAL mount, so the denominator is real
+	// and a silent change in the population is visible.
+	//
+	// This is the counter that would have made the defect visible from the start. Before ADR-0420
+	// the transition "internalized a mount whose content is not in the checkpoint" was not merely
+	// unattributed — it was UNCOUNTED, and it failed inside CRIU with no error line at all.
+	//
+	// Labels: outcome —
+	//   "internalized_with_content"  the checkpoint carries this mount's tmpfs content image, so it
+	//                                is internalized exactly as before (today this is /dev/shm's
+	//                                population, fed by the dump-side capture built for it). A ZERO
+	//                                here on a real migration means the dump-side content capture
+	//                                stopped producing images.
+	//   "rebound_content_absent"     recreatable and construct-and-fill, but no content image in the
+	//                                checkpoint — routed to Class DESTINATION-REBIND and resolved
+	//                                against the destination runtime's own mount. THIS IS THE ONE
+	//                                THAT MATTERS: it is the population that was silently
+	//                                mis-handled before this ADR, and a zero on a real migration
+	//                                means D1 is not doing anything.
+	//   "unresolved_content_absent"  same, but the destination runtime did not offer the mount
+	//                                either — a named, fail-closed hard stop before CRIU is invoked,
+	//                                instead of a silent tmpfs_restore failure inside it.
+	MountContentAvailabilityOutcomeTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "podmotion",
+			Name:      "mount_content_availability_outcome_total",
+			Help:      "Count of ADR-0420 D1 mount content-availability decisions per content-bearing recreatable external mount, labeled by outcome (internalized_with_content|rebound_content_absent|unresolved_content_absent).",
+		},
+		[]string{"outcome"},
+	)
 )
 
 func init() {
@@ -265,5 +297,6 @@ func init() {
 		NRISocketOwnershipMismatchTotal,
 		EvictionWebhookFailClosedTotal,
 		NRIRestoreGateOutcomeTotal,
+		MountContentAvailabilityOutcomeTotal,
 	)
 }

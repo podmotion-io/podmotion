@@ -146,6 +146,28 @@ elif shape == 'reattach_only':
     ])
     dump('fdinfo-2.img', 'FDINFO', [fd(1, 10), fd(2, 11)])
 
+elif shape == 'fstype_int_forms':
+    # ADR-0417 dead-comparison regression (Chad-grounded, 2026-09-02): DROP_ROOT_FSTYPES seeds
+    # is_drop_root() by fstype, and tmpfs_drop_mnt_ids seeds is_drop_root()-AND-tmpfs mounts. Both
+    # predicates used to compare fstype against STRING values ('sysfs' / 'TMPFS'), but pycriu
+    # decodes mnt_entry.fstype as the raw protobuf uint32 int CRIU wrote (sysfs=2, tmpfs=5), never
+    # the name — so both comparisons were always False on a real image and the code they guarded
+    # never fired.
+    #   - /alt-sysfs: fstype=2 (SYSFS), NOT any DROP_PATHS path — dropped as a root ONLY if
+    #     DROP_ROOT_FSTYPES matches the int form (mirrors "a second sysfs instance in kind", the
+    #     documented reason DROP_ROOT_FSTYPES exists instead of relying on DROP_PATHS' literal '/sys').
+    #   - /sys/fs/cgroup: fstype=5, landed deliberately on an exact DROP_PATHS entry (real cgroup2
+    #     is fstype 23; the tmpfs fstype here is fabricated purely to make this entry BOTH
+    #     is_drop_root()==True and tmpfs-typed) — its mnt_id seeds tmpfs_drop_mnt_ids ONLY if that
+    #     seed's fstype comparison matches the int form.
+    dump('mountpoints-10.img', 'MNTS', [
+        mnt(1, 0, '/',              17, src='overlay'),
+        mnt(2, 1, '/alt-sysfs',     2,  src='sysfs'),
+        mnt(3, 1, '/sys/fs/cgroup', 5,  src='tmpfs'),
+    ])
+    dump('files.img', 'FILES', [])
+    dump('fdinfo-2.img', 'FDINFO', [])
+
 elif shape == 'inherit_only':
     # Same mounts, but the ONLY files.img entry is the /data orphan fd, and the test passes its
     # slash-stripped name as an --inherit-fd name (argv[3]) so classify_reg_fd returns KEEP.
@@ -279,24 +301,32 @@ func TestRealCorpus_ParentMntGraphClosureAndOwnedInternalize(t *testing.T) {
 	// (backing_mnt_id 2951) does NOT orphan.
 	out, _ := runProductionPatchScript(t, pypath, extraEnv, ckptDir, []string{"/data"}, nil)
 
-	// (a) parent_mnt_id graph closure: the /sys subtree (structural carve-out) is dropped. /data is
-	// internalized (kept), so the kept set is root + /proc + /dev/shm + /data = 4 entries.
-	if !strings.Contains(out, "mountpoints-10.img") || !strings.Contains(out, "kept 4 entries") {
-		t.Errorf("expected mountpoints graph closure to keep exactly 4 entries (root + /proc + /dev/shm + internalized /data); got: %s", out)
+	// ADR-0417 SUPERSEDES the ADR-0415 expectation this test used to encode. The corpus /data mount
+	// records fstype=0 (a REAL block/NFS filesystem — CRIU's own fstypes[] table has no
+	// construct-and-fill row for it; btrfs is in that table with code 0 for exactly this reason), so
+	// it is Class DESTINATION-REBIND, not Class RECREATABLE. Internalizing it — clearing ext_key and
+	// setting root='/' while leaving fstype at 0 — produced precisely the triple
+	// criu/mount.c validate_mounts is written to reject, and threw the volume's real backing away.
+	// With no destination target supplied (empty argv[5]) the correct behavior is a FAIL-CLOSED
+	// hard-stop, not a silent internalize.
+	if !strings.Contains(out, "EXTERNAL_MOUNT_UNRESOLVED") || !strings.Contains(out, "destination_rebind_target_unresolved") {
+		t.Errorf("ADR-0417: an fstype-0 external with no destination target must hard-stop fail-closed; got: %s", out)
 	}
-
-	// (b) ADR-0415 owned internalize: /data must be internalized (not dropped).
-	if !strings.Contains(out, "internalizing owned mount") || !strings.Contains(out, "mnt_id=2951") || !strings.Contains(out, "mountpoint=/data") {
-		t.Errorf("expected 'internalizing owned mount mnt_id=2951 mountpoint=/data' (ADR-0415); got: %s", out)
+	if !strings.Contains(out, `"mnt_id": 2951`) {
+		t.Errorf("ADR-0417: the hard-stop must name the offending mount (mnt_id 2951); got: %s", out)
 	}
-	// The retired B-2 drop token must NOT appear for /data.
+	// It must NOT be internalized: that is the disproven ADR-0415 carve-out (b) behavior.
+	if strings.Contains(out, "internalizing RECREATABLE mount") && strings.Contains(out, "mountpoint=/data") {
+		t.Errorf("ADR-0417: /data (fstype 0, a real block/NFS filesystem) must NOT be internalized; got: %s", out)
+	}
+	// The retired B-2 drop token must still NOT appear for /data.
 	if strings.Contains(out, `CRIU_EXTERNAL_MOUNT_DROPPED:`) {
-		t.Errorf("ADR-0415: /data must be internalized, not B-2-dropped — no CRIU_EXTERNAL_MOUNT_DROPPED expected; got: %s", out)
+		t.Errorf("/data must not be B-2-dropped — no CRIU_EXTERNAL_MOUNT_DROPPED expected; got: %s", out)
 	}
-
-	// (c) the /data REG-fd must NOT hard-stop (it is backed by the kept, internalized /data mount).
-	if strings.Contains(out, `CRIU_IMAGE_INCONSISTENCY:`) && strings.Contains(out, `"backing_mnt_id":2951`) {
-		t.Errorf("ADR-0415: the /data REG-fd must NOT P-0193-1 hard-stop once /data is internalized; got: %s", out)
+	// The /sys structural carve-out must still be dropped by the parent_mnt_id graph closure — the
+	// original property this test exists for, unaffected by the classification change.
+	if strings.Contains(out, "/sys/devices") {
+		t.Errorf("expected the /sys subtree to be dropped by the graph closure; got: %s", out)
 	}
 }
 
@@ -345,7 +375,11 @@ func TestRealCorpus_ReattachExternalMountPreserved(t *testing.T) {
 	// TestRealCorpus_InheritFdNameExcludesFromFiringClass, not exercised here). So the script may
 	// still exit non-zero for THAT fd; this test asserts ONLY that the /data re-attach fd (fd_id 1,
 	// backing_mnt_id 2951) is preserved and does NOT orphan — the exact postgres PGDATA property.
-	out, _ := runProductionPatchScript(t, pypath, extraEnv, ckptDir, nil, nil, []string{"/data"})
+	// ADR-0417 S1(a): a re-attach-set member with no resolvable destination host target now hard-stops
+	// (it used to be preserved with its SOURCE-node root/source intact and its exemption already
+	// granted — carve-out (a) failing OPEN). Production always supplies the target, so the test does.
+	out, _ := runProductionPatchScriptHT(t, pypath, extraEnv, ckptDir, nil, nil, []string{"/data"},
+		map[string]string{"/data": "/var/lib/kubelet/pods/22222222-2222-2222-2222-222222222222/volumes/kubernetes.io~nfs/pvc-dst"})
 
 	// (1) The /data external mount must be PRESERVED (kept), not B-2 dropped. The mount carries the
 	// real ext_key='CRIU:AUTOGENERATED', so preservation succeeds ONLY via the mountpoint match —
@@ -381,9 +415,13 @@ func TestRealCorpus_ReattachExternalMountPreserved(t *testing.T) {
 	// (4) Isolated corpus (no unrelated cgroup orphan) — the script must run to FULL SUCCESS
 	//     (exit 0) with the re-attach external preserved, exercising the P-0194-1c dual-write
 	//     assertion end-to-end. This is the clean postgres PGDATA end-state.
+	// ADR-0417 S1(a): carve-out (a) now fails CLOSED when a member of the re-attach set has no
+	// resolvable destination host target, so this end-to-end success case must supply one (which is
+	// what production always does — reattachHostTargets carries every resolved mount).
 	isoDir := t.TempDir()
 	isoPy, isoEnv := generateRealShapeCorpus(t, isoDir, "reattach_only")
-	isoOut, isoErr := runProductionPatchScript(t, isoPy, isoEnv, isoDir, nil, nil, []string{"/data"})
+	isoOut, isoErr := runProductionPatchScriptHT(t, isoPy, isoEnv, isoDir, nil, nil, []string{"/data"},
+		map[string]string{"/data": "/var/lib/kubelet/pods/22222222-2222-2222-2222-222222222222/volumes/kubernetes.io~nfs/pvc-dst"})
 	if isoErr != nil {
 		t.Fatalf("isolated re-attach corpus with /data in argv[4]: expected exit 0 (mount preserved, "+
 			"dual-write verified, fd consistent) — postgres end-state. got error %v, output:\n%s", isoErr, isoOut)
@@ -391,26 +429,25 @@ func TestRealCorpus_ReattachExternalMountPreserved(t *testing.T) {
 	if !strings.Contains(isoOut, "P-0194-1c dual-write verified") {
 		t.Errorf("expected the P-0194-1c dual-write consistency check to PASS on the preserved mount; got:\n%s", isoOut)
 	}
-	// Contrast control on the SAME isolated corpus (ADR-0415): WITHOUT /data in the re-attach set,
-	// /data is not a storage-tier PVC re-attach, so it is INTERNALIZED (CRIU-owned + content), not
-	// dropped-and-hard-stopped. The data-file fd on the now-internal mount stays consistent (its
-	// mnt_id is kept), so the script runs to SUCCESS — the ADR-0415 owned-capture end-state that
-	// supersedes the former B-2 drop + P-0193-1 hard-stop. (The distinction between "PVC re-attach"
-	// and "internalize" comes solely from the re-attach set, per carve-out 2.)
+	// Contrast control on the SAME isolated corpus (ADR-0417, superseding the ADR-0415 expectation):
+	// WITHOUT /data in the re-attach set AND with no destination target, /data is an fstype-0
+	// external — a real block/NFS filesystem CRIU cannot construct-and-fill — so it is Class
+	// DESTINATION-REBIND and the script FAILS CLOSED. The prior expectation (internalize it as
+	// CRIU-owned) is exactly the ADR-0415 carve-out (b) defect: it cleared ext_key and set root='/'
+	// on a mount whose recorded fstype stays 0, which criu/mount.c validate_mounts rejects, and
+	// silently discarded the volume's real backing. Failing closed is the corrected end-state.
 	ncDir := t.TempDir()
 	ncPy, ncEnv := generateRealShapeCorpus(t, ncDir, "reattach_only")
 	ncOut, ncErr := runProductionPatchScript(t, ncPy, ncEnv, ncDir, nil, nil, []string{})
-	if ncErr != nil {
-		t.Errorf("ADR-0415 contrast control (empty reattach set): expected /data to be INTERNALIZED "+
-			"and the script to succeed (owned-capture), got error %v; output:\n%s", ncErr, ncOut)
+	if ncErr == nil {
+		t.Errorf("ADR-0417 contrast control (empty reattach set, no destination target): expected a "+
+			"fail-closed hard-stop for the fstype-0 /data external; got exit 0; output:\n%s", ncOut)
 	}
-	if !strings.Contains(ncOut, "internalizing owned mount") || !strings.Contains(ncOut, "mountpoint=/data") {
-		t.Errorf("ADR-0415 contrast control: expected an 'internalizing owned mount ... mountpoint=/data' "+
-			"log line (owned => CRIU-owned + content); got:\n%s", ncOut)
+	if !strings.Contains(ncOut, "destination_rebind_target_unresolved") {
+		t.Errorf("ADR-0417 contrast control: expected reason destination_rebind_target_unresolved; got:\n%s", ncOut)
 	}
-	if strings.Contains(ncOut, `"backing_mnt_id":2951`) {
-		t.Errorf("ADR-0415 contrast control: /data internalized — its data-file fd must NOT orphan "+
-			"(no P-0193-1 for backing_mnt_id 2951); got:\n%s", ncOut)
+	if strings.Contains(ncOut, "internalizing RECREATABLE mount") && strings.Contains(ncOut, "mountpoint=/data") {
+		t.Errorf("ADR-0417 contrast control: /data (fstype 0) must never be internalized; got:\n%s", ncOut)
 	}
 }
 
@@ -485,17 +522,26 @@ func TestRealCorpus_ReattachExternalMountSourceRewritten(t *testing.T) {
 		t.Errorf("source-node path %q must not survive in the patched image (CRIU would open_tree it and ENOENT); root=%q source=%q", srcPath, root, source)
 	}
 
-	// (2) Non-vacuity: WITHOUT argv[5], the mount is still preserved but its source is left intact —
-	// proving the rewrite is driven by the supplied host target, not unconditional.
+	// (2) Non-vacuity, ADR-0417 S1(a) form: WITHOUT argv[5] the rewrite cannot happen, and the
+	// corrected behavior is a FAIL-CLOSED hard-stop rather than "preserve the entry with its
+	// SOURCE-node root/source intact". The old expectation was the fail-open defect itself: the
+	// entry kept the source-node path AND its ext_key AND its exemption-set membership, so the only
+	// thing standing between it and CRIU open_tree()ing a path that exists on the wrong node was a
+	// separate Go-side guard much later in the sequence.
 	dir2 := t.TempDir()
 	pypath2, env2 := generateRealShapeCorpus(t, dir2, "reattach_only")
 	out2, err2 := runProductionPatchScript(t, pypath2, env2, dir2, nil, nil, []string{"/data"})
-	if err2 != nil {
-		t.Fatalf("patch without host target: expected exit 0 (mount still preserved); got %v\noutput:\n%s", err2, out2)
+	if err2 == nil {
+		t.Fatalf("patch without host target must hard-stop fail-closed (ADR-0417 S1(a)); got exit 0\noutput:\n%s", out2)
 	}
+	if !strings.Contains(out2, "reattach_target_unresolved") {
+		t.Errorf("expected reason reattach_target_unresolved; got:\n%s", out2)
+	}
+	// And the image must be left unwritten — the SOURCE-node path must never have been exempted and
+	// committed. The .orig backup is the pre-patch truth; the live image must still match it.
 	root2, source2 := decodeMountEntry(t, pypath2, env2, dir2, "/data")
 	if root2 != srcPath || source2 != "/"+srcPath {
-		t.Errorf("without a host target the source must be left intact: got root=%q source=%q, want root=%q source=%q", root2, source2, srcPath, "/"+srcPath)
+		t.Errorf("a hard-stopped patch must not have rewritten the image: got root=%q source=%q, want root=%q source=%q", root2, source2, srcPath, "/"+srcPath)
 	}
 }
 
@@ -832,5 +878,86 @@ print(json.dumps({'mountpoints': mountpoints, 'reg_mnt_ids': reg_mnt_ids}))
 	}
 	if len(decoded.RegMntIDs) != 1 || decoded.RegMntIDs[0] != 3 {
 		t.Fatalf("ADR-0382 regression: /dev/shm REG fd's mnt_id must remain 3 (untouched, content-preserving path), got: %v", decoded.RegMntIDs)
+	}
+}
+
+// TestRealCorpus_FstypeIntVsStringDropRootAndTmpfsSeed is the direct regression for the ADR-0417
+// dead-comparison bug (Chad-grounded, 2026-09-02): DROP_ROOT_FSTYPES (is_drop_root()'s sysfs-by-type
+// seed) and the tmpfs_drop_mnt_ids seed both compared mnt_entry.fstype against STRING values
+// ('sysfs' / 'TMPFS'), but pycriu.images.load renders fstype as the raw protobuf uint32 int CRIU
+// wrote (sysfs=2, tmpfs=5) — never the name — on every real image (confirmed live against
+// mountpoints-13.img decoded off the standing KVM cluster). Both comparisons were therefore always
+// False and the code they guard was dead: /sys was dropped only because '/sys' is ALSO a literal
+// DROP_PATHS entry (masking the bug for the one instance that happens to sit at that exact path),
+// and tmpfs_drop_mnt_ids — the ADR-0311 seed set classify_reg_fd's REBIND_TO_ROOT decision
+// consults — was ALWAYS EMPTY.
+//
+// This test runs the ACTUAL assembled production script (assemblePatchScript(), the same string
+// production writes to disk) against a real-shape mountpoints image built with integer fstype
+// codes exactly as pycriu renders them, then reads back the two production-computed sets directly
+// (DROP_ROOT_FSTYPES, tmpfs_drop_mnt_ids leak as module-level names after the single-iteration
+// mountpoints for-loop exits — no hand-copied mirror of the predicate is used, so this cannot drift
+// from production the way the pre-fix string-only comparison did).
+func TestRealCorpus_FstypeIntVsStringDropRootAndTmpfsSeed(t *testing.T) {
+	ckptDir := t.TempDir()
+	pypath, extraEnv := generateRealShapeCorpus(t, ckptDir, "fstype_int_forms")
+
+	// Append a diagnostic tail to the REAL production script (never a hand-copy) that reports the
+	// two sets under test. DROP_ROOT_FSTYPES and tmpfs_drop_mnt_ids are plain assignments inside a
+	// top-level `for mp_path in glob.glob(...)` loop in a script run as __main__ — Python for-loops
+	// do not introduce a new scope, so after the (single-image) loop exits these names are still
+	// live module globals holding the production-computed values.
+	script := assemblePatchScript() + "\n" +
+		"print('PM_TEST_MARKER drop_root_fstypes_has_int_2=%s tmpfs_drop_mnt_ids=%s' % (2 in DROP_ROOT_FSTYPES, sorted(tmpfs_drop_mnt_ids)))\n"
+	scriptPath := filepath.Join(t.TempDir(), "pm-patch-ckpt-diag.py")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o600); err != nil {
+		t.Fatalf("write diagnostic patch script: %v", err)
+	}
+	cmd := exec.Command("python3", scriptPath, ckptDir, "[]", "[]")
+	cmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("production patch script failed: %v\noutput: %s", err, out)
+	}
+
+	const wantMarker = "PM_TEST_MARKER drop_root_fstypes_has_int_2=True tmpfs_drop_mnt_ids=[3]"
+	if !strings.Contains(string(out), wantMarker) {
+		t.Errorf("ADR-0417 dead-comparison regression:\n"+
+			"  DROP_ROOT_FSTYPES must contain the int fstype code 2 (SYSFS), not only the string 'sysfs'\n"+
+			"  tmpfs_drop_mnt_ids must be seeded with mnt_id=3 (the fstype=5 TMPFS entry at /sys/fs/cgroup,\n"+
+			"  which IS is_drop_root()==True via the exact DROP_PATHS match) — the int form of TMPFS must match too\n"+
+			"want marker: %s\ngot output:\n%s", wantMarker, out)
+	}
+
+	// Corroborate via observable behavior: /alt-sysfs (fstype=2, NOT any DROP_PATHS path) must be
+	// dropped from the FINAL patched mountpoints image — the only way it can be dropped is via the
+	// DROP_ROOT_FSTYPES int-match, since it never matches DROP_PATHS by name or the parent_mnt_id
+	// closure (its parent, '/', is never dropped).
+	decode := `
+import sys, os, json
+import pycriu
+d = sys.argv[1]
+with open(os.path.join(d, 'mountpoints-10.img'), 'rb') as f:
+    mp = pycriu.images.load(f)
+print(json.dumps(sorted(e.get('mountpoint') for e in mp.get('entries', []))))
+`
+	decodePath := filepath.Join(t.TempDir(), "pm-decode-fstype.py")
+	if err := os.WriteFile(decodePath, []byte(decode), 0o600); err != nil {
+		t.Fatalf("write decode script: %v", err)
+	}
+	decodeCmd := exec.Command("python3", decodePath, ckptDir)
+	decodeCmd.Env = append(extraEnv, "PYTHONPATH="+pypath)
+	decodeOut, decodeErr := decodeCmd.CombinedOutput()
+	if decodeErr != nil {
+		t.Fatalf("decode of patched mountpoints image failed: %v\noutput: %s", decodeErr, decodeOut)
+	}
+	var mountpoints []string
+	if err := json.Unmarshal(decodeOut, &mountpoints); err != nil {
+		t.Fatalf("parse decode output %q: %v", string(decodeOut), err)
+	}
+	for _, mp := range mountpoints {
+		if mp == "/alt-sysfs" {
+			t.Fatalf("ADR-0417: /alt-sysfs (fstype=2, SYSFS by int code, not a DROP_PATHS path) must be dropped via DROP_ROOT_FSTYPES' int-fstype match; got mountpoints: %v", mountpoints)
+		}
 	}
 }

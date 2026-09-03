@@ -588,7 +588,13 @@ func main() {
 			// upstream deadline) instead of discarding it. JoinNsRestore now derives its umbrella
 			// budget from this ctx (min(90s, restoreInvariantBudget)) rather than an unbounded
 			// context.Background() that was disconnected from any real caller deadline.
-			pid, replVethMAC, err := agentSrv.JoinNsRestore(ctx, checkpointRef, migrationNamespace, checkpointDir, event.ImageName, event.ID, event.SandboxID, event.ContainerCgroupsPath, event.PodCgroupParent, tcpPreservationMode)
+			// ADR-0419 D1: pass the NRI-carried OCI mount list straight through as one more
+			// parameter, exactly as the ADR-0351 cgroup fields above. event.Mounts was populated
+			// directly off the same NRI hook payload in buildContainerEvent (plugin.go) — it is
+			// the authoritative destination-mount source for this restore, and threading it here
+			// is what lets appendDestinationRebindReattachMounts stop re-deriving, ambiguously, a
+			// value this closure already holds unambiguously.
+			pid, replVethMAC, err := agentSrv.JoinNsRestore(ctx, checkpointRef, migrationNamespace, checkpointDir, event.ImageName, event.ID, event.SandboxID, event.ContainerCgroupsPath, event.PodCgroupParent, tcpPreservationMode, event.Mounts)
 			if err != nil {
 				log.Error(err, "NRI CRIU restore failed", "container", event.ID)
 				return err

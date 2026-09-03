@@ -9,6 +9,7 @@ package server
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -50,6 +51,7 @@ import (
 	"github.com/podmotion-io/podmotion/internal/agent/grpclimits"
 	"github.com/podmotion-io/podmotion/internal/agent/netnsbroker"
 	"github.com/podmotion-io/podmotion/internal/agent/network"
+	"github.com/podmotion-io/podmotion/internal/agent/nri"
 	"github.com/podmotion-io/podmotion/internal/agent/provenance"
 	"github.com/podmotion-io/podmotion/internal/agent/seccomp"
 	pmstorage "github.com/podmotion-io/podmotion/internal/agent/storage"
@@ -855,7 +857,11 @@ func setConditionOnPM(pm *pmv1.PodMigration, condType string, status metav1.Cond
 // enforces, rather than an arbitrary or re-guessed number.
 const restoreInvariantBudget = 120 * time.Second
 
-func (s *AgentServer) JoinNsRestore(ctx context.Context, migrationName, namespace, checkpointDir, imageName, containerID, sandboxID, containerCgroupsPath, podCgroupParent, tcpPreservationMode string) (int, string, error) {
+// runtimeMounts is the ADR-0419 D1 NRI-carried mount list — the migrated container's OWN OCI
+// mount list, read directly off the NRI ContainerEvent by the caller (cmd/agent/main.go) and
+// threaded here as a plain parameter exactly as containerCgroupsPath/podCgroupParent are. Zero
+// query, zero poll, zero side-map. It is the authoritative destination-mount source on this path.
+func (s *AgentServer) JoinNsRestore(ctx context.Context, migrationName, namespace, checkpointDir, imageName, containerID, sandboxID, containerCgroupsPath, podCgroupParent, tcpPreservationMode string, runtimeMounts []nri.ContainerMount) (int, string, error) {
 	// ADR-0353 R2/R3: acquire the single-owner in-flight restore claim before driving CRIU. A
 	// second actor (the gRPC Restore fallback) racing this same migration MUST NOT proceed —
 	// decline with the TRANSIENT-RETRY ErrRestoreInFlight and leave this owner as sole authority.
@@ -974,6 +980,19 @@ func (s *AgentServer) JoinNsRestore(ctx context.Context, migrationName, namespac
 	// REBIND_TO_ROOT that ENOENTs on a second-or-later migration (see doc on
 	// appendHolderScaffoldReattachMount).
 	reattachMounts = s.appendHolderScaffoldReattachMount(joinNsRestoreCtx, migrationName, reattachMounts)
+	// ADR-0419 (correcting ADR-0417's resolution mechanism): fold in the Class DESTINATION-REBIND
+	// targets this checkpoint actually demands, resolved by lookup in the container's OWN OCI mount
+	// list — see appendDestinationRebindReattachMounts doc. SITE 1 of 3. Every input is already
+	// held here, unambiguously: checkpointDir and sandboxID are live parameters of this function
+	// (sandboxID is the NRI pod sandbox object's own pod.GetId(), documented in-tree as
+	// "unambiguous per pod", and is passed to joinNsRestoreFn nine lines below), and runtimeMounts
+	// came straight off the same NRI event. Nothing here is re-derived.
+	var drErr error
+	reattachMounts, drErr = s.appendDestinationRebindReattachMounts(
+		joinNsRestoreCtx, migrationName, checkpointDir, sandboxID, runtimeMounts, reattachMounts)
+	if drErr != nil {
+		return 0, "", drErr
+	}
 	// ADR-0355 D2/D3: read the authoritative preserved source IP (pm.Spec.SourcePodIP — the same
 	// field SingleHomeRestoredPod single-homes on) and thread it into joinNsRestore so the pre-CRIU
 	// bind-prep can make it locally bindable before soccr's bind() on an established-TCP restore.
@@ -1261,6 +1280,16 @@ const (
 	reattachTierNone reattachTierKind = iota
 	reattachTierTier0RWX
 	reattachTierTier1Longhorn
+	// reattachTierDestinationRebind (ADR-0417) marks a mount resolved for the Class
+	// DESTINATION-REBIND rewrite — a runtime-injected file bind (e.g. /etc/hosts, /etc/hostname,
+	// /etc/resolv.conf) whose recorded fstype is not CRIU-recreatable, so patch_checkpoint_script.go
+	// preserves+rewrites it via the SAME mechanism as a Tier0/Tier1 PVC re-attach rather than
+	// internalizing it. UNLIKE the storage tiers, an entry with this Tier is deliberately EXCLUDED
+	// from reattachContainerPaths (argv[4] / reattach_mount_paths) — see that function's doc —
+	// because DESTINATION-REBIND classification is fstype-keyed inside the patch script, not
+	// membership-keyed; this Tier only feeds the destination-target LOOKUP (reattachHostTargets),
+	// never the unconditional-preserve membership set.
+	reattachTierDestinationRebind
 )
 
 type reattachMount struct {
@@ -1324,13 +1353,25 @@ func classifyReattachTier(ctx context.Context, k8sClient client.Client, pvc *cor
 }
 
 // reattachContainerPaths projects the in-container paths from a []reattachMount (the set the patch
-// classifier needs). Order-preserving.
+// classifier needs) — specifically, patch_checkpoint_script.go's reattach_mount_paths (argv[4]),
+// the carve-out (a) UNCONDITIONAL-preserve membership set. Order-preserving.
+//
+// ADR-0417: entries tagged reattachTierDestinationRebind are deliberately EXCLUDED. That class's
+// whole point is a classification rule keyed on the mount's own recorded fstype (evaluated inside
+// patch_checkpoint_script.go), not on membership in a Go-side path allowlist — putting these
+// mountpoints in reattach_mount_paths would make them carve-out (a) unconditionally regardless of
+// fstype, silently reintroducing exactly the kind of per-path special-casing ADR-0417 avoids.
+// Their destination targets still reach the patch script — see reattachHostTargets below, which is
+// NOT filtered by Tier.
 func reattachContainerPaths(ms []reattachMount) []string {
 	if len(ms) == 0 {
 		return nil
 	}
 	paths := make([]string, 0, len(ms))
 	for _, m := range ms {
+		if m.Tier == reattachTierDestinationRebind {
+			continue
+		}
 		paths = append(paths, m.ContainerPath)
 	}
 	return paths
@@ -1470,6 +1511,415 @@ func (s *AgentServer) appendHolderScaffoldReattachMount(ctx context.Context, mig
 		// rewritten, both of which are identical across tiers.
 		Tier: reattachTierTier1Longhorn,
 	})
+}
+
+// ---------------------------------------------------------------------------------------------
+// ADR-0417 Class DESTINATION-REBIND target resolution.
+//
+// §P-PREMISE decode (performed against a REAL mountpoints-13.img taken off this project's standing
+// cluster — pm-w2, RKE2 v1.35.6+rke2r1, a running postgres workload — not inferred). The recorded
+// pre-patch root/source for every fstype-0 external in that image:
+//
+//	mountpoint            fstype  recorded root                                              source
+//	/etc/hosts            0       /var/lib/kubelet/pods/<podUID>/etc-hosts                    /dev/vda1
+//	/etc/hostname         0       <containerd root>/io.containerd.grpc.v1.cri/sandboxes/<sbx>/hostname
+//	/etc/resolv.conf      0       <containerd root>/io.containerd.grpc.v1.cri/sandboxes/<sbx>/resolv.conf
+//	/dev/termination-log  0       /var/lib/kubelet/pods/<podUID>/containers/<ctr>/<8-hex>     /dev/vda1
+//	/var/lib/postgresql/data 0    /                                                           <nfs export>
+//
+// Three separate writers, three separate directory shapes. The prior implementation assumed all
+// three of /etc/{hosts,hostname,resolv.conf} were kubelet-staged siblings under the pod dir; a live
+// `ls -A /var/lib/kubelet/pods/<uid>` on that node returns exactly `containers etc-hosts plugins
+// volumes` — no etc-hostname, no resolv.conf, on any pod. Two of the three targets pointed at paths
+// that do not exist on the destination node.
+//
+// /dev/termination-log is the fourth member, and it cannot be derived at all from the replacement
+// pod: kubelet's leaf is a per-container-instance random id (two are present on a restarted
+// container), and the replacement pod's workload container has not been created when restore runs.
+// Its destination target is instead the file the AGENT itself stages and already maps into the
+// restore (buildCRIURestoreArgs' pre-existing "--ext-mount-map /dev/termination-log:<termlogFile>"),
+// so the recorded root/source and the ext-mount-map now agree on one real, agent-owned path.
+// ---------------------------------------------------------------------------------------------
+
+// ADR-0419 D6 items 1 and 2: the destinationRebindWriter taxonomy (kubelet pod dir / containerd
+// CRI sandbox dir / agent staging dir) and the hardcoded four-entry destinationRebindWellKnownTargets
+// table are DELETED. Both existed solely to RECONSTRUCT a destination host path the runtime already
+// hands us — and a static demand set is a demand the checkpoint never made. Target resolution is now
+// a lookup in the container's own OCI mount list, keyed by the checkpoint's own recorded demand set:
+// see adr0419_destination_mounts.go (D3/D4).
+//
+// restoreStagingDir / restoreTerminationLogPath are the single definition of the agent-owned restore
+// staging paths. joinNsRestore's own ext-mount-map target and the Class DESTINATION-REBIND target
+// for /dev/termination-log MUST be the identical string, or CRIU gets a recorded source and an
+// --ext-mount-map that disagree.
+// restoreStagingRoot is the agent-owned per-migration staging tree. CRIU (running in the host mount
+// namespace) reaches it through the /var/lib/podmotion bind mount the DaemonSet already carries. It
+// is a package var solely so unit tests can redirect it into a writable temp dir; production never
+// reassigns it.
+var restoreStagingRoot = "/var/lib/podmotion/restore"
+
+func restoreStagingDir(migrationName string) string {
+	return filepath.Join(restoreStagingRoot, migrationName)
+}
+
+func restoreTerminationLogPath(migrationName string) string {
+	return filepath.Join(restoreStagingDir(migrationName), "termination-log")
+}
+
+// ensureRestoreTerminationLogFile creates the agent-staged termination-log file if absent. This IS
+// the destination-side write edge for the /dev/termination-log rebind target, and it is performed
+// here — before the probe below reads it — so the probe is ordered after its real edge exactly as
+// it is for the kubelet- and containerd-written members. Create-if-absent (never truncate): the
+// file is also (re)created later in joinNsRestore, and a truncate on an already-rebound path would
+// be a write we do not need.
+func ensureRestoreTerminationLogFile(migrationName string) (string, error) {
+	dir := restoreStagingDir(migrationName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create restore staging dir %s: %w", dir, err)
+	}
+	path := restoreTerminationLogPath(migrationName)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return "", fmt.Errorf("stage termination-log %s: %w", path, err)
+	}
+	_ = f.Close()
+	return path, nil
+}
+
+// ADR-0419 D6 items 5 and 7. The bounded-wait pair (destinationRebindWaitBudget /
+// destinationRebindPollInterval) is REPLACED, not merely removed: its successors on the gRPC path
+// are destinationMountLookupBudget / destinationMountLookupInterval, which carry the same "strictly
+// under both sibling budgets" invariant forward (adr0419_destination_mounts.go, D5.2). The NRI path
+// needs no successor at all — it has no wait, because containerd could not have created the
+// container without resolving its binds.
+//
+// Both bespoke error types (DestinationRebindTargetNotStagedError, DestinationRebindProbeError) are
+// DELETED. Their successors state facts rather than unobserved edges: DestinationRuntimeMountAbsentError
+// ("the runtime did not give this container this mount") and DestinationRuntimeMountLookupTimeoutError
+// ("the runtime never answered"). Repo-wide grep confirmed neither deleted type had any controller,
+// operator, metrics or Kubernetes-Event consumer — unlike CRIUImageInconsistencyError and
+// ExternalMountUnresolvedError, which do and are untouched.
+//
+// ---------------------------------------------------------------------------------------------
+// ADR-0417 S2(b): --ext-mount-map token validation.
+// ---------------------------------------------------------------------------------------------
+
+// allowedExtMountHostTargetPrefixes is the closed set of destination-node directory trees a
+// --ext-mount-map target may live under. Every legitimate target this agent produces is either a
+// kubelet-staged pod path (PVC volume dirs, EmptyDir scaffold dirs, /etc/hosts), a containerd CRI
+// sandbox path (hostname/resolv.conf — the real §P-PREMISE-decoded writer), or a path this agent
+// staged itself under /var/lib/podmotion. Anything outside these trees — /, /etc, /root, a host
+// device node — is not a target this code path can legitimately produce, so it is rejected before
+// argv regardless of how plausible the string looks.
+//
+// The containerd entries are derived from the DISCOVERED daemon (ADR-0370) rather than hardcoded,
+// so this stays correct on kubeadm-containerd, k3s, and RKE2 alike.
+func allowedExtMountHostTargetPrefixes(ctx context.Context) []string {
+	prefixes := []string{
+		"/var/lib/kubelet/pods/",
+		filepath.Clean(restoreStagingRoot) + "/",
+	}
+	for _, root := range []string{
+		resolveContainerdRootDirFn(ctx, containerdSocketPath),
+		containerdRunRoot,
+		containerdStateRoot,
+	} {
+		if root == "" {
+			continue
+		}
+		prefixes = append(prefixes, filepath.Join(root, criSandboxDirRel)+"/")
+	}
+	return prefixes
+}
+
+// extMountTokenPrefixesFn is a test seam over allowedExtMountHostTargetPrefixes so the validator can
+// be exercised without a live containerd. Production implementation reads the discovered daemon.
+var extMountTokenPrefixesFn = func() []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return allowedExtMountHostTargetPrefixes(ctx)
+}
+
+// hasControlChars reports whether s contains any C0/C1 control character (including '\n', '\r' and
+// NUL). These are exactly the bytes that let an image-derived value forge a line in the patch
+// script's line-oriented stdout protocol, or split an argv token.
+func hasControlChars(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateExtMountToken enforces the S2(b) preconditions on one `--ext-mount-map <key>:<target>`
+// token before it can reach CRIU's argv. See the addExtMountMap doc in buildCRIURestoreArgs for why
+// each rule exists.
+//
+// resolvedHostTargets is the set of host targets THIS AGENT resolved for this restore. It is the
+// load-bearing check against a forged marker line: an attacker who controls the checkpoint image
+// controls the ext_key and can attempt to control the host_target, but cannot make a target of
+// their choosing appear in a set the agent built from Kubernetes/containerd/filesystem reads.
+func validateExtMountToken(key, target string, resolvedHostTargets map[string]bool) error {
+	switch {
+	case key == "":
+		return fmt.Errorf("empty --ext-mount-map key")
+	case len(key) > 4096:
+		return fmt.Errorf("--ext-mount-map key exceeds %d bytes", 4096)
+	case strings.Contains(key, ":"):
+		return fmt.Errorf("--ext-mount-map key %q contains ':', the token delimiter", key)
+	case hasControlChars(key):
+		return fmt.Errorf("--ext-mount-map key contains a control character (raw bytes withheld)")
+	case strings.HasPrefix(key, "/") && filepath.Clean(key) != key:
+		return fmt.Errorf("--ext-mount-map key %q is a path but is not lexically clean (traversal or redundant separators)", key)
+	}
+	switch {
+	case target == "":
+		return fmt.Errorf("empty --ext-mount-map host target for key %q", key)
+	case len(target) > 4096:
+		return fmt.Errorf("--ext-mount-map host target for key %q exceeds %d bytes", key, 4096)
+	case strings.Contains(target, ":"):
+		return fmt.Errorf("--ext-mount-map host target for key %q contains ':', the token delimiter", key)
+	case hasControlChars(target):
+		return fmt.Errorf("--ext-mount-map host target for key %q contains a control character (raw bytes withheld)", key)
+	case !filepath.IsAbs(target):
+		return fmt.Errorf("--ext-mount-map host target %q for key %q is not an absolute path", target, key)
+	case filepath.Clean(target) != target:
+		return fmt.Errorf("--ext-mount-map host target %q for key %q is not lexically clean (traversal or redundant separators)", target, key)
+	}
+	if !resolvedHostTargets[target] {
+		return fmt.Errorf("--ext-mount-map host target %q for key %q was not resolved by this agent — refusing a target that did not come from this restore's own destination resolution (a checkpoint image cannot choose what CRIU binds)", target, key)
+	}
+	var allowed bool
+	for _, p := range extMountTokenPrefixesFn() {
+		if strings.HasPrefix(target, p) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return fmt.Errorf("--ext-mount-map host target %q for key %q is outside every allowed destination prefix %v", target, key, extMountTokenPrefixesFn())
+	}
+	// ADR-0419 D9 — REAL path-confinement in the HOST mount namespace, FAIL CLOSED.
+	//
+	// This replaces a fail-OPEN branch that read
+	//     if real, err := filepath.EvalSymlinks(target); err == nil && real != target { ... }
+	// i.e. on resolve error the entire escape check was SKIPPED. Its licensing comment claimed the
+	// kubelet/containerd targets were "resolved and existence-probed in the host namespace at
+	// resolution time (resolveDestinationRebindTargetsOnce / resolveKubeletVolumeHostPath)" — and
+	// ADR-0419 D6 DELETES resolveDestinationRebindTargetsOnce, so that compensating control no
+	// longer exists. That comment is corrected here, in the same change as the deletion, because
+	// leaving it would assert a control that is gone.
+	//
+	// The fail-open was already dead code for the two prefixes that matter: the agent's DaemonSet
+	// mounts no /var/lib/kubelet and carries no containerd CRI sandbox tree, so EvalSymlinks in
+	// THIS process's mount namespace always errored for them and only the agent-staged
+	// /var/lib/podmotion prefix ever received a real check. It becomes live rather than latent
+	// under ADR-0419 because D3+D4 change this validator's INPUT PROVENANCE: resolvedHostTargets
+	// moves from a closed, agent-constructed four-entry table to runtime-supplied host paths, with
+	// the checkpoint's own mountpoints image — attacker-influenceable under the threat model this
+	// file already models at the addExtMountMap doc — deciding which entries are admitted. There is
+	// also a TOCTOU window D3's own argument creates: the runtime proves the source existed at event
+	// delivery; CRIU resolves it later.
+	//
+	// So the resolution is delegated to the typed netns-broker host_realpath op, which resolves
+	// through /proc/1/root — the SAME mount namespace joinNsRestore nsenters CRIU into — and the
+	// RESOLVED path is prefix-checked. Unresolvable is a REJECTION, matching ADR-0351's own
+	// confinement (EvalSymlinks, then `if err != nil { return }`, then prefix-check the resolved
+	// path). ADR-0419 copies ADR-0351's confinement, not only its plumbing.
+	return confineExtMountTargetRealpath(key, target)
+}
+
+// ADR-0419 D6 item 3: hostRegularFileExistsFn / hostRegularFileExists are DELETED along with the
+// bounded probe loop they served. Their whole purpose was to observe a destination file's write
+// edge before trusting a RECONSTRUCTED path — and there is no reconstructed path any more. The
+// runtime's own mount list is delivered only AFTER containerd resolved every bind source in it, so
+// each Source's existence is a precondition of that delivery rather than a condition to wait on.
+//
+// Their removal also deletes the last `sh -c '[ -f ... ]'` consumer on this path (§P-VERIFY #9).
+// The broker's `sh` allowlist entry is deliberately NOT shrunk: it has other legitimate consumers
+// on other paths, and shrinking it would need its own removal-symmetry audit. This ADR removes a USER of
+// that allowlist entry, never the entry.
+//
+// NOTE the one host-namespace read that is ADDED rather than removed: the typed host_realpath
+// broker op D9 requires. It is one typed read of one value at argv-construction time — not a poll,
+// and not a reinstatement of this deleted chain.
+
+// ADR-0419 D6 item 6: resolveDestinationRebindTargetsOnce, describeMissingDestinationRebindTarget
+// and destinationRebindMissing are DELETED, along with the NOT-YET / NEVER / PROBE-FAILED timing
+// classifier they implemented.
+//
+// describeMissingDestinationRebindTarget in particular re-resolved the replacement pod AND the
+// sandbox ID from scratch on the terminal leg, so the target it named could be resolved against a
+// different pod/sandbox than the loop had actually been blocked on: THE REPORTED FACT WAS NOT THE
+// FACT THAT FAILED. That is why the named target walked /etc/hosts -> /etc/hostname across
+// consecutive gate cycles with nothing underneath changing. It is not replaced by a better-worded
+// version — the condition it described no longer exists.
+//
+// destinationRebindObserveFn moves to adr0419_destination_mounts.go with its new, fact-shaped
+// outcome vocabulary.
+
+// appendDestinationRebindReattachMounts (ADR-0419, correcting ADR-0417's resolution mechanism)
+// resolves the destination node's real backing file for every mount THIS CHECKPOINT classifies as
+// Class DESTINATION-REBIND, and appends them to mounts with Tier=reattachTierDestinationRebind.
+//
+// THE PRIMITIVE (D3): for each mount the checkpoint demands (D4), find the entry in the container's
+// OWN OCI mount list whose Destination equals that in-container path and take its Source. That is
+// the whole resolution. No writer taxonomy, no hardcoded target table, no
+// <containerd root>/io.containerd.grpc.v1.cri/sandboxes/<id> reconstruction, no existence probe, no
+// bounded wait, no three-way timing classifier.
+//
+// WHY THERE IS NOTHING TO WAIT ON: containerd could not have created this container without
+// resolving every bind source in that list, so each Source's existence is a PRECONDITION of the
+// mount list's own delivery. ADR-0417 spent ~97-120 poll iterations and ~580 privileged broker
+// round-trips per restore — issued against the very containerd control socket the in-flight CRIU
+// restore depends on — establishing a fact the runtime had already handed us. On the NRI path that
+// is now ZERO round-trips; on the gRPC paths it is ONE typed round-trip on the healthy path.
+//
+// WHERE THE MOUNT LIST COMES FROM, per call site:
+//   - NRI restore (JoinNsRestore): runtimeMounts is the live nri.ContainerEvent.Mounts, read
+//     directly off the hook payload already delivered to this restore (D1). Zero query.
+//   - gRPC restore (both the config.json and the raw-CRIU branch): runtimeMounts is nil, and the
+//     list is fetched with ONE typed containerd containers-service round-trip (D5). Never a `ctr`
+//     scrape — a CLI exit code cannot distinguish a transient control-plane blip from a structural
+//     failure, and collapsing the two is precisely FM5.
+//
+// PARAMETERS, NOT RE-DERIVATION (D2): sandboxID and checkpointDir are already held, unambiguously,
+// at all three call sites. This function used to accept neither and re-derive the sandbox ID from
+// `ctr containers list` filtered ONLY on the pod UID — a query kubelet stamps on the pod sandbox AND
+// on every workload container, so it returned whichever row containerd listed first. That is root
+// cause (A): a deterministic identifier bug that presented for six gate cycles as a timing failure.
+//
+// Returns mounts unchanged, with no error, ONLY when there is no source of truth to consult at all
+// (no k8s client, no migration name, no PodMigration CR). That early return is deliberately NOT
+// extended to cover an empty sandboxID (§P-VERIFY #15b): doing so would silently drop the
+// DESTINATION-REBIND targets from --ext-mount-map, leaving CRIU to restore against the SOURCE
+// node's recorded /etc/hosts source and ENOENT mid-restore — the exact defect ADR-0417 exists to
+// fix, reintroduced as a fail-open. Every other outcome is a resolved set or a named terminal.
+func (s *AgentServer) appendDestinationRebindReattachMounts(
+	ctx context.Context, migrationName, checkpointDir, sandboxID string,
+	runtimeMounts []nri.ContainerMount, mounts []reattachMount,
+) ([]reattachMount, error) {
+	if s.k8sClient == nil || migrationName == "" {
+		return mounts, nil
+	}
+	pm, ok := s.lookupPodMigration(ctx, migrationName)
+	if !ok {
+		return mounts, nil
+	}
+	podNs := pm.Spec.PodNamespace
+	if podNs == "" {
+		podNs = pm.Namespace
+	}
+	start := time.Now()
+
+	// D7: the agent's OWN destination-side write for /dev/termination-log. The WRITE survives (it
+	// is the real edge, and ensureRestoreTerminationLogFile has a second independent caller); only
+	// the PROBE of its result is gone. Re-verifying through a privileged shell exec a file this
+	// process created two statements earlier could only ADD a failure mode to a fact already held
+	// with certainty — its existence is a postcondition of the agent's own os.OpenFile.
+	if _, tErr := ensureRestoreTerminationLogFile(migrationName); tErr != nil {
+		destinationRebindObserveFn(migrationName, 1, time.Since(start), "runtime_lookup_failed")
+		return mounts, fmt.Errorf("destination rebind: stage agent-owned termination-log for migration %s: %w", migrationName, tErr)
+	}
+
+	// D4 — intersect against the DEMAND set this checkpoint actually recorded, not a hardcoded list.
+	demand, dErr := destinationRebindDemandSetFn(ctx, migrationName, checkpointDir)
+	if dErr != nil {
+		destinationRebindObserveFn(migrationName, 1, time.Since(start), "runtime_lookup_failed")
+		return mounts, dErr
+	}
+	demanded := demand.Paths
+	// ADR-0420 D1b: count the content-availability decision the SAME scan just made. The
+	// internalized-with-content leg is terminal here — those mounts stay CRIU-owned and never reach
+	// the resolution below — so it is recorded now. The content-absent legs are counted after
+	// resolution, where "rebound" and "unresolved" become distinguishable.
+	for i := 0; i < demand.InternalizedWithContent; i++ {
+		metrics.MountContentAvailabilityOutcomeTotal.WithLabelValues("internalized_with_content").Inc()
+	}
+	contentAbsent := make(map[string]bool, len(demand.ContentAbsent))
+	for _, p := range demand.ContentAbsent {
+		contentAbsent[p] = true
+	}
+	if len(demand.ContentAbsent) > 0 {
+		log.Info("ADR-0420 D1: a recreatable, construct-and-fill mount has no content image in this checkpoint — NOT internalizing it; the destination runtime's own mount is used instead (internalizing it would hand CRIU an empty superblock to fill from an image that does not exist, and tmpfs_restore fails silently)",
+			"migration", migrationName, "checkpointDir", checkpointDir,
+			"contentAbsent", demand.ContentAbsent,
+			"internalizedWithContent", demand.InternalizedWithContent)
+	}
+	// A mountpoint already resolved by an earlier tier (storage-tier PVC re-attach, holder scaffold)
+	// is NOT a destination-rebind demand: patch_checkpoint_script.go checks its re-attach carve-out
+	// FIRST and would use that tier's target anyway. Emitting a second, differently-resolved target
+	// for the same key is how a conflicting --ext-mount-map pair gets built.
+	already := make(map[string]bool, len(mounts))
+	for _, m := range mounts {
+		already[m.ContainerPath] = true
+	}
+	pending := make([]string, 0, len(demanded))
+	for _, d := range demanded {
+		if !already[d] {
+			pending = append(pending, d)
+		}
+	}
+	if len(pending) == 0 {
+		// The outcome ADR-0417's hardcoded four-entry table structurally could not produce: this
+		// checkpoint demands no destination-rebind mount, so none is required. A workload whose
+		// checkpoint has no /etc/hostname mount now restores cleanly instead of hard-stopping on a
+		// demand it never made.
+		log.Info("ADR-0419 D4: this checkpoint demands no Class DESTINATION-REBIND mount — nothing to resolve",
+			"migration", migrationName, "checkpointDir", checkpointDir)
+		destinationRebindObserveFn(migrationName, 1, time.Since(start), "not_demanded")
+		return mounts, nil
+	}
+
+	// Resolve the runtime mount list for this restore-target container.
+	source := "NRI ContainerEvent"
+	attempts := 1
+	if runtimeMounts == nil {
+		source = "containerd containers service"
+		replPod := s.resolveReplacementPod(ctx, migrationName, podNs)
+		if replPod == nil || replPod.UID == "" {
+			destinationRebindObserveFn(migrationName, attempts, time.Since(start), "runtime_lookup_failed")
+			return mounts, fmt.Errorf("destination rebind: no replacement pod resolved for migration %s in namespace %s (label %s) — cannot ask the runtime for its mount list (ADR-0419 D5)",
+				migrationName, podNs, replacementPodLabelKey)
+		}
+		var rErr error
+		runtimeMounts, rErr = s.resolveRuntimeMountsWaiting(ctx, string(replPod.UID), sandboxID, pending)
+		if rErr != nil {
+			destinationRebindObserveFn(migrationName, attempts, time.Since(start), "runtime_lookup_failed")
+			return mounts, rErr
+		}
+	}
+
+	// D3 — the lookup. Every demanded path resolves to a runtime-supplied Source, or this fails
+	// closed naming the path the runtime did not supply.
+	resolved, rErr := resolveDestinationRebindTargets(pending, runtimeMounts, migrationName, sandboxID, source)
+	if rErr != nil {
+		// ADR-0420 D1b: if the path the runtime did not supply is one D1 rerouted, that is the
+		// "unresolved_content_absent" leg — the checkpoint never captured this mount's content AND
+		// the destination did not offer it either. Distinguishing it from an ordinary
+		// destination-rebind miss is the whole reason the counter carries three labels.
+		var absentErr *DestinationRuntimeMountAbsentError
+		if errors.As(rErr, &absentErr) && contentAbsent[absentErr.ContainerPath] {
+			metrics.MountContentAvailabilityOutcomeTotal.WithLabelValues("unresolved_content_absent").Inc()
+		}
+		log.Error(rErr, "ADR-0419 D3: a checkpoint-demanded mount has no entry in the runtime's own mount list — failing closed",
+			"migration", migrationName, "sandboxID", sandboxID, "source", source)
+		destinationRebindObserveFn(migrationName, attempts, time.Since(start), "runtime_mount_absent")
+		return mounts, rErr
+	}
+	// ADR-0420 D1b: every content-absent path that DID resolve is the leg that matters — the
+	// population silently mis-handled before this ADR, now rebound to the destination's own mount.
+	for _, m := range resolved {
+		if contentAbsent[m.ContainerPath] {
+			metrics.MountContentAvailabilityOutcomeTotal.WithLabelValues("rebound_content_absent").Inc()
+		}
+	}
+	log.Info("ADR-0419: destination-rebind targets resolved from the runtime's own mount list — zero probes, zero waits",
+		"migration", migrationName, "sandboxID", sandboxID, "source", source,
+		"demanded", len(pending), "resolved", len(resolved), "elapsedMs", time.Since(start).Milliseconds())
+	destinationRebindObserveFn(migrationName, attempts, time.Since(start), "resolved")
+	return append(mounts, resolved...), nil
 }
 
 // replacementPodLabelKey is the label the controller stamps on the replacement pod at creation
@@ -4702,11 +5152,22 @@ var containerdMaskedPaths = []string{
 // docs/adr/0415-capture-everything-by-default-mount-ownership.md.
 
 // standardPodMounts is the canonical set of external mounts that every Kubernetes
-// pod container carries and that buildCRIURestoreArgs maps explicitly by PATH (not to
-// /dev/null) via --ext-mount-map <mountpoint>:<host-target>. The pre-scan must recognise
-// these as covered — they are legitimately restorable external mounts, not unmapped ones.
-// This list MUST stay in lockstep with the path-form --ext-mount-map entries in
-// buildCRIURestoreArgs (ADR-0124 R2 / AC6 — single source of truth, no divergent copy).
+// pod container carries and that the pre-scan below must recognise as covered — they are
+// legitimately restorable external mounts, not unmapped ones.
+//
+// CORRECTED (ADR-0417): /etc/resolv.conf, /etc/hostname, /etc/hosts are NO LONGER "mapped
+// elsewhere, by path" via an unconditional buildCRIURestoreArgs literal — ADR-0417 replaced that
+// unconditional internalize/path-map with a recreatability-keyed classifier. These three
+// mountpoints are now Class DESTINATION-REBIND external mounts (patch_checkpoint_script.go, keyed
+// on recorded fstype): patchCheckpointImages preserves+rewrites them via
+// appendDestinationRebindReattachMounts/reattachHostTargets, the same mechanism as a storage-tier
+// PVC re-attach, not the standardPodMounts/unmapped-mount hard-stop this list feeds. They remain
+// listed here only so this pre-scan does not flag them as unmapped (they are still an external
+// mount CRIU records for every pod, just handled through the re-attach path now, exactly like a
+// reattachMountPaths entry — see the reattach[e.Mountpoint] check below, which they no longer even
+// need to fall through to since standardPodMounts still recognizes them first).
+// This list MUST stay in lockstep with buildCRIURestoreArgs' handling of these paths (ADR-0124 R2 /
+// AC6 — single source of truth, no divergent copy).
 var standardPodMounts = []string{
 	"/data",
 	"/dev/termination-log",
@@ -4731,7 +5192,11 @@ var standardPodMounts = []string{
 // (numeric mnt_id form — the form CRIU failed to resolve in "No mapping for 2288:...").
 //
 // An entry is also covered, and not flagged unmapped, when it is a standardPodMounts /
-// reattachMountPaths entry (mapped elsewhere, by path).
+// reattachMountPaths entry — CORRECTED (ADR-0417): "mapped elsewhere, by path" no longer means an
+// unconditional buildCRIURestoreArgs literal for /etc/resolv.conf, /etc/hostname, /etc/hosts;
+// those three are now Class DESTINATION-REBIND external mounts patchCheckpointImages preserves and
+// rewrites via the reattach mechanism (see standardPodMounts doc). They are still recognized here
+// via standardPodMounts, so this pre-scan does not need reattachMountPaths to also list them.
 //
 // ADR-0415: the obscured-parent "pm-dev" bucket is gone — /dev is captured as pod-owned content and
 // internalized by patchCheckpointImages, never declared external, so it never reaches this pre-scan.
@@ -5087,8 +5552,18 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		tcpFlag,
 		// --mntns-compat-mode is intentionally OMITTED here (gate-fix B1).
 		// Compat-mode runs an umount pass inside the destination container's mount namespace
-		// that tries to remove /sys → EBUSY (sysfs is kernel-referenced and cannot be
-		// unmounted even with MNT_DETACH when it has active references from the host).
+		// that tries to remove /sys → EBUSY.
+		//
+		// The inherited explanation for that EBUSY is the following assertion, kept verbatim:
+		// UNDECODED (ADR-0420 D3a / M2a): sysfs is kernel-referenced and cannot be unmounted even with MNT_DETACH when it has active references from the host.
+		// The line above is an INHERITED, UNVERIFIED claim about kernel behavior — status
+		// UNKNOWN, neither established nor negated. It is NOT a decoded mechanism claim: nothing
+		// in this corpus grounds it and no §P-VERIFY assertion in any prior ADR tests it. It is
+		// scheduled to be decided by the ADR-0420 §5.5 extension item (5) spike. Do NOT build a
+		// fail-closed gate, a convergence condition, or any other load-bearing logic on top of it
+		// until that spike lands — ADR-0420's struck D2 was authored against exactly this
+		// sentence read as though it were established mechanism.
+		//
 		// This causes CRIU to exit code 1 on kind control-plane nodes where the placeholder
 		// container has a different sysfs mount topology than the worker nodes used in
 		// Sprint 31. Without --mntns-compat-mode, CRIU uses mount-v2 mode
@@ -5129,9 +5604,16 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		// --ext-mount-map. The retired pm-dev obscured-parent /dev machinery (ADR-0384/0389/0392) is
 		// documented in docs/adr/0415-capture-everything-by-default-mount-ownership.md; declaring
 		// /dev external was exactly what suppressed the /dev/shm fill.
-		"--ext-mount-map", "/etc/resolv.conf:/etc/resolv.conf",
-		"--ext-mount-map", "/etc/hostname:/etc/hostname",
-		"--ext-mount-map", "/etc/hosts:/etc/hosts",
+		//
+		// ADR-0417: the unconditional "--ext-mount-map /etc/resolv.conf:/etc/resolv.conf" (and the
+		// /etc/hostname, /etc/hosts siblings) that used to sit here are REMOVED from this
+		// unconditional literal set. Under ADR-0415 carve-out (b), patch_checkpoint_script.go
+		// ALWAYS popped these entries' ext_key (internalize), so CRIU never had an external left to
+		// consult and the args were dead weight that merely read as "handled" (ADR-0417
+		// §P-MECHANISM (3)). Under ADR-0417's Class DESTINATION-REBIND, these three mountpoints now
+		// PRESERVE their ext_key when their recorded fstype is not CRIU-recreatable — so the entries
+		// are live again, RE-ACTIVATED below as a conditional loop keyed on the mount actually
+		// having landed in reattachTierDestinationRebind, not emitted unconditionally.
 		// NetworkLock: the dump uses --network-lock skip unconditionally (criu_checkpointer.go:233),
 		// so the restore MUST also pass --network-lock skip to honor the dump/restore-pair invariant.
 		// A restore must not replay lock state the paired dump never captured (ADR-0192 Site A, R2).
@@ -5164,6 +5646,76 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 				m.ContainerPath, replacementPodLabelKey)
 		}
 	}
+	// ADR-0417 S2(b): every --ext-mount-map token emitted from here down carries values that
+	// originate, at least partly, in the CHECKPOINT IMAGE — i.e. in data an image-supplying
+	// adversary controls. `--ext-mount-map <key>:<target>` is a ':'-delimited, argv-positional
+	// token, and the reattachExtMountMap entries specifically are parsed back out of the patch
+	// script's stdout, so an unvalidated key or target is a direct argv-injection primitive against
+	// CRIU. Everything below therefore goes through addExtMountMap, which:
+	//
+	//	(1) rejects an ExtKey or HostTarget containing ':' or any control character (the token
+	//	    delimiter and the line delimiter of the stdout protocol);
+	//	(2) requires HostTarget to be an absolute, lexically-clean, traversal-free path under one of
+	//	    the allowed destination prefixes (allowedExtMountHostTargetPrefixes) — the paths this
+	//	    agent legitimately stages or reads on a destination node, nothing else;
+	//	(3) refuses any HostTarget that is not one THIS AGENT itself resolved (resolvedHostTargets
+	//	    below). The Go side already knows the authoritative {containerPath: hostTarget} map; the
+	//	    script's token is needed only to learn the mnt_id/ext_key that go with it. So a forged
+	//	    CRIU_REATTACH_EXT_MOUNT_MAP line injected through the script's stdout cannot introduce a
+	//	    host target of its own choosing — e.g. the demonstrated `--ext-mount-map /etc/hosts:/`,
+	//	    which would bind the destination node's ROOT FILESYSTEM into the restored container;
+	//	(4) collapses byte-identical duplicates and hard-fails on two DIFFERENT targets for the same
+	//	    key, so CRIU's ext_mount_lookup (first-match) can never silently pick the wrong one.
+	//
+	// This is defense in depth over the script-side fix (all marker lines are json.dumps-encoded, so
+	// no image-derived byte can forge a line at all) — neither layer is load-bearing alone.
+	resolvedHostTargets := make(map[string]bool, len(reattachMountPaths))
+	for _, m := range reattachMountPaths {
+		if m.HostTarget != "" {
+			resolvedHostTargets[m.HostTarget] = true
+		}
+	}
+	// The unconditional literal entries emitted above are agent-owned, not image-derived; register
+	// their targets so the dedupe/consistency check below sees the complete picture.
+	resolvedHostTargets[termlogFile] = true
+	emittedExtMounts := make(map[string]string, len(reattachMountPaths)+len(reattachExtMountMap))
+	emittedExtMounts["/dev/null"] = "/dev/null"
+	emittedExtMounts["/dev/termination-log"] = termlogFile
+	addExtMountMap := func(key, target, origin string) error {
+		if err := validateExtMountToken(key, target, resolvedHostTargets); err != nil {
+			return fmt.Errorf("refusing to build CRIU restore argv from %s: %w", origin, err)
+		}
+		if prev, dup := emittedExtMounts[key]; dup {
+			if prev == target {
+				return nil // byte-identical duplicate — one token is enough
+			}
+			return fmt.Errorf("refusing to build CRIU restore argv from %s: conflicting --ext-mount-map targets for key %q (%q vs %q); CRIU's ext_mount_lookup takes the first match, so one of them would be silently ignored", origin, key, prev, target)
+		}
+		emittedExtMounts[key] = target
+		args = append(args, "--ext-mount-map", key+":"+target)
+		return nil
+	}
+	// ADR-0417: RE-ACTIVATE the path-form --ext-mount-map for the Class DESTINATION-REBIND
+	// mountpoints (see removed literal entries above) — but ONLY for the mounts that actually
+	// landed in reattachTierDestinationRebind (the fail-closed loop just above already guarantees
+	// HostTarget is non-empty for every entry here).
+	//
+	// The mapping is <containerPath>:<HOST TARGET>, NOT the <containerPath>:<containerPath> this
+	// loop emitted before. These entries have a LITERAL ext_key equal to their mountpoint (the real
+	// §P-PREMISE decode records ext_key="/etc/hosts" for the /etc/hosts bind, not
+	// "CRIU:AUTOGENERATED"), so CRIU does NOT bypass the lookup for them — it consults this map and
+	// binds whatever it finds. Mapping /etc/hosts to /etc/hosts therefore bound the DESTINATION
+	// NODE's own /etc/hosts into the restored container, and because this loop runs before the
+	// reattachExtMountMap loop below, that wrong entry won the first-match lookup over the correct
+	// one. Same key, same value on both loops now, so the dedupe collapses them.
+	for _, m := range reattachMountPaths {
+		if m.Tier != reattachTierDestinationRebind || m.ContainerPath == "" || m.HostTarget == "" {
+			continue
+		}
+		if err := addExtMountMap(m.ContainerPath, m.HostTarget, "resolved destination-rebind mount"); err != nil {
+			return nil, err
+		}
+	}
 	// Tier1-Longhorn mount.c:3141 fix: for any preserved reattach mount whose REAL on-disk
 	// ext_key is NOT the CRIU AUTODETECTED_MOUNT constant (see ReattachExtMountMapEntry doc — the
 	// Longhorn/local-block-device shape CRIU records with a literal ext_key, same as ADR-0194's
@@ -5176,7 +5728,9 @@ func buildCRIURestoreArgs(checkpointDir, rootfsDir, dataDir, termlogFile, secret
 		if m.ExtKey == "" || m.HostTarget == "" {
 			continue
 		}
-		args = append(args, "--ext-mount-map", fmt.Sprintf("%s:%s", m.ExtKey, m.HostTarget))
+		if err := addExtMountMap(m.ExtKey, m.HostTarget, "patch-script CRIU_REATTACH_EXT_MOUNT_MAP token"); err != nil {
+			return nil, err
+		}
 	}
 	if destNetnsFd != "" {
 		args = append(args, "--join-ns", "net:"+destNetnsFd)
@@ -5480,12 +6034,19 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	// Step 3: Create ext-mount-map target paths in the agent container's filesystem.
 	// These paths are used as ext-mount-map targets for CRIU; CRIU (running in the host
 	// mount namespace) can access /var/lib/podmotion via the bind-mount (shared filesystem).
-	dataDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/data", migrationName)
-	secretsDir := fmt.Sprintf("/var/lib/podmotion/restore/%s/secrets", migrationName)
-	termlogFile := fmt.Sprintf("/var/lib/podmotion/restore/%s/termination-log", migrationName)
+	dataDir := filepath.Join(restoreStagingDir(migrationName), "data")
+	secretsDir := filepath.Join(restoreStagingDir(migrationName), "secrets")
 	_ = os.MkdirAll(dataDir, 0o700)
 	_ = os.MkdirAll(secretsDir, 0o700)
-	_ = os.WriteFile(termlogFile, nil, 0o644)
+	// ADR-0417: the termination-log target now has TWO consumers that must agree byte-for-byte —
+	// this --ext-mount-map argument AND the Class DESTINATION-REBIND recorded-source rewrite
+	// (appendDestinationRebindReattachMounts). Both go through restoreTerminationLogPath, and the
+	// file is create-if-absent (never truncated) because the rebind resolution already staged and
+	// PROBED it upstream; truncating a path CRIU is about to bind from would be a pointless write.
+	termlogFile, termlogErr := ensureRestoreTerminationLogFile(migrationName)
+	if termlogErr != nil {
+		return 0, nil, fmt.Errorf("stage restore termination-log: %w", termlogErr)
+	}
 
 	// Create required directories and files inside the rootfs in the HOST mount namespace
 	// via nsenterCmd. The rootfsDir is an overlayfs mounted in the host namespace; the agent
@@ -5646,72 +6207,18 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	}
 	criuArgs = append(criuArgs, maskedArgs...)
 
-	// Gate10 fix: pre-lazy-umount /sys from the placeholder container's mount namespace
-	// before CRIU runs compat-mode cleanup.
-	//
-	// Background: CRIU compat-mode enters the destination container's mount namespace
-	// and runs an "umount pass" to remove mounts not present in the checkpoint image.
-	// /sys is mounted in every container by containerd/runc. CRIU can't restore /sys as
-	// external because CRIU 4.2 does not write ext_key for sysfs mounts when declared via
-	// --external mnt[/sys]:pm-sys (path-form matches at walk time but doesn't persist).
-	// Without ext_key, compat-mode treats /sys as a non-external regular mount and calls
-	// umount2(./sys, 0) → EBUSY (sysfs has a kernel reference from the host bind mount).
-	//
-	// Solution: before CRIU runs, enter the placeholder container's mount namespace and
-	// lazy-umount /sys (MNT_DETACH — detaches from namespace tree even if busy). CRIU then
-	// enters the namespace, doesn't find /sys, skips the umount for it, and proceeds.
-	// After CRIU restores, /sys is not in the image (skipped at dump), so the restored
-	// process inherits whatever the container runtime provides at container start time
-	// (containerd/runc re-mounts /sys when the replacement pod starts).
-	//
-	// Implementation: get the placeholder PID via `ctr task ls`, find its mount namespace
-	// fd at /proc/<pid>/ns/mnt (accessible from host mount namespace via nsenter), then
-	// use nsenter --mount=<ns> to run umount -l /sys inside it.
-	placeholderIDForUmount := "pm-placeholder-" + migrationName
-	if placeholderPIDOut, pidErr := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "tasks", "ls", "--quiet")...).Output(); pidErr == nil {
-		// `ctr task ls --quiet` lists running task IDs (not PIDs). Get the PID from `ctr task info`.
-		if strings.Contains(string(placeholderPIDOut), placeholderIDForUmount) {
-			if pidInfo, piErr := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "task", "ls")...).Output(); piErr == nil {
-				for _, line := range strings.Split(string(pidInfo), "\n") {
-					if strings.Contains(line, placeholderIDForUmount) {
-						fields := strings.Fields(line)
-						if len(fields) >= 2 {
-							placeholderPID := fields[1]
-							nsMntPath := fmt.Sprintf("/proc/%s/ns/mnt", placeholderPID)
-							log.Info("gate10 fix: lazy-umounting /sys from placeholder container namespace",
-								"placeholderID", placeholderIDForUmount, "pid", placeholderPID)
-							// Lazy-umount children of /sys first (in case kernel requires bottom-up)
-							sysMounts := []string{
-								"/sys/firmware", "/sys/devices/virtual/powercap",
-								"/sys/devices/virtual/dmi/id/sys_vendor",
-								"/sys/devices/virtual/dmi/id/chassis_serial",
-								"/sys/devices/virtual/dmi/id/board_serial",
-								"/sys/devices/virtual/dmi/id/product_uuid",
-								"/sys/devices/virtual/dmi/id/product_name",
-								"/sys/kernel/config", "/sys/fs/fuse/connections",
-								"/sys/kernel/debug", "/sys/kernel/tracing",
-								"/sys/fs/bpf", "/sys/fs/cgroup", "/sys",
-							}
-							for _, mnt := range sysMounts {
-								umountOut, umountErr := exec.Command("nsenter", "--mount="+nsMntPath, "--", "umount", "-l", mnt).CombinedOutput()
-								if umountErr != nil {
-									// Non-fatal: some mounts may not exist in this container
-									log.Info("gate10 fix: lazy-umount skipped (mount absent or error)",
-										"mount", mnt, "err", umountErr, "output", string(umountOut))
-								} else {
-									log.Info("gate10 fix: lazy-umounted successfully", "mount", mnt)
-								}
-							}
-						}
-						break
-					}
-				}
-			}
-		} else {
-			log.Info("gate10 fix: placeholder not found in running tasks — skipping pre-umount (NRI path or already cleaned up)",
-				"placeholderID", placeholderIDForUmount)
-		}
-	}
+	// ADR-0420 D3: the pre-CRIU destination-namespace lazy-umount mitigation that used to sit
+	// here is DELETED and deliberately replaced with nothing. It justified itself as a mitigation
+	// for CRIU compat-mode's umount pass, but buildCRIURestoreArgs omits --mntns-compat-mode
+	// (see the argv comment above), so the pass it existed to survive never runs on this path.
+	// It also acted on the placeholder container's mount namespace rather than the host mount
+	// namespace CRIU actually restores into (--root rootfsDir, run via nsenter below), read a
+	// hardcoded mountpoint list rather than the kernel, swallowed every umount failure, and never
+	// re-read to confirm any effect — so it could neither report failure nor observe success.
+	// No successor primitive is added: no evidence in this corpus shows destination mount residue
+	// ever causing a restore failure, and building a mitigation for an unobserved failure mode
+	// would be scaffolding. See ADR-0420 (D3, and the struck D2 for the prerequisites any future
+	// residue-reconciliation successor must discharge first).
 
 	// Run CRIU in the host mount namespace via nsenter. The agent container cannot join
 	// the replacement pod's netns directly (nested container user namespace restriction);
@@ -5829,6 +6336,11 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	var agentPIDsErr error
 	criuWrapperPID := criuCmd.Pid()
 	var workloadLive bool
+	// ADR-0418 Decision item 1: the last successfully-observed exited/exitCode from
+	// criuCmd.poll(), captured here rather than discarded, so the :6582-equivalent leg below can
+	// gate cause-naming on CRIU's own terminal verdict instead of log content or ctx state.
+	var lastPollExited bool
+	var lastPollExitCode int
 	// ADR-0354 D2b(iii): the cgroup-liveness wait is bounded by min(now+cgroupPollTimeout,
 	// ctx.Deadline()), not a fixed 60s clock divorced from the caller's migration deadline —
 	// this is the actual invariant-#8 overshoot fix (the fixed 60s + fixed 30s poll clocks
@@ -5847,15 +6359,19 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 			time.Sleep(cgroupPollInterval)
 			continue
 		}
+		lastPollExited, lastPollExitCode = exited, exitCode
 		if exited {
 			if exitCode != 0 {
 				stderrTail := strings.TrimSpace(criuStderr.String())
 				if len(stderrTail) > 4096 {
 					stderrTail = stderrTail[len(stderrTail)-4096:]
 				}
-				logTail := restoreLogTail(restoreLogPath, 4096)
-				return 0, nil, fmt.Errorf("criu restore exited (exit code %d): broker-delegated wrapper\ncriu restore.log tail:\n%s\ncriu stderr:\n%s",
-					exitCode, logTail, stderrTail)
+				// ADR-0418: CRIU's own terminal exit status (exited && exitCode != 0) is already
+				// this leg's own gate — name the causal-first error from the full restore.log
+				// rather than a byte-offset tail window. The checkpoint-dir copy (server.go:6592)
+				// has not run yet at this point in the function — cite only restoreLogPath.
+				cause := criuRestoreFailureCause(restoreLogPath, checkpointDir, false, exited, exitCode, nil, stderrTail)
+				return 0, nil, fmt.Errorf("criu restore exited (exit code %d): broker-delegated wrapper\n%s", exitCode, cause)
 			}
 			// Exit 0 means restore succeeded and CRIU is done (detached-like path or early exit).
 			workloadLive = true
@@ -5900,9 +6416,16 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 		if len(stderrTail) > 4096 {
 			stderrTail = stderrTail[len(stderrTail)-4096:]
 		}
-		logTail := restoreLogTail(restoreLogPath, 4096)
-		return 0, nil, fmt.Errorf("criu restore did not produce workload PIDs in agent cgroup within %s: criu restore.log tail:\n%s\ncriu stderr:\n%s",
-			cgroupPollTimeout, logTail, stderrTail)
+		// ADR-0418 Decision item 1: this leg is reached when CRIU has NOT reached a terminal
+		// state (deadline/ctx abort with exited==false) or the poll round-trip itself is
+		// persistently failing — never when exited && exitCode != 0 (that returns immediately
+		// above). Gate on the last-observed criuCmd.poll() verdict, not on log content or
+		// "Restoring FAILED." presence, and surface a persistently-failing broker round-trip as
+		// its own distinct mechanism-failure class rather than folding it into either other case.
+		// The checkpoint-dir copy has not run yet at this point — cite only restoreLogPath.
+		cause := criuRestoreFailureCause(restoreLogPath, checkpointDir, false, lastPollExited, lastPollExitCode, agentPIDsErr, stderrTail)
+		return 0, nil, fmt.Errorf("criu restore did not produce workload PIDs in agent cgroup within %s\n%s",
+			cgroupPollTimeout, cause)
 	}
 
 	// Copy restore.log to checkpointDir so gate checks can find it under
@@ -5943,12 +6466,25 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 	// caller-deadline/cancel exit (D7) from a genuine "CRIU never wrote a pidfile" failure.
 	pidfileBudget := remainingOrCeiling(ctx, 30*time.Second)
 	pidfileCtxAborted := false
+	// ADR-0418 Decision item 1 / Runtime-dependency audit row 2: exited/exitCode are already read
+	// here via criuCmd.poll() and were previously discarded to `_` — capture the last-observed
+	// verdict instead of synthesizing one, so the error branch below can gate cause-naming on
+	// CRIU's own terminal exit status.
+	var lastPidfilePollExited bool
+	var lastPidfilePollExitCode int
+	var lastPidfilePollErr error
 	pidfilePoll := func() (bool, error) {
 		if ctx.Err() != nil {
 			pidfileCtxAborted = true
 			return true, nil
 		}
-		exited, _, _, perr := criuCmd.poll()
+		exited, exitCode, _, perr := criuCmd.poll()
+		if perr == nil {
+			lastPidfilePollExited, lastPidfilePollExitCode = exited, exitCode
+			lastPidfilePollErr = nil
+		} else {
+			lastPidfilePollErr = perr
+		}
 		return exited, perr
 	}
 	pid, err = readRestoredPIDFromPidfile(pidfilePath, pidfileBudget, pidfilePoll)
@@ -5963,13 +6499,14 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 				"migration", migrationName, "ctxErr", ctx.Err())
 		} else {
 			// Fail loud — never fall back to comm-scan or cgroup-diff (ADR-0228 NRI/gRPC symmetry).
-			// Surface the CRIU restore.log tail: a missing pidfile is usually the DOWNSTREAM symptom
-			// of a restore that aborted earlier (e.g. mount-v2 open_tree on an external mount), and the
-			// real cause is only in restore.log — not in this wrapper message.
 			metrics.MigrationsFailedTotal.WithLabelValues("restore_pidfile_missing").Inc()
 		}
-		logTail := restoreLogTail(restoreLogPath, 4096)
-		return 0, nil, fmt.Errorf("resolve restored PID via CRIU --pidfile: %w\ncriu restore.log tail:\n%s", err, logTail)
+		// ADR-0418: name the causal-first error from the full restore.log rather than a
+		// byte-offset tail window, gated on CRIU's own last-observed terminal exit status. The
+		// checkpoint-dir copy (server.go:6592-6593) has already run by the time this leg is
+		// reached — cite it too.
+		cause := criuRestoreFailureCause(restoreLogPath, checkpointDir, true, lastPidfilePollExited, lastPidfilePollExitCode, lastPidfilePollErr, "")
+		return 0, nil, fmt.Errorf("resolve restored PID via CRIU --pidfile: %w\n%s", err, cause)
 	}
 	// ADR-0228 Invariant 1: identity is guaranteed by --pidfile (CRIU reports the PID it
 	// restored — never the wrapper/holder stub); the residual check is liveness. Defense in
@@ -6088,6 +6625,226 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 
 // readLogTail was removed: ADR-0127 scaffold (restore.log success-signal) removed per ADR-0192.
 // The liveness signal is now the cgroup-PID diff (see joinNsRestore above).
+
+// ADR-0418: criuKnownNonFatalLinePatterns is the causal-attribution known-non-fatal allowlist.
+// Each entry is a CRIU restore.log diagnostic line that is structurally void-helper/cosmetic
+// teardown output and must NEVER be surfaced as THE cause of a restore failure, even when it is
+// the first (or only) line matching "Error (criu/" in the log. Amendable only by ADR (Decision
+// item 5) — each entry requires a recorded per-entry disassembly proof against every deployed
+// CRIU binary before it is added.
+var criuKnownNonFatalLinePatterns = []string{
+	// cleanup_mnt_ns: disassembly-proven void helper at both call sites
+	// (depopulate_roots_yard+380, prepare_namespace_before_tasks+415) — runs during restore
+	// teardown, after the real failure has already been decided; its own error text is
+	// structurally incapable of being the cause. See ADR-0418 Context.
+	"Error (criu/mount.c:3700)",
+	// cgroupd teardown diagnostic, independently observed after the terminal "Restoring FAILED."
+	// line in three real restore logs in this repo's own corpus (docs/sprints/criu-restore.log:305,
+	// criu-restore-attempt5.log:59, criu-restore-attempt7.log:321).
+	"Error (criu/cgroup.c:1998)",
+}
+
+// isKnownNonFatalCRIULine reports whether line matches an ADR-0418 known-non-fatal pattern.
+func isKnownNonFatalCRIULine(line string) bool {
+	for _, p := range criuKnownNonFatalLinePatterns {
+		if strings.Contains(line, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// criuRestoreFailureAttribution is the result of an ADR-0418 forward causal-order scan of a CRIU
+// restore.log.
+type criuRestoreFailureAttribution struct {
+	found           bool   // a non-allowlisted "Error (criu/" line was found — causeLine is authoritative
+	causeLine       string // the named cause line, verbatim (set only when found)
+	terminalLine    string // the first line containing "Restoring FAILED.", if present
+	demoted         bool   // the very first matching line was allowlisted and a later real match exists
+	demotedLine     string // the skipped allowlisted line, verbatim (set when demoted OR onlyAllowlisted)
+	onlyAllowlisted bool   // every matching line found was allowlisted — no real cause present in the log
+	matchCount      int    // total count of "Error (criu/"-matching lines found
+
+	// ADR-0420 D5: the mount-v2 progress trail, collected in the SAME forward pass. It is the
+	// causal anchor for the one class ADR-0418's rule is structurally blind to — a silent
+	// fstype->restore, which emits no "Error (criu/" line at all. It is reported only when the
+	// first-causal-error rule yields nothing but demoted lines; it never outranks a real cause.
+	mountProgress criuMountV2Progress
+}
+
+// scanCRIURestoreLogForFirstError implements ADR-0418 Decision items 2, 3 and 5: a forward
+// (never reverse), causal-order scan of the FULL restore.log for the first line containing the
+// substring "Error (criu/" — matched via strings.Contains, never strings.HasPrefix, because
+// CRIU's own -v4 line format carries a "(SS.mmmmmm) " timestamp and an optional "<task>: " prefix
+// before the message, so the token is never at column 0 (ADR-0418 Context, corrected line-format
+// grounding). Lines matching the known-non-fatal allowlist are skipped in favor of a later real
+// match unless they are the only match found (Decision item 5, "only-match"/"demotion" cases).
+// The terminal "Restoring FAILED." line, if present, is recorded as informational context only —
+// never a gating condition (ADR-0354 D2b/D7 caveat: a genuine failure can omit it entirely).
+//
+// Implemented on bufio.Scanner with a capped per-line buffer and an overall byte ceiling, not
+// os.ReadFile (the primitive restoreLogTail uses) — per the ADR-0418 implementation note,
+// restore.log volume under -v4 scales with the checkpointed workload's fd/mount/VMA count, which
+// is adversary-influenceable on a multi-tenant node, and a first-match forward scan needs no
+// full-file buffer in the privileged node agent.
+func scanCRIURestoreLogForFirstError(restoreLogPath string) criuRestoreFailureAttribution {
+	var result criuRestoreFailureAttribution
+	if restoreLogPath == "" {
+		return result
+	}
+	f, err := os.Open(restoreLogPath)
+	if err != nil {
+		return result
+	}
+	defer f.Close()
+
+	const maxLineBytes = 64 * 1024        // per-line cap — bufio.Scanner's token buffer ceiling
+	const maxScanBytes = 32 * 1024 * 1024 // overall byte ceiling across the whole scan
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 4096), maxLineBytes)
+
+	var firstMatch, firstNonAllowlisted string
+	firstMatchAllowlisted := false
+	var scanned int64
+	for scanner.Scan() {
+		line := scanner.Text()
+		scanned += int64(len(line)) + 1
+		if scanned > maxScanBytes {
+			break
+		}
+		if result.terminalLine == "" && strings.Contains(line, "Restoring FAILED.") {
+			result.terminalLine = line
+		}
+		// ADR-0420 D5: fold the line into the mount-v2 progress trail in this same pass. No second
+		// read of the log, no second file handle, no full-file buffer — one retained line and a
+		// bounded slice.
+		result.mountProgress.noteCRIULogLine(line)
+		if strings.Contains(line, "Error (criu/") {
+			result.matchCount++
+			// ADR-0420 D5 precondition: cause candidacy excludes BOTH ADR-0418's known-non-fatal
+			// allowlist AND CRIU's own terminal "Restoring FAILED." announcement, which carries the
+			// "Error (criu/" substring and would otherwise be named as the cause of the failure it
+			// merely announces — see isCRIUTerminalAnnouncementLine for why that is decisive on the
+			// silent-fstype->restore class and harmless on every other. The line is still COUNTED
+			// here and still reported verbatim as terminalLine; only its candidacy is removed.
+			allowlisted := isNonCausalCRIULine(line)
+			if firstMatch == "" {
+				firstMatch = line
+				firstMatchAllowlisted = allowlisted
+			}
+			if !allowlisted && firstNonAllowlisted == "" {
+				firstNonAllowlisted = line
+			}
+		}
+	}
+
+	if result.matchCount == 0 {
+		return result
+	}
+	if firstNonAllowlisted != "" {
+		result.found = true
+		result.causeLine = firstNonAllowlisted
+		if firstMatchAllowlisted && firstMatch != firstNonAllowlisted {
+			// Decision item 5, demotion case: the first match was allowlisted and a later real
+			// match exists — never silently promote the later line without disclosing this.
+			result.demoted = true
+			result.demotedLine = firstMatch
+		}
+		return result
+	}
+	// Every matching line found was allowlisted — Decision item 5, only-match case: the envelope
+	// must say so explicitly rather than silently reporting the cosmetic line as the cause.
+	result.onlyAllowlisted = true
+	result.demotedLine = firstMatch
+	return result
+}
+
+// criuRestoreFailureCause implements ADR-0418 Decision item 1: CRIU's own terminal exit status
+// (exited && exitCode != 0, from criuCmd.poll(), server.go:8511) gates whether a cause is named
+// at all. mechanismErr, when non-nil, means the poll/broker round-trip itself failed persistently
+// — the read mechanism failed and no CRIU log line is attributable; this is a third class distinct
+// from "CRIU ran and failed" and "CRIU has not finished" and must be reported as such, never
+// folded into either. checkpointDir/checkpointLogCopied cite the checkpoint-dir copy of the log
+// (server.go:6591-6592) only when that copy has already been written by the time the caller's
+// call site executes — citing it before it exists would be an inaccurate path citation
+// (§P-VERIFY #9). stderrTail is the existing bounded byte-offset excerpt (restoreLogTail or the
+// broker stderr capture); retained per the Decision's Retention note as supplementary,
+// non-attributing context ALONGSIDE the causal citation — never the attribution basis itself.
+func criuRestoreFailureCause(restoreLogPath, checkpointDir string, checkpointLogCopied bool, exited bool, exitCode int, mechanismErr error, stderrTail string) string {
+	var b strings.Builder
+
+	switch {
+	case mechanismErr != nil:
+		// Third class: the broker round-trip/poll mechanism itself is persistently failing. No
+		// CRIU verdict was ever obtained, so no CRIU log line is attributable at all.
+		fmt.Fprintf(&b, "criu poll/broker round-trip failed (mechanism failure — no CRIU verdict obtained, no cause attributable from restore.log): %v\n", mechanismErr)
+	case !exited:
+		// CRIU has not reached a terminal state (e.g. a deadline/ctx abort fired first). Per
+		// Decision item 1, a cause MUST NOT be named here — only CRIU's own exit status gates
+		// cause-naming, never log content or the presence/absence of "Restoring FAILED.".
+		fmt.Fprintf(&b, "criu had not terminated when this restore leg aborted — no cause is named (CRIU has not rendered a verdict)\n")
+		attr := scanCRIURestoreLogForFirstError(restoreLogPath)
+		if attr.found {
+			fmt.Fprintf(&b, "last CRIU error observed while restore was still in flight (NOT the cause): %s\n", attr.causeLine)
+		}
+	case exitCode == 0:
+		// Should not normally reach this helper (exit 0 is the success path), but stay honest if
+		// it ever does: no cause to name.
+		fmt.Fprintf(&b, "criu exited 0 — no failure to attribute\n")
+	default:
+		fmt.Fprintf(&b, "criu exited (exit code %d)\n", exitCode)
+		attr := scanCRIURestoreLogForFirstError(restoreLogPath)
+		switch {
+		case attr.found:
+			fmt.Fprintf(&b, "first causal error (earliest \"Error (criu/\" line in restore.log): %s\n", attr.causeLine)
+			if attr.demoted {
+				fmt.Fprintf(&b, "note: an earlier known-non-fatal CRIU diagnostic was demoted, not treated as cause: %s\n", attr.demotedLine)
+			}
+			fmt.Fprintf(&b, "total \"Error (criu/\" lines found in restore.log: %d\n", attr.matchCount)
+		case attr.onlyAllowlisted:
+			// ADR-0420: the demoted line is either an ADR-0418 known-non-fatal diagnostic or CRIU's
+			// own terminal announcement. Name which, rather than calling the announcement a
+			// "diagnostic" — an inaccurate label here is how a reader concludes the log was
+			// searched for something it does not contain.
+			kind := "a known-non-fatal CRIU diagnostic"
+			if isCRIUTerminalAnnouncementLine(attr.demotedLine) && !isKnownNonFatalCRIULine(attr.demotedLine) {
+				kind = "CRIU's own terminal failure announcement (which announces the failure, and cannot be its cause)"
+			}
+			fmt.Fprintf(&b, "only %s found; true cause not present in restore.log: %s\n", kind, attr.demotedLine)
+			if isTeardownNoiseCRIULine(attr.demotedLine) {
+				// ADR-0420 D5 item 3: name it as teardown noise explicitly. The "Device or resource
+				// busy" string on this line is the strerror of rmdir(2) on CRIU's own roots-yard
+				// temp directory during the unwind — NOT a mount EBUSY. Reading it as a bind
+				// conflict is what sent two ADRs after an ownership-inversion hypothesis that a
+				// single decode then refuted.
+				fmt.Fprintf(&b, "note: that line is CRIU TEARDOWN NOISE (rmdir of CRIU's own roots-yard temp dir during the unwind) — its \"Device or resource busy\" text is NOT a mount EBUSY and must never be reported as a cause (ADR-0420 D5)\n")
+			}
+			fmt.Fprintf(&b, "total \"Error (criu/\" lines found in restore.log: %d\n", attr.matchCount)
+			// ADR-0420 D5: ADR-0418's rule found nothing real. Fall to the lower-precedence
+			// mount-v2 progress-trail rule, which covers the silent-fstype->restore class.
+			renderD5Attribution(&b, &attr.mountProgress)
+		default:
+			fmt.Fprintf(&b, "no \"Error (criu/\" line found in restore.log\n")
+			renderD5Attribution(&b, &attr.mountProgress)
+		}
+		if attr.terminalLine != "" {
+			fmt.Fprintf(&b, "terminal line: %s\n", attr.terminalLine)
+		}
+	}
+
+	fmt.Fprintf(&b, "full restore.log: %s", restoreLogPath)
+	if checkpointLogCopied {
+		fmt.Fprintf(&b, " (also copied to %s — available until checkpoint GC, zeroized on release per rule 7)", filepath.Join(checkpointDir, "restore.log"))
+	}
+	b.WriteString("\n")
+
+	if stderrTail != "" {
+		fmt.Fprintf(&b, "criu stderr (bounded excerpt, supplementary/non-attributing):\n%s", stderrTail)
+	}
+
+	return b.String()
+}
 
 // restoreLogTail reads the tail of CRIU's restore.log (written by criu -o restoreLogPath, running
 // via nsenter in the host mount ns) so the REAL restore failure — e.g. the mount-v2 open_tree
@@ -7208,25 +7965,75 @@ var errNoSandboxForPodUID = errors.New("no sandbox container found for pod uid")
 // the real kubelet-driven sandbox-creation edge) without a live containerd.
 var sandboxIDForPodUIDFn = sandboxIDForPodUID
 
-// sandboxIDForPodUID resolves the containerd sandbox (pause container) task ID for the given
-// pod UID via `ctr --namespace k8s.io containers list`, filtering by the io.kubernetes.pod.uid
-// label. Mirrors the existing ctr-based lookup idiom (sandboxNetnsPath) — no
-// new external binary dependency. Returns errNoSandboxForPodUID (wrapped) when the query succeeds
-// but no sandbox exists yet, so callers can distinguish that retryable race from a hard ctr error.
+// sandboxIDForPodUID resolves the containerd POD SANDBOX (pause container) ID for the given pod UID.
+//
+// ADR-0419 D8 — HARDENED, CONTRACT-PRESERVING. The pre-ADR-0419 implementation ran
+//
+//	ctr --namespace k8s.io containers list -q labels."io.kubernetes.pod.uid"==<uid>
+//
+// and returned THE FIRST NON-EMPTY LINE. kubelet stamps io.kubernetes.pod.uid on the pod sandbox
+// AND on every workload container, and there was no kind filter anywhere in the tree, so this
+// returned whichever row containerd happened to list first. Live evidence from the origin
+// diagnosis: for one pod UID the listing order was <container>, <container>, <sandbox> — sandbox
+// LAST — and 6 of 7 multi-container pod UIDs returned a workload container first. A
+// workload-container ID then yielded a sandbox directory that does not exist, every existence probe
+// correctly reported absent, and a deterministic identifier bug presented as a 30-second timeout.
+// That is FM1's root cause (A).
+//
+// This function is no longer on the destination-rebind path at all — ADR-0419 removes it from
+// there. It is hardened anyway, unconditionally, because its THIRD consumer survives: the ADR-0306
+// pod-netns join gate (resolveSandboxIDForMigration), whose correctness rests on the same latent
+// defect and which would otherwise be the next place it surfaced.
+//
+// THE CONTRACT IS TRI-STATE AND THE ZERO-MATCH LEG IS INVARIANT:
+//
+//	exactly one RUNNING sandbox -> that ID. Never "the first row".
+//	ZERO matches                -> wrapped errNoSandboxForPodUID, UNCHANGED. This is the benign
+//	                               "not yet" race edge (the destination kubelet has not created the
+//	                               pause container at this instant) that resolveSandboxIDForMigration
+//	                               converts into ReplacementSandboxNotYetCreatedError and that the
+//	                               60s bounded wait in resolvePodNetnsSandboxWaiting engages on.
+//	                               Introducing a distinct hard error here would sever that chain at
+//	                               its ONLY construction site repo-wide and collapse the gate from
+//	                               "bounded-wait 60s for the kubelet" to "fail terminal on first
+//	                               look" — on the very ~6s race it was built to win.
+//	>1 RUNNING sandbox          -> AmbiguousPodSandboxError naming BOTH. Genuinely ambiguous,
+//	                               correctly terminal.
+//	transport/typed failure     -> terminal wrapped error, unchanged. NOT errNoSandboxForPodUID.
+//
+// Note the zero-match window WIDENS under the kind+state filter: the interval in which workload
+// containers are listed but the sandbox is not yet RUNNING used to return a wrong-but-non-empty ID
+// and now returns zero. That makes preserving the retryable leg MORE load-bearing after this
+// change, not less.
+//
+// WHY A TYPED CLIENT RATHER THAN `ctr`: the RUNNING requirement cannot be expressed by
+// `ctr containers list` at all (it has no state column; state lives in `ctr tasks list`), so
+// satisfying D8 over the CLI would mean a SECOND scrape and a client-side join — more of exactly
+// what FM5 condemns. ListPodSandbox is inherently kind-filtered (it lists sandboxes, nothing else)
+// and takes the state filter directly, so one typed call answers both halves.
+//
+// §P-VERIFY #8c SETTLED LIVE before this leg shipped, on pm-w1 AND pm-w2: 27 pod UIDs across the
+// two nodes carry TWO sandbox rows each — including all four the ADR named
+// (047ae64e…, 110670f4…, 162477b6…, 3634f6ab…) — but ZERO carry more than one in SANDBOX_READY.
+// The second row is always a stale, not-ready sandbox. So two-RUNNING is NOT a steady state this
+// substrate produces, the >1 leg does not terminalize a gate that works today, and it ships as
+// specified. The multiplicity itself is real, which is exactly why the state filter — not the kind
+// filter alone — is what makes the answer unique.
 func sandboxIDForPodUID(ctx context.Context, podUID string) (string, error) {
-	out, err := nsenterCmd(ctx, ctrArgs("/usr/local/bin/ctr", "--namespace", "k8s.io", "containers", "list",
-		"-q", "labels.\"io.kubernetes.pod.uid\"=="+podUID)...).Output()
+	sandboxes, err := runningPodSandboxesForPodUIDFn(ctx, podUID)
 	if err != nil {
-		return "", fmt.Errorf("ctr containers list for pod uid %s: %w", podUID, err)
+		// A transport/typed failure is NOT errNoSandboxForPodUID and must never become it: "we
+		// could not ask" and "the answer is not yet" are different facts (root cause D).
+		return "", fmt.Errorf("pod sandbox lookup for pod uid %s: %w", podUID, err)
 	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	for _, line := range lines {
-		id := strings.TrimSpace(line)
-		if id != "" {
-			return id, nil
-		}
+	switch len(sandboxes) {
+	case 0:
+		return "", fmt.Errorf("%w %s", errNoSandboxForPodUID, podUID)
+	case 1:
+		return sandboxes[0], nil
+	default:
+		return "", &AmbiguousPodSandboxError{PodUID: podUID, SandboxIDs: sandboxes}
 	}
-	return "", fmt.Errorf("%w %s", errNoSandboxForPodUID, podUID)
 }
 
 // patchCheckpointImages modifies the CRIU image files in checkpointDir to remove entries
@@ -9160,6 +9967,23 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 			log.Info(msg, "migration", req.MigrationName)
 			return &agentpb.RestoreResponse{Success: false, ErrorMessage: msg}, nil
 		}
+		// ADR-0417: fold in the Class DESTINATION-REBIND targets — see
+		// appendDestinationRebindReattachMounts doc. Deliberately placed AFTER the pod-netns
+		// sandbox gate above, not before it: the containerd CRI sandbox dir that holds
+		// /etc/hostname and /etc/resolv.conf cannot exist before the sandbox does, so waiting here
+		// starts the destination-file wait on the far side of an edge that is already CONFIRMED
+		// rather than racing it, and a genuinely unresolvable sandbox is reported by the gate that
+		// owns that condition instead of surfacing as a rebind-probe failure.
+		var drErr error
+		// SITE 2 of 3. joinSandboxID is resolved fourteen lines above by the pod-netns sandbox gate
+		// and is threaded in rather than re-derived; imagesDir is this path's checkpointDir.
+		// runtimeMounts is nil here — there is no NRI ContainerEvent on the gRPC path — so the
+		// resolver takes its D5 typed-containerd branch.
+		reattachMounts, drErr = s.appendDestinationRebindReattachMounts(
+			ctx, req.MigrationName, imagesDir, joinSandboxID, nil, reattachMounts)
+		if drErr != nil {
+			return nil, fmt.Errorf("resolve destination-rebind mounts: %w", drErr)
+		}
 		// ADR-0351 D3.1: pass the incoming gRPC Restore handler ctx — the operator-set restore-RPC
 		// deadline D_restore is the real budget source on this path; no new derivation needed.
 		// P-0193-2 (2026-07-18): this gRPC path has no NRI ContainerEvent, but self-resolves the
@@ -9345,10 +10169,15 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	}
 
 	// Raw CRIU restore via joinNsRestore (same path as ctr checkpoint, but without config.json).
-	// The raw CRIU path (go-criu swrk) fails because it runs CRIU in the agent container's
-	// mount namespace, which has /sys. CRIU compat-mode tries to umount /sys → EBUSY.
 	// joinNsRestore runs CRIU via nsenter in the HOST mount namespace with --root pointing to
-	// the container's overlayfs, which avoids the agent namespace /sys issue entirely.
+	// the container's overlayfs, rather than in the agent container's own mount namespace.
+	//
+	// ADR-0420 D3: this note used to justify that choice by the compat-mode umount pass tripping
+	// over /sys → EBUSY. That rationale is STALE: buildCRIURestoreArgs omits --mntns-compat-mode,
+	// so CRIU runs the mount-v2 engine and no umount pass runs on this path at all. The
+	// host-mount-namespace choice stands on its own grounds — CRIU's child must setns() from a
+	// namespace where the checkpoint dir and rootfsDir are both resolvable, which the agent
+	// container's namespace does not satisfy — and is NOT contingent on any compat-mode behavior.
 	//
 	// ADR-0385: this branch used to run its OWN standalone patchCheckpointImages pass here
 	// ("Gate10: patch checkpoint images first") BEFORE calling joinNsRestoreFn below — which
@@ -9378,6 +10207,39 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// P-0193-1 (2026-07-18): see appendHolderScaffoldReattachMount doc — same fold-in as the other
 	// two restore paths, for the raw (non-config.json) gRPC Restore path.
 	rawReattachMounts = s.appendHolderScaffoldReattachMount(ctx, req.MigrationName, rawReattachMounts)
+	// UNIVERSAL POD-NETNS INTEGRATION (ADR-0125/ADR-0177/ADR-0349 — mislabeled "ADR-0325" prior
+	// to ADR-0370's citation fix; see ADR-0370 First Finding): raw-CRIU gRPC path parity with the
+	// config.json branch above — resolve the replacement pod's REAL sandbox netns and join it so
+	// the restored process serves at its pod IP regardless of tcpPreservationMode. The synthetic
+	// migration netns (req.DestNetnsFd) is deliberately NOT joined (old-IP preservation is out of
+	// scope). See the config.json branch for the full rationale. Fail-closed on resolution failure.
+	//
+	// ADR-0419 D2b — THIS GATE IS HOISTED, deliberately. It previously sat EIGHTEEN LINES BELOW the
+	// destination-rebind fold-in, making this branch the outlier: the config.json branch already
+	// runs the sandbox gate FIRST and documents that ordering as deliberate ("a genuinely
+	// unresolvable sandbox is reported by the gate that owns that condition instead of surfacing as
+	// a rebind-probe failure"). Hoisting converges all three sites on that order, and the rebind
+	// resolver now REQUIRES it: D3's lookup needs the sandbox ID to narrow the runtime mount list to
+	// the right container. The two are independent reads — nothing between them writes state the
+	// other consumes — so this is a reordering into the dependency order, on the one branch that
+	// had them backwards. Passing "" instead, or widening the resolver's early return to tolerate an
+	// empty sandbox ID, are both explicitly rejected shapes: the second is a FAIL-OPEN that silently
+	// drops the targets from --ext-mount-map.
+	joinSandboxID2, sandboxAttempted2 := s.resolvePodNetnsSandboxWaiting(ctx, req.MigrationName)
+	if joinSandboxID2 == "" && sandboxAttempted2 {
+		msg := fmt.Sprintf("Restore: pod-netns integration failed for migration %s: could not resolve replacement pod sandbox netns (ADR-0325) — refusing to restore into a detached/non-pod namespace", req.MigrationName)
+		log.Info(msg, "migration", req.MigrationName)
+		return nil, fmt.Errorf("%s", msg)
+	}
+	// ADR-0419: see appendDestinationRebindReattachMounts doc — same fold-in as the other two
+	// restore paths, for the raw (non-config.json) gRPC Restore path. SITE 3 of 3. imagesDir is
+	// this path's checkpointDir; joinSandboxID2 is the sandbox the gate immediately above confirmed;
+	// runtimeMounts is nil (no NRI event on the gRPC path) so the D5 typed branch runs.
+	rawReattachMounts, rawDRErr := s.appendDestinationRebindReattachMounts(
+		ctx, req.MigrationName, imagesDir, joinSandboxID2, nil, rawReattachMounts)
+	if rawDRErr != nil {
+		return nil, fmt.Errorf("resolve destination-rebind mounts: %w", rawDRErr)
+	}
 
 	t0 := time.Now()
 	// ADR-0168 B2: storedWorkloadImage replaces the empty imageName on the gRPC fallback path.
@@ -9386,18 +10248,6 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	s.destHostVethMu.RLock()
 	storedVeth2 := s.destHostVeth[req.MigrationName]
 	s.destHostVethMu.RUnlock()
-	// UNIVERSAL POD-NETNS INTEGRATION (ADR-0125/ADR-0177/ADR-0349 — mislabeled "ADR-0325" prior
-	// to ADR-0370's citation fix; see ADR-0370 First Finding): raw-CRIU gRPC path parity with the
-	// config.json branch above — resolve the replacement pod's REAL sandbox netns and join it so
-	// the restored process serves at its pod IP regardless of tcpPreservationMode. The synthetic
-	// migration netns (req.DestNetnsFd) is deliberately NOT joined (old-IP preservation is out of
-	// scope). See the config.json branch for the full rationale. Fail-closed on resolution failure.
-	joinSandboxID2, sandboxAttempted2 := s.resolvePodNetnsSandboxWaiting(ctx, req.MigrationName)
-	if joinSandboxID2 == "" && sandboxAttempted2 {
-		msg := fmt.Sprintf("Restore: pod-netns integration failed for migration %s: could not resolve replacement pod sandbox netns (ADR-0325) — refusing to restore into a detached/non-pod namespace", req.MigrationName)
-		log.Info(msg, "migration", req.MigrationName)
-		return nil, fmt.Errorf("%s", msg)
-	}
 	// ADR-0351 D3.1: same rationale as the config.json branch above — pass the incoming gRPC
 	// Restore handler ctx (D_restore).
 	// P-0193-2 (2026-07-18): same rationale as the primary gRPC branch above — no NRI event on

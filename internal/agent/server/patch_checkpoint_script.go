@@ -73,6 +73,48 @@ reattach_host_targets = _raw_reattach_ht if isinstance(_raw_reattach_ht, dict) e
 _raw_reattach_tier1 = json.loads(sys.argv[6]) if len(sys.argv) > 6 else []
 reattach_tier1_mount_paths = set(_raw_reattach_tier1) if _raw_reattach_tier1 is not None else set()
 
+# ---- ADR-0417 S2(c): structured, injection-proof marker emission --------------------------------
+#
+# Every marker line this script writes is parsed on the Go side by splitting raw stdout/stderr on
+# '\n' and prefix-matching (server.go patchCheckpointImages). Any image-derived string interpolated
+# into a printed line is therefore attacker-controlled DATA in a line-oriented protocol: a checkpoint
+# image whose ext_key/mountpoint/name contains a newline followed by a forged
+# "CRIU_REATTACH_EXT_MOUNT_MAP:{...}" payload previously parsed cleanly and injected an arbitrary
+# --ext-mount-map token into CRIU's argv (a working exploit was demonstrated against the
+# %-formatting + single-character '"'-replace this replaces).
+#
+# _emit() is now the ONLY way a marker line is produced, and it serializes its payload with
+# json.dumps — which escapes '"', '\', and EVERY control character including '\n', '\r' and NUL as
+# \uXXXX escapes, so no image-derived byte can terminate the line or start a new one. _q() does the
+# same for image-derived values embedded in ordinary human-readable log lines (which share the same
+# stdout stream and are equally capable of forging a marker line if left raw).
+def _q(v):
+    """Render an image-derived value as a JSON string literal: quoted, fully escaped, single-line."""
+    if not isinstance(v, str):
+        v = str(v)
+    return json.dumps(v)
+
+def _p(v):
+    """Render an image-derived value for an ordinary human-readable log line.
+
+    Unquoted (so the long-standing 'mountpoint=/data' log shape is preserved) but with every C0/C1
+    control character — critically '\\n' and '\\r' — replaced by U+FFFD. A value can therefore never
+    terminate the current line or begin a new one, which is the ONLY property a forged marker line
+    needs: the Go-side parser prefix-matches whole lines, so an injected payload that cannot reach
+    column 0 of its own line can never be mistaken for a marker.
+    """
+    if not isinstance(v, str):
+        v = str(v)
+    return ''.join((c if (31 < ord(c) < 127) or ord(c) > 159 else '�') for c in v)
+
+def _emit(marker, payload, stream=None):
+    """Write one structured marker line. Payload is JSON-encoded; keys sorted for stable output."""
+    line = marker + ':' + json.dumps(payload, sort_keys=True)
+    if stream is None:
+        print(line)
+    else:
+        print(line, file=stream)
+
 def backup(path):
     orig = path + '.orig'
     if not os.path.exists(orig):
@@ -104,19 +146,19 @@ def load_image(image_file, fail_on_magic_error=True):
     except MagicException as e:
         magic_val = getattr(e, 'magic', 'unknown')
         if fail_on_magic_error:
-            print('PATCH_ERROR: %s:%s:%s' % (image_file, magic_val, str(e)), file=sys.stderr)
+            print('PATCH_ERROR: %s:%s:%s' % (_p(image_file), _p(magic_val), _p(str(e))), file=sys.stderr)
             sys.exit(1)
         else:
-            print('WARNING: skipping %s — unknown magic %s: %s' % (image_file, magic_val, str(e)))
+            print('WARNING: skipping %s — unknown magic %s: %s' % (_p(image_file), _p(magic_val), _p(str(e))))
             return None
     except Exception as e:
         # Catches "No handler found for image with magic <name>" when magic is known
         # but the vendored pycriu lacks the handler (e.g. IFADDR in older pycriu).
         if fail_on_magic_error:
-            print('PATCH_ERROR: %s:unknown:%s' % (image_file, str(e)), file=sys.stderr)
+            print('PATCH_ERROR: %s:unknown:%s' % (_p(image_file), _p(str(e))), file=sys.stderr)
             sys.exit(1)
         else:
-            print('WARNING: skipping %s — no pycriu handler: %s' % (image_file, str(e)))
+            print('WARNING: skipping %s — no pycriu handler: %s' % (_p(image_file), _p(str(e))))
             return None
 
 # ---- mountpoints: keep only mounts with valid (non-null) ext_key or standard in-container mounts ----
@@ -138,8 +180,15 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     # /proc and /dev are NOT in DROP_ROOT_FSTYPES — policy keeps /proc root and /dev;
     # only specific submounts listed in DROP_PATHS are removed exactly.
 
+    # ADR-0417 int-vs-string fix: mnt_entry.fstype (criu/images/mnt.proto) is a plain protobuf
+    # uint32 field, NOT a TYPE_ENUM field, so pycriu.images.load returns the raw integer CRIU
+    # wrote (sysfs=2), never the decoded enum-name string 'sysfs' — same grounding as
+    # RECREATABLE_FSTYPES below and the _fst in (...) fix at the REBIND_TO_ROOT site. Both the
+    # int code and the string are listed so a pycriu build that ever DOES decode names (e.g.
+    # pretty=True) still matches, matching the ('TMPFS', 'DEVTMPFS', 5, 3) convention used there.
+    FSTYPE_SYSFS = 2
     DROP_ROOT_FSTYPES = {
-        'sysfs',   # /sys — re-provided by destination runtime; catches both sysfs instances in kind
+        FSTYPE_SYSFS, 'sysfs',   # /sys — re-provided by destination runtime; catches both sysfs instances in kind
         # NOTE: procfs NOT here — policy keeps /proc root, drops only named submounts
     }
 
@@ -173,7 +222,15 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
         mp = entry.get('mountpoint')
         if mp in DROP_PATHS:
             return True
-        if entry.get('fstype') in DROP_ROOT_FSTYPES:
+        # The fstype-based seed is scoped to CRIU-NATIVE mounts only (no ext_key) — it exists to
+        # catch a genuine kernel-mounted sysfs instance that CRIU did NOT record as an external
+        # (e.g. a second /sys-shaped mount under a different path in kind), which DROP_PATHS'
+        # literal '/sys' string cannot. An EXTERNAL entry (ext_key set) that happens to carry the
+        # same fstype code is a different animal — an auto-detected bind/PVC mount — and is left
+        # for the ADR-0417 external-mount classification pass below (reattach / RECREATABLE
+        # internalize / DESTINATION-REBIND), which already has its own fstype-driven predicate
+        # (RECREATABLE_FSTYPES, which also lists 2/SYSFS) for exactly that case.
+        if entry.get('fstype') in DROP_ROOT_FSTYPES and not entry.get('ext_key'):
             return True
         return False
 
@@ -190,7 +247,13 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
     # tmpfs_drop_mnt_ids, so its REG orphan fds DECLINE rather than rebind — documented
     # fail-closed narrowing (ADR-0311 decision 1), not a regression, out of scope to widen here.
     # Disjoint by construction from any DROP_ROOT_FSTYPES(sysfs) match (TMPFS != sysfs).
-    tmpfs_drop_mnt_ids = {e['mnt_id'] for e in img['entries'] if is_drop_root(e) and 'mnt_id' in e and e.get('fstype') == 'TMPFS'}
+    #
+    # ADR-0417 int-vs-string fix: same grounding as DROP_ROOT_FSTYPES above and the _fst in (...)
+    # fix at the REBIND_TO_ROOT site — fstype is a raw protobuf uint32 (tmpfs=5), not the decoded
+    # enum-name string 'TMPFS', so the string-only comparison this set used to use never matched
+    # a real pycriu-decoded image and this seed set was always empty. Accept both forms.
+    FSTYPE_TMPFS = 5
+    tmpfs_drop_mnt_ids = {e['mnt_id'] for e in img['entries'] if is_drop_root(e) and 'mnt_id' in e and e.get('fstype') in (FSTYPE_TMPFS, 'TMPFS')}
 
     # PodMotion's own holder-bin scaffold mount, seeded by MOUNTPOINT (not by drop-pass
     # membership — this mount is bind-mounted into the container, so it survives Phase A/B and is
@@ -269,7 +332,8 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
         for p in DROP_PATHS:
             if mp == p or mp.startswith(p + '/'):
                 return True
-        if entry.get('fstype') in DROP_ROOT_FSTYPES:
+        # Same ext_key scoping as is_drop_root() above — see that function's comment.
+        if entry.get('fstype') in DROP_ROOT_FSTYPES and not entry.get('ext_key'):
             return True
         return False
 
@@ -282,7 +346,7 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
             continue
         # For entries without mnt_id, fall back to path-prefix matching.
         if mid is None and _fallback_drop(e):
-            print('mountpoints: WARNING missing mnt_id on entry mountpoint=%r fstype=%r — dropped by path fallback' % (mp, e.get('fstype')))
+            print('mountpoints: WARNING missing mnt_id on entry mountpoint=%s fstype=%s — dropped by path fallback' % (_p(mp), _p(e.get('fstype'))))
             continue
         # Apply existing null_ext_key_masked test.
         if mp in null_ext_key_masked and not e.get('ext_key'):
@@ -309,8 +373,10 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
         sid = e.get('shared_id', 0) or 0
         mid_prop = e.get('master_id', 0) or 0
         if sid != 0 or mid_prop != 0:
-            print('EXTERNAL_MOUNT_UNRESOLVED:{"mnt_id":%d,"ext_key":"%s","shared_id":%d,"master_id":%d,"reason":"propagation_peer"}' % (
-                e.get('mnt_id', -1), ext_key.replace('"', '\\"'), sid, mid_prop), file=sys.stderr)
+            _emit('EXTERNAL_MOUNT_UNRESOLVED', {
+                'mnt_id': e.get('mnt_id', -1), 'ext_key': ext_key,
+                'shared_id': sid, 'master_id': mid_prop, 'reason': 'propagation_peer'},
+                stream=sys.stderr)
             sys.exit(1)
 
     # Identify root mnt_id (dynamic lookup of the kept '/' entry — not hardcoded).
@@ -320,33 +386,124 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
             root_mnt_id = e.get('mnt_id')
             break
 
-    # ADR-0415: capture everything the pod owns — no per-mount drop/preserve/internalize
-    # classification. Every kept mountpoints entry CRIU recorded EXTERNAL is exactly one of two
-    # things, and both carve-outs are STRUCTURAL (not judgment calls about whether content matters):
+    # ADR-0417 recreatability predicate — POSITIVE ALLOWLIST of CRIU's construct-and-fill subset.
     #
-    #   (a) an already-durable, storage-tier-managed PVC re-attach (carve-out 2) — matched by the
-    #       pod-spec-derived mountPath (or ext_key). PRESERVE its ext_key and rewrite its recorded
-    #       root/source to the destination kubelet volume dir so CRIU re-attaches the identically-
-    #       mounted DESTINATION volume (CRIU binds mi->source directly for an AUTODETECTED_MOUNT,
-    #       get_mp_root criu/mount.c 4.2; a Longhorn/literal-ext_key entry additionally needs the
-    #       emitted --ext-mount-map token). Multi-GB/TB volume content is re-attached, never tarred.
+    # WIRE FORMAT (source-verified, not assumed): mnt_entry.fstype (criu/images/mnt.proto) is a plain
+    # protobuf uint32 field (NOT a TYPE_ENUM field — verified against both the vendored and the
+    # installed pycriu: field type == 13 (TYPE_UINT32), enum_type is None), so pycriu.images.load
+    # returns it as a raw Python int, never a decoded string name. The sibling 'enum fstype { ... }'
+    # block in mnt.proto defines the NUMBERING CRIU itself writes into that int field.
     #
-    #   (b) an ORDINARY POD-OWNED mount — the /dev tmpfs, /dev/shm (a POSIX-shm tmpfs the ctr fast
-    #       path records as a sandbox bind, ext_key='/dev/shm'), the serviceaccount token tmpfs, any
-    #       pod-local tmpfs, or any OS construct a future runtime injects. INTERNALIZE it: clear
-    #       ext_key and set root='/' so CRIU OWNS it and lays its captured content back down (the
-    #       ADR-0413-proven CRIU-owned-mount -> CRIU-creates-and-fills primitive). No backing file
-    #       is pre-created (never zero-fill); the content comes from CRIU's own dump/restore engine
-    #       (its native tmpfs tar / shmem-pagemap re-lay), captured by default at dump.
+    # WHY AN ALLOWLIST AND NOT "fstype != 0": the earlier negative predicate conflated "CRIU has an
+    # fstypes[] table row for this filesystem" with "CRIU can construct this superblock and refill it
+    # from checkpoint content". They are different properties, and most in-table rows have the first
+    # without the second. Grounding is a direct DWARF decode of the REAL fstypes[] array out of the
+    # CRIU 4.2 binary this project ships against (criu --version 4.2, GitID v4.2, ELF "with debug_info, not
+    # stripped"), read with gdb — not the enum list, not memory. Decoded rows (name, code, and which
+    # of dump/restore/mount/parse/sb_equal are non-NULL):
+    #
+    #   unsupported  code 0   — all callbacks NULL
+    #   proc         code 1   — all NULL (kernel-synthesized view; CRIU mounts it natively)
+    #   sysfs        code 2   — all NULL (kernel-synthesized view; CRIU mounts it natively)
+    #   devtmpfs     code 3   — dump=devtmpfs_dump  restore=devtmpfs_restore   <- construct AND fill
+    #   binfmt_misc  code 4   — all NULL here; its registrations restore from binfmt-misc images
+    #   tmpfs        code 5   — dump=tmpfs_dump     restore=tmpfs_restore      <- construct AND fill
+    #   devpts       code 6   — restore=devpts_restore parse/check_bindmount set  <- constructible
+    #   simfs        code 7   — all NULL (OpenVZ container root — a REAL backing fs, content not captured)
+    #   btrfs        code 0   — sb_equal only, and its code is literally 0 (i.e. UNSUPPORTED)
+    #   pstore       code 8   — dump=dump_empty_fs, NO restore (host-global)
+    #   mqueue       code 14  — dump=dump_empty_fs, NO restore (kernel-constructed, asserted empty at dump)
+    #   securityfs   code 9   — all NULL (host-global)
+    #   fusectl      code 10  — dump=fusectl_dump, NO restore (host-global)
+    #   debugfs      code 11  — parse only, NO restore (host-global)
+    #   tracefs      code 19  — parse only, NO restore (host-global)
+    #   cgroup       code 12  — parse/sb_equal only (restored by --manage-cgroups, not superblock construction)
+    #   cgroup2      code 23  — parse/sb_equal only (same)
+    #   aufs         code 13  — parse only (union fs over SOURCE-node branch dirs)
+    #   fuse         code 15  — dump=always_fail restore=always_fail  <- CRIU guarantees failure
+    #   overlay      code 17  — parse only (union fs over SOURCE-node lower/upper dirs)
+    #   autofs       code 18  — dump/parse/mount set, NO restore (automounter; its daemon is source-node-local)
+    #   auto_cr      code 16  — all callbacks NULL
+    #
+    # RECREATABLE_FSTYPES (defined in mountContentAxisPy, prepended above) is therefore the
+    # enumerated set of codes for which internalizing
+    # (pop ext_key, root='/', let CRIU do_new_mount it) is CORRECT: either CRIU genuinely captures and
+    # re-lays the content (devtmpfs, tmpfs), or the filesystem is a kernel-constructed pseudo-fs whose
+    # entire content is regenerated by the kernel on mount and carries no source-node identity
+    # (proc, sysfs, devpts, binfmt_misc, mqueue). EVERYTHING ELSE — including every in-table code
+    # listed above but absent here, and any code a future CRIU introduces — falls through to Class
+    # DESTINATION-REBIND and must resolve a real destination target or hard-stop. That is the correct
+    # drift direction: a NEW non-recreatable filesystem (which is exactly what btrfs/nfs/zfs are)
+    # fails closed with no code change, instead of silently internalizing into the ADR-0415 defect.
+    #
+    # Note that btrfs proves the point directly: it HAS an fstypes[] row, and its code is 0. A real
+    # block filesystem is UNSUPPORTED to CRIU by construction — the bind-of-a-regular-file-off-block-fs
+    # shape (/etc/hosts, /etc/hostname, /etc/resolv.conf, /dev/termination-log) this ADR targets.
+    # Retained as the named sentinel the fail-closed branch below and the class documentation refer
+    # to; the predicate itself is now allowlist-driven, so this is documentation, not a test.
+    # ADR-0420 D1c: FSTYPE_UNSUPPORTED, RECREATABLE_FSTYPES and _is_recreatable_fstype are NO LONGER
+    # DEFINED HERE. They moved, verbatim, into mountContentAxisPy (adr0420_mount_content_axis.go),
+    # which is prepended to this script by assemblePatchScript() AND to the Go-side destination-rebind
+    # demand scanner (destinationRebindDemandScanPy). Both decoders must answer the recreatability
+    # question identically, and under ADR-0420 they must additionally answer the CONTENT question
+    # identically — a divergence produces a false hard-stop on EVERY migration (see
+    # internalization_outcome's doc). Two copies of the literal is how that divergence happens, so
+    # there is now exactly one. See the ADR-0420 D1c note in adr0420_mount_content_axis.go.
+
+    # ADR-0417 corrects ADR-0415 carve-out (b): classify by RECREATABILITY (does CRIU's own
+    # fstypes[] table know how to construct this superblock?), not by OWNERSHIP ("is it
+    # pod-owned?"). Every kept mountpoints entry CRIU recorded EXTERNAL is exactly one of THREE
+    # things now:
+    #
+    #   (a) an already-durable, storage-tier-managed PVC re-attach (carve-out 2, UNCHANGED from
+    #       ADR-0415) — matched by the pod-spec-derived mountPath (or ext_key). PRESERVE its
+    #       ext_key and rewrite its recorded root/source to the destination kubelet volume dir so
+    #       CRIU re-attaches the identically-mounted DESTINATION volume (CRIU binds mi->source
+    #       directly for an AUTODETECTED_MOUNT, get_mp_root criu/mount.c 4.2; a Longhorn/literal-
+    #       ext_key entry additionally needs the emitted --ext-mount-map token). Multi-GB/TB
+    #       volume content is re-attached, never tarred.
+    #
+    #   (b) Class RECREATABLE — internalization_outcome(...) is INTERNALIZE_OK: CRIU can construct
+    #       this superblock type AND (ADR-0420 D1) this checkpoint actually carries its content, or
+    #       the fstype is kernel-regenerated and needs none. INTERNALIZE it: clear ext_key and set
+    #       root='/' so CRIU OWNS it and lays its captured content back down (the ADR-0413-proven
+    #       CRIU-owned-mount -> CRIU-creates-and-fills primitive). No backing file is pre-created
+    #       (never zero-fill); the content comes from CRIU's own dump/restore engine (its native
+    #       tmpfs tar / shmem-pagemap re-lay). ADR-0415 keyed this branch on "owned"; ADR-0417
+    #       re-keyed it to "fstype-recreatable"; ADR-0420 adds the second, independent axis the
+    #       first two were missing — recreatability is NECESSARY BUT NOT SUFFICIENT.
+    #
+    #   (c) Class DESTINATION-REBIND — reached two ways, and both land on the SAME mechanism:
+    #         - NOT_RECREATABLE (ADR-0417): the recorded fstype is FSTYPE_UNSUPPORTED/absent (any
+    #           bind of a regular file or directory off a real block filesystem — /etc/hosts,
+    #           /etc/hostname, /etc/resolv.conf are the members that surfaced this, not the scope).
+    #           Internalizing this class is exactly the ADR-0415 defect (the classifier never
+    #           rewrites fstype, so root='/' + no ext_key + fstype->code==0 is precisely the triple
+    #           criu/mount.c:723-726 is written to reject).
+    #         - INTERNALIZE_CONTENT_ABSENT (ADR-0420 D1, NEW): the fstype IS recreatable and
+    #           construct-and-fill, but this checkpoint carries no content image for it — because
+    #           the mount was EXTERNAL at dump time and CRIU does not dump content for external
+    #           mounts. Internalizing hands CRIU an empty superblock to fill from an image that does
+    #           not exist and tmpfs_restore fails SILENTLY, with no "Error (criu/" line at all. The
+    #           destination kubelet/containerd has ALREADY provisioned a fresh, valid mount for the
+    #           replacement pod (this is the serviceaccount-token tmpfs case), so the destination's
+    #           own copy is not merely acceptable but PREFERABLE — it is the credential the
+    #           destination pod is actually supposed to present, with the destination's own
+    #           projection and expiry.
+    #       Either way: do NOT internalize. Apply the SAME mechanism carve-out (a) uses — PRESERVE
+    #       ext_key and REWRITE the recorded root/source to the DESTINATION node's equivalent path,
+    #       looked up in the SAME reattach_host_targets map (a). Fail-closed
+    #       (EXTERNAL_MOUNT_UNRESOLVED) if the destination target cannot be resolved — never
+    #       restore a mount whose recorded source exists only on the source node.
     #
     # The /proc and /sys structural carve-out (carve-out 1) was already dropped above in Phase A/B.
-    # The pm-dev obscured-parent placeholder, the /dev/shm special-case, and the B-2 external-drop of
-    # pod-owned mounts (the four-site ad hoc classification) are ALL removed in favor of this single
-    # "owned => CRIU-owned + content" rule. See docs/adr/0415-*.md.
-    ext_drop_mnt_ids = {}  # retained for the files.img reconciliation ctx below; empty under ADR-0415
-                           # (no pod-owned external is dropped — owned mounts are internalized+kept)
+    # See docs/adr/0415-*.md and docs/adr/0417-*.md.
+    ext_drop_mnt_ids = {}  # retained for the files.img reconciliation ctx below; empty under
+                           # ADR-0415/ADR-0417 (no pod-owned external is dropped — every survivor is
+                           # either internalized or preserved+rewritten)
     reattach_kept_mnt_ids = set()  # mnt_ids preserved+rewritten as storage-tier PVC re-attaches (carve-out 2)
-    internalized_mnt_ids = set()   # mnt_ids re-owned to CRIU as internal tmpfs (owned-content capture)
+    internalized_mnt_ids = set()   # mnt_ids re-owned to CRIU as internal tmpfs (Class RECREATABLE)
+    destination_rebind_mnt_ids = set()  # ADR-0417: mnt_ids preserved+rewritten as Class DESTINATION-REBIND
     kept_after_ext_drop = []
     for e in kept:
         ext_key = e.get('ext_key')
@@ -359,56 +516,120 @@ for mp_path in glob.glob(os.path.join(ckpt, 'mountpoints-*.img')):
         # (a) storage-tier PVC re-attach (carve-out 2): preserve + rewrite recorded source to the
         # destination kubelet volume dir. Matched on the pod-spec-derived mountPath (or ext_key).
         if mp in reattach_mount_paths or ext_key in reattach_mount_paths:
-            reattach_kept_mnt_ids.add(mnt_id)
             _is_tier1 = mp in reattach_tier1_mount_paths
             _tier_label = 'Tier1-Longhorn' if _is_tier1 else 'Tier0 RWX'
             host_target = reattach_host_targets.get(mp) or reattach_host_targets.get(ext_key)
-            if host_target:
-                # Whole-volume re-attach: the recorded source IS the kubelet volume dir, replaced
-                # wholesale with the destination volume dir (leading-slash count preserved — CRIU
-                # marks an external source as '//<abspath>').
-                for _f in ('root', 'source'):
-                    _orig = e.get(_f)
-                    if isinstance(_orig, str) and _orig:
-                        _lead = len(_orig) - len(_orig.lstrip('/'))
-                        e[_f] = ('/' * _lead) + host_target.lstrip('/')
-                print('mountpoints: re-attach mnt_id=%d mountpoint=%s root/source rewritten to destination kubelet dir %s (%s cross-node; CRIU binds mi->source directly for AUTODETECTED_MOUNT)' % (
-                    mnt_id, mp, host_target, _tier_label))
-                # For a literal (non-'CRIU:AUTOGENERATED') ext_key (the Longhorn/local-block-device
-                # shape), get_mp_root takes the ext_mount_lookup(ext_key) branch, so also emit a
-                # token so buildCRIURestoreArgs supplies --ext-mount-map <ext_key>:<host_target>. A
-                # no-op for the AUTODETECTED_MOUNT/Tier0 case (CRIU bypasses the map lookup there).
-                if ext_key != 'CRIU:AUTOGENERATED':
-                    print('CRIU_REATTACH_EXT_MOUNT_MAP:{"mnt_id":%d,"mountpoint":"%s","ext_key":"%s","host_target":"%s"}' % (
-                        mnt_id, mp.replace('"', '\\"'), ext_key.replace('"', '\\"'), host_target.replace('"', '\\"')))
+            # ADR-0417 S1(a) ORDERING FIX: the exemption-set membership below
+            # (reattach_kept_mnt_ids) used to be added HERE, BEFORE host_target was even looked up,
+            # and the entry was appended unconditionally. An entry whose destination target could not
+            # be resolved therefore kept its SOURCE-node recorded root/source AND its ext_key while
+            # sitting in the exemption set that both the P-0194-1 survived-drop guard and the
+            # P-0194-1c dual-write reconciliation honor — i.e. carve-out (a) failed OPEN on an
+            # unresolved target, backstopped only by a later Go-side guard. It now fails CLOSED here,
+            # in the script, on the same footing as Class DESTINATION-REBIND: no destination target,
+            # no rewrite, no exemption, no image write.
+            if not host_target:
+                _emit('EXTERNAL_MOUNT_UNRESOLVED', {
+                    'mnt_id': mnt_id, 'ext_key': ext_key, 'shared_id': 0, 'master_id': 0,
+                    'reason': 'reattach_target_unresolved'}, stream=sys.stderr)
+                sys.exit(1)
+            # Whole-volume re-attach: the recorded source IS the kubelet volume dir, replaced
+            # wholesale with the destination volume dir (leading-slash count preserved — CRIU
+            # marks an external source as '//<abspath>').
+            for _f in ('root', 'source'):
+                _orig = e.get(_f)
+                if isinstance(_orig, str) and _orig:
+                    _lead = len(_orig) - len(_orig.lstrip('/'))
+                    e[_f] = ('/' * _lead) + host_target.lstrip('/')
+            # Exemption-set membership is granted ONLY here — after the hard-stop above and after the
+            # root/source rewrite actually landed on the entry.
+            reattach_kept_mnt_ids.add(mnt_id)
+            print('mountpoints: re-attach mnt_id=%d mountpoint=%s root/source rewritten to destination kubelet dir %s (%s cross-node; CRIU binds mi->source directly for AUTODETECTED_MOUNT)' % (
+                mnt_id, _p(mp), _p(host_target), _tier_label))
+            # For a literal (non-'CRIU:AUTOGENERATED') ext_key (the Longhorn/local-block-device
+            # shape), get_mp_root takes the ext_mount_lookup(ext_key) branch, so also emit a
+            # token so buildCRIURestoreArgs supplies --ext-mount-map <ext_key>:<host_target>. A
+            # no-op for the AUTODETECTED_MOUNT/Tier0 case (CRIU bypasses the map lookup there).
+            if ext_key != 'CRIU:AUTOGENERATED':
+                _emit('CRIU_REATTACH_EXT_MOUNT_MAP', {
+                    'mnt_id': mnt_id, 'mountpoint': mp, 'ext_key': ext_key,
+                    'host_target': host_target})
             kept_after_ext_drop.append(e)
             print('mountpoints: preserving re-attach external mnt_id=%d mountpoint=%s ext_key=%s (%s)' % (
-                mnt_id, mp, ext_key, _tier_label))
+                mnt_id, _p(mp), _p(ext_key), _tier_label))
             continue
-        # (b) ordinary pod-owned mount: internalize so CRIU owns + fills it with captured content.
-        # P-0194-1b (SC-3): a mount with non-zero shared_id/master_id was already hard-stopped above
-        # (collapsing a propagation-peer group is forbidden), so internalizing here is safe.
-        e.pop('ext_key', None)
-        e['root'] = '/'
-        internalized_mnt_ids.add(mnt_id)
+        # ADR-0417: classify the remaining externals by RECREATABILITY, not ownership.
+        # ADR-0420 D1: recreatability is necessary but NOT SUFFICIENT — internalization_outcome
+        # additionally asks, for the construct-and-fill fstypes, whether this checkpoint actually
+        # contains the mount's content. Both decoders (this one and the Go-side demand scanner)
+        # call the SAME function from mountContentAxisPy; see its doc for why that is load-bearing.
+        fstype = e.get('fstype')
+        _outcome = internalization_outcome(ckpt, e)
+        if _outcome == INTERNALIZE_OK:
+            # (b) Class RECREATABLE: internalize so CRIU owns + fills it with captured content.
+            # P-0194-1b (SC-3): a mount with non-zero shared_id/master_id was already hard-stopped
+            # above (collapsing a propagation-peer group is forbidden), so internalizing is safe.
+            e.pop('ext_key', None)
+            e['root'] = '/'
+            internalized_mnt_ids.add(mnt_id)
+            kept_after_ext_drop.append(e)
+            print('mountpoints: ADR-0417 internalizing RECREATABLE mount mnt_id=%d mountpoint=%s fstype=%s (was ext_key=%s) -> CRIU-owned so its captured content is recreated+filled (ADR-0420 content=present-or-not-required)' % (
+                mnt_id, _p(mp), _p(fstype), _p(ext_key)))
+            continue
+        # (c) Class DESTINATION-REBIND, reached either because the recorded fstype is not in CRIU's
+        # recreatable set (ADR-0417 — would decode to FSTYPE__UNSUPPORTED, criu/mount.c:723) or
+        # because it IS recreatable and construct-and-fill but this checkpoint carries no content
+        # image for it (ADR-0420 D1). Do NOT internalize. Apply the SAME destination-rewrite
+        # mechanism as carve-out (a), keyed on mountpoint/ext_key via the SAME reattach_host_targets
+        # map — no new argv position, no new branch, no per-path allowlist.
+        _content_absent = (_outcome == INTERNALIZE_CONTENT_ABSENT)
+        # ADR-0420 D1a: the fall-through must be VISIBLE. 'absent' means "recreatable, content-bearing,
+        # and this checkpoint has no content image for it" — the D1 reclassification. 'n/a' means the
+        # content axis does not apply (ADR-0417's pre-existing non-recreatable class).
+        _content_note = 'absent' if _content_absent else 'n/a'
+        host_target = reattach_host_targets.get(mp) or reattach_host_targets.get(ext_key)
+        if not host_target:
+            # ADR-0420 D1a: same marker, same typed Go error, same stderr parser branch, same
+            # Warning Event on the PodMigration CR — ONE new 'reason' value, so an operator reading
+            # the Event can tell "the destination never offered this mount" apart from "the
+            # checkpoint never captured this mount's content AND the destination did not offer it
+            # either." No new typed error, no new Event type, no new parser branch, no new marker.
+            _emit('EXTERNAL_MOUNT_UNRESOLVED', {
+                'mnt_id': mnt_id, 'ext_key': ext_key, 'shared_id': 0, 'master_id': 0,
+                'reason': ('internalize_without_captured_content_and_no_destination_target'
+                           if _content_absent else 'destination_rebind_target_unresolved')},
+                  stream=sys.stderr)
+            sys.exit(1)
+        for _f in ('root', 'source'):
+            _orig = e.get(_f)
+            if isinstance(_orig, str) and _orig:
+                _lead = len(_orig) - len(_orig.lstrip('/'))
+                e[_f] = ('/' * _lead) + host_target.lstrip('/')
+        destination_rebind_mnt_ids.add(mnt_id)
         kept_after_ext_drop.append(e)
-        print('mountpoints: ADR-0415 internalizing owned mount mnt_id=%d mountpoint=%s (was ext_key=%s) -> CRIU-owned tmpfs so its captured content is recreated+filled' % (
-            mnt_id, mp, ext_key))
+        print('mountpoints: ADR-0417 DESTINATION-REBIND mnt_id=%d mountpoint=%s fstype=%s content=%s root/source rewritten to destination %s (preserving ext_key=%s)' % (
+            mnt_id, _p(mp), _p(fstype), _content_note, _p(host_target), _p(ext_key)))
+        if ext_key != 'CRIU:AUTOGENERATED':
+            _emit('CRIU_REATTACH_EXT_MOUNT_MAP', {
+                'mnt_id': mnt_id, 'mountpoint': mp, 'ext_key': ext_key,
+                'host_target': host_target})
 
     img['entries'] = kept_after_ext_drop
     # Build the set of kept mountpoints mnt_ids AFTER external-drop (for P-0193-1 + P-0194-1c).
     kept_mnt_ids = {e['mnt_id'] for e in kept_after_ext_drop if 'mnt_id' in e}
 
-    # ADR-0415 P-0194-1 (H2 re-entry guard): verify no external entry survives that we did not
-    # deliberately keep. The ONLY entries that legitimately retain an ext_key are the storage-tier
-    # PVC re-attaches (reattach_kept_mnt_ids), whose recorded source was rewritten above to the
-    # destination kubelet volume dir. Every pod-owned external was INTERNALIZED above (ext_key
-    # cleared), so it has no ext_key here. Any OTHER surviving external entry is an unmapped
-    # external — HARD-STOP before writing the image.
+    # ADR-0415/ADR-0417 P-0194-1 (H2 re-entry guard): verify no external entry survives that we did
+    # not deliberately keep. The entries that legitimately retain an ext_key are the storage-tier
+    # PVC re-attaches (reattach_kept_mnt_ids) AND, as of ADR-0417, the Class DESTINATION-REBIND
+    # entries (destination_rebind_mnt_ids) — both had their recorded source rewritten above to a
+    # destination path. Every Class RECREATABLE mount was INTERNALIZED above (ext_key cleared), so
+    # it has no ext_key here. This guard is deliberately WIDENED, not relaxed: any OTHER surviving
+    # external entry is still an unmapped external — HARD-STOP before writing the image.
     for e in kept_after_ext_drop:
-        if e.get('ext_key') and e.get('mnt_id') not in reattach_kept_mnt_ids:
-            print('EXTERNAL_MOUNT_UNRESOLVED:{"mnt_id":%d,"ext_key":"%s","shared_id":0,"master_id":0,"reason":"survived_drop"}' % (
-                e.get('mnt_id', -1), (e.get('ext_key') or '').replace('"', '\\"')), file=sys.stderr)
+        if e.get('ext_key') and e.get('mnt_id') not in reattach_kept_mnt_ids and e.get('mnt_id') not in destination_rebind_mnt_ids:
+            _emit('EXTERNAL_MOUNT_UNRESOLVED', {
+                'mnt_id': e.get('mnt_id', -1), 'ext_key': (e.get('ext_key') or ''),
+                'shared_id': 0, 'master_id': 0, 'reason': 'survived_drop'}, stream=sys.stderr)
             sys.exit(1)
 
     # Atomic mountpoints write: temp file → fsync → rename (H1 / SC-2).
@@ -545,14 +766,14 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
                 if orig_id is not None:
                     remap_ids.add(orig_id)
         except Exception as remap_err:
-            print('WARNING: could not parse %s: %s' % (remap_f, remap_err))
+            print('WARNING: could not parse %s: %s' % (_p(remap_f), _p(remap_err)))
 
     files_src = backup(files_img_path)
     try:
         with open(files_src, 'rb') as f:
             files_img = pycriu.images.load(f)
     except Exception as fe:
-        print('PATCH_ERROR: %s:unknown:%s' % (files_img_path, str(fe)), file=sys.stderr)
+        print('PATCH_ERROR: %s:unknown:%s' % (_p(files_img_path), _p(str(fe))), file=sys.stderr)
         sys.exit(1)
 
     # Single source of truth for the REG-fd decision: classify_reg_fd (classifyRegFdPy).
@@ -635,9 +856,10 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
             # (CRIU_IMAGE_DIR_FD_REBOUND) is unchanged for backward log-parser compatibility even
             # though it now also covers REG fds — entry_type is the field to key on going forward.
             print('WARNING pm-image-consistency: %s-fd rebind — fd_id=%d name=%s backing_mnt_id=%d label=%s new_mnt_id=%d entry_type=%s (open handle redirected to container root; verify this is not a live persistent-volume directory)' % (
-                'directory' if is_dir_fd else 'file', fd_id, name, mnt_id, label, root_mnt_id, entry_type))
-            print('CRIU_IMAGE_DIR_FD_REBOUND:{"fd_id":%d,"name":"%s","backing_mnt_id":%d,"new_mnt_id":%d,"label":"%s","entry_type":"%s"}' % (
-                fd_id, name.replace('"', '\\"'), mnt_id, root_mnt_id, label, entry_type))
+                'directory' if is_dir_fd else 'file', fd_id, _p(name), mnt_id, label, root_mnt_id, entry_type))
+            _emit('CRIU_IMAGE_DIR_FD_REBOUND', {
+                'fd_id': fd_id, 'name': name, 'backing_mnt_id': mnt_id,
+                'new_mnt_id': root_mnt_id, 'label': label, 'entry_type': entry_type})
             reg['mnt_id'] = root_mnt_id
             modified = True
         elif action == 'DECLINE':
@@ -657,10 +879,11 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
             if _decline_mp is None:
                 _decline_mp = mnt_mountpoints.get(str(mnt_id))
             print('pm-image-consistency: P-0193-1 DECLINE — fd_id=%d name=%s backing_mnt_id=%d backing_fstype=%s backing_mountpoint=%s (orphan mnt_id absent from kept mountpoints; non-tmpfs backing means fix belongs in restore-time mount preservation, not a classifier rebind)' % (
-                fd_id, name, mnt_id, _decline_fst, _decline_mp))
-            print('CRIU_IMAGE_INCONSISTENCY:{"fd_id":%d,"name_leaf":"%s","backing_mnt_id":%d,"backing_fstype":"%s","backing_mountpoint":"%s"}' % (
-                fd_id, name_leaf.replace('"', '\\"'), mnt_id,
-                str(_decline_fst).replace('"', '\\"'), str(_decline_mp).replace('"', '\\"')), file=sys.stderr)
+                fd_id, _p(name), mnt_id, _p(_decline_fst), _p(_decline_mp)))
+            _emit('CRIU_IMAGE_INCONSISTENCY', {
+                'fd_id': fd_id, 'name_leaf': name_leaf, 'backing_mnt_id': mnt_id,
+                'backing_fstype': str(_decline_fst), 'backing_mountpoint': str(_decline_mp)},
+                stream=sys.stderr)
             sys.exit(1)
 
     # Atomic files.img write: temp file → fsync → rename (H1 / SC-2 dual-image atomicity).
@@ -711,10 +934,10 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
         if _rc_mp is None:
             _rc_mp = mnt_mountpoints.get(str(mnt_id))
         print('pm-image-consistency: P-0193-1 DECLINE (re-check) — fd_id=%d name=%s backing_mnt_id=%d backing_fstype=%s backing_mountpoint=%s' % (
-            fd_id, name, mnt_id, _rc_fst, _rc_mp))
-        print('CRIU_IMAGE_INCONSISTENCY:{"fd_id":%d,"name_leaf":"%s","backing_mnt_id":%d,"backing_fstype":"%s","backing_mountpoint":"%s"}' % (
-            fd_id, name_leaf.replace('"', '\\"'), mnt_id,
-            str(_rc_fst).replace('"', '\\"'), str(_rc_mp).replace('"', '\\"')), file=sys.stderr)
+            fd_id, _p(name), mnt_id, _p(_rc_fst), _p(_rc_mp)))
+        _emit('CRIU_IMAGE_INCONSISTENCY', {
+            'fd_id': fd_id, 'name_leaf': name_leaf, 'backing_mnt_id': mnt_id,
+            'backing_fstype': str(_rc_fst), 'backing_mountpoint': str(_rc_mp)}, stream=sys.stderr)
         sys.exit(1)
 
     # P-0194-1c cross-image assertion (SC-2): verify dual-write consistency.
@@ -722,17 +945,19 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
     # from kept_mnt_ids), AND files.img must have no REG fd still referencing those dropped mnt_ids.
     # This is the both-or-neither enforcement at the assertion layer.
     #
-    # ADR-0415: Shared/re-attach PVC externals (reattach_kept_mnt_ids) are the ONLY entries
-    # DELIBERATELY preserved with their ext_key intact — CRIU re-attaches them on restore by binding
-    # from the (rewritten-to-destination) recorded source. They are therefore EXEMPT from the
-    # "surviving external" mismatch. Every pod-owned external was internalized (ext_key cleared), so
-    # it carries no ext_key here and cannot appear in this set. Any other surviving external (or a
-    # files.img fd still pointing at a dropped mnt_id) is a real dual-write mismatch.
+    # ADR-0415/ADR-0417: Shared/re-attach PVC externals (reattach_kept_mnt_ids) and, as of
+    # ADR-0417, Class DESTINATION-REBIND externals (destination_rebind_mnt_ids) are the entries
+    # DELIBERATELY preserved with their ext_key intact — CRIU re-attaches/rebinds them on restore by
+    # binding from the (rewritten-to-destination) recorded source. They are therefore EXEMPT from
+    # the "surviving external" mismatch. Every Class RECREATABLE mount was internalized (ext_key
+    # cleared), so it carries no ext_key here and cannot appear in this set. Any other surviving
+    # external (or a files.img fd still pointing at a dropped mnt_id) is a real dual-write mismatch.
     with open(mp_path, 'rb') as f:
         mp_img_final = pycriu.images.load(f)
     surviving_ext_in_mp = {e['mnt_id'] for e in mp_img_final.get('entries', [])
                            if e.get('ext_key') and 'mnt_id' in e
-                           and e['mnt_id'] not in reattach_kept_mnt_ids}
+                           and e['mnt_id'] not in reattach_kept_mnt_ids
+                           and e['mnt_id'] not in destination_rebind_mnt_ids}
     surviving_ext_in_files = set()
     for entry in files_img_final.get('entries', []):
         if entry.get('type') != 'REG':
@@ -742,8 +967,11 @@ if os.path.exists(files_img_path) and kept_mnt_ids is not None and root_mnt_id i
         if mnt_id in ext_drop_mnt_ids:
             surviving_ext_in_files.add(mnt_id)
     if surviving_ext_in_mp or surviving_ext_in_files:
-        print('EXTERNAL_MOUNT_UNRESOLVED:{"mnt_id":-1,"ext_key":"","shared_id":0,"master_id":0,"reason":"p0194_1c_dual_write_mismatch","mp_surviving":%s,"files_surviving":%s}' % (
-            list(surviving_ext_in_mp), list(surviving_ext_in_files)), file=sys.stderr)
+        _emit('EXTERNAL_MOUNT_UNRESOLVED', {
+            'mnt_id': -1, 'ext_key': '', 'shared_id': 0, 'master_id': 0,
+            'reason': 'p0194_1c_dual_write_mismatch',
+            'mp_surviving': sorted(surviving_ext_in_mp), 'files_surviving': sorted(surviving_ext_in_files)},
+            stream=sys.stderr)
         sys.exit(1)
 
     print('files.img: P-0193-1/P-0194-1 unified consistency check passed (no PLAIN-REG orphan mnt_ids; P-0194-1c dual-write verified)')
@@ -757,6 +985,11 @@ else:
 // /dev/shm/pm-patch-ckpt.py and runs. It is the SINGLE SOURCE OF TRUTH shared by production and
 // the corpus contract tests (H-19): classifyRegFdPy (the REG-fd classifier) prepended verbatim to
 // patchCheckpointScriptBody. Tests MUST call this rather than reproduce the script by hand.
+// ADR-0420 D1c: mountContentAxisPy is prepended FIRST. It carries the recreatability allowlist
+// (moved out of the body verbatim) and the content-availability axis, and it is the SAME Go
+// constant rendered into the Go-side destination-rebind demand scanner — so the two decoders
+// cannot answer the internalization question differently. Its own --content-selftest entry point
+// is dormant here (production passes the checkpoint dir as argv[1], never that flag).
 func assemblePatchScript() string {
-	return classifyRegFdPy + patchCheckpointScriptBody
+	return mountContentAxisPy + classifyRegFdPy + patchCheckpointScriptBody
 }

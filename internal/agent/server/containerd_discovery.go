@@ -383,6 +383,104 @@ func nriSocketPathFromConfig(cfg string) string {
 	return ""
 }
 
+// ---------------------------------------------------------------------------------------------
+// ADR-0417 Condition 2: containerd CRI sandbox directory resolution.
+//
+// The CRI plugin — NOT the kubelet — is the writer of a pod's /etc/hostname and /etc/resolv.conf.
+// It stages them as regular files in its own PERSISTENT sandbox dir,
+// <containerd root>/io.containerd.grpc.v1.cri/sandboxes/<sandboxID>/, and bind-mounts them into
+// each workload container. §P-PREMISE decode of a real mountpoints-13.img taken off this project's
+// standing cluster (pm-w2, RKE2 v1.35.6+rke2r1, postgres workload) records exactly that:
+//
+//	/etc/hostname     root=/var/lib/rancher/rke2/agent/containerd/io.containerd.grpc.v1.cri/
+//	                       sandboxes/590a5b28.../hostname   source=/dev/vda1  fstype=0
+//	/etc/resolv.conf  root=<same sandbox dir>/resolv.conf   source=/dev/vda1  fstype=0
+//	/etc/hosts        root=/var/lib/kubelet/pods/<podUID>/etc-hosts  source=/dev/vda1  fstype=0
+//
+// and `ls -A /var/lib/kubelet/pods/<uid>` on that node returns exactly
+// `containers etc-hosts plugins volumes` — there is no etc-hostname and no resolv.conf under the
+// kubelet pod dir at all. Two different writers, two different directories.
+//
+// The containerd ROOT dir is NOT containerdRunRoot or containerdStateRoot: on RKE2 those are both
+// /run/k3s/containerd (the `state` dir), while the CRI sandbox dir lives under the `root` dir
+// /var/lib/rancher/rke2/agent/containerd. It is read from the authoritative source — the winning
+// containerd daemon's OWN config.toml, the identical config file resolveNRISocketPath already reads
+// for the same daemon — never guessed.
+// ---------------------------------------------------------------------------------------------
+
+// defaultContainerdRootDir is containerd's documented default `root` when its config.toml does not
+// set one. Used ONLY when the winning daemon's config was read successfully and simply carries no
+// top-level `root` key; an unreadable config or an unrecognized socket resolves to "" (fail closed).
+const defaultContainerdRootDir = "/var/lib/containerd"
+
+// criSandboxDirRel is the CRI plugin's sandbox subtree, relative to the containerd root dir.
+const criSandboxDirRel = "io.containerd.grpc.v1.cri/sandboxes"
+
+// containerdRootFromConfig extracts the TOP-LEVEL `root = "..."` key from a containerd config.toml.
+// Top-level means: before the first `[table]` header — a `root` key inside e.g. `[plugins...]` is a
+// different, unrelated key and must not be mistaken for it (RKE2's generated config has exactly
+// that shape). Returns "" when absent.
+func containerdRootFromConfig(cfg string) string {
+	for _, raw := range strings.Split(cfg, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") {
+			// First table header ends the top-level key space.
+			return ""
+		}
+		if !strings.HasPrefix(line, "root") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) != "root" {
+			continue
+		}
+		val := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
+		if val != "" {
+			return val
+		}
+	}
+	return ""
+}
+
+// resolveContainerdRootDirFn is a test seam. Production implementation: resolveContainerdRootDir.
+var resolveContainerdRootDirFn = resolveContainerdRootDir
+
+// resolveContainerdRootDir returns the winning containerd daemon's `root` directory, read from that
+// daemon's own config.toml. Returns "" when the socket is one this package has no known config path
+// for (an operator override or an operator-extended candidate) or the config cannot be read — the
+// caller must then fail closed rather than substitute a guess.
+func resolveContainerdRootDir(ctx context.Context, winnerSocket string) string {
+	cfgPath, known := containerdConfigPathFor(winnerSocket)
+	if !known {
+		return ""
+	}
+	out, err := nsenterCmd(ctx, "cat", cfgPath).Output()
+	if err != nil {
+		return ""
+	}
+	if r := containerdRootFromConfig(string(out)); r != "" {
+		return r
+	}
+	return defaultContainerdRootDir
+}
+
+// ADR-0419 D6 item 4: containerdCRISandboxDir is DELETED. It existed only to RECONSTRUCT
+// <containerd root>/io.containerd.grpc.v1.cri/sandboxes/<id> so a destination file could be probed
+// inside it — and ADR-0419 never reconstructs that path: the runtime hands us the resolved Source
+// directly. (As a side effect this moots the origin synthesis' unresolved root-vs-state-dir
+// question entirely; the live mount lists confirm the sandbox files do sit under the `root` dir,
+// but nothing in this codebase depends on that being true any more.)
+//
+// ITS TWO DEPENDENCIES ARE DELIBERATELY RETAINED — deleting them alongside it is the specific
+// asymmetric-removal error this note exists to prevent. resolveContainerdRootDirFn and
+// criSandboxDirRel EACH have an independent surviving consumer in
+// allowedExtMountHostTargetPrefixes (server.go), which needs the containerd root to authorize
+// sandbox-dir prefixes for --ext-mount-map token validation. That need is unrelated to destination
+// target RESOLUTION and outlives this ADR.
+
 // pidOwningUnixSocketFn is a test seam. Production implementation: pidOwningUnixSocket.
 var pidOwningUnixSocketFn = pidOwningUnixSocket
 

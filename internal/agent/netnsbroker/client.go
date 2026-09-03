@@ -398,6 +398,34 @@ func (c *Client) NetnsMatch(ctx context.Context, pid int, expectedNetnsPath stri
 	return resp.Match, nil
 }
 
+// HostRealpath asks the privileged, UNCONFINED broker for the fully symlink-resolved
+// HOST-mount-namespace realpath of target (ADR-0419 D9), so the caller can prefix-confine
+// the RESOLVED path before admitting it into CRIU's --ext-mount-map argv.
+//
+// This exists because the agent's own mount namespace does not carry the kubelet pod
+// tree or the containerd CRI sandbox tree at all, so a direct filepath.EvalSymlinks on
+// those targets can only ever return ENOENT — which made the confinement check it
+// guarded a silent no-op for exactly the two path families that matter. The broker
+// resolves through /proc/1/root (the same namespace CRIU is nsenter'd into), so the
+// answer governs the read CRIU will actually perform.
+//
+// FAIL CLOSED: any broker-unreachable, rejected, or unresolvable case returns a non-nil
+// error and an empty path. There is no "could not check, so allow" leg — that shape is
+// precisely the fail-open this op replaces. Callers MUST treat the error as a rejection.
+func (c *Client) HostRealpath(ctx context.Context, target string) (string, error) {
+	resp, err := c.do(ctx, Request{Op: "host_realpath", HostRealpathTarget: target})
+	if err != nil {
+		return "", fmt.Errorf("netns-broker host_realpath %s: %w", target, err)
+	}
+	if resp.Error != "" {
+		return "", fmt.Errorf("netns-broker host_realpath %s: %s", target, resp.Error)
+	}
+	if resp.RealPath == "" {
+		return "", fmt.Errorf("netns-broker host_realpath %s: broker returned no path", target)
+	}
+	return resp.RealPath, nil
+}
+
 // Teardown requests unmount+removal of the per-migration netns. Idempotent broker-side.
 func (c *Client) Teardown(ctx context.Context, migrationUID string) error {
 	resp, err := c.do(ctx, Request{Op: "teardown", MigrationUID: migrationUID})
