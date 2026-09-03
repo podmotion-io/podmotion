@@ -3,12 +3,19 @@
 # Usage: make kind-node-image
 #        kind create cluster --config images/kind/kind-config.yaml
 
-ARG KIND_BASE=kindest/node:v1.32.0
+# kindest/node:v1.35.5 (bumped from v1.32.0): the scheduler binary is built against
+# k8s.io/kubernetes v1.35.0 (go.mod), which requires the DynamicResourceAllocation API
+# (GA/locked-on as of 1.35 — cannot be disabled). kindest/node:v1.32.0 does not serve
+# that API at all, so the scheduler never started. v1.35.6 has no published kindest/node
+# tag (verified against the kindest/node Docker Hub tag list) — v1.35.5 is the closest
+# available published tag to the standing KVM substrate's v1.35.6+rke2r1, and it pulls
+# successfully (digest sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95).
+ARG KIND_BASE=kindest/node:v1.35.5
 FROM ${KIND_BASE}
 
 # Add CRIU OBS repo to get CRIU 4.x.
-# kindest/node:v1.32.0 is Debian Bookworm (12). Debian Bookworm ships CRIU 3.17
-# which is incompatible with go-criu v7.2 RPC protocol (requires 4.x).
+# kindest/node:v1.35.5 is Debian Bookworm (12), same as the prior v1.32.0 base. Debian
+# Bookworm ships CRIU 3.17 which is incompatible with go-criu v7.2 RPC protocol (requires 4.x).
 # Ubuntu PPAs are not compatible with Debian; use the CRIU OpenSUSE Build Service
 # repository for Debian 12 instead.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -80,7 +87,7 @@ RUN set -eux; \
 RUN mkdir -p /etc/containerd/conf.d /usr/local/lib/nri
 
 # Enable NRI in containerd.
-# containerd v2 (used in kindest/node:v1.32.0) does NOT auto-load conf.d/*.toml —
+# containerd v2 (used in kindest/node:v1.35.5) does NOT auto-load conf.d/*.toml —
 # it requires an explicit `imports` stanza in the main config.toml. Append the NRI
 # plugin block directly so it is always active regardless of containerd version.
 COPY images/capi/ansible/roles/podmotion-node/files/nri.toml /etc/containerd/conf.d/nri.toml
