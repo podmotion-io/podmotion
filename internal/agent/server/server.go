@@ -1824,10 +1824,28 @@ func (s *AgentServer) appendDestinationRebindReattachMounts(
 	}
 
 	// D4 — intersect against the DEMAND set this checkpoint actually recorded, not a hardcoded list.
-	demanded, dErr := destinationRebindDemandSetFn(ctx, migrationName, checkpointDir)
+	demand, dErr := destinationRebindDemandSetFn(ctx, migrationName, checkpointDir)
 	if dErr != nil {
 		destinationRebindObserveFn(migrationName, 1, time.Since(start), "runtime_lookup_failed")
 		return mounts, dErr
+	}
+	demanded := demand.Paths
+	// ADR-0420 D1b: count the content-availability decision the SAME scan just made. The
+	// internalized-with-content leg is terminal here — those mounts stay CRIU-owned and never reach
+	// the resolution below — so it is recorded now. The content-absent legs are counted after
+	// resolution, where "rebound" and "unresolved" become distinguishable.
+	for i := 0; i < demand.InternalizedWithContent; i++ {
+		metrics.MountContentAvailabilityOutcomeTotal.WithLabelValues("internalized_with_content").Inc()
+	}
+	contentAbsent := make(map[string]bool, len(demand.ContentAbsent))
+	for _, p := range demand.ContentAbsent {
+		contentAbsent[p] = true
+	}
+	if len(demand.ContentAbsent) > 0 {
+		log.Info("ADR-0420 D1: a recreatable, construct-and-fill mount has no content image in this checkpoint — NOT internalizing it; the destination runtime's own mount is used instead (internalizing it would hand CRIU an empty superblock to fill from an image that does not exist, and tmpfs_restore fails silently)",
+			"migration", migrationName, "checkpointDir", checkpointDir,
+			"contentAbsent", demand.ContentAbsent,
+			"internalizedWithContent", demand.InternalizedWithContent)
 	}
 	// A mountpoint already resolved by an earlier tier (storage-tier PVC re-attach, holder scaffold)
 	// is NOT a destination-rebind demand: patch_checkpoint_script.go checks its re-attach carve-out
@@ -1877,10 +1895,25 @@ func (s *AgentServer) appendDestinationRebindReattachMounts(
 	// closed naming the path the runtime did not supply.
 	resolved, rErr := resolveDestinationRebindTargets(pending, runtimeMounts, migrationName, sandboxID, source)
 	if rErr != nil {
+		// ADR-0420 D1b: if the path the runtime did not supply is one D1 rerouted, that is the
+		// "unresolved_content_absent" leg — the checkpoint never captured this mount's content AND
+		// the destination did not offer it either. Distinguishing it from an ordinary
+		// destination-rebind miss is the whole reason the counter carries three labels.
+		var absentErr *DestinationRuntimeMountAbsentError
+		if errors.As(rErr, &absentErr) && contentAbsent[absentErr.ContainerPath] {
+			metrics.MountContentAvailabilityOutcomeTotal.WithLabelValues("unresolved_content_absent").Inc()
+		}
 		log.Error(rErr, "ADR-0419 D3: a checkpoint-demanded mount has no entry in the runtime's own mount list — failing closed",
 			"migration", migrationName, "sandboxID", sandboxID, "source", source)
 		destinationRebindObserveFn(migrationName, attempts, time.Since(start), "runtime_mount_absent")
 		return mounts, rErr
+	}
+	// ADR-0420 D1b: every content-absent path that DID resolve is the leg that matters — the
+	// population silently mis-handled before this ADR, now rebound to the destination's own mount.
+	for _, m := range resolved {
+		if contentAbsent[m.ContainerPath] {
+			metrics.MountContentAvailabilityOutcomeTotal.WithLabelValues("rebound_content_absent").Inc()
+		}
 	}
 	log.Info("ADR-0419: destination-rebind targets resolved from the runtime's own mount list — zero probes, zero waits",
 		"migration", migrationName, "sandboxID", sandboxID, "source", source,
@@ -6631,6 +6664,12 @@ type criuRestoreFailureAttribution struct {
 	demotedLine     string // the skipped allowlisted line, verbatim (set when demoted OR onlyAllowlisted)
 	onlyAllowlisted bool   // every matching line found was allowlisted — no real cause present in the log
 	matchCount      int    // total count of "Error (criu/"-matching lines found
+
+	// ADR-0420 D5: the mount-v2 progress trail, collected in the SAME forward pass. It is the
+	// causal anchor for the one class ADR-0418's rule is structurally blind to — a silent
+	// fstype->restore, which emits no "Error (criu/" line at all. It is reported only when the
+	// first-causal-error rule yields nothing but demoted lines; it never outranks a real cause.
+	mountProgress criuMountV2Progress
 }
 
 // scanCRIURestoreLogForFirstError implements ADR-0418 Decision items 2, 3 and 5: a forward
@@ -6677,9 +6716,19 @@ func scanCRIURestoreLogForFirstError(restoreLogPath string) criuRestoreFailureAt
 		if result.terminalLine == "" && strings.Contains(line, "Restoring FAILED.") {
 			result.terminalLine = line
 		}
+		// ADR-0420 D5: fold the line into the mount-v2 progress trail in this same pass. No second
+		// read of the log, no second file handle, no full-file buffer — one retained line and a
+		// bounded slice.
+		result.mountProgress.noteCRIULogLine(line)
 		if strings.Contains(line, "Error (criu/") {
 			result.matchCount++
-			allowlisted := isKnownNonFatalCRIULine(line)
+			// ADR-0420 D5 precondition: cause candidacy excludes BOTH ADR-0418's known-non-fatal
+			// allowlist AND CRIU's own terminal "Restoring FAILED." announcement, which carries the
+			// "Error (criu/" substring and would otherwise be named as the cause of the failure it
+			// merely announces — see isCRIUTerminalAnnouncementLine for why that is decisive on the
+			// silent-fstype->restore class and harmless on every other. The line is still COUNTED
+			// here and still reported verbatim as terminalLine; only its candidacy is removed.
+			allowlisted := isNonCausalCRIULine(line)
 			if firstMatch == "" {
 				firstMatch = line
 				firstMatchAllowlisted = allowlisted
@@ -6754,10 +6803,30 @@ func criuRestoreFailureCause(restoreLogPath, checkpointDir string, checkpointLog
 			}
 			fmt.Fprintf(&b, "total \"Error (criu/\" lines found in restore.log: %d\n", attr.matchCount)
 		case attr.onlyAllowlisted:
-			fmt.Fprintf(&b, "only a known-non-fatal CRIU diagnostic found; true cause not present in restore.log: %s\n", attr.demotedLine)
+			// ADR-0420: the demoted line is either an ADR-0418 known-non-fatal diagnostic or CRIU's
+			// own terminal announcement. Name which, rather than calling the announcement a
+			// "diagnostic" — an inaccurate label here is how a reader concludes the log was
+			// searched for something it does not contain.
+			kind := "a known-non-fatal CRIU diagnostic"
+			if isCRIUTerminalAnnouncementLine(attr.demotedLine) && !isKnownNonFatalCRIULine(attr.demotedLine) {
+				kind = "CRIU's own terminal failure announcement (which announces the failure, and cannot be its cause)"
+			}
+			fmt.Fprintf(&b, "only %s found; true cause not present in restore.log: %s\n", kind, attr.demotedLine)
+			if isTeardownNoiseCRIULine(attr.demotedLine) {
+				// ADR-0420 D5 item 3: name it as teardown noise explicitly. The "Device or resource
+				// busy" string on this line is the strerror of rmdir(2) on CRIU's own roots-yard
+				// temp directory during the unwind — NOT a mount EBUSY. Reading it as a bind
+				// conflict is what sent two ADRs after an ownership-inversion hypothesis that a
+				// single decode then refuted.
+				fmt.Fprintf(&b, "note: that line is CRIU TEARDOWN NOISE (rmdir of CRIU's own roots-yard temp dir during the unwind) — its \"Device or resource busy\" text is NOT a mount EBUSY and must never be reported as a cause (ADR-0420 D5)\n")
+			}
 			fmt.Fprintf(&b, "total \"Error (criu/\" lines found in restore.log: %d\n", attr.matchCount)
+			// ADR-0420 D5: ADR-0418's rule found nothing real. Fall to the lower-precedence
+			// mount-v2 progress-trail rule, which covers the silent-fstype->restore class.
+			renderD5Attribution(&b, &attr.mountProgress)
 		default:
 			fmt.Fprintf(&b, "no \"Error (criu/\" line found in restore.log\n")
+			renderD5Attribution(&b, &attr.mountProgress)
 		}
 		if attr.terminalLine != "" {
 			fmt.Fprintf(&b, "terminal line: %s\n", attr.terminalLine)

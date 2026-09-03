@@ -175,17 +175,49 @@ func (e *AmbiguousPodSandboxError) Error() string {
 // destinationRebindDemandSetFn is a test seam over destinationRebindDemandSet.
 var destinationRebindDemandSetFn = destinationRebindDemandSet
 
+// destinationRebindDemand is what ONE scan of the checkpoint's own mountpoints images yields.
+//
+// ADR-0419 returned only Paths. ADR-0420 D1b adds the content-axis classification of the SAME
+// scan, because the counter's denominator has to be real: "how many content-bearing recreatable
+// externals did this checkpoint have, and how many of them had their content?" is decidable from
+// the directory this scan already reads, and answering it here costs no extra subprocess, no extra
+// decode, and no new marker line in the patch script's line-oriented output protocol.
+type destinationRebindDemand struct {
+	// Paths are the in-container mountpoints this checkpoint classifies as Class
+	// DESTINATION-REBIND — the set that must resolve a destination target or hard-stop.
+	Paths []string `json:"demand"`
+	// ContentAbsent is the SUBSET of Paths that are there because of ADR-0420 D1: recreatable,
+	// construct-and-fill, and no content image in this checkpoint. Under ADR-0417 these would have
+	// been internalized and would have failed silently inside CRIU's tmpfs_restore.
+	ContentAbsent []string `json:"content_absent"`
+	// InternalizedWithContent counts the content-bearing recreatable externals that DID carry their
+	// content and are therefore still internalized — /dev/shm's population. A zero here on a real
+	// migration means the dump-side capture stopped producing content images.
+	InternalizedWithContent int `json:"internalized_with_content"`
+}
+
 // destinationRebindDemandScanPy mirrors patch_checkpoint_script.go's Class DESTINATION-REBIND
 // predicate EXACTLY, and is the reason a workload whose checkpoint has no /etc/hostname mount no
 // longer hard-stops on a demand it never made.
 //
-// An entry is DEMANDED iff it is EXTERNAL (truthy ext_key), has a mnt_id and a mountpoint, and its
-// recorded fstype is NOT in CRIU's construct-and-fill allowlist. RECREATABLE_FSTYPES below is
-// copied verbatim from the patch script's own frozenset — the two MUST agree, because a mount the
-// script classifies DESTINATION-REBIND but this scan does not demand would reach the script with
-// no resolved host target and hard-stop there instead, which is a worse-worded version of the same
-// failure. Non-int/absent fstype falls through to demanded, fail-closed, exactly as the script's
-// _is_recreatable_fstype does.
+// An entry is DEMANDED iff it is EXTERNAL (truthy ext_key), has a mnt_id and a mountpoint, and the
+// patch script would NOT internalize it — i.e. internalization_outcome() returns anything other
+// than INTERNALIZE_OK.
+//
+// ADR-0420 D1c — THIS IS NO LONGER A COPY, AND THAT CHANGE IS THE POINT. Before ADR-0420 this
+// scanner carried its own `RECREATABLE_FSTYPES = frozenset((1,2,3,4,5,6,14))` literal and
+// `continue`d past every recreatable fstype, because under ADR-0417 those were ALWAYS internalized.
+// D1 makes that false: a recreatable, construct-and-fill tmpfs whose content is NOT in the
+// checkpoint now routes to DESTINATION-REBIND and therefore DEMANDS a destination target. A scanner
+// that kept skipping it would leave that target undemanded and unresolved, and the patch script
+// would hard-stop on a mount the destination could have supplied — a FALSE HARD STOP ON EVERY
+// MIGRATION. The predicate is therefore prepended from the one shared definition
+// (mountContentAxisPy) rather than restated, so the two decoders agree by construction rather than
+// by review. TestADR0420_ContentAxisIsTheSingleDefinitionInBothDecoders asserts it mechanically.
+//
+// It also reports the content-axis classification itself, so ADR-0420 D1b's counter has a REAL
+// denominator without a second subprocess, a second decode, or a new marker line: the outcome is a
+// pure function of the same directory this scan already reads.
 //
 // The script's carve-out (a) — storage-tier PVC re-attach — is deliberately NOT modelled here.
 // That branch is checked FIRST in the script and its targets are resolved by the storage tier's
@@ -196,10 +228,12 @@ var destinationRebindDemandSetFn = destinationRebindDemandSet
 // Security (ADR-0121, same contract as readDevShmMountInfo): imagesDir is passed as ARGV and is
 // never string-formatted into the script body.
 const destinationRebindDemandScanPy = `
-import pycriu, glob, json, sys, os
-RECREATABLE_FSTYPES = frozenset((1, 2, 3, 4, 5, 6, 14))
+import pycriu, glob
+ckpt = sys.argv[1]
 demand = set()
-for img in sorted(glob.glob(os.path.join(sys.argv[1], 'mountpoints-*.img'))):
+content_absent = set()
+internalized_with_content = 0
+for img in sorted(glob.glob(os.path.join(ckpt, 'mountpoints-*.img'))):
     if not img.endswith('.img'):
         continue
     with open(img, 'rb') as f:
@@ -210,11 +244,21 @@ for img in sorted(glob.glob(os.path.join(sys.argv[1], 'mountpoints-*.img'))):
         mp = e.get('mountpoint')
         if not ext_key or mnt_id is None or not mp:
             continue
-        fstype = e.get('fstype')
-        if isinstance(fstype, int) and not isinstance(fstype, bool) and fstype in RECREATABLE_FSTYPES:
+        outcome = internalization_outcome(ckpt, e)
+        if outcome == INTERNALIZE_OK:
+            # Counted only for the population the content axis actually governs, so the D1b
+            # denominator is the set of decisions D1 could have changed — not every kept mount.
+            if _is_content_bearing_fstype(e.get('fstype')):
+                internalized_with_content += 1
             continue
+        if outcome == INTERNALIZE_CONTENT_ABSENT:
+            content_absent.add(mp)
         demand.add(mp)
-print(json.dumps(sorted(demand)))
+print(json.dumps({
+    'demand': sorted(demand),
+    'content_absent': sorted(content_absent),
+    'internalized_with_content': internalized_with_content,
+}))
 `
 
 // destinationRebindDemandSet reads the checkpoint's OWN mountpoints image and returns the
@@ -234,37 +278,41 @@ print(json.dumps(sorted(demand)))
 // readDevShmMountInfo's /dev/shm: the restore path cannot assume /dev/shm is writable in the
 // agent's own mount namespace, and restoreStagingDir is a tree this process demonstrably owns
 // (ensureRestoreTerminationLogFile has already created it by the time this runs).
-func destinationRebindDemandSet(ctx context.Context, migrationName, checkpointDir string) ([]string, error) {
+func destinationRebindDemandSet(ctx context.Context, migrationName, checkpointDir string) (destinationRebindDemand, error) {
+	var zero destinationRebindDemand
 	if checkpointDir == "" {
-		return nil, fmt.Errorf("destination rebind demand set: empty checkpoint dir — refusing to proceed without reading which mounts this checkpoint actually demands (ADR-0419 D4)")
+		return zero, fmt.Errorf("destination rebind demand set: empty checkpoint dir — refusing to proceed without reading which mounts this checkpoint actually demands (ADR-0419 D4)")
 	}
 	dir := restoreStagingDir(migrationName)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("destination rebind demand set: create staging dir %s: %w", dir, err)
+		return zero, fmt.Errorf("destination rebind demand set: create staging dir %s: %w", dir, err)
 	}
 	f, err := os.CreateTemp(dir, "pm-demand-scan-*.py")
 	if err != nil {
-		return nil, fmt.Errorf("destination rebind demand set: create scan script: %w", err)
+		return zero, fmt.Errorf("destination rebind demand set: create scan script: %w", err)
 	}
 	scriptPath := f.Name()
 	defer os.Remove(scriptPath)
-	if _, werr := f.WriteString(destinationRebindDemandScanPy); werr != nil {
+	// ADR-0420 D1c: the shared content axis is prepended, exactly as assemblePatchScript prepends
+	// it to the patch script. This is what makes "the two decoders agree" a property of the build
+	// rather than a review obligation.
+	if _, werr := f.WriteString(mountContentAxisPy + destinationRebindDemandScanPy); werr != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("destination rebind demand set: write scan script: %w", werr)
+		return zero, fmt.Errorf("destination rebind demand set: write scan script: %w", werr)
 	}
 	if cerr := f.Close(); cerr != nil {
-		return nil, fmt.Errorf("destination rebind demand set: close scan script: %w", cerr)
+		return zero, fmt.Errorf("destination rebind demand set: close scan script: %w", cerr)
 	}
 
 	cmd := exec.CommandContext(ctx, "python3", scriptPath, checkpointDir)
 	cmd.Env = append(os.Environ(), "PYTHONPATH=/usr/lib/python3/dist-packages")
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("destination rebind demand set: mountpoints scan failed: %w\n%s", err, out)
+		return zero, fmt.Errorf("destination rebind demand set: mountpoints scan failed: %w\n%s", err, out)
 	}
-	var demand []string
+	var demand destinationRebindDemand
 	if uerr := json.Unmarshal(out, &demand); uerr != nil {
-		return nil, fmt.Errorf("destination rebind demand set: parse scan output: %w\n%s", uerr, out)
+		return zero, fmt.Errorf("destination rebind demand set: parse scan output: %w\n%s", uerr, out)
 	}
 	return demand, nil
 }
@@ -577,10 +625,12 @@ func resolveDestinationRebindTargets(demanded []string, runtimeMounts []nri.Cont
 		if m.Destination == "" {
 			continue
 		}
-		if _, dup := bySource[m.Destination]; !dup {
+		if _, dup := bySource[normalizeContainerMountPath(m.Destination)]; !dup {
+			// `known` reports what the runtime LITERALLY supplied, un-normalized: an operator
+			// reading a hard-stop transcript needs the runtime's own spelling, not ours.
 			known = append(known, m.Destination)
 		}
-		bySource[m.Destination] = m.Source
+		bySource[normalizeContainerMountPath(m.Destination)] = m.Source
 	}
 	sort.Strings(known)
 
@@ -595,7 +645,11 @@ func resolveDestinationRebindTargets(demanded []string, runtimeMounts []nri.Cont
 			})
 			continue
 		}
-		hostTarget, ok := bySource[containerPath]
+		// ADR-0420 D1d: BOTH SIDES of this one comparison are normalized, and nothing else is.
+		// ContainerPath below stays the checkpoint's OWN literal mountpoint, because that string is
+		// the key the patch script looks its host target up by (reattach_host_targets.get(mp));
+		// rewriting it here would silently unresolve the mount one layer down.
+		hostTarget, ok := bySource[normalizeContainerMountPath(containerPath)]
 		if !ok || hostTarget == "" {
 			return nil, &DestinationRuntimeMountAbsentError{
 				ContainerPath: containerPath, SandboxID: sandboxID,
@@ -613,6 +667,44 @@ func resolveDestinationRebindTargets(demanded []string, runtimeMounts []nri.Cont
 
 // restoreTerminationLogContainerPath is the single in-container path D3.1 carves out.
 const restoreTerminationLogContainerPath = "/dev/termination-log"
+
+// normalizeContainerMountPath canonicalizes the ONE in-container-path spelling difference that
+// makes two strings denote the same mount, so both sides of D3's exact-equality lookup are compared
+// in the same domain (ADR-0420 D1d).
+//
+// WHY THIS EXISTS. ADR-0419's lookup matches a checkpoint-recorded mountpoint against the runtime's
+// OCI Destination by exact string equality. That was correct for every path ADR-0419 shipped
+// against — /etc/hosts, /etc/hostname, /etc/resolv.conf, /dev/termination-log — because none of
+// them traverses a symlinked parent. ADR-0420 D1 routes a NEW member through the same lookup: the
+// pod serviceaccount-token tmpfs. The checkpoint records what the kernel's mount table says, which
+// the live decode shows as /run/secrets/kubernetes.io/serviceaccount; a pod spec's serviceaccount
+// mountPath is /var/run/secrets/kubernetes.io/serviceaccount, and /var/run is a symlink to /run in
+// essentially every base image. Two different strings, one mount. Unhandled, D1 would convert a
+// SILENT restore failure into a DestinationRuntimeMountAbsent hard stop on every migration — a
+// different failure, not a fix.
+//
+// WHY A PREFIX CANONICALIZATION AND NOT AN ALIAS TABLE. Explicitly rejected by name: a
+// SERVICEACCOUNT_PATH_ALIASES map, and special-casing this one mount the way /dev/termination-log
+// is carved out above. That carve-out is justified by the agent OWNING that file's content, which
+// is a different reason and does not generalize to "these two strings denote the same mount". This
+// is a statement about a filesystem-layout convention, applied identically to every path on both
+// sides of one comparison — it names no workload and no mount.
+//
+// It is deliberately NARROW. /var/run -> /run is the only rewrite, it is anchored at the start of
+// the path, and it fires only on the exact component boundary (/var/run itself or /var/run/...) so
+// a hypothetical /var/runtime is untouched. It cannot make two genuinely different mounts collide
+// that the kernel itself distinguishes, because /var/run and /run are the same directory on any
+// image where this fires. Applied to both sides, it is a no-op wherever the two already agreed.
+func normalizeContainerMountPath(p string) string {
+	const legacy = "/var/run"
+	if p == legacy {
+		return "/run"
+	}
+	if strings.HasPrefix(p, legacy+"/") {
+		return "/run" + strings.TrimPrefix(p, legacy)
+	}
+	return p
+}
 
 // ---------------------------------------------------------------------------------------------
 // D9 — host-namespace realpath confinement for runtime-supplied --ext-mount-map targets.

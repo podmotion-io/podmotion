@@ -145,6 +145,14 @@ func writeADR0417Corpus(t *testing.T, pypath string, extraEnv []string, ckptDir 
 	if !strings.Contains(string(out), "CORPUS_OK") {
 		t.Fatalf("corpus generator did not report CORPUS_OK; output: %s", out)
 	}
+	// ADR-0420 D1: a REAL checkpoint of a pod with /dev/shm carries /dev/shm's tmpfs content image
+	// — this project builds it on the dump side (captureCtrDevShmContent, with the ADR-0415
+	// fail-closed capture gate). Staging it here makes the fixture MORE faithful, not less: without
+	// it the fixture modelled a checkpoint whose /dev/shm content is MISSING, which under the
+	// decoded mechanism is a mount CRIU would internalize and then fail to fill SILENTLY. The
+	// corpus entry has root_dev=0, so tmpfs-dev-0.tar.gz.img is the name tmpfs_restore looks for
+	// first.
+	stageTmpfsContentImage(t, ckptDir, "tmpfs-dev-0.tar.gz.img")
 }
 
 // readMountpointsEntries reads back every entry across all mountpoints-*.img files in ckptDir

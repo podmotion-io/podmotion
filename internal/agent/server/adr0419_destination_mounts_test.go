@@ -64,11 +64,17 @@ func adr0419FakeEventMounts() []nri.ContainerMount {
 }
 
 // withDemandSet installs a fake checkpoint demand set (D4) and returns a restore func.
+//
+// ADR-0420 D1b widened the scan's return from a bare path list to destinationRebindDemand (the same
+// scan now also reports the content-availability classification it already computed). This helper
+// keeps the ADR-0419 call shape: the paths it is given are demanded, and none of them is there
+// because of the content axis — which is the correct default for every ADR-0419 test, since all of
+// them exercise the NOT_RECREATABLE class. withContentAbsentDemandSet is the ADR-0420 counterpart.
 func withDemandSet(t *testing.T, demand ...string) func() {
 	t.Helper()
 	orig := destinationRebindDemandSetFn
-	destinationRebindDemandSetFn = func(context.Context, string, string) ([]string, error) {
-		return demand, nil
+	destinationRebindDemandSetFn = func(context.Context, string, string) (destinationRebindDemand, error) {
+		return destinationRebindDemand{Paths: demand}, nil
 	}
 	return func() { destinationRebindDemandSetFn = orig }
 }
@@ -968,14 +974,34 @@ func TestADR0419_NoPathResolvedCtrInvocations(t *testing.T) {
 // same fstype corpus generator the ADR-0417 classifier tests use.
 func TestADR0419_D4_DemandSetAgreesWithThePatchScriptClassifier(t *testing.T) {
 	// Codes drawn from CRIU 4.2's own fstypes[] table, as decoded for ADR-0417.
-	recreatable := []int{1, 2, 3, 4, 5, 6, 14}        // construct-and-fill: NOT demanded
+	//
+	// ADR-0420 D1c SPLITS the recreatable side of this assertion, because the agreement being
+	// asserted is now over TWO axes rather than one. A kernel-regenerated recreatable fstype is
+	// internalized unconditionally and is still never demanded. A CONSTRUCT-AND-FILL one (DEVTMPFS=3,
+	// TMPFS=5) is internalized only when the checkpoint carries its content — so it is not demanded
+	// WITH a content image and IS demanded without one. Testing those two codes only in the
+	// with-content configuration would leave the exact lockstep divergence D1c exists to prevent
+	// (script routes it to DESTINATION-REBIND, scanner does not demand it, false hard stop on every
+	// migration) uncovered, so both configurations are asserted here.
+	kernelRegenerated := []int{1, 2, 4, 6, 14}        // no content image exists or is expected
+	contentBearing := []int{3, 5}                     // construct-and-fill: the content axis applies
 	notRecreatable := []int{0, 7, 15, 16, 17, 20, 99} // must be demanded, incl. codes outside the table
 
 	origStaging := restoreStagingRoot
 	defer func() { restoreStagingRoot = origStaging }()
 
-	for _, code := range recreatable {
-		t.Run("recreatable_not_demanded_"+strconv.Itoa(code), func(t *testing.T) {
+	demandedProbe := func(t *testing.T, got destinationRebindDemand) bool {
+		t.Helper()
+		for _, mp := range got.Paths {
+			if mp == "/mnt/probe" {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, code := range kernelRegenerated {
+		t.Run("kernel_regenerated_not_demanded_"+strconv.Itoa(code), func(t *testing.T) {
 			pypath, extraEnv := pycriuEnv(t)
 			ckpt := t.TempDir()
 			writeADR0417FstypeCorpus(t, pypath, extraEnv, ckpt, code)
@@ -984,10 +1010,51 @@ func TestADR0419_D4_DemandSetAgreesWithThePatchScriptClassifier(t *testing.T) {
 			if err != nil {
 				t.Fatalf("demand-set scan: %v", err)
 			}
-			for _, mp := range got {
-				if mp == "/mnt/probe" {
-					t.Errorf("fstype %d is CRIU-recreatable — the script internalizes it and never asks for a destination target, so it must NOT be demanded; got %v", code, got)
-				}
+			if demandedProbe(t, got) {
+				t.Errorf("fstype %d is kernel-regenerated and CRIU-recreatable — the script internalizes it unconditionally and never asks for a destination target, so it must NOT be demanded; got %v", code, got.Paths)
+			}
+			if len(got.ContentAbsent) != 0 {
+				t.Errorf("fstype %d is not content-bearing — the ADR-0420 content axis must not touch it; got ContentAbsent=%v", code, got.ContentAbsent)
+			}
+		})
+	}
+
+	for _, code := range contentBearing {
+		t.Run("content_bearing_with_content_not_demanded_"+strconv.Itoa(code), func(t *testing.T) {
+			pypath, extraEnv := pycriuEnv(t)
+			ckpt := t.TempDir()
+			writeADR0417FstypeCorpus(t, pypath, extraEnv, ckpt, code)
+			stageTmpfsContentImage(t, ckpt, "tmpfs-dev-0.tar.gz.img") // corpus entry has root_dev=0
+			restoreStagingRoot = t.TempDir()
+			got, err := destinationRebindDemandSet(context.Background(), "d4-mig", ckpt)
+			if err != nil {
+				t.Fatalf("demand-set scan: %v", err)
+			}
+			if demandedProbe(t, got) {
+				t.Errorf("fstype %d WITH its content image is internalized by the script, so it must NOT be demanded; got %v", code, got.Paths)
+			}
+			if got.InternalizedWithContent != 1 {
+				t.Errorf("fstype %d with content must be counted once as internalized_with_content; got %d", code, got.InternalizedWithContent)
+			}
+		})
+
+		t.Run("content_bearing_without_content_demanded_"+strconv.Itoa(code), func(t *testing.T) {
+			pypath, extraEnv := pycriuEnv(t)
+			ckpt := t.TempDir()
+			writeADR0417FstypeCorpus(t, pypath, extraEnv, ckpt, code)
+			restoreStagingRoot = t.TempDir()
+			got, err := destinationRebindDemandSet(context.Background(), "d4-mig", ckpt)
+			if err != nil {
+				t.Fatalf("demand-set scan: %v", err)
+			}
+			if !demandedProbe(t, got) {
+				t.Errorf("ADR-0420 D1c: fstype %d WITHOUT a content image is routed to DESTINATION-REBIND by the patch script, so the demand scanner MUST demand it — a scanner that skips it produces a false hard stop on every migration; got %v", code, got.Paths)
+			}
+			if len(got.ContentAbsent) != 1 || got.ContentAbsent[0] != "/mnt/probe" {
+				t.Errorf("fstype %d without content must be reported on the content-absent axis so D1b's counter has a real denominator; got %v", code, got.ContentAbsent)
+			}
+			if got.InternalizedWithContent != 0 {
+				t.Errorf("fstype %d without content must NOT be counted as internalized_with_content; got %d", code, got.InternalizedWithContent)
 			}
 		})
 	}
@@ -1002,14 +1069,11 @@ func TestADR0419_D4_DemandSetAgreesWithThePatchScriptClassifier(t *testing.T) {
 			if err != nil {
 				t.Fatalf("demand-set scan: %v", err)
 			}
-			var found bool
-			for _, mp := range got {
-				if mp == "/mnt/probe" {
-					found = true
-				}
+			if !demandedProbe(t, got) {
+				t.Errorf("fstype %d is NOT CRIU-recreatable — patch_checkpoint_script.go hard-stops without a destination target, so it MUST be demanded; got %v", code, got.Paths)
 			}
-			if !found {
-				t.Errorf("fstype %d is NOT CRIU-recreatable — patch_checkpoint_script.go hard-stops without a destination target, so it MUST be demanded; got %v", code, got)
+			if len(got.ContentAbsent) != 0 {
+				t.Errorf("fstype %d is demanded because it is not recreatable at all, NOT because of the content axis — conflating the two would mislabel D1b's counter; got ContentAbsent=%v", code, got.ContentAbsent)
 			}
 		})
 	}

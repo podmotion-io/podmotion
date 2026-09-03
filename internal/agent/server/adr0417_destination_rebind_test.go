@@ -72,7 +72,9 @@ func TestMain(m *testing.M) {
 	resolveContainerdRootDirFn = func(context.Context, string) string { return adr0417ContainerdRoot }
 	// ADR-0419 D4: default to "this checkpoint demands nothing", so tests about other things do not
 	// need a real checkpoint image or a python3/pycriu decode on the box.
-	destinationRebindDemandSetFn = func(context.Context, string, string) ([]string, error) { return nil, nil }
+	destinationRebindDemandSetFn = func(context.Context, string, string) (destinationRebindDemand, error) {
+		return destinationRebindDemand{}, nil
+	}
 	// ADR-0419 D5: no containerd in a unit-test process.
 	containerdRuntimeMountsOnceFn = func(context.Context, string, string) ([]nri.ContainerMount, error) { return nil, nil }
 	// ADR-0419 D8: no containerd in a unit-test process; one RUNNING sandbox is the healthy shape.
@@ -397,6 +399,17 @@ func TestPatchCheckpointImages_ADR0417_FstypeAllowlist(t *testing.T) {
 			pypath, extraEnv := pycriuEnv(t)
 			ckptDir := t.TempDir()
 			writeADR0417FstypeCorpus(t, pypath, extraEnv, ckptDir, tc.code)
+			// ADR-0420 D1: recreatability is necessary but NOT SUFFICIENT. For the two
+			// construct-and-fill fstypes (DEVTMPFS=3, TMPFS=5) the classifier now additionally
+			// requires the checkpoint to actually CARRY the mount's content, because internalizing a
+			// contentless one hands CRIU an empty superblock to fill from an image that does not
+			// exist and tmpfs_restore fails silently. This corpus entry has root_dev=0, so staging
+			// tmpfs-dev-0.tar.gz.img is what makes it the /dev/shm shape — a recreatable mount whose
+			// content IS in the checkpoint — and the assertions below are unchanged for it.
+			// ADR-0420's own suite covers the contentless case in every direction.
+			if tc.code == 3 || tc.code == 5 {
+				stageTmpfsContentImage(t, ckptDir, "tmpfs-dev-0.tar.gz.img")
+			}
 			// No host target supplied: a RECREATABLE mount does not need one, so this must succeed.
 			if _, _, err := patchCheckpointImages(ckptDir, nil, nil, nil, nil); err != nil {
 				t.Fatalf("fstype %d (%s) must classify RECREATABLE and internalize without a destination target; got %v", tc.code, tc.name, err)
@@ -501,6 +514,12 @@ func TestPatchCheckpointImages_ADR0417_StdoutInjectionExploitBlocked(t *testing.
 	if out, err := cmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "CORPUS_OK") {
 		t.Fatalf("generate exploit corpus: %v\noutput: %s", err, out)
 	}
+	// ADR-0420 D1: the exploit's only precondition is that the hostile ext_key reaches the
+	// RECREATABLE branch's log line, which is now additionally gated on the checkpoint carrying the
+	// mount's content (corpus root_dev=0). Staging it keeps this test pointed at the INJECTION
+	// surface rather than accidentally re-testing the content gate — without it the entry would
+	// take the DESTINATION-REBIND branch and the exploit's actual target would go unexercised.
+	stageTmpfsContentImage(t, ckptDir, "tmpfs-dev-0.tar.gz.img")
 
 	_, tokens, err := patchCheckpointImages(ckptDir, nil, nil, nil, nil)
 	if err != nil {
