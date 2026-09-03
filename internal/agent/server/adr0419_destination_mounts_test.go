@@ -159,7 +159,7 @@ func TestADR0419_NRIPathIssuesZeroRuntimeLookups(t *testing.T) {
 	defer withDemandSet(t, "/etc/hosts", "/etc/hostname", "/etc/resolv.conf")()
 	lookups := 0
 	orig := containerdRuntimeMountsOnceFn
-	containerdRuntimeMountsOnceFn = func(context.Context, string, string) ([]nri.ContainerMount, error) {
+	containerdRuntimeMountsOnceFn = func(context.Context, string, string, []string) ([]nri.ContainerMount, error) {
 		lookups++
 		return adr0419FakeEventMounts(), nil
 	}
@@ -389,7 +389,7 @@ func TestADR0419_NotYetThatNeverConvergesGetsANamedTerminal(t *testing.T) {
 
 	calls := 0
 	orig := containerdRuntimeMountsOnceFn
-	containerdRuntimeMountsOnceFn = func(context.Context, string, string) ([]nri.ContainerMount, error) {
+	containerdRuntimeMountsOnceFn = func(context.Context, string, string, []string) ([]nri.ContainerMount, error) {
 		calls++
 		return nil, status.Error(codes.Unavailable, "containerd is down")
 	}
@@ -434,7 +434,7 @@ func TestADR0419_TransientBlipThenSuccessResolves(t *testing.T) {
 
 	calls := 0
 	orig := containerdRuntimeMountsOnceFn
-	containerdRuntimeMountsOnceFn = func(context.Context, string, string) ([]nri.ContainerMount, error) {
+	containerdRuntimeMountsOnceFn = func(context.Context, string, string, []string) ([]nri.ContainerMount, error) {
 		calls++
 		if calls < 3 {
 			return nil, status.Error(codes.Unavailable, "blip")
@@ -460,7 +460,7 @@ func TestADR0419_TerminalStatusIsNotRetried(t *testing.T) {
 	defer withDemandSet(t, "/etc/hosts")()
 	calls := 0
 	orig := containerdRuntimeMountsOnceFn
-	containerdRuntimeMountsOnceFn = func(context.Context, string, string) ([]nri.ContainerMount, error) {
+	containerdRuntimeMountsOnceFn = func(context.Context, string, string, []string) ([]nri.ContainerMount, error) {
 		calls++
 		return nil, status.Error(codes.PermissionDenied, "denied")
 	}

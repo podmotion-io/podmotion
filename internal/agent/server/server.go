@@ -1828,6 +1828,16 @@ func validateExtMountToken(key, target string, resolvedHostTargets map[string]bo
 // DESTINATION-REBIND targets from --ext-mount-map, leaving CRIU to restore against the SOURCE
 // node's recorded /etc/hosts source and ENOENT mid-restore — the exact defect ADR-0417 exists to
 // fix, reintroduced as a fail-open. Every other outcome is a resolved set or a named terminal.
+//
+// ADR-0421 D2j AMENDS THAT, without disturbing it. The reasoning above is correct and is retained:
+// an empty sandboxID must not silently drop the destination-rebind targets. What is ADDED is that
+// it must not reach an UNDER-DETERMINED LOOKUP either. On the gRPC path the client-side sandbox
+// narrowing is a no-op when the key is empty — every row for the pod UID survives, across every
+// sandbox including stale ones — and a CRI container name is byte-identical across sandbox churn,
+// so the container-name filter cannot disambiguate the very thing the missing key left open. An
+// empty sandboxID therefore now routes to a NAMED TERMINAL
+// (DestinationRuntimeMountSandboxKeyMissingError), decided before any containerd listing is
+// requested. Neither fail-open nor silent guess.
 func (s *AgentServer) appendDestinationRebindReattachMounts(
 	ctx context.Context, migrationName, checkpointDir, sandboxID string,
 	runtimeMounts []nri.ContainerMount, mounts []reattachMount,
@@ -1915,8 +1925,39 @@ func (s *AgentServer) appendDestinationRebindReattachMounts(
 			return mounts, fmt.Errorf("destination rebind: no replacement pod resolved for migration %s in namespace %s (label %s) — cannot ask the runtime for its mount list (ADR-0419 D5)",
 				migrationName, podNs, replacementPodLabelKey)
 		}
+		// ADR-0421 D2a — thread the restore-target discriminator in FROM THE SOURCE OF TRUTH.
+		//
+		// The value comes from the replacement pod the caller ALREADY HAS IN HAND, two statements
+		// above: replPod.Spec.Containers[i].Name for every i. No new Kubernetes API call, no new
+		// gRPC call, no new argv, no new annotation, no new field — one slice walk on an object
+		// already fetched.
+		//
+		// NOT the podmotion.io/restore-target-containers annotation, deliberately. That key has
+		// exactly one producer and NO admission-time integrity guard anywhere — no validating
+		// webhook, no ownership check — and the replacement pod is resolved in the WORKLOAD's
+		// namespace, so the annotation is writable by any principal holding `patch pods` there: a
+		// sidecar injector, a service mesh, a CI deployer, a compromised in-namespace controller.
+		// Making it the SELECTOR would hand such a principal control over which container's OCI
+		// mount list populates resolvedHostTargets — the very set validateExtMountToken calls "the
+		// load-bearing check against a forged marker line", on the stated ground that an attacker
+		// who controls the checkpoint image cannot make a target of their choosing appear in a set
+		// the agent built from Kubernetes/containerd/filesystem reads. Reading a derived,
+		// attacker-writable COPY of a fact already held in its authoritative form is exactly the
+		// brittle-chain signature this ADR is written against; container names are IMMUTABLE on an
+		// existing pod through the API server, annotations are freely patchable.
+		//
+		// The annotation is therefore NOT read on this path at all — not cross-checked, not
+		// preferred, not used as a fallback. Cross-checking would still leave an attacker able to
+		// NARROW the set (drop names -> empty -> fail closed -> denial); not reading it removes the
+		// input from this path entirely. The NRI path's own use of it is unchanged and stays
+		// correct, because there it only ever causes a SKIP and a full anti-spoof verification sits
+		// immediately behind it.
+		restoreTargets := make([]string, 0, len(replPod.Spec.Containers))
+		for i := range replPod.Spec.Containers {
+			restoreTargets = append(restoreTargets, replPod.Spec.Containers[i].Name)
+		}
 		var rErr error
-		runtimeMounts, rErr = s.resolveRuntimeMountsWaiting(ctx, string(replPod.UID), sandboxID, pending)
+		runtimeMounts, rErr = s.resolveRuntimeMountsWaiting(ctx, string(replPod.UID), sandboxID, restoreTargets, pending)
 		if rErr != nil {
 			destinationRebindObserveFn(migrationName, attempts, time.Since(start), "runtime_lookup_failed")
 			return mounts, rErr

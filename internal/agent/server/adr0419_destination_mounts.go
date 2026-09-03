@@ -46,6 +46,7 @@ import (
 
 	"github.com/podmotion-io/podmotion/internal/agent/netnsbroker"
 	"github.com/podmotion-io/podmotion/internal/agent/nri"
+	"github.com/podmotion-io/podmotion/internal/agent/restoretargets"
 )
 
 // ---------------------------------------------------------------------------------------------
@@ -331,6 +332,24 @@ const containerdNamespace = "k8s.io"
 const (
 	criKindLabel   = "io.cri-containerd.kind"
 	criPodUIDLabel = "io.kubernetes.pod.uid"
+
+	// ADR-0421 D2b — the container-NAME sources, in the order they are consulted.
+	//
+	// criContainerNameLabel is read off Container.Labels and needs NO OCI spec decode, so a
+	// non-target row is never unmarshalled: the decode surface stays at one row per lookup,
+	// exactly as before this ADR. criContainerNameAnnotation is the documented alternate,
+	// readable only AFTER the decode.
+	//
+	// ADR-0421 §P-VERIFY #2 measured BOTH on two substrates — kind (containerd 2.3.1) and
+	// RKE2 v1.36.4+rke2r1 — on BOTH an init container and a workload container, and found both
+	// populated and both equal to the Kubernetes container name. That selects the LABEL and with
+	// it the before-the-decode placement. The annotation fallback is retained because EC2 was NOT
+	// measured, so this code may not assert the label is substrate-invariant across the whole
+	// matrix; the fallback is what makes the per-row decode-error rule below live rather than
+	// inert. Neither source populated on some substrate is NOT folded into the not-yet budget —
+	// it gets its own named terminal (D2f).
+	criContainerNameLabel      = "io.kubernetes.container.name"
+	criContainerNameAnnotation = "io.kubernetes.cri.container-name"
 )
 
 // ociSpecMounts is the subset of the OCI runtime spec this ADR reads. containerd stores a
@@ -344,6 +363,341 @@ type ociSpecMounts struct {
 		Source      string   `json:"source"`
 		Options     []string `json:"options"`
 	} `json:"mounts"`
+	// ADR-0421 D2b — the fallback container-name source. Additive decode of bytes that were
+	// already fetched and already unmarshalled: no second round-trip either way.
+	Annotations map[string]string `json:"annotations"`
+}
+
+// ---------------------------------------------------------------------------------------------
+// ADR-0421 D2 — restore-target-container discrimination for the gRPC runtime-mount lookup.
+//
+// ADR-0419 D5.1 resolved "the restore-target container's OWN OCI mount list" with pod UID +
+// kind==container + Sandbox and then took the FIRST surviving row. The podmotion-inject-holder
+// INIT container satisfies every one of those predicates — identical pod UID, identical
+// io.cri-containerd.kind=container, identical Sandbox — and containerd's listing order carries no
+// meaning, so the lookup could return the init container's mount list instead of the workload
+// container's. That is not hypothetical: ADR-0421's Gate 0 capture observed it on a live kind
+// restore, where the returned list carried /holder-bin (the init container's holder mount) and not
+// /podmotion (every main container's), and the restore hard-stopped on /data absent.
+//
+// Meanwhile the NRI path ALREADY knew which container the restore targets — ADR-0197 Rule D — so
+// the two destination-mount paths disagreed about the answer. D2 closes that by making the gRPC
+// path apply the discriminator the NRI path already applies, and by naming every way the read can
+// fail instead of guessing through it.
+// ---------------------------------------------------------------------------------------------
+
+// DestinationRuntimeMountSandboxKeyMissingError (D2j) is the named terminal for a gRPC-path lookup
+// entered with an EMPTY sandbox ID.
+//
+// appendDestinationRebindReattachMounts documents an empty sandboxID as a deliberately reachable
+// runtime state that is deliberately not early-returned. On that branch the client-side narrowing
+// `sandboxID != "" && c.GetSandbox() != sandboxID` is a NO-OP: every row matching the pod UID
+// survives, ACROSS EVERY SANDBOX for that pod UID including stale ones — and ADR-0419's own live
+// settle found 27 pod UIDs carrying two sandbox rows each, so stale sandboxes are the normal case
+// on this substrate, not an edge case. A CRI container name is byte-identical on the stale
+// sandbox's row and the live one, so the D2b name filter CANNOT disambiguate them: it is a
+// selector, and a selector with no sandbox key is under-determined by construction. Applying it
+// there would not infer a weak answer, it would manufacture CONFIDENCE in an arbitrary one — which
+// is strictly worse than the pre-D2 behaviour, whose first-match was at least order-arbitrary and
+// unbiased rather than deterministically plausible-looking.
+//
+// Terminal on FIRST occurrence is provably correct here, unlike D2f: sandboxID is a PARAMETER,
+// constant across every iteration of the probe loop, so re-probing cannot change it. Burning the
+// lookup budget on a value that cannot change would manufacture a timing story for a structural
+// fact. This is decided BEFORE any List is issued: zero round-trips, zero new classification
+// outcomes.
+type DestinationRuntimeMountSandboxKeyMissingError struct {
+	PodUID string
+}
+
+func (e *DestinationRuntimeMountSandboxKeyMissingError) Error() string {
+	return fmt.Sprintf("destination rebind: the runtime-mount lookup for pod uid %s was entered with an EMPTY sandbox ID — refusing to select a container across every sandbox for this pod (a CRI container name is identical across sandbox churn, so the name filter cannot disambiguate a stale sandbox from the live one) (ADR-0421 D2j)", e.PodUID)
+}
+
+// DestinationRuntimeMountRestoreTargetsMissingError (D2d) is the named terminal for a gRPC-path
+// lookup entered with an EMPTY restore-target set.
+//
+// D2d REVERSES ADR-0421 rev 1's decision to keep first-match here. The justification for that
+// fail-open was that it "mirrors the NRI path's own guard precisely, so the two paths degrade
+// identically", and that claim is false: on the NRI path the annotation is a FILTER on an
+// already-identified container, with a full anti-spoof CR verification immediately behind it, so
+// degrading open costs a spurious pass-through and container identity is never in doubt. Here it
+// is the SELECTOR resolving an N-way ambiguity, and the successor control is NONE. Fail-open on
+// this path is the defect verbatim, silent — no error, no not-yet, no named terminal, just the
+// wrong container's mount list handed to CRIU.
+//
+// Since D2a sources the set from replPod.Spec.Containers[].Name and a pod cannot exist with zero
+// containers, the guarded branch is not version skew — it is "the agent is holding an object that
+// cannot be a pod". Terminal for the right reason.
+type DestinationRuntimeMountRestoreTargetsMissingError struct {
+	PodUID, SandboxID string
+}
+
+func (e *DestinationRuntimeMountRestoreTargetsMissingError) Error() string {
+	return fmt.Sprintf("destination rebind: the runtime-mount lookup for pod uid %s (sandbox %s) was entered with an EMPTY restore-target container set — refusing to fall back to containerd listing order, which is the ADR-0421 DEFECT 2 selection this decision exists to remove (ADR-0421 D2d)", e.PodUID, e.SandboxID)
+}
+
+// DestinationRuntimeMountNameSourceMissingError (D2f) is the named terminal for "rows matched this
+// sandbox but NONE of them yielded a determinable container name".
+//
+// Without this, that condition lands on the same empty-result not-yet leg as a container that
+// genuinely has not been created yet, so on any substrate where neither name source is populated
+// EVERY gRPC-path restore would burn the full lookup budget and die reporting "sandbox/container
+// not created yet" — a CORRECT BOUND ON A BROKEN READ, which manufactures a convincing timing
+// story for a structural failure. The condition is separable at the skip site with zero extra
+// round-trips and no new data: the rows exist and are correctly attributed to this sandbox.
+//
+// FIRES ON THE SECOND CONSECUTIVE OBSERVATION, not the first. Terminating on the first would rest
+// on an ungrounded premise — that a containerd container record can never be observable while its
+// CRI name source is not yet populated, i.e. that record creation and name-label population are
+// ATOMIC on the deployed containerd. Nothing grounds that, and the restore path is exactly where
+// the workload container is being created CONCURRENTLY with the lookup, so firing terminal on a
+// read that was merely EARLY is the mirror image of the failure this ADR is written against. The
+// surviving-row set is identified by its SORTED CONTAINER IDS so "the same set" is a real
+// comparison and not a count; if the set differs between probes the substrate is still converging
+// and the streak resets. Cost: one extra probe interval on a substrate where the name source is
+// genuinely absent, against a killed restore on one where the read was merely early.
+type DestinationRuntimeMountNameSourceMissingError struct {
+	PodUID, SandboxID string
+	RowIDs            []string
+	DecodeFailedIDs   []string
+	Observations      int
+	Waited            time.Duration
+}
+
+func (e *DestinationRuntimeMountNameSourceMissingError) Error() string {
+	msg := fmt.Sprintf("destination rebind: %d containerd row(s) matched pod uid %s and sandbox %s but NONE yielded a determinable container name from either %q (label) or %q (OCI spec annotation), across %d consecutive observations %s apart of the identical row set %v — reporting a missing discriminator AS a missing discriminator rather than as a convergence timeout (ADR-0421 D2f)",
+		len(e.RowIDs), e.PodUID, e.SandboxID, criContainerNameLabel, criContainerNameAnnotation,
+		e.Observations, e.Waited, e.RowIDs)
+	if len(e.DecodeFailedIDs) > 0 {
+		msg += fmt.Sprintf("; of these, the OCI spec failed to decode for %v", e.DecodeFailedIDs)
+	}
+	return msg
+}
+
+// DestinationRuntimeMountInstanceAmbiguousError (D2i) is the named terminal for >1 RUNNING row
+// sharing ONE container name.
+//
+// Name membership closes CROSS-NAME ambiguity and leaves INTRA-NAME INSTANCE ambiguity fully open,
+// which is the same failure shape ADR-0419's own sufficiency claim had one layer up. The
+// replacement pod sets no RestartPolicy, so it inherits the source pod's — Always for the standing
+// workloads — and a holder crash or a failed prior restore attempt makes kubelet recreate the
+// container under the SAME sandbox with a NEW container ID, while kubelet's container GC retains
+// the dead instance. Two rows then match pod UID AND sandbox AND name. Their /data sources are
+// DIFFERENT DIRECTORIES, because the anonymous volume is minted per container ID. Pre-D1 either
+// was rejected at the prefix check; post-D1 both are admitted, so without this narrowing CRIU
+// could bind the restored workload's /data onto a DEAD instance's volume dir that GC will unlink
+// out from under a live process.
+//
+// Two live instances of the same named container is not an ambiguity the agent may resolve by
+// picking. It is a state the agent must NAME.
+type DestinationRuntimeMountInstanceAmbiguousError struct {
+	PodUID, SandboxID, ContainerName string
+	RunningIDs                       []string
+}
+
+func (e *DestinationRuntimeMountInstanceAmbiguousError) Error() string {
+	return fmt.Sprintf("destination rebind: %d containerd rows for pod uid %s in sandbox %s share the container name %q and ALL have a RUNNING task (%v) — their anonymous volume dirs are per-container-instance and therefore different directories, so this choice is under-determined and must not be made by listing order (ADR-0421 D2i)",
+		len(e.RunningIDs), e.PodUID, e.SandboxID, e.ContainerName, e.RunningIDs)
+}
+
+// runtimeMountNameSourceUndetermined is the PER-PROBE marker for D2f's condition. It is internal:
+// resolveRuntimeMountsWaiting converts a repeated observation of it into the exported terminal
+// above. It is not itself a terminal, because one observation cannot distinguish "this containerd
+// has no name source" from "this read was early".
+type runtimeMountNameSourceUndetermined struct {
+	SandboxID       string
+	RowIDs          []string
+	DecodeFailedIDs []string
+}
+
+func (e *runtimeMountNameSourceUndetermined) Error() string {
+	return fmt.Sprintf("no determinable container name on any of %d row(s) matching sandbox %s: %v", len(e.RowIDs), e.SandboxID, e.RowIDs)
+}
+
+// isADR0421D2Sentinel reports whether err is one of D2's own named terminals, as opposed to a real
+// gRPC status error. D2h: these must not be wrapped as "gRPC status Unknown", which would defeat
+// the whole point of reporting a missing discriminator AS a missing discriminator.
+func isADR0421D2Sentinel(err error) bool {
+	var sandboxKey *DestinationRuntimeMountSandboxKeyMissingError
+	var targets *DestinationRuntimeMountRestoreTargetsMissingError
+	var nameSrc *DestinationRuntimeMountNameSourceMissingError
+	var instance *DestinationRuntimeMountInstanceAmbiguousError
+	return errors.As(err, &sandboxKey) || errors.As(err, &targets) ||
+		errors.As(err, &nameSrc) || errors.As(err, &instance)
+}
+
+// d2Row is one containers-service row reduced to what D2 needs to decide.
+type d2Row struct {
+	ID     string
+	Name   string
+	Mounts []nri.ContainerMount
+}
+
+// d2Selection is the outcome of D2's client-side narrowing over ONE containers-service listing.
+type d2Selection struct {
+	// SandboxMatchedIDs is every row that passed the sandbox narrowing, sorted. It is D2f's
+	// denominator and the identity of the surviving-row set across probes.
+	SandboxMatchedIDs []string
+	// UndeterminableIDs is the subset of the above that yielded no determinable container name.
+	UndeterminableIDs []string
+	// DecodeFailedIDs is the subset of UndeterminableIDs whose OCI spec failed to decode, kept
+	// separate purely so an operator reading the terminal can tell the two apart.
+	DecodeFailedIDs []string
+	// Targets is every row whose determinable name is a member of restoreTargets, in containerd's
+	// listing order.
+	Targets []d2Row
+}
+
+// selectRestoreTargetRows applies D2's sandbox narrowing, D2b's name filter and D2b's decode-error
+// rule to one containers-service listing. It is PURE — no round-trips — so every branch below is
+// assertable from a fake listing without a live containerd, which is what ADR-0421 D3 items 4, 5,
+// 7 and 8 drive rather than widening the production seam to express a raw row.
+//
+// D2b — DETERMINABILITY GATES THE MEMBERSHIP CALL; IT DOES NOT FOLLOW IT. Per row, a name must be
+// established as determinable — a non-empty value from whichever source is populated — BEFORE the
+// membership predicate is called with it. A row with no determinable name is never passed to the
+// predicate; it is counted toward D2f's undeterminable set and skipped. This is not defensive
+// styling: it is what keeps an empty string out of the predicate, and restoretargets.Contains's
+// own empty-name rejection is the BACKSTOP behind it, not a substitute for it.
+//
+// D2b — THE DECODE-ERROR RULE. Before D2 the first sandbox-matching row was also the returned row,
+// so at most one OCI spec was ever decoded and a decode failure could only ever concern the row
+// being returned. D2 makes the loop iterate PAST rows it intends to skip, so an unqualified hard
+// return would widen a terminal decode error from one row to N — turning a decode failure on a
+// container D2 means to SKIP into a terminal failure of the workload container's lookup, the exact
+// opposite of the direction D2b promises. Therefore:
+//
+//   - a decode failure on a row whose membership CANNOT YET BE DETERMINED continues — the row is
+//     skipped and counted undeterminable, matching the fail-closed-toward-not-yet direction;
+//   - a decode failure on a row that DOES match restoreTargets remains terminal, unchanged.
+//
+// On the label source no non-target row is ever decoded, so the first rule is inert; it is written
+// so that reaching the annotation fallback on an unmeasured substrate cannot silently widen the
+// surface.
+func selectRestoreTargetRows(rows []*containersapi.Container, sandboxID string, restoreTargets []string) (d2Selection, error) {
+	var sel d2Selection
+	for _, c := range rows {
+		if c == nil {
+			continue
+		}
+		// Client-side sandbox narrowing (ADR-0419 D5.1). D2j guarantees sandboxID is non-empty by
+		// the time any listing is requested, so this is a real narrowing and never a no-op.
+		if sandboxID != "" && c.GetSandbox() != sandboxID {
+			continue
+		}
+		sel.SandboxMatchedIDs = append(sel.SandboxMatchedIDs, c.GetID())
+
+		// Name source 1: the CRI LABEL. Free — no decode.
+		name := c.GetLabels()[criContainerNameLabel]
+
+		var spec ociSpecMounts
+		decoded := false
+		if name == "" {
+			// Name source 2: the OCI spec annotation, readable only after the decode.
+			if uerr := json.Unmarshal(c.GetSpec().GetValue(), &spec); uerr != nil {
+				// Membership cannot be determined for this row: skip, do not terminalize.
+				sel.UndeterminableIDs = append(sel.UndeterminableIDs, c.GetID())
+				sel.DecodeFailedIDs = append(sel.DecodeFailedIDs, c.GetID())
+				continue
+			}
+			decoded = true
+			name = spec.Annotations[criContainerNameAnnotation]
+		}
+		if name == "" {
+			sel.UndeterminableIDs = append(sel.UndeterminableIDs, c.GetID())
+			continue
+		}
+		if !restoretargets.Contains(name, restoreTargets) {
+			continue
+		}
+
+		// This row IS a restore target, so its spec must decode: a decode failure here remains
+		// terminal, exactly as before this ADR.
+		if !decoded {
+			if uerr := json.Unmarshal(c.GetSpec().GetValue(), &spec); uerr != nil {
+				return sel, fmt.Errorf("decode OCI spec for container %s: %w", c.GetID(), uerr)
+			}
+		}
+		mounts := make([]nri.ContainerMount, 0, len(spec.Mounts))
+		for _, m := range spec.Mounts {
+			if m.Destination == "" {
+				continue
+			}
+			mounts = append(mounts, nri.ContainerMount{
+				Destination: m.Destination, Type: m.Type, Source: m.Source, Options: m.Options,
+			})
+		}
+		sel.Targets = append(sel.Targets, d2Row{ID: c.GetID(), Name: name, Mounts: mounts})
+	}
+	sort.Strings(sel.SandboxMatchedIDs)
+	sort.Strings(sel.UndeterminableIDs)
+	sort.Strings(sel.DecodeFailedIDs)
+	return sel, nil
+}
+
+// resolveD2Survivors applies D2f, D2i and D2g to a completed selection plus the set of candidate
+// container IDs whose containerd TASK is RUNNING. Pure, for the same testability reason as above.
+//
+// Ordering is specified rather than left open, for round-trip economy: the NAME filter runs first
+// (client-side, free, in selectRestoreTargetRows) and the task Get is issued ONLY for rows that
+// already passed it. On a single-container pod with no restart that is one extra task Get.
+func resolveD2Survivors(sel d2Selection, running []string, podUID, sandboxID string) ([]nri.ContainerMount, error) {
+	// D2f — rows matched this sandbox, but not one of them could be named. Distinct from not-yet.
+	if len(sel.Targets) == 0 {
+		if len(sel.SandboxMatchedIDs) > 0 && len(sel.UndeterminableIDs) == len(sel.SandboxMatchedIDs) {
+			return nil, &runtimeMountNameSourceUndetermined{
+				SandboxID: sandboxID, RowIDs: sel.SandboxMatchedIDs, DecodeFailedIDs: sel.DecodeFailedIDs,
+			}
+		}
+		// Genuine NOT-YET: either no row matched the sandbox at all, or the rows that did are
+		// nameable and simply are not restore targets — the workload container starting after the
+		// init container is exactly the case the re-probe budget was built for.
+		return nil, nil
+	}
+
+	runningSet := make(map[string]bool, len(running))
+	for _, id := range running {
+		runningSet[id] = true
+	}
+	survivors := make([]d2Row, 0, len(sel.Targets))
+	for _, r := range sel.Targets {
+		if runningSet[r.ID] {
+			survivors = append(survivors, r)
+		}
+	}
+
+	// D2i — every candidate's task is absent or not RUNNING. The workload container exists but its
+	// task has not started: retryable, and exactly what the budget is for.
+	if len(survivors) == 0 {
+		return nil, nil
+	}
+
+	if len(survivors) > 1 {
+		names := make(map[string]bool, len(survivors))
+		ids := make([]string, 0, len(survivors))
+		for _, r := range survivors {
+			names[r.Name] = true
+			ids = append(ids, r.ID)
+		}
+		if len(names) == 1 {
+			// D2i — INSTANCE ambiguity. Never D2g's log-and-return-first: the two rows' anonymous
+			// volume dirs are different directories and one of them may be dead.
+			return nil, &DestinationRuntimeMountInstanceAmbiguousError{
+				PodUID: podUID, SandboxID: sandboxID, ContainerName: survivors[0].Name, RunningIDs: ids,
+			}
+		}
+		// D2g — a genuine MULTI-CONTAINER pod: distinct names, all of them restore targets. That
+		// is a known, scoped limit rather than a correctness failure, and this log is what makes
+		// the day the multi-container scope lifts announce itself instead of being reconstructed
+		// afterwards from a wrong restore. D2g is TELEMETRY: the returned value is unchanged, only
+		// its observability is. It is deliberately NOT asked to cover the instance case above,
+		// which it could not — a logged wrong answer is not a control.
+		log.Error(nil, "ADR-0421 D2g: more than one RUNNING restore-target container survived the name filter — returning the first; this pod is multi-container, which is a known scoped limit",
+			"podUID", podUID, "sandboxID", sandboxID, "survivingCount", len(survivors),
+			"survivingIDs", ids, "selectedContainerID", survivors[0].ID, "selectedContainerName", survivors[0].Name)
+	}
+	return survivors[0].Mounts, nil
 }
 
 // containerdRuntimeMountsOnceFn is a test seam over containerdRuntimeMountsOnce. It is the seam
@@ -366,24 +720,39 @@ var containerdRuntimeMountsOnceFn = containerdRuntimeMountsOnce
 // Source shapes the NRI G0 probe recorded. The CRI option is FALSIFIED for this purpose; this one
 // is verified.
 //
-// HOW THE WORKLOAD-CONTAINER ID IS OBTAINED WITHOUT RE-ENTERING A `ctr` SCRAPE (§P-VERIFY #5):
+// HOW THE WORKLOAD-CONTAINER ID IS OBTAINED WITHOUT RE-ENTERING A `ctr` SCRAPE:
 // the containers service is filtered SERVER-SIDE on
 // labels."io.kubernetes.pod.uid"==<replacement pod UID>,labels."io.cri-containerd.kind"==container
-// (an AND — both proven to work live), and the result is then narrowed CLIENT-SIDE to the
-// container whose Container.Sandbox equals the sandbox ID D2/D2b threaded in. That second step is
-// load-bearing, not belt-and-braces: this ADR's own §P-VERIFY #8c settle found 27 pod UIDs across
-// the two nodes carrying TWO sandbox rows each, so a pod-UID-only match can select a container
-// belonging to a STALE sandbox. Container.Sandbox was verified live to be populated by this
-// containerd. (Server-side filtering on sandbox==<id> and on spec.annotations was probed and
-// returns 0 rows — containerd's filter grammar does not index either — hence the client-side step.)
+// (an AND — both proven to work live), and the result is then narrowed CLIENT-SIDE.
 //
-// ONE ROUND-TRIP: List already returns each Container's Spec, so no follow-up Get is issued.
-// §P-VERIFY #10's "exactly one typed round-trip on the healthy path" is satisfied literally.
+// THE SUFFICIENT KEY, IN FULL (ADR-0421 D2e — and stated in full deliberately, because writing a
+// SUFFICIENCY claim into this comment is what produced a defect on this surface TWICE):
+//
+//	pod UID + kind==container + Sandbox (non-empty, REQUIRED) + container NAME + a RUNNING task.
+//
+// The first three are NECESSARY AND JOINTLY INSUFFICIENT — the podmotion-inject-holder init
+// container satisfies all three, carrying the identical pod UID, the identical kind label and the
+// identical sandbox as the workload container, and ADR-0421's Gate 0 capture observed the lookup
+// actually returning it on a live restore. NAME closes that cross-name ambiguity (D2b/D2c). The
+// TASK STATE closes intra-name INSTANCE ambiguity across container restarts (D2i). And a non-empty
+// Sandbox is a PRECONDITION, not a filter, because the narrowing is a no-op without it (D2j).
+//
+// The ADR-0419 live-evidence argument for the sandbox step is retained unchanged and is correct —
+// its own §P-VERIFY #8c settle found 27 pod UIDs carrying TWO sandbox rows each, so a pod-UID-only
+// match can select a container belonging to a STALE sandbox. It closes the cross-SANDBOX ambiguity
+// and it simply does not close the intra-sandbox one. No proper subset of the key above is
+// asserted sufficient here, and none should be added later without re-deriving the whole list.
+//
+// ROUND-TRIPS: List already returns each Container's Spec, so no follow-up Get is issued TO FETCH
+// A NAME — the name comes off the List response either as a label or out of the spec bytes that
+// response already carried. D2i does issue a TASKS-service Get per surviving name-matched row,
+// which is stated explicitly rather than left to be discovered: ADR-0419 D8 already accepted
+// exactly this cost on its own path through this same function.
 //
 // Returns (nil, nil) — an empty, non-error result — when the sandbox/container genuinely has not
 // been created yet. That is a NOT-YET, and the caller re-probes; it is NOT an error, and must
 // never be collapsed into one.
-func containerdRuntimeMountsOnce(ctx context.Context, podUID, sandboxID string) ([]nri.ContainerMount, error) {
+func containerdRuntimeMountsOnce(ctx context.Context, podUID, sandboxID string, restoreTargets []string) ([]nri.ContainerMount, error) {
 	dialPath, err := containerdDialPath()
 	if err != nil {
 		return nil, fmt.Errorf("containerd containers client: %w", err)
@@ -406,33 +775,24 @@ func containerdRuntimeMountsOnce(ctx context.Context, podUID, sandboxID string) 
 		return nil, err
 	}
 
-	for _, c := range resp.GetContainers() {
-		if c == nil {
-			continue
-		}
-		// Client-side sandbox narrowing — see the doc comment above for why this is required
-		// rather than optional. An empty Container.Sandbox is not matched: an unattributable
-		// container is not evidence that it is the right one.
-		if sandboxID != "" && c.GetSandbox() != sandboxID {
-			continue
-		}
-		var spec ociSpecMounts
-		if uerr := json.Unmarshal(c.GetSpec().GetValue(), &spec); uerr != nil {
-			return nil, fmt.Errorf("decode OCI spec for container %s: %w", c.GetID(), uerr)
-		}
-		out := make([]nri.ContainerMount, 0, len(spec.Mounts))
-		for _, m := range spec.Mounts {
-			if m.Destination == "" {
-				continue
-			}
-			out = append(out, nri.ContainerMount{
-				Destination: m.Destination, Type: m.Type, Source: m.Source, Options: m.Options,
-			})
-		}
-		return out, nil
+	sel, serr := selectRestoreTargetRows(resp.GetContainers(), sandboxID, restoreTargets)
+	if serr != nil {
+		return nil, serr
 	}
-	// No container for this sandbox yet — a NOT-YET, not a failure.
-	return nil, nil
+
+	// D2i — the task Get is issued ONLY for rows that already passed the free name filter.
+	var running []string
+	if len(sel.Targets) > 0 {
+		candidates := make([]string, 0, len(sel.Targets))
+		for _, r := range sel.Targets {
+			candidates = append(candidates, r.ID)
+		}
+		var terr error
+		if running, terr = runningTaskIDsFn(ctx, conn, candidates); terr != nil {
+			return nil, terr
+		}
+	}
+	return resolveD2Survivors(sel, running, podUID, sandboxID)
 }
 
 // runningPodSandboxesForPodUIDFn is a test seam over runningPodSandboxesForPodUID, so D8's
@@ -530,6 +890,15 @@ const (
 	// runtimeMountLookupTerminal: fail closed immediately. Anything that is neither a known
 	// transient nor a known not-yet.
 	runtimeMountLookupTerminal
+	// runtimeMountLookupNameSourceMissing (ADR-0421 D2f): rows matched this sandbox but NONE
+	// yielded a determinable container name. This is the ONE place ADR-0419's "no new
+	// classification branch" is overridden, deliberately: inferring "not created yet" from data
+	// that already says otherwise — the rows exist and ARE correctly attributed to this sandbox —
+	// is precisely the inference this corpus keeps having to remove. It is NOT terminal on sight;
+	// resolveRuntimeMountsWaiting requires a second consecutive observation of the identical row
+	// set before converting it into the named terminal, because one observation cannot tell "this
+	// containerd has no name source" from "this read was early".
+	runtimeMountLookupNameSourceMissing
 )
 
 // classifyRuntimeMountLookup maps one lookup outcome onto D5.3's table.
@@ -546,6 +915,12 @@ func classifyRuntimeMountLookup(mounts []nri.ContainerMount, err error) runtimeM
 		}
 		return runtimeMountLookupResolved
 	}
+	// ADR-0421 D2f — checked BEFORE the gRPC status switch, because this sentinel carries no gRPC
+	// status and would otherwise fall through to terminal-on-first-occurrence.
+	var undetermined *runtimeMountNameSourceUndetermined
+	if errors.As(err, &undetermined) {
+		return runtimeMountLookupNameSourceMissing
+	}
 	switch status.Code(err) {
 	case codes.Unavailable, codes.DeadlineExceeded:
 		return runtimeMountLookupNotYet
@@ -559,28 +934,88 @@ func classifyRuntimeMountLookup(mounts []nri.ContainerMount, err error) runtimeM
 //
 // A NOT-YET that never converges gets a NAMED terminal (DestinationRuntimeMountLookupTimeoutError)
 // rather than being allowed to run out D_restore and surface as a bare RPC timeout.
-func (s *AgentServer) resolveRuntimeMountsWaiting(ctx context.Context, podUID, sandboxID string, demanded []string) ([]nri.ContainerMount, error) {
+func (s *AgentServer) resolveRuntimeMountsWaiting(ctx context.Context, podUID, sandboxID string, restoreTargets, demanded []string) ([]nri.ContainerMount, error) {
+	// ADR-0421 D2j — decided BEFORE the probe loop, on purpose. sandboxID is fully known from the
+	// parameters at entry, so a probe cannot inform it and re-probing provably cannot change it.
+	// Deciding it here costs ZERO round-trips and adds ZERO classification outcomes; deciding it
+	// inside the loop would burn the whole budget on a value that cannot change, which is the same
+	// manufactured-timing-story failure D2f exists to prevent.
+	//
+	// This is a fail-closed change to a branch that previously "worked" by luck, and that is
+	// disclosed rather than assumed away: if an empty sandboxID turns out to be COMMON on real
+	// gRPC-path restores this will stop them. ADR-0421's Gate 0 capture observed a populated
+	// sandbox ID on the one live gRPC-path restore available and a populated Container.Sandbox on
+	// every non-sandbox containerd row measured on both substrates, which is one real data point
+	// and not a distribution. It remains the thing to watch.
+	if sandboxID == "" {
+		err := &DestinationRuntimeMountSandboxKeyMissingError{PodUID: podUID}
+		log.Error(err, "ADR-0421 D2j: refusing an under-determined runtime-mount lookup — the sandbox key is absent, so the container-name filter cannot discriminate a stale sandbox from the live one",
+			"podUID", podUID)
+		return nil, err
+	}
+	// ADR-0421 D2d — fail CLOSED on an empty restore-target set. Never fall back to listing order.
+	if len(restoreTargets) == 0 {
+		err := &DestinationRuntimeMountRestoreTargetsMissingError{PodUID: podUID, SandboxID: sandboxID}
+		log.Error(err, "ADR-0421 D2d: refusing to select a restore-target container by containerd listing order",
+			"podUID", podUID, "sandboxID", sandboxID)
+		return nil, err
+	}
+
 	waitCtx, cancel := context.WithTimeout(ctx, destinationMountLookupBudget)
 	defer cancel()
 	start := time.Now()
 	attempts := 0
 	lastStatus := "none"
+	// ADR-0421 D2f streak state. Local to this call: not persisted, not shared across restores,
+	// and not a new timeout constant.
+	var undeterminedRowIDs []string
+	undeterminedStreak := 0
 	for {
 		attempts++
-		mounts, err := containerdRuntimeMountsOnceFn(waitCtx, podUID, sandboxID)
+		mounts, err := containerdRuntimeMountsOnceFn(waitCtx, podUID, sandboxID, restoreTargets)
 		switch classifyRuntimeMountLookup(mounts, err) {
 		case runtimeMountLookupResolved:
 			log.Info("ADR-0419 D5: resolved the restore-target container's OCI mount list via one typed containerd round-trip",
 				"podUID", podUID, "sandboxID", sandboxID, "mounts", len(mounts),
+				"restoreTargets", restoreTargets,
 				"attempts", attempts, "elapsedMs", time.Since(start).Milliseconds())
 			return mounts, nil
 		case runtimeMountLookupTerminal:
+			// ADR-0421 D2h — D2's sentinels are not gRPC errors, so wrapping them with a status
+			// code would surface a missing discriminator as "gRPC status Unknown" and partly
+			// defeat the point of naming it. Genuine status errors keep the original arm.
+			if isADR0421D2Sentinel(err) {
+				return nil, fmt.Errorf("destination rebind: typed containerd mount lookup for pod uid %s (sandbox %s) failed terminally: %w", podUID, sandboxID, err)
+			}
 			return nil, fmt.Errorf("destination rebind: typed containerd mount lookup for pod uid %s failed terminally (gRPC status %s): %w", podUID, status.Code(err), err)
-		}
-		if err != nil {
-			lastStatus = status.Code(err).String()
-		} else {
-			lastStatus = "OK(empty result — sandbox/container not created yet)"
+		case runtimeMountLookupNameSourceMissing:
+			var undetermined *runtimeMountNameSourceUndetermined
+			_ = errors.As(err, &undetermined)
+			// "The same set" is a real comparison over SORTED CONTAINER IDS, not a count: if a row
+			// appeared or was replaced the substrate is still converging and this is not-yet.
+			if undeterminedStreak > 0 && equalStringSets(undeterminedRowIDs, undetermined.RowIDs) {
+				terr := &DestinationRuntimeMountNameSourceMissingError{
+					PodUID: podUID, SandboxID: sandboxID,
+					RowIDs: undetermined.RowIDs, DecodeFailedIDs: undetermined.DecodeFailedIDs,
+					Observations: undeterminedStreak + 1, Waited: time.Since(start),
+				}
+				log.Error(terr, "ADR-0421 D2f: the container-name discriminator is missing on this containerd — failing closed with its OWN named terminal rather than riding the budget out and reporting a broken read as a convergence timeout",
+					"podUID", podUID, "sandboxID", sandboxID, "attempts", attempts)
+				return nil, terr
+			}
+			undeterminedRowIDs = undetermined.RowIDs
+			undeterminedStreak++
+			lastStatus = "OK(rows matched this sandbox but none yielded a determinable container name)"
+		default:
+			// A genuine not-yet: the streak resets, because D2f's terminal requires CONSECUTIVE
+			// observations of the identical undeterminable row set.
+			undeterminedStreak = 0
+			undeterminedRowIDs = nil
+			if err != nil {
+				lastStatus = status.Code(err).String()
+			} else {
+				lastStatus = "OK(empty result — sandbox/container not created yet)"
+			}
 		}
 		select {
 		case <-waitCtx.Done():
@@ -598,6 +1033,22 @@ func (s *AgentServer) resolveRuntimeMountsWaiting(ctx context.Context, podUID, s
 		case <-time.After(destinationMountLookupInterval):
 		}
 	}
+}
+
+// equalStringSets reports whether two ALREADY-SORTED id slices are identical. ADR-0421 D2f
+// identifies "the same surviving-row set" by its sorted container IDs precisely so that a row
+// appearing or being replaced between probes resets the streak instead of being absorbed by a
+// count that happens to match.
+func equalStringSets(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------------------------
