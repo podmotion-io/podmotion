@@ -416,6 +416,19 @@ const defaultContainerdRootDir = "/var/lib/containerd"
 // criSandboxDirRel is the CRI plugin's sandbox subtree, relative to the containerd root dir.
 const criSandboxDirRel = "io.containerd.grpc.v1.cri/sandboxes"
 
+// criContainersDirRel is the CRI plugin's per-container subtree, relative to the containerd root
+// dir. It holds the anonymous volume dirs containerd synthesizes for image VOLUME directives the
+// pod spec does not address: <root>/io.containerd.grpc.v1.cri/containers/<CID>/volumes/<hash>.
+//
+// ADR-0421 D1. This is a FOURTH legitimate writer of destination mount sources, alongside the
+// three allowedExtMountHostTargetPrefixes already knew about. It is not exotic and not a
+// kind artifact: it is the documented behavior of containerd's CRI plugin for any image VOLUME the
+// pod spec does not cover, and ADR-0421 §P-VERIFY #1 measured the identical relative segment on two
+// independent substrates (kind/containerd 2.3.1 under root /var/lib/containerd; RKE2 v1.36.4+rke2r1
+// under root /var/lib/rancher/rke2/agent/containerd). Like criSandboxDirRel it is RELATIVE, and the
+// absolute prefix is composed against the DISCOVERED root (ADR-0370) rather than hardcoded.
+const criContainersDirRel = "io.containerd.grpc.v1.cri/containers"
+
 // containerdRootFromConfig extracts the TOP-LEVEL `root = "..."` key from a containerd config.toml.
 // Top-level means: before the first `[table]` header — a `root` key inside e.g. `[plugins...]` is a
 // different, unrelated key and must not be mistaken for it (RKE2's generated config has exactly
@@ -480,6 +493,15 @@ func resolveContainerdRootDir(ctx context.Context, winnerSocket string) string {
 // allowedExtMountHostTargetPrefixes (server.go), which needs the containerd root to authorize
 // sandbox-dir prefixes for --ext-mount-map token validation. That need is unrelated to destination
 // target RESOLUTION and outlives this ADR.
+//
+// ADR-0421 D1 amends this note: there are now THREE such retained dependencies, not two.
+// criContainersDirRel joins resolveContainerdRootDirFn and criSandboxDirRel as a constant whose
+// ONLY consumer is allowedExtMountHostTargetPrefixes, for the same validation-not-resolution
+// reason. ADR-0421 D1c is explicit that D1 does NOT reconstruct
+// <root>/io.containerd.grpc.v1.cri/containers/<CID>/volumes/<hash> to probe or resolve anything —
+// that is exactly the reconstruction deleted above, and re-introducing it here would undo this
+// ADR. The target value continues to come from the runtime's reported Source. A future
+// asymmetric-removal pass must see all three.
 
 // pidOwningUnixSocketFn is a test seam. Production implementation: pidOwningUnixSocket.
 var pidOwningUnixSocketFn = pidOwningUnixSocket

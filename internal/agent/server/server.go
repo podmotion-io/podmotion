@@ -1605,15 +1605,44 @@ func ensureRestoreTerminationLogFile(migrationName string) (string, error) {
 // ---------------------------------------------------------------------------------------------
 
 // allowedExtMountHostTargetPrefixes is the closed set of destination-node directory trees a
-// --ext-mount-map target may live under. Every legitimate target this agent produces is either a
-// kubelet-staged pod path (PVC volume dirs, EmptyDir scaffold dirs, /etc/hosts), a containerd CRI
-// sandbox path (hostname/resolv.conf — the real §P-PREMISE-decoded writer), or a path this agent
-// staged itself under /var/lib/podmotion. Anything outside these trees — /, /etc, /root, a host
-// device node — is not a target this code path can legitimately produce, so it is rejected before
-// argv regardless of how plausible the string looks.
+// --ext-mount-map target may live under. There are FOUR legitimate target classes:
+//
+//  1. a kubelet-staged pod path (PVC volume dirs, EmptyDir scaffold dirs, /etc/hosts);
+//  2. a containerd CRI SANDBOX path (hostname/resolv.conf — the real §P-PREMISE-decoded writer);
+//  3. a containerd CRI CONTAINERS path — the anonymous per-container volume dir containerd
+//     synthesizes for an image VOLUME directive the pod spec does not address
+//     (<root>/io.containerd.grpc.v1.cri/containers/<CID>/volumes/<hash>);
+//  4. a path this agent staged itself under /var/lib/podmotion.
+//
+// Anything outside these trees — /, /etc, /root, a host device node — is not a target this code
+// path can legitimately produce, so it is rejected before argv regardless of how plausible the
+// string looks.
+//
+// ADR-0421 D1a — WHY CLASS 3 EXISTS AND WHEN IT BECAME REACHABLE, because the previous version of
+// this comment asserted the three-class enumeration was EXHAUSTIVE and that assertion was FALSE.
+// It was true for the four hardcoded targets ADR-0417 resolved. It stopped being true when
+// ADR-0419 D3 replaced that closed four-entry table with an open lookup over whatever the runtime
+// reports — i.e. the allowlist was not widened in step with its own INPUT'S PROVENANCE change, and
+// a target that this agent itself resolved from runtime truth was then rejected at the prefix check
+// below even though the resolvedHostTargets provenance check above it had already passed. Leaving a
+// comment that asserts a closed set the code no longer has is the failure that produced that
+// defect; it is not repeated. This enumeration is open to correction, not asserted as final.
+//
+// ADR-0421 D1b — class 3 is a CLASS ADMISSION, NOT AN EXEMPTION. The added prefix is a specific
+// subtree, never the containerd root: widening to the bare root would admit the snapshotter tree,
+// the content store and every other subtree, destroying the confinement property this function
+// exists for. Every other S2(b) rule still runs on a containers-tree target exactly as it runs on a
+// sandbox-tree target — the resolvedHostTargets provenance check, the control-character and
+// lexical-cleanliness rules, the absolute-path rule, and the ADR-0419 D9 fail-closed EvalSymlinks
+// realpath confinement.
 //
 // The containerd entries are derived from the DISCOVERED daemon (ADR-0370) rather than hardcoded,
-// so this stays correct on kubeadm-containerd, k3s, and RKE2 alike.
+// so this stays correct on kubeadm-containerd, k3s, and RKE2 alike. Both CRI classes are emitted
+// under EACH of the three discovered roots, in one loop: ADR-0421's runtime-dependency audit
+// records the root-vs-run-vs-state question as deliberately UNDECIDED, resolved by enumerating
+// rather than guessing, exactly as the sandbox class already did. (ADR-0421 §P-VERIFY #1 measured
+// the containers tree under the `root` dir on both kind and RKE2; the other two prefixes cost one
+// string each and buy substrate independence.)
 func allowedExtMountHostTargetPrefixes(ctx context.Context) []string {
 	prefixes := []string{
 		"/var/lib/kubelet/pods/",
@@ -1627,7 +1656,10 @@ func allowedExtMountHostTargetPrefixes(ctx context.Context) []string {
 		if root == "" {
 			continue
 		}
-		prefixes = append(prefixes, filepath.Join(root, criSandboxDirRel)+"/")
+		prefixes = append(prefixes,
+			filepath.Join(root, criSandboxDirRel)+"/",
+			filepath.Join(root, criContainersDirRel)+"/",
+		)
 	}
 	return prefixes
 }
