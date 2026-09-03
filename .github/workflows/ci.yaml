@@ -118,6 +118,17 @@ jobs:
       - name: Helm lint
         run: helm lint charts/podmotion
 
+  substrate-version-check:
+    name: Substrate K8s Version Cross-Check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check go.mod k8s.io/kubernetes floor against every deploy substrate
+        run: bash hack/check-substrate-k8s-versions.sh
+
   build-validate:
     name: Multi-Arch Build Validation
     runs-on: ubuntu-24.04

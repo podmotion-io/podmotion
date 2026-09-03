@@ -484,6 +484,11 @@ proto-gen:
 verify-kernel-config:
 	bash hack/verify-kernel-config.sh
 
+## check-substrate-versions: Cross-check go.mod's k8s.io/kubernetes floor against every deploy substrate's pinned version
+.PHONY: check-substrate-versions
+check-substrate-versions:
+	bash hack/check-substrate-k8s-versions.sh
+
 # ── M18: Packaging & Upstream Contributions ──────────────────────────────────
 
 BUNDLE_IMG         ?= ghcr.io/podmotion/podmotion-bundle:v$(VERSION)

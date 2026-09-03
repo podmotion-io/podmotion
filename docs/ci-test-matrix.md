@@ -200,3 +200,47 @@ active mitigation before the release.
 | bpftool | bundled in linux-tools | standalone (OK) | standalone (OK) | standalone (OK) | MEDIUM |
 | containerd NRI | 1.7+ (OK) | 1.7+ (OK) | EKS-managed (MEDIUM) | 1.7+ (OK) | MEDIUM |
 | iproute2 | 5.15 (OK) | 6.x (OK) | 5.18+ (OK) | 5.18+ (OK) | LOW |
+
+### 5.1 Substrate Kubernetes Version Cross-Check
+
+The table above tracks OS-package drift by hand, each release cycle. It does
+not cover a different, machine-checkable kind of drift: **go.mod's
+`k8s.io/kubernetes` entry silently outrunning what a deploy substrate's own
+pinned Kubernetes version actually serves.**
+
+**Origin incident (2026-09-03):** `go.mod` was bumped to `k8s.io/kubernetes
+v1.35.0`, which builds the scheduler against the `DynamicResourceAllocation`
+API — GA and locked-on (cannot be disabled) as of Kubernetes 1.35.
+`images/kind/Dockerfile` was still pinned to `kindest/node:v1.32.0`, which
+does not serve that API at all. The scheduler binary started and connected
+to the API server normally, then silently never scheduled anything — no
+crash, no error, just a hang. Nothing in the repo cross-checked go.mod's
+floor requirement against any substrate's actual served version, on kind or
+otherwise, so the mismatch shipped undetected until it was hit live.
+
+**The check:** `hack/check-substrate-k8s-versions.sh` (wired into CI as the
+`substrate-version-check` job in `.github/workflows/ci.yaml`, and available
+standalone via `make check-substrate-versions`) parses go.mod's
+`k8s.io/kubernetes` minor version as the floor requirement, then parses each
+substrate's own pinned/documented Kubernetes minor version out of its actual
+config file:
+
+| Substrate | Source of truth |
+|---|---|
+| kind | `images/kind/Dockerfile` — `ARG KIND_BASE=kindest/node:vX.Y.Z` |
+| KVM/RKE2 standing cluster | `hack/kvm-cluster.sh` header doc comment ("Kubernetes vX.Y.x") — RKE2 itself has no static version pin (`RKE2_VERSION` defaults to empty = get.rke2.io's current-stable channel), so the header's documented version of the actually-running standing cluster is this substrate's source of truth |
+| kubeadm-EC2 AMI | `images/capi/packer/kubeadm-ubuntu.pkrvars.hcl` — `kubernetes_version` (the apt package itself has no exact-version pin; this sets the `pkgs.k8s.io` channel minor that package installs pull from) |
+| EKS | `terraform/eks-cluster/variables.tf` — `variable "kubernetes_version" { default = ... }` |
+
+A substrate below go.mod's floor minor is a hard failure (non-zero exit,
+names the substrate, its pinned version, the required floor, and the gap in
+minor versions). A substrate at or above the floor passes — this is a floor
+check, not an exact-match check, so a substrate ahead of go.mod is not
+flagged.
+
+As of this check's introduction, it also caught (beyond the kind incident
+that motivated it) a live, unfixed instance of the same class of gap: EKS's
+terraform default (`kubernetes_version = "1.31"`) and the kubeadm-EC2 AMI's
+packer pin (`kubernetes_version = "1.32"`) are both behind go.mod's v1.35
+floor. Neither has been bumped as of this writing — the check will fail in
+CI until they are.
