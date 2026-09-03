@@ -61,6 +61,8 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/podmotion-io/podmotion/internal/agent/cripaths"
 )
 
 const (
@@ -861,12 +863,29 @@ func doHolderSentinel(containerID string) Response {
 // answer ("what would I open, in a namespace CRIU never enters?").
 const hostMountNsRoot = "/proc/1/root"
 
-// criSandboxDirMarker is the CRI plugin's sandbox subtree, matched as an interior
-// path segment. The containerd ROOT dir it hangs off is discovered at runtime
-// (ADR-0370) and differs per distro (/var/lib/containerd on kubeadm,
+// criDirMarkers are the CRI plugin's on-disk subtrees, matched as INTERIOR path
+// segments. The containerd ROOT dir they hang off is discovered at runtime (ADR-0370)
+// and differs per distro (/var/lib/containerd on kubeadm,
 // /var/lib/rancher/rke2/agent/containerd on RKE2), so the broker — which does not
 // perform that discovery — pins the invariant SUBTREE rather than a full prefix.
-const criSandboxDirMarker = "/io.containerd.grpc.v1.cri/sandboxes/"
+//
+// ADR-0421 D1e: the CLASS LIST is imported from internal/agent/cripaths rather than
+// written out here. This list was a hand-maintained second copy of the agent's, it
+// named only the sandbox subtree, and when ADR-0421 D1 added the per-container subtree
+// to the agent's allowlist this one was not touched — so a legitimate
+// <root>/io.containerd.grpc.v1.cri/containers/<CID>/volumes/<hash> target passed the
+// agent's own check and was then refused HERE as "outside the server-pinned path
+// family", failing every such restore closed. The two bounds remain independent (that
+// is D9's whole design); only their notion of which subtree classes exist is now
+// shared, because their disagreeing about that is never a security property.
+var criDirMarkers = func() []string {
+	rels := cripaths.AllDirRels()
+	out := make([]string, 0, len(rels))
+	for _, rel := range rels {
+		out = append(out, cripaths.Marker(rel))
+	}
+	return out
+}()
 
 // hostRealpathAllowed is the host_realpath op's SERVER-PINNED path family (SC-1).
 // The client never widens it. It is deliberately COARSER than the agent's own
@@ -888,8 +907,11 @@ func hostRealpathAllowed(p string) bool {
 		return true
 	case strings.HasPrefix(p, "/var/lib/podmotion/"):
 		return true
-	case strings.Contains(p, criSandboxDirMarker):
-		return true
+	}
+	for _, marker := range criDirMarkers {
+		if strings.Contains(p, marker) {
+			return true
+		}
 	}
 	return false
 }

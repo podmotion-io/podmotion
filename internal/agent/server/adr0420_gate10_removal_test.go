@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -141,8 +142,20 @@ const adr0420BaseHEAD = "6160038"
 // A token scan is deliberately NOT used here. broker.go already carries pre-existing umount
 // authority for netns bind-path teardown (nsenterHostMntCombined("umount", "-l", bindPath)),
 // which long predates this ADR and is unrelated to the struck D2. What assertion #9 actually
-// forbids is this ADR ADDING a new Op string, dispatch case, or Response field — i.e. any
-// modification to broker.go at all. Diffing is the check that matches the requirement.
+// forbids is a new Op string, dispatch case, or Response field.
+//
+// ADR-0421 D1e NARROWS THIS GUARD from byte-identity to that stated requirement, and the reason
+// is recorded here because silently loosening a security guard is worse than the guard being
+// wrong. The byte-identity form asserted a property of ONE commit ("this ADR did not touch the
+// broker") as a permanent invariant on the file, so it failed on the first legitimate later
+// change to broker.go for any reason at all — including ADR-0421 D1e, which adds the
+// per-container CRI subtree to hostRealpathAllowed's server-pinned path family and adds no op,
+// no dispatch case and no Response field. A guard that must be disabled to make a correct change
+// teaches that guards are obstacles. So the check now compares the broker's PRIVILEGED SURFACE —
+// its dispatch op set and its Response field set — between the base HEAD revision and the
+// working tree, and fails on any ADDITION to either. That is assertion #9's actual content, it
+// still fires on exactly the smuggled-privilege case it was written for, and unlike the diff it
+// keeps firing for every future commit rather than only until the next unrelated edit.
 func TestADR0420_D3_BrokerUntouchedByThisADR(t *testing.T) {
 	root := adr0420RepoRoot(t)
 
@@ -157,16 +170,74 @@ func TestADR0420_D3_BrokerUntouchedByThisADR(t *testing.T) {
 	}
 
 	const brokerRel = "internal/agent/netnsbroker/broker.go"
-	out, err := exec.Command("git", "-C", root, "diff", "--name-only", adr0420BaseHEAD, "--", brokerRel).Output()
+	baseSrc, err := exec.Command("git", "-C", root, "show", adr0420BaseHEAD+":"+brokerRel).Output()
 	if err != nil {
-		t.Fatalf("git diff against %s: %v", adr0420BaseHEAD, err)
+		t.Fatalf("read %s at %s: %v", brokerRel, adr0420BaseHEAD, err)
 	}
-	if strings.TrimSpace(string(out)) != "" {
-		t.Errorf("ADR-0420 assertion #9: %s is MODIFIED relative to base HEAD %s. This ADR strikes "+
-			"D2 in full and adds no broker Op, no dispatch case, and no Response field — the broker "+
-			"must be byte-identical. A privileged unmount surface here would be strictly more "+
-			"destructive than the privileged:true the agent gave up.", brokerRel, adr0420BaseHEAD)
+	headSrc, err := os.ReadFile(filepath.Join(root, brokerRel))
+	if err != nil {
+		t.Fatalf("read working-tree %s: %v", brokerRel, err)
 	}
+
+	for _, surface := range []struct {
+		name string
+		of   func(string) map[string]bool
+		why  string
+	}{
+		{
+			name: "dispatch op",
+			of:   adr0420BrokerDispatchOps,
+			why: "a new op is a new privileged operation the de-privileged agent can invoke; " +
+				"a privileged unmount surface here would be strictly more destructive than the " +
+				"privileged:true the agent gave up",
+		},
+		{
+			name: "Response field",
+			of:   adr0420BrokerResponseFields,
+			why:  "a new response field is a new channel for privileged state to leave the broker",
+		},
+	} {
+		base, head := surface.of(string(baseSrc)), surface.of(string(headSrc))
+		if len(base) == 0 {
+			t.Fatalf("extracted zero %ss from the base revision of %s — the guard is not "+
+				"observing what it claims to observe", surface.name, brokerRel)
+		}
+		for name := range head {
+			if !base[name] {
+				t.Errorf("ADR-0420 assertion #9: %s adds %s %q relative to base HEAD %s — %s",
+					brokerRel, surface.name, name, adr0420BaseHEAD, surface.why)
+			}
+		}
+	}
+}
+
+// adr0420BrokerDispatchOps extracts the set of op strings the broker's request dispatch accepts,
+// as `case "<op>":` labels. Ops are lower_snake_case by convention, which keeps this from
+// matching unrelated string switches elsewhere in the file.
+func adr0420BrokerDispatchOps(src string) map[string]bool {
+	return adr0420MatchSet(src, regexp.MustCompile(`(?m)^\s*case "([a-z][a-z0-9_]*)":`))
+}
+
+// adr0420BrokerResponseFields extracts the exported field names of the broker's Response struct.
+func adr0420BrokerResponseFields(src string) map[string]bool {
+	const marker = "type Response struct {"
+	i := strings.Index(src, marker)
+	if i < 0 {
+		return nil
+	}
+	body := src[i+len(marker):]
+	if j := strings.Index(body, "\n}"); j >= 0 {
+		body = body[:j]
+	}
+	return adr0420MatchSet(body, regexp.MustCompile(`(?m)^\t([A-Z][A-Za-z0-9]*)\s+\S`))
+}
+
+func adr0420MatchSet(src string, re *regexp.Regexp) map[string]bool {
+	out := map[string]bool{}
+	for _, m := range re.FindAllStringSubmatch(src, -1) {
+		out[m[1]] = true
+	}
+	return out
 }
 
 // TestADR0420_D3_SharedHelpersSurviveDeletion is the other half of ADR-0420 assertion #8. ctrArgs and nsenterCmd were CALLED by the deleted block but are not owned by it

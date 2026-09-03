@@ -47,6 +47,7 @@ import (
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	"github.com/podmotion-io/podmotion/internal/agent/authz"
+	"github.com/podmotion-io/podmotion/internal/agent/cripaths"
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
 	"github.com/podmotion-io/podmotion/internal/agent/grpclimits"
 	"github.com/podmotion-io/podmotion/internal/agent/netnsbroker"
@@ -1656,10 +1657,14 @@ func allowedExtMountHostTargetPrefixes(ctx context.Context) []string {
 		if root == "" {
 			continue
 		}
-		prefixes = append(prefixes,
-			filepath.Join(root, criSandboxDirRel)+"/",
-			filepath.Join(root, criContainersDirRel)+"/",
-		)
+		// ADR-0421 D1e: iterate the SHARED class list rather than naming the two segments here.
+		// The netns-broker's server-pinned path family (ADR-0419 D9) is a second, independent
+		// confinement bound over the same classes; enumerating them in two places is what let D1
+		// widen this bound and silently leave that one behind. A fifth writer class added to
+		// internal/agent/cripaths now reaches both bounds without editing either.
+		for _, rel := range cripaths.AllDirRels() {
+			prefixes = append(prefixes, filepath.Join(root, rel)+"/")
+		}
 	}
 	return prefixes
 }

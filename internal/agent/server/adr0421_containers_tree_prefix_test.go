@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/podmotion-io/podmotion/internal/agent/cripaths"
 )
 
 // ADR-0421 D3 items 1-3 — the D1 pins.
@@ -72,20 +74,20 @@ func TestADR0421_D3Item1_ContainersTreePrefixShape(t *testing.T) {
 			// (a) exactly one containers-tree prefix per DISTINCT non-empty root, and it is the
 			// documented relative segment joined onto that root.
 			for _, root := range tc.wantContainersPrefixesUnder {
-				want := filepath.Join(root, criContainersDirRel) + "/"
+				want := filepath.Join(root, cripaths.ContainersDirRel) + "/"
 				if !containsString(got, want) {
 					t.Fatalf("missing containers-tree prefix %q for root %q; got %v", want, root, got)
 				}
 				// (b) it is a STRICT SUBTREE prefix, never the bare root. This is the assertion
 				// that fails if a future edit "simplifies" D1 to the containerd root dir.
-				if want == root+"/" || !strings.Contains(want, criContainersDirRel) {
+				if want == root+"/" || !strings.Contains(want, cripaths.ContainersDirRel) {
 					t.Fatalf("containers-tree prefix %q is not a strict subtree of root %q", want, root)
 				}
 			}
 
 			// (c) the sandbox class is untouched — D1 ADDS a class, it does not replace one.
 			for _, root := range tc.wantContainersPrefixesUnder {
-				want := filepath.Join(root, criSandboxDirRel) + "/"
+				want := filepath.Join(root, cripaths.SandboxDirRel) + "/"
 				if !containsString(got, want) {
 					t.Fatalf("D1 must not disturb the sandbox class: missing %q; got %v", want, got)
 				}
@@ -94,7 +96,7 @@ func TestADR0421_D3Item1_ContainersTreePrefixShape(t *testing.T) {
 			// (d) an empty root contributes NOTHING — not a bare "/", not a rootless
 			// "io.containerd.grpc.v1.cri/containers/".
 			for _, p := range got {
-				if p == "/" || strings.HasPrefix(p, criContainersDirRel) {
+				if p == "/" || strings.HasPrefix(p, cripaths.ContainersDirRel) {
 					t.Fatalf("empty root leaked a degenerate prefix %q; got %v", p, got)
 				}
 			}
@@ -153,10 +155,10 @@ func TestADR0421_D3Item3_NegativeConfinement(t *testing.T) {
 		defer func() { hostRealpathFn = origRealpath }()
 
 		for _, target := range []string{
-			root + "/io.containerd.grpc.v1.cri",              // bare CRI dir
-			root + "/io.containerd.grpc.v1.cri/containers",   // bare containers dir, no trailing sep
-			root,                                             // bare containerd root
-			root + "/io.containerd.content.v1.content/blobs", // the content store
+			root + "/io.containerd.grpc.v1.cri",            // bare CRI dir
+			root + "/io.containerd.grpc.v1.cri/containers", // bare containers dir, no trailing sep
+			root, // bare containerd root
+			root + "/io.containerd.content.v1.content/blobs",              // the content store
 			root + "/io.containerd.snapshotter.v1.overlayfs/snapshots/42", // the snapshotter tree
 			"/etc/shadow",
 		} {
