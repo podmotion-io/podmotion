@@ -111,3 +111,55 @@ func TestADR0421_SharedClassListIsNotWritableByConsumers(t *testing.T) {
 		t.Fatal("AllDirRels returned aliased backing storage — a consumer can widen the shared class list")
 	}
 }
+
+// TestADR0421_BrokerMarkerListIsExactlyTheSharedClassList holds, on the broker's own derived copy,
+// the property the test above holds on the shared source.
+//
+// D1e demoted criDirMarkers from an immutable `const` block to a package-level `var` initialized by
+// a func literal, because the list is now DERIVED from cripaths.AllDirRels() and Go has no
+// immutable slice — there is no `const []string`, and an array var is no less writable, so no purely
+// syntactic form restores the guarantee `const` gave. The reachable widening is therefore narrower
+// than before but not zero: cripaths itself is safe (AllDirRels hands back a fresh slice, pinned
+// above), and criDirMarkers is unexported so no importer can touch it, which leaves in-package code
+// appending to it — at init, or from any function in this package — as the one remaining path.
+//
+// This closes that path by pinning the CONTENT rather than the storage class: criDirMarkers must be
+// exactly the marker of every shared class, no more and no fewer. Package-level var initialization
+// completes before any test runs, so an `init()` or initializer that appends an extra subtree is
+// observed here as a surplus entry. An entry added by hand — the exact regression D1e existed to
+// prevent, a second hand-maintained copy drifting from the agent's list — fails the same way. The
+// guard admits any legitimate change to the shared list automatically, since both sides of the
+// comparison move together; only a broker-local widening fails.
+func TestADR0421_BrokerMarkerListIsExactlyTheSharedClassList(t *testing.T) {
+	want := map[string]bool{}
+	for _, rel := range cripaths.AllDirRels() {
+		want[cripaths.Marker(rel)] = true
+	}
+
+	got := map[string]bool{}
+	for _, m := range criDirMarkers {
+		got[m] = true
+	}
+
+	// Length is compared on the slice, not the set, so a duplicated entry is a failure too.
+	if len(criDirMarkers) != len(want) {
+		t.Errorf("criDirMarkers has %d entries (%d distinct); the shared class list yields %d — "+
+			"the broker's copy has been widened locally instead of derived (ADR-0421 D1e): %v",
+			len(criDirMarkers), len(got), len(want), criDirMarkers)
+	}
+	for m := range got {
+		if !want[m] {
+			t.Errorf("criDirMarkers admits %q, which no shared CRI class yields — an in-package "+
+				"widening of the broker's server-pinned path family. Every marker must come from "+
+				"cripaths.AllDirRels(), so the two confinement bounds cannot disagree about which "+
+				"subtree classes exist.", m)
+		}
+	}
+	for m := range want {
+		if !got[m] {
+			t.Errorf("criDirMarkers is MISSING %q, which the shared class list yields — the broker "+
+				"will refuse a target the agent's allowlist emits, failing that restore closed "+
+				"(the exact D1e desync).", m)
+		}
+	}
+}
