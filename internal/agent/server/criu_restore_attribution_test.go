@@ -137,7 +137,7 @@ func TestCriuRestoreFailureCause_DemotionIsNeverSilent(t *testing.T) {
 	if !strings.Contains(out, "sk-inet.c:1059") {
 		t.Fatalf("envelope text must name the later real match as the cause; got:\n%s", out)
 	}
-	if !strings.Contains(out, "total \"Error (criu/\" lines found in restore.log: 3") {
+	if !strings.Contains(out, "total \"Error (criu/ or soccr/)\" lines found in restore.log: 3") {
 		t.Fatalf("envelope text must report the total match count; got:\n%s", out)
 	}
 }

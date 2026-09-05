@@ -118,7 +118,7 @@ func TestFinalizeRestore_SandboxNetnsStrictDoesNotFailClosed(t *testing.T) {
 	storeResolvedNetnsPath(migration, "/var/run/netns/cni-e2e", "eth0")
 
 	netnsPath, ifname := s.finalizeNetnsPath(migration)
-	fr, err := s.finalizeRestore(context.Background(), 4242, netnsPath, ifname, migration, "", "Strict", "")
+	fr, err := s.finalizeRestore(context.Background(), 4242, netnsPath, ifname, migration, "", "Strict", "", "")
 	if err != nil {
 		t.Fatalf("finalizeRestore [Strict] fail-closed on a pod-sandbox-netns restore: %v — "+
 			"this is the sprint46 cycle-2 regression (ifname resolved to %q instead of eth0)", err, ifname)
@@ -142,7 +142,7 @@ func TestFinalizeRestore_PassesIfnameToMACRead(t *testing.T) {
 
 	s := New("test-node", &criu.StubCheckpointer{}, nil)
 	if _, err := s.finalizeRestore(context.Background(), 12345, "/run/podmotion/netns/pm-mig-x/bind",
-		network.MigrationVethPeer, "redis-live-migration", "", "Strict", ""); err != nil {
+		network.MigrationVethPeer, "redis-live-migration", "", "Strict", "", ""); err != nil {
 		t.Fatalf("finalizeRestore returned unexpected error: %v", err)
 	}
 	if gotIfname != network.MigrationVethPeer {
@@ -211,7 +211,7 @@ func TestFinalizeRestore_WriteBack_CaptureLatchesValue_NoReReadOnReinvocation(t 
 	// Two finalizes (models the idempotent-confirm re-invocations of the gRPC Restore RPC): each
 	// serves the latched VALUE with NO kernel read (the spy fails any read after the capture).
 	for i := 1; i <= 2; i++ {
-		fr, err := s.finalizeRestore(context.Background(), 7777, netnsPath, ifname, migration, "", "Strict", "")
+		fr, err := s.finalizeRestore(context.Background(), 7777, netnsPath, ifname, migration, "", "Strict", "", "")
 		if err != nil {
 			t.Fatalf("finalizeRestore #%d re-read the recorded path instead of serving the latched value: %v", i, err)
 		}

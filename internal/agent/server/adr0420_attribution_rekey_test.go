@@ -103,7 +103,7 @@ func TestADR0420_D5_DeviceOrResourceBusyIsNeverACause(t *testing.T) {
 	// forbids silent demotion), so the assertion is on the attribution sentence, not on the string's
 	// presence anywhere in the envelope.
 	for _, causeClaim := range []string{
-		"first causal error (earliest \"Error (criu/\" line in restore.log): (00.032011)",
+		"first causal error (earliest \"Error (criu/\" or \"Error (soccr/\" line in restore.log): (00.032011)",
 		"ADR-0420 D5 attributed cause (CRIU's fstype->restore fails SILENTLY, so this class has no \"Error (criu/\" line to find): CRIU could not construct a mount",
 	} {
 		if strings.Contains(envelope, causeClaim) {

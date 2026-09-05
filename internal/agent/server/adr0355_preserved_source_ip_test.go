@@ -338,14 +338,14 @@ func TestFinalizeRestore_D4_LivenessAndFailClosed(t *testing.T) {
 		var gotNS string
 		var invoked bool
 		orig := singleHomeRestoredPodFn
-		singleHomeRestoredPodFn = func(_ *AgentServer, _ context.Context, _, namespace string, _ int) error {
+		singleHomeRestoredPodFn = func(_ *AgentServer, _ context.Context, _, namespace string, _ int, _ string) error {
 			invoked = true
 			gotNS = namespace
 			return nil
 		}
 		defer func() { singleHomeRestoredPodFn = orig }()
 
-		fr, err := s.finalizeRestore(context.Background(), 4242, "", "eth0", migration, "", "None", writeCheckpointWithTCP(t, false))
+		fr, err := s.finalizeRestore(context.Background(), 4242, "", "eth0", migration, "", "None", writeCheckpointWithTCP(t, false), "")
 		if err != nil {
 			t.Fatalf("finalizeRestore returned error: %v", err)
 		}
@@ -365,12 +365,12 @@ func TestFinalizeRestore_D4_LivenessAndFailClosed(t *testing.T) {
 		const migration = "adr0355-failclosed-estab"
 		s := newServerWithPM(t, migration)
 		orig := singleHomeRestoredPodFn
-		singleHomeRestoredPodFn = func(_ *AgentServer, _ context.Context, _, _ string, _ int) error {
+		singleHomeRestoredPodFn = func(_ *AgentServer, _ context.Context, _, _ string, _ int, _ string) error {
 			return errors.New("backfill failed")
 		}
 		defer func() { singleHomeRestoredPodFn = orig }()
 
-		_, err := s.finalizeRestore(context.Background(), 4242, "", "eth0", migration, "", "None", writeCheckpointWithTCP(t, true))
+		_, err := s.finalizeRestore(context.Background(), 4242, "", "eth0", migration, "", "None", writeCheckpointWithTCP(t, true), "")
 		if err == nil {
 			t.Fatal("expected finalizeRestore to FAIL CLOSED on an established-TCP backfill error (DR-14), got nil — the deferred SIGCONT would resume onto the non-routable /32")
 		}
@@ -381,12 +381,12 @@ func TestFinalizeRestore_D4_LivenessAndFailClosed(t *testing.T) {
 		const migration = "adr0355-nonfatal"
 		s := newServerWithPM(t, migration)
 		orig := singleHomeRestoredPodFn
-		singleHomeRestoredPodFn = func(_ *AgentServer, _ context.Context, _, _ string, _ int) error {
+		singleHomeRestoredPodFn = func(_ *AgentServer, _ context.Context, _, _ string, _ int, _ string) error {
 			return errors.New("backfill failed")
 		}
 		defer func() { singleHomeRestoredPodFn = orig }()
 
-		if _, err := s.finalizeRestore(context.Background(), 4242, "", "eth0", migration, "", "None", writeCheckpointWithTCP(t, false)); err != nil {
+		if _, err := s.finalizeRestore(context.Background(), 4242, "", "eth0", migration, "", "None", writeCheckpointWithTCP(t, false), ""); err != nil {
 			t.Fatalf("non-established-TCP backfill error must be non-fatal, got %v", err)
 		}
 	})
@@ -398,13 +398,13 @@ func TestFinalizeRestore_D4_LivenessAndFailClosed(t *testing.T) {
 		s := New("test-node", &criu.StubCheckpointer{}, cl)
 		var invoked bool
 		orig := singleHomeRestoredPodFn
-		singleHomeRestoredPodFn = func(_ *AgentServer, _ context.Context, _, _ string, _ int) error {
+		singleHomeRestoredPodFn = func(_ *AgentServer, _ context.Context, _, _ string, _ int, _ string) error {
 			invoked = true
 			return nil
 		}
 		defer func() { singleHomeRestoredPodFn = orig }()
 
-		_, err := s.finalizeRestore(context.Background(), 4242, "", "eth0", migration, "", "None", writeCheckpointWithTCP(t, true))
+		_, err := s.finalizeRestore(context.Background(), 4242, "", "eth0", migration, "", "None", writeCheckpointWithTCP(t, true), "")
 		if err == nil {
 			t.Fatal("expected fail-closed on unresolved namespace + established TCP (DR-14), got nil")
 		}
@@ -464,11 +464,14 @@ func argvHas(argv []string, want string) bool {
 
 // fakeEth0Broker is a stateful stand-in for brokerNetnsExecFn that models eth0's IPv4 address set the
 // way iproute2 would, so SingleHomeRestoredPod's strip/add/verify sequence runs end-to-end without a
-// real netns broker. It records `ip addr add`/`ip addr del` CIDRs for assertions.
+// real netns broker. It records `ip addr add`/`ip addr del` CIDRs for assertions, and every
+// `ip route ...` invocation verbatim (argv joined with spaces) in routeCalls so gateway/route-CIDR
+// keying can be asserted directly instead of only inferred from address add/delete calls.
 type fakeEth0Broker struct {
-	addrs    []eth0Addr
-	addCalls []string
-	delCalls []string
+	addrs      []eth0Addr
+	addCalls   []string
+	delCalls   []string
+	routeCalls []string
 }
 
 func (f *fakeEth0Broker) exec(_ context.Context, _ int, _ string, argv ...string) netnsbroker.ExecResult {
@@ -499,7 +502,10 @@ func (f *fakeEth0Broker) exec(_ context.Context, _ int, _ string, argv ...string
 		}
 		f.addrs = kept
 		return netnsbroker.ExecResult{ExitCode: 0}
-	default: // `ip route ...` and anything else — succeed, no address-set effect
+	case argvHas(argv, "route"):
+		f.routeCalls = append(f.routeCalls, strings.Join(argv, " "))
+		return netnsbroker.ExecResult{ExitCode: 0}
+	default: // anything else — succeed, no address-set effect
 		return netnsbroker.ExecResult{ExitCode: 0}
 	}
 }
@@ -528,7 +534,7 @@ func TestSingleHomeRestoredPod_D4_ScopeAwareBackfill(t *testing.T) {
 		brokerNetnsExecFn = fk.exec
 		defer func() { brokerNetnsExecFn = orig }()
 
-		if err := s.SingleHomeRestoredPod(context.Background(), migration, "podmotion-test", 4242); err != nil {
+		if err := s.SingleHomeRestoredPod(context.Background(), migration, "podmotion-test", 4242, ""); err != nil {
 			t.Fatalf("SingleHomeRestoredPod returned error: %v", err)
 		}
 		if len(fk.delCalls) != 0 {
@@ -553,7 +559,7 @@ func TestSingleHomeRestoredPod_D4_ScopeAwareBackfill(t *testing.T) {
 		brokerNetnsExecFn = fk.exec
 		defer func() { brokerNetnsExecFn = orig }()
 
-		if err := s.SingleHomeRestoredPod(context.Background(), migration, "podmotion-test", 4242); err != nil {
+		if err := s.SingleHomeRestoredPod(context.Background(), migration, "podmotion-test", 4242, ""); err != nil {
 			t.Fatalf("SingleHomeRestoredPod returned error: %v", err)
 		}
 		if containsStr(fk.addCalls, oldIP+"/24") {
