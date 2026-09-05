@@ -34,6 +34,7 @@ KVM_DIR="${KVM_DIR:-$HOME/podmotion-kvm}"
 SSH_KEY="${SSH_KEY:-$KVM_DIR/id_pmkvm}"
 HOSTS_ENV="${HOSTS_ENV:-$KVM_DIR/hosts.env}"
 KUBECONFIG_OUT="${KUBECONFIG_OUT:-$KVM_DIR/kubeconfig}"
+KVM_CONTEXT="${KVM_CONTEXT:-default}"          # standing KVM cluster's kubeconfig context — pin explicitly so a drifted current-context (e.g. a stray kind context) never silently redirects cluster-mutating commands
 SSH_USER="${SSH_USER:-chad}"
 POD_CIDR="10.244.0.0/16"
 FLANNEL_MANIFEST="images/kind/kube-flannel-v0.25.4.yml"   # repo-vendored (CLAUDE.md)
@@ -321,9 +322,9 @@ require_local_sudo() {
 cmd_verify() {
   load_ips
   echo "==> Verifying KVM kubeadm cluster (control-plane $CP1_IP)..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl get nodes -o wide
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" get nodes -o wide
   local ready
-  ready="$(KUBECONFIG="$KUBECONFIG_OUT" kubectl get nodes --no-headers 2>/dev/null | grep -cw Ready || true)"
+  ready="$(KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" get nodes --no-headers 2>/dev/null | grep -cw Ready || true)"
   if [[ "$ready" -lt 3 ]]; then
     echo "ERROR: expected 3 Ready nodes, found $ready." >&2
     exit 1
@@ -443,7 +444,7 @@ cmd_reset_cluster() {
   chmod 600 "$KUBECONFIG_OUT"
 
   echo "==> Waiting for 3 nodes Ready..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl wait --for=condition=Ready nodes --all --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" wait --for=condition=Ready nodes --all --timeout=180s
   cmd_verify
 }
 
@@ -562,7 +563,7 @@ cmd_reset_cluster_k3s() {
   chmod 600 "$KUBECONFIG_OUT"
 
   echo "==> Waiting for 3 nodes Ready..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl wait --for=condition=Ready nodes --all --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" wait --for=condition=Ready nodes --all --timeout=180s
   cmd_verify
 
   echo "==> reset-cluster-k3s complete."
@@ -713,7 +714,7 @@ token: $rke2_token"
   chmod 600 "$KUBECONFIG_OUT"
 
   echo "==> Waiting for 3 nodes Ready..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl wait --for=condition=Ready nodes --all --timeout=300s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" wait --for=condition=Ready nodes --all --timeout=300s
   cmd_verify
 
   echo "==> reset-cluster-rke2 complete."
@@ -921,17 +922,17 @@ cmd_deploy_podmotion() {
   done
 
   echo "==> Applying CRDs (chart crds/ is empty — apply manually)..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl apply -f config/crd/bases/
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" apply -f config/crd/bases/
 
   echo "==> Ensuring podmotion-system namespace..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl create namespace podmotion-system \
-    --dry-run=client -o yaml | KUBECONFIG="$KUBECONFIG_OUT" kubectl apply -f -
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" create namespace podmotion-system \
+    --dry-run=client -o yaml | KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" apply -f -
 
   echo "==> Minting operator<->agent mTLS secrets (certManager disabled)..."
   KUBECONFIG="$KUBECONFIG_OUT" make agent-certs-dev
 
   echo "==> Helm install..."
-  KUBECONFIG="$KUBECONFIG_OUT" helm upgrade --install podmotion charts/podmotion/ \
+  KUBECONFIG="$KUBECONFIG_OUT" helm --kube-context="$KVM_CONTEXT" upgrade --install podmotion charts/podmotion/ \
     --namespace podmotion-system --create-namespace \
     --set operator.image.repository=podmotion-operator --set operator.image.tag="$TAG" --set operator.image.pullPolicy=IfNotPresent \
     --set agent.image.repository=podmotion-agent --set agent.image.tag="$TAG" --set agent.image.pullPolicy=IfNotPresent \
@@ -956,12 +957,12 @@ cmd_deploy_podmotion() {
   # produce fresh pods, not just a "diff detected" one (confirmed live
   # 2026-07-14 as the root cause of a stale-binary false-negative gate).
   echo "==> Forcing rollout restart (same-tag deploys are otherwise a silent no-op)..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system rollout restart deploy/podmotion-operator ds/podmotion-agent deploy/podmotion-scheduler
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n podmotion-system rollout restart deploy/podmotion-operator ds/podmotion-agent deploy/podmotion-scheduler
 
   echo "==> Waiting for rollout (failure/timeout is a real error, not swallowed)..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system rollout status deploy/podmotion-operator --timeout=180s
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system rollout status ds/podmotion-agent --timeout=180s
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system rollout status deploy/podmotion-scheduler --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n podmotion-system rollout status deploy/podmotion-operator --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n podmotion-system rollout status ds/podmotion-agent --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n podmotion-system rollout status deploy/podmotion-scheduler --timeout=180s
 
   # ── §2.2 deploy-time provenance ──────────────────────────────────────────────
   # Make provenance queryable from the cluster itself, not just from whoever ran the deploy:
@@ -969,11 +970,11 @@ cmd_deploy_podmotion() {
   # and write the same tuple (plus each image's local digest) to deploy-manifest.json
   # alongside the kubeconfig, so a fresh session/orchestrator can read it without re-deploying.
   echo "==> Stamping deploy provenance (podmotion.io/deployed-revision, podmotion.io/deployed-branch)..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system annotate deploy/podmotion-operator \
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n podmotion-system annotate deploy/podmotion-operator \
     "podmotion.io/deployed-revision=$GIT_SHA" "podmotion.io/deployed-branch=$GIT_BRANCH" --overwrite
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system annotate ds/podmotion-agent \
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n podmotion-system annotate ds/podmotion-agent \
     "podmotion.io/deployed-revision=$GIT_SHA" "podmotion.io/deployed-branch=$GIT_BRANCH" --overwrite
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system annotate deploy/podmotion-scheduler \
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n podmotion-system annotate deploy/podmotion-scheduler \
     "podmotion.io/deployed-revision=$GIT_SHA" "podmotion.io/deployed-branch=$GIT_BRANCH" --overwrite
 
   local op_digest agent_digest scheduler_digest
@@ -1086,7 +1087,7 @@ cmd_deploy_podmotion_demo() {
   done
 
   echo "==> [podmotion-demo] Helm upgrade --install (standalone release, namespace $PODMOTION_DEMO_NAMESPACE)..."
-  KUBECONFIG="$KUBECONFIG_OUT" helm upgrade --install podmotion-demo charts/podmotion-demo \
+  KUBECONFIG="$KUBECONFIG_OUT" helm --kube-context="$KVM_CONTEXT" upgrade --install podmotion-demo charts/podmotion-demo \
     --namespace "$PODMOTION_DEMO_NAMESPACE" --create-namespace \
     --set enabled=true \
     --set web.image.repository=podmotion-demo-web --set web.image.tag="$TAG" --set web.image.pullPolicy=IfNotPresent \
@@ -1098,14 +1099,14 @@ cmd_deploy_podmotion_demo() {
   # actually rebuilds every call); postgres/redis/jaeger use fixed upstream
   # tags and don't need churning on every re-run.
   echo "==> [podmotion-demo] Forcing rollout restart of web+api (same-tag deploys are otherwise a silent no-op)..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$PODMOTION_DEMO_NAMESPACE" rollout restart deploy/podmotion-demo-web deploy/podmotion-demo-api
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$PODMOTION_DEMO_NAMESPACE" rollout restart deploy/podmotion-demo-web deploy/podmotion-demo-api
 
   echo "==> [podmotion-demo] Waiting for rollout (failure/timeout is a real error, not swallowed)..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$PODMOTION_DEMO_NAMESPACE" rollout status deploy/podmotion-demo-web --timeout=180s
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$PODMOTION_DEMO_NAMESPACE" rollout status deploy/podmotion-demo-api --timeout=180s
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$PODMOTION_DEMO_NAMESPACE" rollout status deploy/podmotion-demo-postgres --timeout=180s
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$PODMOTION_DEMO_NAMESPACE" rollout status deploy/podmotion-demo-redis --timeout=180s
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$PODMOTION_DEMO_NAMESPACE" rollout status deploy/podmotion-demo-jaeger --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$PODMOTION_DEMO_NAMESPACE" rollout status deploy/podmotion-demo-web --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$PODMOTION_DEMO_NAMESPACE" rollout status deploy/podmotion-demo-api --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$PODMOTION_DEMO_NAMESPACE" rollout status deploy/podmotion-demo-postgres --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$PODMOTION_DEMO_NAMESPACE" rollout status deploy/podmotion-demo-redis --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$PODMOTION_DEMO_NAMESPACE" rollout status deploy/podmotion-demo-jaeger --timeout=180s
 
   # ── Local access: always via the idempotent helper, never a hand-typed
   # `kubectl port-forward` ────────────────────────────────────────────────
@@ -1168,7 +1169,7 @@ cmd_deploy_migration_demo() {
 
   if [[ -z "${MIGRATION_DEMO_STORAGE_CLASS:-}" ]]; then
     local default_sc
-    default_sc="$(KUBECONFIG="$KUBECONFIG_OUT" kubectl get storageclass \
+    default_sc="$(KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" get storageclass \
       -o jsonpath='{.items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")].metadata.name}' 2>/dev/null || true)"
     if [[ -z "$default_sc" ]]; then
       echo "ERROR: deploy-migration-demo-stack: no default StorageClass found in the cluster — migration-demo-stack's postgres PVC (values.yaml storageClassName: \"\") needs one to bind, and would otherwise hang Pending silently." >&2
@@ -1200,20 +1201,20 @@ cmd_deploy_migration_demo() {
   done
 
   echo "==> [migration-demo-stack] Helm upgrade --install (standalone chart+release, namespace $MIGRATION_DEMO_NAMESPACE)..."
-  KUBECONFIG="$KUBECONFIG_OUT" helm upgrade --install migration-demo "$MIGRATION_DEMO_REPO/charts/migration-demo-stack" \
+  KUBECONFIG="$KUBECONFIG_OUT" helm --kube-context="$KVM_CONTEXT" upgrade --install migration-demo "$MIGRATION_DEMO_REPO/charts/migration-demo-stack" \
     --namespace "$MIGRATION_DEMO_NAMESPACE" --create-namespace \
     --set web.nginx.image.repository=migration-demo-web --set web.nginx.image.tag="$TAG" --set web.nginx.image.pullPolicy=IfNotPresent \
     --set web.app.image.repository=migration-demo-backend --set web.app.image.tag="$TAG" --set web.app.image.pullPolicy=IfNotPresent \
     ${MIGRATION_DEMO_STORAGE_CLASS:+--set postgres.persistence.storageClassName="$MIGRATION_DEMO_STORAGE_CLASS"}
 
   echo "==> [migration-demo-stack] Forcing rollout restart of web (same-tag deploys are otherwise a silent no-op; redis/postgres use fixed upstream images and don't need churning)..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$MIGRATION_DEMO_NAMESPACE" rollout restart deploy/migration-demo-web
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$MIGRATION_DEMO_NAMESPACE" rollout restart deploy/migration-demo-web
 
   echo "==> [migration-demo-stack] Waiting for rollout (failure/timeout is a real error, not swallowed)..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$MIGRATION_DEMO_NAMESPACE" rollout status deploy/migration-demo-web --timeout=180s
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$MIGRATION_DEMO_NAMESPACE" rollout status deploy/migration-demo-redis --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$MIGRATION_DEMO_NAMESPACE" rollout status deploy/migration-demo-web --timeout=180s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$MIGRATION_DEMO_NAMESPACE" rollout status deploy/migration-demo-redis --timeout=180s
   echo "  -- waiting for postgres (PVC bind can take longer than redis/web)..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$MIGRATION_DEMO_NAMESPACE" rollout status deploy/migration-demo-postgres --timeout=240s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$MIGRATION_DEMO_NAMESPACE" rollout status deploy/migration-demo-postgres --timeout=240s
 
   echo "==> [migration-demo-stack] Ready. Access:"
   echo "      kubectl port-forward -n $MIGRATION_DEMO_NAMESPACE svc/migration-demo-web 8080:8080   # -> http://localhost:8080 (basic auth user 'demo', default password 'migration-demo')"
@@ -1265,7 +1266,7 @@ cmd_verify_deployed_revision() {
   fi
 
   local got_sha
-  got_sha="$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n podmotion-system get deploy/podmotion-operator \
+  got_sha="$(KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n podmotion-system get deploy/podmotion-operator \
     -o jsonpath='{.metadata.annotations.podmotion\.io/deployed-revision}' 2>/dev/null || echo "")"
   if [[ -z "$got_sha" ]]; then
     echo "ERROR: verify-deployed-revision: live operator Deployment has no podmotion.io/deployed-revision annotation — it was deployed by a version of this script predating the provenance gate, or deploy-podmotion has never run against this cluster. Re-run 'deploy-podmotion'." >&2
@@ -1284,9 +1285,9 @@ cmd_wipe() {
   load_ips
   echo "==> WIPE: removing PodMotion + migration state (VMs persist)..."
   # In-cluster: uninstall helm release, delete PodMigration CRs, namespace.
-  KUBECONFIG="$KUBECONFIG_OUT" helm uninstall podmotion -n podmotion-system 2>/dev/null || true
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl delete podmigrations.podmotion.io --all -A 2>/dev/null || true
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl delete ns podmotion-system 2>/dev/null || true
+  KUBECONFIG="$KUBECONFIG_OUT" helm --kube-context="$KVM_CONTEXT" uninstall podmotion -n podmotion-system 2>/dev/null || true
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" delete podmigrations.podmotion.io --all -A 2>/dev/null || true
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" delete ns podmotion-system 2>/dev/null || true
 
   # Demo/test apps wired into the standard deploy flow (cmd_deploy_demo_apps)
   # are their own standalone releases in their own namespaces (see
@@ -1295,10 +1296,10 @@ cmd_wipe() {
   # so a wipe leaves no PodMotion-adjacent state behind, matching this
   # command's existing "state on the VMs, not the VMs" contract.
   echo "==> WIPE: removing demo/test app releases (podmotion-demo, migration-demo)..."
-  KUBECONFIG="$KUBECONFIG_OUT" helm uninstall podmotion-demo -n "$PODMOTION_DEMO_NAMESPACE" 2>/dev/null || true
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl delete ns "$PODMOTION_DEMO_NAMESPACE" 2>/dev/null || true
-  KUBECONFIG="$KUBECONFIG_OUT" helm uninstall migration-demo -n "$MIGRATION_DEMO_NAMESPACE" 2>/dev/null || true
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl delete ns "$MIGRATION_DEMO_NAMESPACE" 2>/dev/null || true
+  KUBECONFIG="$KUBECONFIG_OUT" helm --kube-context="$KVM_CONTEXT" uninstall podmotion-demo -n "$PODMOTION_DEMO_NAMESPACE" 2>/dev/null || true
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" delete ns "$PODMOTION_DEMO_NAMESPACE" 2>/dev/null || true
+  KUBECONFIG="$KUBECONFIG_OUT" helm --kube-context="$KVM_CONTEXT" uninstall migration-demo -n "$MIGRATION_DEMO_NAMESPACE" 2>/dev/null || true
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" delete ns "$MIGRATION_DEMO_NAMESPACE" 2>/dev/null || true
 
   # On each VM: clear checkpoint tmpfs debris + wrapper install (datapath artifact
   # cleanup only — never touch the VM definition, disks, or the base OS).
@@ -1346,7 +1347,7 @@ cmd_provision_shared_storage() {
   helm repo add nfs-subdir-external-provisioner \
     https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ >/dev/null 2>&1 || true
   helm repo update nfs-subdir-external-provisioner >/dev/null 2>&1 || true
-  KUBECONFIG="$KUBECONFIG_OUT" helm upgrade --install nfs-subdir-external-provisioner \
+  KUBECONFIG="$KUBECONFIG_OUT" helm --kube-context="$KVM_CONTEXT" upgrade --install nfs-subdir-external-provisioner \
     nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
     --namespace "$NFS_PROVISIONER_NS" --create-namespace \
     --set nfs.server="$NFS_SERVER_IP" \
@@ -1358,7 +1359,7 @@ cmd_provision_shared_storage() {
     --set storageClass.archiveOnDelete=true \
     --set image.repository=registry.k8s.io/sig-storage/nfs-subdir-external-provisioner \
     --set image.tag="$NFS_PROVISIONER_IMG_TAG"
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$NFS_PROVISIONER_NS" rollout status \
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$NFS_PROVISIONER_NS" rollout status \
     deploy/nfs-subdir-external-provisioner --timeout=120s
   echo "==> Shared storage ready. Workloads use an RWX PVC on storageClassName: $NFS_STORAGE_CLASS"
 }
@@ -1416,8 +1417,8 @@ REMOTE
   done
 
   echo "==> [4/5] Install Longhorn $LH_VERSION and wait for pods Ready..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl apply -f "$LH_MANIFEST"
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" rollout status ds/longhorn-manager --timeout=300s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" apply -f "$LH_MANIFEST"
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$LH_NAMESPACE" rollout status ds/longhorn-manager --timeout=300s
   # Let Longhorn also use the control-plane node's disk: tolerate the cp taint and
   # add the toleration to the longhorn-manager DaemonSet (the setting alone does not
   # patch the manager DS). Idempotent.
@@ -1433,7 +1434,7 @@ REMOTE
   # "degraded" from the moment it was created, unrelated to disk space or the disk's
   # own Ready/Schedulable conditions. Retry with a real wait instead of swallowing.
   local lh_patch_tries=0
-  until KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" patch setting taint-toleration \
+  until KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$LH_NAMESPACE" patch setting taint-toleration \
       --type=merge -p '{"value":"node-role.kubernetes.io/control-plane:NoSchedule"}' 2>/dev/null; do
     lh_patch_tries=$((lh_patch_tries + 1))
     if [[ $lh_patch_tries -ge 30 ]]; then
@@ -1444,23 +1445,23 @@ REMOTE
     sleep 2
   done
   local lh_applied
-  lh_applied="$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" get setting taint-toleration -o jsonpath='{.value}')"
+  lh_applied="$(KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$LH_NAMESPACE" get setting taint-toleration -o jsonpath='{.value}')"
   if [[ "$lh_applied" != "node-role.kubernetes.io/control-plane:NoSchedule" ]]; then
     echo "ERROR: taint-toleration Setting patch reported success but value is '$lh_applied', not the expected toleration." >&2
     exit 1
   fi
   echo "  -- taint-toleration setting confirmed: $lh_applied"
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" patch ds longhorn-manager --type=json \
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$LH_NAMESPACE" patch ds longhorn-manager --type=json \
     -p '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]' || true
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" rollout status ds/longhorn-manager --timeout=300s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$LH_NAMESPACE" rollout status ds/longhorn-manager --timeout=300s
   echo "  -- waiting for all longhorn-system pods Ready"
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" wait --for=condition=Ready pods --all --timeout=300s || true
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$LH_NAMESPACE" wait --for=condition=Ready pods --all --timeout=300s || true
 
   echo "==> [5/5] Ensure StorageClasses ($LH_STORAGE_CLASS default RWO; $LH_MIGRATABLE_SC RWX live-migration)..."
   # The default $LH_STORAGE_CLASS SC ships with the Longhorn manifest. Create the
   # RWX live-migration SC: migratable=true lets the volume attach on the destination
   # node while still attached on the source during a PodMotion live migration.
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl apply -f - <<YAML
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" apply -f - <<YAML
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -1479,7 +1480,7 @@ parameters:
 YAML
 
   echo "==> Longhorn ready. Per-node schedulable capacity:"
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$LH_NAMESPACE" get nodes.longhorn.io
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$LH_NAMESPACE" get nodes.longhorn.io
   echo "==> Workloads: use storageClassName: $LH_STORAGE_CLASS (RWO) or $LH_MIGRATABLE_SC (RWX, live-migratable)."
 }
 
@@ -1537,7 +1538,7 @@ cmd_provision_cilium() {
   # ipv4NativeRoutingCIDR = pod CIDR excluded from SNAT so pod<->pod keeps its real
   # source IP (essential for TCP/IP preservation). pullPolicy IfNotPresent picks up the
   # pre-imported images. This is upgrade --install so re-running is safe.
-  KUBECONFIG="$KUBECONFIG_OUT" helm upgrade --install cilium cilium/cilium \
+  KUBECONFIG="$KUBECONFIG_OUT" helm --kube-context="$KVM_CONTEXT" upgrade --install cilium cilium/cilium \
     --version "$CILIUM_CHART_VERSION" --namespace "$CILIUM_NAMESPACE" \
     --set ipam.mode=cluster-pool \
     --set ipam.operator.clusterPoolIPv4PodCIDRList="{$POD_CIDR}" \
@@ -1560,8 +1561,8 @@ cmd_provision_cilium() {
     KUBECONFIG="$KUBECONFIG_OUT" cilium status --wait
   else
     echo "  -- cilium-cli not on PATH; waiting on the DaemonSet/Deployment rollout instead"
-    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" rollout status ds/cilium --timeout=300s
-    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" rollout status deploy/cilium-operator --timeout=300s
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CILIUM_NAMESPACE" rollout status ds/cilium --timeout=300s
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CILIUM_NAMESPACE" rollout status deploy/cilium-operator --timeout=300s
   fi
   echo "==> Cilium ready. CNI swap done at the install layer; run the cutover to remove Flannel/kube-proxy."
 }
@@ -1583,7 +1584,7 @@ cmd_provision_cilium_multipool() {
   echo "==> [1/3] Switching Cilium IPAM mode: cluster-pool -> multi-pool..."
   helm repo add cilium https://helm.cilium.io >/dev/null 2>&1 || true
   helm repo update cilium >/dev/null 2>&1 || true
-  KUBECONFIG="$KUBECONFIG_OUT" helm upgrade --install cilium cilium/cilium \
+  KUBECONFIG="$KUBECONFIG_OUT" helm --kube-context="$KVM_CONTEXT" upgrade --install cilium cilium/cilium \
     --version "$CILIUM_CHART_VERSION" --namespace "$CILIUM_NAMESPACE" \
     --set ipam.mode=multi-pool \
     --set routingMode=tunnel \
@@ -1600,7 +1601,7 @@ cmd_provision_cilium_multipool() {
     --set operator.replicas=1
 
   echo "==> [2/3] Applying CiliumPodIPPool CRs (one /24 pool per node, same CIDRs as before)..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl apply -f - <<'EOF'
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" apply -f - <<'EOF'
 apiVersion: cilium.io/v2alpha1
 kind: CiliumPodIPPool
 metadata:
@@ -1637,8 +1638,8 @@ EOF
     KUBECONFIG="$KUBECONFIG_OUT" cilium status --wait
   else
     echo "  -- cilium-cli not on PATH; waiting on the DaemonSet/Deployment rollout instead"
-    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" rollout status ds/cilium --timeout=300s
-    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" rollout status deploy/cilium-operator --timeout=300s
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CILIUM_NAMESPACE" rollout status ds/cilium --timeout=300s
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CILIUM_NAMESPACE" rollout status deploy/cilium-operator --timeout=300s
   fi
   echo "==> Cilium now in multi-pool IPAM mode with per-node CiliumPodIPPool CRs."
   echo "==> Re-run TestCrossNodeReachability (PODMOTION_CILIUM_LIVE_TEST=1) to confirm the ipam.cilium.io/ip pin now honors cross-node placement."
@@ -1702,7 +1703,7 @@ cmd_provision_calico() {
   echo "==> [2/3] helm install the Tigera Operator, then apply the Installation CR (single non-strict-affinity IPPool, VXLAN, bpfEnabled=false)..."
   helm repo add projectcalico https://docs.tigera.io/calico/charts >/dev/null 2>&1 || true
   helm repo update projectcalico >/dev/null 2>&1 || true
-  KUBECONFIG="$KUBECONFIG_OUT" helm upgrade --install calico projectcalico/tigera-operator \
+  KUBECONFIG="$KUBECONFIG_OUT" helm --kube-context="$KVM_CONTEXT" upgrade --install calico projectcalico/tigera-operator \
     --version "$CALICO_CHART_VERSION" \
     --namespace "$CALICO_OPERATOR_NAMESPACE" --create-namespace \
     --set installation.enabled=false \
@@ -1718,7 +1719,7 @@ cmd_provision_calico() {
   # in direct, unresolved conflict with PodMotion's zero-window hold and XDP
   # bridge (internal/agent/network/bridge.go CheckXDPHookConflict, bpf/xdp_bridge.c,
   # bpf/zero_window.c).
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl apply -f - <<YAML
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" apply -f - <<YAML
 apiVersion: operator.tigera.io/v1
 kind: Installation
 metadata:
@@ -1747,7 +1748,7 @@ YAML
   # infinite wait.
   local waited=0
   local calico_ns_timeout=120
-  until KUBECONFIG="$KUBECONFIG_OUT" kubectl get namespace "$CALICO_NAMESPACE" >/dev/null 2>&1; do
+  until KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" get namespace "$CALICO_NAMESPACE" >/dev/null 2>&1; do
     if (( waited >= calico_ns_timeout )); then
       echo "ERROR: namespace $CALICO_NAMESPACE did not appear within ${calico_ns_timeout}s — Tigera Operator has not reconciled the Installation CR. Check 'kubectl -n $CALICO_OPERATOR_NAMESPACE logs deploy/tigera-operator'." >&2
       exit 1
@@ -1758,8 +1759,8 @@ YAML
   echo "  -- namespace $CALICO_NAMESPACE present after ${waited}s"
 
   echo "==> Waiting for Calico to come up (rollout status on calico-node / calico-kube-controllers)..."
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CALICO_NAMESPACE" rollout status ds/calico-node --timeout=300s
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CALICO_NAMESPACE" rollout status deploy/calico-kube-controllers --timeout=300s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CALICO_NAMESPACE" rollout status ds/calico-node --timeout=300s
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CALICO_NAMESPACE" rollout status deploy/calico-kube-controllers --timeout=300s
   echo "==> Calico ready. CNI swap done at the install layer; run cutover-calico to remove the previously-active CNI."
 }
 
@@ -1802,8 +1803,8 @@ cmd_cutover_calico() {
 
   echo "==> [1/4] Confirming Calico is Ready on all nodes before removing the previously-active CNI..."
   local ready desired
-  ready=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CALICO_NAMESPACE" get ds calico-node -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
-  desired=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CALICO_NAMESPACE" get ds calico-node -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo -1)
+  ready=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CALICO_NAMESPACE" get ds calico-node -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+  desired=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CALICO_NAMESPACE" get ds calico-node -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo -1)
   if [[ "$ready" -lt 1 || "$ready" != "$desired" ]]; then
     echo "ERROR: calico-node DaemonSet not fully Ready ($ready/$desired) — refusing to remove the previously-active CNI (cluster would be left with no CNI)." >&2
     exit 1
@@ -1811,17 +1812,17 @@ cmd_cutover_calico() {
   echo "  -- calico-node DaemonSet Ready: $ready/$desired"
 
   echo "==> [2/4] Removing the previously-active CNI's remnants (Flannel and/or Cilium, whichever is present)..."
-  if KUBECONFIG="$KUBECONFIG_OUT" kubectl get ns kube-flannel >/dev/null 2>&1; then
+  if KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" get ns kube-flannel >/dev/null 2>&1; then
     echo "  -- removing Flannel remnants"
-    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-flannel delete daemonset kube-flannel-ds --ignore-not-found
-    KUBECONFIG="$KUBECONFIG_OUT" kubectl delete ns kube-flannel --ignore-not-found
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n kube-flannel delete daemonset kube-flannel-ds --ignore-not-found
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" delete ns kube-flannel --ignore-not-found
   else
     echo "  -- no kube-flannel namespace present"
   fi
-  if KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" get ds cilium >/dev/null 2>&1; then
+  if KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CILIUM_NAMESPACE" get ds cilium >/dev/null 2>&1; then
     echo "  -- removing Cilium remnants (DaemonSet/Deployment only — Cilium script functions in this file are untouched)"
-    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" delete daemonset cilium --ignore-not-found
-    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" delete deployment cilium-operator --ignore-not-found
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CILIUM_NAMESPACE" delete daemonset cilium --ignore-not-found
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CILIUM_NAMESPACE" delete deployment cilium-operator --ignore-not-found
   else
     echo "  -- no active Cilium DaemonSet present"
   fi
@@ -1919,9 +1920,9 @@ cmd_cutover() {
 
   echo "==> [1/3] Confirming Cilium is Ready on all nodes before removing Flannel/kube-proxy..."
   local ready
-  ready=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" get ds cilium -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+  ready=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CILIUM_NAMESPACE" get ds cilium -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
   local desired
-  desired=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" get ds cilium -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo -1)
+  desired=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CILIUM_NAMESPACE" get ds cilium -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo -1)
   if [[ "$ready" -lt 1 || "$ready" != "$desired" ]]; then
     echo "ERROR: Cilium DaemonSet not fully Ready ($ready/$desired) — refusing to remove Flannel/kube-proxy (cluster would be left with no CNI)." >&2
     exit 1
@@ -1929,17 +1930,17 @@ cmd_cutover() {
   echo "  -- cilium DaemonSet Ready: $ready/$desired"
 
   echo "==> [2/3] Removing Flannel remnants (if any)..."
-  if KUBECONFIG="$KUBECONFIG_OUT" kubectl get ns kube-flannel >/dev/null 2>&1; then
-    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-flannel delete daemonset kube-flannel-ds --ignore-not-found
-    KUBECONFIG="$KUBECONFIG_OUT" kubectl delete ns kube-flannel --ignore-not-found
+  if KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" get ns kube-flannel >/dev/null 2>&1; then
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n kube-flannel delete daemonset kube-flannel-ds --ignore-not-found
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" delete ns kube-flannel --ignore-not-found
   else
     echo "  -- no kube-flannel namespace present (already clean)"
   fi
 
   echo "==> [3/3] Removing kube-proxy remnants (if any — Cilium kubeProxyReplacement=true supersedes it)..."
-  if KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-system get ds kube-proxy >/dev/null 2>&1; then
-    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-system delete daemonset kube-proxy --ignore-not-found
-    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-system delete configmap kube-proxy --ignore-not-found
+  if KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n kube-system get ds kube-proxy >/dev/null 2>&1; then
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n kube-system delete daemonset kube-proxy --ignore-not-found
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n kube-system delete configmap kube-proxy --ignore-not-found
   else
     echo "  -- no kube-proxy DaemonSet present (already clean)"
   fi
@@ -2011,7 +2012,7 @@ cmd_provision_cilium_rke2() {
   # if starting from a node that has never pulled Cilium images.
   helm repo add cilium https://helm.cilium.io >/dev/null 2>&1 || true
   helm repo update cilium >/dev/null 2>&1 || true
-  KUBECONFIG="$KUBECONFIG_OUT" helm upgrade --install cilium cilium/cilium \
+  KUBECONFIG="$KUBECONFIG_OUT" helm --kube-context="$KVM_CONTEXT" upgrade --install cilium cilium/cilium \
     --version "$CILIUM_CHART_VERSION" --namespace "$CILIUM_NAMESPACE" \
     --set ipam.mode=cluster-pool \
     --set ipam.operator.clusterPoolIPv4PodCIDRList="{$RKE2_CILIUM_POD_CIDR}" \
@@ -2033,8 +2034,8 @@ cmd_provision_cilium_rke2() {
   if command -v cilium >/dev/null 2>&1; then
     KUBECONFIG="$KUBECONFIG_OUT" cilium status --wait
   else
-    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" rollout status ds/cilium --timeout=300s
-    KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" rollout status deploy/cilium-operator --timeout=300s
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CILIUM_NAMESPACE" rollout status ds/cilium --timeout=300s
+    KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CILIUM_NAMESPACE" rollout status deploy/cilium-operator --timeout=300s
   fi
   echo "==> Cilium ready alongside canal (both active — canal's install-cni already renamed its own conflist to *.cilium_bak on each node). Run cutover-canal-rke2 to disable canal via RKE2's own mechanism."
 }
@@ -2045,8 +2046,8 @@ cmd_cutover_canal_rke2() {
 
   echo "==> [1/4] Confirming Cilium is Ready on all nodes before disabling canal..."
   local ready desired
-  ready=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" get ds cilium -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
-  desired=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n "$CILIUM_NAMESPACE" get ds cilium -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo -1)
+  ready=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CILIUM_NAMESPACE" get ds cilium -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+  desired=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n "$CILIUM_NAMESPACE" get ds cilium -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo -1)
   if [[ "$ready" -lt 1 || "$ready" != "$desired" ]]; then
     echo "ERROR: cilium DaemonSet not fully Ready ($ready/$desired) — refusing to disable canal (cluster would be left with no CNI)." >&2
     exit 1
@@ -2058,7 +2059,7 @@ cmd_cutover_canal_rke2() {
   nsh "$CP1_IP" "sudo systemctl restart rke2-server.service"
   echo "  -- waiting for apiserver to come back..."
   local waited=0
-  until KUBECONFIG="$KUBECONFIG_OUT" kubectl get nodes >/dev/null 2>&1; do
+  until KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" get nodes >/dev/null 2>&1; do
     if (( waited >= 150 )); then
       echo "ERROR: apiserver did not come back within 150s of rke2-server restart." >&2
       exit 1
@@ -2075,7 +2076,7 @@ cmd_cutover_canal_rke2() {
     nsh "$ip" "sudo systemctl restart rke2-agent.service"
   done
   waited=0
-  until KUBECONFIG="$KUBECONFIG_OUT" kubectl get nodes >/dev/null 2>&1; do
+  until KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" get nodes >/dev/null 2>&1; do
     if (( waited >= 150 )); then
       echo "ERROR: apiserver did not come back within 150s of rke2-server restart (kube-proxy disable step)." >&2
       exit 1
@@ -2083,7 +2084,7 @@ cmd_cutover_canal_rke2() {
     sleep 5; waited=$((waited + 5))
   done
   local kp
-  kp=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-system get pods -o name 2>/dev/null | grep -c '^pod/kube-proxy-' || true)
+  kp=$(KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n kube-system get pods -o name 2>/dev/null | grep -c '^pod/kube-proxy-' || true)
   if [[ "$kp" -ne 0 ]]; then
     echo "ERROR: $kp kube-proxy static pod(s) still present after disable-kube-proxy on all nodes." >&2
     exit 1
@@ -2097,9 +2098,9 @@ cmd_cutover_canal_rke2() {
   # CNI needs an explicit rollout restart. This step handles the RKE2-bundled
   # in-cluster components only; caller is responsible for restarting their
   # own workloads the same way if IP-mobility/Cilium-only invariants matter.
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-system rollout restart deploy/rke2-coredns-rke2-coredns deploy/rke2-coredns-rke2-coredns-autoscaler deploy/rke2-metrics-server deploy/rke2-snapshot-controller 2>/dev/null || true
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-system rollout restart daemonset/rke2-ingress-nginx-controller 2>/dev/null || true
-  KUBECONFIG="$KUBECONFIG_OUT" kubectl -n kube-system rollout status deploy/rke2-coredns-rke2-coredns --timeout=120s 2>/dev/null || true
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n kube-system rollout restart deploy/rke2-coredns-rke2-coredns deploy/rke2-coredns-rke2-coredns-autoscaler deploy/rke2-metrics-server deploy/rke2-snapshot-controller 2>/dev/null || true
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n kube-system rollout restart daemonset/rke2-ingress-nginx-controller 2>/dev/null || true
+  KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" -n kube-system rollout status deploy/rke2-coredns-rke2-coredns --timeout=120s 2>/dev/null || true
   for ip in "$CP1_IP" "${WORKER_IPS[@]}"; do
     nsh "$ip" "sudo ip link del flannel.1 2>/dev/null || true; sudo rm -f /etc/cni/net.d/calico-kubeconfig"
   done
