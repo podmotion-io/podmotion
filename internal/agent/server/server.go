@@ -5290,6 +5290,31 @@ type devShmMountInfo struct {
 	ExtKey string `json:"ext_key"`
 }
 
+// createScratchScript creates a per-invocation-unique /dev/shm scratch script for a CRIU patch/scan
+// python3 helper, writes content to it, and returns its path. Uniqueness comes from os.CreateTemp's
+// own kernel-guaranteed collision-free creation — never from any caller-supplied identifier — so
+// concurrent invocations (including retry-driven concurrent invocations sharing every other argument,
+// e.g. the Checkpoint RPC's un-guarded retry path) never share a scratch-file path (ADR-0425 round 3).
+// Precondition: callers must still `defer os.Remove(path)` themselves immediately after exec, exactly
+// as today — this helper only creates and writes the file, it does not own its cleanup.
+func createScratchScript(pattern, content string) (path string, err error) {
+	f, err := os.CreateTemp("/dev/shm", pattern)
+	if err != nil {
+		return "", fmt.Errorf("create scratch script %s: %w", pattern, err)
+	}
+	path = f.Name()
+	if _, werr := f.WriteString(content); werr != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return "", fmt.Errorf("write scratch script %s: %w", path, werr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("close scratch script %s: %w", path, cerr)
+	}
+	return path, nil
+}
+
 // readDevShmMountInfo reads /dev/shm's root_dev and ext_key from the checkpoint's mountpoints image
 // via the same vendored pycriu decoder buildMaskedPathExtMountArgs uses (PYTHONPATH per ADR-0121).
 // imagesDir is passed as argv, never string-formatted into the script body (Security note, ADR-0121).
@@ -5307,8 +5332,8 @@ for img in sorted(glob.glob(os.path.join(sys.argv[1], 'mountpoints-*.img'))):
             info = {'present': True, 'root_dev': e.get('root_dev', 0) or 0, 'ext_key': e.get('ext_key') or ''}
 print(json.dumps(info))
 `
-	scriptPath := "/dev/shm/pm-devshm-scan.py"
-	if err := os.WriteFile(scriptPath, []byte(scanScript), 0o600); err != nil {
+	scriptPath, err := createScratchScript("pm-devshm-scan-*.py", scanScript)
+	if err != nil {
 		return devShmMountInfo{}, fmt.Errorf("write devshm-scan script: %w", err)
 	}
 	defer os.Remove(scriptPath)
@@ -5571,8 +5596,8 @@ for img in imgs:
             results.append({'mnt_id': e.get('mnt_id'), 'mountpoint': e.get('mountpoint', ''), 'root': e.get('root', ''), 'ext_key': e.get('ext_key', '')})
 print(json.dumps(results))
 `
-	scriptPath := "/dev/shm/pm-scan-mounts.py"
-	if err := os.WriteFile(scriptPath, []byte(scanScript), 0o600); err != nil {
+	scriptPath, err := createScratchScript("pm-scan-mounts-*.py", scanScript)
+	if err != nil {
 		return nil, fmt.Errorf("write mount-scan script: %w", err)
 	}
 	defer os.Remove(scriptPath)
@@ -8688,9 +8713,10 @@ func patchCheckpointImages(checkpointDir string, inheritFdNames []string, reatta
 	// automatically; there is no divergent test copy to drift out of sync.
 	patchScript := assemblePatchScript()
 	// /dev/shm is an in-memory filesystem (tmpfs) — avoids writing the script to disk.
-	// 0600 so only root can read the path; removed immediately after exec.
-	scriptPath := "/dev/shm/pm-patch-ckpt.py"
-	if err := os.WriteFile(scriptPath, []byte(patchScript), 0o600); err != nil {
+	// 0600 so only root can read the path (os.CreateTemp's default mode); removed immediately after
+	// exec. The path itself is per-invocation-unique (ADR-0425 round 3) — see createScratchScript.
+	scriptPath, err := createScratchScript("pm-patch-ckpt-*.py", patchScript)
+	if err != nil {
 		return nil, nil, fmt.Errorf("write patch script: %w", err)
 	}
 	defer os.Remove(scriptPath)
