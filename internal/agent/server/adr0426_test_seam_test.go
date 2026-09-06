@@ -31,3 +31,20 @@ func withHostRunRootForTest(t *testing.T, root string) {
 	hostRunRoot = root
 	t.Cleanup(func() { hostRunRoot = orig })
 }
+
+// withDumpedFromDeviceCheckAcceptAllForTest overrides the package-level ADR-0427 D6 seam
+// (dumpedFromDeviceCheck) for the lifetime of the calling test, restoring the production default
+// (dumpedFromDevice) automatically via t.Cleanup. This is the seam ADR-0427 round 4 requires:
+// wiring D6 at the capture call site would otherwise make every pre-existing capture-success
+// fixture in this package fail closed, because their fixtures pin an arbitrary RootDev that has no
+// relationship to the real device their t.TempDir()-backed hostRunRoot lives on — a fact that is
+// irrelevant to what those fixtures are actually testing (reachability/demand-blindness/etc., not
+// D6's device comparison). Tests that exist SPECIFICALLY to exercise D6's own comparison logic must
+// NOT use this override — they call the real dumpedFromDevice (directly or via the unmodified seam)
+// so the comparison itself is what is under test.
+func withDumpedFromDeviceCheckAcceptAllForTest(t *testing.T) {
+	t.Helper()
+	orig := dumpedFromDeviceCheck
+	dumpedFromDeviceCheck = func(dir string, recordedRootDev int64) (bool, error) { return true, nil }
+	t.Cleanup(func() { dumpedFromDeviceCheck = orig })
+}

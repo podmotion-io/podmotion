@@ -42,6 +42,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/podmotion-io/podmotion/internal/metrics"
 )
@@ -212,6 +215,40 @@ func runHostDir(candidate string) (string, bool) {
 	}
 	return hostRunRoot + strings.TrimPrefix(candidate, "/run"), true
 }
+
+// dumpedFromDevice reports whether dir — the agent-visible host directory resolved for a
+// content-absent mount — actually lives on the SAME filesystem CRIU dumped that mount from.
+// ADR-0427 D6.
+//
+// recordedRootDev is the mountpoints image's own root_dev for this entry: CRIU's mi->s_dev, the
+// device of the superblock the mount was on at dump time. It is the SOURCE OF TRUTH for "which
+// filesystem object did CRIU dump here", which is why nothing about the path has to be inferred —
+// no mountpoint test, no parent comparison, no /proc/self/mountinfo parse, no tiers.
+//
+// ENCODING — VERIFIED EMPIRICALLY (ADR-0427 round 4); THE TWO NUMBERS ARE NOT INTERCHANGEABLE:
+//   - CRIU root_dev is the kernel-internal form, major<<20|minor — the same composition
+//     /proc/<pid>/mountinfo prints as "maj:min".
+//   - syscall.Stat_t.Dev is what stat(2) returns, packed by the kernel's new_encode_dev() as
+//     (minor&0xff) | (major<<8) | ((minor&~0xff)<<12).
+//
+// They agree ONLY when major==0 && minor<256. Real /dev/shm root_dev values on the reference
+// cluster fall on BOTH sides of that boundary, so a raw == would accept some captures and wrongly
+// refuse others depending on which anonymous minor the kernel allocated. Both values are therefore
+// decomposed to (major, minor) and compared componentwise. Do not "simplify" this back to ==.
+func dumpedFromDevice(dir string, recordedRootDev int64) (bool, error) {
+	var st syscall.Stat_t
+	if err := syscall.Stat(dir, &st); err != nil {
+		return false, err
+	}
+	live := uint64(st.Dev)
+	rec := uint64(recordedRootDev)
+	return unix.Major(live) == uint32(rec>>20) && unix.Minor(live) == uint32(rec&0xFFFFF), nil
+}
+
+// dumpedFromDeviceCheck is the D6 test seam (ADR-0427): a package-level function variable whose
+// only permitted mutation site is a test helper, mirroring the hostRunRoot discipline above
+// (:200-203). Production code MUST NEVER assign to this outside of the initializer.
+var dumpedFromDeviceCheck = dumpedFromDevice
 
 // mountHostSourceDir resolves the agent-visible host source directory for mountpoint, and the
 // OCI-recorded source string used by mountSourceReconstructability, per ADR-0426 D1b / D1b-1 / D1b-3.
@@ -406,8 +443,17 @@ func (e *ContentAbsentRegFileDemandError) Error() string {
 // property of the source directory other than its reachability (ADR-0426 D1d).
 //
 // Called from BOTH dump paths (D2): the ctr fast path's success branch, and the raw-CRIU fallback
-// path, at the identical point relative to LeaveStopped+registerFrozenSource (D3), so every
-// fail-closed return arrives with the source frozen and thawable, never released (D3-THAW, F6).
+// path. The two paths leave the source in DIFFERENT states, and the distinction matters (ADR-0427):
+//
+//   - raw-CRIU path: the capture runs after that path's LeaveStopped dump and registerFrozenSource
+//     (D3), so the source is additionally FROZEN and thawable via the frozen-source machinery.
+//   - ctr fast path: ctrCheckpoint passes no exit/stop flag, so the source is never frozen at all —
+//     it KEEPS RUNNING normally across the capture window. This is the common case in practice.
+//
+// A fail-closed return here never releases or tears down the source on EITHER path. That property
+// comes from the fail-closed return itself — the checkpoint images are zeroized and a typed failure
+// is returned to the caller, which aborts the migration around an intact source — and NOT from the
+// source's freeze state (D3-THAW, F6), which only one of the two paths establishes.
 func captureContentAbsentMounts(ctx context.Context, imagesDir string) (captureOutcome, error) {
 	var out captureOutcome
 
@@ -437,6 +483,27 @@ func captureContentAbsentMounts(ctx context.Context, imagesDir string) (captureO
 		// Stage 1 — capture. Demand-blind AND emptiness-blind (D1a-CAP): attempted for every
 		// INTERNALIZE_CONTENT_ABSENT entry whose host source resolves, full stop.
 		if e.RootDev != 0 && ok {
+			// ADR-0427 D6: verify, before any tar, that hostDir actually lives on the filesystem
+			// CRIU recorded dumping this mount from — not merely that the path resolves lexically.
+			// A stale, unpropagated /host-run view resolves fine and stats fine while pointing at
+			// the empty directory a later host mount is layered over; this is the check that
+			// catches that case at the source of truth (RootDev) instead of inferring it.
+			matched, devErr := dumpedFromDeviceCheck(hostDir, e.RootDev)
+			if devErr != nil {
+				metrics.MountContentCaptureOutcomeTotal.WithLabelValues("failed_closed", "root_dev_check_failed", origin).Inc()
+				return out, fail(fmt.Sprintf("could not verify resolved host source %q against recorded root_dev %d: %v", hostDir, e.RootDev, devErr))
+			}
+			if !matched {
+				var live syscall.Stat_t
+				liveMajMin := "unknown"
+				if statErr := syscall.Stat(hostDir, &live); statErr == nil {
+					liveMajMin = fmt.Sprintf("%d:%d", unix.Major(uint64(live.Dev)), unix.Minor(uint64(live.Dev)))
+				}
+				recMajMin := fmt.Sprintf("%d:%d", uint32(uint64(e.RootDev)>>20), uint32(uint64(e.RootDev)&0xFFFFF))
+				metrics.MountContentCaptureOutcomeTotal.WithLabelValues("failed_closed", "root_dev_mismatch", origin).Inc()
+				return out, fail(fmt.Sprintf("resolved host source %q is not the filesystem CRIU dumped this mount from: live device %s != recorded root_dev %s (ADR-0427 D6 — mount propagation is the overwhelmingly likely cause)", hostDir, liveMajMin, recMajMin))
+			}
+
 			if tarErr := writeTmpfsContentImage(ctx, hostDir, outPath); tarErr != nil {
 				metrics.MountContentCaptureOutcomeTotal.WithLabelValues("failed_closed", "tar_failed", origin).Inc()
 				return out, fail(fmt.Sprintf("tar of resolved host source %q failed: %v", hostDir, tarErr))

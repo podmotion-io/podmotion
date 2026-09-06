@@ -156,6 +156,7 @@ func TestADR0426_ContentAbsentMountWithRegFileDemand_IsCapturedAtDump(t *testing
 	imagesDir := t.TempDir()
 	hostRunDir := t.TempDir()
 	withHostRunRootForTest(t, hostRunDir)
+	withDumpedFromDeviceCheckAcceptAllForTest(t) // ADR-0427 D6 is exercised by its own tests, not here
 
 	const rootDev = 361
 	const mntID = 3
@@ -214,6 +215,7 @@ func TestADR0426_ContentAbsentMountWithEmptyReachableSource_IsStillCaptured(t *t
 	imagesDir := t.TempDir()
 	hostRunDir := t.TempDir()
 	withHostRunRootForTest(t, hostRunDir)
+	withDumpedFromDeviceCheckAcceptAllForTest(t) // ADR-0427 D6 is exercised by its own tests, not here
 
 	const rootDev = 290 // grl96's live root_dev (F8a)
 	const mntID = 3700  // grl96's live mnt_id (F8a)
@@ -267,6 +269,7 @@ func TestADR0426_ReachableNonEmptySourceIsCapturedEvenWithZeroDemand(t *testing.
 	imagesDir := t.TempDir()
 	hostRunDir := t.TempDir()
 	withHostRunRootForTest(t, hostRunDir)
+	withDumpedFromDeviceCheckAcceptAllForTest(t) // ADR-0427 D6 is exercised by its own tests, not here
 
 	const rootDev = 130
 	const mntID = 3977
@@ -360,6 +363,7 @@ func TestADR0426_CaptureLegReadsNoPropertyOfTheSourceDirectoryButReachability(t 
 			imagesDir := t.TempDir()
 			hostRunDir := t.TempDir()
 			withHostRunRootForTest(t, hostRunDir)
+			withDumpedFromDeviceCheckAcceptAllForTest(t) // ADR-0427 D6 is exercised by its own tests, not here
 
 			rootDev := 400 + i
 			mntID := 4000 + i

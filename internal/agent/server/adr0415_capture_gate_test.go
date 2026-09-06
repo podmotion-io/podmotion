@@ -202,6 +202,7 @@ func TestCaptureContentAbsentMounts_CapturesReachableRawPathSource(t *testing.T)
 	imagesDir := t.TempDir()
 	hostRunDir := t.TempDir()
 	withHostRunRootForTest(t, hostRunDir)
+	withDumpedFromDeviceCheckAcceptAllForTest(t) // ADR-0427 D6 is exercised by its own tests, not here
 	writeExternalTmpfsMountpointsImg(t, imagesDir, "/dev/shm",
 		"/run/k3s/containerd/io.containerd.grpc.v1.cri/sandboxes/38b9ff67/shm", 399)
 	shmSrc := filepath.Join(hostRunDir, "k3s/containerd/io.containerd.grpc.v1.cri/sandboxes/38b9ff67/shm")

@@ -425,6 +425,15 @@ spec:
             - name: host-run
               mountPath: /host-run
               readOnly: true
+              # Without this, the hostPath bind is a ONE-TIME recursive snapshot of host /run taken
+              # when this container starts (Kubernetes default mountPropagation: None => rprivate).
+              # Every mount the host creates afterwards — each new pod sandbox's /dev/shm tmpfs, each
+              # task's rootfs overlay — is invisible here forever, and a read of that path silently
+              # returns the EMPTY underlying directory the mount is layered over rather than an error.
+              # ADR-0426's content capture tarred exactly that ghost directory. HostToContainer
+              # (rslave) keeps this view live. Same reason and same shape as host-var-run-netns below
+              # (ADR-0178) and run-podmotion (ADR-0165).
+              mountPropagation: HostToContainer
             # host /var/lib/containerd, read-only: runc writes criu-dump.log into the task `work`
             # dir, which symlinks to /var/lib/containerd/io.containerd.runtime.v2.task/... — not
             # into the run bundle. resolveCtrDumpLogPath re-roots that target here so the classifier
