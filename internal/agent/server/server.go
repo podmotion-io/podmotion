@@ -2025,6 +2025,29 @@ func (s *AgentServer) appendDestinationRebindReattachMounts(
 			"contentAbsent", demand.ContentAbsent,
 			"internalizedWithContent", demand.InternalizedWithContent)
 	}
+
+	// ADR-0426 D4 — the cross-axis assertion that does not exist today. Immediately after the
+	// ADR-0420 D1 log line and BEFORE resolveDestinationRebindTargets (and therefore before any CRIU
+	// invocation): a non-empty ContentAbsentWithRegFileDemand map means this checkpoint is internally
+	// inconsistent — it classifies a mount content-absent (so the destination's own empty mount is
+	// used) while recording a regular file inside it that CRIU will be told to open. Restoring would
+	// abort at criu/files-reg.c:2353. This is a HARD STOP, refusing before CRIU is invoked instead of
+	// crashing 400ms into `criu restore`. The S_IFDIR exclusion stays mandatory here (round 2): a
+	// directory-fd demand (a token-rotation directory watch) lands in the diagnostic-only
+	// ContentAbsentWithDirFdDemand map and never reaches this check, so it does not turn a routine
+	// restore into an attributed hard failure.
+	for mp, n := range demand.ContentAbsentWithRegFileDemand {
+		if n <= 0 {
+			continue
+		}
+		metrics.MountContentAvailabilityOutcomeTotal.WithLabelValues("inconsistent_reg_file_demand").Inc()
+		err := &ContentAbsentRegFileDemandError{Mountpoint: mp, RegFileCount: n}
+		log.Error(err, "ADR-0426 D4: checkpoint is internally inconsistent — content-absent mount records a regular-file demand CRIU would fail to open at restore — failing closed before CRIU is invoked",
+			"migration", migrationName, "checkpointDir", checkpointDir, "mountpoint", mp, "regFileCount", n)
+		destinationRebindObserveFn(migrationName, 1, time.Since(start), "content_absent_reg_file_demand")
+		return mounts, err
+	}
+
 	// A mountpoint already resolved by an earlier tier (storage-tier PVC re-attach, holder scaffold)
 	// is NOT a destination-rebind demand: patch_checkpoint_script.go checks its re-attach carve-out
 	// FIRST and would use that tier's target anyway. Emitting a second, differently-resolved target
@@ -5271,200 +5294,6 @@ func ctrCheckpoint(ctx context.Context, taskID, imagesDir string, tcpEstablished
 	return total, nil
 }
 
-// devShmContentImageName is the CRIU tmpfs-content image basename for a /dev/shm tmpfs whose
-// recorded root_dev is rootDev. CRIU tar-serializes every internally-owned tmpfs's content to
-// tmpfs-dev-<root_dev>.tar.gz.img (criu/tmpfs.c dump_tmpfs / restore_tmpfs), keyed by the root_dev
-// field in the mountpoints image — ground-truthed against a live ctr checkpoint on the KVM cluster
-// (the /dev tmpfs recorded root_dev=558 has its content in tmpfs-dev-558.tar.gz.img).
-func devShmContentImageName(rootDev int64) string {
-	return fmt.Sprintf("tmpfs-dev-%d.tar.gz.img", rootDev)
-}
-
-// devShmMountInfo carries the /dev/shm mountpoints-image facts captureCtrDevShmContent keys on.
-type devShmMountInfo struct {
-	Present bool  `json:"present"`
-	RootDev int64 `json:"root_dev"`
-	// ExtKey is the recorded external-mount key. A non-empty value ('/dev/shm' on the ctr fast
-	// path) means CRIU treated /dev/shm as an EXTERNAL mount and therefore skipped its content;
-	// empty means CRIU owns it internally and already content-captured it (raw-CRIU path, ADR-0382).
-	ExtKey string `json:"ext_key"`
-}
-
-// createScratchScript creates a per-invocation-unique /dev/shm scratch script for a CRIU patch/scan
-// python3 helper, writes content to it, and returns its path. Uniqueness comes from os.CreateTemp's
-// own kernel-guaranteed collision-free creation — never from any caller-supplied identifier — so
-// concurrent invocations (including retry-driven concurrent invocations sharing every other argument,
-// e.g. the Checkpoint RPC's un-guarded retry path) never share a scratch-file path (ADR-0425 round 3).
-// Precondition: callers must still `defer os.Remove(path)` themselves immediately after exec, exactly
-// as today — this helper only creates and writes the file, it does not own its cleanup.
-func createScratchScript(pattern, content string) (path string, err error) {
-	f, err := os.CreateTemp("/dev/shm", pattern)
-	if err != nil {
-		return "", fmt.Errorf("create scratch script %s: %w", pattern, err)
-	}
-	path = f.Name()
-	if _, werr := f.WriteString(content); werr != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
-		return "", fmt.Errorf("write scratch script %s: %w", path, werr)
-	}
-	if cerr := f.Close(); cerr != nil {
-		_ = os.Remove(path)
-		return "", fmt.Errorf("close scratch script %s: %w", path, cerr)
-	}
-	return path, nil
-}
-
-// readDevShmMountInfo reads /dev/shm's root_dev and ext_key from the checkpoint's mountpoints image
-// via the same vendored pycriu decoder buildMaskedPathExtMountArgs uses (PYTHONPATH per ADR-0121).
-// imagesDir is passed as argv, never string-formatted into the script body (Security note, ADR-0121).
-func readDevShmMountInfo(ctx context.Context, imagesDir string) (devShmMountInfo, error) {
-	const scanScript = `
-import pycriu, glob, json, sys, os
-info = {'present': False, 'root_dev': 0, 'ext_key': ''}
-for img in sorted(glob.glob(os.path.join(sys.argv[1], 'mountpoints-*.img'))):
-    if not img.endswith('.img'):
-        continue
-    with open(img, 'rb') as f:
-        data = pycriu.images.load(f)
-    for e in data.get('entries', []):
-        if e.get('mountpoint') == '/dev/shm':
-            info = {'present': True, 'root_dev': e.get('root_dev', 0) or 0, 'ext_key': e.get('ext_key') or ''}
-print(json.dumps(info))
-`
-	scriptPath, err := createScratchScript("pm-devshm-scan-*.py", scanScript)
-	if err != nil {
-		return devShmMountInfo{}, fmt.Errorf("write devshm-scan script: %w", err)
-	}
-	defer os.Remove(scriptPath)
-
-	cmd := exec.CommandContext(ctx, "python3", scriptPath, imagesDir)
-	cmd.Env = append(os.Environ(), "PYTHONPATH=/usr/lib/python3/dist-packages")
-	out, err := cmd.Output()
-	if err != nil {
-		return devShmMountInfo{}, fmt.Errorf("devshm-scan script failed: %w\n%s", err, out)
-	}
-	var info devShmMountInfo
-	if err := json.Unmarshal(out, &info); err != nil {
-		return devShmMountInfo{}, fmt.Errorf("parse devshm-scan output: %w\n%s", err, out)
-	}
-	return info, nil
-}
-
-// devShmHostSourceDir returns the agent-visible path to the source pod's /dev/shm backing directory
-// — the pod-sandbox shm dir the CRI runtime bind-mounts at /dev/shm, recorded as the /dev/shm mount
-// SOURCE in config.json (e.g. /run/k3s/containerd/io.containerd.grpc.v1.cri/sandboxes/<id>/shm).
-// It is re-rooted onto the broad host-/run mount (/host-run) the daemonset always carries, exactly
-// as the criu-dump.log / bundle paths are (remapWorkTargetToDumpLog). Returns ok=false when
-// config.json is absent/unparseable, /dev/shm has no bind source, or the source is not under /run
-// (so unreachable from the agent) — every such case is a documented no-op for the caller.
-func devShmHostSourceDir(imagesDir string) (string, bool) {
-	data, err := os.ReadFile(filepath.Join(imagesDir, "config.json"))
-	if err != nil {
-		return "", false
-	}
-	var cfg struct {
-		Mounts []struct {
-			Destination string `json:"destination"`
-			Source      string `json:"source"`
-		} `json:"mounts"`
-	}
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return "", false
-	}
-	for _, m := range cfg.Mounts {
-		if m.Destination != "/dev/shm" {
-			continue
-		}
-		if !strings.HasPrefix(m.Source, "/run/") {
-			return "", false
-		}
-		return "/host-run" + strings.TrimPrefix(m.Source, "/run"), true
-	}
-	return "", false
-}
-
-// captureCtrDevShmContent captures the source pod's /dev/shm content as a CRIU-native tmpfs content
-// image so a restore that internalizes /dev/shm can populate it (ADR-0414 — the dump-side half).
-//
-// The containerd/ctr fast path records /dev/shm as an EXTERNAL bind mount (ext_key='/dev/shm',
-// source=<pod-sandbox>/shm — verified live on the KVM cluster: config.json carries /dev/shm as a
-// bind from the CRI sandbox shm dir, and the mountpoints image stamps ext_key='/dev/shm'). runc's
-// CRIU therefore never tar-serializes /dev/shm content: NO tmpfs-dev-<root_dev>.tar.gz.img is
-// written for it. A workload that keeps real state there — a PostgreSQL POSIX-shmem segment
-// dev/shm/PostgreSQL.<N> held mmap'd MAP_SHARED — loses that content at dump, so the restore-side
-// internalization (patch_checkpoint_script.go, ADR-0414) makes CRIU own an EMPTY /dev/shm tmpfs and
-// files-reg.c:2353 ENOENTs opening the recorded reg-file path (or, once owned+mounted with no
-// content to fill, tears the tmpfs down busy).
-//
-// /dev/shm is ordinary pod-local data, an owned mount captured with content by default like every
-// other owned mount (ADR-0415). This reads /dev/shm's recorded root_dev (the value CRIU names the
-// tmpfs content image by) and the sandbox shm source dir, then tar-serializes that dir's live
-// content into tmpfs-dev-<root_dev>.tar.gz.img in CRIU's own dump_tmpfs format — so the restore-side
-// internalization has real content to lay into the CRIU-owned /dev/shm tmpfs. Unconditional and
-// workload-agnostic: an empty /dev/shm (e.g. Redis) yields an empty tmpfs image, exactly what CRIU's
-// own dump_tmpfs writes for an empty owned tmpfs. The source is frozen/dumped by the just-completed
-// ctr checkpoint and the sandbox shm dir outlives the task, so its bytes are the checkpoint-instant
-// state.
-//
-// ADR-0415 fail-closed capture gate — FAIL CLOSED. Returns nil (a legitimate "nothing owned to capture here" state,
-// NOT a silent skip-and-continue over a real failure) only when: the image records no /dev/shm mount
-// (the pod owns none), or /dev/shm is already CRIU-internal (ext_key empty — the raw-CRIU dump path
-// already tar-captured it), or its content image already exists (do not clobber CRIU's own capture).
-// In every other case — the ctr fast path externalized an owned /dev/shm (runc's CRIU skipped its
-// content) and the agent CANNOT capture it (mountpoints scan failed, no root_dev to name the image,
-// the sandbox shm source is unreachable, or the tar failed) — it returns a wrapped
-// ErrMountContentCaptureFailed so the caller fails the checkpoint closed with the attributed
-// MountContentCaptureFailed reason. It NEVER fabricates zero-filled shared memory and NEVER lets a
-// failed capture pass as success.
-func captureCtrDevShmContent(ctx context.Context, imagesDir string) error {
-	fail := func(cause string) error {
-		return &MountContentCaptureFailedDetail{Mountpoint: "/dev/shm", Cause: cause}
-	}
-	info, err := readDevShmMountInfo(ctx, imagesDir)
-	if err != nil {
-		return fail(fmt.Sprintf("mountpoints scan failed: %v", err))
-	}
-	if !info.Present {
-		return nil // no /dev/shm mount recorded in the image — the pod owns none; nothing to capture
-	}
-	if info.ExtKey == "" {
-		return nil // /dev/shm already CRIU-internal (raw-CRIU path, ADR-0382): content already captured
-	}
-	outPath := filepath.Join(imagesDir, devShmContentImageName(info.RootDev))
-	if _, statErr := os.Stat(outPath); statErr == nil {
-		return nil // content image already present — do not clobber CRIU's own capture
-	}
-	if info.RootDev == 0 {
-		return fail("external /dev/shm has no root_dev in the mountpoints image — cannot name the CRIU tmpfs content image")
-	}
-	shmDir, ok := devShmHostSourceDir(imagesDir)
-	if !ok {
-		return fail("no agent-visible sandbox shm source in config.json — owned /dev/shm content is unreachable")
-	}
-	if tarErr := writeDevShmContentImage(ctx, shmDir, outPath); tarErr != nil {
-		return fail(fmt.Sprintf("tar of sandbox shm dir failed: %v", tarErr))
-	}
-	log.Info("Checkpoint: captured /dev/shm content as CRIU tmpfs image (ADR-0415 dump-side owned-mount capture for the ctr fast path)",
-		"image", devShmContentImageName(info.RootDev), "srcDir", shmDir, "rootDev", info.RootDev)
-	return nil
-}
-
-// writeDevShmContentImage tar-serializes the live sandbox /dev/shm directory (shmDir) into the
-// CRIU-native content image at outPath, matching CRIU's own dump_tmpfs invocation (gzip tar,
-// sparse, numeric owner, ./-relative from the mount dir) so restore_tmpfs extracts it into the
-// CRIU-owned /dev/shm tmpfs unchanged. On failure it removes any partial image so the checkpoint
-// never carries a torn content layer.
-func writeDevShmContentImage(ctx context.Context, shmDir, outPath string) error {
-	tarCmd := exec.CommandContext(ctx, "tar", "--create", "--gzip", "--sparse", "--numeric-owner",
-		"--file", outPath, "-C", shmDir, ".")
-	if tout, err := tarCmd.CombinedOutput(); err != nil {
-		_ = os.Remove(outPath)
-		return fmt.Errorf("tar /dev/shm content: %w\n%s", err, strings.TrimSpace(string(tout)))
-	}
-	return nil
-}
-
 // classifyCtrCheckpointFailure maps a failed `ctr tasks checkpoint` invocation to a typed error
 // so the Checkpoint RPC can decide whether to fall through to the raw go-criu Dump path. outStr is
 // ctr's combined output with the resolved criu-dump.log appended (or not, per dumpLogRead); rawErr
@@ -8519,9 +8348,16 @@ def classify_reg_fd(entry, ctx):
             return 'DECLINE'
         return 'REBIND_TO_ROOT'
     # ADR-0311: a PLAIN-REG *non-directory* fd is still safely rebindable when its orphan
-    # mnt_id is backed by a tmpfs/shm mount. tmpfs/shm backing storage is memory-only and
-    # never survives a checkpoint regardless, so redirecting the handle to root (rather than
-    # the previous dir-vs-nondir proxy that always DECLINEd non-directory orphans) fixes
+    # mnt_id is backed by a tmpfs/shm mount. REBIND_TO_ROOT here is safe because its backing
+    # MOUNT was dropped from the restored mount set (this fd's mnt_id is not in kept_mnt_ids),
+    # not because tmpfs/shm content cannot survive a checkpoint — ADR-0426 makes /dev/shm's
+    # content SURVIVE a checkpoint by design (captureContentAbsentMounts), and a content-absent
+    # tmpfs/shm mount whose content IS captured is INTERNALIZED and stays in kept_mnt_ids, so its
+    # REG fds classify KEEP above and never reach this branch at all. (The prior wording here —
+    # "tmpfs/shm backing storage is memory-only and never survives a checkpoint regardless" — was
+    # made FALSE by ADR-0426 and is corrected atomically with it, per that ADR's disproven-scaffolding
+    # removal symmetry and its "Related ADRs → ADR-0311" section.) redirecting the handle to root (rather
+    # than the previous dir-vs-nondir proxy that always DECLINEd non-directory orphans) fixes
     # /dev/shm-backed workloads (PostgreSQL POSIX-shmem segments) without weakening the Strict
     # guard for any other orphan class.
     #
@@ -9528,22 +9364,24 @@ func (s *AgentServer) Checkpoint(ctx context.Context, req *agentpb.CheckpointReq
 					return nil, fmt.Errorf("checkpoint: clearing partial ctr images before raw CRIU: %w", rmErr)
 				}
 			} else {
-				// ADR-0415: capture /dev/shm owned-mount content as a CRIU tmpfs image BEFORE the
+				// ADR-0426 D1/D2: capture the content of every content-absent mount whose backing
+				// host source is agent-reachable — /dev/shm today, and any future runtime-injected
+				// content-bearing external tmpfs, empty or not, demanded or not — BEFORE the
 				// checksum/encrypt below, so it is transferred and restored with the rest of the
 				// image. The ctr fast path records /dev/shm as an external sandbox bind, so runc's
 				// CRIU never dumps its content; without this a workload with real /dev/shm state
 				// (PostgreSQL POSIX-shmem) loses it and the internalizing restore
 				// (patch_checkpoint_script.go) has an empty tmpfs to open the recorded reg-file in.
-				// fail-closed capture gate: this now FAILS CLOSED — a capture that should happen but cannot returns a
-				// typed MountContentCaptureFailed status so the migration fails with an attributed
-				// reason rather than shipping a non-restorable image (no silent skip-and-continue).
-				if capErr := captureCtrDevShmContent(ctx, imagesDir); capErr != nil {
-					log.Error(capErr, "Checkpoint: owned /dev/shm content capture failed — failing closed (ADR-0415 fail-closed capture gate)",
+				// Fails CLOSED — a capture that should happen but cannot returns a typed
+				// MountContentCaptureFailed status so the migration fails with an attributed reason
+				// rather than shipping a non-restorable image (no silent skip-and-continue).
+				if _, capErr := captureContentAbsentMounts(ctx, imagesDir); capErr != nil {
+					log.Error(capErr, "Checkpoint: content-absent mount capture failed — failing closed (ADR-0426 D1d)",
 						"migration", req.MigrationName)
 					// Zeroize the partial ctr image set before returning (Standing Rule 7): it
 					// contains live memory pages and must not linger recoverable on tmpfs.
 					if zErr := zeroizeDir(imagesDir); zErr != nil {
-						log.Error(zErr, "Checkpoint: zeroize after owned-mount capture failure", "migration", req.MigrationName)
+						log.Error(zErr, "Checkpoint: zeroize after content capture failure", "migration", req.MigrationName)
 					}
 					return nil, newMountContentCaptureFailedStatus(capErr)
 				}
@@ -9853,8 +9691,6 @@ func (s *AgentServer) Checkpoint(ctx context.Context, req *agentpb.CheckpointReq
 	} else {
 		checkpointPath = result.ImagesDir
 		freezeDurationMs = result.FreezeDurationMs
-		// Compute SHA256 of all files in the images directory.
-		sha256sum, sizeBytes = checksumDir(checkpointPath)
 		fallbackNote = "real CRIU checkpoint"
 
 		// Stage config.json from the containerd bundle into the checkpoint dir.
@@ -9863,6 +9699,15 @@ func (s *AgentServer) Checkpoint(ctx context.Context, req *agentpb.CheckpointReq
 		// does NOT — and the destination NRI restore reads
 		// <checkpointDir>/config.json to build the OCI bundle. Without it restore fails
 		// with "read config.json: no such file or directory" (ADR-0131 restore path).
+		//
+		// ADR-0426 D3: this staging step is HOISTED to before checksumDir (moved below) and before
+		// the content capture that follows, so the reported digest covers config.json when it is
+		// staged — closing a small, separate, pre-existing checksum-coverage hole. This hoist is
+		// NOT what makes the raw path's capture correct (D3's own round-4 correction): staging is
+		// best-effort by construction (FindContainerTaskID fails after a raw dump, ADR-0134) and is
+		// absent on 100% of the live raw-path corpus (F8d) — the capture's raw-path correctness
+		// rests on captureContentAbsentMounts' D1b-3 mountpoints-source fallback, which does not
+		// depend on this staging step succeeding.
 		if podUID != "" {
 			// ADR-0134: prefer the task ID cached during the ctr attempt. Re-resolving here
 			// fails after the raw CRIU dump (frozen task drops off FindContainerTaskID's scan).
@@ -9887,6 +9732,28 @@ func (s *AgentServer) Checkpoint(ctx context.Context, req *agentpb.CheckpointReq
 				log.Info("Checkpoint: could not resolve task ID to stage config.json (raw CRIU path)", "podUID", podUID, "err", taskErr)
 			}
 		}
+
+		// ADR-0426 D2/D3: the raw-CRIU path's own content-absent mount capture — the wiring
+		// asymmetry (F1) this ADR closes. This path is taken by every established-TCP migration
+		// (Strict/BestEffort tcpPreservationMode), which the deleted /dev/shm-literal dump-side
+		// capture never covered at all. Placed after LeaveStopped+
+		// registerFrozenSource (above) so a fail-closed return here always arrives with the source
+		// frozen and thawable via the existing frozen-source machinery, never released (D3-THAW,
+		// F6) — and before checksumDir (moved below) so the digest covers the content image too.
+		if _, capErr := captureContentAbsentMounts(ctx, imagesDir); capErr != nil {
+			log.Error(capErr, "Checkpoint: content-absent mount capture failed — failing closed (ADR-0426 D1d, raw-CRIU path)",
+				"migration", req.MigrationName)
+			// Zeroize the partial image set before returning (Standing Rule 7): it contains live
+			// memory pages and must not linger recoverable on tmpfs.
+			if zErr := zeroizeDir(imagesDir); zErr != nil {
+				log.Error(zErr, "Checkpoint: zeroize after content capture failure (raw-CRIU path)", "migration", req.MigrationName)
+			}
+			return nil, newMountContentCaptureFailedStatus(capErr)
+		}
+
+		// Compute SHA256 of all files in the images directory. MOVED here (ADR-0426 D3), after
+		// config.json staging and the content capture, so the digest accounts for both.
+		sha256sum, sizeBytes = checksumDir(checkpointPath)
 	}
 
 	log.Info("Checkpoint complete", "path", checkpointPath, "sha256", sha256sum, "fallback", fallbackNote)

@@ -195,6 +195,23 @@ type destinationRebindDemand struct {
 	// content and are therefore still internalized — /dev/shm's population. A zero here on a real
 	// migration means the dump-side capture stopped producing content images.
 	InternalizedWithContent int `json:"internalized_with_content"`
+	// ContentAbsentWithRegFileDemand is ADR-0426 D4's cross-axis assertion: for each
+	// INTERNALIZE_CONTENT_ABSENT entry, the count of files.img REG entries under its mnt_id whose
+	// mode is NOT S_IFDIR — the SAME demanded_regular predicate D1a computes, spelled with the same
+	// shipped S_IFMT/S_IFDIR mask, so the two sides cannot disagree about what a "demand" is. A
+	// non-empty count for a mountpoint means this checkpoint is internally inconsistent: it
+	// classifies the mount content-absent (so the destination's own mount is used) while recording a
+	// regular file inside it that CRIU will be told to open — the exact files-reg.c:2353 shape. This
+	// is the ONLY leg in the whole design where a demand count gates anything (round 3): the dump
+	// side stopped reading it (D1d stage 2 reads the OCI source type instead); D4 keeps reading it
+	// because it asks a different question — is THIS checkpoint's own recorded content internally
+	// consistent — that only files.img's own REG set can answer.
+	ContentAbsentWithRegFileDemand map[string]int `json:"content_absent_reg_demand"`
+	// ContentAbsentWithDirFdDemand is the diagnostic-only S_IFDIR counterpart. It NEVER gates
+	// anything — the directory-fd exclusion stays mandatory here (round 2), because an unnarrowed D4
+	// would refuse a routine restore on a token-rotation directory watch that restores correctly
+	// today.
+	ContentAbsentWithDirFdDemand map[string]int `json:"content_absent_dir_demand"`
 }
 
 // destinationRebindDemandScanPy mirrors patch_checkpoint_script.go's Class DESTINATION-REBIND
@@ -226,14 +243,48 @@ type destinationRebindDemand struct {
 // destinationRebindDemandSet's caller). Modelling it here would duplicate a resolution that
 // already happened and risk emitting two conflicting targets for one key.
 //
-// Security (ADR-0121, same contract as readDevShmMountInfo): imagesDir is passed as ARGV and is
+// Security (ADR-0121, same contract as contentCaptureDemandScan): imagesDir is passed as ARGV and is
 // never string-formatted into the script body.
 const destinationRebindDemandScanPy = `
 import pycriu, glob
+
+_S_IFMT = 0o170000
+_S_IFDIR = 0o040000
+
+
+def _reg_fd_counts(ckpt, mnt_id):
+    """ADR-0426 D4: files.img REG-entry counts under mnt_id, split by the SAME S_IFMT/S_IFDIR mask
+    the shipped classifiers use (patch_checkpoint_script.go, classifyRegFdPy, this axis's own
+    scanner) — never a private fourth spelling (V5/V8b)."""
+    regular = 0
+    directory = 0
+    files_path = os.path.join(ckpt, 'files.img')
+    if not os.path.exists(files_path):
+        return regular, directory
+    try:
+        with open(files_path, 'rb') as f:
+            files_img = pycriu.images.load(f)
+    except Exception:
+        return regular, directory
+    for entry in files_img.get('entries', []):
+        if entry.get('type') != 'REG':
+            continue
+        reg = entry.get('reg', {}) or {}
+        if reg.get('mnt_id') != mnt_id:
+            continue
+        if (reg.get('mode', 0) & _S_IFMT) == _S_IFDIR:
+            directory += 1
+        else:
+            regular += 1
+    return regular, directory
+
+
 ckpt = sys.argv[1]
 demand = set()
 content_absent = set()
 internalized_with_content = 0
+content_absent_reg_demand = {}
+content_absent_dir_demand = {}
 for img in sorted(glob.glob(os.path.join(ckpt, 'mountpoints-*.img'))):
     if not img.endswith('.img'):
         continue
@@ -254,11 +305,21 @@ for img in sorted(glob.glob(os.path.join(ckpt, 'mountpoints-*.img'))):
             continue
         if outcome == INTERNALIZE_CONTENT_ABSENT:
             content_absent.add(mp)
+            # ADR-0426 D4: the cross-axis assertion. This checkpoint's OWN files.img is the
+            # authoritative answer to "does CRIU expect to open a name under this content-absent
+            # mount" — not a proxy for it.
+            reg_n, dir_n = _reg_fd_counts(ckpt, mnt_id)
+            if reg_n:
+                content_absent_reg_demand[mp] = content_absent_reg_demand.get(mp, 0) + reg_n
+            if dir_n:
+                content_absent_dir_demand[mp] = content_absent_dir_demand.get(mp, 0) + dir_n
         demand.add(mp)
 print(json.dumps({
     'demand': sorted(demand),
     'content_absent': sorted(content_absent),
     'internalized_with_content': internalized_with_content,
+    'content_absent_reg_demand': content_absent_reg_demand,
+    'content_absent_dir_demand': content_absent_dir_demand,
 }))
 `
 
@@ -270,13 +331,13 @@ print(json.dumps({
 // and a future runtime-injected file bind off a block filesystem is covered with zero new code.
 //
 // Mechanism is the EXISTING, working one (ADR-0121): vendored pycriu via a python3 subprocess with
-// PYTHONPATH=/usr/lib/python3/dist-packages. It deliberately matches readDevShmMountInfo's shape
+// PYTHONPATH=/usr/lib/python3/dist-packages. It deliberately matches contentCaptureDemandScan's shape
 // rather than inventing a second decoder — including that site's PATH-resolved `python3`, which is
 // a RECORDED, separately-tracked exposure this function must not WIDEN and does not (same binary,
 // same env, same argv-not-interpolation rule). Pinning it is its own change, out of scope here.
 //
 // The scratch script is written under the AGENT-OWNED per-migration staging dir rather than
-// readDevShmMountInfo's /dev/shm: the restore path cannot assume /dev/shm is writable in the
+// contentCaptureDemandScan's /dev/shm: the restore path cannot assume /dev/shm is writable in the
 // agent's own mount namespace, and restoreStagingDir is a tree this process demonstrably owns
 // (ensureRestoreTerminationLogFile has already created it by the time this runs).
 func destinationRebindDemandSet(ctx context.Context, migrationName, checkpointDir string) (destinationRebindDemand, error) {
