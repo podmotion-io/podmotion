@@ -72,6 +72,7 @@ func TestRunPreStage_HungPreStage_TimeoutSurfacesAsPreStageTimeout(t *testing.T)
 	pvc := makePVC("lh-pvc", "default", "longhorn-migratable",
 		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
 	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+	sc.Parameters = map[string]string{"migratable": "true"} // ADR-0424 D3
 	pod := makeOwnedPodWithPVC("default", "lh-pvc")
 	pod.Name = "lh-pod"
 
@@ -164,6 +165,7 @@ func TestRunPreStage_EmptyDestinationNode_SurfacesAsEmptyDestinationNodeConditio
 	pvc := makePVC("lh-pvc", "default", "longhorn-migratable",
 		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
 	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+	sc.Parameters = map[string]string{"migratable": "true"} // ADR-0424 D3
 	pod := makeOwnedPodWithPVC("default", "lh-pvc")
 	pod.Name = "lh-pod"
 

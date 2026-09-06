@@ -140,7 +140,7 @@ func TestSetRolledBackConditionForTier1EarlyRelease_NoOwner(t *testing.T) {
 	rec := record.NewFakeRecorder(10)
 	r := &PodMigrationReconciler{Recorder: rec}
 
-	r.setRolledBackConditionForTier1EarlyRelease(pm)
+	r.setRolledBackConditionForTier1EarlyRelease(pm, "")
 
 	cond := meta.FindStatusCondition(pm.Status.Conditions, pmv1.ConditionRolledBack)
 	if cond == nil {
@@ -173,7 +173,7 @@ func TestSetRolledBackConditionForTier1EarlyRelease_WithOwner(t *testing.T) {
 	rec := record.NewFakeRecorder(10)
 	r := &PodMigrationReconciler{Recorder: rec}
 
-	r.setRolledBackConditionForTier1EarlyRelease(pm)
+	r.setRolledBackConditionForTier1EarlyRelease(pm, "")
 
 	cond := meta.FindStatusCondition(pm.Status.Conditions, pmv1.ConditionRolledBack)
 	if cond == nil {

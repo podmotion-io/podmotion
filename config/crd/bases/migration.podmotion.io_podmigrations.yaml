@@ -337,7 +337,7 @@ spec:
                   annotation) so this progress marker never depends on repassing spec admission — the
                   validating webhook is registered only on the "podmigrations" resource, not
                   "podmigrations/status" (config/webhook/manifests.yaml), so a status-only write never
-                  invokes it (Finding 3a, round 2 of the Verifying-phase wedge fix).
+                  invokes it (part of the Verifying-phase wedge fix).
                 format: int32
                 type: integer
               cniProvider:
@@ -570,6 +570,36 @@ spec:
                   set by the NRI plugin after successful CRIU restore.
                 format: int32
                 type: integer
+              rollbackAttempted:
+                description: |-
+                  RollbackAttempted is set true, durably via patchRollbackProgress, the moment
+                  reconcileRollingBack is entered and the zero-window hold is disarmed — before any of that
+                  function's other early returns, including the restoreSourceStorageIfNeeded error return
+                  that precedes r.Rollbacker.Rollback (ADR-0423 D4a). It gates the rollback wall-clock bound
+                  so the bound can never force Failed before Rollbacker.Rollback — the only in-band
+                  mechanism that thaws a SIGSTOPped source — has been attempted at least once. Like
+                  RollbackStartTime, a transient regression to false is self-healing (the next
+                  reconcileRollingBack entry sets it back to true) and this field is deliberately not on
+                  preserveOperatorOwnedDurableStatus's allowlist. Operator-written only. See ADR-0423.
+                type: boolean
+              rollbackStartTime:
+                description: |-
+                  RollbackStartTime is the wall-clock instant this migration first entered
+                  Phase=RollingBack, stamped DURABLY by patchRollbackProgress (ADR-0423 D4) — a dedicated
+                  field-scoped, optimistic-lock patch, never the whole-.status blob writers
+                  (transitionTo/statusUpdate/failMigration). It is the source of truth for the rollback
+                  wall-clock bound: once RollbackAttempted is true, a RollingBack migration whose elapsed
+                  time since RollbackStartTime exceeds rollbackBudget is force-terminated to Failed via
+                  finalizeFailed rather than looping unbounded (the completion-budget watchdog is
+                  otherwise inert once Phase==RollingBack). A nil value is adopted-and-stamped on the next
+                  RollingBack reconcile (enterRollingBack/D4(c)) rather than treated as already-expired or
+                  as no-bound — see ADR-0423 D4/D4(c). Deliberately NOT protected by
+                  preserveOperatorOwnedDurableStatus's allowlist: a transient regression to nil is
+                  self-healing (the very next reconcile re-stamps it), unlike StoragePreStageDispatch/
+                  SourcePodSpecSnapshot, for which a regression is a correctness violation. Operator-written
+                  only (via patchRollbackProgress). See ADR-0423.
+                format: date-time
+                type: string
               seqXlatSeeded:
                 description: |-
                   SeqXlatSeeded indicates that PM_SEQ_XLAT has been seeded on the destination node AND

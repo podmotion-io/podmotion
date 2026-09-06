@@ -90,6 +90,11 @@ func TestReconcile_VerifyingWedge_LegitimateSourceDeletion_ClosesOutInsteadOfRol
 			Conditions: []metav1.Condition{
 				{Type: conditionTrafficVerified, Status: metav1.ConditionTrue, Reason: "Verified", LastTransitionTime: metav1.Now()},
 				{Type: pmv1.ConditionWorkloadLivenessVerified, Status: metav1.ConditionTrue, Reason: "Verified", LastTransitionTime: metav1.Now()},
+				// ADR-0423 D1 (V9): the S1 predicate additionally requires Restored==True. A real
+				// None-mode migration in Verifying always has this — this fixture was
+				// under-specified, not the gate weakened to fit it ("zero test-body changes" is
+				// retired as an acceptance criterion for this fixture, per ADR-0423 V9).
+				{Type: conditionRestored, Status: metav1.ConditionTrue, Reason: "Verified", LastTransitionTime: metav1.Now()},
 				{Type: conditionSourcePodDeleted, Status: metav1.ConditionTrue, Reason: "Deleted",
 					Message: "Source pod deleted post-TrafficVerified+WorkloadLivenessVerified", LastTransitionTime: metav1.Now()},
 				// The cni0-cleanup-verify retry budget is exhausted (ADR-0241 fail-open) —

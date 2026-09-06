@@ -984,6 +984,35 @@ type PodMigrationStatus struct {
 	// nil and the first reconcile claims). Operator-written only. See ADR-0398.
 	// +optional
 	StoragePreStageDispatch *StoragePreStageDispatch `json:"storagePreStageDispatch,omitempty"`
+
+	// RollbackStartTime is the wall-clock instant this migration first entered
+	// Phase=RollingBack, stamped DURABLY by patchRollbackProgress (ADR-0423 D4) — a dedicated
+	// field-scoped, optimistic-lock patch, never the whole-.status blob writers
+	// (transitionTo/statusUpdate/failMigration). It is the source of truth for the rollback
+	// wall-clock bound: once RollbackAttempted is true, a RollingBack migration whose elapsed
+	// time since RollbackStartTime exceeds rollbackBudget is force-terminated to Failed via
+	// finalizeFailed rather than looping unbounded (the completion-budget watchdog is
+	// otherwise inert once Phase==RollingBack). A nil value is adopted-and-stamped on the next
+	// RollingBack reconcile (enterRollingBack/D4(c)) rather than treated as already-expired or
+	// as no-bound — see ADR-0423 D4/D4(c). Deliberately NOT protected by
+	// preserveOperatorOwnedDurableStatus's allowlist: a transient regression to nil is
+	// self-healing (the very next reconcile re-stamps it), unlike StoragePreStageDispatch/
+	// SourcePodSpecSnapshot, for which a regression is a correctness violation. Operator-written
+	// only (via patchRollbackProgress). See ADR-0423.
+	// +optional
+	RollbackStartTime *metav1.Time `json:"rollbackStartTime,omitempty"`
+
+	// RollbackAttempted is set true, durably via patchRollbackProgress, the moment
+	// reconcileRollingBack is entered and the zero-window hold is disarmed — before any of that
+	// function's other early returns, including the restoreSourceStorageIfNeeded error return
+	// that precedes r.Rollbacker.Rollback (ADR-0423 D4a). It gates the rollback wall-clock bound
+	// so the bound can never force Failed before Rollbacker.Rollback — the only in-band
+	// mechanism that thaws a SIGSTOPped source — has been attempted at least once. Like
+	// RollbackStartTime, a transient regression to false is self-healing (the next
+	// reconcileRollingBack entry sets it back to true) and this field is deliberately not on
+	// preserveOperatorOwnedDurableStatus's allowlist. Operator-written only. See ADR-0423.
+	// +optional
+	RollbackAttempted bool `json:"rollbackAttempted,omitempty"`
 }
 
 // StoragePreStageDispatchPhase is the lifecycle phase of the storage pre-stage single-dispatch marker.

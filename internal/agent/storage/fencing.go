@@ -49,6 +49,16 @@ type PVCDetachChecker interface {
 	IsDetached(ctx context.Context, namespace, pvcName, nodeName string) (bool, error)
 }
 
+// RollbackEnterer decouples internal/agent/storage from internal/controller (avoiding an import
+// cycle — internal/controller already imports internal/agent/storage) while still routing every
+// Phase=RollingBack write through the controller's one sole-writer implementation (ADR-0423 D4
+// decision (b)). Implemented by (*controller.PodMigrationReconciler).EnterRollingBack, an
+// exported one-line wrapper around that package's unexported enterRollingBack core — there
+// remains exactly one place the phase/marker/condition are actually set.
+type RollbackEnterer interface {
+	EnterRollingBack(ctx context.Context, pm *pmv1.PodMigration, reason string) error
+}
+
 // NodeFencingEmitter monitors RWO PVC detach progress after a migration
 // completes. If a RWO PVC fails to detach from the source node within
 // rwoDetachTimeout it emits a Kubernetes Event and sets the
@@ -61,14 +71,19 @@ type NodeFencingEmitter struct {
 	Client        client.Client
 	Recorder      record.EventRecorder
 	DetachChecker PVCDetachChecker
+	// Enterer routes Phase=RollingBack entry through the controller's sole-writer
+	// enterRollingBack (ADR-0423 D4 decision (b)). May be nil in tests that never exercise the
+	// rollbackOnFailure path (initiateRollback is unreachable without it).
+	Enterer RollbackEnterer
 }
 
 // NewNodeFencingEmitter returns a production NodeFencingEmitter.
-func NewNodeFencingEmitter(c client.Client, recorder record.EventRecorder, checker PVCDetachChecker) *NodeFencingEmitter {
+func NewNodeFencingEmitter(c client.Client, recorder record.EventRecorder, checker PVCDetachChecker, enterer RollbackEnterer) *NodeFencingEmitter {
 	return &NodeFencingEmitter{
 		Client:        c,
 		Recorder:      recorder,
 		DetachChecker: checker,
+		Enterer:       enterer,
 	}
 }
 
@@ -197,15 +212,12 @@ func (e *NodeFencingEmitter) isTrafficVerified(pm *pmv1.PodMigration) bool {
 	return false
 }
 
-// initiateRollback patches the PodMigration phase to RollingBack so the
-// controller picks up the rollback pipeline on the next reconcile.
+// initiateRollback routes entry into Phase=RollingBack through the controller's sole-writer
+// enterRollingBack (ADR-0423 D4 decision (b)) via the injected RollbackEnterer, rather than
+// writing Status.Phase directly — internal/agent/storage contains no Status.Phase= assignment of
+// any kind after this conversion.
 func (e *NodeFencingEmitter) initiateRollback(ctx context.Context, pm *pmv1.PodMigration) error {
-	fresh := &pmv1.PodMigration{}
-	if err := e.Client.Get(ctx, client.ObjectKeyFromObject(pm), fresh); err != nil {
-		return err
-	}
-	fresh.Status.Phase = pmv1.MigrationPhaseRollingBack
-	return e.Client.Status().Update(ctx, fresh)
+	return e.Enterer.EnterRollingBack(ctx, pm, "node fencing detected")
 }
 
 // ── VolumeAttachment-based DetachChecker ──────────────────────────────────

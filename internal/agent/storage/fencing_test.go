@@ -68,7 +68,7 @@ func TestNodeFencingEmitter_EmitsEventOnTimeout(t *testing.T) {
 		DetachAfter: 24 * time.Hour, // effectively never in this test
 	}
 
-	emitter := storage.NewNodeFencingEmitter(c, recorder, checker)
+	emitter := storage.NewNodeFencingEmitter(c, recorder, checker, nil)
 
 	opts := storage.MigrationOptions{
 		MigrationName:   pm.Name,
@@ -127,7 +127,7 @@ func TestNodeFencingEmitter_NoOpForRWX(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pm).Build()
 	recorder := record.NewFakeRecorder(1)
 	checker := &storage.StubDetachChecker{DetachAfter: 24 * time.Hour}
-	emitter := storage.NewNodeFencingEmitter(c, recorder, checker)
+	emitter := storage.NewNodeFencingEmitter(c, recorder, checker, nil)
 
 	opts := storage.MigrationOptions{
 		Classifications: []storage.TierClassification{

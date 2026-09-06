@@ -322,13 +322,72 @@ func adr0393RecreateReconciler(t *testing.T, pm *pmv1.PodMigration) (*PodMigrati
 	return &PodMigrationReconciler{Client: c, Scheme: scheme, testOnlySnapshotHMACKey: adr0393TestKey()}, c
 }
 
+// adr0393MarkRecreatePodRunning (ADR-0423 D6a) sets a cold-recreate pod's observed status to
+// Running with its (no-readiness-probe) workload container's State.Running populated, so
+// reconcileTier1ColdRecreateFromSnapshot's Running-confirmation gate can be exercised.
+// restartCount/startedAt let a caller simulate either a stable read or a restart between reads.
+func adr0393MarkRecreatePodRunning(t *testing.T, c client.Client, ns, name string, restartCount int32, startedAt metav1.Time) {
+	t.Helper()
+	pod := &corev1.Pod{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: name}, pod); err != nil {
+		t.Fatalf("get recreate pod %q to mark running: %v", name, err)
+	}
+	pod.Status = corev1.PodStatus{
+		Phase: corev1.PodRunning,
+		ContainerStatuses: []corev1.ContainerStatus{
+			{
+				Name:         pod.Spec.Containers[0].Name,
+				RestartCount: restartCount,
+				State: corev1.ContainerState{
+					Running: &corev1.ContainerStateRunning{StartedAt: startedAt},
+				},
+			},
+		},
+	}
+	// corev1.Pod is one of the fake client's built-in "in-tree resources with status" — its
+	// status subresource is implicit even without an explicit WithStatusSubresource(&corev1.Pod{})
+	// registration, so a plain Update() silently drops this Status write; Status().Update() is
+	// required.
+	if err := c.Status().Update(context.Background(), pod); err != nil {
+		t.Fatalf("update recreate pod %q status: %v", name, err)
+	}
+}
+
 func TestADR0393_ColdRecreate_CreatesOnePod_DistinctMarker(t *testing.T) {
 	key := adr0393TestKey()
 	pm := adr0393BarePM("pm-recreate")
 	pm.Status.SourcePodSpecSnapshot = adr0393MakeSnapshot(t, key, pm, adr0393SimpleSpec(), "src-pod", "default")
 	r, c := adr0393RecreateReconciler(t, pm)
+	want := "src-pod-r-" + string(pm.UID)[:8]
 
+	// Pass 1: creates the pod. D6a — a pod object existing is not a workload running, so this must
+	// NOT yet report success.
 	outcome, _, err := r.reconcileTier1ColdRecreateFromSnapshot(context.Background(), pm)
+	if err != nil {
+		t.Fatalf("recreate errored: %v", err)
+	}
+	if outcome != coldRecreatePending {
+		t.Fatalf("expected coldRecreatePending immediately after create (D6a — not yet observed Running), got %v", outcome)
+	}
+	if n := countRecreatePods(t, c, pm); n != 1 {
+		t.Fatalf("expected exactly 1 recreate pod after create, got %d", n)
+	}
+
+	startedAt := metav1.Now()
+	adr0393MarkRecreatePodRunning(t, c, "default", want, 0, startedAt)
+
+	// Pass 2: first Running observation. adr0393SimpleSpec's container declares no readiness
+	// probe, so D6a's no-probe fallback requires a SECOND, later, agreeing read before confirming.
+	outcome, _, err = r.reconcileTier1ColdRecreateFromSnapshot(context.Background(), pm)
+	if err != nil {
+		t.Fatalf("recreate errored: %v", err)
+	}
+	if outcome != coldRecreatePending {
+		t.Fatalf("expected coldRecreatePending on the first Running observation (D6a two-read fallback), got %v", outcome)
+	}
+
+	// Pass 3: RestartCount/StartedAt unchanged across two reads — confirmed running.
+	outcome, _, err = r.reconcileTier1ColdRecreateFromSnapshot(context.Background(), pm)
 	if err != nil {
 		t.Fatalf("recreate errored: %v", err)
 	}
@@ -339,7 +398,6 @@ func TestADR0393_ColdRecreate_CreatesOnePod_DistinctMarker(t *testing.T) {
 		t.Fatalf("expected exactly 1 recreate pod, got %d", n)
 	}
 	// Distinct marker + deterministic "-r-" name; NOT the replacement-pod label.
-	want := "src-pod-r-" + string(pm.UID)[:8]
 	got := &corev1.Pod{}
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: want}, got); err != nil {
 		t.Fatalf("recreate pod %q not found: %v", want, err)
@@ -368,14 +426,25 @@ func TestADR0393_ColdRecreate_DAccept_CreateSucceededButUnrecorded(t *testing.T)
 	setCondition(pm, pmv1.ConditionRollbackRecreatePending, metav1.ConditionTrue, "RollbackRecreateInProgress", "")
 
 	scheme := adr0356Scheme(t)
-	// Pre-seed the already-created recreate pod (the create that landed before the crash).
+	// Pre-seed the already-created recreate pod (the create that landed before the crash), already
+	// observed Running+Ready (D6a) — this test's own subject is D-ACCEPT idempotency (no second
+	// pod on re-entry), not the Running-confirmation gate, so give the container a readiness probe
+	// to confirm on a single read rather than exercising the no-probe two-read fallback here.
+	recreateSpec := adr0393SimpleSpec()
+	recreateSpec.Containers[0].ReadinessProbe = &corev1.Probe{}
 	preExisting := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "src-pod-r-" + string(pm.UID)[:8],
 			Namespace: "default",
 			Labels:    map[string]string{rollbackRecreateMigrationUIDLabel: string(pm.UID)},
 		},
-		Spec: *adr0393SimpleSpec(),
+		Spec: *recreateSpec,
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: recreateSpec.Containers[0].Name, Ready: true},
+			},
+		},
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&pmv1.PodMigration{}).WithObjects(pm, preExisting).Build()

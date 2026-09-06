@@ -293,6 +293,87 @@ detect_ctr_addr_flag() {   # detect_ctr_addr_flag <ip>
   fi
 }
 
+# ── assert_storageclass_tier1_migratable: ADR-0424 D2 ────────────────────────
+# Named, reusable preflight primitive: given the RESOLVED StorageClass name a
+# Tier-1-eligible demo workload will actually bind to, fails loudly — before any
+# docker build/helm install — if that class is Longhorn-backed but does not
+# declare parameters.migratable="true". Without this, Longhorn never starts a
+# second engine on the destination node during a live migration attempt, making
+# LonghornMigrator.pollUntilSingleOwner (internal/agent/storage/tier1.go)
+# structurally unsatisfiable no matter how long it runs — the mechanism-map H6
+# finding this ADR closes.
+#
+# A StorageClass that is not Longhorn-provisioned (provisioner does not contain
+# "longhorn.io") is a different tier entirely (e.g. Ceph RBD) and is out of this
+# check's evidence base — NOT blocked here; "not migratable=true" is only
+# treated as "broken" for a Longhorn-backed class.
+#
+# No silent auto-correction: on failure this exits non-zero with a named,
+# actionable error and two remediations, exactly like the pre-existing
+# no-default-StorageClass check below — never quietly substitutes a different
+# StorageClass than the one the operator requested.
+assert_storageclass_tier1_migratable() {   # assert_storageclass_tier1_migratable <sc-name> <workload-label>
+  local sc_name="$1" workload_label="$2"
+  local provisioner migratable
+  provisioner="$(KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" get storageclass "$sc_name" \
+    -o jsonpath='{.provisioner}' 2>/dev/null || true)"
+  if [[ -z "$provisioner" ]]; then
+    echo "ERROR: assert_storageclass_tier1_migratable: StorageClass '$sc_name' (workload: $workload_label) not found in the cluster." >&2
+    exit 1
+  fi
+  if [[ "$provisioner" != *longhorn.io* ]]; then
+    echo "  -- StorageClass '$sc_name' (workload: $workload_label) is not Longhorn-provisioned (provisioner: $provisioner) — ADR-0424's migratability check does not apply to it."
+    return 0
+  fi
+  migratable="$(KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" get storageclass "$sc_name" \
+    -o jsonpath='{.parameters.migratable}' 2>/dev/null || true)"
+  if [[ "$migratable" != "true" ]]; then
+    echo "ERROR: assert_storageclass_tier1_migratable: StorageClass '$sc_name' (workload: $workload_label, provisioner: $provisioner) does not set parameters.migratable=\"true\" — PodMotion's Tier1-Longhorn dual-engine live migration requires a migratable Longhorn StorageClass; the default single-attach-only Longhorn class cannot collapse to a second engine on the destination node and AwaitSingleOwner would stall for the full completion budget instead of failing fast (ADR-0424)." >&2
+    echo "       Remediation: run 'bash hack/kvm-cluster.sh provision-longhorn' and use its \$LH_MIGRATABLE_SC (default: longhorn-migratable), or set MIGRATION_DEMO_STORAGE_CLASS=<a-migratable-longhorn-class> explicitly." >&2
+    exit 1
+  fi
+  echo "  -- StorageClass '$sc_name' (workload: $workload_label) confirmed Tier1-migratable (provisioner: $provisioner, parameters.migratable=true)"
+}
+
+# ── resolve_chart_postgres_storageclass: ADR-0424 D1/D2 fix ──────────────────
+# Reads the EFFECTIVE postgres.persistence.storageClassName default straight
+# out of the migration-demo-stack chart's own values.yaml, with no
+# MIGRATION_DEMO_STORAGE_CLASS override in play. This exists because
+# cmd_deploy_migration_demo used to resolve "what StorageClass will postgres
+# actually bind to?" as "the override, or else the cluster's default
+# StorageClass" — true when values.yaml left storageClassName empty, but
+# ADR-0424's D1 fix set it to the fixed value "longhorn-migratable" (see the
+# chart's postgres.persistence section), which need not be, and on this
+# standing cluster is NOT, the cluster's default StorageClass ("longhorn" is
+# default; "longhorn-migratable" is not). Skipping this step made the preflight
+# validate the wrong class and fail closed on a correctly-configured deploy.
+#
+# Prints the resolved value on stdout and returns 0 on success; prints nothing
+# and returns 1 if the chart's values.yaml is missing or does not set
+# postgres.persistence.storageClassName to a non-empty, non-comment value
+# (callers must fall back to the cluster default in that case — an explicitly
+# empty chart default legitimately means "use the cluster default").
+resolve_chart_postgres_storageclass() {   # resolve_chart_postgres_storageclass <chart-dir>
+  local chart_dir="$1"
+  local values_file="$chart_dir/values.yaml"
+  if [[ ! -f "$values_file" ]]; then
+    return 1
+  fi
+  local val
+  val="$(
+    awk '/^postgres:/{f=1;next} f && /^[a-zA-Z]/{f=0} f' "$values_file" |
+    awk '/^  persistence:/{p=1;next} p && /^  [a-zA-Z]/{p=0} p' |
+    grep -v '^[[:space:]]*#' |
+    grep -m1 'storageClassName:' |
+    sed -E 's/^[[:space:]]*storageClassName:[[:space:]]*"?([^"#[:space:]]*)"?.*/\1/'
+  )"
+  if [[ -z "$val" ]]; then
+    return 1
+  fi
+  echo "$val"
+  return 0
+}
+
 # ── Safety guard: never destroy/undefine a pm-* VM ───────────────────────────
 assert_no_vm_destruction() {
   echo "SAFETY: this script never runs 'virsh destroy' or 'virsh undefine' on the standing VMs (${PM_VMS[*]}). The VMs are permanent infrastructure." >&2
@@ -1167,17 +1248,57 @@ cmd_deploy_migration_demo() {
     fi
   done
 
-  if [[ -z "${MIGRATION_DEMO_STORAGE_CLASS:-}" ]]; then
-    local default_sc
-    default_sc="$(KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" get storageclass \
+  # ADR-0424 D2 (fixed): resolve the EFFECTIVE StorageClass postgres will
+  # actually bind to, in the SAME order Helm's own precedence + the chart's
+  # values.yaml actually produce it:
+  #   1. MIGRATION_DEMO_STORAGE_CLASS override, if set (passed through to helm
+  #      via --set postgres.persistence.storageClassName=... below).
+  #   2. Else, the chart's OWN postgres.persistence.storageClassName default
+  #      (resolve_chart_postgres_storageclass, above) — ADR-0424's D1 fix set
+  #      this to the fixed value "longhorn-migratable" in
+  #      charts/migration-demo-stack/values.yaml, so with no override postgres
+  #      binds to THAT, never to whatever the cluster calls its default.
+  #   3. Only if neither of the above yields a value (e.g. a future chart
+  #      regression back to storageClassName: "") does this fall back to the
+  #      cluster's default StorageClass, which is what postgres would actually
+  #      bind to in that case.
+  # Validating against the cluster-default StorageClass unconditionally (the
+  # pre-fix behavior) is wrong on THIS standing cluster specifically: its
+  # default class is "longhorn" (non-migratable), while postgres actually
+  # binds to "longhorn-migratable" (migratable, not default) — so the old
+  # resolution validated the wrong class and failed closed on an otherwise
+  # correctly-configured deploy. This is a real, visible fail-fast for the H6
+  # mechanism-map defect: proving A StorageClass merely EXISTS is not the same
+  # as proving the one postgres will actually use can support Longhorn's
+  # dual-engine live migration.
+  local resolved_sc="${MIGRATION_DEMO_STORAGE_CLASS:-}"
+  if [[ -z "$resolved_sc" ]]; then
+    resolved_sc="$(resolve_chart_postgres_storageclass "$MIGRATION_DEMO_REPO/charts/migration-demo-stack" || true)"
+    if [[ -n "$resolved_sc" ]]; then
+      echo "  -- no MIGRATION_DEMO_STORAGE_CLASS override; chart default postgres.persistence.storageClassName: $resolved_sc"
+    fi
+  fi
+  if [[ -z "$resolved_sc" ]]; then
+    resolved_sc="$(KUBECONFIG="$KUBECONFIG_OUT" kubectl --context="$KVM_CONTEXT" get storageclass \
       -o jsonpath='{.items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")].metadata.name}' 2>/dev/null || true)"
-    if [[ -z "$default_sc" ]]; then
-      echo "ERROR: deploy-migration-demo-stack: no default StorageClass found in the cluster — migration-demo-stack's postgres PVC (values.yaml storageClassName: \"\") needs one to bind, and would otherwise hang Pending silently." >&2
+    if [[ -z "$resolved_sc" ]]; then
+      echo "ERROR: deploy-migration-demo-stack: neither MIGRATION_DEMO_STORAGE_CLASS nor the chart's postgres.persistence.storageClassName default is set, and no default StorageClass exists in the cluster — migration-demo-stack's postgres PVC needs one to bind, and would otherwise hang Pending silently." >&2
       echo "       Run 'bash hack/kvm-cluster.sh provision-longhorn' first, or set MIGRATION_DEMO_STORAGE_CLASS=<name> to target an explicit StorageClass." >&2
       exit 1
     fi
-    echo "  -- default StorageClass present: $default_sc"
+    echo "  -- no override and no chart default; falling back to cluster default StorageClass: $resolved_sc"
   fi
+  # §P-VERIFY-relevant sanity check: on this standing cluster, with no
+  # MIGRATION_DEMO_STORAGE_CLASS override set, this MUST resolve to the
+  # chart's current default ("longhorn-migratable"), never to the cluster's
+  # separately-configured default StorageClass ("longhorn") — that divergence
+  # is exactly the bug this fix closes. This does not hard-fail (a deliberate
+  # future chart change is legitimate); it is a visible signal if the
+  # resolution path silently reverts to the old, wrong behavior.
+  if [[ -z "${MIGRATION_DEMO_STORAGE_CLASS:-}" && "$resolved_sc" != "longhorn-migratable" ]]; then
+    echo "  -- NOTE: resolved StorageClass '$resolved_sc' differs from the expected chart default 'longhorn-migratable' — confirm charts/migration-demo-stack/values.yaml postgres.persistence.storageClassName if this is unexpected."
+  fi
+  assert_storageclass_tier1_migratable "$resolved_sc" "migration-demo-stack postgres"
 
   local ctr_addr_flag
   ctr_addr_flag="$(detect_ctr_addr_flag "$CP1_IP")"

@@ -9,6 +9,7 @@ package storage_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -466,6 +467,7 @@ func TestStorageClassifier_Tier1_LonghornRWX(t *testing.T) {
 	pvc := makePVC("lh-rwx-pvc", "default", "longhorn-migratable",
 		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
 	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+	sc.Parameters = map[string]string{"migratable": "true"} // ADR-0424 D3
 	pod := makeOwnedPodWithPVC("default", "lh-rwx-pvc")
 
 	fakeClient := fake.NewClientBuilder().
@@ -498,6 +500,7 @@ func TestStorageClassifier_Tier1_LonghornRWX_AnnotationOnly(t *testing.T) {
 	sc := makeSC("lh-annot-sc", "some.other.provisioner", map[string]string{
 		"longhorn.io/last-applied-configmap": "unused",
 	})
+	sc.Parameters = map[string]string{"migratable": "true"} // ADR-0424 D3
 	pod := makeOwnedPodWithPVC("default", "lh-rwx-annot-pvc")
 
 	fakeClient := fake.NewClientBuilder().
@@ -531,7 +534,8 @@ func TestStorageClassifier_Tier1Longhorn_NoOwningController_IsBlocked(t *testing
 	pvc := makePVC("lh-rwx-bare-pvc", "default", "longhorn-migratable",
 		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
 	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
-	pod := makePodWithPVC("default", "lh-rwx-bare-pvc") // bare pod — no OwnerReferences
+	sc.Parameters = map[string]string{"migratable": "true"} // ADR-0424 D3 — isolate the ADR-0391 owner check this test targets
+	pod := makePodWithPVC("default", "lh-rwx-bare-pvc")     // bare pod — no OwnerReferences
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(newScheme()).
@@ -562,7 +566,8 @@ func TestStorageClassifier_Tier1Longhorn_BarePod_ArmedKeepsLonghorn(t *testing.T
 	pvc := makePVC("lh-rwx-bare-pvc", "default", "longhorn-migratable",
 		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
 	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
-	pod := makePodWithPVC("default", "lh-rwx-bare-pvc") // bare pod — no OwnerReferences
+	sc.Parameters = map[string]string{"migratable": "true"} // ADR-0424 D3
+	pod := makePodWithPVC("default", "lh-rwx-bare-pvc")     // bare pod — no OwnerReferences
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(newScheme()).
@@ -592,6 +597,7 @@ func TestStorageClassifier_Tier1Longhorn_OwnedPod_UnaffectedByArming(t *testing.
 		pvc := makePVC("lh-rwx-owned-pvc", "default", "longhorn-migratable",
 			[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
 		sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+		sc.Parameters = map[string]string{"migratable": "true"} // ADR-0424 D3
 		pod := makeOwnedPodWithPVC("default", "lh-rwx-owned-pvc")
 
 		fakeClient := fake.NewClientBuilder().
@@ -611,6 +617,71 @@ func TestStorageClassifier_Tier1Longhorn_OwnedPod_UnaffectedByArming(t *testing.
 			t.Errorf("armed=%v: expected TierLonghorn (1) for an OWNED RWX Longhorn pod (unaffected by arming), got %d (reason=%q)",
 				armed, clsfs[0].Tier, clsfs[0].Reason)
 		}
+	}
+}
+
+// TestStorageClassifier_Tier1Longhorn_NonMigratableSC_IsBlocked is the regression test for
+// ADR-0424 D3 (mechanism map H6): a Longhorn-backed, RWX PVC whose resolved StorageClass does
+// NOT declare parameters.migratable="true" must be classified TierBlocked, never TierLonghorn.
+// Before this fix, this exact fixture (RWX Longhorn + owning controller + a StorageClass
+// missing the migratable parameter — the cluster's default "longhorn" class, in the H6
+// incident) passed the RWX/ADR-0387 gate and the ADR-0391 owner gate and was classified
+// TierLonghorn, making LonghornMigrator.pollUntilSingleOwner (tier1.go) structurally
+// unsatisfiable: Longhorn never starts a second engine on the destination node when
+// spec.migratable=false, so the poll burned its full completion budget and never succeeded.
+// Uses an owned pod so this test isolates the migratable check from ADR-0391's separate
+// owner-controller gate (see TestStorageClassifier_Tier1Longhorn_NoOwningController_IsBlocked
+// for that one).
+func TestStorageClassifier_Tier1Longhorn_NonMigratableSC_IsBlocked(t *testing.T) {
+	for name, params := range map[string]map[string]string{
+		"migratable parameter omitted entirely": nil,
+		"migratable=false":                      {"migratable": "false"},
+		"migratable=True (wrong case)":          {"migratable": "True"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pvc := makePVC("lh-rwx-nonmig-pvc", "default", "longhorn",
+				[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
+			sc := makeSC("longhorn", "driver.longhorn.io", nil)
+			sc.Parameters = params
+			pod := makeOwnedPodWithPVC("default", "lh-rwx-nonmig-pvc")
+
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(newScheme()).
+				WithObjects(pvc, sc).
+				Build()
+
+			classifier := storage.NewStorageClassifier(fakeClient)
+			clsfs, err := classifier.ClassifyPod(context.Background(), pod, false)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(clsfs) != 1 {
+				t.Fatalf("expected 1 classification, got %d", len(clsfs))
+			}
+			if clsfs[0].Tier != storage.TierBlocked {
+				t.Errorf("expected TierBlocked (4) for a Longhorn RWX PVC on a non-migratable StorageClass, got %d (reason=%q)",
+					clsfs[0].Tier, clsfs[0].Reason)
+			}
+			if !strings.Contains(clsfs[0].Reason, "migratable") {
+				t.Errorf("expected reason to identify the missing/invalid migratable parameter, got %q", clsfs[0].Reason)
+			}
+		})
+	}
+}
+
+// TestStorageClassifier_IsLonghornStorageClassMigratable covers the exported
+// IsLonghornStorageClassMigratable primitive (ADR-0424 D3) directly, independent of the full
+// classifyPVC path.
+func TestStorageClassifier_IsLonghornStorageClassMigratable(t *testing.T) {
+	migratable := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+	migratable.Parameters = map[string]string{"migratable": "true"}
+	if !storage.IsLonghornStorageClassMigratable(migratable) {
+		t.Errorf("expected true for a StorageClass with parameters.migratable=\"true\"")
+	}
+
+	nonMigratable := makeSC("longhorn", "driver.longhorn.io", nil)
+	if storage.IsLonghornStorageClassMigratable(nonMigratable) {
+		t.Errorf("expected false for a StorageClass with no migratable parameter")
 	}
 }
 
