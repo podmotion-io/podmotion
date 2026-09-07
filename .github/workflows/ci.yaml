@@ -38,8 +38,21 @@ jobs:
           check-latest: true
       - name: Download modules
         run: go mod download
+      # The controller suite (internal/controller/suite_test.go BeforeSuite) starts a
+      # real Kubernetes control plane via envtest, which needs the etcd/kube-apiserver
+      # test binaries on disk and KUBEBUILDER_ASSETS pointing at them. Without this the
+      # job fails before any assertion runs. Uses the same setup-envtest mechanism as
+      # the Makefile `test` target.
+      - name: Set up envtest control-plane binaries
+        run: make setup-envtest
       - name: Run tests with race detector
-        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+        run: |
+          KUBEBUILDER_ASSETS="$(make --no-print-directory envtest-path)"
+          export KUBEBUILDER_ASSETS
+          echo "KUBEBUILDER_ASSETS=${KUBEBUILDER_ASSETS}"
+          # /e2e is excluded: it targets a standing external cluster a hosted runner
+          # cannot reach (same reason test-e2e.yml is workflow_dispatch-only).
+          go test -race -coverprofile=coverage.out -covermode=atomic $(go list ./... | grep -v /e2e)
       - name: Upload coverage artifact
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
