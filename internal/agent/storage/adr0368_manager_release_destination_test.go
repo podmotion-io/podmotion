@@ -10,7 +10,7 @@ package storage_test
 // adr0368_manager_release_destination_test.go covers StorageMigrationManager.ReleaseDestination
 // (ADR-0368 §5.3) and the opts.CutoverComplete population it drives (CONDITION 2's grounding in
 // the existing meta.FindStatusCondition/meta.IsStatusConditionTrue pattern — see
-// podmigration_controller.go:1050's use of the same ConditionStorageCutoverComplete condition).
+// podmigration_controller.go:1640's use of the same ConditionStorageCutoverComplete condition).
 
 import (
 	"context"
@@ -119,7 +119,7 @@ func withCachedLonghornClassification(pm *pmv1.PodMigration) {
 }
 
 // TestStorageMigrationManager_ReleaseDestination_CutoverCompleteGrounding table-drives
-// cutoverSideEffectOccurred's three input shapes against the real
+// CutoverSideEffectOccurred's three input shapes against the real
 // ConditionStorageCutoverComplete condition (CONDITION 2's grounding requirement) — proving
 // opts.CutoverComplete reflects the codebase's existing condition-reading pattern, not tier
 // identity.

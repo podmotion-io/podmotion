@@ -177,6 +177,7 @@ func TestDefaultConstructor_RegistersLonghornMigrator(t *testing.T) {
 	pvc := makePVC("lh-pvc", "default", "longhorn-migratable",
 		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
 	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+	sc.Parameters = map[string]string{"migratable": "true"} // ADR-0424 D3
 	pod := makeOwnedPodWithPVC("default", "lh-pvc")
 	pod.Name = "lh-pod"
 
@@ -291,6 +292,7 @@ func TestRunPreStage_TransientError_RetriesThenSucceeds(t *testing.T) {
 	pvc := makePVC("lh-pvc", "default", "longhorn-migratable",
 		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
 	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+	sc.Parameters = map[string]string{"migratable": "true"} // ADR-0424 D3
 	pod := makeOwnedPodWithPVC("default", "lh-pvc")
 	pod.Name = "lh-pod"
 
@@ -340,6 +342,7 @@ func TestRunPreStage_TransientError_BoundedRetry_FailsClosedAfterMaxAttempts(t *
 	pvc := makePVC("lh-pvc", "default", "longhorn-migratable",
 		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
 	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+	sc.Parameters = map[string]string{"migratable": "true"} // ADR-0424 D3
 	pod := makeOwnedPodWithPVC("default", "lh-pvc")
 	pod.Name = "lh-pod"
 
@@ -392,6 +395,7 @@ func TestRunPreStage_PermanentError_FailsFastWithoutRetry(t *testing.T) {
 	pvc := makePVC("lh-pvc", "default", "longhorn-migratable",
 		[]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany})
 	sc := makeSC("longhorn-migratable", "driver.longhorn.io", nil)
+	sc.Parameters = map[string]string{"migratable": "true"} // ADR-0424 D3
 	pod := makeOwnedPodWithPVC("default", "lh-pvc")
 	pod.Name = "lh-pod"
 

@@ -9,7 +9,7 @@ package server
 //
 // Default-capture only eliminates the "we forgot this OS construct" bug class if a capture that
 // FAILS cannot silently degrade into a skip. The systemic root cause named the exact anti-pattern:
-// the former captureCtrDevShmContent's silent no-op/skip branches let a real capture failure
+// the former /dev/shm-literal capture helper's silent no-op/skip branches let a real capture failure
 // (sandbox source unreachable, image write error) pass as success, so a restore later ENOENTed on
 // content that was never captured. Under fail-closed capture gate that is forbidden: if capturing an owned mount's
 // content fails, the checkpoint fails closed with an attributed reason (MountContentCaptureFailed),

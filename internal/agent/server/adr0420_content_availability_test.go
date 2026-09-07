@@ -269,7 +269,7 @@ func TestADR0420_D1_ContentAxisPredicate(t *testing.T) {
 // mechanically rather than by review.
 //
 // The shapes ADR-0420 rejects BY NAME are all string-matching shapes: a serviceaccount skip list, a
-// SERVICEACCOUNT_MOUNT_PATHS constant, extending captureCtrDevShmContent's literal /dev/shm match to
+// SERVICEACCOUNT_MOUNT_PATHS constant, extending the dump-side capture's literal /dev/shm match to
 // a second literal path. Every one of them would leave a path literal in this predicate. There is
 // none, and there must never be one — the predicate is keyed on a fact about the checkpoint on disk,
 // which is why it covers a projected-volume tmpfs, a CSI ephemeral tmpfs and a future

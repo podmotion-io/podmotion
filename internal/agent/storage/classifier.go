@@ -355,6 +355,27 @@ func (sc *StorageClassifier) classifyPVC(ctx context.Context, namespace, name st
 						StorageClass: scName,
 					}, nil
 				}
+				// ADR-0424 D3: an RWX Longhorn PVC is only genuinely Tier1-migratable if the
+				// resolved StorageClass's own declared contract says so. Longhorn will never
+				// start a second engine on the destination node when spec.migratable=false, so
+				// without this check an RWX Longhorn PVC on a non-migratable StorageClass (e.g.
+				// the cluster's plain "longhorn" default, which is RWX-capable but not
+				// migratable) sailed through to TierLonghorn uncaught here, only to make
+				// AwaitSingleOwner/pollUntilSingleOwner (tier1.go) structurally unsatisfiable —
+				// it would poll for up to the full completion budget and never succeed. Checked
+				// on sc2, the same StorageClass object already fetched above; zero new API calls.
+				if !isLonghornStorageClassMigratable(sc2) {
+					return TierClassification{
+						Tier: TierBlocked,
+						Reason: fmt.Sprintf("Longhorn-backed StorageClass %q (provisioner %s) does not set "+
+							"parameters.migratable=\"true\" — PodMotion's Tier1-Longhorn dual-engine live "+
+							"migration requires a migratable Longhorn StorageClass (e.g. \"longhorn-migratable\"); "+
+							"the default single-attach-only Longhorn class cannot collapse to a second engine on "+
+							"the destination node and AwaitSingleOwner would never succeed (ADR-0424)", scName, sc2.Provisioner),
+						PVCName:      name,
+						StorageClass: scName,
+					}, nil
+				}
 				return TierClassification{
 					Tier:         TierLonghorn,
 					Reason:       reasonForTier(TierLonghorn, sc2.Provisioner),
@@ -451,6 +472,22 @@ func isLonghornStorageClass(sc *storagev1.StorageClass) bool {
 		}
 	}
 	return false
+}
+
+// IsLonghornStorageClassMigratable is the exported form of isLonghornStorageClassMigratable
+// (ADR-0424 D3), for the same reason IsLonghornStorageClass is exported: so any future caller
+// needing this exact signal (a Longhorn StorageClass whose declared contract supports Tier1
+// dual-engine live migration) reuses this primitive rather than re-deriving
+// sc.Parameters["migratable"] == "true" a second time elsewhere in the tree. Per ADR-0424's
+// residual-risk note, this is an intentionally strict, exact-string comparison against the
+// StorageClass's own declared parameter — it does not poll the live Longhorn Volume object's
+// actual spec.migratable, and does not accept a differently-cased or padded value.
+func IsLonghornStorageClassMigratable(sc *storagev1.StorageClass) bool {
+	return isLonghornStorageClassMigratable(sc)
+}
+
+func isLonghornStorageClassMigratable(sc *storagev1.StorageClass) bool {
+	return sc.Parameters["migratable"] == "true"
 }
 
 func reasonForTier(tier StorageTier, provisioner string) string {

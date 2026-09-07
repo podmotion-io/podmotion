@@ -25,7 +25,7 @@ package server
 // The pod serviceaccount-token tmpfs is exactly that shape on every pod in the cluster.
 //
 // /dev/shm survives the identical treatment ONLY because this project separately BUILT a dump-side
-// capture for it (captureCtrDevShmContent -> tmpfs-dev-<root_dev>.tar.gz.img, with the ADR-0415
+// capture for it (ADR-0426 captureContentAbsentMounts -> tmpfs-dev-<root_dev>.tar.gz.img, with the ADR-0415
 // fail-closed capture gate). That is a per-mount carve-out matched by the literal string
 // "/dev/shm", standing in for a class-level rule. D1 is the class-level form of the question the
 // ADR-0415 gate already asks for that one mount, put on the RESTORE side where the internalization
@@ -38,7 +38,7 @@ package server
 // a future sidecar-injected credential mount tomorrow — with no new code and no skip list.
 // Explicitly rejected by name, as the shapes the standing substrate-primitive bias forbids: adding
 // /run/secrets/kubernetes.io/serviceaccount to a skip list; a SERVICEACCOUNT_MOUNT_PATHS constant;
-// dropping the offending mount; extending captureCtrDevShmContent's literal /dev/shm match to a
+// dropping the offending mount; extending the dump-side capture's literal /dev/shm match to a
 // second literal path; retrying the restore (there is nothing to retry — the content does not
 // exist).
 //
@@ -57,8 +57,9 @@ package server
 // asserts that mechanically rather than by review.
 
 // mountContentAxisPy is the SINGLE definition of CRIU's recreatability allowlist and of ADR-0420's
-// content-availability axis. It is prepended verbatim to BOTH production Python decoders
-// (assemblePatchScript and destinationRebindDemandScanPy) and is exercised directly, in
+// content-availability axis. It is prepended verbatim to ALL THREE production Python decoders
+// (assemblePatchScript, destinationRebindDemandScanPy, and — as of ADR-0426 D1a —
+// contentCaptureDemandScanPy) and is exercised directly, in
 // --content-selftest mode, by adr0420_content_availability_test.go — so the shipped predicate is
 // the one that is tested, never a Go re-implementation of it (the anti-pattern that let a Go mirror
 // drift from the real Python and miss defects; see patch_classify_test.go).

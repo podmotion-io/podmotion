@@ -274,9 +274,39 @@ var (
 		prometheus.CounterOpts{
 			Namespace: "podmotion",
 			Name:      "mount_content_availability_outcome_total",
-			Help:      "Count of ADR-0420 D1 mount content-availability decisions per content-bearing recreatable external mount, labeled by outcome (internalized_with_content|rebound_content_absent|unresolved_content_absent).",
+			Help:      "Count of ADR-0420 D1 mount content-availability decisions per content-bearing recreatable external mount, labeled by outcome (internalized_with_content|rebound_content_absent|unresolved_content_absent|inconsistent_reg_file_demand).",
 		},
 		[]string{"outcome"},
+	)
+
+	// MountContentCaptureOutcomeTotal counts the ADR-0426 D1d dump-side content-capture decision,
+	// once per INTERNALIZE_CONTENT_ABSENT mount the scanner classifies, on BOTH dump paths. This is
+	// the dump-side counterpart to MountContentAvailabilityOutcomeTotal and gives
+	// InternalizedWithContent==0 a cause rather than only a symptom (ADR-0426 D5.1).
+	//
+	// Labels:
+	//   outcome — captured|already_present|scan_failed|failed_closed|destination_reconstructable
+	//     (the failed_closed cause is carried in the "cause" label, not encoded into outcome, so the
+	//     label cardinality stays bounded)
+	//   cause — set only for failed_closed: no_root_dev|tar_failed|unreachable_workload_state|
+	//     root_dev_mismatch|root_dev_check_failed; the empty string for every other outcome.
+	//     root_dev_mismatch (ADR-0427 D6) — the resolved host directory's live device does not match
+	//     the root_dev CRIU recorded dumping this mount from: mount propagation is the overwhelmingly
+	//     likely cause. root_dev_check_failed (ADR-0427 D6) — the stat() verifying that fact could not
+	//     itself run (EACCES/ENOENT/ELOOP); this is a different, distinct fact from a confirmed
+	//     mismatch and must not be conflated with it.
+	//   source_origin — config.json|mountpoints|none (ADR-0426 round-4 D5 addition): which source of
+	//     truth the reachability check resolved the candidate host path from. Set on "captured" and on
+	//     "failed_closed{cause=unreachable_workload_state}"; empty otherwise. This is what lets a
+	//     raw-path migration reporting captured{source_origin=mountpoints} be directly distinguished
+	//     from "we did not look" (F8d).
+	MountContentCaptureOutcomeTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "podmotion",
+			Name:      "mount_content_capture_outcome_total",
+			Help:      "Count of ADR-0426 D1d dump-side content-capture decisions, labeled by outcome, cause (failed_closed only) and source_origin (config.json|mountpoints|none).",
+		},
+		[]string{"outcome", "cause", "source_origin"},
 	)
 )
 
@@ -298,5 +328,6 @@ func init() {
 		EvictionWebhookFailClosedTotal,
 		NRIRestoreGateOutcomeTotal,
 		MountContentAvailabilityOutcomeTotal,
+		MountContentCaptureOutcomeTotal,
 	)
 }

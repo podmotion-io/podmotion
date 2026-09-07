@@ -461,13 +461,21 @@ func main() {
 	// The cache is required for the ADR-0118 podUID-from-CR fallback: Checkpoint reads the
 	// PodMigration CR, and a cold (un-synced) cache would return spurious not-found errors.
 	var k8sClient client.Client
+	var apiReader client.Reader // ADR-0422 D1a item 2 / D1j
 	var seccompRecorder record.EventRecorder
 	cl, clErr := cluster.New(cfg, func(o *cluster.Options) { o.Scheme = scheme })
 	if clErr != nil {
 		log.Error(clErr, "Failed to build k8s cluster client — MigrationCheckpoint CR updates will be skipped")
 		k8sClient = nil
+		// apiReader stays nil (ADR-0422 D1j): mirrors k8sClient's own nil-on-failure branch, and
+		// matches the existing cl != nil guard at the NewBridgeMapReconciler call site below. A nil
+		// apiReader here is NOT itself a crash risk (that is exactly what this guard prevents) — what
+		// a nil apiReader MEANS downstream (fail-closed on an established-TCP restore, harmless no-op
+		// otherwise) is resolvePreservedSourceIPAuthoritative's own decision (ADR-0422 D1g1a), not
+		// this wiring's.
 	} else {
 		k8sClient = cl.GetClient()
+		apiReader = cl.GetAPIReader()
 		// ADR-0009 §3/§4: the seccomp manager emits SeccompWeakened/SeccompRestored events
 		// against the migrated Pod. Source the recorder from the cluster's event provider.
 		seccompRecorder = cl.GetEventRecorderFor("podmotion-seccomp")
@@ -479,7 +487,7 @@ func main() {
 		}()
 	}
 
-	agentSrv := server.New(nodeName, checkpointer, k8sClient)
+	agentSrv := server.New(nodeName, checkpointer, k8sClient, apiReader)
 
 	// SD-3 (ADR-0009 §2): crash-recovery for the seccomp Unconfined window. If a prior agent
 	// instance died inside the checkpoint window after SwapToUnconfined but before

@@ -127,7 +127,7 @@ func TestCaptureRestoredVethMAC_ReadsProcessOwnNetns_NotRecordedBindPath(t *test
 		t.Errorf("resolvedNetnsMAC = %q after capture, want the written-back value (write-back did not latch)", got)
 	}
 
-	if fr, err := s.finalizeRestore(context.Background(), 4242, gotPath, gotIfname, migration, "", "Strict", ""); err != nil {
+	if fr, err := s.finalizeRestore(context.Background(), 4242, gotPath, gotIfname, migration, "", "Strict", "", ""); err != nil {
 		t.Fatalf("finalizeRestore [Strict] fail-closed despite an at-restore-captured MAC: %v", err)
 	} else if fr.mac != "aa:bb:cc:dd:ee:ff" {
 		t.Errorf("finalizeRestore mac = %q, want the captured value it serves from the write-back", fr.mac)
@@ -171,7 +171,7 @@ func TestCaptureRestoredVethMAC_SucceedsWhereBindPathReadFails_LiveProofCycle1Re
 	captureRestoredVethMAC(context.Background(), migration, 9001, "")
 
 	netnsPath, ifname := s.finalizeNetnsPath(migration)
-	fr, err := s.finalizeRestore(context.Background(), 9001, netnsPath, ifname, migration, "", "Strict", "")
+	fr, err := s.finalizeRestore(context.Background(), 9001, netnsPath, ifname, migration, "", "Strict", "", "")
 	if err != nil {
 		t.Fatalf("finalizeRestore [Strict] fail-closed even though eth0 IS present in the restored process's own netns: %v — "+
 			"this is the sprint46B2 live-proof cycle-1 failure (the recorded bind-path read returns empty; the SrcPID capture must carry the migration)", err)
@@ -212,7 +212,7 @@ func TestFinalizeRestore_Strict_FailClosed_OnUnrecordableNetns(t *testing.T) {
 		t.Fatalf("test setup invalid: finalizeNetnsPath returned %q, want \"\" (nothing recorded)", netnsPath)
 	}
 
-	_, err := s.finalizeRestore(context.Background(), 4242, netnsPath, ifname, migration, "podmotion-test", "Strict", "")
+	_, err := s.finalizeRestore(context.Background(), 4242, netnsPath, ifname, migration, "podmotion-test", "Strict", "", "")
 	if err == nil {
 		t.Fatal("expected fail-closed error, got nil")
 	}
@@ -251,7 +251,7 @@ func TestFinalizeRestore_Strict_FailClosed_OnMalformedMAC(t *testing.T) {
 	storeResolvedNetnsPath(migration, "/var/run/netns/cni-malformed", "eth0")
 	netnsPath, ifname := s.finalizeNetnsPath(migration)
 
-	_, err := s.finalizeRestore(context.Background(), 4242, netnsPath, ifname, migration, "", "Strict", "")
+	_, err := s.finalizeRestore(context.Background(), 4242, netnsPath, ifname, migration, "", "Strict", "", "")
 	if err == nil {
 		t.Fatal("expected fail-closed error for an unparseable MAC, got nil")
 	}

@@ -47,6 +47,7 @@ import (
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	"github.com/podmotion-io/podmotion/internal/agent/authz"
+	"github.com/podmotion-io/podmotion/internal/agent/cripaths"
 	"github.com/podmotion-io/podmotion/internal/agent/criu"
 	"github.com/podmotion-io/podmotion/internal/agent/grpclimits"
 	"github.com/podmotion-io/podmotion/internal/agent/netnsbroker"
@@ -165,6 +166,18 @@ func (e *ExternalMountUnresolvedError) Error() string {
 	return fmt.Sprintf("external mount mnt_id=%d ext_key=%s unresolved (reason=%s, shared_id=%d, master_id=%d): hard-stopped before criu restore (ADR-0194 P-0194-1)", e.MntID, e.ExtKey, e.Reason, e.SharedID, e.MasterID)
 }
 
+// BindIPWithoutHomeIPError is returned by SingleHomeRestoredPod (ADR-0422 D1f-R4a) when the
+// checkpointed socket's bind address (bindIP) is present but the pod's identity address (homeIP,
+// Spec.SourcePodIP) is empty — there is no identity address to re-home the restored pod onto, so
+// the restore fails closed before any gateway/address-add/route-install site is reached.
+type BindIPWithoutHomeIPError struct {
+	BindIP string
+}
+
+func (e *BindIPWithoutHomeIPError) Error() string {
+	return fmt.Sprintf("SingleHomeRestoredPod: Status.TCPSeqSnapshots[0].SrcIP (bindIP=%s) is set but Spec.SourcePodIP (homeIP) is empty — no identity address to re-home onto; refusing to derive a gateway/route/address-add from an empty homeIP (ADR-0422 D1f-R4a, fail-closed)", e.BindIP)
+}
+
 // ExternalMountDroppedInfo carries the structured info for a single B-2 external mount drop.
 // Emitted as a Normal CRIUExternalMountDropped event on the PodMigration CR (H4 / C-2).
 type ExternalMountDroppedInfo struct {
@@ -237,6 +250,17 @@ type AgentServer struct {
 	checkpointer criu.Checkpointer
 	nodeName     string
 	k8sClient    client.Client // may be nil in pure-stub mode
+
+	// apiReader is the agent's UNCACHED, informer-free k8s reader (cluster.GetAPIReader()) — used
+	// ONLY where a read must be authoritative-at-this-instant rather than eventually-consistent
+	// through the informer cache (ADR-0422 D1a item 2). Populated once at agent startup from the
+	// same cluster.New() result k8sClient itself is built from (cmd/agent/main.go), mirroring the
+	// existing NewBridgeMapReconciler(cl.GetAPIReader()) call-time-argument precedent that predates
+	// this field. May be nil (cluster.New() failed at startup, the same already-tolerated
+	// cl==nil/k8sClient==nil branch — ADR-0422 D1j) — every caller MUST nil-check, and a nil reader
+	// on an established-TCP restore fails closed rather than silently no-opping (D1g1a), never a
+	// crash.
+	apiReader client.Reader
 
 	// podCIDRAllowlist is the ADR-0325 cached SSRF dial-allowlist, parsed once from
 	// Node.Spec.PodCIDRs and refreshed on the NMC re-registration cadence. nil-safe: an
@@ -321,11 +345,24 @@ type AgentServer struct {
 
 // New constructs an AgentServer with the given Checkpointer implementation.
 // k8sClient may be nil; when set the Checkpoint handler will update MigrationCheckpoint CRs.
-func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client) *AgentServer {
+//
+// apiReader is ADR-0422 D1a item 2's new UNCACHED reader (cluster.GetAPIReader()) — variadic and
+// optional (never required) so every one of this package's ~60 pre-existing test call sites built
+// against the historical 3-argument form keeps compiling unmodified; omitting it, or passing nil,
+// leaves s.apiReader nil, which every consuming call site (D1g1a) already treats as a distinguishable
+// fail-closed condition on an established-TCP restore, never a crash (D1j) and never a silent no-op
+// on a checkpoint that actually holds a connection to preserve. Production wiring passes exactly one
+// value: cl.GetAPIReader() (cmd/agent/main.go), guarded the same way k8sClient itself already is.
+func New(nodeName string, cp criu.Checkpointer, k8sClient client.Client, apiReader ...client.Reader) *AgentServer {
+	var reader client.Reader
+	if len(apiReader) > 0 {
+		reader = apiReader[0]
+	}
 	s := &AgentServer{
 		checkpointer:          cp,
 		nodeName:              nodeName,
 		k8sClient:             k8sClient,
+		apiReader:             reader,
 		ebpfMgr:               network.NewEBPFManager(context.Background()),
 		migrationPodUID:       make(map[string]string),
 		migrationSeqSnapshots: make(map[string][]*agentpb.SeqSnapshot),
@@ -409,8 +446,8 @@ var addPreservedSourceAddrFn = addPreservedSourceAddr
 // D4 liveness + fail-closed behavior is unit-testable through the real finalizeRestore entry
 // (D5 test 5 — a direct SingleHomeRestoredPod call is explicitly NOT accepted as the liveness proof,
 // ADR-0355 DR-7). Production value delegates straight to the method.
-var singleHomeRestoredPodFn = func(s *AgentServer, ctx context.Context, migrationName, namespace string, pid int) error {
-	return s.SingleHomeRestoredPod(ctx, migrationName, namespace, pid)
+var singleHomeRestoredPodFn = func(s *AgentServer, ctx context.Context, migrationName, namespace string, pid int, bindIP string) error {
+	return s.SingleHomeRestoredPod(ctx, migrationName, namespace, pid, bindIP)
 }
 
 // procNetnsPID parses "/proc/<N>/ns/net" → (N, true); anything else → (0, false). Used by
@@ -510,38 +547,101 @@ func prepPreservedSourceAddrForRestore(ctx context.Context, migrationName, check
 		metrics.MigrationsFailedTotal.WithLabelValues("restore_preserved_source_addr_bind_prep").Inc()
 		return fmt.Errorf("make preserved source IP %s bindable in pod-sandbox netns before CRIU restore (broker-delegated, ADR-0355 D1): %w", preservedSourceIP, aerr)
 	}
+	// ADR-0422 D1i5: latch the exact value actually programmed, so the idempotent-confirm gRPC
+	// Restore branch (a later RPC, after CRIU restore already ran) can serve it back rather than
+	// re-resolving a value that could diverge from what was really bound.
+	storeResolvedBindIP(migrationName, preservedSourceIP)
 	log.Info("joinNsRestore: preserved source IP made bindable in pod-sandbox netns before CRIU restore (ADR-0355 D1, broker-delegated)",
 		"migration", migrationName, "ifname", ifname, "preservedSourceIP", preservedSourceIP, "netnsPath", netnsPath)
 	return nil
 }
 
-// resolvePreservedSourceIP reads pm.Spec.SourcePodIP (the authoritative preserved source IP — the
-// SAME field SingleHomeRestoredPod single-homes on, so D1's pre-CRIU /32 and the post-CRIU /24
-// backfill cannot diverge; ADR-0355 D2 same-value invariant) for the named migration. It is NOT a
-// cache map: a fresh API-server read that cannot go stale on migration-name reuse. Returns "" when
-// the CR is unavailable/unreadable or the field is empty — the bind-prep gate treats "" as "no
-// preserved-IP prep needed."
-func (s *AgentServer) resolvePreservedSourceIP(ctx context.Context, namespace, migrationName string) string {
-	if s.k8sClient == nil || namespace == "" || migrationName == "" {
-		return ""
-	}
-	pm := &pmv1.PodMigration{}
-	if err := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: migrationName}, pm); err != nil {
-		log.Info("resolvePreservedSourceIP: get PodMigration failed — no preserved-IP bind-prep (ADR-0355 D2)",
-			"migration", migrationName, "namespace", namespace, "err", err)
-		return ""
+// preservedSourceIPFromCR is ADR-0422 D1f-R2's single reader for "which address did the held TCP
+// connection actually bind to, snapshot-first" — the ONE place this selection order is written.
+// Status.TCPSeqSnapshots[0].SrcIP (the address PrepareSource captured off the SOURCE node's own
+// socket inventory before checkpoint, persisted by the controller before Restore is ever reached —
+// podmigration_controller.go's checkpoint-response write) is preferred; pm.Spec.SourcePodIP is the
+// fallback used ONLY when no snapshot value is present (ADR-0422 D1b — a real, disclosed no-op for
+// tcpPreservationMode:None/connectionless BestEffort/Strict, and a deliberate, no-worse-than-before
+// degrade for an established-TCP checkpoint whose snapshot capture itself failed; see D1b for the
+// full reasoning either way).
+//
+// AUTHORITATIVE-BY-PROVENANCE, NOT INTEGRITY-PROTECTED (ADR-0422 D1a):
+// this value is authoritative in the sense that it is read from the SAME socket inventory the
+// checkpoint image itself is taken from, so it cannot legitimately diverge from the checkpoint ON
+// THE LEGITIMATE WRITE PATH (the source agent's own PrepareSource capture, persisted verbatim by the
+// controller) — it is NOT cryptographically integrity-protected. podmigrations/status carries no
+// field-level RBAC in this project's current chart, so any node agent's ServiceAccount can already
+// co-write TCPSeqSnapshots on any PodMigration; this function has no way to distinguish a
+// legitimately-captured value from one a compromised agent forged. See the ADR-0422 "Residual risk"
+// section for the full disclosure of what this means concretely and why it is accepted, not closed,
+// by this ADR.
+func preservedSourceIPFromCR(pm *pmv1.PodMigration) string {
+	if len(pm.Status.TCPSeqSnapshots) > 0 {
+		if snap := strings.TrimSpace(pm.Status.TCPSeqSnapshots[0].SrcIP); snap != "" {
+			return snap
+		}
 	}
 	return strings.TrimSpace(pm.Spec.SourcePodIP)
 }
 
-// resolvePreservedSourceIPForMigration is the gRPC-path variant of resolvePreservedSourceIP that
-// resolves the namespace itself (the RestoreRequest proto carries no namespace field) via the same
-// resolveNamespaceForMigration the gRPC path already trusts post-finalize. Returns "" on any miss.
-func (s *AgentServer) resolvePreservedSourceIPForMigration(ctx context.Context, migrationName string) string {
-	if s.k8sClient == nil {
-		return ""
+// bindIPFromRestoreRequest is ADR-0422 D1a item 1: a pure, zero-I/O read of the preserved-source-IP
+// value directly off the RestoreRequest RPC payload the gRPC Restore handler already received —
+// req.SeqSnapshots is populated by the controller from CheckpointResponse.seq_snapshots (the SAME
+// authoritative source preservedSourceIPFromCR prefers), so a value already in hand from the same
+// RPC call that triggers the restore cannot race a controller CR write the way a subsequent read
+// can. Returns ("", false) when req.SeqSnapshots is empty or its first entry's SrcIp is blank — the
+// caller then falls back to resolvePreservedSourceIPAuthoritative (D1a item 2/3), never re-reads a
+// cache. Index [0] only, matching prepPreservedSourceAddrForRestore's own single-address contract
+// (see the ADR's "why index [0]" note) — this is not a multi-connection primitive.
+func bindIPFromRestoreRequest(req *agentpb.RestoreRequest) (string, bool) {
+	if req == nil || len(req.SeqSnapshots) == 0 {
+		return "", false
 	}
-	return s.resolvePreservedSourceIP(ctx, s.resolveNamespaceForMigration(ctx, migrationName), migrationName)
+	ip := strings.TrimSpace(req.SeqSnapshots[0].SrcIp)
+	if ip == "" {
+		return "", false
+	}
+	return ip, true
+}
+
+// errNilAuthoritativeReader is returned by resolvePreservedSourceIPAuthoritative when reader is nil
+// (ADR-0422 D1g1a) — a state reached whenever cluster.New() failed at agent startup (D1j's own
+// already-tolerated branch), NOT the same as a genuinely empty namespace/migrationName. Collapsing
+// the two into the same ("", nil) no-op would silently skip bind-prep on a node whose agent started
+// degraded, for a checkpoint that genuinely holds an established connection to preserve — the exact
+// fail-open shape D1g0 exists to close, reintroduced at the reader-nil case. Every caller propagates
+// this as a non-nil error, which D1g2's checkpointHasEstablishedTCP-scoped fail-closed policy then
+// handles identically to any other resolution failure.
+var errNilAuthoritativeReader = errors.New("resolvePreservedSourceIPAuthoritative: apiReader is nil")
+
+// resolvePreservedSourceIPAuthoritative is ADR-0422 D1a items 2/3 — the generalized, explicit-
+// client.Reader-parameterized form of the retired resolvePreservedSourceIP. Callers pass s.apiReader
+// (the agent's UNCACHED reader, never s.k8sClient) so this function never races the controller's
+// Status.TCPSeqSnapshots write the way a cached, informer-backed read can (ADR-0422 D1a's own
+// cache-race finding — there is no happens-before ordering between the controller's write and this
+// agent's informer catching up).
+//
+// Returns (value, nil) on a genuine no-op (nil reader excepted — see errNilAuthoritativeReader
+// above), and ("", err) on any read failure — a failed Get is never collapsed into the same "" a
+// successfully-read-but-empty CR returns (ADR-0422 D1g0's fail-open regression class). Callers are
+// responsible for D1g2's checkpointHasEstablishedTCP-scoped fail-closed decision; this function only
+// reports what happened, it does not decide whether a failure here should abort the restore.
+func resolvePreservedSourceIPAuthoritative(ctx context.Context, reader client.Reader, namespace, migrationName string) (string, error) {
+	if reader == nil {
+		// D1g1a: a nil reader is NOT the same case as a genuinely empty namespace/migrationName —
+		// see errNilAuthoritativeReader's own doc comment for why collapsing the two is unsafe.
+		return "", errNilAuthoritativeReader
+	}
+	if namespace == "" || migrationName == "" {
+		// No identity to look up — a real no-op, unrelated to whether a reader exists.
+		return "", nil
+	}
+	pm := &pmv1.PodMigration{}
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: migrationName}, pm); err != nil {
+		return "", fmt.Errorf("resolvePreservedSourceIPAuthoritative: get PodMigration %s/%s: %w", namespace, migrationName, err)
+	}
+	return preservedSourceIPFromCR(pm), nil
 }
 
 // ADR-0353: restoreClaim is the single-owner in-flight restore claim record. owner is "NRI" or
@@ -633,7 +733,14 @@ type restoreResult struct {
 // Condition 3). For None/BestEffort: an empty MAC records a queryable CR-status condition and
 // continues. Returns the populated restoreResult; callers must pass result.mac to
 // ReportRestoreConfirmed.
-func (s *AgentServer) finalizeRestore(ctx context.Context, pid int, netnsPath, ifname, migrationName, namespace, tcpPreservationMode, checkpointDir string) (restoreResult, error) {
+// bindIP is ADR-0422 D1i's threaded trailing parameter — the SAME already-resolved value the caller
+// obtained via D1a's resolution mechanisms before invoking joinNsRestoreFn on this same execution
+// path (or, on the idempotent-confirm branch, the D1i5 write-back latch). finalizeRestore threads it
+// straight into SingleHomeRestoredPod rather than letting that function re-derive it through its own
+// cached read — the second half of the D1a cache-race fix (D1i0's own finding: closing the race at
+// bind-prep's read alone left it open one function later, on the branch with the most severe
+// (silent) failure shape).
+func (s *AgentServer) finalizeRestore(ctx context.Context, pid int, netnsPath, ifname, migrationName, namespace, tcpPreservationMode, checkpointDir, bindIP string) (restoreResult, error) {
 	result := restoreResult{
 		pid:       pid,
 		netnsPath: netnsPath,
@@ -755,7 +862,7 @@ func (s *AgentServer) finalizeRestore(ctx context.Context, pid int, netnsPath, i
 		shNamespace = s.resolveNamespaceForMigration(ctx, migrationName)
 	}
 	if s.k8sClient != nil && shNamespace != "" && pid > 0 {
-		if shErr := singleHomeRestoredPodFn(s, ctx, migrationName, shNamespace, pid); shErr != nil {
+		if shErr := singleHomeRestoredPodFn(s, ctx, migrationName, shNamespace, pid, bindIP); shErr != nil {
 			if establishedTCP {
 				// FAIL CLOSED (DR-14): D1's non-routable /32 is present and the routable /24 backfill
 				// FAILED — resuming the ESTABLISHED socket onto the /32 is the H3' silent stranding,
@@ -997,7 +1104,25 @@ func (s *AgentServer) JoinNsRestore(ctx context.Context, migrationName, namespac
 	// field SingleHomeRestoredPod single-homes on) and thread it into joinNsRestore so the pre-CRIU
 	// bind-prep can make it locally bindable before soccr's bind() on an established-TCP restore.
 	// Empty (no CR / empty field) → the bind-prep gate is a no-op.
-	preservedSourceIP := s.resolvePreservedSourceIP(joinNsRestoreCtx, namespace, migrationName)
+	// ADR-0422 D1a item 2: the NRI path has no RestoreRequest RPC payload (no req.SeqSnapshots
+	// exists here) — resolve authoritatively via the uncached s.apiReader (never s.k8sClient, which
+	// races the controller's Status.TCPSeqSnapshots write). D1g2: an authoritative-read failure
+	// fails closed ONLY when the checkpoint actually holds an established TCP connection to
+	// preserve — a harmless, disclosed no-op otherwise.
+	preservedSourceIP, resolveErr := resolvePreservedSourceIPAuthoritative(joinNsRestoreCtx, s.apiReader, namespace, migrationName)
+	if resolveErr != nil {
+		if checkpointHasEstablishedTCP(checkpointDir) {
+			// Observability Architect finding: surface this fail-closed condition as a Warning
+			// Event immediately, agent-side (emitPreservedSourceIPUnresolvedEvent), rather than
+			// leaving the operator to wait on the 60s controller NRI-confirm timeout / gRPC
+			// Restore retry to learn about it from the agent-pod log alone.
+			s.emitPreservedSourceIPUnresolvedEvent(context.Background(), migrationName, resolveErr)
+			return 0, "", fmt.Errorf("resolve preserved source IP for established-TCP restore (ADR-0422 D1g, fail-closed): %w", resolveErr)
+		}
+		log.Info("JoinNsRestore: resolve preserved source IP failed, but checkpoint has no established TCP to preserve — proceeding without bind-prep (ADR-0422 D1g, scoped fail-closed)",
+			"migration", migrationName, "err", resolveErr)
+		preservedSourceIP = ""
+	}
 	pid, droppedMounts, err := joinNsRestoreFn(joinNsRestoreCtx, migrationName, checkpointDir, imageName, containerID, "", sandboxID, storedVeth, strictMode, reattachMounts, containerCgroupsPath, podCgroupParent, preservedSourceIP)
 	if err != nil {
 		// ADR-0193 P-0193-4 / S1: emit a Warning CRIUImageInconsistency Kubernetes Event on the
@@ -1062,8 +1187,15 @@ func (s *AgentServer) JoinNsRestore(ctx context.Context, migrationName, namespac
 	// (parity with the gRPC fallback path), MAC resolution falls back to the PrepareDestinationNetns
 	// bind mount rather than the ptrace'd /proc/<pid>/ns/net path AppArmor denies.
 	netnsPath, macIfname := s.finalizeNetnsPath(migrationName)
-	fr, frErr := s.finalizeRestore(joinNsRestoreCtx, pid, netnsPath, macIfname, migrationName, namespace, tcpPreservationMode, checkpointDir)
+	fr, frErr := s.finalizeRestore(joinNsRestoreCtx, pid, netnsPath, macIfname, migrationName, namespace, tcpPreservationMode, checkpointDir, preservedSourceIP)
 	if frErr != nil {
+		// Observability Architect finding: surface the ADR-0422 D1f-R4a fail-closed condition as
+		// a Warning Event immediately, agent-side, matching the emitPreservedSourceIPUnresolvedEvent
+		// treatment above rather than leaving it agent-pod-log-only until the 60s controller poll.
+		var bhErr *BindIPWithoutHomeIPError
+		if errors.As(frErr, &bhErr) {
+			s.emitBindIPWithoutHomeIPEvent(context.Background(), migrationName, bhErr)
+		}
 		// Strict/Full fail-closed: propagate.
 		return 0, "", frErr
 	}
@@ -1605,15 +1737,44 @@ func ensureRestoreTerminationLogFile(migrationName string) (string, error) {
 // ---------------------------------------------------------------------------------------------
 
 // allowedExtMountHostTargetPrefixes is the closed set of destination-node directory trees a
-// --ext-mount-map target may live under. Every legitimate target this agent produces is either a
-// kubelet-staged pod path (PVC volume dirs, EmptyDir scaffold dirs, /etc/hosts), a containerd CRI
-// sandbox path (hostname/resolv.conf — the real §P-PREMISE-decoded writer), or a path this agent
-// staged itself under /var/lib/podmotion. Anything outside these trees — /, /etc, /root, a host
-// device node — is not a target this code path can legitimately produce, so it is rejected before
-// argv regardless of how plausible the string looks.
+// --ext-mount-map target may live under. There are FOUR legitimate target classes:
+//
+//  1. a kubelet-staged pod path (PVC volume dirs, EmptyDir scaffold dirs, /etc/hosts);
+//  2. a containerd CRI SANDBOX path (hostname/resolv.conf — the real §P-PREMISE-decoded writer);
+//  3. a containerd CRI CONTAINERS path — the anonymous per-container volume dir containerd
+//     synthesizes for an image VOLUME directive the pod spec does not address
+//     (<root>/io.containerd.grpc.v1.cri/containers/<CID>/volumes/<hash>);
+//  4. a path this agent staged itself under /var/lib/podmotion.
+//
+// Anything outside these trees — /, /etc, /root, a host device node — is not a target this code
+// path can legitimately produce, so it is rejected before argv regardless of how plausible the
+// string looks.
+//
+// ADR-0421 D1a — WHY CLASS 3 EXISTS AND WHEN IT BECAME REACHABLE, because the previous version of
+// this comment asserted the three-class enumeration was EXHAUSTIVE and that assertion was FALSE.
+// It was true for the four hardcoded targets ADR-0417 resolved. It stopped being true when
+// ADR-0419 D3 replaced that closed four-entry table with an open lookup over whatever the runtime
+// reports — i.e. the allowlist was not widened in step with its own INPUT'S PROVENANCE change, and
+// a target that this agent itself resolved from runtime truth was then rejected at the prefix check
+// below even though the resolvedHostTargets provenance check above it had already passed. Leaving a
+// comment that asserts a closed set the code no longer has is the failure that produced that
+// defect; it is not repeated. This enumeration is open to correction, not asserted as final.
+//
+// ADR-0421 D1b — class 3 is a CLASS ADMISSION, NOT AN EXEMPTION. The added prefix is a specific
+// subtree, never the containerd root: widening to the bare root would admit the snapshotter tree,
+// the content store and every other subtree, destroying the confinement property this function
+// exists for. Every other S2(b) rule still runs on a containers-tree target exactly as it runs on a
+// sandbox-tree target — the resolvedHostTargets provenance check, the control-character and
+// lexical-cleanliness rules, the absolute-path rule, and the ADR-0419 D9 fail-closed EvalSymlinks
+// realpath confinement.
 //
 // The containerd entries are derived from the DISCOVERED daemon (ADR-0370) rather than hardcoded,
-// so this stays correct on kubeadm-containerd, k3s, and RKE2 alike.
+// so this stays correct on kubeadm-containerd, k3s, and RKE2 alike. Both CRI classes are emitted
+// under EACH of the three discovered roots, in one loop: ADR-0421's runtime-dependency audit
+// records the root-vs-run-vs-state question as deliberately UNDECIDED, resolved by enumerating
+// rather than guessing, exactly as the sandbox class already did. (ADR-0421 §P-VERIFY #1 measured
+// the containers tree under the `root` dir on both kind and RKE2; the other two prefixes cost one
+// string each and buy substrate independence.)
 func allowedExtMountHostTargetPrefixes(ctx context.Context) []string {
 	prefixes := []string{
 		"/var/lib/kubelet/pods/",
@@ -1627,7 +1788,14 @@ func allowedExtMountHostTargetPrefixes(ctx context.Context) []string {
 		if root == "" {
 			continue
 		}
-		prefixes = append(prefixes, filepath.Join(root, criSandboxDirRel)+"/")
+		// ADR-0421 D1e: iterate the SHARED class list rather than naming the two segments here.
+		// The netns-broker's server-pinned path family (ADR-0419 D9) is a second, independent
+		// confinement bound over the same classes; enumerating them in two places is what let D1
+		// widen this bound and silently leave that one behind. A fifth writer class added to
+		// internal/agent/cripaths now reaches both bounds without editing either.
+		for _, rel := range cripaths.AllDirRels() {
+			prefixes = append(prefixes, filepath.Join(root, rel)+"/")
+		}
 	}
 	return prefixes
 }
@@ -1796,6 +1964,16 @@ func validateExtMountToken(key, target string, resolvedHostTargets map[string]bo
 // DESTINATION-REBIND targets from --ext-mount-map, leaving CRIU to restore against the SOURCE
 // node's recorded /etc/hosts source and ENOENT mid-restore — the exact defect ADR-0417 exists to
 // fix, reintroduced as a fail-open. Every other outcome is a resolved set or a named terminal.
+//
+// ADR-0421 D2j AMENDS THAT, without disturbing it. The reasoning above is correct and is retained:
+// an empty sandboxID must not silently drop the destination-rebind targets. What is ADDED is that
+// it must not reach an UNDER-DETERMINED LOOKUP either. On the gRPC path the client-side sandbox
+// narrowing is a no-op when the key is empty — every row for the pod UID survives, across every
+// sandbox including stale ones — and a CRI container name is byte-identical across sandbox churn,
+// so the container-name filter cannot disambiguate the very thing the missing key left open. An
+// empty sandboxID therefore now routes to a NAMED TERMINAL
+// (DestinationRuntimeMountSandboxKeyMissingError), decided before any containerd listing is
+// requested. Neither fail-open nor silent guess.
 func (s *AgentServer) appendDestinationRebindReattachMounts(
 	ctx context.Context, migrationName, checkpointDir, sandboxID string,
 	runtimeMounts []nri.ContainerMount, mounts []reattachMount,
@@ -1847,6 +2025,29 @@ func (s *AgentServer) appendDestinationRebindReattachMounts(
 			"contentAbsent", demand.ContentAbsent,
 			"internalizedWithContent", demand.InternalizedWithContent)
 	}
+
+	// ADR-0426 D4 — the cross-axis assertion that does not exist today. Immediately after the
+	// ADR-0420 D1 log line and BEFORE resolveDestinationRebindTargets (and therefore before any CRIU
+	// invocation): a non-empty ContentAbsentWithRegFileDemand map means this checkpoint is internally
+	// inconsistent — it classifies a mount content-absent (so the destination's own empty mount is
+	// used) while recording a regular file inside it that CRIU will be told to open. Restoring would
+	// abort at criu/files-reg.c:2353. This is a HARD STOP, refusing before CRIU is invoked instead of
+	// crashing 400ms into `criu restore`. The S_IFDIR exclusion stays mandatory here (round 2): a
+	// directory-fd demand (a token-rotation directory watch) lands in the diagnostic-only
+	// ContentAbsentWithDirFdDemand map and never reaches this check, so it does not turn a routine
+	// restore into an attributed hard failure.
+	for mp, n := range demand.ContentAbsentWithRegFileDemand {
+		if n <= 0 {
+			continue
+		}
+		metrics.MountContentAvailabilityOutcomeTotal.WithLabelValues("inconsistent_reg_file_demand").Inc()
+		err := &ContentAbsentRegFileDemandError{Mountpoint: mp, RegFileCount: n}
+		log.Error(err, "ADR-0426 D4: checkpoint is internally inconsistent — content-absent mount records a regular-file demand CRIU would fail to open at restore — failing closed before CRIU is invoked",
+			"migration", migrationName, "checkpointDir", checkpointDir, "mountpoint", mp, "regFileCount", n)
+		destinationRebindObserveFn(migrationName, 1, time.Since(start), "content_absent_reg_file_demand")
+		return mounts, err
+	}
+
 	// A mountpoint already resolved by an earlier tier (storage-tier PVC re-attach, holder scaffold)
 	// is NOT a destination-rebind demand: patch_checkpoint_script.go checks its re-attach carve-out
 	// FIRST and would use that tier's target anyway. Emitting a second, differently-resolved target
@@ -1883,8 +2084,39 @@ func (s *AgentServer) appendDestinationRebindReattachMounts(
 			return mounts, fmt.Errorf("destination rebind: no replacement pod resolved for migration %s in namespace %s (label %s) — cannot ask the runtime for its mount list (ADR-0419 D5)",
 				migrationName, podNs, replacementPodLabelKey)
 		}
+		// ADR-0421 D2a — thread the restore-target discriminator in FROM THE SOURCE OF TRUTH.
+		//
+		// The value comes from the replacement pod the caller ALREADY HAS IN HAND, two statements
+		// above: replPod.Spec.Containers[i].Name for every i. No new Kubernetes API call, no new
+		// gRPC call, no new argv, no new annotation, no new field — one slice walk on an object
+		// already fetched.
+		//
+		// NOT the podmotion.io/restore-target-containers annotation, deliberately. That key has
+		// exactly one producer and NO admission-time integrity guard anywhere — no validating
+		// webhook, no ownership check — and the replacement pod is resolved in the WORKLOAD's
+		// namespace, so the annotation is writable by any principal holding `patch pods` there: a
+		// sidecar injector, a service mesh, a CI deployer, a compromised in-namespace controller.
+		// Making it the SELECTOR would hand such a principal control over which container's OCI
+		// mount list populates resolvedHostTargets — the very set validateExtMountToken calls "the
+		// load-bearing check against a forged marker line", on the stated ground that an attacker
+		// who controls the checkpoint image cannot make a target of their choosing appear in a set
+		// the agent built from Kubernetes/containerd/filesystem reads. Reading a derived,
+		// attacker-writable COPY of a fact already held in its authoritative form is exactly the
+		// brittle-chain signature this ADR is written against; container names are IMMUTABLE on an
+		// existing pod through the API server, annotations are freely patchable.
+		//
+		// The annotation is therefore NOT read on this path at all — not cross-checked, not
+		// preferred, not used as a fallback. Cross-checking would still leave an attacker able to
+		// NARROW the set (drop names -> empty -> fail closed -> denial); not reading it removes the
+		// input from this path entirely. The NRI path's own use of it is unchanged and stays
+		// correct, because there it only ever causes a SKIP and a full anti-spoof verification sits
+		// immediately behind it.
+		restoreTargets := make([]string, 0, len(replPod.Spec.Containers))
+		for i := range replPod.Spec.Containers {
+			restoreTargets = append(restoreTargets, replPod.Spec.Containers[i].Name)
+		}
 		var rErr error
-		runtimeMounts, rErr = s.resolveRuntimeMountsWaiting(ctx, string(replPod.UID), sandboxID, pending)
+		runtimeMounts, rErr = s.resolveRuntimeMountsWaiting(ctx, string(replPod.UID), sandboxID, restoreTargets, pending)
 		if rErr != nil {
 			destinationRebindObserveFn(migrationName, attempts, time.Since(start), "runtime_lookup_failed")
 			return mounts, rErr
@@ -2536,7 +2768,7 @@ func (s *AgentServer) markSeqXlatSeeded(ctx context.Context, migrationName, name
 // CiliumEndpoint/ipcache accounting for the stripped CNI-assigned primary is explicitly UNRECONCILED
 // by ADR-0355 and DEFERRED to its DR-5 live proof + ADR-0330 (a real Cilium ipcache substrate) — not
 // re-decided in this function. See ADR-0355 §Consequences and the sprint46B9 DR-5 live proof.
-func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, namespace string, pid int) error {
+func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, namespace string, pid int, bindIP string) error {
 	if s.k8sClient == nil {
 		return fmt.Errorf("SingleHomeRestoredPod: no k8s client available on agent server")
 	}
@@ -2552,14 +2784,46 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 		return fmt.Errorf("SingleHomeRestoredPod: get PodMigration %s/%s: %w", namespace, migrationName, err)
 	}
 
-	oldIP := strings.TrimSpace(pm.Spec.SourcePodIP)
-	if oldIP == "" {
-		log.Info("SingleHomeRestoredPod: pm.Spec.SourcePodIP is empty — no-op (legacy/cold path)",
+	// ADR-0422 D1f: the old single "oldIP" splits into TWO facts. homeIP is the pod's declared/
+	// pinned IDENTITY address (pm.Spec.SourcePodIP — unchanged source field, D1/D1a do not touch
+	// its meaning here; it is what the Service endpoint, WorkloadLivenessVerified, and
+	// dialAllowedForMigrationProbe already treat as this pod's real, cluster-routable identity).
+	// bindIP is the SOCKET BIND address — the address soccr actually bound the held ESTABLISHED
+	// connection to — and is now CALLER-SUPPLIED (D1i): it is the SAME already-resolved value
+	// bind-prep programmed before CRIU restore, threaded down through finalizeRestore, never
+	// independently re-derived here through a second, potentially-racing CR read.
+	//
+	// When the caller passes "" — a connectionless restore where bind-prep never ran, a direct
+	// legacy-style call, or a first-generation migration where the two values coincide by
+	// construction — bindIP degrades to homeIP, so every currently-reachable no-divergence path
+	// behaves exactly as it did before this ADR (D1f-R1/D1f-R3).
+	homeIP := strings.TrimSpace(pm.Spec.SourcePodIP)
+	bindIP = strings.TrimSpace(bindIP)
+	if bindIP == "" {
+		bindIP = homeIP
+	}
+	if homeIP == "" && bindIP == "" {
+		log.Info("SingleHomeRestoredPod: no preserved source IP (Spec.SourcePodIP and Status.TCPSeqSnapshots[0].SrcIP both empty) — no-op (legacy/cold path)",
 			"migration", migrationName, "restoredPID", pid)
 		return nil
 	}
-	if parsed := net.ParseIP(oldIP); parsed == nil || parsed.To4() == nil {
-		return fmt.Errorf("SingleHomeRestoredPod: SourcePodIP %q is not a valid IPv4", oldIP)
+	if homeIP != "" {
+		if parsed := net.ParseIP(homeIP); parsed == nil || parsed.To4() == nil {
+			return fmt.Errorf("SingleHomeRestoredPod: SourcePodIP (homeIP) %q is not a valid IPv4", homeIP)
+		}
+	}
+	if bindIP != "" && bindIP != homeIP {
+		if parsed := net.ParseIP(bindIP); parsed == nil || parsed.To4() == nil {
+			return fmt.Errorf("SingleHomeRestoredPod: bindIP %q is not a valid IPv4", bindIP)
+		}
+	}
+	// ADR-0422 D1f-R4a: bindIP present but homeIP empty (an out-of-band CR mutation, or a future
+	// workflow that seeds a snapshot before the spec field — not provably unreachable today, per
+	// D1f-R3's own open question) fails closed HERE, before any gateway/address-add/route-install
+	// site downstream can be reached with an empty homeIP and construct a malformed "/24"-only
+	// address or a "" derived gateway/route.
+	if bindIP != "" && homeIP == "" {
+		return &BindIPWithoutHomeIPError{BindIP: bindIP}
 	}
 
 	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
@@ -2578,7 +2842,7 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 	}
 	addrs := parseEth0IPv4Addrs(string(r1.Combined))
 	log.Info("SingleHomeRestoredPod: eth0 addresses before single-home (ADR-0137/0138)",
-		"migration", migrationName, "restoredPID", pid, "oldIP", oldIP, "addrs", addrs)
+		"migration", migrationName, "restoredPID", pid, "bindIP", bindIP, "homeIP", homeIP, "addrs", addrs)
 
 	// ADR-0352 Strict DUAL-HOME (sprint46B9 regression fix): the preserved-IP pin need NOT be
 	// honored — under Cilium cluster-pool IPAM the restored pod is legitimately assigned a FRESH
@@ -2602,39 +2866,44 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 	// WAS honored, i.e. oldIP is itself the CNI primary, or a legacy replay left oldIP as the sole
 	// address). The signal is the pod's OWN eth0 address set — a local source of truth with no
 	// dependency on Status.PodIP having propagated yet.
+	// ADR-0422 D1f-R5 (2689): keyed on homeIP — this asks "does eth0 carry a scope-global address
+	// that differs from the pod's home identity," a question about IDENTITY divergence, not about
+	// the socket bind artifact (which is scope-host per D1 and excluded by the scope==global filter
+	// regardless).
 	dualHomePrimary := ""
 	for _, a := range addrs {
 		ipOnly := a.CIDR
 		if i := strings.IndexByte(ipOnly, '/'); i >= 0 {
 			ipOnly = ipOnly[:i]
 		}
-		if ipOnly != oldIP && a.Scope == "global" {
+		if ipOnly != homeIP && a.Scope == "global" {
 			dualHomePrimary = ipOnly
 			break
 		}
 	}
 	if dualHomePrimary != "" {
-		// DUAL-HOME: keep the CNI primary AND oldIP; do not strip, do not re-home, do not rewrite the
-		// (correct, CNI-provided) routes. Verify routability for the DR-14 fail-closed contract: a
-		// scope-global primary must be present (it is — dualHomePrimary) and oldIP must be present on
-		// eth0 (D1's /32 scope-host, or a scope-global oldIP). If oldIP is somehow absent the held
-		// socket would strand — fail closed rather than resume onto a missing bind address.
+		// DUAL-HOME: keep the CNI primary AND bindIP; do not strip, do not re-home, do not rewrite
+		// the (correct, CNI-provided) routes. Verify routability for the DR-14 fail-closed contract:
+		// a scope-global primary must be present (it is — dualHomePrimary) and bindIP must be
+		// present on eth0 (D1's /32 scope-host, or a scope-global bindIP — ADR-0422 D1f-R5 2700-2712:
+		// this is D1's own subject verbatim). If bindIP is somehow absent the held socket would
+		// strand — fail closed rather than resume onto a missing bind address.
 		oldPresent := false
 		for _, a := range addrs {
 			ipOnly := a.CIDR
 			if i := strings.IndexByte(ipOnly, '/'); i >= 0 {
 				ipOnly = ipOnly[:i]
 			}
-			if ipOnly == oldIP {
+			if ipOnly == bindIP {
 				oldPresent = true
 				break
 			}
 		}
 		if !oldPresent {
-			return fmt.Errorf("SingleHomeRestoredPod: dual-home — OLD IP %s absent from eth0 (D1 /32 bind missing); held socket would strand (addrs %v)", oldIP, addrs)
+			return fmt.Errorf("SingleHomeRestoredPod: dual-home — BIND IP %s absent from eth0 (D1 /32 bind missing); held socket would strand (addrs %v)", bindIP, addrs)
 		}
-		log.Info("SingleHomeRestoredPod: dual-homed restored pod — kept CNI primary + preserved OLD IP (ADR-0352 Strict, sprint46B9 fix; pin not honored, no single-home strip)",
-			"migration", migrationName, "restoredPID", pid, "oldIP", oldIP, "cniPrimary", dualHomePrimary, "addrs", addrs)
+		log.Info("SingleHomeRestoredPod: dual-homed restored pod — kept CNI primary + preserved BIND IP (ADR-0352 Strict, sprint46B9 fix; pin not honored, no single-home strip)",
+			"migration", migrationName, "restoredPID", pid, "bindIP", bindIP, "homeIP", homeIP, "cniPrimary", dualHomePrimary, "addrs", addrs)
 		return nil
 	}
 
@@ -2647,27 +2916,34 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 	// ADR-0355 D4 part 3 (scope-aware oldSeen): a scope-host /32 for the OLD IP is the D1 CRIU-bind
 	// artifact — NEVER strip it, and do NOT let it suppress the /24 scope-global add; only a
 	// scope-GLOBAL OLD-IP address counts as "already single-homed".
+	// ADR-0422 D1f-R5: oldSeen (2740-2742) is keyed ONLY on homeIP — the ASSIGN step below adds
+	// homeIP, not bindIP, so oldSeen must ask "is homeIP already present at scope-global," never
+	// "is bindIP present." The strip-loop never-strip predicate (2737-2743) protects the UNION of
+	// both: stripping bindIP strands the held socket; stripping homeIP if already present would
+	// defeat the point of re-homing onto it. When bindIP == homeIP (no divergence) this collapses
+	// to the original single check.
 	oldSeen := false
 	var delErrs []string
-	cni0Gateway := gatewayForIP(oldIP) // fallback
+	cni0Gateway := gatewayForIP(homeIP) // fallback
 	for _, a := range addrs {
 		cidr := a.CIDR
 		ipOnly := cidr
 		if i := strings.IndexByte(cidr, '/'); i >= 0 {
 			ipOnly = cidr[:i]
 		}
-		if ipOnly == oldIP {
-			// Never strip an OLD-IP address. Only a scope-GLOBAL OLD IP suppresses the /24 add
-			// (ADR-0355 D4 part 3) — a scope-host /32 (the D1 artifact) must NOT.
-			if a.Scope == "global" {
+		if ipOnly == bindIP || ipOnly == homeIP {
+			// Never strip EITHER address. Only a scope-GLOBAL homeIP suppresses the /24 add
+			// (ADR-0355 D4 part 3 / ADR-0422 D1f-R5) — a scope-host /32 bindIP (the D1 artifact)
+			// must NOT, and must never be treated as "already single-homed" either.
+			if ipOnly == homeIP && a.Scope == "global" {
 				oldSeen = true
 			}
 			continue
 		}
 		// This is the new CNI IP (or any other non-OLD address). Derive the DESTINATION gateway from
-		// an address whose /24 is NOT the OLD IP's /24 (an OLD-/24 leftover would yield the dead
-		// SOURCE gateway and break the pod's return path); keep the OLD-/24 fallback otherwise.
-		if cidr24ForIP(ipOnly) != cidr24ForIP(oldIP) {
+		// an address whose /24 is NOT homeIP's /24 (a homeIP-/24 leftover would yield the dead
+		// SOURCE gateway and break the pod's return path); keep the homeIP-/24 fallback otherwise.
+		if cidr24ForIP(ipOnly) != cidr24ForIP(homeIP) {
 			if gw := gatewayForIP(ipOnly); gw != "" {
 				cni0Gateway = gw
 			}
@@ -2696,15 +2972,15 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 			delErrs = append(delErrs, fmt.Sprintf("del %s: %v (%s)", cidr, delErr, msg))
 			continue
 		}
-		log.Info("SingleHomeRestoredPod: removed non-OLD eth0 address (ADR-0138 single-home)",
-			"migration", migrationName, "restoredPID", pid, "removed", cidr, "reason", "not OLD IP")
+		log.Info("SingleHomeRestoredPod: removed non-preserved eth0 address (ADR-0138 single-home)",
+			"migration", migrationName, "restoredPID", pid, "removed", cidr, "reason", "neither BIND IP nor HOME IP")
 	}
 
 	// ADR-0138 step 2: ASSIGN oldIP/24 scope-global to eth0 if no scope-global OLD IP is already
 	// present (idempotent: tolerate EEXIST). This replaces ADR-0137's invalid assumption that CRIU
 	// restored it, and is NOT suppressed by D1's oldIP/32 scope-host artifact (scope-aware oldSeen).
 	if !oldSeen {
-		addR := brokerNetnsExecFn(ctx, pid, "", "ip", "addr", "add", oldIP+"/24", "dev", "eth0")
+		addR := brokerNetnsExecFn(ctx, pid, "", "ip", "addr", "add", homeIP+"/24", "dev", "eth0")
 		var addOut []byte
 		var addErr error
 		if addR.SpawnErr != nil {
@@ -2718,13 +2994,13 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 		if addErr != nil {
 			msg := strings.TrimSpace(string(addOut))
 			if strings.Contains(strings.ToLower(msg), "exists") {
-				log.Info("SingleHomeRestoredPod: OLD IP already present (idempotent)", "oldIP", oldIP)
+				log.Info("SingleHomeRestoredPod: HOME IP already present (idempotent)", "homeIP", homeIP)
 			} else {
-				return fmt.Errorf("SingleHomeRestoredPod: assign OLD IP %s/24 to eth0: %w (%s)", oldIP, addErr, msg)
+				return fmt.Errorf("SingleHomeRestoredPod: assign HOME IP %s/24 to eth0: %w (%s)", homeIP, addErr, msg)
 			}
 		} else {
-			log.Info("SingleHomeRestoredPod: assigned OLD IP to eth0 (ADR-0138)",
-				"migration", migrationName, "restoredPID", pid, "oldIP", oldIP)
+			log.Info("SingleHomeRestoredPod: assigned HOME IP to eth0 (ADR-0138)",
+				"migration", migrationName, "restoredPID", pid, "homeIP", homeIP)
 		}
 	}
 
@@ -2749,7 +3025,7 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 			log.Info("SingleHomeRestoredPod: installed cni0-gateway routes (ADR-0138)",
 				"migration", migrationName, "restoredPID", pid, "gateway", cni0Gateway)
 		}
-		srcNodeCIDR := cidr24ForIP(oldIP)
+		srcNodeCIDR := cidr24ForIP(homeIP)
 		if srcNodeCIDR != "" {
 			if revR := brokerNetnsExecFn(ctx, pid, "", "ip", "route", "replace", srcNodeCIDR, "via", cni0Gateway, "dev", "eth0"); revR.SpawnErr != nil {
 				log.Info("SingleHomeRestoredPod: warning — set reverse-path route (ADR-0139 D2)",
@@ -2764,7 +3040,7 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 		}
 	}
 
-	// Verify: only the OLD IP should remain on eth0. ADR-0348 broker-delegated.
+	// Verify: only the BIND IP and/or HOME IP should remain on eth0. ADR-0348 broker-delegated.
 	verifyR := brokerNetnsExecFn(ctx, pid, "", "ip", "-o", "-4", "addr", "show", "eth0")
 	if verifyR.SpawnErr != nil {
 		return fmt.Errorf("SingleHomeRestoredPod: netns exec failed: verify eth0 addrs in netns %s: %w",
@@ -2776,14 +3052,18 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 	}
 	remaining := parseEth0IPv4Addrs(string(verifyR.Combined))
 	log.Info("SingleHomeRestoredPod: eth0 addresses after single-home (ADR-0138 AC5)",
-		"migration", migrationName, "restoredPID", pid, "oldIP", oldIP, "remaining", remaining, "gateway", cni0Gateway)
+		"migration", migrationName, "restoredPID", pid, "bindIP", bindIP, "homeIP", homeIP, "remaining", remaining, "gateway", cni0Gateway)
 
 	if len(delErrs) > 0 {
 		return fmt.Errorf("SingleHomeRestoredPod: failed to remove %d address(es): %s",
 			len(delErrs), strings.Join(delErrs, "; "))
 	}
-	// AC5: eth0 must carry the OLD IP and only the OLD IP (both the D1 /32 scope-host and the /24
-	// scope-global are the OLD IP, so both pass).
+	// ADR-0422 D1f-R5 (2865-2876): the terminal verify predicate accepts the UNION of bindIP and
+	// homeIP — a legitimately-surviving bindIP that differs from homeIP is a protected side effect
+	// (D1's own /32 scope-host artifact), not a violation of the single-home contract. AC5's actual
+	// success criterion (oldPresent, 2865-2873) is keyed on homeIP SPECIFICALLY: the function's
+	// terminal contract is "the pod is single-homed on its identity address" — bindIP's survival is
+	// a protected side effect, not the success criterion itself.
 	oldPresent := false
 	for _, a := range remaining {
 		cidr := a.CIDR
@@ -2791,14 +3071,17 @@ func (s *AgentServer) SingleHomeRestoredPod(ctx context.Context, migrationName, 
 		if i := strings.IndexByte(cidr, '/'); i >= 0 {
 			ipOnly = cidr[:i]
 		}
-		if ipOnly == oldIP {
+		switch {
+		case ipOnly == homeIP:
 			oldPresent = true
-		} else {
-			return fmt.Errorf("SingleHomeRestoredPod: eth0 still has non-OLD address %s after single-home (remaining %v)", cidr, remaining)
+		case ipOnly == bindIP:
+			// Accepted: the protected D1 bind artifact, not a contract violation.
+		default:
+			return fmt.Errorf("SingleHomeRestoredPod: eth0 still has an address %s that is neither BIND IP nor HOME IP after single-home (remaining %v)", cidr, remaining)
 		}
 	}
 	if !oldPresent {
-		return fmt.Errorf("SingleHomeRestoredPod: OLD IP %s not present on eth0 after single-home (remaining %v)", oldIP, remaining)
+		return fmt.Errorf("SingleHomeRestoredPod: HOME IP %s not present on eth0 after single-home (remaining %v)", homeIP, remaining)
 	}
 	return nil
 }
@@ -2979,6 +3262,13 @@ type resolvedNetns struct {
 	// live-proof falsified). Never sourced from Status.ReplVethMAC (ADR-0349 D3) — it is the
 	// agent's own kernel read.
 	mac string
+
+	// bindIP is the exact preserved-source-address value prepPreservedSourceAddrForRestore
+	// actually programmed into the netns for this migration (ADR-0422 D1i5). Written back at the
+	// point of actual programming, not at the point of resolution — mirrors this same struct's own
+	// mac field's "capture at the moment of truth, serve the value later" discipline. Empty until
+	// the first successful bind-prep latches it via storeResolvedBindIP.
+	bindIP string
 }
 
 var (
@@ -3141,6 +3431,61 @@ func (s *AgentServer) resolvedNetnsMAC(migrationName string) string {
 	resolvedNetnsPathsMu.RLock()
 	defer resolvedNetnsPathsMu.RUnlock()
 	return resolvedNetnsPaths[migrationName].mac
+}
+
+// storeResolvedBindIP writes back the bindIP value prepPreservedSourceAddrForRestore actually
+// programmed for migrationName (ADR-0422 D1i5), immediately after addPreservedSourceAddrFn confirms
+// success — the single point where "actually programmed" becomes true, shared by all three
+// restoring-path callers (NRI, gRPC primary, gRPC raw-CRIU-fallback). No-op when no (path, ifname)
+// handle exists yet, mirroring storeResolvedNetnsMAC's own guard — a bindIP has no netns to belong
+// to without one.
+func storeResolvedBindIP(migrationName, bindIP string) {
+	if migrationName == "" || bindIP == "" {
+		return
+	}
+	resolvedNetnsPathsMu.Lock()
+	defer resolvedNetnsPathsMu.Unlock()
+	rec, ok := resolvedNetnsPaths[migrationName]
+	if !ok || rec.path == "" {
+		return
+	}
+	rec.bindIP = bindIP
+	resolvedNetnsPaths[migrationName] = rec
+}
+
+// resolvedBindIP returns the bindIP latched for migrationName (ADR-0422 D1i5), or "" if bind-prep
+// never successfully programmed one for this migration (no established TCP to preserve, or this is
+// a fresh agent process that lost the in-memory latch across a restart — resolvedNetnsPaths is an
+// in-memory map with no restart-durable backing, the same known limit this file's netns-identity
+// re-check already reckons with on the idempotent-confirm path). The idempotent-confirm gRPC Restore
+// branch (server.go, ADR-0422 D1i5) reads this INSTEAD OF any fresh D1a resolution — it is the exact
+// value the prior successful restore attempt programmed, by construction, never a re-derivation that
+// could diverge from it.
+func (s *AgentServer) resolvedBindIP(migrationName string) string {
+	resolvedNetnsPathsMu.RLock()
+	defer resolvedNetnsPathsMu.RUnlock()
+	return resolvedNetnsPaths[migrationName].bindIP
+}
+
+// resolveIdempotentConfirmBindIP implements the D1i5 bindIP resolution + fail-closed policy for
+// the gRPC Restore idempotent-confirm branch (server.go, inside Restore): serve the latched
+// write-back value verbatim, never a fresh re-resolution (see resolvedBindIP's doc comment for
+// why). When nothing was latched and the checkpoint has an established TCP connection to protect,
+// return the named D1i5 fail-closed message instead of a usable bindIP.
+//
+// Factored out of the Restore RPC body (behavior-preserving) so this exact decision — and the
+// exact message text that becomes the RPC's RestoreResponse.ErrorMessage — is directly
+// unit-testable without standing up a full gRPC/containerd/live-process harness (§P-VERIFY #23).
+//
+// Returns (bindIP, "") on success (bindIP may legitimately be "" when there was nothing to
+// preserve), or ("", failClosedMsg) when the caller must fail the RPC closed.
+func (s *AgentServer) resolveIdempotentConfirmBindIP(migrationName, imagesDir string) (bindIP string, failClosedMsg string) {
+	bindIP = s.resolvedBindIP(migrationName)
+	if bindIP == "" && checkpointHasEstablishedTCP(imagesDir) {
+		msg := fmt.Sprintf("Restore: idempotent confirm path — no latched bindIP for an established-TCP checkpoint (bind-prep result not in memory, possibly agent-restart loss); refusing to confirm without the address the prior restore actually programmed (ADR-0422 D1i5, fail-closed): %s", migrationName)
+		return "", msg
+	}
+	return bindIP, ""
 }
 
 // finalizeNetnsPath resolves the sandbox-netns path handed to ReadReplVethMAC (via
@@ -3616,6 +3961,35 @@ func (s *AgentServer) resolveNamespaceForMigration(ctx context.Context, migratio
 		}
 	}
 	return ""
+}
+
+// resolveNamespaceForMigrationE is ADR-0422 D1g1's error-returning sibling of
+// resolveNamespaceForMigration, added rather than changing that function's existing callers/
+// behavior. resolveNamespaceForMigration swallows its own List failure and returns "" —
+// indistinguishable from "no such migration," the same silent-""-collapse shape D1g0 already named
+// for the CR-read case, present a second time on the namespace lookup that gates the gRPC bind-prep
+// fallback (D1a item 1's no-payload-snapshot case) before it can call
+// resolvePreservedSourceIPAuthoritative. A List failure here is now distinguishable from a
+// genuinely-not-found migration, so it reaches D1g2's checkpointHasEstablishedTCP-scoped fail-closed
+// policy like any other resolution failure, instead of being silently treated as "no such migration."
+func (s *AgentServer) resolveNamespaceForMigrationE(ctx context.Context, migrationName string) (string, error) {
+	if s.k8sClient == nil || migrationName == "" {
+		return "", nil // legitimate no-op, unchanged
+	}
+	pm := &pmv1.PodMigration{}
+	if err := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: migrationName}, pm); err == nil {
+		return pm.Namespace, nil
+	}
+	pmList := &pmv1.PodMigrationList{}
+	if err := s.k8sClient.List(ctx, pmList); err != nil {
+		return "", fmt.Errorf("resolveNamespaceForMigrationE: list PodMigrations: %w", err)
+	}
+	for i := range pmList.Items {
+		if pmList.Items[i].Name == migrationName {
+			return pmList.Items[i].Namespace, nil
+		}
+	}
+	return "", nil // genuinely not found — a real no-op, not a read failure
 }
 
 // resolveReplVethPeer returns the HOST-side veth peer name for the replacement pod's eth0,
@@ -4920,175 +5294,6 @@ func ctrCheckpoint(ctx context.Context, taskID, imagesDir string, tcpEstablished
 	return total, nil
 }
 
-// devShmContentImageName is the CRIU tmpfs-content image basename for a /dev/shm tmpfs whose
-// recorded root_dev is rootDev. CRIU tar-serializes every internally-owned tmpfs's content to
-// tmpfs-dev-<root_dev>.tar.gz.img (criu/tmpfs.c dump_tmpfs / restore_tmpfs), keyed by the root_dev
-// field in the mountpoints image — ground-truthed against a live ctr checkpoint on the KVM cluster
-// (the /dev tmpfs recorded root_dev=558 has its content in tmpfs-dev-558.tar.gz.img).
-func devShmContentImageName(rootDev int64) string {
-	return fmt.Sprintf("tmpfs-dev-%d.tar.gz.img", rootDev)
-}
-
-// devShmMountInfo carries the /dev/shm mountpoints-image facts captureCtrDevShmContent keys on.
-type devShmMountInfo struct {
-	Present bool  `json:"present"`
-	RootDev int64 `json:"root_dev"`
-	// ExtKey is the recorded external-mount key. A non-empty value ('/dev/shm' on the ctr fast
-	// path) means CRIU treated /dev/shm as an EXTERNAL mount and therefore skipped its content;
-	// empty means CRIU owns it internally and already content-captured it (raw-CRIU path, ADR-0382).
-	ExtKey string `json:"ext_key"`
-}
-
-// readDevShmMountInfo reads /dev/shm's root_dev and ext_key from the checkpoint's mountpoints image
-// via the same vendored pycriu decoder buildMaskedPathExtMountArgs uses (PYTHONPATH per ADR-0121).
-// imagesDir is passed as argv, never string-formatted into the script body (Security note, ADR-0121).
-func readDevShmMountInfo(ctx context.Context, imagesDir string) (devShmMountInfo, error) {
-	const scanScript = `
-import pycriu, glob, json, sys, os
-info = {'present': False, 'root_dev': 0, 'ext_key': ''}
-for img in sorted(glob.glob(os.path.join(sys.argv[1], 'mountpoints-*.img'))):
-    if not img.endswith('.img'):
-        continue
-    with open(img, 'rb') as f:
-        data = pycriu.images.load(f)
-    for e in data.get('entries', []):
-        if e.get('mountpoint') == '/dev/shm':
-            info = {'present': True, 'root_dev': e.get('root_dev', 0) or 0, 'ext_key': e.get('ext_key') or ''}
-print(json.dumps(info))
-`
-	scriptPath := "/dev/shm/pm-devshm-scan.py"
-	if err := os.WriteFile(scriptPath, []byte(scanScript), 0o600); err != nil {
-		return devShmMountInfo{}, fmt.Errorf("write devshm-scan script: %w", err)
-	}
-	defer os.Remove(scriptPath)
-
-	cmd := exec.CommandContext(ctx, "python3", scriptPath, imagesDir)
-	cmd.Env = append(os.Environ(), "PYTHONPATH=/usr/lib/python3/dist-packages")
-	out, err := cmd.Output()
-	if err != nil {
-		return devShmMountInfo{}, fmt.Errorf("devshm-scan script failed: %w\n%s", err, out)
-	}
-	var info devShmMountInfo
-	if err := json.Unmarshal(out, &info); err != nil {
-		return devShmMountInfo{}, fmt.Errorf("parse devshm-scan output: %w\n%s", err, out)
-	}
-	return info, nil
-}
-
-// devShmHostSourceDir returns the agent-visible path to the source pod's /dev/shm backing directory
-// — the pod-sandbox shm dir the CRI runtime bind-mounts at /dev/shm, recorded as the /dev/shm mount
-// SOURCE in config.json (e.g. /run/k3s/containerd/io.containerd.grpc.v1.cri/sandboxes/<id>/shm).
-// It is re-rooted onto the broad host-/run mount (/host-run) the daemonset always carries, exactly
-// as the criu-dump.log / bundle paths are (remapWorkTargetToDumpLog). Returns ok=false when
-// config.json is absent/unparseable, /dev/shm has no bind source, or the source is not under /run
-// (so unreachable from the agent) — every such case is a documented no-op for the caller.
-func devShmHostSourceDir(imagesDir string) (string, bool) {
-	data, err := os.ReadFile(filepath.Join(imagesDir, "config.json"))
-	if err != nil {
-		return "", false
-	}
-	var cfg struct {
-		Mounts []struct {
-			Destination string `json:"destination"`
-			Source      string `json:"source"`
-		} `json:"mounts"`
-	}
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return "", false
-	}
-	for _, m := range cfg.Mounts {
-		if m.Destination != "/dev/shm" {
-			continue
-		}
-		if !strings.HasPrefix(m.Source, "/run/") {
-			return "", false
-		}
-		return "/host-run" + strings.TrimPrefix(m.Source, "/run"), true
-	}
-	return "", false
-}
-
-// captureCtrDevShmContent captures the source pod's /dev/shm content as a CRIU-native tmpfs content
-// image so a restore that internalizes /dev/shm can populate it (ADR-0414 — the dump-side half).
-//
-// The containerd/ctr fast path records /dev/shm as an EXTERNAL bind mount (ext_key='/dev/shm',
-// source=<pod-sandbox>/shm — verified live on the KVM cluster: config.json carries /dev/shm as a
-// bind from the CRI sandbox shm dir, and the mountpoints image stamps ext_key='/dev/shm'). runc's
-// CRIU therefore never tar-serializes /dev/shm content: NO tmpfs-dev-<root_dev>.tar.gz.img is
-// written for it. A workload that keeps real state there — a PostgreSQL POSIX-shmem segment
-// dev/shm/PostgreSQL.<N> held mmap'd MAP_SHARED — loses that content at dump, so the restore-side
-// internalization (patch_checkpoint_script.go, ADR-0414) makes CRIU own an EMPTY /dev/shm tmpfs and
-// files-reg.c:2353 ENOENTs opening the recorded reg-file path (or, once owned+mounted with no
-// content to fill, tears the tmpfs down busy).
-//
-// /dev/shm is ordinary pod-local data, an owned mount captured with content by default like every
-// other owned mount (ADR-0415). This reads /dev/shm's recorded root_dev (the value CRIU names the
-// tmpfs content image by) and the sandbox shm source dir, then tar-serializes that dir's live
-// content into tmpfs-dev-<root_dev>.tar.gz.img in CRIU's own dump_tmpfs format — so the restore-side
-// internalization has real content to lay into the CRIU-owned /dev/shm tmpfs. Unconditional and
-// workload-agnostic: an empty /dev/shm (e.g. Redis) yields an empty tmpfs image, exactly what CRIU's
-// own dump_tmpfs writes for an empty owned tmpfs. The source is frozen/dumped by the just-completed
-// ctr checkpoint and the sandbox shm dir outlives the task, so its bytes are the checkpoint-instant
-// state.
-//
-// ADR-0415 fail-closed capture gate — FAIL CLOSED. Returns nil (a legitimate "nothing owned to capture here" state,
-// NOT a silent skip-and-continue over a real failure) only when: the image records no /dev/shm mount
-// (the pod owns none), or /dev/shm is already CRIU-internal (ext_key empty — the raw-CRIU dump path
-// already tar-captured it), or its content image already exists (do not clobber CRIU's own capture).
-// In every other case — the ctr fast path externalized an owned /dev/shm (runc's CRIU skipped its
-// content) and the agent CANNOT capture it (mountpoints scan failed, no root_dev to name the image,
-// the sandbox shm source is unreachable, or the tar failed) — it returns a wrapped
-// ErrMountContentCaptureFailed so the caller fails the checkpoint closed with the attributed
-// MountContentCaptureFailed reason. It NEVER fabricates zero-filled shared memory and NEVER lets a
-// failed capture pass as success.
-func captureCtrDevShmContent(ctx context.Context, imagesDir string) error {
-	fail := func(cause string) error {
-		return &MountContentCaptureFailedDetail{Mountpoint: "/dev/shm", Cause: cause}
-	}
-	info, err := readDevShmMountInfo(ctx, imagesDir)
-	if err != nil {
-		return fail(fmt.Sprintf("mountpoints scan failed: %v", err))
-	}
-	if !info.Present {
-		return nil // no /dev/shm mount recorded in the image — the pod owns none; nothing to capture
-	}
-	if info.ExtKey == "" {
-		return nil // /dev/shm already CRIU-internal (raw-CRIU path, ADR-0382): content already captured
-	}
-	outPath := filepath.Join(imagesDir, devShmContentImageName(info.RootDev))
-	if _, statErr := os.Stat(outPath); statErr == nil {
-		return nil // content image already present — do not clobber CRIU's own capture
-	}
-	if info.RootDev == 0 {
-		return fail("external /dev/shm has no root_dev in the mountpoints image — cannot name the CRIU tmpfs content image")
-	}
-	shmDir, ok := devShmHostSourceDir(imagesDir)
-	if !ok {
-		return fail("no agent-visible sandbox shm source in config.json — owned /dev/shm content is unreachable")
-	}
-	if tarErr := writeDevShmContentImage(ctx, shmDir, outPath); tarErr != nil {
-		return fail(fmt.Sprintf("tar of sandbox shm dir failed: %v", tarErr))
-	}
-	log.Info("Checkpoint: captured /dev/shm content as CRIU tmpfs image (ADR-0415 dump-side owned-mount capture for the ctr fast path)",
-		"image", devShmContentImageName(info.RootDev), "srcDir", shmDir, "rootDev", info.RootDev)
-	return nil
-}
-
-// writeDevShmContentImage tar-serializes the live sandbox /dev/shm directory (shmDir) into the
-// CRIU-native content image at outPath, matching CRIU's own dump_tmpfs invocation (gzip tar,
-// sparse, numeric owner, ./-relative from the mount dir) so restore_tmpfs extracts it into the
-// CRIU-owned /dev/shm tmpfs unchanged. On failure it removes any partial image so the checkpoint
-// never carries a torn content layer.
-func writeDevShmContentImage(ctx context.Context, shmDir, outPath string) error {
-	tarCmd := exec.CommandContext(ctx, "tar", "--create", "--gzip", "--sparse", "--numeric-owner",
-		"--file", outPath, "-C", shmDir, ".")
-	if tout, err := tarCmd.CombinedOutput(); err != nil {
-		_ = os.Remove(outPath)
-		return fmt.Errorf("tar /dev/shm content: %w\n%s", err, strings.TrimSpace(string(tout)))
-	}
-	return nil
-}
-
 // classifyCtrCheckpointFailure maps a failed `ctr tasks checkpoint` invocation to a typed error
 // so the Checkpoint RPC can decide whether to fall through to the raw go-criu Dump path. outStr is
 // ctr's combined output with the resolved criu-dump.log appended (or not, per dumpLogRead); rawErr
@@ -5220,8 +5425,8 @@ for img in imgs:
             results.append({'mnt_id': e.get('mnt_id'), 'mountpoint': e.get('mountpoint', ''), 'root': e.get('root', ''), 'ext_key': e.get('ext_key', '')})
 print(json.dumps(results))
 `
-	scriptPath := "/dev/shm/pm-scan-mounts.py"
-	if err := os.WriteFile(scriptPath, []byte(scanScript), 0o600); err != nil {
+	scriptPath, err := createScratchScript("pm-scan-mounts-*.py", scanScript)
+	if err != nil {
 		return nil, fmt.Errorf("write mount-scan script: %w", err)
 	}
 	defer os.Remove(scriptPath)
@@ -6629,9 +6834,10 @@ func joinNsRestore(ctx context.Context, migrationName, checkpointDir, imageName,
 // ADR-0418: criuKnownNonFatalLinePatterns is the causal-attribution known-non-fatal allowlist.
 // Each entry is a CRIU restore.log diagnostic line that is structurally void-helper/cosmetic
 // teardown output and must NEVER be surfaced as THE cause of a restore failure, even when it is
-// the first (or only) line matching "Error (criu/" in the log. Amendable only by ADR (Decision
-// item 5) — each entry requires a recorded per-entry disassembly proof against every deployed
-// CRIU binary before it is added.
+// the first (or only) line matching "Error (criu/" or "Error (soccr/" in the log (ADR-0422 D2
+// widens the match to the soccr/ family; no soccr/ line is ever added to this allowlist — see D2c).
+// Amendable only by ADR (Decision item 5) — each entry requires a recorded per-entry disassembly
+// proof against every deployed CRIU binary before it is added.
 var criuKnownNonFatalLinePatterns = []string{
 	// cleanup_mnt_ns: disassembly-proven void helper at both call sites
 	// (depopulate_roots_yard+380, prepare_namespace_before_tasks+415) — runs during restore
@@ -6657,26 +6863,28 @@ func isKnownNonFatalCRIULine(line string) bool {
 // criuRestoreFailureAttribution is the result of an ADR-0418 forward causal-order scan of a CRIU
 // restore.log.
 type criuRestoreFailureAttribution struct {
-	found           bool   // a non-allowlisted "Error (criu/" line was found — causeLine is authoritative
+	found           bool   // a non-allowlisted "Error (criu/" or "Error (soccr/" line was found — causeLine is authoritative
 	causeLine       string // the named cause line, verbatim (set only when found)
 	terminalLine    string // the first line containing "Restoring FAILED.", if present
 	demoted         bool   // the very first matching line was allowlisted and a later real match exists
 	demotedLine     string // the skipped allowlisted line, verbatim (set when demoted OR onlyAllowlisted)
 	onlyAllowlisted bool   // every matching line found was allowlisted — no real cause present in the log
-	matchCount      int    // total count of "Error (criu/"-matching lines found
+	matchCount      int    // total count of "Error (criu/" or "Error (soccr/"-matching lines found (ADR-0422 D2)
 
 	// ADR-0420 D5: the mount-v2 progress trail, collected in the SAME forward pass. It is the
 	// causal anchor for the one class ADR-0418's rule is structurally blind to — a silent
-	// fstype->restore, which emits no "Error (criu/" line at all. It is reported only when the
-	// first-causal-error rule yields nothing but demoted lines; it never outranks a real cause.
+	// fstype->restore, which emits no "Error (criu/" or "Error (soccr/" line at all. It is reported
+	// only when the first-causal-error rule yields nothing but demoted lines; it never outranks a
+	// real cause.
 	mountProgress criuMountV2Progress
 }
 
-// scanCRIURestoreLogForFirstError implements ADR-0418 Decision items 2, 3 and 5: a forward
-// (never reverse), causal-order scan of the FULL restore.log for the first line containing the
-// substring "Error (criu/" — matched via strings.Contains, never strings.HasPrefix, because
-// CRIU's own -v4 line format carries a "(SS.mmmmmm) " timestamp and an optional "<task>: " prefix
-// before the message, so the token is never at column 0 (ADR-0418 Context, corrected line-format
+// scanCRIURestoreLogForFirstError implements ADR-0418 Decision items 2, 3 and 5, widened by
+// ADR-0422 D2: a forward (never reverse), causal-order scan of the FULL restore.log for the first
+// line containing the substring "Error (criu/" OR "Error (soccr/" — matched via strings.Contains,
+// never strings.HasPrefix, because CRIU's own -v4 line format carries a "(SS.mmmmmm) " timestamp
+// and an optional "<task>: " prefix before the message, so the token is never at column 0 (ADR-0418
+// Context, corrected line-format
 // grounding). Lines matching the known-non-fatal allowlist are skipped in favor of a later real
 // match unless they are the only match found (Decision item 5, "only-match"/"demotion" cases).
 // The terminal "Restoring FAILED." line, if present, is recorded as informational context only —
@@ -6720,14 +6928,24 @@ func scanCRIURestoreLogForFirstError(restoreLogPath string) criuRestoreFailureAt
 		// read of the log, no second file handle, no full-file buffer — one retained line and a
 		// bounded slice.
 		result.mountProgress.noteCRIULogLine(line)
-		if strings.Contains(line, "Error (criu/") {
+		// ADR-0422 D2a: widened to also match "Error (soccr/" — CRIU's soccr restorer is a
+		// distinct source subtree (libsoccr) from criu/ and emits its own "Error (soccr/...)" lines
+		// (e.g. "Error (soccr/soccr.c:499): Can't bind inet socket back: ..."), which the pre-D2
+		// criu/-only match was blind to, misattributing every soccr-family restore failure to
+		// whatever downstream wrapper frame happened to match "Error (criu/" first. D2b: this repo's
+		// own 4-file real restore.log corpus contains exactly two Error(...) subtrees, criu/ and
+		// soccr/ — this is a literal two-string match, not a general subtree-enumeration claim (see
+		// D2b for the honest limit: a third subtree is plausible but unverified against CRIU source).
+		if strings.Contains(line, "Error (criu/") || strings.Contains(line, "Error (soccr/") {
 			result.matchCount++
 			// ADR-0420 D5 precondition: cause candidacy excludes BOTH ADR-0418's known-non-fatal
 			// allowlist AND CRIU's own terminal "Restoring FAILED." announcement, which carries the
 			// "Error (criu/" substring and would otherwise be named as the cause of the failure it
 			// merely announces — see isCRIUTerminalAnnouncementLine for why that is decisive on the
-			// silent-fstype->restore class and harmless on every other. The line is still COUNTED
-			// here and still reported verbatim as terminalLine; only its candidacy is removed.
+			// silent-fstype->restore class and harmless on every other. No soccr/ line is ever
+			// allowlisted (ADR-0422 D2c) — soccr/ errors are exactly the TCP-preservation-critical
+			// signal this project's guarantee depends on surfacing, never demoting. The line is still
+			// COUNTED here and still reported verbatim as terminalLine; only its candidacy is removed.
 			allowlisted := isNonCausalCRIULine(line)
 			if firstMatch == "" {
 				firstMatch = line
@@ -6797,11 +7015,11 @@ func criuRestoreFailureCause(restoreLogPath, checkpointDir string, checkpointLog
 		attr := scanCRIURestoreLogForFirstError(restoreLogPath)
 		switch {
 		case attr.found:
-			fmt.Fprintf(&b, "first causal error (earliest \"Error (criu/\" line in restore.log): %s\n", attr.causeLine)
+			fmt.Fprintf(&b, "first causal error (earliest \"Error (criu/\" or \"Error (soccr/\" line in restore.log): %s\n", attr.causeLine)
 			if attr.demoted {
 				fmt.Fprintf(&b, "note: an earlier known-non-fatal CRIU diagnostic was demoted, not treated as cause: %s\n", attr.demotedLine)
 			}
-			fmt.Fprintf(&b, "total \"Error (criu/\" lines found in restore.log: %d\n", attr.matchCount)
+			fmt.Fprintf(&b, "total \"Error (criu/ or soccr/)\" lines found in restore.log: %d\n", attr.matchCount)
 		case attr.onlyAllowlisted:
 			// ADR-0420: the demoted line is either an ADR-0418 known-non-fatal diagnostic or CRIU's
 			// own terminal announcement. Name which, rather than calling the announcement a
@@ -6820,12 +7038,12 @@ func criuRestoreFailureCause(restoreLogPath, checkpointDir string, checkpointLog
 				// single decode then refuted.
 				fmt.Fprintf(&b, "note: that line is CRIU TEARDOWN NOISE (rmdir of CRIU's own roots-yard temp dir during the unwind) — its \"Device or resource busy\" text is NOT a mount EBUSY and must never be reported as a cause (ADR-0420 D5)\n")
 			}
-			fmt.Fprintf(&b, "total \"Error (criu/\" lines found in restore.log: %d\n", attr.matchCount)
+			fmt.Fprintf(&b, "total \"Error (criu/ or soccr/)\" lines found in restore.log: %d\n", attr.matchCount)
 			// ADR-0420 D5: ADR-0418's rule found nothing real. Fall to the lower-precedence
 			// mount-v2 progress-trail rule, which covers the silent-fstype->restore class.
 			renderD5Attribution(&b, &attr.mountProgress)
 		default:
-			fmt.Fprintf(&b, "no \"Error (criu/\" line found in restore.log\n")
+			fmt.Fprintf(&b, "no \"Error (criu/\" or \"Error (soccr/\" line found in restore.log\n")
 			renderD5Attribution(&b, &attr.mountProgress)
 		}
 		if attr.terminalLine != "" {
@@ -8130,9 +8348,16 @@ def classify_reg_fd(entry, ctx):
             return 'DECLINE'
         return 'REBIND_TO_ROOT'
     # ADR-0311: a PLAIN-REG *non-directory* fd is still safely rebindable when its orphan
-    # mnt_id is backed by a tmpfs/shm mount. tmpfs/shm backing storage is memory-only and
-    # never survives a checkpoint regardless, so redirecting the handle to root (rather than
-    # the previous dir-vs-nondir proxy that always DECLINEd non-directory orphans) fixes
+    # mnt_id is backed by a tmpfs/shm mount. REBIND_TO_ROOT here is safe because its backing
+    # MOUNT was dropped from the restored mount set (this fd's mnt_id is not in kept_mnt_ids),
+    # not because tmpfs/shm content cannot survive a checkpoint — ADR-0426 makes /dev/shm's
+    # content SURVIVE a checkpoint by design (captureContentAbsentMounts), and a content-absent
+    # tmpfs/shm mount whose content IS captured is INTERNALIZED and stays in kept_mnt_ids, so its
+    # REG fds classify KEEP above and never reach this branch at all. (The prior wording here —
+    # "tmpfs/shm backing storage is memory-only and never survives a checkpoint regardless" — was
+    # made FALSE by ADR-0426 and is corrected atomically with it, per that ADR's disproven-scaffolding
+    # removal symmetry and its "Related ADRs → ADR-0311" section.) redirecting the handle to root (rather
+    # than the previous dir-vs-nondir proxy that always DECLINEd non-directory orphans) fixes
     # /dev/shm-backed workloads (PostgreSQL POSIX-shmem segments) without weakening the Strict
     # guard for any other orphan class.
     #
@@ -8324,9 +8549,10 @@ func patchCheckpointImages(checkpointDir string, inheritFdNames []string, reatta
 	// automatically; there is no divergent test copy to drift out of sync.
 	patchScript := assemblePatchScript()
 	// /dev/shm is an in-memory filesystem (tmpfs) — avoids writing the script to disk.
-	// 0600 so only root can read the path; removed immediately after exec.
-	scriptPath := "/dev/shm/pm-patch-ckpt.py"
-	if err := os.WriteFile(scriptPath, []byte(patchScript), 0o600); err != nil {
+	// 0600 so only root can read the path (os.CreateTemp's default mode); removed immediately after
+	// exec. The path itself is per-invocation-unique (ADR-0425 round 3) — see createScratchScript.
+	scriptPath, err := createScratchScript("pm-patch-ckpt-*.py", patchScript)
+	if err != nil {
 		return nil, nil, fmt.Errorf("write patch script: %w", err)
 	}
 	defer os.Remove(scriptPath)
@@ -9138,22 +9364,24 @@ func (s *AgentServer) Checkpoint(ctx context.Context, req *agentpb.CheckpointReq
 					return nil, fmt.Errorf("checkpoint: clearing partial ctr images before raw CRIU: %w", rmErr)
 				}
 			} else {
-				// ADR-0415: capture /dev/shm owned-mount content as a CRIU tmpfs image BEFORE the
+				// ADR-0426 D1/D2: capture the content of every content-absent mount whose backing
+				// host source is agent-reachable — /dev/shm today, and any future runtime-injected
+				// content-bearing external tmpfs, empty or not, demanded or not — BEFORE the
 				// checksum/encrypt below, so it is transferred and restored with the rest of the
 				// image. The ctr fast path records /dev/shm as an external sandbox bind, so runc's
 				// CRIU never dumps its content; without this a workload with real /dev/shm state
 				// (PostgreSQL POSIX-shmem) loses it and the internalizing restore
 				// (patch_checkpoint_script.go) has an empty tmpfs to open the recorded reg-file in.
-				// fail-closed capture gate: this now FAILS CLOSED — a capture that should happen but cannot returns a
-				// typed MountContentCaptureFailed status so the migration fails with an attributed
-				// reason rather than shipping a non-restorable image (no silent skip-and-continue).
-				if capErr := captureCtrDevShmContent(ctx, imagesDir); capErr != nil {
-					log.Error(capErr, "Checkpoint: owned /dev/shm content capture failed — failing closed (ADR-0415 fail-closed capture gate)",
+				// Fails CLOSED — a capture that should happen but cannot returns a typed
+				// MountContentCaptureFailed status so the migration fails with an attributed reason
+				// rather than shipping a non-restorable image (no silent skip-and-continue).
+				if _, capErr := captureContentAbsentMounts(ctx, imagesDir); capErr != nil {
+					log.Error(capErr, "Checkpoint: content-absent mount capture failed — failing closed (ADR-0426 D1d)",
 						"migration", req.MigrationName)
 					// Zeroize the partial ctr image set before returning (Standing Rule 7): it
 					// contains live memory pages and must not linger recoverable on tmpfs.
 					if zErr := zeroizeDir(imagesDir); zErr != nil {
-						log.Error(zErr, "Checkpoint: zeroize after owned-mount capture failure", "migration", req.MigrationName)
+						log.Error(zErr, "Checkpoint: zeroize after content capture failure", "migration", req.MigrationName)
 					}
 					return nil, newMountContentCaptureFailedStatus(capErr)
 				}
@@ -9463,8 +9691,6 @@ func (s *AgentServer) Checkpoint(ctx context.Context, req *agentpb.CheckpointReq
 	} else {
 		checkpointPath = result.ImagesDir
 		freezeDurationMs = result.FreezeDurationMs
-		// Compute SHA256 of all files in the images directory.
-		sha256sum, sizeBytes = checksumDir(checkpointPath)
 		fallbackNote = "real CRIU checkpoint"
 
 		// Stage config.json from the containerd bundle into the checkpoint dir.
@@ -9473,6 +9699,15 @@ func (s *AgentServer) Checkpoint(ctx context.Context, req *agentpb.CheckpointReq
 		// does NOT — and the destination NRI restore reads
 		// <checkpointDir>/config.json to build the OCI bundle. Without it restore fails
 		// with "read config.json: no such file or directory" (ADR-0131 restore path).
+		//
+		// ADR-0426 D3: this staging step is HOISTED to before checksumDir (moved below) and before
+		// the content capture that follows, so the reported digest covers config.json when it is
+		// staged — closing a small, separate, pre-existing checksum-coverage hole. This hoist is
+		// NOT what makes the raw path's capture correct (D3's own round-4 correction): staging is
+		// best-effort by construction (FindContainerTaskID fails after a raw dump, ADR-0134) and is
+		// absent on 100% of the live raw-path corpus (F8d) — the capture's raw-path correctness
+		// rests on captureContentAbsentMounts' D1b-3 mountpoints-source fallback, which does not
+		// depend on this staging step succeeding.
 		if podUID != "" {
 			// ADR-0134: prefer the task ID cached during the ctr attempt. Re-resolving here
 			// fails after the raw CRIU dump (frozen task drops off FindContainerTaskID's scan).
@@ -9497,6 +9732,28 @@ func (s *AgentServer) Checkpoint(ctx context.Context, req *agentpb.CheckpointReq
 				log.Info("Checkpoint: could not resolve task ID to stage config.json (raw CRIU path)", "podUID", podUID, "err", taskErr)
 			}
 		}
+
+		// ADR-0426 D2/D3: the raw-CRIU path's own content-absent mount capture — the wiring
+		// asymmetry (F1) this ADR closes. This path is taken by every established-TCP migration
+		// (Strict/BestEffort tcpPreservationMode), which the deleted /dev/shm-literal dump-side
+		// capture never covered at all. Placed after LeaveStopped+
+		// registerFrozenSource (above) so a fail-closed return here always arrives with the source
+		// frozen and thawable via the existing frozen-source machinery, never released (D3-THAW,
+		// F6) — and before checksumDir (moved below) so the digest covers the content image too.
+		if _, capErr := captureContentAbsentMounts(ctx, imagesDir); capErr != nil {
+			log.Error(capErr, "Checkpoint: content-absent mount capture failed — failing closed (ADR-0426 D1d, raw-CRIU path)",
+				"migration", req.MigrationName)
+			// Zeroize the partial image set before returning (Standing Rule 7): it contains live
+			// memory pages and must not linger recoverable on tmpfs.
+			if zErr := zeroizeDir(imagesDir); zErr != nil {
+				log.Error(zErr, "Checkpoint: zeroize after content capture failure (raw-CRIU path)", "migration", req.MigrationName)
+			}
+			return nil, newMountContentCaptureFailedStatus(capErr)
+		}
+
+		// Compute SHA256 of all files in the images directory. MOVED here (ADR-0426 D3), after
+		// config.json staging and the content capture, so the digest accounts for both.
+		sha256sum, sizeBytes = checksumDir(checkpointPath)
 	}
 
 	log.Info("Checkpoint complete", "path", checkpointPath, "sha256", sha256sum, "fallback", fallbackNote)
@@ -9870,9 +10127,29 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 				}
 			}
 
+			// ADR-0422 D1i5: this branch runs AFTER CRIU restore already happened, in a PRIOR RPC —
+			// it confirms an already-live, already-restored workload; it does not re-restore. A
+			// fresh D1a resolution here could return a DIFFERENT value than whatever
+			// prepPreservedSourceAddrForRestore actually programmed before that prior CRIU restore
+			// ran, which would make SingleHomeRestoredPod protect/verify against the WRONG address
+			// on an already-successfully-restored, already-live workload — reopening the exact
+			// cache-race class D1i0 exists to close, at the one site D1i's own fix was supposed to
+			// close it at. Serve the latched write-back instead: the SAME value the prior successful
+			// restore attempt actually programmed. Nothing here can diverge from that, because it is
+			// not independently re-derived. When nothing was latched (bind-prep never ran, or an
+			// agent restart lost the in-memory latch), apply the SAME checkpointHasEstablishedTCP-
+			// scoped fail-closed policy as every other bindIP-resolving call site. Factored into
+			// resolveIdempotentConfirmBindIP (behavior-preserving extraction) so this exact
+			// decision+message pair is directly unit-testable without a full gRPC/containerd harness
+			// (§P-VERIFY #23).
+			bindIP, failClosedMsg := s.resolveIdempotentConfirmBindIP(req.MigrationName, imagesDir)
+			if failClosedMsg != "" {
+				log.Error(errors.New("no latched bindIP"), failClosedMsg, "migration", req.MigrationName)
+				return &agentpb.RestoreResponse{Success: false, ErrorMessage: failClosedMsg}, nil
+			}
 			// Parity with the terminal success path: populate MAC + SingleHomeRestoredPod.
 			netnsPath, macIfname := s.finalizeNetnsPath(req.MigrationName)
-			fr, frErr := s.finalizeRestore(ctx, priorPID, netnsPath, macIfname, req.MigrationName, "", req.TcpPreservationMode, imagesDir)
+			fr, frErr := s.finalizeRestore(ctx, priorPID, netnsPath, macIfname, req.MigrationName, "", req.TcpPreservationMode, imagesDir, bindIP)
 			if frErr != nil {
 				log.Error(frErr, "Restore: finalizeRestore failed on idempotent confirm path (Strict/Full fail-closed)", "migration", req.MigrationName)
 				return &agentpb.RestoreResponse{Success: false, ErrorMessage: frErr.Error()}, nil
@@ -9997,9 +10274,25 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		// cgroup-ANCHOR-move step (a separate, broader tracked gap from the one this fixes) still
 		// gates on it below and is unchanged by this fix.
 		containerCgroupsPathResolved := s.resolveContainerCgroupsPathForMigration(ctx, req.MigrationName)
-		// ADR-0355 D2/D3: resolve the authoritative preserved source IP (pm.Spec.SourcePodIP) and
-		// thread it into joinNsRestore for the pre-CRIU bind-prep. "" (no CR / empty field) → no-op.
-		preservedSourceIP := s.resolvePreservedSourceIPForMigration(ctx, req.MigrationName)
+		// ADR-0422 D1a item 1: prefer the value already in hand on the RestoreRequest RPC payload
+		// (req.SeqSnapshots — zero cache, zero race, populated by the controller from
+		// CheckpointResponse.seq_snapshots). Only when the RPC carried no snapshot (D1b) do we fall
+		// back to the uncached authoritative reader (item 2/3), scoped fail-closed per D1g2.
+		preservedSourceIP, havePayloadIP := bindIPFromRestoreRequest(req)
+		if !havePayloadIP {
+			ns, nsErr := s.resolveNamespaceForMigrationE(ctx, req.MigrationName)
+			if nsErr == nil {
+				preservedSourceIP, nsErr = resolvePreservedSourceIPAuthoritative(ctx, s.apiReader, ns, req.MigrationName)
+			}
+			if nsErr != nil {
+				if checkpointHasEstablishedTCP(imagesDir) {
+					return nil, fmt.Errorf("resolve preserved source IP for established-TCP restore (ADR-0422 D1g, fail-closed): %w", nsErr)
+				}
+				log.Info("Restore: resolve preserved source IP failed, but checkpoint has no established TCP to preserve — proceeding without bind-prep (ADR-0422 D1g, scoped fail-closed)",
+					"migration", req.MigrationName, "err", nsErr)
+				preservedSourceIP = ""
+			}
+		}
 		pid, droppedMnts, joinErr := joinNsRestoreFn(ctx, req.MigrationName, imagesDir, storedWorkloadImage, "", "", joinSandboxID, storedVeth, false, reattachMounts, containerCgroupsPathResolved, "", preservedSourceIP)
 		// SD-4: CRIU restore has returned — ptrace is no longer expected. Close the window on
 		// the happy path immediately (the deferred close above is the fallback for early returns).
@@ -10133,7 +10426,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 		// on this gRPC path (parity with NRI path — Condition 2).
 		// Unconditional: finalizeRestore always runs (MAC resolution + Strict/Full fail-closed applies even without k8s client).
 		netnsPath, macIfname := s.finalizeNetnsPath(req.MigrationName)
-		fr, frErr := s.finalizeRestore(ctx, pid, netnsPath, macIfname, req.MigrationName, "", req.TcpPreservationMode, imagesDir)
+		fr, frErr := s.finalizeRestore(ctx, pid, netnsPath, macIfname, req.MigrationName, "", req.TcpPreservationMode, imagesDir, preservedSourceIP)
 		if frErr != nil {
 			log.Error(frErr, "Restore: finalizeRestore failed (Strict/Full fail-closed)", "migration", req.MigrationName)
 			return &agentpb.RestoreResponse{Success: false, ErrorMessage: frErr.Error()}, nil
@@ -10256,8 +10549,23 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// podCgroupParent stays "" — same D2.3-optional-bound rationale as the config.json branch;
 	// the separate cgroup-anchor-move tracked gap is unchanged by this fix.
 	containerCgroupsPathResolved2 := s.resolveContainerCgroupsPathForMigration(ctx, req.MigrationName)
-	// ADR-0355 D2/D3: same pre-CRIU bind-prep threading as the config.json branch above.
-	preservedSourceIP2 := s.resolvePreservedSourceIPForMigration(ctx, req.MigrationName)
+	// ADR-0422 D1a: same RPC-payload-first, uncached-reader-fallback threading as the config.json
+	// branch above, scoped fail-closed per D1g2.
+	preservedSourceIP2, havePayloadIP2 := bindIPFromRestoreRequest(req)
+	if !havePayloadIP2 {
+		ns2, nsErr2 := s.resolveNamespaceForMigrationE(ctx, req.MigrationName)
+		if nsErr2 == nil {
+			preservedSourceIP2, nsErr2 = resolvePreservedSourceIPAuthoritative(ctx, s.apiReader, ns2, req.MigrationName)
+		}
+		if nsErr2 != nil {
+			if checkpointHasEstablishedTCP(imagesDir) {
+				return nil, fmt.Errorf("resolve preserved source IP for established-TCP restore (ADR-0422 D1g, fail-closed): %w", nsErr2)
+			}
+			log.Info("Restore (raw CRIU path): resolve preserved source IP failed, but checkpoint has no established TCP to preserve — proceeding without bind-prep (ADR-0422 D1g, scoped fail-closed)",
+				"migration", req.MigrationName, "err", nsErr2)
+			preservedSourceIP2 = ""
+		}
+	}
 	rawPID, droppedMnts2, joinErr := joinNsRestoreFn(ctx, req.MigrationName, imagesDir, storedWorkloadImage, "", "", joinSandboxID2, storedVeth2, false, rawReattachMounts, containerCgroupsPathResolved2, "", preservedSourceIP2)
 	for _, d := range droppedMnts2 {
 		s.emitExternalMountDroppedEvent(context.Background(), req.MigrationName, d)
@@ -10273,7 +10581,7 @@ func (s *AgentServer) Restore(ctx context.Context, req *agentpb.RestoreRequest) 
 	// on the raw CRIU fallback path (Conditions 1, 2, 3).
 	// Unconditional: finalizeRestore always runs (MAC resolution + Strict/Full fail-closed applies even without k8s client).
 	netnsPath2, macIfname2 := s.finalizeNetnsPath(req.MigrationName)
-	fr2, frErr2 := s.finalizeRestore(ctx, result.PID, netnsPath2, macIfname2, req.MigrationName, "", req.TcpPreservationMode, imagesDir)
+	fr2, frErr2 := s.finalizeRestore(ctx, result.PID, netnsPath2, macIfname2, req.MigrationName, "", req.TcpPreservationMode, imagesDir, preservedSourceIP2)
 	if frErr2 != nil {
 		log.Error(frErr2, "Restore (raw CRIU path): finalizeRestore failed (Strict/Full fail-closed)", "migration", req.MigrationName)
 		return &agentpb.RestoreResponse{Success: false, ErrorMessage: frErr2.Error()}, nil
@@ -12218,6 +12526,114 @@ func (s *AgentServer) emitExternalMountUnresolvedEvent(ctx context.Context, migr
 	} else {
 		log.Info("emitExternalMountUnresolvedEvent: Warning ExternalMountUnresolved Event emitted (ADR-0194 P-0194-1)",
 			"migration", migrationName, "mnt_id", extErr.MntID, "ext_key", extErr.ExtKey, "reason", extErr.Reason)
+	}
+}
+
+// emitPreservedSourceIPUnresolvedEvent emits a Warning PreservedSourceIPUnresolved Kubernetes
+// Event on the PodMigration CR when ADR-0422 D1g fails closed on the NRI restore path: the
+// authoritative preserved-source-IP read failed and the checkpoint holds an established TCP
+// connection to preserve. Follows the exact emitCRIUImageInconsistencyEvent precedent so this new
+// fail-closed condition surfaces to the operator immediately, agent-side, instead of only via the
+// agent-pod log until the 60s controller NRI-confirm timeout falls through to the gRPC Restore
+// retry. Best-effort: logs on failure but does not block the caller's error path.
+func (s *AgentServer) emitPreservedSourceIPUnresolvedEvent(ctx context.Context, migrationName string, resolveErr error) {
+	if s.k8sClient == nil {
+		log.Info("emitPreservedSourceIPUnresolvedEvent: k8sClient nil — event not emitted",
+			"migration", migrationName)
+		return
+	}
+	namespace := s.resolveNamespaceForMigration(ctx, migrationName)
+	if namespace == "" {
+		namespace = "default"
+	}
+	pm := &pmv1.PodMigration{}
+	if getErr := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: migrationName}, pm); getErr != nil {
+		log.Error(getErr, "emitPreservedSourceIPUnresolvedEvent: could not fetch PodMigration to emit event",
+			"migration", migrationName)
+		return
+	}
+	msg := fmt.Sprintf("resolve preserved source IP for established-TCP restore failed (ADR-0422 D1g, fail-closed): %v", resolveErr)
+	now := metav1.Now()
+	event := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s.preserved-source-ip-unresolved.%d", migrationName, now.UnixNano()),
+			Namespace: namespace,
+		},
+		InvolvedObject: corev1.ObjectReference{
+			APIVersion: "podmotion.io/v1alpha1",
+			Kind:       "PodMigration",
+			Name:       pm.Name,
+			Namespace:  pm.Namespace,
+			UID:        pm.UID,
+		},
+		Reason:         "PreservedSourceIPUnresolved",
+		Message:        msg,
+		Type:           corev1.EventTypeWarning,
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+		Count:          1,
+		Source:         corev1.EventSource{Component: "podmotion-agent"},
+	}
+	if createErr := s.k8sClient.Create(ctx, event); createErr != nil {
+		log.Error(createErr, "emitPreservedSourceIPUnresolvedEvent: failed to create Event",
+			"migration", migrationName, "msg", msg)
+	} else {
+		log.Info("emitPreservedSourceIPUnresolvedEvent: Warning PreservedSourceIPUnresolved Event emitted (ADR-0422 D1g)",
+			"migration", migrationName, "msg", msg)
+	}
+}
+
+// emitBindIPWithoutHomeIPEvent emits a Warning BindIPWithoutHomeIP Kubernetes Event on the
+// PodMigration CR when ADR-0422 D1f-R4a fails closed: SingleHomeRestoredPod found a checkpointed
+// bind address but no identity (home) address to re-home the restored pod onto. Follows the exact
+// emitCRIUImageInconsistencyEvent precedent so this new fail-closed condition surfaces to the
+// operator immediately, agent-side, instead of only via the agent-pod log until the 60s
+// controller NRI-confirm timeout falls through to the gRPC Restore retry. Best-effort: logs on
+// failure but does not block the caller's error path.
+func (s *AgentServer) emitBindIPWithoutHomeIPEvent(ctx context.Context, migrationName string, bhErr *BindIPWithoutHomeIPError) {
+	if s.k8sClient == nil {
+		log.Info("emitBindIPWithoutHomeIPEvent: k8sClient nil — event not emitted",
+			"migration", migrationName)
+		return
+	}
+	namespace := s.resolveNamespaceForMigration(ctx, migrationName)
+	if namespace == "" {
+		namespace = "default"
+	}
+	pm := &pmv1.PodMigration{}
+	if getErr := s.k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: migrationName}, pm); getErr != nil {
+		log.Error(getErr, "emitBindIPWithoutHomeIPEvent: could not fetch PodMigration to emit event",
+			"migration", migrationName)
+		return
+	}
+	msg := bhErr.Error()
+	now := metav1.Now()
+	event := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s.bind-ip-without-home-ip.%d", migrationName, now.UnixNano()),
+			Namespace: namespace,
+		},
+		InvolvedObject: corev1.ObjectReference{
+			APIVersion: "podmotion.io/v1alpha1",
+			Kind:       "PodMigration",
+			Name:       pm.Name,
+			Namespace:  pm.Namespace,
+			UID:        pm.UID,
+		},
+		Reason:         "BindIPWithoutHomeIP",
+		Message:        msg,
+		Type:           corev1.EventTypeWarning,
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+		Count:          1,
+		Source:         corev1.EventSource{Component: "podmotion-agent"},
+	}
+	if createErr := s.k8sClient.Create(ctx, event); createErr != nil {
+		log.Error(createErr, "emitBindIPWithoutHomeIPEvent: failed to create Event",
+			"migration", migrationName, "msg", msg)
+	} else {
+		log.Info("emitBindIPWithoutHomeIPEvent: Warning BindIPWithoutHomeIP Event emitted (ADR-0422 D1f-R4a)",
+			"migration", migrationName, "msg", msg)
 	}
 }
 

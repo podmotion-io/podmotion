@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -171,10 +172,16 @@ func (r *PodMigrationReconciler) captureSourcePodSpecSnapshot(ctx context.Contex
 	return nil
 }
 
-// readBackReader returns the UNCACHED APIReader for the ADR-0393/0410 capture read-back gate, falling
-// back to the cached client only when APIReader is unset (unit tests, where the fake client is
-// read-after-write consistent and no cache-lag exists to defend against). Production ALWAYS wires
-// APIReader (cmd/main.go), so the authoritative read-back never depends on watch-delivery latency.
+// readBackReader returns the UNCACHED APIReader for the controller's authoritative same-pass
+// reads, falling back to the cached client only when APIReader is unset (unit tests, where the
+// fake client is read-after-write consistent and no cache-lag exists to defend against).
+// Production ALWAYS wires APIReader (cmd/main.go), so these reads never depend on
+// watch-delivery latency. Four non-test call sites as of ADR-0428: the ADR-0393/0410 capture
+// read-back gate (podspec_snapshot.go:163), the ADR-0423 rollback-progress stamp
+// (adr0423_terminal_integrity.go:353), and the ADR-0428 storage-cutover guard's pre-cutover
+// re-check (D1b) and post-cutover condition re-fetch (D1a). See StorageMigrationManager's
+// mirrored helper of the same name (internal/agent/storage/manager.go) for the equivalent
+// primitive one component over (ADR-0428 D7).
 func (r *PodMigrationReconciler) readBackReader() client.Reader {
 	if r.APIReader != nil {
 		return r.APIReader
@@ -182,11 +189,84 @@ func (r *PodMigrationReconciler) readBackReader() client.Reader {
 	return r.Client
 }
 
-// buildColdRecreatePod deserializes the snapshot into a fresh Pod object for cold-recreate. This is a
-// plain pod from the captured spec — NOT a checkpoint restore (the CRIU restore is the thing that
-// failed) — so it carries no holder init-container and no checkpoint-ref annotation. Scheduler fields
-// are re-cleared defensively. The name is deterministic and bound to pm.UID, and a distinct recreate
-// marker label is stamped (see rollbackRecreateMigrationUIDLabel).
+// stripPodMotionInjectedArtifacts (ADR-0423 D5) removes every PodMotion-injected artifact from a
+// pod spec/annotation set: the holder emptyDir volume, the holder init container, the holder
+// volume mounts, and the podmotion.io/checkpoint-ref, podmotion.io/migration-namespace,
+// podmotion.io/original-command-overridden, and podmotion.io/restore-target-containers
+// annotations. Extracted from createReplacementPod so both
+// createReplacementPod and buildColdRecreatePod strip from ONE place. createReplacementPod calls
+// this before re-injecting its own fresh holder artifacts; buildColdRecreatePod calls it and never
+// re-injects (a cold-recreated pod runs the workload's own command directly — D6b already confirmed
+// it is safe to attempt one at all, by restricting cold-recreate to first-generation snapshots,
+// which never carry these artifacts in the first place, making this call defensive/idempotent
+// rather than load-bearing on that specific path).
+func stripPodMotionInjectedArtifacts(spec *corev1.PodSpec, annotations map[string]string) {
+	const holderVolumeName = "podmotion-holder-bin"
+	const holderMountPath = "/podmotion"
+
+	filteredVolumes := make([]corev1.Volume, 0, len(spec.Volumes))
+	for _, v := range spec.Volumes {
+		if v.Name == holderVolumeName {
+			continue
+		}
+		filteredVolumes = append(filteredVolumes, v)
+	}
+	spec.Volumes = filteredVolumes
+
+	filteredInitContainers := make([]corev1.Container, 0, len(spec.InitContainers))
+	for _, c := range spec.InitContainers {
+		if c.Name == "podmotion-inject-holder" {
+			continue
+		}
+		filteredInitContainers = append(filteredInitContainers, c)
+	}
+	spec.InitContainers = filteredInitContainers
+
+	for i := range spec.Containers {
+		filteredMounts := make([]corev1.VolumeMount, 0, len(spec.Containers[i].VolumeMounts))
+		for _, m := range spec.Containers[i].VolumeMounts {
+			if m.Name == holderVolumeName || m.MountPath == holderMountPath {
+				continue
+			}
+			filteredMounts = append(filteredMounts, m)
+		}
+		spec.Containers[i].VolumeMounts = filteredMounts
+	}
+
+	delete(annotations, "podmotion.io/checkpoint-ref")
+	delete(annotations, "podmotion.io/migration-namespace")
+	delete(annotations, "podmotion.io/original-command-overridden")
+	delete(annotations, "podmotion.io/restore-target-containers")
+}
+
+// snapshotIsFirstGeneration implements ADR-0423 D6b: cold-recreate reliance is restricted to
+// first-generation sources — a snapshot captured from a pod that has never itself been a PodMotion
+// successor. D5 found that stripping alone cannot make a second-generation cold-recreate correct:
+// createReplacementPod overwrites the workload's own Command/Args and clears its probes, preserving
+// no copy anywhere, so a second-generation snapshot has irrecoverably lost that information by the
+// time a cold-recreate would run. All three clauses are already captured verbatim by
+// captureSourcePodSpecSnapshot and are deliberately redundant — this is a fail-closed gate on a
+// recovery mechanism that fabricates when wrong (D6a), so any one of them tripping means "do not
+// attempt." A nil snapshot is never first-generation (fail closed).
+func snapshotIsFirstGeneration(s *pmv1.SourcePodSpecSnapshot) bool {
+	if s == nil {
+		return false
+	}
+	return s.Annotations["podmotion.io/original-command-overridden"] != "true" &&
+		s.Annotations["podmotion.io/checkpoint-ref"] == "" &&
+		podlineage.GenerationFromLabels(s.Labels) == 0
+}
+
+// buildColdRecreatePod deserializes the snapshot into a fresh Pod object for cold-recreate. This is
+// a plain pod from the captured spec — NOT a checkpoint restore (the CRIU restore is the thing that
+// failed). Scheduler fields are re-cleared defensively and any PodMotion-injected holder artifacts
+// are stripped via the shared stripPodMotionInjectedArtifacts helper (ADR-0423 D5) — a true no-op
+// for the first-generation-only snapshots D6b restricts this function to (see
+// snapshotIsFirstGeneration), since a first-generation source never carried holder artifacts to
+// begin with, but kept here rather than assumed so the function's own doc comment states an
+// accurate, verified fact rather than a claim that was false for any second-generation source. The
+// name is deterministic and bound to pm.UID, and a distinct recreate marker label is stamped (see
+// rollbackRecreateMigrationUIDLabel).
 func buildColdRecreatePod(pm *pmv1.PodMigration) (*corev1.Pod, error) {
 	s := pm.Status.SourcePodSpecSnapshot
 	if s == nil {
@@ -236,6 +316,10 @@ func buildColdRecreatePod(pm *pmv1.PodMigration) (*corev1.Pod, error) {
 		annotations[k] = v
 	}
 	delete(annotations, "kubectl.kubernetes.io/last-applied-configuration")
+
+	// ADR-0423 D5: strip any PodMotion-injected artifacts via the shared helper (never re-injected
+	// — a cold-recreated pod runs the workload's own command directly).
+	stripPodMotionInjectedArtifacts(&spec, annotations)
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -290,6 +374,14 @@ func (r *PodMigrationReconciler) reconcileTier1ColdRecreateFromSnapshot(ctx cont
 				"migration", pm.Name, "pod", pod.Name)
 			return coldRecreateBlockedInvalid, ctrl.Result{}, nil
 		}
+		// D6a: a pod object existing is not a workload running — do not report success until a
+		// fresh read confirms it. This is checked on EVERY re-entrant pass (never only the pass
+		// that created it), which is what makes the confirmation re-entrant/crash-safe too.
+		if !coldRecreateConfirmedRunning(pm, existing) {
+			log.Info("ADR-0393: cold-recreate pod exists but is not yet confirmed Running (D6a) — requeuing",
+				"migration", pm.Name, "pod", existing.Name, "phase", existing.Status.Phase)
+			return coldRecreatePending, ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
 		return r.completeColdRecreate(ctx, pm), ctrl.Result{}, nil
 	case !apierrors.IsNotFound(getErr):
 		return coldRecreatePending, ctrl.Result{RequeueAfter: 3 * time.Second}, getErr
@@ -309,17 +401,98 @@ func (r *PodMigrationReconciler) reconcileTier1ColdRecreateFromSnapshot(ctx cont
 	// bypass). A rejected create leaves RollbackRecreatePending=True and requeues — it never
 	// downgrades to a widened pod.
 	if err := r.Create(ctx, pod); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			// Created concurrently (e.g. crash-after-create re-entry) — treat as success.
-			return r.completeColdRecreate(ctx, pm), ctrl.Result{}, nil
+		if !apierrors.IsAlreadyExists(err) {
+			log.Error(err, "ADR-0393: cold-recreate create rejected/failed — withholding terminal RolledBack, requeuing",
+				"migration", pm.Name, "pod", pod.Name)
+			return coldRecreatePending, ctrl.Result{RequeueAfter: 3 * time.Second}, err
 		}
-		log.Error(err, "ADR-0393: cold-recreate create rejected/failed — withholding terminal RolledBack, requeuing",
+		// Created concurrently (e.g. crash-after-create re-entry) — fall through to the pending
+		// requeue below; the NEXT reconcile's getErr==nil branch re-checks Running (D6a).
+	} else {
+		log.Info("ADR-0393: cold-recreate pod created from durable snapshot — awaiting Running confirmation (D6a; ReplicaSet parity, NOT a zero-downtime rollback)",
 			"migration", pm.Name, "pod", pod.Name)
-		return coldRecreatePending, ctrl.Result{RequeueAfter: 3 * time.Second}, err
 	}
-	log.Info("ADR-0393: cold-recreated source pod from durable snapshot (ReplicaSet parity — NOT a zero-downtime rollback)",
-		"migration", pm.Name, "pod", pod.Name)
-	return r.completeColdRecreate(ctx, pm), ctrl.Result{}, nil
+	// D6a: a just-created (or just-observed-AlreadyExists) pod cannot yet be observed Running on
+	// this SAME pass — that requires a fresh read, which can only happen on a later reconcile.
+	return coldRecreatePending, ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+}
+
+// coldRecreateNoProbeObservation is a single (RestartCount, StartedAt) reading for one workload
+// container, tracked in-memory across reconciles for D6a's no-readiness-probe fallback.
+type coldRecreateNoProbeObservation struct {
+	restartCount int32
+	startedAt    metav1.Time
+}
+
+// coldRecreateNoProbeObserved tracks the last observation per (migration, container) so D6a's
+// no-readiness-probe fallback can require two SUCCESSIVE reconcile passes to agree before
+// declaring a cold-recreated container confirmed running — ruling out a crash-loop that restarted
+// entirely between two reads taken close together. This mirrors the existing
+// macWritebackFirstSeen in-memory cross-reconcile pattern already used elsewhere in this package:
+// it is best-effort, NOT a durable status field (ADR-0423 mints exactly two new typed status
+// fields, RollbackStartTime/RollbackAttempted, neither of which is this) — losing this map (e.g.
+// an operator restart) only costs one extra confirmation cycle, never a false positive.
+var coldRecreateNoProbeObserved sync.Map // key: pm.Namespace+"/"+pm.Name+"/"+containerName
+
+// coldRecreateConfirmedRunning implements ADR-0423 D6a: a cold-recreate pod is confirmed running
+// only when Status.Phase==Running and every workload container is confirmed — via its Ready
+// condition when it declares a readiness probe, or (round-4 fix) via State.Running non-nil AND
+// RestartCount AND State.Running.StartedAt unchanged across two successive reads when it declares
+// none, which rules out a full crash-loop cycle (crash, backoff, restart) completing between two
+// reads that would otherwise leave RestartCount looking unchanged.
+func coldRecreateConfirmedRunning(pm *pmv1.PodMigration, pod *corev1.Pod) bool {
+	if pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	statusByName := make(map[string]*corev1.ContainerStatus, len(pod.Status.ContainerStatuses))
+	for i := range pod.Status.ContainerStatuses {
+		cs := &pod.Status.ContainerStatuses[i]
+		statusByName[cs.Name] = cs
+	}
+	allConfirmed := true
+	for i := range pod.Spec.Containers {
+		c := &pod.Spec.Containers[i]
+		cs := statusByName[c.Name]
+		obsKey := pm.Namespace + "/" + pm.Name + "/" + c.Name
+		if cs == nil {
+			allConfirmed = false
+			continue
+		}
+		if c.ReadinessProbe != nil {
+			if !cs.Ready {
+				allConfirmed = false
+			}
+			continue
+		}
+		if cs.State.Running == nil {
+			coldRecreateNoProbeObserved.Delete(obsKey)
+			allConfirmed = false
+			continue
+		}
+		cur := coldRecreateNoProbeObservation{restartCount: cs.RestartCount, startedAt: cs.State.Running.StartedAt}
+		prevAny, ok := coldRecreateNoProbeObserved.Load(obsKey)
+		if !ok {
+			coldRecreateNoProbeObserved.Store(obsKey, cur)
+			allConfirmed = false // first read — require a second, later, agreeing read.
+			continue
+		}
+		prev := prevAny.(coldRecreateNoProbeObservation)
+		if prev.restartCount != cur.restartCount || !prev.startedAt.Equal(&cur.startedAt) {
+			// Restarted between reads (or this is a fresh baseline) — re-baseline and keep waiting.
+			coldRecreateNoProbeObserved.Store(obsKey, cur)
+			allConfirmed = false
+		}
+	}
+	if allConfirmed {
+		// Clear observations for this migration's containers once confirmed, so a future
+		// cold-recreate of a differently-named migration never reads a stale entry (the key is
+		// scoped by migration name+namespace+container name, so collision is already impossible,
+		// but clearing keeps the map from growing unboundedly across many migrations).
+		for i := range pod.Spec.Containers {
+			coldRecreateNoProbeObserved.Delete(pm.Namespace + "/" + pm.Name + "/" + pod.Spec.Containers[i].Name)
+		}
+	}
+	return allConfirmed
 }
 
 // patchSourcePodSpecSnapshot writes ONLY .status.sourcePodSpecSnapshot as a field-scoped, optimistic-lock

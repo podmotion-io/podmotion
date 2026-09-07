@@ -35,6 +35,7 @@ import (
 
 	pmv1 "github.com/podmotion-io/podmotion/api/v1alpha1"
 	"github.com/podmotion-io/podmotion/internal/agent/netnsbroker"
+	"github.com/podmotion-io/podmotion/internal/agent/restoretargets"
 	"github.com/podmotion-io/podmotion/internal/metrics"
 )
 
@@ -360,7 +361,7 @@ func (p *Plugin) HandleStartContainer(ctx context.Context, event ContainerEvent)
 	// non-targets is removed.)
 	const restoreTargetsKey = "podmotion.io/restore-target-containers"
 	if targets := event.Annotations[restoreTargetsKey]; targets != "" {
-		if !containerInList(event.Name, targets) {
+		if !restoretargets.Contains(event.Name, restoretargets.FromCSV(targets)) {
 			log.Info("ADR-0197 Rule D: container is not a restore target — clean pass-through (no restore, no barrier)",
 				"container", event.ID, "name", event.Name, "restoreTargets", targets)
 			return nil
@@ -526,7 +527,7 @@ func (p *Plugin) HandlePostStartContainer(_ context.Context, event ContainerEven
 	// containers (the init container's post-start) return nil immediately.
 	const restoreTargetsKey = "podmotion.io/restore-target-containers"
 	if targets := event.Annotations[restoreTargetsKey]; targets != "" {
-		if !containerInList(event.Name, targets) {
+		if !restoretargets.Contains(event.Name, restoretargets.FromCSV(targets)) {
 			log.Info("ADR-0197 Rule D: container is not a restore target — clean pass-through (PostStartContainer)",
 				"container", event.ID, "name", event.Name, "restoreTargets", targets)
 			return nil
@@ -1179,18 +1180,12 @@ func observeHolderStdoutToken(event ContainerEvent, token string) bool {
 	return false
 }
 
-// containerInList reports whether name is a member of the comma-joined list (ADR-0197 Rule D
-// restore-target-containers annotation). Whitespace around each element is trimmed; empty
-// elements are ignored. The init container (podmotion-inject-holder) is never in this list by
-// construction, so it is excluded as a consequence of the allow-list, not a hard-coded deny.
-func containerInList(name, csv string) bool {
-	for _, part := range strings.Split(csv, ",") {
-		if strings.TrimSpace(part) == name {
-			return true
-		}
-	}
-	return false
-}
+// (containerInList was MOVED, not deleted: ADR-0421 D2c relocates the ADR-0197 Rule D membership
+// semantics to internal/agent/restoretargets, a transport-neutral leaf package, because ADR-0421
+// gives the predicate a second consumer on the gRPC destination-mount path and a second COPY of it
+// would let the NRI gate and the gRPC gate diverge — which is the defect ADR-0421 D2 closes. The
+// move also corrects this predicate's doc comment, which claimed empty csv elements were ignored
+// when they were not. See restoretargets.FromCSV / restoretargets.Contains.)
 
 // (findContainerInitPID was retired: the holder-ready sentinel is now observed via
 // the unconfined netns-broker's holder_sentinel op, which resolves the holder PID

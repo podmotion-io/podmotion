@@ -76,7 +76,7 @@ func TestMain(m *testing.M) {
 		return destinationRebindDemand{}, nil
 	}
 	// ADR-0419 D5: no containerd in a unit-test process.
-	containerdRuntimeMountsOnceFn = func(context.Context, string, string) ([]nri.ContainerMount, error) { return nil, nil }
+	containerdRuntimeMountsOnceFn = func(context.Context, string, string, []string) ([]nri.ContainerMount, error) { return nil, nil }
 	// ADR-0419 D8: no containerd in a unit-test process; one RUNNING sandbox is the healthy shape.
 	runningPodSandboxesForPodUIDFn = func(_ context.Context, podUID string) ([]string, error) {
 		return []string{"sandbox-for-" + podUID}, nil

@@ -413,8 +413,27 @@ func nriSocketPathFromConfig(cfg string) string {
 // top-level `root` key; an unreadable config or an unrecognized socket resolves to "" (fail closed).
 const defaultContainerdRootDir = "/var/lib/containerd"
 
-// criSandboxDirRel is the CRI plugin's sandbox subtree, relative to the containerd root dir.
-const criSandboxDirRel = "io.containerd.grpc.v1.cri/sandboxes"
+// ADR-0421 D1e: criSandboxDirRel and criContainersDirRel — the two CRI subtree segments this
+// package used to declare here — now live in internal/agent/cripaths as SandboxDirRel and
+// ContainersDirRel, and allowedExtMountHostTargetPrefixes iterates cripaths.AllDirRels() instead
+// of naming either one.
+//
+// This is a MOVE, not a removal, and the reason is a live defect rather than tidiness. The
+// privileged netns-broker's host_realpath op carries its OWN server-pinned path family
+// (hostRealpathAllowed, ADR-0419 D9) — a second, independent confinement bound, deliberately
+// coarser, deliberately not trusted jointly with this one. It held a hand-written second copy of
+// this class list naming only the sandbox subtree. ADR-0421 D1 widened THIS bound with the
+// per-container subtree and did not touch that one, so a legitimate
+// <root>/io.containerd.grpc.v1.cri/containers/<CID>/volumes/<hash> target passed the agent's
+// prefix check and was then refused by the broker as "outside the server-pinned path family" —
+// every affected restore failed closed. Two hand-maintained copies of one list is the whole
+// defect; the bounds stay independent, the CLASS LIST does not.
+//
+// The relative-vs-absolute property is unchanged and still load-bearing: the segments are
+// RELATIVE, and the absolute prefix is composed against the containerd root DISCOVERED at
+// runtime (ADR-0370), never hardcoded. So is D1's substrate evidence — ADR-0421 §P-VERIFY #1
+// measured the identical containers segment on kind/containerd 2.3.1 (root /var/lib/containerd)
+// and RKE2 v1.36.4+rke2r1 (root /var/lib/rancher/rke2/agent/containerd).
 
 // containerdRootFromConfig extracts the TOP-LEVEL `root = "..."` key from a containerd config.toml.
 // Top-level means: before the first `[table]` header — a `root` key inside e.g. `[plugins...]` is a
@@ -480,6 +499,21 @@ func resolveContainerdRootDir(ctx context.Context, winnerSocket string) string {
 // allowedExtMountHostTargetPrefixes (server.go), which needs the containerd root to authorize
 // sandbox-dir prefixes for --ext-mount-map token validation. That need is unrelated to destination
 // target RESOLUTION and outlives this ADR.
+//
+// ADR-0421 D1 amended this note to THREE such retained dependencies; D1e re-states it as TWO
+// LOCAL plus ONE SHARED. resolveContainerdRootDirFn is retained here, unchanged, for the reason
+// above. The two CRI subtree segments are retained as a CLASS LIST in internal/agent/cripaths
+// (SandboxDirRel + ContainersDirRel, iterated via AllDirRels) because a SECOND confinement bound
+// — the netns-broker's server-pinned path family — needs the same class set and silently diverged
+// from this one when D1 widened only this side. Retention is therefore unchanged in substance and
+// relocated in form: a future asymmetric-removal pass must still see all three, and must look for
+// the segments in cripaths rather than in this file.
+//
+// ADR-0421 D1c is explicit that D1 does NOT reconstruct
+// <root>/io.containerd.grpc.v1.cri/containers/<CID>/volumes/<hash> to probe or resolve anything —
+// that is exactly the reconstruction deleted above, and re-introducing it here would undo this
+// ADR. The target value continues to come from the runtime's reported Source. A future
+// asymmetric-removal pass must see all three.
 
 // pidOwningUnixSocketFn is a test seam. Production implementation: pidOwningUnixSocket.
 var pidOwningUnixSocketFn = pidOwningUnixSocket

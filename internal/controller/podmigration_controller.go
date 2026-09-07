@@ -208,15 +208,20 @@ var (
 // PodMigrationReconciler reconciles a PodMigration object.
 type PodMigrationReconciler struct {
 	client.Client
-	// APIReader is an UNCACHED apiserver reader (mgr.GetAPIReader), used ONLY for the ADR-0393/0410
-	// capture read-back gate. The informer cache is NOT read-after-write consistent with the direct
-	// Status().Patch that persists the snapshot one line earlier, so a cached read-back can return the
-	// pre-patch object (SourcePodSpecSnapshot == nil) until the watch delivers the write — a
-	// read-your-own-write blip, worst at cold-start. The uncached read grounds the fail-closed "refuse
-	// source kill" gate in authoritative server state, exactly as the eviction webhook (ADR-0401) and
-	// the agent bridge reconciler (ADR-0400 D2) already do. Nil in unit tests → the read-back falls
-	// back to r.Client via readBackReader() (the fake client is read-after-write consistent, so there
-	// is no cache-lag to defend against there).
+	// APIReader is an UNCACHED apiserver reader (mgr.GetAPIReader), used for the controller's
+	// authoritative same-pass reads: the ADR-0393/0410 capture read-back gate, the ADR-0423
+	// rollback-progress stamp (adr0423_terminal_integrity.go), and the ADR-0428 storage-cutover
+	// guard's pre-cutover re-check (D1b) and post-cutover condition re-fetch (D1a). The informer
+	// cache is NOT read-after-write consistent with a direct Status().Patch/Update issued earlier
+	// in the same reconcile pass, so a cached read-back can return the pre-write object until the
+	// watch delivers the write — a read-your-own-write blip, worst at cold-start. General rule
+	// (ADR-0428 D2): any read where a cache would be standing in for ground truth about a fact the
+	// API server holds authoritatively, and where being wrong is consequential and not
+	// self-correcting, must go through readBackReader(). The uncached read grounds these
+	// fail-closed gates in authoritative server state, exactly as the eviction webhook (ADR-0401)
+	// and the agent bridge reconciler (ADR-0400 D2) already do. Nil in unit tests → the read-back
+	// falls back to r.Client via readBackReader() (the fake client is read-after-write consistent,
+	// so there is no cache-lag to defend against there).
 	APIReader  client.Reader
 	Scheme     *runtime.Scheme
 	Estimator  estimation.Estimator
@@ -451,7 +456,14 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			// delete the healthy replacement: a real availability regression, not a safety net.
 			// Close out to Complete directly instead. Every other case (source never deleted)
 			// still fails closed to RollingBack exactly as before.
-			if r.sourceAlreadyDeletedLegitimately(deadline, pm) {
+			// ADR-0423 D1: sourceAlreadyDeletedLegitimately alone is not sufficient — it agrees on
+			// exactly one fact ("is the source pod gone, per a condition the controller itself set
+			// and a corroborating live fetch?") and that condition carries two epistemically
+			// different weights (ADR-0012's real success path vs. ADR-0356's Tier1-Longhorn early
+			// release). migrationGenuinelyVerifiedComplete additionally requires the mode-correct
+			// SourceTeardownBlockReason gate and Restored==True before this escape hatch may
+			// declare Complete on this antecedent.
+			if r.migrationGenuinelyVerifiedComplete(deadline, pm) {
 				return r.closeOutAfterLegitimateSourceDeletion(deadline, pm,
 					fmt.Sprintf("completion budget (%ds) exceeded, but source pod deletion was already legitimate and verified (ADR-0012) — closing out instead of destructive rollback", budgetSecs))
 			}
@@ -459,6 +471,17 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				"migration", pm.Name, "phase", pm.Status.Phase, "budgetSeconds", budgetSecs)
 			return r.initiateRollback(deadline, pm,
 				fmt.Sprintf("completion budget (%ds) exceeded before reaching a terminal phase (invariant #8); failing closed to rollback rather than wedging past the cap (source never deleted — ADR-0012)", budgetSecs))
+		}
+	}
+
+	// ADR-0423 D4/D4a/D4b: the completion-budget watchdog above is inert once Phase==RollingBack
+	// (isTerminalOrRollingBackPhase excludes it). Without an independent wall-clock bound here, a
+	// RollingBack migration whose ensureReplacementEndpointsRemoved never confirms, or whose
+	// ADR-0393 cold-recreate never converges, loops forever — the exact unbounded wedge D4 exists
+	// to close, now that D1/D2 route budget-expired migrations into RollingBack.
+	if pm.Status.Phase == pmv1.MigrationPhaseRollingBack {
+		if res, err, terminal := r.enforceRollbackBudget(deadline, pm); terminal {
+			return res, err
 		}
 	}
 
@@ -735,11 +758,13 @@ func (r *PodMigrationReconciler) reconcileDestinationPrewarm(ctx context.Context
 				if r.Recorder != nil {
 					r.Recorder.Eventf(pm, corev1.EventTypeWarning, "StrictClsactUnsupported", "%s", msg)
 				}
-				pm.Status.Phase = pmv1.MigrationPhaseFailed
-				if sErr := r.statusUpdate(ctx, pm); sErr != nil {
-					return ctrl.Result{}, sErr
-				}
-				return ctrl.Result{}, nil
+				// ADR-0423 Gap 1 / D2: routed through the sole Phase=Failed writer instead of a
+				// bare Status.Phase assignment, so this exit inherits the same unconditional
+				// terminal-cleanup guarantee as every other Failed exit. No dest netns/checkpoint
+				// artifacts exist yet at this call site (Strict clsact pre-check runs before any
+				// dest netns is staged), so ensureMigrationTerminalCleanup's steps no-op cleanly
+				// through their own preconditions — this conversion is not "adding work."
+				return r.finalizeFailed(ctx, pm, msg)
 			}
 		}
 	}
@@ -1617,15 +1642,78 @@ func (r *PodMigrationReconciler) gateStorageCutoverBeforeRestore(ctx context.Con
 	if r.StorageMgr == nil {
 		return ctrl.Result{}, true, nil
 	}
+
+	// ADR-0428 D1b: the fast path is the CACHED read — pm.Status.Conditions comes from this
+	// reconcile's top-of-Reconcile r.Get, which is cache-backed. A cached TRUE is always
+	// trustworthy (the informer cache never invents a condition; it only lags behind one), so
+	// a True short-circuits immediately with no extra apiserver traffic.
+	//
+	// A cached FALSE/ABSENT is NOT trustworthy, and acting on it is expensive: it commits this
+	// reconcile to a real Longhorn detach-from-source / attach-to-destination / await-single-owner
+	// sequence against a volume that may ALREADY be collapsed to single-owner on the destination
+	// node and mounted by the destination pod. patchStorageCutover's direct Status().Update may
+	// have landed on the API server in a PREVIOUS pass whose transitionTo then 409'd on its own
+	// cached re-Get (:7125) and requeued us here before the watch delivered — the condition is
+	// durably True on the server and absent from the cache. Confirm the negative against the
+	// source of truth before paying for a redundant, disruptive datapath action.
+	//
+	// Cost: exactly one extra apiserver Get, and ONLY on the branch that was about to issue a
+	// multi-second Longhorn cutover anyway. Strictly cheaper than the redundant detach/attach it
+	// prevents. Same primitive, same reason as the read-back below and the ADR-0393/0410
+	// snapshot read-back (podspec_snapshot.go). Do NOT "simplify" this to the cached read alone.
 	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionStorageCutoverComplete) {
 		return ctrl.Result{}, true, nil
 	}
-
-	if err := r.StorageMgr.Cutover(ctx, pm); err != nil {
-		log.Error(err, "OverlayHandoff: storage cutover failed — requeuing before allowing the restore-eligible phase",
-			"migration", pm.Name)
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, false, nil
+	authoritative := &pmv1.PodMigration{}
+	if err := r.readBackReader().Get(ctx, client.ObjectKeyFromObject(pm), authoritative); err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("authoritative re-check of storage-cutover condition before cutover: %w", err)
 	}
+	if meta.IsStatusConditionTrue(authoritative.Status.Conditions, pmv1.ConditionStorageCutoverComplete) {
+		// The cutover already completed and the cache had not caught up. Install the
+		// authoritative condition list so the caller's subsequent blob write does not
+		// re-clobber it (same reason as the post-cutover re-fetch below), and short-circuit.
+		pm.Status.Conditions = authoritative.Status.Conditions
+		return ctrl.Result{}, true, nil
+	}
+	// BOTH reads agree the condition is not True — fall through to the Cutover-skip
+	// decision (ADR-0428 D1c), which decides on ADR-0368's predicate, not on this one.
+
+	// ADR-0428 D1c: the question this decision is asking is "has the destination-side
+	// storage action already executed?" — and ADR-0368 already OWNS the answer to that
+	// question in storage.CutoverSideEffectOccurred (internal/agent/storage/manager.go).
+	// A bare IsStatusConditionTrue is a SECOND, WEAKER answer to the same question: it
+	// misses the case where the condition sits at False with reason
+	// "AwaitSingleOwnerTimeout", which is set ONLY after migrator.Cutover already returned
+	// nil — the tier's destination-side action was already issued and accepted; only the
+	// post-cutover collapse poll timed out. Re-issuing Cutover in that state re-detaches the
+	// volume from the (already deleted, ADR-0356) source node and re-attaches it to the
+	// destination node while the destination pod is mounting it, once per collapse-poll
+	// timeout cycle (~2m05s: longhornSingleOwnerTimeout + this requeue delay), indefinitely.
+	//
+	// Skipping it is safe, and the reason is NOT "the detach/attach provably took effect" —
+	// those are unconfirmed POSTs (no confirmation poll, unlike ReleaseDestination's
+	// pollUntilDetached). It is safe because the dual-engine collapse AwaitSingleOwner polls
+	// for is driven by the Kubernetes CSI attachment tickets, NOT by these legacy
+	// ?action=detach/?action=attach REST calls (see the Cutover doc comment in
+	// internal/agent/storage/tier1.go) — so re-issuing them cannot make the collapse more
+	// likely and skipping them cannot make it less likely. AwaitSingleOwner below stays
+	// unconditional and is what actually drives convergence. ADR-0428 D1c.0.
+	//
+	// Ask ADR-0368's predicate, never a second hand-rolled one; if the two ever disagree
+	// again, the predicate is the single place to fix it.
+	if !storage.CutoverSideEffectOccurred(authoritative.Status.Conditions) {
+		if err := r.StorageMgr.Cutover(ctx, pm); err != nil {
+			log.Error(err, "OverlayHandoff: storage cutover failed — requeuing before allowing the restore-eligible phase",
+				"migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, false, nil
+		}
+	}
+	// AwaitSingleOwner is DELIBERATELY unconditional and outside the skip above. In the
+	// AwaitSingleOwnerTimeout case the collapse poll is precisely the step that has NOT
+	// completed, so it must keep being retried on every pass — skipping it would convert a
+	// recoverable timeout into a permanent stall. AwaitSingleOwner is self-contained
+	// (it re-derives its own options via buildMigrationOptionsFromCache, manager.go:498)
+	// and does not require Cutover to have run in THIS process or THIS pass.
 	if err := r.StorageMgr.AwaitSingleOwner(ctx, pm); err != nil {
 		log.Error(err, "OverlayHandoff: await-single-owner failed — requeuing before allowing the restore-eligible phase",
 			"migration", pm.Name)
@@ -1637,8 +1725,18 @@ func (r *PodMigrationReconciler) gateStorageCutoverBeforeRestore(ctx context.Con
 	// this reconcile's in-memory pm. Re-fetch conditions here so the caller's subsequent
 	// statusUpdate/transitionTo calls — full Status replaces, not merges — don't clobber that
 	// just-written condition with the stale in-memory copy.
+	//
+	// ADR-0428: this re-fetch MUST go through the UNCACHED reader (readBackReader() ->
+	// mgr.GetAPIReader), never the cache-backed r.Client. patchStorageCutover's direct
+	// Status().Update landed on the API server MILLISECONDS ago, in THIS reconcile pass; the
+	// informer cache is not read-after-write consistent with it. A cached Get here can return
+	// the PRE-PATCH object, and this assignment then re-installs a condition list that LACKS
+	// the condition — the exact clobber this guard exists to prevent, executed by the guard
+	// itself. Same hazard, same primitive, same reason as the ADR-0393/0410 snapshot read-back
+	// (podspec_snapshot.go) and the ADR-0423 rollback-stamp read-back
+	// (adr0423_terminal_integrity.go). Do NOT "simplify" this back to r.Get.
 	fresh := &pmv1.PodMigration{}
-	if err := r.Get(ctx, client.ObjectKeyFromObject(pm), fresh); err != nil {
+	if err := r.readBackReader().Get(ctx, client.ObjectKeyFromObject(pm), fresh); err != nil {
 		return ctrl.Result{}, false, fmt.Errorf("re-fetch PodMigration after storage cutover: %w", err)
 	}
 	pm.Status.Conditions = fresh.Status.Conditions
@@ -5886,10 +5984,11 @@ func (r *PodMigrationReconciler) injectIPHandoff(ctx context.Context, pm *pmv1.P
 					"migration", pm.Name, "deadlineSec", macWritebackDeadlineSec.Seconds())
 				setCondition(pm, conditionIPHandoffInjected, metav1.ConditionFalse, "MACWritebackDeadlineExceeded",
 					"MAC writeback deadline exceeded — replVethMAC empty >30s after RestoreConfirmed")
-				if sErr := r.statusUpdate(ctx, pm); sErr != nil {
-					return ctrl.Result{}, sErr, false
-				}
-				if _, tErr := r.transitionTo(ctx, pm, pmv1.MigrationPhaseRollingBack); tErr != nil {
+				// ADR-0423 D4 decision (b): routed through the sole Phase=RollingBack writer
+				// (enterRollingBack) instead of a direct transitionTo call, so this entry into
+				// RollingBack is durably stamped with RollbackStartTime like every other entry.
+				// enterRollingBack's own transitionTo blob write persists the condition set above.
+				if _, tErr := r.enterRollingBack(ctx, pm, "MAC writeback deadline exceeded — replVethMAC empty >30s after CRIURestoreConfirmed (ADR-0133)"); tErr != nil {
 					return ctrl.Result{}, tErr, false
 				}
 				return ctrl.Result{}, nil, true
@@ -6694,6 +6793,17 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 	// instead of waiting up to FreezeWindowBudgetMs+500ms for the watchdog to fire.
 	r.disarmZeroWindowOnFailurePath(ctx, pm)
 
+	// ADR-0423 D4a: mark that a rollback attempt is happening — durably, via the field-scoped
+	// patchRollbackProgress — immediately after the zero-window disarm (ADR-0157 D2's disarm-first
+	// ordering) and before any of this function's other early returns, including the
+	// restoreSourceStorageIfNeeded error return that precedes r.Rollbacker.Rollback. Fail-safe, not
+	// fail-propagating: a bookkeeping write must never gate the only in-band source-thaw trigger.
+	attempted := true
+	if stamped, err := r.patchRollbackProgress(ctx, pm, nil, &attempted); err != nil || !stamped {
+		log.Error(err, "reconcileRollingBack: patchRollbackProgress did not confirm RollbackAttempted stamp — proceeding unconditionally (ADR-0423 D4a)",
+			"migration", pm.Name, "stamped", stamped)
+	}
+
 	// Delete the replacement pod first — before rolling back the source — so there is
 	// never a window where both pods are running and matching Service selectors.
 	// ADR-0350 D1: capture the reaped UIDs — this is the source-of-truth handoff consumed
@@ -6741,87 +6851,11 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 		return r.failMigration(ctx, pm, fmt.Sprintf("rollback failed: %v", err))
 	}
 
-	// GC-9 fix: release destination-side checkpoint images on the rollback/failure path.
-	// When CheckpointTransferred=true the dest agent holds checkpoint files in its tmpfs
-	// (/run/podmotion/checkpoints/<migration>/final/). On a failed restore these are
-	// never released by the normal success path, leaving orphaned .img files on the node.
-	// ReleaseCheckpoint is idempotent; errors are warn-only (ADR-0012: source pod is
-	// already safe, so we never block the Failed transition on a cleanup RPC failure).
-	//
-	// ADR-0182 CHURN-15 Issue 3 (GC-10): the GC-9 ReleaseCheckpoint gate and the GC-10
-	// dest-netns Abort gate are SEPARATE conditions. ReleaseCheckpoint depends on
-	// CheckpointTransferred (dest images exist only post-transfer). Abort/dest-netns teardown
-	// depends only on netns *staging* (ConditionDestinationNetnsReady), which is set during
-	// DestinationPrewarm BEFORE Checkpoint runs — so a Checkpoint-phase failure (where
-	// CheckpointTransferred is never set) must still tear the netns down. The old single guard
-	// on CheckpointTransferred skipped Abort entirely on early failure, leaking the bind-mount.
-	destStaged := r.AgentPool != nil && pm.Status.DestinationNodeName != "" &&
-		meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionDestinationNetnsReady)
-	if destStaged {
-		destNode := pm.Status.DestinationNodeName
-		destAgent, agErr := r.AgentPool.ForNode(ctx, destNode)
-		if agErr != nil {
-			log.Error(agErr, "reconcileRollingBack: cannot connect to dest agent for GC-9/GC-10 cleanup (warn-only)",
-				"migration", pm.Name, "node", destNode)
-		} else {
-			// GC-9: dest checkpoint images exist ONLY after transfer — retain that gate.
-			if pm.Status.CheckpointTransferred {
-				_, relErr := destAgent.ReleaseCheckpoint(ctx, &agentpb.ReleaseCheckpointRequest{
-					MigrationName:      pm.Name,
-					MigrationNamespace: pm.Namespace,
-				})
-				if relErr != nil {
-					log.Error(relErr, "reconcileRollingBack: dest ReleaseCheckpoint failed (GC-9, warn-only — images remain on dest tmpfs until reboot)",
-						"migration", pm.Name, "node", destNode)
-				} else {
-					log.Info("reconcileRollingBack: dest checkpoint released (GC-9)", "migration", pm.Name, "node", destNode)
-				}
-			}
-
-			// GC-10 (ADR-0173): tear down the pre-staged dest migration netns on the
-			// NRI/operator-driven restore-failure path via the Abort RPC. Conditioned on
-			// ConditionDestinationNetnsReady (netns staging), NOT on CheckpointTransferred —
-			// the netns is staged at DestinationPrewarm, independent of transfer, so this
-			// fires on Checkpoint-phase failures too (ADR-0182 CHURN-15 Issue 3). Issued
-			// STRICTLY SEQUENTIALLY — only after disarmZeroWindowOnFailurePath (DisarmZeroWindow)
-			// and Rollbacker.Rollback (NetworkRollback) have already returned above; it is NOT
-			// concurrent with them and reuses the same dest-agent handle. AbortRequest carries
-			// only migration_name and reason (no namespace field exists in the proto). The
-			// agent's Abort handler is idempotent (server.go delete-on-first-call), so an
-			// unconditional dispatch is safe under re-queues. Warn-only (ADR-0012 /
-			// ADR-0165-r2 SP-7): never blocks the Failed transition.
-			_, abErr := destAgent.Abort(ctx, &agentpb.AbortRequest{
-				MigrationName: pm.Name,
-				Reason:        "GC-10 rollback: tear down dest migration netns (phase-independent)",
-			})
-			if abErr != nil {
-				log.Error(abErr, "reconcileRollingBack: dest Abort/teardown failed (GC-10, warn-only — dest netns may remain until reboot)",
-					"migration", pm.Name, "node", destNode)
-			} else {
-				log.Info("reconcileRollingBack: dest migration netns teardown signalled (GC-10)", "migration", pm.Name, "node", destNode)
-			}
-		}
-	}
-
-	// ADR-0168 GC-9: set MigrationCheckpoint CR Status.Phase=Failed on rollback completion.
-	// Re-entry guard: skip if PodMigration is already Failed (idempotent under re-queues).
-	if pm.Status.Phase != pmv1.MigrationPhaseFailed {
-		if pm.Status.CheckpointRef != nil && pm.Status.CheckpointRef.Name != "" {
-			mcpGC9 := &pmv1.MigrationCheckpoint{}
-			mcpGC9Key := types.NamespacedName{Name: pm.Name, Namespace: pm.Namespace}
-			if mcpGetErr := r.Get(ctx, mcpGC9Key, mcpGC9); mcpGetErr == nil {
-				mcpGC9.Status.Phase = "Failed"
-				if mcpUpdateErr := r.Status().Update(ctx, mcpGC9); mcpUpdateErr != nil {
-					log.Error(mcpUpdateErr, "GC-9: failed to set MCP Status.Phase=Failed (warn-only, ADR-0012)", "migration", pm.Name)
-				} else {
-					log.Info("GC-9: MCP Status.Phase set to Failed", "migration", pm.Name)
-				}
-			} else {
-				log.Error(mcpGetErr, "GC-9: failed to fetch MCP for phase update (warn-only)", "migration", pm.Name)
-			}
-		}
-		// When CheckpointRef.Name is empty there is no MCP CR to advance (failure before checkpoint).
-	}
+	// GC-9/GC-10/MCP-phase cleanup MOVED to ensureMigrationTerminalCleanup (ADR-0423 D2/D7) — it
+	// now runs unconditionally, exit-agnostically, at the terminal write (finalizeFailed), for
+	// every present and future exit of this function, including the two (restoreSourceStorageIfNeeded
+	// failure and Rollback failure, above) that used to skip this block entirely by returning before
+	// ever reaching it. Nothing is left behind here.
 
 	// ADR-0350 D1/D2: gate RolledBack=True on confirmed replacement-endpoint absence. Placed
 	// here — after Rollbacker.Rollback has resumed the source, immediately before the 4548-4549
@@ -6861,31 +6895,41 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 	// container + on-disk/WAL recovery; in-memory and TCP connection state are lost — never a
 	// zero-downtime rollback.
 	coldRecreated := false
+	secondGenerationSkipped := false
 	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionTier1EarlySourceRelease) &&
 		pm.Status.Tier1EarlyReleaseSourceOwnerKind == "" &&
 		pm.Status.SourcePodSpecSnapshot != nil {
-		outcome, res, rcErr := r.reconcileTier1ColdRecreateFromSnapshot(ctx, pm)
-		if rcErr != nil {
-			// A real error attempting the recreate (transient API error, admission rejection).
-			// Withhold the terminal RolledBack and requeue — never fabricate/widen a pod, never
-			// silently proceed to the unrecovered-outage report on a recreate that could still
-			// succeed on retry.
-			log.Error(rcErr, "reconcileRollingBack: ADR-0393 cold-recreate errored — withholding RolledBack and requeuing",
-				"migration", pm.Name)
-			return ctrl.Result{RequeueAfter: 3 * time.Second}, r.statusUpdate(ctx, pm)
-		}
-		switch outcome {
-		case coldRecreatePending:
-			// Recreate in flight; re-enter from persisted state on the next reconcile.
-			return res, r.statusUpdate(ctx, pm)
-		case coldRecreateSucceeded:
-			coldRecreated = true
-		case coldRecreateBlockedInvalid:
-			// Fall through to the honest RollbackCompleteNoOwningController report below.
+		// ADR-0423 D6b: cold-recreate reliance is restricted to FIRST-GENERATION sources only — a
+		// second-(or-later-)generation source already had its original command/probes overwritten
+		// by a prior migration and D5 found stripping alone cannot recover them; attempting a
+		// recreate from that snapshot would fabricate a probe-less holder pod (the exact
+		// fabricated-health shape this ADR exists to eliminate). See snapshotIsFirstGeneration.
+		if !snapshotIsFirstGeneration(pm.Status.SourcePodSpecSnapshot) {
+			secondGenerationSkipped = true
+		} else {
+			outcome, res, rcErr := r.reconcileTier1ColdRecreateFromSnapshot(ctx, pm)
+			if rcErr != nil {
+				// A real error attempting the recreate (transient API error, admission rejection).
+				// Withhold the terminal RolledBack and requeue — never fabricate/widen a pod, never
+				// silently proceed to the unrecovered-outage report on a recreate that could still
+				// succeed on retry.
+				log.Error(rcErr, "reconcileRollingBack: ADR-0393 cold-recreate errored — withholding RolledBack and requeuing",
+					"migration", pm.Name)
+				return ctrl.Result{RequeueAfter: 3 * time.Second}, r.statusUpdate(ctx, pm)
+			}
+			switch outcome {
+			case coldRecreatePending:
+				// Recreate in flight (not yet observed Running — D6a); re-enter from persisted
+				// state on the next reconcile.
+				return res, r.statusUpdate(ctx, pm)
+			case coldRecreateSucceeded:
+				coldRecreated = true
+			case coldRecreateBlockedInvalid:
+				// Fall through to the honest RollbackCompleteNoOwningController report below.
+			}
 		}
 	}
 
-	pm.Status.Phase = pmv1.MigrationPhaseFailed
 	// Status-honesty fix (sprint49): "Source pod restored to live state" is only true when
 	// the source pod was still alive (frozen, never deleted — ADR-0012's normal guarantee) and
 	// Rollbacker.Rollback thawed it in place. ADR-0356's Tier1-Longhorn early source release
@@ -6895,7 +6939,16 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 	// this is a real bounded-downtime outage recovered via the source pod's owning controller
 	// (e.g. a ReplicaSet) recreating a fresh replacement, not a live-resume.
 	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionTier1EarlySourceRelease) {
-		if coldRecreated {
+		// ADR-0423 D2 finding (a) / V8: re-derive whether cold-recreate actually succeeded from a
+		// FRESH read of the deterministic recreate pod, not solely from the in-memory `coldRecreated`
+		// bool this pass computed. A prior pass's recreate may have succeeded and durably cleared
+		// SourcePodSpecSnapshot (via clearSourcePodSpecSnapshot's independent field-scoped patch)
+		// while its own terminal blob write (this function's tail, below) conflicted/errored —
+		// leaving Phase stuck at RollingBack with the ADR-0393 gate above now failing its
+		// SourcePodSpecSnapshot!=nil conjunct. Checking observed state here, BEFORE deciding which
+		// narration to set, prevents ever emitting the wrong Tier1EarlyReleaseUnrecoveredOutage
+		// event on such a re-entrant pass.
+		if coldRecreated || r.coldRecreatePodExists(ctx, pm) {
 			// ADR-0393: a bare pod's source was cold-recreated from the durable snapshot. Report
 			// ReplicaSet-parity recovery honestly — a fresh container from on-disk state, NOT a
 			// zero-downtime live-resume.
@@ -6906,17 +6959,25 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 					"on-disk/WAL state); in-memory state and live TCP connections are lost. This is NOT a "+
 					"zero-downtime rollback.")
 		} else {
-			r.setRolledBackConditionForTier1EarlyRelease(pm)
+			extraNote := ""
+			if secondGenerationSkipped {
+				extraNote = " ADR-0423 D6b: the source is a second-generation pod (a prior migration's " +
+					"replacement) — its original command/probes were already overwritten and are not " +
+					"durably preserved in the snapshot, so cold-recreate was not attempted (second-generation, " +
+					"no durable original spec)."
+			}
+			r.setRolledBackConditionForTier1EarlyRelease(pm, extraNote)
 		}
 	} else {
 		setCondition(pm, pmv1.ConditionRolledBack, metav1.ConditionTrue, "RollbackComplete", "Source pod restored to live state")
 	}
-	// M26: emit flow_loss counter at Failed (all TCP connections inventoried are treated as lost).
-	pmmetrics.MigrationFlowLossTotal.WithLabelValues(pm.Name, pm.Namespace).Add(
-		float64(len(pm.Status.TCPSeqSnapshots)),
-	)
-	r.releaseDestinationCapacity(ctx, pm)
-	return ctrl.Result{}, r.statusUpdate(ctx, pm)
+	// ADR-0423 D2: routed through the sole Phase=Failed writer (finalizeFailed) instead of
+	// hand-rolling the terminal write — it now performs the unconditional terminal cleanup
+	// (GC-9/GC-10/MCP/capacity-release/flow-loss-metric) that used to live inline here, and that
+	// used to be skipped entirely on the restoreSourceStorageIfNeeded/Rollback failure exits above.
+	// The ConditionRolledBack narration set above stays exactly where it is — finalizeFailed
+	// consumes it as-is, it does not replace it.
+	return r.finalizeFailed(ctx, pm, "rollback path complete — see ConditionRolledBack for the recovery narrative")
 }
 
 // setRolledBackConditionForTier1EarlyRelease implements ADR-0387: report the TRUE recovery
@@ -6932,7 +6993,9 @@ func (r *PodMigrationReconciler) reconcileRollingBack(ctx context.Context, pm *p
 // 2026-07-23) — so nothing will ever recreate it: this is an unrecovered outage, not a
 // bounded-downtime auto-recovery, and must be reported as such (distinct Reason + Warning
 // event) so an operator/alert rule can tell the two apart.
-func (r *PodMigrationReconciler) setRolledBackConditionForTier1EarlyRelease(pm *pmv1.PodMigration) {
+// extraNote (ADR-0423 D6b) is appended verbatim to the no-owning-controller message when non-empty
+// — used to state plainly why no ADR-0393 recovery was attempted (e.g. a second-generation source).
+func (r *PodMigrationReconciler) setRolledBackConditionForTier1EarlyRelease(pm *pmv1.PodMigration, extraNote string) {
 	if pm.Status.Tier1EarlyReleaseSourceOwnerKind == "" {
 		setCondition(pm, pmv1.ConditionRolledBack, metav1.ConditionTrue, "RollbackCompleteNoOwningController",
 			"ADR-0356 Tier1-Longhorn early source release had already deleted the source pod before rollback "+
@@ -6940,7 +7003,7 @@ func (r *PodMigrationReconciler) setRolledBackConditionForTier1EarlyRelease(pm *
 				"pod), so ADR-0356's usual 'a controller recreates a fresh replacement' recovery does not apply "+
 				"here: nothing will recreate this pod automatically. This is an unrecovered outage requiring "+
 				"manual intervention (recreate the pod from its original spec / the durably-verified checkpoint), "+
-				"not a bounded-downtime auto-recovery (ADR-0387).")
+				"not a bounded-downtime auto-recovery (ADR-0387)."+extraNote)
 		if r.Recorder != nil {
 			r.Recorder.Eventf(pm, corev1.EventTypeWarning, "Tier1EarlyReleaseUnrecoveredOutage",
 				"migration %s: Tier1-Longhorn early source release deleted a standalone pod with no owning "+
@@ -7154,42 +7217,20 @@ func (r *PodMigrationReconciler) transitionTo(ctx context.Context, pm *pmv1.PodM
 	return ctrl.Result{Requeue: true}, nil
 }
 
+// failMigration is a thin wrapper over finalizeFailed (ADR-0423 D2) — the sole writer of
+// Phase=Failed. Kept only because it is the name every existing call site already uses; it gains
+// finalizeFailed's full terminal-cleanup guarantee (GC-9/GC-10/MCP-phase, on top of the
+// disarm/reap/capacity-release/flow-loss-metric it already performed) with zero textual change at
+// any call site.
 func (r *PodMigrationReconciler) failMigration(ctx context.Context, pm *pmv1.PodMigration, reason string) (ctrl.Result, error) {
-	// ADR-0157 D2: call DisarmZeroWindow FIRST when the hold is armed and not yet disarmed.
-	// Non-blocking: disarm failure is recorded as WatchdogFired and rollback continues.
-	r.disarmZeroWindowOnFailurePath(ctx, pm)
-
-	// Clean up the replacement pod on hard failure (not rollback — rollback handles its own).
-	// Prevents a gated orphan pod from lingering when the migration is permanently failed.
-	r.deleteReplacementPod(ctx, pm)
-	r.releaseDestinationCapacity(ctx, pm)
-
-	// M26: emit flow_loss counter at Failed (all TCP connections inventoried are treated as lost).
-	pmmetrics.MigrationFlowLossTotal.WithLabelValues(pm.Name, pm.Namespace).Add(
-		float64(len(pm.Status.TCPSeqSnapshots)),
-	)
-
-	key := client.ObjectKeyFromObject(pm)
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &pmv1.PodMigration{}
-		if fetchErr := r.Get(ctx, key, fresh); fetchErr != nil {
-			return fetchErr
-		}
-		server := fresh.DeepCopy()
-		fresh.Status = pm.Status
-		preserveOperatorOwnedDurableStatus(server, &fresh.Status) // ADR-0398/0408: never blob-overwrite marker or snapshot
-		fresh.Status.Phase = pmv1.MigrationPhaseFailed
-		now := metav1.Now()
-		fresh.Status.CompletionTime = &now
-		setCondition(fresh, pmv1.ConditionFailed, metav1.ConditionTrue, "MigrationFailed", reason)
-		return r.Status().Update(ctx, fresh)
-	})
-	return ctrl.Result{}, err
+	return r.finalizeFailed(ctx, pm, reason)
 }
 
+// initiateRollback is a thin wrapper over enterRollingBack (ADR-0423 D4 decision (b)) — the sole
+// writer of Phase=RollingBack. Kept only because it is the name the watchdog's negative branch and
+// other call sites already use.
 func (r *PodMigrationReconciler) initiateRollback(ctx context.Context, pm *pmv1.PodMigration, reason string) (ctrl.Result, error) {
-	setCondition(pm, "RollbackReason", metav1.ConditionTrue, "Initiating", reason)
-	return r.transitionTo(ctx, pm, pmv1.MigrationPhaseRollingBack)
+	return r.enterRollingBack(ctx, pm, reason)
 }
 
 // isTerminalOrRollingBackPhase reports whether a phase is a terminal outcome or already on the
@@ -7806,19 +7847,6 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	}
 	delete(newAnnotations, "kubectl.kubernetes.io/last-applied-configuration")
 
-	// ADR-0120 D3 / ADR-0175: stamp the checkpoint-ref unconditionally. The annotation
-	// value is pm.Name (DNS-label safe, stable from first reconcile) — it does not
-	// depend on CheckpointRef being populated. The NRI plugin reconstructs the full
-	// checkpoint path as /run/podmotion/checkpoints/<ref>/final from pm.Name. The
-	// prior nil-guard caused a race where CheckpointRef was not yet set at
-	// createReplacementPod time, silently dropping the annotation and preventing the
-	// NRI StartContainer hook from firing CRIU restore.
-	newAnnotations["podmotion.io/checkpoint-ref"] = pm.Name
-	newAnnotations["podmotion.io/migration-namespace"] = pm.Namespace
-	// ADR-0130: mark that this pod's container command was replaced with a holder
-	// (the real workload is supplied by the CRIU-restored tree).
-	newAnnotations["podmotion.io/original-command-overridden"] = "true"
-
 	// Deep-copy spec; clear scheduler-assigned and mutable fields.
 	spec := *sourcePod.Spec.DeepCopy()
 	spec.SchedulerName = ""    // webhook injects podmotion-scheduler
@@ -7902,37 +7930,31 @@ func (r *PodMigrationReconciler) createReplacementPod(ctx context.Context, pm *p
 	//   spec.containers[0].volumeMounts[N].mountPath: Invalid value: "/podmotion": must be unique
 	// which silently strands the migration with Status.ReplacementPodName never set (reproduced
 	// live, sprint49: nginx-live-proof2-retry, operator log "failed to create replacement pod").
-	// Stripping by name/mountPath here — mirroring the selector-label strip above — makes
-	// replacement-pod creation idempotent regardless of how many times this workload has
-	// already been migrated.
-	filteredVolumes := make([]corev1.Volume, 0, len(spec.Volumes))
-	for _, v := range spec.Volumes {
-		if v.Name == holderVolumeName {
-			continue
-		}
-		filteredVolumes = append(filteredVolumes, v)
-	}
-	spec.Volumes = filteredVolumes
+	// Stripping here — mirroring the selector-label strip above — makes replacement-pod creation
+	// idempotent regardless of how many times this workload has already been migrated.
+	//
+	// ADR-0423 D5: the strip logic itself is now the SHARED stripPodMotionInjectedArtifacts
+	// helper, extracted so createReplacementPod and buildColdRecreatePod (podspec_snapshot.go)
+	// strip from exactly one place, shared rather than each hand-maintaining a copy. It also strips
+	// the podmotion.io/checkpoint-ref, podmotion.io/migration-namespace,
+	// podmotion.io/original-command-overridden, and podmotion.io/restore-target-containers
+	// annotations from newAnnotations BEFORE they are (re-)stamped immediately below — a strip
+	// followed immediately by a fresh stamp, so a second/Nth-generation source's stale values are
+	// never carried forward, only this migration's own.
+	stripPodMotionInjectedArtifacts(&spec, newAnnotations)
 
-	filteredInitContainers := make([]corev1.Container, 0, len(spec.InitContainers))
-	for _, c := range spec.InitContainers {
-		if c.Name == "podmotion-inject-holder" {
-			continue
-		}
-		filteredInitContainers = append(filteredInitContainers, c)
-	}
-	spec.InitContainers = filteredInitContainers
-
-	for i := range spec.Containers {
-		filteredMounts := make([]corev1.VolumeMount, 0, len(spec.Containers[i].VolumeMounts))
-		for _, m := range spec.Containers[i].VolumeMounts {
-			if m.Name == holderVolumeName || m.MountPath == holderMountPath {
-				continue
-			}
-			filteredMounts = append(filteredMounts, m)
-		}
-		spec.Containers[i].VolumeMounts = filteredMounts
-	}
+	// ADR-0120 D3 / ADR-0175: stamp the checkpoint-ref unconditionally. The annotation
+	// value is pm.Name (DNS-label safe, stable from first reconcile) — it does not
+	// depend on CheckpointRef being populated. The NRI plugin reconstructs the full
+	// checkpoint path as /run/podmotion/checkpoints/<ref>/final from pm.Name. The
+	// prior nil-guard caused a race where CheckpointRef was not yet set at
+	// createReplacementPod time, silently dropping the annotation and preventing the
+	// NRI StartContainer hook from firing CRIU restore.
+	newAnnotations["podmotion.io/checkpoint-ref"] = pm.Name
+	newAnnotations["podmotion.io/migration-namespace"] = pm.Namespace
+	// ADR-0130: mark that this pod's container command was replaced with a holder
+	// (the real workload is supplied by the CRIU-restored tree).
+	newAnnotations["podmotion.io/original-command-overridden"] = "true"
 
 	// Inject the holder emptyDir volume onto the replacement pod spec.
 	spec.Volumes = append(spec.Volumes, corev1.Volume{

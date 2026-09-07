@@ -42,7 +42,7 @@ func TestJoinNsRestore_PopulatesMAC(t *testing.T) {
 
 	s := New("test-node", &criu.StubCheckpointer{}, nil)
 	// k8sClient is nil — finalizeRestore skips k8s operations but must still populate mac.
-	result, err := s.finalizeRestore(context.Background(), 12345, "/var/run/netns/test", "eth0", "test-migration", "", "None", "")
+	result, err := s.finalizeRestore(context.Background(), 12345, "/var/run/netns/test", "eth0", "test-migration", "", "None", "", "")
 	if err != nil {
 		t.Fatalf("finalizeRestore returned unexpected error: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestJoinNsRestore_EmptyMACStrictFails(t *testing.T) {
 	defer func() { readReplVethMACFn = orig }()
 
 	s := New("test-node", &criu.StubCheckpointer{}, nil)
-	_, err := s.finalizeRestore(context.Background(), 12345, "/var/run/netns/test", "eth0", "test-migration", "", "Strict", "")
+	_, err := s.finalizeRestore(context.Background(), 12345, "/var/run/netns/test", "eth0", "test-migration", "", "Strict", "", "")
 	if err == nil {
 		t.Fatal("expected non-nil error for Strict mode with empty MAC, got nil")
 	}
@@ -84,7 +84,7 @@ func TestJoinNsRestore_EmptyMACBestEffortDegrades(t *testing.T) {
 	defer func() { readReplVethMACFn = orig }()
 
 	s := New("test-node", &criu.StubCheckpointer{}, nil)
-	result, err := s.finalizeRestore(context.Background(), 12345, "/var/run/netns/test", "eth0", "test-migration", "", "BestEffort", "")
+	result, err := s.finalizeRestore(context.Background(), 12345, "/var/run/netns/test", "eth0", "test-migration", "", "BestEffort", "", "")
 	if err != nil {
 		t.Fatalf("BestEffort mode: expected nil error on empty MAC, got: %v", err)
 	}

@@ -159,7 +159,7 @@ func TestADR0419_NRIPathIssuesZeroRuntimeLookups(t *testing.T) {
 	defer withDemandSet(t, "/etc/hosts", "/etc/hostname", "/etc/resolv.conf")()
 	lookups := 0
 	orig := containerdRuntimeMountsOnceFn
-	containerdRuntimeMountsOnceFn = func(context.Context, string, string) ([]nri.ContainerMount, error) {
+	containerdRuntimeMountsOnceFn = func(context.Context, string, string, []string) ([]nri.ContainerMount, error) {
 		lookups++
 		return adr0419FakeEventMounts(), nil
 	}
@@ -389,7 +389,7 @@ func TestADR0419_NotYetThatNeverConvergesGetsANamedTerminal(t *testing.T) {
 
 	calls := 0
 	orig := containerdRuntimeMountsOnceFn
-	containerdRuntimeMountsOnceFn = func(context.Context, string, string) ([]nri.ContainerMount, error) {
+	containerdRuntimeMountsOnceFn = func(context.Context, string, string, []string) ([]nri.ContainerMount, error) {
 		calls++
 		return nil, status.Error(codes.Unavailable, "containerd is down")
 	}
@@ -434,7 +434,7 @@ func TestADR0419_TransientBlipThenSuccessResolves(t *testing.T) {
 
 	calls := 0
 	orig := containerdRuntimeMountsOnceFn
-	containerdRuntimeMountsOnceFn = func(context.Context, string, string) ([]nri.ContainerMount, error) {
+	containerdRuntimeMountsOnceFn = func(context.Context, string, string, []string) ([]nri.ContainerMount, error) {
 		calls++
 		if calls < 3 {
 			return nil, status.Error(codes.Unavailable, "blip")
@@ -460,7 +460,7 @@ func TestADR0419_TerminalStatusIsNotRetried(t *testing.T) {
 	defer withDemandSet(t, "/etc/hosts")()
 	calls := 0
 	orig := containerdRuntimeMountsOnceFn
-	containerdRuntimeMountsOnceFn = func(context.Context, string, string) ([]nri.ContainerMount, error) {
+	containerdRuntimeMountsOnceFn = func(context.Context, string, string, []string) ([]nri.ContainerMount, error) {
 		calls++
 		return nil, status.Error(codes.PermissionDenied, "denied")
 	}
@@ -779,13 +779,23 @@ func TestADR0419_RemovalSymmetry_RemovedSymbolsAreGone(t *testing.T) {
 func TestADR0419_RemovalSymmetry_RetainedSymbolsSurvive(t *testing.T) {
 	server := adr0419ReadSource(t, "server.go")
 	discovery := adr0419ReadSource(t, "containerd_discovery.go")
+	// Row 9's subject MOVED rather than vanished (ADR-0421 D1e): the CRI subtree segments now
+	// live in internal/agent/cripaths, because a SECOND confinement bound — the netns-broker's
+	// server-pinned path family — needs the same class set and silently diverged from this one
+	// when ADR-0421 D1 widened only the agent side. Retention is asserted at the new home, and
+	// server.go is separately asserted to still consume it, so the row still catches an
+	// over-deletion in either place. Keeping it pointed at the old location would have made the
+	// guard fail on a correct change, which teaches that guards are obstacles.
+	shared := adr0419ReadSource(t, filepath.Join("..", "cripaths", "cripaths.go"))
 
 	cases := []struct {
 		sym, in, why string
 		src          string
 	}{
 		{"resolveContainerdRootDirFn", "server.go", "allowedExtMountHostTargetPrefixes needs the containerd root to authorize sandbox-dir prefixes (row 8)", server},
-		{"criSandboxDirRel", "server.go", "same allowlist consumer as row 8 (row 9)", server},
+		{"SandboxDirRel", "internal/agent/cripaths/cripaths.go", "row 9's segment, relocated by ADR-0421 D1e to the one place both confinement bounds read", shared},
+		{"ContainersDirRel", "internal/agent/cripaths/cripaths.go", "ADR-0421 D1's fourth writer class, in that same shared home", shared},
+		{"cripaths.AllDirRels", "server.go", "row 9's surviving CONSUMER: the allowlist still authorizes CRI subtree prefixes, now by iterating the shared class list", server},
 		{"resolveContainerdRootDir", "containerd_discovery.go", "the production implementation behind the retained seam (row 8)", discovery},
 		{"sandboxIDForPodUID", "server.go", "the ADR-0306 pod-netns join gate still calls it — it is HARDENED, not deleted (row 10)", server},
 		{"errNoSandboxForPodUID", "server.go", "its zero-match retryable contract is invariant (row 10 contract-delta)", server},

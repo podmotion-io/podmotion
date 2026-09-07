@@ -492,11 +492,20 @@ func (c *CRIUCheckpointer) Dump(ctx context.Context, opts DumpOptions) (Checkpoi
 	//     --external mnt[]{:AUTO_OPTIONS} below and re-attached on restore, never tarred into the
 	//     checkpoint. That is the storage tier's carve-out, not a skipMnts entry.
 	//
-	// Every other pod-local mount — /dev, /dev/shm, /dev/mqueue, /dev/pts, the serviceaccount token
-	// tmpfs, any pod-local tmpfs, and whatever construct a future runtime injects — is captured with
-	// content by default (no entry here). Checkpoint confidentiality (0700 images, tmpfs, zeroize on
-	// exit, and the ADR-0029 checkpoint encryption feature) is the uniform place that risk is
-	// handled, NOT a capture-time exclusion list.
+	// Every other pod-local mount — /dev, /dev/mqueue, /dev/pts, the serviceaccount token tmpfs, any
+	// pod-local tmpfs, and whatever construct a future runtime injects — is captured with content by
+	// default (no entry here), WITH ONE DECODED EXCEPTION (ADR-0426): /dev/shm is a SEPARATE mount
+	// with its own superblock, bind-mounted from the pod SANDBOX's host directory rather than being a
+	// per-container tmpfs — CRIU autodetects it as an EXTERNAL mount unaided
+	// (--external mnt[]{:AUTO_OPTIONS} above has no per-mount opt-out, F3) and dumps NO content image
+	// for it, on both dump paths. The claim this comment used to make — that /dev/shm "is captured
+	// with content by default" — was FALSE and was the comment that made that gap invisible for six
+	// weeks (ADR-0426 D5.3, C9). /dev/shm's content is therefore captured by PodMotion's OWN
+	// dump-side primitive, captureContentAbsentMounts (internal/agent/server/adr0426_dump_side_content_capture.go),
+	// not by CRIU — keyed on mount reachability and content-absence, not on which dump path ran.
+	// Checkpoint confidentiality (0700 images, tmpfs, zeroize on exit, and the ADR-0029 checkpoint
+	// encryption feature) is the uniform place the residency risk is handled, NOT a capture-time
+	// exclusion list.
 	// (1) /sys — kernel-synthesized; the ENTIRE subtree is carved out. Discovered from the target's
 	// live mount table (see sysSubtreeSkips) because --skip-mnt is path-literal/non-recursive and
 	// /sys's separately-mounted children would otherwise orphan on the skipped /sys parent and abort
