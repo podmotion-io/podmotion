@@ -52,23 +52,18 @@
 # canonical /etc/cni/net.d the agent's CNI plugin detector scans by default.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# KNOWN GOTCHA — same dev-mode scheduler gap as the kind/kubeadm quickstarts
+# Scheduling-gate binding path (matches the kind/kubeadm quickstarts)
 # ─────────────────────────────────────────────────────────────────────────────
-# With scheduler.enabled=false + webhook.podMutation.enabled=false (the
-# dev-mode config this quickstart uses, same as kind/kubeadm), nothing pins
-# the REPLACEMENT pod onto spec.targetNodeName — the default Kubernetes
-# scheduler places it wherever it likes, and the destination agent hard-
-# rejects the restore if that lands on the wrong node. This was hit and
-# confirmed live during THIS quickstart's own k3s verification too (same
-# underlying cause as kubeadm — this is not a k3s-specific issue). If a
-# migration wedges at RestoreSocketReattach or the replacement pod shows
-# Init:CrashLoopBackOff with "destinationNode X != this node Y", cordon
-# every node except your intended target before applying the PodMigration:
-#   kubectl cordon <every-other-node>
-#   ... apply the PodMigration, wait for Complete ...
-#   kubectl uncordon <every-other-node>
-# This is a workaround for verification, not a fix — real node pinning needs
-# scheduler.enabled=true (out of scope for this dev quickstart).
+# This quickstart delegates to hack/kvm-cluster.sh deploy-podmotion and
+# re-enters Helm with --reuse-values, so it inherits that script's
+# scheduler.enabled=true / webhook.podMutation.enabled=true pair (matched,
+# true since commit 7b2ecb53, 2026-07-27; ADR-0416 brings kind and EC2 to the
+# same parity). The REPLACEMENT pod is pinned onto spec.targetNodeName by the
+# podmotion scheduler, so the cordon/uncordon workaround this section used to
+# document is no longer needed. If a migration still wedges at
+# RestoreSocketReattach, or a replacement pod shows Init:CrashLoopBackOff with
+# "destinationNode X != this node Y", check that deploy/podmotion-scheduler is
+# actually Ready rather than reaching for a cordon.
 #
 # Usage:
 #   hack/quickstart-k3s.sh [VM_PREFIX] [--demo-repo PATH] [--skip-workloads] [--help]
@@ -494,22 +489,13 @@ Run your first migration:
 
   KUBECONFIG=$KUBECONFIG_FILE kubectl get podmigration migrate-my-app -n pm-e2e -o yaml
 
-IMPORTANT — known gotcha on this 3-node dev deploy (scheduler.enabled=false,
-webhook.podMutation.enabled=false, same degraded config the kind/kubeadm
-quickstarts use): nothing pins the REPLACEMENT pod onto spec.targetNodeName —
-the default Kubernetes scheduler places it wherever it likes, and the
-destination agent hard-rejects the restore if that lands on the wrong node
-("destinationNode X != this node Y"). This was hit and confirmed live during
-THIS quickstart's own k3s verification too (not a k3s-specific issue — same
-underlying cause as kubeadm). If a migration wedges at RestoreSocketReattach
-or the replacement pod shows Init:CrashLoopBackOff with that exact error,
-cordon every node except your intended target before applying the
-PodMigration so the default scheduler has no other choice, e.g.:
-  KUBECONFIG=$KUBECONFIG_FILE kubectl cordon <every-other-node>
-  ... apply the PodMigration, wait for Complete ...
-  KUBECONFIG=$KUBECONFIG_FILE kubectl uncordon <every-other-node>
-This is a workaround for verification, not a fix — real node pinning needs
-scheduler.enabled=true (out of scope for this dev quickstart).
+NOTE — this quickstart delegates to hack/kvm-cluster.sh deploy-podmotion and
+re-enters Helm with --reuse-values, so it inherits that script's
+scheduler.enabled=true / webhook.podMutation.enabled=true pair (matched, true
+since commit 7b2ecb53, 2026-07-27; ADR-0416 brings kind and EC2 to the same
+parity). The scheduling-gate binding path is live on this 3-node dev deploy:
+the replacement pod is pinned onto spec.targetNodeName by the podmotion
+scheduler, so the old cordon/uncordon workaround is no longer needed.
 
 k3s-specific containerd paths in use on this cluster (agent.containerd.*):
   socketPath: $K3S_CONTAINERD_SOCKET

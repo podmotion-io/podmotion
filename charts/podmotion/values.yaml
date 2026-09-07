@@ -164,10 +164,13 @@ scheduler:
   # Flipping this true (already the default) now renders a real podmotion-scheduler
   # Deployment/ConfigMap/RBAC (scheduler-deployment.yaml, scheduler-configmap.yaml,
   # scheduler-rbac.yaml) instead of nothing — but the image it runs is only real once
-  # ADR-0362 Part B1 lands. The live KVM deploy path (hack/kvm-cluster.sh) explicitly
-  # passes --set scheduler.enabled=false and is NOT changed by this ADR (that override
-  # flip is ADR-0362 Part C, dispatched separately) — so this chart-level default staying
-  # true does not put a broken pod on the standing cluster. Do not flip this to false: the
+  # ADR-0362 Part B1 lands. The live KVM deploy path (hack/kvm-cluster.sh) passes
+  # --set scheduler.enabled=true / --set webhook.podMutation.enabled=true since commit
+  # 7b2ecb53 (2026-07-27), and ADR-0416 brought the kind, k3s and EC2 quickstart paths
+  # to the same parity — every supported install path now matches this chart-level
+  # default rather than overriding it back to false. Note that each of those paths also
+  # overrides scheduler.image.* at install time to a locally built/loaded image; the
+  # remote default below is not pullable on a dev substrate. Do not flip this to false: the
   # _coherence-checks.tpl guard (ADR-0360) fails render on a bare `helm template` (no
   # overrides) if scheduler.enabled=false while webhook.podMutation.enabled=true (also
   # default true) — the two defaults are a matched pair.

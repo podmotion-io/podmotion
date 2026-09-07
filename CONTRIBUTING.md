@@ -254,7 +254,8 @@ helm upgrade --install podmotion charts/podmotion/ \
   --set agent.image.pullPolicy=Never \
   --set operator.replicas=1 \
   --set webhook.certManager.enabled=false \
-  --set scheduler.enabled=false \
+  --set scheduler.enabled=true \
+  --set webhook.podMutation.enabled=true \
   --set installCRDs=false \
   --set operator.featureGates="TCPPreservation=true"
 ```
@@ -263,6 +264,7 @@ helm upgrade --install podmotion charts/podmotion/ \
 - `webhook.certManager.enabled=false` — cert-manager is not present in kind; also removes the volume mount so `podmotion-webhook-tls` secret is not required
 - `installCRDs=false` — chart `crds/` dir is empty; apply CRDs manually (step 3)
 - `operator.replicas=1` — single replica for dev
+- `scheduler.enabled=true` / `webhook.podMutation.enabled=true` — a matched pair (ADR-0360 coherence guard fails the render on a mismatch). Both are already the chart default; ADR-0416 keeps the scheduling-gate binding path enabled on every install path. If you build a scheduler image locally, also pass `--set scheduler.image.repository=podmotion-scheduler --set scheduler.image.tag=dev --set scheduler.image.pullPolicy=Never`, otherwise the Deployment falls through to the chart's remote default image
 
 **Flags that do NOT exist in the operator binary** — passing these causes an immediate crash:
 - `--transfer-mode` — not a real flag

@@ -428,21 +428,13 @@ Run your first migration:
 
   KUBECONFIG=$KUBECONFIG_FILE kubectl get podmigration migrate-my-app -n pm-e2e -o yaml
 
-IMPORTANT — known gotcha on this 3-node dev deploy (scheduler.enabled=false,
-webhook.podMutation.enabled=false, same degraded config the kind quickstart
-uses): nothing pins the REPLACEMENT pod onto spec.targetNodeName — the default
-Kubernetes scheduler places it wherever it likes, and the destination agent
-hard-rejects the restore if that lands on the wrong node ("destinationNode X !=
-this node Y"). This was hit and confirmed live during this quickstart's own
-verification. If a migration wedges at RestoreSocketReattach or the replacement
-pod shows Init:CrashLoopBackOff with that exact error, cordon every node except
-your intended target before applying the PodMigration so the default scheduler
-has no other choice, e.g.:
-  KUBECONFIG=$KUBECONFIG_FILE kubectl cordon <every-other-node>
-  ... apply the PodMigration, wait for Complete ...
-  KUBECONFIG=$KUBECONFIG_FILE kubectl uncordon <every-other-node>
-This is a workaround for verification, not a fix — real node pinning needs
-scheduler.enabled=true (out of scope for this dev quickstart).
+NOTE — this quickstart delegates to hack/kvm-cluster.sh deploy-podmotion and
+re-enters Helm with --reuse-values, so it inherits that script's
+scheduler.enabled=true / webhook.podMutation.enabled=true pair (matched, true
+since commit 7b2ecb53, 2026-07-27; ADR-0416 brings kind and EC2 to the same
+parity). The scheduling-gate binding path is live on this 3-node dev deploy:
+the replacement pod is pinned onto spec.targetNodeName by the podmotion
+scheduler, so the old cordon/uncordon workaround is no longer needed.
 
 Extra test workloads (redis/postgres/nginx) are running in namespace: $WORKLOADS_NAMESPACE
 
