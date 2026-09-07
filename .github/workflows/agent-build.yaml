@@ -13,7 +13,6 @@ on:
           - operator
           - agent
           - scheduler
-          - pm-checkpoint-gc
       tag:
         description: "Custom tag to push"
         required: true
@@ -63,7 +62,7 @@ jobs:
           reason="${reason:-agent-requested build}"
 
           if [ "${img}" = "all" ]; then
-            list='["operator","agent","scheduler","pm-checkpoint-gc"]'
+            list='["operator","agent","scheduler"]'
           else
             list="[\"${img}\"]"
           fi

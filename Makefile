@@ -57,25 +57,33 @@ proto: ## Generate Go bindings from proto/migration_agent.proto using protoc.
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 
+# NOTE: `generate` deliberately does NOT depend on bpf-generate.
+#
+# The eBPF Go bindings in internal/agent/network/bpfloader/ are COMMITTED build
+# artifacts (see bpf/Makefile header) that require clang >= 14 to regenerate and
+# are only refreshed deliberately, by hand, when a bpf/*.c program changes.
+# Wiring them into `generate` made `make generate` — and therefore `make test`,
+# the CI codegen drift check, and `make build-installer` — hard-fail on any host
+# without the eBPF toolchain. `generate` now covers controller-gen deepcopy only,
+# which is exactly what the CI drift check is meant to verify.
 .PHONY: generate
-generate: controller-gen bpf-generate ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
+generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	"$(CONTROLLER_GEN)" object:headerFile="hack/boilerplate.go.txt",year=$(YEAR) paths="./..."
 
-# bpf-generate requires clang and libbpf-dev on the build host (apt-get install clang libbpf-dev).
-# Also requires github.com/cilium/ebpf in go.mod: run `go get github.com/cilium/ebpf@latest` first.
-GO ?= go
+# bpf-generate delegates to bpf/Makefile rather than duplicating the bpf2go
+# invocation. The previous copy here was broken and had never worked: it set no
+# GOPACKAGE and passed no -go-package (so bpf2go always exited "missing package,
+# you should either set the go-package flag or the GOPACKAGE env"), wrote to a
+# non-existent internal/agent/network/bpf/ directory, and covered only 2 of the 5
+# eBPF programs. bpf/Makefile is the single source of truth: it sets
+# GOPACKAGE=bpfloader and targets internal/agent/network/bpfloader/.
+#
+# Requires clang >= 14 on the build host. Regenerating rewrites committed
+# bindings, so run it only when a bpf/*.c program actually changed, and review
+# the resulting diff before committing.
 .PHONY: bpf-generate
-bpf-generate: ## Generate Go bindings for BPF C programs via bpf2go
-	$(GO) run github.com/cilium/ebpf/cmd/bpf2go \
-		-target amd64 \
-		-output-dir internal/agent/network/bpf \
-		ZeroWindow bpf/zero_window.c -- \
-		-I/usr/include/linux -I/usr/include
-	$(GO) run github.com/cilium/ebpf/cmd/bpf2go \
-		-target amd64 \
-		-output-dir internal/agent/network/bpf \
-		XDPBridge bpf/xdp_bridge.c -- \
-		-I/usr/include/linux -I/usr/include
+bpf-generate: ## Regenerate Go bindings for the BPF C programs (requires clang >= 14).
+	$(MAKE) -C bpf generate
 
 .PHONY: fmt
 fmt: ## Run go fmt against code.
@@ -216,7 +224,7 @@ docker-build: ## Build docker image with the manager.
 # has a real image for `make sbom`/`make security-scan` to find instead of erroring on a
 # nonexistent tag. NOT wired into hack/kvm-cluster.sh's cmd_deploy_podmotion — that deploy-path
 # integration belongs to ADR-0363's B2 (chart) follow-up, not this target.
-IMG_SCHEDULER ?= ghcr.io/podmotion-io/podmotion-scheduler:latest
+IMG_SCHEDULER ?= ghcr.io/podmotion-io/scheduler:latest
 .PHONY: docker-build-scheduler
 docker-build-scheduler: ## Build docker image for the custom scheduler.
 	$(CONTAINER_TOOL) build --build-arg GIT_SHA=$(GIT_SHA) -f images/scheduler/Dockerfile -t ${IMG_SCHEDULER} .
@@ -320,6 +328,13 @@ setup-envtest: envtest ## Download the binaries required for ENVTEST in the loca
 		echo "Error: Failed to set up envtest binaries for version $(ENVTEST_K8S_VERSION)."; \
 		exit 1; \
 	}
+
+# envtest-path prints ONLY the KUBEBUILDER_ASSETS directory (no log chatter), so CI
+# can do: export KUBEBUILDER_ASSETS="$$(make --no-print-directory envtest-path)".
+# Reuses the same setup-envtest mechanism as the `test` target — no second copy.
+.PHONY: envtest-path
+envtest-path: envtest ## Print the KUBEBUILDER_ASSETS path for the envtest control-plane binaries.
+	@"$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path
 
 .PHONY: envtest
 envtest: $(ENVTEST) ## Download setup-envtest locally if necessary.
@@ -534,8 +549,12 @@ GRYPE_VERSION ?= v0.85.0
 SBOM_DIR      ?= dist/sbom
 SBOM_SEVERITY ?= high     # grype fail-cutoff: critical|high|medium|low
 
-# Image short names — the four container images in scope (ADR-0077 §1).
-SC_IMAGES     ?= operator agent scheduler checkpoint-gc
+# Image short names — the container images in scope (ADR-0077 §1).
+# These MUST match what .github/workflows/_build-image.yaml publishes:
+#   ghcr.io/podmotion-io/<name>   (no "podmotion-" prefix)
+# and must correspond to a real images/<name>/Dockerfile. "checkpoint-gc" is an
+# accepted design (ADR-0053) with no source dir and no Dockerfile — not built.
+SC_IMAGES     ?= operator agent scheduler
 
 .PHONY: syft
 syft: $(SYFT) ## Download syft (CycloneDX SBOM generator) locally if necessary.
@@ -551,8 +570,8 @@ $(GRYPE): $(LOCALBIN)
 sbom: $(SYFT) ## Generate a CycloneDX JSON SBOM for every image and the Helm chart (ADR-0077 §1.5).
 	@mkdir -p $(SBOM_DIR)
 	@for b in $(SC_IMAGES); do \
-	  echo "==> SBOM: ghcr.io/podmotion-io/podmotion-$$b:$(VERSION)"; \
-	  "$(SYFT)" "ghcr.io/podmotion-io/podmotion-$$b:$(VERSION)" \
+	  echo "==> SBOM: ghcr.io/podmotion-io/$$b:$(VERSION)"; \
+	  "$(SYFT)" "ghcr.io/podmotion-io/$$b:$(VERSION)" \
 	    -o cyclonedx-json > "$(SBOM_DIR)/podmotion-$$b.cdx.json" || exit 1; \
 	done
 	"$(SYFT)" dir:charts/podmotion/ -o cyclonedx-json > "$(SBOM_DIR)/chart.cdx.json"

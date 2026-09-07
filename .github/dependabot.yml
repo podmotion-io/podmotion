@@ -37,10 +37,9 @@ updates:
 
   - package-ecosystem: docker
     directories:
-      - "/cmd/operator"
-      - "/cmd/agent"
-      - "/cmd/scheduler"
-      - "/cmd/pm-checkpoint-gc"
+      - "/images/operator"
+      - "/images/agent"
+      - "/images/scheduler"
     schedule:
       interval: weekly
       day: monday
