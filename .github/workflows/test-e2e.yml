@@ -1,8 +1,18 @@
 name: E2E Tests
 
+# INTERIM DEFAULT — manual trigger only.
+#
+# `make test-e2e` targets the standing KVM/libvirt cluster (VMs pm-cp1/pm-w1/pm-w2 on
+# a private 192.168.122.0/24 NAT network). A GitHub-hosted runner cannot reach that
+# network, so on push/pull_request this workflow failed 100% of the time and reported
+# a permanent false "CI is red" signal on every commit.
+#
+# Switching the trigger to workflow_dispatch stops the false signal; it does NOT make
+# the suite runnable from a hosted runner. The real decision — self-hosted runner on
+# the KVM host, an ephemeral in-CI cluster, or dropping this workflow — is still open
+# and deliberately NOT made here.
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 permissions: {}
 

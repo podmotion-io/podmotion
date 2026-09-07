@@ -1,8 +1,15 @@
 # Supply Chain Security — ADR-0077
 #
 # CycloneDX SBOM generation, Grype vulnerability scan, cosign keyless signing,
-# cosign verification, and SBOM attestation for all four PodMotion images plus
-# the Helm chart.
+# cosign verification, and SBOM attestation for every published PodMotion image
+# plus the Helm chart.
+#
+# Image short names here MUST match what _build-image.yaml actually publishes:
+#   ghcr.io/<namespace>/<image>   (no "podmotion-" prefix)
+# and must be limited to components that really have images/<name>/Dockerfile —
+# today: operator, agent, scheduler. "checkpoint-gc"/"pm-checkpoint-gc" is an
+# accepted design (ADR-0053) with no source directory and no Dockerfile, so it is
+# deliberately absent; re-add it here only once cmd/ + images/ for it exist.
 #
 #   sbom         — generate a CycloneDX JSON SBOM per image + chart (always)
 #   vuln-scan    — Grype-scan every SBOM; fail on a fixable CRITICAL/HIGH (always)
@@ -42,7 +49,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [operator, agent, scheduler, checkpoint-gc]
+        image: [operator, agent, scheduler]
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -52,7 +59,7 @@ jobs:
 
       - name: Generate image SBOM (CycloneDX)
         env:
-          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/podmotion-${{ matrix.image }}:${{ github.ref_type == 'tag' && github.ref_name || env.VERSION }}
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ github.ref_type == 'tag' && github.ref_name || env.VERSION }}
         run: |
           mkdir -p dist/sbom
           syft "${IMAGE_REF}" -o cyclonedx-json > "dist/sbom/podmotion-${{ matrix.image }}.cdx.json"
@@ -135,7 +142,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [operator, agent, scheduler, checkpoint-gc]
+        image: [operator, agent, scheduler]
     steps:
       - name: Install cosign
         uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
@@ -149,11 +156,11 @@ jobs:
 
       - name: Resolve digest and sign
         env:
-          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/podmotion-${{ matrix.image }}:${{ github.ref_name }}
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ github.ref_name }}
           COSIGN_EXPERIMENTAL: "true"
         run: |
           digest=$(cosign triangulate --type digest "${IMAGE_REF}" 2>/dev/null || true)
-          ref="${REGISTRY}/${IMAGE_NAMESPACE}/podmotion-${{ matrix.image }}"
+          ref="${REGISTRY}/${IMAGE_NAMESPACE}/${{ matrix.image }}"
           if [ -z "${digest}" ]; then
             digest=$(crane digest "${IMAGE_REF}")
           fi
@@ -172,7 +179,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [operator, agent, scheduler, checkpoint-gc]
+        image: [operator, agent, scheduler]
     steps:
       - name: Install cosign
         uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
@@ -192,11 +199,11 @@ jobs:
 
       - name: Attest SBOM (cyclonedx)
         env:
-          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/podmotion-${{ matrix.image }}:${{ github.ref_name }}
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ github.ref_name }}
           COSIGN_EXPERIMENTAL: "true"
         run: |
           digest=$(crane digest "${IMAGE_REF}")
-          ref="${REGISTRY}/${IMAGE_NAMESPACE}/podmotion-${{ matrix.image }}"
+          ref="${REGISTRY}/${IMAGE_NAMESPACE}/${{ matrix.image }}"
           cosign attest --yes \
             --predicate "dist/sbom/podmotion-${{ matrix.image }}.cdx.json" \
             --type cyclonedx \
@@ -215,14 +222,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [operator, agent, scheduler, checkpoint-gc]
+        image: [operator, agent, scheduler]
     steps:
       - name: Install cosign
         uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
 
       - name: Verify image signature (keyless)
         env:
-          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/podmotion-${{ matrix.image }}:${{ github.ref_name }}
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ github.ref_name }}
         run: |
           cosign verify \
             --certificate-identity-regexp="https://github.com/podmotion-io/podmotion/.github/workflows/supply-chain.yaml@.*" \
@@ -231,7 +238,7 @@ jobs:
 
       - name: Verify SBOM attestation (cyclonedx)
         env:
-          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/podmotion-${{ matrix.image }}:${{ github.ref_name }}
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ github.ref_name }}
         run: |
           cosign verify-attestation \
             --type cyclonedx \

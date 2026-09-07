@@ -11,7 +11,6 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAMESPACE: podmotion-io
-  GO_VERSION: "1.24"
 
 jobs:
   ci-gate:
@@ -27,15 +26,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           sha="${{ github.sha }}"
           echo "Checking CI conclusion for ${sha}"
+          # FAIL-CLOSED: a release must never ship on an unverified commit. The
+          # previous form (`!= success && -n "$status"`) let an EMPTY status — no CI
+          # run found for this SHA, or a failed `gh` call — fall straight through to
+          # "passed", which is the exact case the gate exists to catch.
           status=$(gh run list --workflow=ci.yaml --commit "${sha}" \
             --json conclusion --jq '.[0].conclusion' 2>/dev/null || echo "")
-          if [ "${status}" != "success" ] && [ -n "${status}" ]; then
+          if [ -z "${status}" ] || [ "${status}" = "null" ]; then
+            echo "::error::No CI result found for ${sha}. Refusing to release an unverified commit."
+            exit 1
+          fi
+          if [ "${status}" != "success" ]; then
             echo "::error::CI for ${sha} did not succeed (status: ${status})."
             exit 1
           fi
-          echo "CI gate passed (status: ${status:-not-found, proceeding})."
+          echo "CI gate passed (status: ${status})."
 
   prepare:
     name: Prepare Tags
@@ -72,7 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [operator, agent, scheduler, pm-checkpoint-gc]
+        image: [operator, agent, scheduler]
     uses: ./.github/workflows/_build-image.yaml
     with:
       image: ${{ matrix.image }}
@@ -90,7 +98,7 @@ jobs:
       packages: write
     strategy:
       matrix:
-        image: [operator, agent, scheduler, pm-checkpoint-gc]
+        image: [operator, agent, scheduler]
     uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.0.0
     with:
       image: ghcr.io/podmotion-io/${{ matrix.image }}
@@ -111,7 +119,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5.1.0
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: go.mod
           check-latest: true
       - name: Build installer
         env:
@@ -198,7 +206,6 @@ jobs:
           - \`ghcr.io/podmotion-io/operator:${TAG}\`
           - \`ghcr.io/podmotion-io/agent:${TAG}\`
           - \`ghcr.io/podmotion-io/scheduler:${TAG}\`
-          - \`ghcr.io/podmotion-io/pm-checkpoint-gc:${TAG}\`
 
           All images are multi-arch (amd64/arm64), cosign-signed (keyless), and ship SPDX SBOM attestations with SLSA L2 provenance.
 

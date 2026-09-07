@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       image:
-        description: "Image short name (operator|agent|scheduler|pm-checkpoint-gc)"
+        description: "Image short name (operator|agent|scheduler) — must match a directory under images/"
         required: true
         type: string
       tags:
@@ -83,12 +83,21 @@ jobs:
           annotations: |
             org.opencontainers.image.title=podmotion-${{ inputs.image }}
 
+      # KNOWN GAP (not fixed in this pass — needs a design decision, see report):
+      # images/{operator,agent,scheduler}/Dockerfile all COPY *pre-built* binaries
+      # out of bin/ (e.g. `COPY bin/manager-linux-amd64 /manager`) rather than
+      # compiling in-image, and those artifacts are amd64-only. So this job needs a
+      # `make build-linux` step before the build, and `platforms:` below cannot
+      # actually produce a working linux/arm64 layer until the Dockerfiles either
+      # build in-stage (like the repo-root ./Dockerfile does) or bin/ is populated
+      # per-arch. This workflow has never run, so the gap has never surfaced.
       - name: Build and push
         id: build
         uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
         with:
           context: .
-          file: ./cmd/${{ inputs.image }}/Dockerfile
+          # Dockerfiles live under images/<component>/, NOT cmd/<component>/.
+          file: ./images/${{ inputs.image }}/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
