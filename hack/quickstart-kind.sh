@@ -98,6 +98,7 @@ TAG="${CLUSTER_NAME}-quickstart"
 KIND_NODE_IMG="podmotion-node:${TAG}"
 OPERATOR_IMG="podmotion-operator:${TAG}"
 AGENT_IMG="podmotion-agent:${TAG}"
+SCHEDULER_IMG="podmotion-scheduler:${TAG}"
 DEMO_WEB_IMG="podmotion-demo-web:${TAG}"
 DEMO_API_IMG="podmotion-demo-api:${TAG}"
 
@@ -225,18 +226,27 @@ kubectl --kubeconfig "$KUBECONFIG_FILE" wait --for=condition=Ready nodes --all -
 echo "  [ok] cluster '$CLUSTER_NAME' is up. Kubeconfig: $KUBECONFIG_FILE"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 5 — Build + load the operator and agent container images
+# Step 5 — Build + load the operator, agent and scheduler container images
 # ─────────────────────────────────────────────────────────────────────────────
 
-section "Step 5/11 — Build + kind load operator/agent images"
+section "Step 5/11 — Build + kind load operator/agent/scheduler images"
 
 cd "$REPO_ROOT"
-docker build -f images/operator/Dockerfile -t "$OPERATOR_IMG" .
-docker build -f images/agent/Dockerfile    -t "$AGENT_IMG"    .
+docker build -f images/operator/Dockerfile  -t "$OPERATOR_IMG"  .
+docker build -f images/agent/Dockerfile     -t "$AGENT_IMG"     .
+# ADR-0416: the scheduler image is load-bearing on kind now that
+# scheduler.enabled=true (Step 9). Without a locally-built, locally-loaded
+# image the Deployment falls through to the chart default
+# (ghcr.io/podmotion/podmotion-scheduler:latest, values.yaml scheduler.image.*),
+# a remote image that does not exist — ImagePullBackOff on every deploy. Same
+# build/load/override treatment operator and agent already get here, and the
+# same fix hack/kvm-cluster.sh's cmd_deploy_podmotion already makes.
+docker build -f images/scheduler/Dockerfile -t "$SCHEDULER_IMG" .
 
-kind load docker-image "$OPERATOR_IMG" --name "$CLUSTER_NAME"
-kind load docker-image "$AGENT_IMG"    --name "$CLUSTER_NAME"
-echo "  [ok] loaded $OPERATOR_IMG and $AGENT_IMG into cluster '$CLUSTER_NAME'"
+kind load docker-image "$OPERATOR_IMG"  --name "$CLUSTER_NAME"
+kind load docker-image "$AGENT_IMG"     --name "$CLUSTER_NAME"
+kind load docker-image "$SCHEDULER_IMG" --name "$CLUSTER_NAME"
+echo "  [ok] loaded $OPERATOR_IMG, $AGENT_IMG, and $SCHEDULER_IMG into cluster '$CLUSTER_NAME'"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 6 — Apply CRDs
@@ -294,12 +304,20 @@ helm dependency update charts/podmotion
 # fallback for exactly this case; the standing podmotion-demo kind cluster
 # already runs with this override.
 #
-# webhook.podMutation.enabled=false: podmotion-coherence-check.yaml (ADR-0359 /
-# ADR-0360) fails the render if podMutation is left at its default `true` while
-# scheduler.enabled=false — the mutating webhook would bind replacement pods to
-# a scheduler that isn't running. Disabling both together is the documented
-# full-degradation path (no scheduler pinning, no gate, no IP pins, no node
-# binding) and matches hack/kvm-cluster.sh's dev-cluster install.
+# scheduler.enabled=true / webhook.podMutation.enabled=true (ADR-0416): a
+# MATCHED PAIR — never flip one without the other. podmotion-coherence-check.yaml
+# (ADR-0359 / ADR-0360) fails the render on a mismatch, because a mutating
+# webhook that binds replacement pods to a scheduler that isn't running strands
+# them SchedulingGated forever. Both are already the chart default
+# (charts/podmotion/values.yaml); this script used to override both back to
+# false, which silently re-disabled the ADR-0046/ADR-0025/ADR-0359
+# scheduling-gate binding path on kind — nothing then pinned the REPLACEMENT pod
+# onto spec.targetNodeName and the destination agent hard-rejected the restore
+# ("destinationNode X != this node Y"). ADR-0416 removes that override so kind
+# matches the KVM path (hack/kvm-cluster.sh, true since 7b2ecb53, 2026-07-27).
+# scheduler.image.pullPolicy=Never matches the kind image-load convention used
+# for operator/agent above: the image comes from `kind load docker-image`
+# (Step 5), never a registry pull.
 KUBECONFIG="$KUBECONFIG_FILE" helm upgrade --install podmotion charts/podmotion \
   --namespace "$PODMOTION_NAMESPACE" --create-namespace \
   --set operator.image.repository="podmotion-operator" \
@@ -311,8 +329,11 @@ KUBECONFIG="$KUBECONFIG_FILE" helm upgrade --install podmotion charts/podmotion 
   --set agent.apparmorProfile=unconfined \
   --set operator.replicas=1 \
   --set webhook.certManager.enabled=false \
-  --set scheduler.enabled=false \
-  --set webhook.podMutation.enabled=false \
+  --set scheduler.enabled=true \
+  --set scheduler.image.repository="podmotion-scheduler" \
+  --set scheduler.image.tag="$TAG" \
+  --set scheduler.image.pullPolicy=Never \
+  --set webhook.podMutation.enabled=true \
   --set installCRDs=false \
   --set checkpoint.transferMode="" \
   --set checkpoint.registry.url="" \
@@ -326,6 +347,16 @@ KUBECONFIG="$KUBECONFIG_FILE" helm upgrade --install podmotion charts/podmotion 
   --wait=false
 
 echo "  [ok] helm release 'podmotion' installed/upgraded in namespace '$PODMOTION_NAMESPACE'"
+
+# ADR-0416: the scheduling gate is load-bearing on kind now. A scheduler
+# Deployment that renders but never becomes Ready leaves every replacement pod
+# stuck Pending/SchedulingGated forever — strictly worse than the old same-node
+# landing. Treat rollout failure as a hard error, mirroring the equivalent gate
+# in hack/kvm-cluster.sh's cmd_deploy_podmotion.
+echo "  [step] Waiting for deploy/podmotion-scheduler rollout..."
+KUBECONFIG="$KUBECONFIG_FILE" kubectl -n "$PODMOTION_NAMESPACE" rollout status \
+  deploy/podmotion-scheduler --timeout=180s
+echo "  [ok] podmotion-scheduler is Ready"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 10 — Wait for everything to reach Ready
