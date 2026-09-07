@@ -16,7 +16,7 @@ jobs:
   disclose-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check for internal-process vocabulary leakage
         run: |
           set -euo pipefail
