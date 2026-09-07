@@ -72,12 +72,12 @@ type MigrationOptions struct {
 	// Classifications is the list of per-PVC tier decisions from StorageClassifier.
 	Classifications []TierClassification
 	// CutoverComplete is true when ConditionStorageCutoverComplete is (or, per
-	// cutoverSideEffectOccurred, was) True on the PodMigration at the moment this
+	// CutoverSideEffectOccurred, was) True on the PodMigration at the moment this
 	// MigrationOptions was built — i.e. Cutover's tier-specific destination-side action
 	// (Longhorn attach, Ceph `rbd migration commit`, …) is known to have actually executed.
 	// Populated ONLY by buildMigrationOptionsFromCache (the read path ReleaseDestination uses),
 	// via the same meta.FindStatusCondition/meta.IsStatusConditionTrue pattern already used
-	// elsewhere in this controller (podmigration_controller.go:1050) — never inferred from tier
+	// elsewhere in this controller (podmigration_controller.go:1640) — never inferred from tier
 	// identity alone (ADR-0368 CONDITION 2 / KVM Expert FINDING 1). Tier2/Tier3's
 	// ReleaseDestination implementations gate their point-of-no-return/not-implemented sentinel
 	// on this field: if cutover never actually ran, there is nothing destination-side to
@@ -161,11 +161,34 @@ type Migrator interface {
 // The manager is called from the PodMigration controller PreMigrating phase alongside
 // the ReplicationManager; both goroutines run concurrently (ADR-0011).
 type StorageMigrationManager struct {
-	Client     client.Client
+	Client client.Client
+	// APIReader is an UNCACHED apiserver reader (mgr.GetAPIReader). ADR-0428 D7:
+	// buildMigrationOptionsFromCache's CutoverComplete verdict feeds
+	// CutoverSideEffectOccurred, which decides whether a rollback treats a tier's
+	// destination-side action as already-executed-and-irreversible or never-executed.
+	// A cache-backed read there can report "cutover never happened" for a cutover that
+	// provably ran (the informer cache is not read-after-write consistent with
+	// patchStorageCutover's direct Status().Update), which is the ADR-0368
+	// fabricated-success failure mode reached by an ADR-0428 root cause. Nil in unit
+	// tests → readBackReader() falls back to Client (fake clients are read-after-write
+	// consistent). Mirrors PodMigrationReconciler.APIReader / readBackReader()
+	// (internal/controller/podspec_snapshot.go).
+	APIReader  client.Reader
 	Classifier *StorageClassifier
 	// Migrators maps StorageTier → Migrator. Populated by wire code in cmd/operator.
 	// Tests inject stubs here.
 	Migrators map[StorageTier]Migrator
+}
+
+// readBackReader returns the UNCACHED APIReader when one is wired, falling back to the
+// cached Client otherwise. Deliberately identical in shape and rationale to
+// PodMigrationReconciler.readBackReader (internal/controller/podspec_snapshot.go) — same
+// primitive, same nil-fallback contract, different component.
+func (m *StorageMigrationManager) readBackReader() client.Reader {
+	if m.APIReader != nil {
+		return m.APIReader
+	}
+	return m.Client
 }
 
 // NewStorageMigrationManager returns a manager wired with the default migrators.
@@ -378,7 +401,12 @@ func (m *StorageMigrationManager) classifyFromLiveSourcePod(ctx context.Context,
 // retryable condition, not a permanent failure.
 func (m *StorageMigrationManager) buildMigrationOptionsFromCache(ctx context.Context, pm *pmv1.PodMigration) (TierClassification, Migrator, MigrationOptions, error) {
 	fresh := &pmv1.PodMigration{}
-	if err := m.Client.Get(ctx, client.ObjectKeyFromObject(pm), fresh); err != nil {
+	// ADR-0428 D7: this MUST go through the UNCACHED reader (readBackReader() ->
+	// mgr.GetAPIReader), never m.Client directly. The condition this feeds
+	// (CutoverSideEffectOccurred, via CutoverComplete below) decides an ADR-0368
+	// irreversibility verdict; a cache-backed read here can report "cutover never
+	// happened" for a cutover that provably ran. Do NOT "simplify" this back to m.Client.
+	if err := m.readBackReader().Get(ctx, client.ObjectKeyFromObject(pm), fresh); err != nil {
 		return TierClassification{}, nil, MigrationOptions{}, fmt.Errorf("re-fetch PodMigration for cached classification: %w", err)
 	}
 	if fresh.Status.StorageTier == nil {
@@ -402,7 +430,7 @@ func (m *StorageMigrationManager) buildMigrationOptionsFromCache(ctx context.Con
 		SourceNode:      pm.Status.SourceNodeName,
 		DestinationNode: pm.Status.DestinationNodeName,
 		Classifications: classifications,
-		CutoverComplete: cutoverSideEffectOccurred(fresh.Status.Conditions),
+		CutoverComplete: CutoverSideEffectOccurred(fresh.Status.Conditions),
 	}
 
 	return highest, m.Migrators[highest.Tier], opts, nil
@@ -418,13 +446,18 @@ func (m *StorageMigrationManager) buildMigrationOptionsFromCache(ctx context.Con
 var errNoCachedClassification = errors.New(
 	"no cached PVC classification yet (RunPreStage has not completed) — cannot cutover before storage pre-stage classifies volumes")
 
-// cutoverSideEffectOccurred reports whether Cutover's tier-specific destination-side action
+// CutoverSideEffectOccurred reports whether Cutover's tier-specific destination-side action
 // (Longhorn attach, Ceph `rbd migration commit`, …) is known to have actually executed for this
 // PodMigration, read from the SAME ConditionStorageCutoverComplete condition/pattern already used
-// elsewhere in this controller (podmigration_controller.go:1050's
-// meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionStorageCutoverComplete) check) —
-// ADR-0368 CONDITION 2: ground this in the codebase's existing condition-reading pattern, never
-// infer it from tier identity alone.
+// elsewhere in this controller (podmigration_controller.go:1640's guard) — ADR-0368 CONDITION 2:
+// ground this in the codebase's existing condition-reading pattern, never infer it from tier
+// identity alone. Exported (ADR-0428 D1c) so the storage-cutover guard can ask this predicate
+// instead of maintaining a second, weaker answer to the same question.
+//
+// This is the single predicate for "did the destination-side storage action already execute."
+// Callers must not re-derive it from IsStatusConditionTrue — that expression misses the
+// AwaitSingleOwnerTimeout case and produced a redundant, live-observed Longhorn detach/attach
+// (ADR-0428 D1c).
 //
 // True in two cases:
 //   - the condition is already True: AwaitSingleOwner (manager.go's AwaitSingleOwner method,
@@ -444,7 +477,7 @@ var errNoCachedClassification = errors.New(
 // PreMigrating's Cutover phase ever ran, e.g. a Checkpointing/Transferring-phase failure; or
 // reason "CutoverFailed"/"ClassifyFailed"/etc — migrator.Cutover itself never returned nil)
 // reports false: Cutover's destination-side action never executed.
-func cutoverSideEffectOccurred(conditions []metav1.Condition) bool {
+func CutoverSideEffectOccurred(conditions []metav1.Condition) bool {
 	cond := meta.FindStatusCondition(conditions, pmv1.ConditionStorageCutoverComplete)
 	if cond == nil {
 		return false
@@ -494,6 +527,18 @@ func (m *StorageMigrationManager) Cutover(ctx context.Context, pm *pmv1.PodMigra
 // reconcileOverlayHandoff's gateStorageCutoverBeforeRestore, and before
 // permitting the phase transition that makes CRIU restore eligible to run
 // (RestoreSocketReattach — see nri/plugin.go verifyPhaseInAcceptSet).
+//
+// SEQUENCE INVARIANT (ADR-0428 D1c): this method is what PATCHES the AwaitSingleOwnerTimeout
+// reason relied on by CutoverSideEffectOccurred (above) and, transitively, by the
+// storage-cutover guard's Cutover-skip decision (podmigration_controller.go's
+// gateStorageCutoverBeforeRestore) as evidence that the tier's Cutover already ran. This method
+// has FOUR write legs to that reason — the three early-return guards above and the
+// migrator.AwaitSingleOwner failure branch immediately below — and this is where a future author
+// adding a FIFTH write leg would actually be standing: any new leg that patches
+// AwaitSingleOwnerTimeout without Cutover having genuinely already succeeded reopens D1c's defect
+// class (a false "destination-side action already executed" signal). See the identical invariant
+// comment on LonghornMigrator.AwaitSingleOwner (tier1.go:266-273) — same invariant, tier-specific
+// half, cross-referenced rather than duplicated.
 func (m *StorageMigrationManager) AwaitSingleOwner(ctx context.Context, pm *pmv1.PodMigration) error {
 	highest, migrator, opts, err := m.buildMigrationOptionsFromCache(ctx, pm)
 	if err != nil {

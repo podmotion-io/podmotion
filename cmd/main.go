@@ -269,6 +269,10 @@ func main() {
 	// StorageMigrationManager drives storage pre-stage (sets StorageReadyForFreeze=True).
 	replicationMgr := &replication.ReplicationManager{Client: mgr.GetClient(), AgentPool: agentPool}
 	storageMgr := storage.NewStorageMigrationManager(mgr.GetClient())
+	// ADR-0428 D7: authoritative reader for buildMigrationOptionsFromCache's
+	// CutoverComplete verdict (ADR-0368 irreversibility gate). Same primitive and same
+	// nil-fallback contract as PodMigrationReconciler.APIReader (:311 below).
+	storageMgr.APIReader = mgr.GetAPIReader()
 	// Wire the real Longhorn Tier1 migrator (dual-engine replica add/poll/detach/attach via
 	// the Longhorn Manager HTTP API) in place of the LonghornStubMigrator default. Without
 	// this, TierLonghorn always reports 100% sync on the first poll and the freeze proceeds

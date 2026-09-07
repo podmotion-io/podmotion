@@ -208,15 +208,20 @@ var (
 // PodMigrationReconciler reconciles a PodMigration object.
 type PodMigrationReconciler struct {
 	client.Client
-	// APIReader is an UNCACHED apiserver reader (mgr.GetAPIReader), used ONLY for the ADR-0393/0410
-	// capture read-back gate. The informer cache is NOT read-after-write consistent with the direct
-	// Status().Patch that persists the snapshot one line earlier, so a cached read-back can return the
-	// pre-patch object (SourcePodSpecSnapshot == nil) until the watch delivers the write — a
-	// read-your-own-write blip, worst at cold-start. The uncached read grounds the fail-closed "refuse
-	// source kill" gate in authoritative server state, exactly as the eviction webhook (ADR-0401) and
-	// the agent bridge reconciler (ADR-0400 D2) already do. Nil in unit tests → the read-back falls
-	// back to r.Client via readBackReader() (the fake client is read-after-write consistent, so there
-	// is no cache-lag to defend against there).
+	// APIReader is an UNCACHED apiserver reader (mgr.GetAPIReader), used for the controller's
+	// authoritative same-pass reads: the ADR-0393/0410 capture read-back gate, the ADR-0423
+	// rollback-progress stamp (adr0423_terminal_integrity.go), and the ADR-0428 storage-cutover
+	// guard's pre-cutover re-check (D1b) and post-cutover condition re-fetch (D1a). The informer
+	// cache is NOT read-after-write consistent with a direct Status().Patch/Update issued earlier
+	// in the same reconcile pass, so a cached read-back can return the pre-write object until the
+	// watch delivers the write — a read-your-own-write blip, worst at cold-start. General rule
+	// (ADR-0428 D2): any read where a cache would be standing in for ground truth about a fact the
+	// API server holds authoritatively, and where being wrong is consequential and not
+	// self-correcting, must go through readBackReader(). The uncached read grounds these
+	// fail-closed gates in authoritative server state, exactly as the eviction webhook (ADR-0401)
+	// and the agent bridge reconciler (ADR-0400 D2) already do. Nil in unit tests → the read-back
+	// falls back to r.Client via readBackReader() (the fake client is read-after-write consistent,
+	// so there is no cache-lag to defend against there).
 	APIReader  client.Reader
 	Scheme     *runtime.Scheme
 	Estimator  estimation.Estimator
@@ -1637,15 +1642,78 @@ func (r *PodMigrationReconciler) gateStorageCutoverBeforeRestore(ctx context.Con
 	if r.StorageMgr == nil {
 		return ctrl.Result{}, true, nil
 	}
+
+	// ADR-0428 D1b: the fast path is the CACHED read — pm.Status.Conditions comes from this
+	// reconcile's top-of-Reconcile r.Get, which is cache-backed. A cached TRUE is always
+	// trustworthy (the informer cache never invents a condition; it only lags behind one), so
+	// a True short-circuits immediately with no extra apiserver traffic.
+	//
+	// A cached FALSE/ABSENT is NOT trustworthy, and acting on it is expensive: it commits this
+	// reconcile to a real Longhorn detach-from-source / attach-to-destination / await-single-owner
+	// sequence against a volume that may ALREADY be collapsed to single-owner on the destination
+	// node and mounted by the destination pod. patchStorageCutover's direct Status().Update may
+	// have landed on the API server in a PREVIOUS pass whose transitionTo then 409'd on its own
+	// cached re-Get (:7125) and requeued us here before the watch delivered — the condition is
+	// durably True on the server and absent from the cache. Confirm the negative against the
+	// source of truth before paying for a redundant, disruptive datapath action.
+	//
+	// Cost: exactly one extra apiserver Get, and ONLY on the branch that was about to issue a
+	// multi-second Longhorn cutover anyway. Strictly cheaper than the redundant detach/attach it
+	// prevents. Same primitive, same reason as the read-back below and the ADR-0393/0410
+	// snapshot read-back (podspec_snapshot.go). Do NOT "simplify" this to the cached read alone.
 	if meta.IsStatusConditionTrue(pm.Status.Conditions, pmv1.ConditionStorageCutoverComplete) {
 		return ctrl.Result{}, true, nil
 	}
-
-	if err := r.StorageMgr.Cutover(ctx, pm); err != nil {
-		log.Error(err, "OverlayHandoff: storage cutover failed — requeuing before allowing the restore-eligible phase",
-			"migration", pm.Name)
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, false, nil
+	authoritative := &pmv1.PodMigration{}
+	if err := r.readBackReader().Get(ctx, client.ObjectKeyFromObject(pm), authoritative); err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("authoritative re-check of storage-cutover condition before cutover: %w", err)
 	}
+	if meta.IsStatusConditionTrue(authoritative.Status.Conditions, pmv1.ConditionStorageCutoverComplete) {
+		// The cutover already completed and the cache had not caught up. Install the
+		// authoritative condition list so the caller's subsequent blob write does not
+		// re-clobber it (same reason as the post-cutover re-fetch below), and short-circuit.
+		pm.Status.Conditions = authoritative.Status.Conditions
+		return ctrl.Result{}, true, nil
+	}
+	// BOTH reads agree the condition is not True — fall through to the Cutover-skip
+	// decision (ADR-0428 D1c), which decides on ADR-0368's predicate, not on this one.
+
+	// ADR-0428 D1c: the question this decision is asking is "has the destination-side
+	// storage action already executed?" — and ADR-0368 already OWNS the answer to that
+	// question in storage.CutoverSideEffectOccurred (internal/agent/storage/manager.go).
+	// A bare IsStatusConditionTrue is a SECOND, WEAKER answer to the same question: it
+	// misses the case where the condition sits at False with reason
+	// "AwaitSingleOwnerTimeout", which is set ONLY after migrator.Cutover already returned
+	// nil — the tier's destination-side action was already issued and accepted; only the
+	// post-cutover collapse poll timed out. Re-issuing Cutover in that state re-detaches the
+	// volume from the (already deleted, ADR-0356) source node and re-attaches it to the
+	// destination node while the destination pod is mounting it, once per collapse-poll
+	// timeout cycle (~2m05s: longhornSingleOwnerTimeout + this requeue delay), indefinitely.
+	//
+	// Skipping it is safe, and the reason is NOT "the detach/attach provably took effect" —
+	// those are unconfirmed POSTs (no confirmation poll, unlike ReleaseDestination's
+	// pollUntilDetached). It is safe because the dual-engine collapse AwaitSingleOwner polls
+	// for is driven by the Kubernetes CSI attachment tickets, NOT by these legacy
+	// ?action=detach/?action=attach REST calls (see the Cutover doc comment in
+	// internal/agent/storage/tier1.go) — so re-issuing them cannot make the collapse more
+	// likely and skipping them cannot make it less likely. AwaitSingleOwner below stays
+	// unconditional and is what actually drives convergence. ADR-0428 D1c.0.
+	//
+	// Ask ADR-0368's predicate, never a second hand-rolled one; if the two ever disagree
+	// again, the predicate is the single place to fix it.
+	if !storage.CutoverSideEffectOccurred(authoritative.Status.Conditions) {
+		if err := r.StorageMgr.Cutover(ctx, pm); err != nil {
+			log.Error(err, "OverlayHandoff: storage cutover failed — requeuing before allowing the restore-eligible phase",
+				"migration", pm.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, false, nil
+		}
+	}
+	// AwaitSingleOwner is DELIBERATELY unconditional and outside the skip above. In the
+	// AwaitSingleOwnerTimeout case the collapse poll is precisely the step that has NOT
+	// completed, so it must keep being retried on every pass — skipping it would convert a
+	// recoverable timeout into a permanent stall. AwaitSingleOwner is self-contained
+	// (it re-derives its own options via buildMigrationOptionsFromCache, manager.go:498)
+	// and does not require Cutover to have run in THIS process or THIS pass.
 	if err := r.StorageMgr.AwaitSingleOwner(ctx, pm); err != nil {
 		log.Error(err, "OverlayHandoff: await-single-owner failed — requeuing before allowing the restore-eligible phase",
 			"migration", pm.Name)
@@ -1657,8 +1725,18 @@ func (r *PodMigrationReconciler) gateStorageCutoverBeforeRestore(ctx context.Con
 	// this reconcile's in-memory pm. Re-fetch conditions here so the caller's subsequent
 	// statusUpdate/transitionTo calls — full Status replaces, not merges — don't clobber that
 	// just-written condition with the stale in-memory copy.
+	//
+	// ADR-0428: this re-fetch MUST go through the UNCACHED reader (readBackReader() ->
+	// mgr.GetAPIReader), never the cache-backed r.Client. patchStorageCutover's direct
+	// Status().Update landed on the API server MILLISECONDS ago, in THIS reconcile pass; the
+	// informer cache is not read-after-write consistent with it. A cached Get here can return
+	// the PRE-PATCH object, and this assignment then re-installs a condition list that LACKS
+	// the condition — the exact clobber this guard exists to prevent, executed by the guard
+	// itself. Same hazard, same primitive, same reason as the ADR-0393/0410 snapshot read-back
+	// (podspec_snapshot.go) and the ADR-0423 rollback-stamp read-back
+	// (adr0423_terminal_integrity.go). Do NOT "simplify" this back to r.Get.
 	fresh := &pmv1.PodMigration{}
-	if err := r.Get(ctx, client.ObjectKeyFromObject(pm), fresh); err != nil {
+	if err := r.readBackReader().Get(ctx, client.ObjectKeyFromObject(pm), fresh); err != nil {
 		return ctrl.Result{}, false, fmt.Errorf("re-fetch PodMigration after storage cutover: %w", err)
 	}
 	pm.Status.Conditions = fresh.Status.Conditions

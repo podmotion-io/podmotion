@@ -172,10 +172,16 @@ func (r *PodMigrationReconciler) captureSourcePodSpecSnapshot(ctx context.Contex
 	return nil
 }
 
-// readBackReader returns the UNCACHED APIReader for the ADR-0393/0410 capture read-back gate, falling
-// back to the cached client only when APIReader is unset (unit tests, where the fake client is
-// read-after-write consistent and no cache-lag exists to defend against). Production ALWAYS wires
-// APIReader (cmd/main.go), so the authoritative read-back never depends on watch-delivery latency.
+// readBackReader returns the UNCACHED APIReader for the controller's authoritative same-pass
+// reads, falling back to the cached client only when APIReader is unset (unit tests, where the
+// fake client is read-after-write consistent and no cache-lag exists to defend against).
+// Production ALWAYS wires APIReader (cmd/main.go), so these reads never depend on
+// watch-delivery latency. Four non-test call sites as of ADR-0428: the ADR-0393/0410 capture
+// read-back gate (podspec_snapshot.go:163), the ADR-0423 rollback-progress stamp
+// (adr0423_terminal_integrity.go:353), and the ADR-0428 storage-cutover guard's pre-cutover
+// re-check (D1b) and post-cutover condition re-fetch (D1a). See StorageMigrationManager's
+// mirrored helper of the same name (internal/agent/storage/manager.go) for the equivalent
+// primitive one component over (ADR-0428 D7).
 func (r *PodMigrationReconciler) readBackReader() client.Reader {
 	if r.APIReader != nil {
 		return r.APIReader

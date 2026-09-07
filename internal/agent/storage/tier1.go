@@ -262,6 +262,15 @@ func (m *LonghornMigrator) Cutover(ctx context.Context, opts MigrationOptions) e
 // one" is the volume's controllers array (JSON field the live Longhorn
 // v1.9.1 Manager API actually returns, confirmed via GET
 // /v1/volumes/{name}): exactly one entry, running=true, hostId==destNode.
+//
+// This method's AwaitSingleOwnerTimeout reason is relied on by CutoverSideEffectOccurred
+// (ADR-0368) and, as of ADR-0428 D1c, by the storage-cutover guard's Cutover-skip decision, as
+// evidence that the tier's Cutover already ran. That is a SEQUENCE invariant, not a confirmed
+// fact: it holds only because the sole non-test caller reaches this method only after Cutover
+// returned nil. A future caller that invokes this without a preceding successful Cutover breaks
+// both consumers — after D1c, in the skip direction. See the Cutover doc comment above for why
+// the collapse this polls for is CSI-attacher-driven and does not depend on Cutover's REST calls
+// (ADR-0428 D1c.0.2).
 func (m *LonghornMigrator) AwaitSingleOwner(ctx context.Context, opts MigrationOptions) error {
 	log := logf.FromContext(ctx).WithValues("migration", opts.MigrationName, "tier", "Longhorn")
 
